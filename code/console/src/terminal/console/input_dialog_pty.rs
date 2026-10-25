@@ -2,7 +2,7 @@ use super::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 pub(super) const FIXTURE_DIRECTORY: &str = "TICKLOOP_INPUT_DIALOG_FIXTURE_DIR";
 pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
@@ -362,16 +362,16 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
 #[ignore]
 fn plan_approval_pty_fixture() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = PathBuf::from(std::env::var(FIXTURE_DIRECTORY).unwrap());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("plan", "# Controlled PTY plan\nCreate executed.txt only after approval."),
-            tickloop_harness_test_support::call("execute", "Write", serde_json::json!({"file_path":"executed.txt","content":"approved implementation"})),
-            tickloop_harness_test_support::text("Implementation completed."),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("plan", "# Controlled PTY plan\nCreate executed.txt only after approval."),
+            tickloop_harness::test_support::call("execute", "Write", serde_json::json!({"file_path":"executed.txt","content":"approved implementation"})),
+            tickloop_harness::test_support::text("Implementation completed."),
         ]));
-        let agent = ConsoleExecution::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = ConsoleExecution::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.clone()).await.unwrap();
         agent.set_execution_mode(chat, ExecutionMode::Plan).await.unwrap();
         let (console, mut input) = Console::start(true).unwrap();

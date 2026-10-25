@@ -16,7 +16,7 @@ use super::{
     image_cache::ImageLinks,
     presentation, safe_text,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     BranchPublicItem, BranchPublicSource, ChatSnapshot, CommandSnapshot, CommandState, Content,
     EventKind, ExecutionMode, FOLDED_TICK_REPLY_CHARACTERS, InputContext, LocalMessage, LoopState,
     Receipt, Role, SUBAGENT_TOOL_NAME, SavedChat, ToolResult, UserShellRecord, UserShellState,
@@ -65,7 +65,7 @@ impl PlanApprovalChoice {
 
 pub(super) enum Workflow {
     Chats {
-        choices: Vec<tickloop_harness_protocol::ChatId>,
+        choices: Vec<tickloop_harness::protocol::ChatId>,
         as_new_chat: bool,
     },
     Commands {
@@ -270,7 +270,7 @@ impl Workflow {
             .permissions
             .iter()
             .find(|request| {
-                request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME
+                request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME
                     && request.loop_id == chat_loop
             })
             .map(|request| request.id);
@@ -652,7 +652,7 @@ pub(super) fn chat_title(chat: &ChatSnapshot) -> String {
     if let Some(name) = chat.branch_name() {
         return single_line(name);
     }
-    single_line(&tickloop_harness_protocol::chat_display_title(
+    single_line(&tickloop_harness::protocol::chat_display_title(
         chat,
         &chat.user_shells,
     ))
@@ -1060,7 +1060,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             .copied()
             .filter(|input| {
                 super::consumed_input_text(chat, (*input).into()).is_some()
-                    || matches!(chat.trigger_origins.get(input), Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. }))
+                    || matches!(chat.trigger_origins.get(input), Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. }))
             })
             .map(|input| input.uuid())
             .chain(
@@ -1086,7 +1086,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
 }
 
 /// A Tick Update delivery: the Chat shows its lit-tick lines, never the payload the model reads.
-fn is_tick_delivery(message: &tickloop_harness_protocol::Message) -> bool {
+fn is_tick_delivery(message: &tickloop_harness::protocol::Message) -> bool {
     message.role == Role::User
         && message.content.iter().any(|content| match content {
             Content::Text { text } => {
@@ -1101,7 +1101,7 @@ fn is_tick_delivery(message: &tickloop_harness_protocol::Message) -> bool {
 
 /// A quiet answer to a delivery: one short piece of text and no tool call, so it folds into one
 /// muted line instead of a full reply block.
-fn is_folded_tick_reply(message: &tickloop_harness_protocol::Message) -> bool {
+fn is_folded_tick_reply(message: &tickloop_harness::protocol::Message) -> bool {
     message.role == Role::Assistant
         && message.content.iter().all(|content| match content {
             Content::Text { text } => text.chars().count() <= FOLDED_TICK_REPLY_CHARACTERS,
@@ -1155,7 +1155,7 @@ fn append_public_message(
     tool_calls: &mut HashMap<(Uuid, Option<Uuid>, String), (String, serde_json::Value)>,
     source: &BranchPublicSource,
     contexts: &[InputContext],
-    message: &tickloop_harness_protocol::Message,
+    message: &tickloop_harness::protocol::Message,
     display: DisplayProfile,
     folded: bool,
 ) {
@@ -1165,7 +1165,7 @@ fn append_public_message(
         .flatten();
     if matches!(
         trigger,
-        Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. })
+        Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. })
     ) {
         history.push_runs(&super::goal_view::continuation_runs());
         return;
@@ -1314,7 +1314,7 @@ fn append_public_message(
                     is_error: *is_error,
                     output_ref: None,
                 };
-                if name == tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME {
+                if name == tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME {
                     if let Some((heading, response)) = presentation::question_result_runs(
                         input,
                         &result,
@@ -1352,7 +1352,7 @@ fn append_public_message(
                 }
                 let facts = presentation::CallFacts {
                     review: run_id
-                        .filter(|_| name == tickloop_harness_tools::EDIT_TOOL_NAME && !*is_error)
+                        .filter(|_| name == tickloop_harness::tools::EDIT_TOOL_NAME && !*is_error)
                         .and_then(|run| {
                             presentation::file_change_review(history.chat, run.into(), tool_use_id)
                         }),
@@ -1421,15 +1421,18 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
     use std::sync::Arc;
-    use tickloop_harness_protocol::{BranchRequest, CompactionMarker, Event, SummaryDirection};
-    use tickloop_harness_protocol::{Decision, PermissionRule};
-    use tickloop_harness_protocol::{InputModality, Message, ModelConfig, Protocol};
+    use tickloop_harness::protocol::{BranchRequest, CompactionMarker, Event, SummaryDirection};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{InputModality, Message, ModelConfig, Protocol};
 
     async fn completed(
-        events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+        events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
     ) {
         loop {
-            match tickloop_harness_test_support::next_event(events).await.kind {
+            match tickloop_harness::test_support::next_event(events)
+                .await
+                .kind
+            {
                 EventKind::Completed { .. } => return,
                 EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
@@ -1440,26 +1443,26 @@ mod tests {
     #[tokio::test]
     async fn retained_history_keeps_completion_notices_out_of_permanent_content() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::with_usages(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::with_usages(
             vec![
-                tickloop_harness_test_support::text("First report."),
-                tickloop_harness_test_support::text("Second report."),
+                tickloop_harness::test_support::text("First report."),
+                tickloop_harness::test_support::text("Second report."),
             ],
             vec![
-                tickloop_harness_protocol::Usage {
+                tickloop_harness::protocol::Usage {
                     input_tokens: Some(31),
                     output_tokens: Some(7),
                     ..Default::default()
                 },
-                tickloop_harness_protocol::Usage {
+                tickloop_harness::protocol::Usage {
                     input_tokens: Some(117),
                     output_tokens: Some(29),
                     ..Default::default()
                 },
             ],
         ));
-        let agent = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+        let agent = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
             model,
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -1660,8 +1663,8 @@ mod tests {
             "id": Uuid::from_u128(500),
             "folder": "/workspace",
             "model": ModelConfig {
-                provider: tickloop_harness_protocol::ModelProvider::Api,
-                auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
+                provider: tickloop_harness::protocol::ModelProvider::Api,
+                auth_source: tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv,
                 name: "fixture".into(),
                 protocol: Protocol::Messages,
                 base_url: "https://example.invalid".into(),
@@ -1697,7 +1700,7 @@ mod tests {
     fn summary_marker(direction: Option<SummaryDirection>) -> CompactionMarker {
         CompactionMarker::Summary {
             summarize_metadata: direction.map(|direction| {
-                tickloop_harness_protocol::SummarizeMetadata {
+                tickloop_harness::protocol::SummarizeMetadata {
                     messages_summarized: 6,
                     user_context: None,
                     direction,
@@ -1729,7 +1732,7 @@ mod tests {
             "id": Uuid::from_u128(701),
             "folder": "/workspace",
             "messages": [
-                user_text(&tickloop_harness_protocol::local_messages::tick_delivery(&payload)),
+                user_text(&tickloop_harness::protocol::local_messages::tick_delivery(&payload)),
                 Message {
                     role: Role::Assistant,
                     content: vec![Content::Text { text: reply.into() }],
@@ -1832,7 +1835,7 @@ mod tests {
             .store(
                 chat,
                 1,
-                &tickloop_harness_base::image::prepare(&png).unwrap(),
+                &tickloop_harness::base::image::prepare(&png).unwrap(),
             )
             .unwrap();
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
@@ -1939,17 +1942,17 @@ mod tests {
         )
         .unwrap();
         std::fs::write(directory.path().join("chart.png"), &bytes).unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "read-chart",
                 "Read",
                 json!({"file_path": directory.path().join("chart.png")}),
             ),
-            tickloop_harness_test_support::text("A chart."),
+            tickloop_harness::test_support::text("A chart."),
         ]));
         let agent = Agent::open_embedded(
             directory.path().join("state"),
-            tickloop_harness_test_support::config(),
+            tickloop_harness::test_support::config(),
             model,
         )
         .unwrap();
@@ -1963,7 +1966,7 @@ mod tests {
         let detailed = super::presentation::ToolPresentation::new(true);
         let mut rendered = Vec::new();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             compact.record(&event);
             if matches!(event.kind, EventKind::ToolCompleted { .. }) {
                 rendered.extend(compact.render_event(&event));
@@ -2118,7 +2121,7 @@ mod tests {
     #[tokio::test]
     async fn choosing_history_does_not_resume_work() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
             vec![
                 Content::Thinking {
                     thinking: "private thought".into(),
@@ -2131,7 +2134,7 @@ mod tests {
         ]));
         let agent = Agent::open_embedded(
             directory.path().join("state"),
-            tickloop_harness_test_support::config(),
+            tickloop_harness::test_support::config(),
             model.clone(),
         )
         .unwrap();
@@ -2251,15 +2254,15 @@ mod tests {
     #[tokio::test]
     async fn shell_tasks_keep_user_and_agent_controls_separate() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "agent-shell",
                 "Bash",
                 json!({"command":"sleep 30","run_in_background":true}),
             ),
-            tickloop_harness_test_support::text("Agent task is running in the background."),
+            tickloop_harness::test_support::text("Agent task is running in the background."),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::AcceptEdits)
@@ -2286,7 +2289,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut agent_events)
+            match tickloop_harness::test_support::next_event(&mut agent_events)
                 .await
                 .kind
             {
@@ -2449,12 +2452,12 @@ mod tests {
     #[tokio::test]
     async fn plan_selection_approves_only_reviewed_version_then_continues_same_run() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("p1", "Read notes first."),
-            tickloop_harness_test_support::submit_plan("p2", "Read notes and summarize."),
-            tickloop_harness_test_support::text("Approved implementation finished."),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("p1", "Read notes first."),
+            tickloop_harness::test_support::submit_plan("p2", "Read notes and summarize."),
+            tickloop_harness::test_support::text("Approved implementation finished."),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Plan)
@@ -2463,12 +2466,15 @@ mod tests {
         let mut events = agent.subscribe();
         let run = agent.submit(chat, "Prepare a plan.".into()).await.unwrap();
         async fn approval(
-            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
         ) {
             loop {
-                match tickloop_harness_test_support::next_event(events).await.kind {
+                match tickloop_harness::test_support::next_event(events)
+                    .await
+                    .kind
+                {
                     EventKind::PermissionRequested { request }
-                        if request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME =>
+                        if request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME =>
                     {
                         return;
                     }
@@ -2531,12 +2537,15 @@ mod tests {
     async fn chat_picker_lists_recent_chats_with_titles_and_branch_sources() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("source answer"),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("source answer"),
         ]));
-        let agent =
-            Agent::open_embedded(root.clone(), tickloop_harness_test_support::config(), model)
-                .unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            tickloop_harness::test_support::config(),
+            model,
+        )
+        .unwrap();
         let source = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(source, "source prompt".into()).await.unwrap();
@@ -2555,7 +2564,7 @@ mod tests {
         for (chat, age_seconds) in [(source, 7_200), (child.into(), 60)] {
             std::fs::File::options()
                 .write(true)
-                .open(tickloop_harness_test_support::transcript_file(&root, chat))
+                .open(tickloop_harness::test_support::transcript_file(&root, chat))
                 .unwrap()
                 .set_modified(now - std::time::Duration::from_secs(age_seconds))
                 .unwrap();
@@ -2602,7 +2611,7 @@ mod tests {
             matches!(workflow, Workflow::Chats { choices, as_new_chat: true } if choices == vec![source])
         );
 
-        std::fs::remove_file(tickloop_harness_test_support::transcript_file(
+        std::fs::remove_file(tickloop_harness::test_support::transcript_file(
             &root, source,
         ))
         .unwrap();

@@ -12,7 +12,7 @@ use tickloop_code_client::{
     LocalAgentClient,
     frame::{read_frame, write_frame},
 };
-use tickloop_harness_protocol::LoopState;
+use tickloop_harness::protocol::LoopState;
 
 use tickloop_code_access::test_support::TRANSPORT_LIMITS;
 

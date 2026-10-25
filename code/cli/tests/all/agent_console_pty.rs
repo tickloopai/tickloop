@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use crate::support;
-use tickloop_harness_test_support::model_http_support;
-use tickloop_harness_test_support::screen::SELECTED_MARK;
+use tickloop_harness::test_support::model_http_support;
+use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 mod artifact_attachment;
 mod auto_review;
@@ -42,9 +42,9 @@ use tickloop_code_access::{
     ObservationRequest, ObservationValue, Page, PendingRequestKind, RequestRef, TaskOrigin,
     TaskRef, UserInput,
 };
-use tickloop_harness_protocol::UserShellState;
+use tickloop_harness::protocol::UserShellState;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const STARTUP_BANNER_TITLE: &str = concat!("Tickloop v", env!("CARGO_PKG_VERSION"));
 const TERMINAL_WIDTH: usize = 100;
@@ -78,7 +78,7 @@ impl PrivateFixture {
             )
             .unwrap();
         }
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
         std::fs::write(
             directory.path().join("model.json"),
@@ -115,17 +115,17 @@ impl PrivateFixture {
         }
     }
 
-    fn set_model(&self, model: &tickloop_harness_protocol::ModelConfig) {
+    fn set_model(&self, model: &tickloop_harness::protocol::ModelConfig) {
         std::fs::write(self.path("model.json"), serde_json::to_vec(model).unwrap()).unwrap();
     }
 
-    fn set_chat_model(&self, base_url: &str) -> tickloop_harness_protocol::ModelConfig {
-        let mut model = tickloop_harness_test_support::config();
-        model.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    fn set_chat_model(&self, base_url: &str) -> tickloop_harness::protocol::ModelConfig {
+        let mut model = tickloop_harness::test_support::config();
+        model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
         model.base_url = base_url.trim_end_matches("/anthropic").into();
         model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
         self.set_model(&model);
-        tickloop_harness_model::cards::ModelCatalog::defaults()
+        tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap()
     }
@@ -668,7 +668,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
                 );
                 assert!(snapshot.events.iter().all(|event| !matches!(
                     event.kind,
-                    tickloop_harness_protocol::EventKind::Started
+                    tickloop_harness::protocol::EventKind::Started
                 )));
                 break shell.id;
             }
@@ -916,8 +916,8 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
         }))), "")),
         (200, chat_reply(None, "original execution completed after reattach")),
     ]).await;
-    let mut model = tickloop_harness_test_support::config();
-    model.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    let mut model = tickloop_harness::test_support::config();
+    model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     fixture.set_model(&model);
@@ -938,8 +938,8 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     .await
     .expect("ordinary prompt must create the working Agent");
     let running = wait_snapshot(&client, execution, "original model work remains Running", |snapshot| {
-        snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Running
-            && snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness_protocol::EventKind::ToolStarted { name, .. } if name == "Bash"))
+        snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Running
+            && snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::ToolStarted { name, .. } if name == "Bash"))
     }).await;
     let loop_id = running.conversation.chat_loop.id;
     let run_id = running.conversation.chat_loop.run_id;
@@ -955,7 +955,7 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     let detached = snapshot(&client, execution).await;
     assert_eq!(
         detached.conversation.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     assert_eq!(detached.conversation.chat_loop.id, loop_id);
     assert_eq!(detached.conversation.chat_loop.run_id, run_id);
@@ -1002,7 +1002,7 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
         execution,
         "original run completes after reattach",
         |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         },
     )
     .await;
@@ -1534,13 +1534,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
         ),
         chat_reply(
             None,
-            &tickloop_harness_test_support::auto_classification(false).to_string(),
+            &tickloop_harness::test_support::auto_classification(false).to_string(),
         ),
         chat_reply(
             Some((
                 "AskUserQuestion",
                 "question-first",
-                tickloop_harness_test_support::single_question("Which bounded cadence?"),
+                tickloop_harness::test_support::single_question("Which bounded cadence?"),
             )),
             RAW_CHILD_CONTENT,
         ),
@@ -1548,7 +1548,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
             Some((
                 "AskUserQuestion",
                 "question-second",
-                tickloop_harness_test_support::single_question("Which second window?"),
+                tickloop_harness::test_support::single_question("Which second window?"),
             )),
             "",
         ),
@@ -1562,7 +1562,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         ),
         chat_reply(
             None,
-            &tickloop_harness_test_support::auto_classification(false).to_string(),
+            &tickloop_harness::test_support::auto_classification(false).to_string(),
         ),
         chat_reply(None, "parent delegated result received"),
         chat_reply(
@@ -1575,7 +1575,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         ),
         chat_reply(
             None,
-            &tickloop_harness_test_support::auto_classification(false).to_string(),
+            &tickloop_harness::test_support::auto_classification(false).to_string(),
         ),
         chat_reply(None, "parent processed the follow-up report"),
     ];
@@ -1587,8 +1587,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     let finish_parent = releases.pop().unwrap();
     let show_child_question = releases.pop().unwrap();
-    let mut model = tickloop_harness_test_support::config();
-    model.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    let mut model = tickloop_harness::test_support::config();
+    model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     fixture.set_model(&model);
@@ -1800,7 +1800,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     );
     assert_eq!(
         snapshot(&client, parent).await.conversation.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     second
         .wait_for("same real request in second View", |frame| {
@@ -1816,7 +1816,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
                     execution: parent,
                     ..question
                 },
-                answers: vec![tickloop_harness_protocol::QuestionAnswer::option("Weekly")],
+                answers: vec![tickloop_harness::protocol::QuestionAnswer::option("Weekly")],
             },
         })
         .await
@@ -1865,9 +1865,9 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent,
         "parent waits on its model response after receiving the child result",
         |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Running
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Running
                 && snapshot.events.iter().any(|event| matches!(&event.kind,
-                    tickloop_harness_protocol::EventKind::ToolCompleted { call_id, .. } if call_id == "delegate-cli"))
+                    tickloop_harness::protocol::EventKind::ToolCompleted { call_id, .. } if call_id == "delegate-cli"))
         },
     )
     .await;
@@ -1979,7 +1979,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         )
         .await;
     first.send(format!("{FOLLOW_UP}\r").as_bytes());
-    let followed = wait_snapshot(&client, child, "original child Loop follow-up", |snapshot| snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness_protocol::EventKind::Text(text) if text.contains("child follow-up acknowledged")))).await;
+    let followed = wait_snapshot(&client, child, "original child Loop follow-up", |snapshot| snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains("child follow-up acknowledged")))).await;
     assert_eq!(followed.conversation.chat_loop.id, child_loop);
     assert_eq!(
         serde_json::to_value(followed.conversation.delegation.as_ref().unwrap()).unwrap(),
@@ -2002,7 +2002,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     );
     assert_eq!(
         parent_after_follow_up.conversation.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     assert_eq!(
         parent_after_follow_up.conversation.chat_loop.id,
@@ -2022,15 +2022,15 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent,
         "parent processes the delivered follow-up report",
         |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
                 && snapshot.events.iter().any(|event| matches!(&event.kind,
-                    tickloop_harness_protocol::EventKind::Text(text) if text.contains("parent processed the follow-up report")))
+                    tickloop_harness::protocol::EventKind::Text(text) if text.contains("parent processed the follow-up report")))
         },
     )
     .await;
     assert_eq!(parent_done.conversation.chat_loop.id, parent_loop);
     assert_ne!(parent_done.conversation.chat_loop.run_id, parent_run);
-    assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_harness_protocol::EventKind::Text(text) if text.contains("parent delegated result received"))));
+    assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains("parent delegated result received"))));
     let shared_fact = second
         .wait_for("shared child fact keeps the second View draft", |frame| {
             frame.contains("child follow-up acknowledged") && frame.contains("CHILD-DRAFT-TWO")
@@ -2050,7 +2050,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
                 provider: None,
                 execution: parent,
                 change: ConfigurationChange::ExecutionMode {
-                    mode: tickloop_harness_protocol::ExecutionMode::AcceptEdits,
+                    mode: tickloop_harness::protocol::ExecutionMode::AcceptEdits,
                 },
             },
         })
@@ -2072,7 +2072,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     .await;
     assert!(matches!(
         waiting.permissions[0].execution,
-        tickloop_harness_protocol::PermissionExecution::UserShell { .. }
+        tickloop_harness::protocol::PermissionExecution::UserShell { .. }
     ));
     assert!(waiting.user_shells.iter().all(|shell| shell.pid.is_none()));
     first.send(b"\r");
@@ -2084,7 +2084,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
             snapshot
                 .user_shells
                 .iter()
-                .any(|shell| shell.state == tickloop_harness_protocol::UserShellState::Completed)
+                .any(|shell| shell.state == tickloop_harness::protocol::UserShellState::Completed)
         },
     )
     .await;
@@ -2175,8 +2175,8 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         }))), &history)),
         (200, chat_reply(None, "A final output after switching away")),
     ]).await;
-    let mut model = tickloop_harness_test_support::config();
-    model.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    let mut model = tickloop_harness::test_support::config();
+    model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     fixture.set_model(&model);
@@ -2193,10 +2193,10 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     let first_running = snapshot(&client, first).await;
     assert_eq!(
         first_running.conversation.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     assert!(first_running.events.iter().any(|event| matches!(
-        &event.kind, tickloop_harness_protocol::EventKind::Text(text) if text.contains("stable history 00")
+        &event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains("stable history 00")
     )));
     let other_project = fixture.path("reading-project");
     std::fs::create_dir(&other_project).unwrap();
@@ -2320,7 +2320,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         first,
         "first Agent completes while another is visible",
         |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         },
     )
     .await;
@@ -2333,7 +2333,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         first_running.conversation.chat_loop.run_id
     );
     assert!(completed.events.iter().any(|event| matches!(&event.kind,
-        tickloop_harness_protocol::EventKind::Text(text) if text.contains("A final output after switching away"))));
+        tickloop_harness::protocol::EventKind::Text(text) if text.contains("A final output after switching away"))));
     assert!(!view.frame().contains("A final output after switching away"));
     view.send(b"\x1b[D");
     view.wait_for("return overview has both independent roots", |frame| {
@@ -2697,10 +2697,10 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
     })
     .await;
     let completed = wait_snapshot(&client, first, "restored image completes on its original Agent", |snapshot| {
-        snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+        snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
             && snapshot.events.iter().any(|event| matches!(
                 &event.kind,
-                tickloop_harness_protocol::EventKind::Text(text) if text.contains("restored image received")
+                tickloop_harness::protocol::EventKind::Text(text) if text.contains("restored image received")
             ))
     })
     .await;
@@ -3519,7 +3519,7 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
     view.wait_for("dense View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     let project = fixture.path("work").canonicalize().unwrap();
     let create = |initial: Option<UserInput>| {
@@ -3771,7 +3771,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
         .wait_for("daemon View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     let project = fixture.path("work").canonicalize().unwrap();
     let create = |initial: Option<UserInput>| {
@@ -3819,7 +3819,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
             if rows.len() == 20
                 && rows
                     .iter()
-                    .filter(|row| row.state == tickloop_harness_protocol::LoopState::Idle)
+                    .filter(|row| row.state == tickloop_harness::protocol::LoopState::Idle)
                     .count()
                     == 20
             {
@@ -4351,7 +4351,7 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
                         event.run_id == queued_receipts[0].run_id
                             && matches!(
                                 event.kind,
-                                tickloop_harness_protocol::EventKind::Completed { .. }
+                                tickloop_harness::protocol::EventKind::Completed { .. }
                             )
                     })
             },
@@ -4360,7 +4360,7 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
         let started = completed
             .events
             .iter()
-            .filter(|event| matches!(event.kind, tickloop_harness_protocol::EventKind::Started))
+            .filter(|event| matches!(event.kind, tickloop_harness::protocol::EventKind::Started))
             .map(|event| event.run_id)
             .collect::<Vec<_>>();
         assert_eq!(started.len(), 2, "initial run plus one waiting batch");
@@ -4369,7 +4369,7 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
             .events
             .iter()
             .filter_map(|event| match event.kind {
-                tickloop_harness_protocol::EventKind::InputMerged { into_run_id } => {
+                tickloop_harness::protocol::EventKind::InputMerged { into_run_id } => {
                     Some((event.run_id, into_run_id))
                 }
                 _ => None,
@@ -4535,7 +4535,7 @@ async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
             .unwrap();
     }
     wait_snapshot(&client,execution,"the Skill is actually consumed",|snapshot| {
-        snapshot.pending_commands.is_empty() && snapshot.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content,tickloop_harness_protocol::Content::Text {text} if text=="/tickloop busy skill")))
+        snapshot.pending_commands.is_empty() && snapshot.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content,tickloop_harness::protocol::Content::Text {text} if text=="/tickloop busy skill")))
     }).await;
     let consumed = view
         .wait_for("the consumed Skill is echoed before its reply", |frame| {

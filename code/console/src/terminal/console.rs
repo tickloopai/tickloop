@@ -18,7 +18,7 @@ use crossterm::terminal::{self, Clear, ClearType, ScrollUp};
 use crossterm::{execute, queue};
 use tickloop_code_settings::DisplayPreferences;
 use tickloop_code_updater::UpdateNotice;
-use tickloop_harness_tools::file_change::FileChangeReview;
+use tickloop_harness::tools::file_change::FileChangeReview;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -236,7 +236,7 @@ impl TerminalSurface {
 #[cfg(test)]
 use super::monitor::MonitorEntry;
 use tickloop_code_access::ExecutionRef;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind, TaskBoard,
     TickSubscriptionStatus,
 };
@@ -665,7 +665,7 @@ impl ArtifactMetadataSink {
         &self,
         chat: Uuid,
         id: String,
-        metadata: Option<tickloop_harness_artifacts::ArtifactMetadata>,
+        metadata: Option<tickloop_harness::artifacts::ArtifactMetadata>,
     ) {
         let Some(state) = self.state.upgrade() else {
             return;
@@ -716,7 +716,7 @@ struct Lifetime {
 /// A hosted Tick of `chat` waiting to take the terminal.
 struct FullScreenAttach {
     chat: Uuid,
-    grant: tickloop_harness_protocol::HostedViewGrant,
+    grant: tickloop_harness::protocol::HostedViewGrant,
 }
 
 pub(super) struct State {
@@ -761,7 +761,7 @@ pub(super) struct State {
     prompt_enabled: bool,
     prompt_suggestion_enabled: bool,
     /// The execution modes Shift+Tab visits, from the user's `shiftTabModes` setting.
-    shift_tab_modes: Vec<tickloop_harness_protocol::ExecutionMode>,
+    shift_tab_modes: Vec<tickloop_harness::protocol::ExecutionMode>,
     prompt_suggestion: Option<String>,
     prompt_suggestion_request: Option<super::prompt_suggestion::SuggestionRequest>,
     foreground_shell: bool,
@@ -913,7 +913,7 @@ pub(super) struct State {
     status: String,
     provider_failure: Option<String>,
     provider_failures:
-        HashMap<Uuid, HashMap<String, tickloop_harness_protocol::ProviderHttpFailure>>,
+        HashMap<Uuid, HashMap<String, tickloop_harness::protocol::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     update_notice: Option<UpdateNotice>,
@@ -1482,7 +1482,7 @@ impl Console {
         request: &super::artifacts_picker::ArtifactLoad,
         result: Result<
             (
-                tickloop_harness_artifacts::ArtifactPage,
+                tickloop_harness::artifacts::ArtifactPage,
                 HashSet<String>,
                 bool,
             ),
@@ -1545,7 +1545,7 @@ impl Console {
 
     pub(super) fn update_monitor_chat(
         &self,
-        status: impl Into<Arc<tickloop_harness_protocol::ChatStatus>>,
+        status: impl Into<Arc<tickloop_harness::protocol::ChatStatus>>,
     ) -> Result<(), String> {
         let status = status.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -1559,7 +1559,7 @@ impl Console {
     /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
     pub(super) fn refresh_monitor_ticks(
         &self,
-        shells: tickloop_harness_protocol::ShellTaskSnapshot,
+        shells: tickloop_harness::protocol::ShellTaskSnapshot,
         subscriptions: Option<Vec<TickSubscriptionStatus>>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -1575,7 +1575,7 @@ impl Console {
                     .monitor
                     .entry_flash_role(
                         state.display,
-                        tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                        tickloop_harness::base::private_fs::unix_time_milliseconds(),
                     )
                     .is_none()
         {
@@ -1602,7 +1602,7 @@ impl Console {
         &self,
         chat: Uuid,
         id: String,
-        metadata: Option<tickloop_harness_artifacts::ArtifactMetadata>,
+        metadata: Option<tickloop_harness::artifacts::ArtifactMetadata>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let monitor = state.monitor_for_chat_mut(chat);
@@ -1706,7 +1706,7 @@ impl Console {
     pub(super) fn update_monitor_membership(
         &self,
         chat: Uuid,
-        membership: tickloop_harness_protocol::MonitorMembership,
+        membership: tickloop_harness::protocol::MonitorMembership,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_for_chat_mut(chat).set_membership(membership);
@@ -1802,7 +1802,7 @@ impl Console {
     pub(super) fn begin_full_screen_attach(
         &self,
         chat: Uuid,
-        grant: tickloop_harness_protocol::HostedViewGrant,
+        grant: tickloop_harness::protocol::HostedViewGrant,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.chat != Some(chat) || !state.interactive {
@@ -2167,7 +2167,7 @@ impl Console {
     /// commands act on a child.
     pub(super) fn shift_tab_modes(
         &self,
-    ) -> Result<Vec<tickloop_harness_protocol::ExecutionMode>, String> {
+    ) -> Result<Vec<tickloop_harness::protocol::ExecutionMode>, String> {
         Ok(self
             .state
             .lock()
@@ -2178,7 +2178,7 @@ impl Console {
 
     pub(super) fn set_shift_tab_modes(
         &self,
-        modes: Vec<tickloop_harness_protocol::ExecutionMode>,
+        modes: Vec<tickloop_harness::protocol::ExecutionMode>,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -2444,7 +2444,7 @@ impl Console {
     pub(super) fn set_provider_failures(
         &self,
         chat: Uuid,
-        failures: &HashMap<String, tickloop_harness_protocol::ProviderHttpFailure>,
+        failures: &HashMap<String, tickloop_harness::protocol::ProviderHttpFailure>,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -2478,7 +2478,7 @@ impl Console {
     /// Shows the execution mode a change just confirmed without reading the Agent again.
     pub(super) fn show_execution_mode(
         &self,
-        mode: tickloop_harness_protocol::ExecutionMode,
+        mode: tickloop_harness::protocol::ExecutionMode,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.status_area.set_mode(mode.to_string()) {
@@ -2943,7 +2943,7 @@ impl Console {
     pub(super) fn show_permissions(
         &self,
         view: impl Into<PermissionsPage>,
-        history: Result<tickloop_harness_protocol::ApprovalHistoryView, String>,
+        history: Result<tickloop_harness::protocol::ApprovalHistoryView, String>,
         return_to_settings: bool,
         auto_page: bool,
     ) -> Result<(), String> {
@@ -2960,7 +2960,7 @@ impl Console {
     fn show_permissions_at(
         &self,
         view: impl Into<PermissionsPage>,
-        history: Option<Result<tickloop_harness_protocol::ApprovalHistoryView, String>>,
+        history: Option<Result<tickloop_harness::protocol::ApprovalHistoryView, String>>,
         destination: PermissionsReturn,
         auto_page: bool,
     ) -> Result<(), String> {
@@ -3040,7 +3040,7 @@ impl Console {
         &self,
         chat: Uuid,
         generation: Uuid,
-        result: Result<tickloop_harness_protocol::AutoEnvironmentDraft, String>,
+        result: Result<tickloop_harness::protocol::AutoEnvironmentDraft, String>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if let Some(surface) = state
@@ -3147,7 +3147,7 @@ impl Console {
     pub(super) fn permissions_denials(
         &self,
         chat: Uuid,
-        view: Result<tickloop_harness_protocol::ApprovalHistoryView, String>,
+        view: Result<tickloop_harness::protocol::ApprovalHistoryView, String>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let surface = state
@@ -3489,7 +3489,7 @@ impl Console {
     pub(super) fn write_model_retry(
         &self,
         run_id: Uuid,
-        kind: tickloop_harness_protocol::ModelRequestKind,
+        kind: tickloop_harness::protocol::ModelRequestKind,
         attempt: usize,
         spans: &[(String, Option<Role>)],
     ) -> Result<(), String> {
@@ -3829,19 +3829,19 @@ impl Console {
 
     pub(super) fn record_local_deliveries(
         &self,
-        snapshot: &tickloop_harness_protocol::ChatSnapshot,
+        snapshot: &tickloop_harness::protocol::ChatSnapshot,
         input: Uuid,
-        messages: &[tickloop_harness_protocol::LocalMessage],
+        messages: &[tickloop_harness::protocol::LocalMessage],
     ) -> Result<(), String> {
         let display = self.display_profile()?;
         let names = super::tick_labels::TickLabels::from_snapshot(snapshot);
         let mut labels = Vec::new();
         let mut instances = Vec::new();
-        let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         for message in messages.iter().cloned() {
             let message = super::presentation::name_local_ticks(message, &names);
             match &message {
-                tickloop_harness_protocol::LocalMessage::TickDelivery { items } => {
+                tickloop_harness::protocol::LocalMessage::TickDelivery { items } => {
                     for item in items {
                         instances.push(item.instance.clone());
                         let flash = Some((super::list_row::RowFlash::TakeIn, now_ms));
@@ -3855,7 +3855,7 @@ impl Console {
                         ));
                     }
                 }
-                tickloop_harness_protocol::LocalMessage::ArtifactRequest {
+                tickloop_harness::protocol::LocalMessage::ArtifactRequest {
                     artifact_id, ..
                 } => {
                     instances.extend(names.artifact_instance(artifact_id));
@@ -3923,11 +3923,11 @@ impl Console {
 
     pub(super) fn write_shell_notification(
         &self,
-        notification: &tickloop_harness_protocol::TaskNotification,
+        notification: &tickloop_harness::protocol::TaskNotification,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let runs = super::task_notification_line(notification, state.display);
-        let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         state.monitor.flash_received(
             tick_protocol::InstanceRef::shell(notification.task_id),
             now_ms,
@@ -3948,7 +3948,7 @@ impl Console {
         instance: tick_protocol::InstanceRef,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         state.scrollback.flash_tool_call(call_key, now_ms);
         state.monitor.flash_use(instance, now_ms);
         state
@@ -3958,7 +3958,7 @@ impl Console {
 
     pub(super) fn flash_trigger_input(
         &self,
-        snapshot: &tickloop_harness_protocol::ChatSnapshot,
+        snapshot: &tickloop_harness::protocol::ChatSnapshot,
         input: Uuid,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -3967,7 +3967,7 @@ impl Console {
         {
             state.monitor.flash_trigger(
                 source,
-                tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                tickloop_harness::base::private_fs::unix_time_milliseconds(),
             );
         }
         Ok(())
@@ -5713,7 +5713,7 @@ impl State {
         self.switch_editor_chat(chat);
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
-        let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         self.monitor.settle_flashes(now_ms);
         if let Some(chat) = chat {
             self.auto_reveal_monitor(chat);
@@ -6855,7 +6855,7 @@ impl State {
         }
         if self.monitor_side_columns().is_none() {
             self.monitor.entry_flash_at_ms =
-                Some(tickloop_harness_base::private_fs::unix_time_milliseconds());
+                Some(tickloop_harness::base::private_fs::unix_time_milliseconds());
         } else {
             self.monitor.auto_shown = true;
         }
@@ -6876,7 +6876,7 @@ impl State {
                 width,
                 height,
                 self.display,
-                tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                tickloop_harness::base::private_fs::unix_time_milliseconds(),
             )
         };
         (width, height)
@@ -6987,7 +6987,7 @@ impl State {
         self.monitor_separator = None;
         self.content_viewport = None;
         self.row_clock_at =
-            self.next_row_clock(tickloop_harness_base::private_fs::unix_time_milliseconds());
+            self.next_row_clock(tickloop_harness::base::private_fs::unix_time_milliseconds());
         if self.full_review {
             let lines = self.full_review_frame();
             let rows = lines
@@ -7112,7 +7112,7 @@ impl State {
             self.display.preferences().prefers_reduced_motion,
         );
         self.row_clock_at =
-            self.next_row_clock(tickloop_harness_base::private_fs::unix_time_milliseconds());
+            self.next_row_clock(tickloop_harness::base::private_fs::unix_time_milliseconds());
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         // As in Claude Code, a conversation shorter than the screen starts at the top, and the
@@ -7130,7 +7130,7 @@ impl State {
         };
         let side_columns = self.monitor_columns();
         let monitor_lines = self.monitor_visible().then(|| {
-            let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+            let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
             let height = if self.monitor.overlay {
                 start
             } else {
@@ -8651,7 +8651,7 @@ impl State {
                         .monitor
                         .entry_flash_role(
                             self.display,
-                            tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                            tickloop_harness::base::private_fs::unix_time_milliseconds(),
                         )
                         .is_some())
             {
@@ -8693,7 +8693,7 @@ impl State {
                         self.monitor
                             .entry_flash_role(
                                 self.display,
-                                tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                                tickloop_harness::base::private_fs::unix_time_milliseconds(),
                             )
                             .unwrap_or(Role::MutedText)
                     };
@@ -8965,7 +8965,7 @@ impl State {
                         self.update_notice.as_ref().unwrap(),
                         available,
                         self.display,
-                        tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                        tickloop_harness::base::private_fs::unix_time_milliseconds(),
                     );
                 }
                 if self.execution_connection_notice.is_some()
@@ -12099,7 +12099,7 @@ impl State {
                     let executor = if let Some(task) = self.monitor.selected_task() {
                         // p is offered only where it acts; elsewhere it does nothing.
                         if task.confirmation
-                            == Some(tickloop_harness_protocol::ScheduledTaskConfirmation::Pending)
+                            == Some(tickloop_harness::protocol::ScheduledTaskConfirmation::Pending)
                         {
                             return None;
                         }
@@ -13328,7 +13328,7 @@ fn read_keys(
             state.expire_shell_background_chord();
             let confirmation_expired = state.expire_key_confirmations();
             let rows_changed = state
-                .refresh_row_clocks(tickloop_harness_base::private_fs::unix_time_milliseconds());
+                .refresh_row_clocks(tickloop_harness::base::private_fs::unix_time_milliseconds());
             let hint_changed = state.refresh_foreground_command_hint(Instant::now());
             // Terminals report motion only when the pointer changes cell, so a drag held at an
             // edge keeps scrolling from here.
@@ -13923,13 +13923,15 @@ fn draft_keeps_context(draft: &str, context: &InputContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_protocol::{Decision, ExecutionMode, PermissionRule};
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{Decision, ExecutionMode, PermissionRule};
+    use tickloop_harness::protocol::{
         EventKind, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
         ShellTaskSnapshot, ShellTaskState, TextContext,
     };
-    use tickloop_harness_protocol::{FileChangeAction, FileVersion};
-    use tickloop_harness_tools::file_change::{FileChangeHunk, FileChangeLine, FileChangeLineKind};
+    use tickloop_harness::protocol::{FileChangeAction, FileVersion};
+    use tickloop_harness::tools::file_change::{
+        FileChangeHunk, FileChangeLine, FileChangeLineKind,
+    };
 
     use crate::terminal::branch_from_terminal;
     use crate::terminal::diff_catalog::{
@@ -13966,8 +13968,10 @@ mod tests {
     async fn a_delegated_agents_permissions_open_read_only_without_editing_hints_or_forms() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
@@ -14044,8 +14048,10 @@ mod tests {
     async fn a_permission_menu_suspends_the_permissions_draft_until_dismissed() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
@@ -14208,20 +14214,20 @@ mod tests {
             updated_at_ms: None,
             kind: None,
             id: Uuid::from_u128(u128::from(instance)),
-            loop_state: tickloop_harness_protocol::LoopState::Idle,
+            loop_state: tickloop_harness::protocol::LoopState::Idle,
             instance: tick_protocol::InstanceRef::new(
                 "calendar",
                 &format!("fixture-run-{instance}"),
             )
             .unwrap(),
-            frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+            frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
             accumulated: 0,
             has_pending_change: false,
             pending_since_ms: None,
             program_exit: None,
             last_delivery_ms: None,
             last_delivery: None,
-            link: tickloop_harness_protocol::TickLinkState::Live,
+            link: tickloop_harness::protocol::TickLinkState::Live,
             next_check_at_ms: None,
             period_ms: None,
         }
@@ -14289,7 +14295,7 @@ mod tests {
     }
 
     /// The last frame's rows as a terminal shows them, with the selection fill marked by the
-    /// test screen's [`SELECTED_MARK`](tickloop_harness_test_support::screen::SELECTED_MARK).
+    /// test screen's [`SELECTED_MARK`](tickloop_harness::test_support::screen::SELECTED_MARK).
     pub(super) fn selection_marked_screen(state: &State) -> Vec<String> {
         let output = state
             .rendered_rows
@@ -14297,7 +14303,7 @@ mod tests {
             .enumerate()
             .map(|(row, rendered)| format!("\x1b[{};1H{rendered}", row + 1))
             .collect::<String>();
-        tickloop_harness_test_support::screen::visible_screen_with_selection(
+        tickloop_harness::test_support::screen::visible_screen_with_selection(
             &output,
             state.width,
             state.rendered_rows.len().max(1),
@@ -16023,8 +16029,10 @@ mod tests {
     async fn summary_completion_before_branch_dispatch_preserves_later_failure_input() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let command = "/branch summary-finished-first";
@@ -16112,8 +16120,10 @@ mod tests {
     async fn terminal_pre_save_branch_errors_preserve_the_retryable_input() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let empty_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let command = "/branch @branch-context";
@@ -16164,15 +16174,15 @@ mod tests {
     #[tokio::test]
     async fn terminal_busy_branch_rejection_is_immediate_and_keeps_the_input() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("source answer"),
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("source answer"),
+            tickloop_harness::test_support::call(
                 "write",
                 "Write",
                 serde_json::json!({"file_path":"busy.txt","content":"pending"}),
             ),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_permission_rules(
@@ -16195,7 +16205,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -16209,7 +16219,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -16247,9 +16257,9 @@ mod tests {
     async fn terminal_summary_tracker_rejects_branch_after_runtime_becomes_quiescent() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-                tickloop_harness_test_support::text("source answer"),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+                tickloop_harness::test_support::text("source answer"),
             ])),
         );
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -16259,7 +16269,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -16297,9 +16307,9 @@ mod tests {
     async fn post_save_switch_failure_consumes_input_and_reports_the_durable_child() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-                tickloop_harness_test_support::text("source answer"),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+                tickloop_harness::test_support::text("source answer"),
             ])),
         );
         let source_chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -16309,7 +16319,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -16628,12 +16638,12 @@ mod tests {
     #[tokio::test]
     async fn the_question_dialog_answers_every_question_through_menu_keys() {
         use crate::terminal::menus::Menus;
-        use tickloop_harness_protocol::Content;
-        use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
+        use tickloop_harness::protocol::Content;
+        use tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME;
 
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "clarify",
                 ASK_USER_QUESTION_TOOL_NAME,
                 serde_json::json!({"questions":[
@@ -16648,9 +16658,9 @@ mod tests {
                     ]}
                 ]}),
             ),
-            tickloop_harness_test_support::text("Done."),
+            tickloop_harness::test_support::text("Done."),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -16659,7 +16669,7 @@ mod tests {
             .unwrap();
         let request = loop {
             if let EventKind::QuestionAsked { request } =
-                tickloop_harness_test_support::next_event(&mut events)
+                tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind
             {
@@ -16774,7 +16784,7 @@ mod tests {
         assert!(console.state.lock().unwrap().menu.is_none());
 
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -16806,14 +16816,14 @@ mod tests {
         use crate::terminal::menus::Menus;
         const TITLE: &str = "Review the shared plan";
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "shell",
                 "Bash",
                 serde_json::json!({"command": "printf checked"}),
             ),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let twin = agent.create_chat(directory.path().into()).await.unwrap();
         agent
@@ -16838,7 +16848,7 @@ mod tests {
 
             title: TITLE.into(),
             status: "Running".into(),
-            state: tickloop_harness_protocol::LoopState::Running,
+            state: tickloop_harness::protocol::LoopState::Running,
             project: "/work".into(),
             workspace: None,
             approvals: 0,
@@ -16868,7 +16878,7 @@ mod tests {
         agent.submit(chat, TITLE.into()).await.unwrap();
         let request = loop {
             if let EventKind::PermissionRequested { request } =
-                tickloop_harness_test_support::next_event(&mut events)
+                tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind
             {
@@ -16905,14 +16915,14 @@ mod tests {
     async fn a_permission_request_names_its_agent_without_a_loop_hash() {
         use crate::terminal::menus::Menus;
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "shell",
                 "Bash",
                 serde_json::json!({"command": "printf checked"}),
             ),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_permission_rules(
@@ -16938,7 +16948,7 @@ mod tests {
             .unwrap();
         let request = loop {
             if let EventKind::PermissionRequested { request } =
-                tickloop_harness_test_support::next_event(&mut events)
+                tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind
             {
@@ -16974,22 +16984,22 @@ mod tests {
     #[tokio::test]
     async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
-        use tickloop_harness_tools::ENTER_PLAN_MODE_TOOL_NAME;
+        use tickloop_harness::tools::ENTER_PLAN_MODE_TOOL_NAME;
 
         let directory = tempfile::tempdir().unwrap();
         let enter = |id| {
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 id,
                 ENTER_PLAN_MODE_TOOL_NAME,
                 serde_json::json!({}),
             )
         };
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
             enter("declined"),
             enter("accepted"),
-            tickloop_harness_test_support::text("Planning first."),
+            tickloop_harness::test_support::text("Planning first."),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
@@ -17004,11 +17014,13 @@ mod tests {
             console: &Console,
             menus: &mut Menus,
             chat: Uuid,
-            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
         ) -> Uuid {
             let request = loop {
                 if let EventKind::PermissionRequested { request } =
-                    tickloop_harness_test_support::next_event(events).await.kind
+                    tickloop_harness::test_support::next_event(events)
+                        .await
+                        .kind
                 {
                     break request;
                 }
@@ -17029,10 +17041,12 @@ mod tests {
             request.id
         }
         async fn finished(
-            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
         ) -> EventKind {
             loop {
-                let kind = tickloop_harness_test_support::next_event(events).await.kind;
+                let kind = tickloop_harness::test_support::next_event(events)
+                    .await
+                    .kind;
                 if matches!(kind, EventKind::Completed { .. } | EventKind::Interrupted) {
                     return kind;
                 }
@@ -17749,12 +17763,12 @@ mod tests {
     #[tokio::test]
     async fn stale_parent_choice_releases_gate_without_dismissing_replacement_menu() {
         use crate::terminal::menus::Menus;
-        use tickloop_harness_model::{LocalModelClients, ModelClients};
-        use tickloop_harness_protocol::{InputModality, ModelConfig, Protocol};
+        use tickloop_harness::model::{LocalModelClients, ModelClients};
+        use tickloop_harness::protocol::{InputModality, ModelConfig, Protocol};
 
         let config = ModelConfig {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
-            auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_harness::protocol::ModelProvider::Api,
+            auth_source: tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv,
             name: "menu gate fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -18673,7 +18687,7 @@ mod tests {
     }
 
     fn clipboard_image() -> Image {
-        tickloop_harness_base::image::prepare(&png_bytes()).unwrap()
+        tickloop_harness::base::image::prepare(&png_bytes()).unwrap()
     }
 
     fn state_with_clipboard(image: Option<Image>, remote: bool) -> State {
@@ -19805,7 +19819,7 @@ mod tests {
     /// them to the new screen.
     #[test]
     fn keyboard_flags_are_pushed_and_popped_on_the_screen_the_console_draws_on() {
-        use tickloop_harness_test_support::kitty_keyboard::{
+        use tickloop_harness::test_support::kitty_keyboard::{
             DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard,
         };
         for renderer in [Renderer::Fullscreen, Renderer::Inline] {
@@ -22108,12 +22122,12 @@ mod tests {
     #[tokio::test]
     async fn rewind_menu_transitions_keep_keyboard_focus_and_the_insert_draft() {
         use crate::terminal::menus::Menus;
-        use tickloop_harness_model::{LocalModelClients, ModelClients};
-        use tickloop_harness_protocol::ChatSnapshot;
-        use tickloop_harness_protocol::{InputModality, ModelConfig, Protocol};
+        use tickloop_harness::model::{LocalModelClients, ModelClients};
+        use tickloop_harness::protocol::ChatSnapshot;
+        use tickloop_harness::protocol::{InputModality, ModelConfig, Protocol};
         let config = ModelConfig {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
-            auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_harness::protocol::ModelProvider::Api,
+            auth_source: tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv,
             name: "focus fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -22137,7 +22151,7 @@ mod tests {
             "messages":[{"role":"user","content":[{"type":"text","text":"Recorded prompt"}]}],
             "operations":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"last_sequence":0,
             "message_ids":{"0":Uuid::new_v4()},
-            "prompt_execution_modes":{"0":tickloop_harness_protocol::ExecutionMode::AcceptEdits}
+            "prompt_execution_modes":{"0":tickloop_harness::protocol::ExecutionMode::AcceptEdits}
         }))
         .unwrap();
         let mut state = State::new(true, 100, 30);
@@ -22230,8 +22244,10 @@ mod tests {
         use crate::terminal::menus::Menus;
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut state = State::new(true, 100, 30);
@@ -22320,12 +22336,14 @@ mod tests {
     async fn shift_tab_modes_checklist_toggles_with_space_and_saves_with_enter() {
         use crate::terminal::menus::Menus;
         use tickloop_code_settings::UserSettings;
-        use tickloop_harness_protocol::ExecutionMode;
+        use tickloop_harness::protocol::ExecutionMode;
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let target = crate::terminal::ConfigTarget::Agent(chat);
@@ -22394,8 +22412,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let target = crate::terminal::ConfigTarget::Agent(chat);
@@ -22919,11 +22939,11 @@ mod tests {
             chat,
             HashMap::from([(
                 "deepseek-api".into(),
-                tickloop_harness_protocol::ProviderHttpFailure {
+                tickloop_harness::protocol::ProviderHttpFailure {
                     provider_id: "deepseek-api".into(),
                     provider_name: "DeepSeek".into(),
                     status: 403,
-                    class: tickloop_harness_protocol::ProviderFailureClass::UsageLimit,
+                    class: tickloop_harness::protocol::ProviderFailureClass::UsageLimit,
                     message: "Monthly limit".into(),
                     hint: "Check allowance".into(),
                     retry_after: None,

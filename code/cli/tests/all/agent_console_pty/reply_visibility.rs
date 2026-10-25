@@ -81,7 +81,7 @@ fn batch_reply() -> String {
 fn review_allow_reply() -> String {
     chat_reply(
         None,
-        &tickloop_harness_test_support::auto_classification(false).to_string(),
+        &tickloop_harness::test_support::auto_classification(false).to_string(),
     )
 }
 
@@ -702,7 +702,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         |snapshot| {
             snapshot.conversation.chat_loop.run_id != Some(interrupted_run)
                 && snapshot.conversation.chat_loop.state
-                    == tickloop_harness_protocol::LoopState::Idle
+                    == tickloop_harness::protocol::LoopState::Idle
                 && !snapshot
                     .events
                     .iter()

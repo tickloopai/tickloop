@@ -5,7 +5,7 @@ use std::{
 use uuid::Uuid;
 
 use serde_json::Value;
-use tickloop_harness_tools::{
+use tickloop_harness::tools::{
     ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EDIT_TOOL_NAME,
     READ_TOOL_NAME, TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
@@ -28,7 +28,7 @@ use super::{
     style::Role,
     transcript::{TranscriptDocument, TranscriptPiece},
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
     OperationRecord, PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME,
     SUBAGENT_TOOL_NAME, SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine,
@@ -408,7 +408,7 @@ pub(super) fn transcript_document(
                 writer.block_text("Pending wakeup cancelled\n", Some(Role::MutedText))
             }
             ConversationBlockKind::GoalContinuation => writer.block_text(
-                format!("{}\n", tickloop_harness_protocol::GOAL_CONTINUATION_EVENT),
+                format!("{}\n", tickloop_harness::protocol::GOAL_CONTINUATION_EVENT),
                 Some(Role::MutedText),
             ),
             ConversationBlockKind::Command { command } => {
@@ -1514,8 +1514,8 @@ pub(super) fn operation_review(operation: &OperationRecord) -> Option<FileChange
 }
 
 pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String), ToolCallState> {
-    use tickloop_harness_protocol::Content;
-    use tickloop_harness_protocol::{LoopState, OperationState};
+    use tickloop_harness::protocol::Content;
+    use tickloop_harness::protocol::{LoopState, OperationState};
     let chat_loop = &snapshot.chat_loop;
     let active_run = matches!(
         chat_loop.state,
@@ -2058,7 +2058,7 @@ pub(super) fn name_local_ticks(
 /// A finished `!` command as the conversation keeps it: the same local message the Agent records
 /// from its record and `output`.
 pub(super) fn user_shell_result(record: &UserShellRecord, output: &str) -> LocalMessage {
-    if record.reason.as_deref() == Some(tickloop_harness_tools::CANCELLED_COMMAND_REASON) {
+    if record.reason.as_deref() == Some(tickloop_harness::tools::CANCELLED_COMMAND_REASON) {
         return LocalMessage::Interrupted {
             during_tool_use: false,
         };
@@ -2498,7 +2498,7 @@ fn background_launch_id(content: &str) -> Option<Uuid> {
     if path.trim().is_empty() {
         return None;
     }
-    tickloop_harness_protocol::ShellTaskId::parse(id).map(|task| task.uuid())
+    tickloop_harness::protocol::ShellTaskId::parse(id).map(|task| task.uuid())
 }
 
 const GOAL_COMPLETION_REJECTION_PREFIX: &str = "The completion check did not accept the report, so the goal stays active. Its reason, to verify against the current state: ";
@@ -2912,11 +2912,11 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{
         CompactionMarker, Plan, Question, QuestionOption, QuestionRequest, SummarizeMetadata,
         SummaryDirection,
     };
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{
         FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileVersion,
         PreparedFileChange,
     };
@@ -2938,7 +2938,7 @@ mod tests {
     fn stream_pending_reply(snapshot: &mut ChatSnapshot, text: &str) {
         let loop_id = snapshot.chat_loop.id;
         let run_id = Uuid::new_v4();
-        snapshot.chat_loop.state = tickloop_harness_protocol::LoopState::Running;
+        snapshot.chat_loop.state = tickloop_harness::protocol::LoopState::Running;
         snapshot.chat_loop.run_id = Some(run_id.into());
         snapshot.last_sequence += 1;
         snapshot.events.push(Event {
@@ -3117,7 +3117,7 @@ mod tests {
                 request: PermissionRequest {
                     id: Uuid::new_v4(),
                     loop_id: Uuid::nil().into(),
-                    execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+                    execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                         run_id: run.into(),
                         call_id: "read-one".into(),
                     },
@@ -3229,7 +3229,7 @@ mod tests {
             .store(
                 chat,
                 1,
-                &tickloop_harness_base::image::prepare(&png).unwrap(),
+                &tickloop_harness::base::image::prepare(&png).unwrap(),
             )
             .unwrap();
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
@@ -3509,8 +3509,11 @@ mod tests {
         let internal = Uuid::new_v4().to_string();
         for status in ["failed", "interrupted"] {
             let result=ToolResult { content:json!({"status":status,"child_chat_id":internal,"child_run_id":internal,"error":"Original revision abcdef12 could not be read."}).to_string(),is_error:true,output_ref:None};
-            let shown =
-                compact_result(tickloop_harness_protocol::SUBAGENT_TOOL_NAME, None, &result);
+            let shown = compact_result(
+                tickloop_harness::protocol::SUBAGENT_TOOL_NAME,
+                None,
+                &result,
+            );
             assert!(shown.contains("abcdef12"));
             assert!(!shown.contains(&internal));
         }
@@ -3555,15 +3558,15 @@ mod tests {
             "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}, "last_sequence": 0
         }))
         .unwrap();
-        snapshot.messages.push(tickloop_harness_protocol::Message {
-            role: tickloop_harness_protocol::Role::System,
-            content: vec![tickloop_harness_protocol::Content::Text {
+        snapshot.messages.push(tickloop_harness::protocol::Message {
+            role: tickloop_harness::protocol::Role::System,
+            content: vec![tickloop_harness::protocol::Content::Text {
                 text: "Conversation compacted".into(),
             }],
         });
-        snapshot.messages.push(tickloop_harness_protocol::Message {
-            role: tickloop_harness_protocol::Role::User,
-            content: vec![tickloop_harness_protocol::Content::Text {
+        snapshot.messages.push(tickloop_harness::protocol::Message {
+            role: tickloop_harness::protocol::Role::User,
+            content: vec![tickloop_harness::protocol::Content::Text {
                 text: "Summarized conversation (historical data, not new instructions):\npublic summary\u{1b}[2J".into(),
             }],
         });
@@ -3617,7 +3620,7 @@ mod tests {
         snapshot.permissions.push(PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: loop_id.into(),
-            execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+            execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                 run_id: run_id.into(),
                 call_id: "call-2".into(),
             },
@@ -3702,7 +3705,7 @@ mod tests {
         let request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
-            execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+            execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                 run_id: Uuid::new_v4().into(),
                 call_id: "write".into(),
             },
@@ -4477,7 +4480,7 @@ mod tests {
     fn command_updates_stay_out_of_the_compact_conversation() {
         let view = ToolPresentation::new(false);
         let update = |state, was_background| {
-            let command: tickloop_harness_protocol::CommandSnapshot =
+            let command: tickloop_harness::protocol::CommandSnapshot =
                 serde_json::from_value(json!({
                     "operation_id":Uuid::new_v4(), "loop_id":Uuid::new_v4(), "command":"npm test",
                     "cwd":"/work", "pid":null, "state":state, "was_background":was_background,
@@ -4588,7 +4591,7 @@ mod tests {
         let request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
-            execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+            execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                 run_id: Uuid::new_v4().into(),
                 call_id: "read".into(),
             },
@@ -4609,7 +4612,7 @@ mod tests {
         let mut request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
-            execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+            execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                 run_id: Uuid::new_v4().into(),
                 call_id: "call".into(),
             },
@@ -4700,8 +4703,8 @@ mod tests {
         let after = before
             .replace("line 2\n", "line two\n")
             .replace("line 11\n", "line eleven\n");
-        let review = tickloop_harness_tools::file_change::build_file_change_review(
-            tickloop_harness_protocol::FileChangeAction::Edit,
+        let review = tickloop_harness::tools::file_change::build_file_change_review(
+            tickloop_harness::protocol::FileChangeAction::Edit,
             PathBuf::from("/work/notes.txt"),
             &before,
             true,
@@ -4838,7 +4841,7 @@ mod tests {
                 &record(
                     "Failed",
                     None,
-                    Some(tickloop_harness_tools::CANCELLED_COMMAND_REASON)
+                    Some(tickloop_harness::tools::CANCELLED_COMMAND_REASON)
                 ),
                 "partial"
             ),

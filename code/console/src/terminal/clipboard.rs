@@ -9,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tickloop_harness_base::image::{self};
-use tickloop_harness_protocol::Image;
+use tickloop_harness::base::image::{self};
+use tickloop_harness::protocol::Image;
 
 /// OSC 52 travels in-band through the terminal, and terminals cap how much they
 /// will accept. Refusing past the cap is better than silently pasting a

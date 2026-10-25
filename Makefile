@@ -42,7 +42,7 @@ build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost --bins
 
 install:
-	cargo install --locked --path code/cli --bins
+	cargo install --locked --force --path code/cli --bins
 	cargo install --locked --path tickhost/host --bin tickhost
 
 ## Package the Agent and the Tickhost.

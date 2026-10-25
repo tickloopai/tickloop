@@ -15,7 +15,7 @@ pub use tickloop_harness_model as model;
 pub use tickloop_harness_runtime as runtime;
 #[cfg(feature = "test-support")]
 pub use tickloop_harness_test_support as test_support;
-#[cfg(feature = "engine")]
+#[cfg(feature = "tools")]
 pub use tickloop_harness_tools as tools;
 #[cfg(feature = "transcript")]
 pub use tickloop_harness_transcript as transcript;

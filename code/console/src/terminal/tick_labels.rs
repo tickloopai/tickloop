@@ -7,7 +7,7 @@ use std::{
 
 use serde_json::Value;
 use tick_protocol::InstanceRef;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, Content, MonitorMembership, ObservationKind, TickDeliveryLine,
     TickSubscriptionStatus,
 };
@@ -56,9 +56,9 @@ impl TickLabels {
 
     pub(super) fn include_native(
         &mut self,
-        commands: &[tickloop_harness_protocol::CommandSnapshot],
-        shells: &[tickloop_harness_protocol::UserShellRecord],
-        artifacts: &[tickloop_harness_protocol::ArtifactTick],
+        commands: &[tickloop_harness::protocol::CommandSnapshot],
+        shells: &[tickloop_harness::protocol::UserShellRecord],
+        artifacts: &[tickloop_harness::protocol::ArtifactTick],
         workdir: &Path,
     ) {
         self.workdir = workdir.to_owned();
@@ -395,10 +395,10 @@ mod tests {
     #[test]
     fn native_reads_keep_their_tools_and_resolve_the_shell_or_artifact() {
         let task = Uuid::new_v4();
-        let command: tickloop_harness_protocol::CommandSnapshot = serde_json::from_value(serde_json::json!({
+        let command: tickloop_harness::protocol::CommandSnapshot = serde_json::from_value(serde_json::json!({
             "operation_id":task,"loop_id":Uuid::new_v4(),"command":"sleep 30","description":"Wait thirty seconds","cwd":"/work","pid":null,"state":"Completed","exit_code":0,"signal":null,"reason":null,"output_ref":"/work/task.output","output_bytes":4
         })).unwrap();
-        let artifact: tickloop_harness_protocol::ArtifactTick = serde_json::from_value(serde_json::json!({
+        let artifact: tickloop_harness::protocol::ArtifactTick = serde_json::from_value(serde_json::json!({
             "artifact_id":"doc","origin":"https://docs.example","title":"State atlas","format":"html","url":"https://docs.example/artifact/doc","access_role":"owner","added_at_ms":1
         })).unwrap();
         let mut labels = TickLabels::default();

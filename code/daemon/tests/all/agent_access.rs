@@ -6,25 +6,25 @@ use tickloop_code_access::{
     ObservationRequest, ObservationValue, PendingRequestKind, RequestRef, UserInput,
 };
 use tickloop_code_daemon::EmbeddedAgentAccess;
-use tickloop_harness_protocol::QuestionAnswer;
+use tickloop_harness::protocol::QuestionAnswer;
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn embedded_caller_can_answer_the_original_request_and_observe_the_result() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "question",
             "AskUserQuestion",
-            tickloop_harness_test_support::single_question("How often?"),
+            tickloop_harness::test_support::single_question("How often?"),
         ),
-        tickloop_harness_test_support::text("The weekly report is ready."),
+        tickloop_harness::test_support::text("The weekly report is ready."),
     ]));
     let runtime = Agent::open_embedded(
         directory.path().join("state"),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model,
     )
     .unwrap();
@@ -108,7 +108,7 @@ async fn embedded_caller_can_answer_the_original_request_and_observe_the_result(
                     .conversation
                     .messages
                     .iter()
-                    .any(|message| message.content.iter().any(|block| matches!(block, tickloop_harness_protocol::Content::Text { text } if text.contains("The weekly report is ready."))))
+                    .any(|message| message.content.iter().any(|block| matches!(block, tickloop_harness::protocol::Content::Text { text } if text.contains("The weekly report is ready."))))
             {
                 break;
             }
@@ -144,15 +144,15 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
     use tickloop_code_access::{AccessErrorCode, ReceiptState};
 
     let temporary = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "q",
             "AskUserQuestion",
-            tickloop_harness_test_support::single_question("Cadence?"),
+            tickloop_harness::test_support::single_question("Cadence?"),
         ),
-        tickloop_harness_test_support::text("Weekly selected."),
+        tickloop_harness::test_support::text("Weekly selected."),
     ]));
-    let runtime = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let runtime = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
@@ -252,7 +252,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
             ))
     );
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "Weekly selected."))) { break; }
+        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "Weekly selected."))) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     assert_eq!(model.requests.lock().unwrap().len(), 2);
@@ -264,9 +264,9 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
     use tickloop_code_access::AfterTurnAction;
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("Next action ran."),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("Next action ran."),
         ])),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
@@ -352,7 +352,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
         .into_result()
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "Next action ran."))) { break; }
+        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "Next action ran."))) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     runtime.shutdown().await;
@@ -361,23 +361,23 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
 #[tokio::test]
 async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retry() {
     use tickloop_code_access::AccessErrorCode;
-    use tickloop_harness_protocol::PermissionScope;
+    use tickloop_harness::protocol::PermissionScope;
     let temporary = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     let source = external.path().join("source.txt");
     std::fs::write(&source, "approved information").unwrap();
     let root = temporary.path().join("state");
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "read",
             "Read",
             serde_json::json!({"file_path": source}),
         ),
-        tickloop_harness_test_support::text("The explicit retry completed."),
+        tickloop_harness::test_support::text("The explicit retry completed."),
     ]));
     let runtime = Agent::open_embedded(
         root.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model.clone(),
     )
     .unwrap();
@@ -455,7 +455,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
         .into_result()
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "The explicit retry completed."))) { break; }
+        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "The explicit retry completed."))) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     assert_eq!(model.requests.lock().unwrap().len(), 2);
@@ -469,9 +469,9 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
     let temporary = tempfile::tempdir().unwrap();
     let output = "result ".repeat(20_000);
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text(&output),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text(&output),
         ])),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
@@ -525,8 +525,8 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
             assert!(serde_json::to_vec(&update).unwrap().len() <= FEED_CHANGE_BYTES);
             match update.change {
                 ObservationChange::Event(event) => match event.kind {
-                    tickloop_harness_protocol::EventKind::Text(text) => streamed.push_str(&text),
-                    tickloop_harness_protocol::EventKind::Completed { .. } => break,
+                    tickloop_harness::protocol::EventKind::Text(text) => streamed.push_str(&text),
+                    tickloop_harness::protocol::EventKind::Completed { .. } => break,
                     _ => {}
                 },
                 ObservationChange::Resync { .. } | ObservationChange::Reset { .. } => {
@@ -540,7 +540,7 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
     .unwrap();
     assert_eq!(streamed, output);
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == &output))) { break; }
+        if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == &output))) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     runtime.shutdown().await;
@@ -552,8 +552,8 @@ async fn embedded_directory_observation_reports_a_new_execution_after_its_snapsh
 
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let query = ObservationRequest::Overview {
@@ -602,9 +602,9 @@ async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation
 
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("noted"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("noted"),
         ])),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
@@ -675,9 +675,9 @@ async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation
 async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_agent() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("loaded"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("loaded"),
         ])),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
@@ -733,8 +733,10 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
 async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let envelope = |command| CommandEnvelope {
@@ -758,7 +760,7 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
     else {
         panic!("missing created execution");
     };
-    let tick = tickloop_harness_protocol::ArtifactTick {
+    let tick = tickloop_harness::protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: "Research".into(),
@@ -800,8 +802,10 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
 async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let envelope = |command| CommandEnvelope {
@@ -869,20 +873,22 @@ async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
 #[tokio::test]
 async fn search_connection_check_uses_selected_agent_credentials_and_cancels_with_observation() {
     use tickloop_code_access::ObservationChange;
-    use tickloop_harness_protocol::{SearchConfig, SearchProviderKind, SearchTestStatus};
+    use tickloop_harness::protocol::{SearchConfig, SearchProviderKind, SearchTestStatus};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap().join("credentials");
-    tickloop_harness_model::credentials::save_api_key(
+    tickloop_harness::model::credentials::save_api_key(
         &root,
         "SCOPE_SEARCH_TEST_KEY",
         "selected-agent-private-key",
     )
     .unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let mut launch = LaunchSpec::embedded(directory.path().into());

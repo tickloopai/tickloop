@@ -1,5 +1,5 @@
 use crate::support;
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 use std::{
     io::{Read, Write},

@@ -21,9 +21,9 @@ use tickloop_code_access::{
     ExecutionRef, LaunchSpec, Observation, ObservationRequest, ObservationValue, ReceiptState,
     TaskAction, ViewRef,
 };
-use tickloop_harness_protocol::LoopState;
+use tickloop_harness::protocol::LoopState;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_LATE_RECEIPT_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_LATE_RECEIPT_DIRECTORY";
@@ -202,34 +202,34 @@ impl AgentAccess for LateReceiptDaemon {
 
 /// The fixture model; while `hold-model` exists a request waits, so the run stays active.
 struct HeldWhileFlagged {
-    model: Arc<tickloop_harness_test_support::ScriptedModel>,
+    model: Arc<tickloop_harness::test_support::ScriptedModel>,
     flag: PathBuf,
 }
 
 #[async_trait]
-impl tickloop_harness_model::ModelClient for HeldWhileFlagged {
+impl tickloop_harness::model::ModelClient for HeldWhileFlagged {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
         self.model.identity()
     }
 
     async fn complete(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         while self.flag.exists() {
             tokio::select! {
-                _ = cancel.cancelled() => return Err(tickloop_harness_model::ModelError::Cancelled),
+                _ = cancel.cancelled() => return Err(tickloop_harness::model::ModelError::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }
@@ -260,13 +260,13 @@ fn late_receipt_pty_fixture() {
 
 async fn run_late_receipt_fixture() {
     let directory = PathBuf::from(std::env::var_os(DIRECTORY_VARIABLE).unwrap());
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::text("late reply"),
-        tickloop_harness_test_support::text("edited reply"),
-        tickloop_harness_test_support::text("command reply"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::text("late reply"),
+        tickloop_harness::test_support::text("edited reply"),
+        tickloop_harness::test_support::text("command reply"),
     ]));
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         Arc::new(HeldWhileFlagged {
             model: model.clone(),
             flag: directory.join("hold-model"),
@@ -279,7 +279,7 @@ async fn run_late_receipt_fixture() {
         directory: directory.clone(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),

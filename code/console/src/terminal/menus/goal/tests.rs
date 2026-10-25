@@ -2,14 +2,14 @@ use super::*;
 use std::sync::Arc;
 #[cfg(test)]
 use tickloop_code_settings::local_agent::LocalAgent;
-use tickloop_harness_protocol::{GoalPause, Receiving};
+use tickloop_harness::protocol::{GoalPause, Receiving};
 
 fn goal(status: GoalStatus) -> GoalSnapshot {
     GoalSnapshot {
         id: Uuid::new_v4(),
         objective: "Verify the release".into(),
         objective_revision: 1,
-        set_by: tickloop_harness_protocol::GoalAuthor::User,
+        set_by: tickloop_harness::protocol::GoalAuthor::User,
         status,
         token_budget: Some(50_000),
         tokens_used: 12_500,
@@ -52,12 +52,12 @@ fn goal_command_parser_preserves_conditions_and_limits_unicode_characters() {
 }
 
 async fn fixture() -> (Agent, Uuid, Console, Menus) {
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     core.hold_goal_continuations_for_tests();
-    let agent = Agent::from_embedded(core, tickloop_harness_test_support::config());
+    let agent = Agent::from_embedded(core, tickloop_harness::test_support::config());
     let chat = agent
         .create_chat(std::env::current_dir().unwrap())
         .await
@@ -216,7 +216,7 @@ async fn paused_or_blocked_goal_prompt_does_not_require_receiving_to_be_paused()
             by: GoalPause::HistoryLoaded,
         },
         GoalStatus::Blocked {
-            by: tickloop_harness_protocol::GoalBlock::NoProgress,
+            by: tickloop_harness::protocol::GoalBlock::NoProgress,
         },
     ] {
         let mut status = agent.status(chat).await.unwrap();
@@ -240,10 +240,10 @@ async fn paused_or_blocked_goal_prompt_does_not_require_receiving_to_be_paused()
 #[tokio::test]
 async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![]));
-    let core = tickloop_harness_runtime::Agent::open_embedded(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![]));
+    let core = tickloop_harness::runtime::Agent::open_embedded(
         directory.path().into(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model.clone(),
     )
     .unwrap();
@@ -263,7 +263,7 @@ async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
     let before = core.snapshot(chat).await.unwrap().goal_history;
     assert_eq!(before.len(), 2);
     core.shutdown().await;
-    let path = tickloop_harness_test_support::transcript_file(directory.path(), chat.into());
+    let path = tickloop_harness::test_support::transcript_file(directory.path(), chat.into());
     let mut transcript = std::fs::read_to_string(&path).unwrap();
     let notices = transcript
         .lines()
@@ -280,7 +280,7 @@ async fn goal_event_history_survives_reopening_and_uses_notice_styles() {
     std::fs::write(path, transcript).unwrap();
     let reopened = Agent::open_embedded(
         directory.path().into(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model,
     )
     .unwrap();

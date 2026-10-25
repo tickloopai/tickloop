@@ -11,11 +11,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-harness = { path = "../../harness/sdk" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tickloop-harness-protocol = { path = "../../harness/protocol" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 uuid = { version = "1", features = ["v4", "serde"] }

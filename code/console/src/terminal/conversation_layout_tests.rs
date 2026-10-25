@@ -10,13 +10,13 @@ use std::{
     time::Duration,
 };
 use tickloop_code_access::ExecutionRef;
-use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness_protocol::{
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::protocol::{
     Content, Decision, Event, LocalMessage, ModelIdentity, ModelProvider, PermissionRule,
     PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ToolResult, Usage,
 };
 
-use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
+use tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -51,7 +51,7 @@ impl ModelClient for StreamedScript {
         _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -118,10 +118,13 @@ fn rule(decision: Decision, tool: &str) -> PermissionRule {
 async fn finish_run(
     agent: &Agent,
     chat: Uuid,
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
 ) {
     loop {
-        match tickloop_harness_test_support::next_event(events).await.kind {
+        match tickloop_harness::test_support::next_event(events)
+            .await
+            .kind
+        {
             EventKind::PermissionRequested { request } => agent
                 .answer_permission_with_comment(
                     chat,
@@ -198,8 +201,8 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
     )
     .unwrap();
     let path = |name: &str| workdir.join(name).display().to_string();
-    let call = tickloop_harness_test_support::call;
-    let text = tickloop_harness_test_support::text;
+    let call = tickloop_harness::test_support::call;
+    let text = tickloop_harness::test_support::text;
     let model = StreamedScript {
         replies: Mutex::new(
             [
@@ -257,7 +260,7 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             .into(),
         ),
     };
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), Arc::new(model));
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), Arc::new(model));
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::AcceptEdits)
@@ -354,9 +357,9 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
 #[tokio::test]
 async fn questions_show_only_their_answers_or_decline_alike() {
     let directory = tempfile::tempdir().unwrap();
-    let call = tickloop_harness_test_support::call;
+    let call = tickloop_harness::test_support::call;
     let option = |label: &str| serde_json::json!({"label": label, "description": label});
-    let model = tickloop_harness_test_support::ScriptedModel::new(vec![
+    let model = tickloop_harness::test_support::ScriptedModel::new(vec![
         call(
             "report",
             ASK_USER_QUESTION_TOOL_NAME,
@@ -376,7 +379,7 @@ async fn questions_show_only_their_answers_or_decline_alike() {
             ]}),
         ),
     ]);
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), Arc::new(model));
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), Arc::new(model));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -385,7 +388,7 @@ async fn questions_show_only_their_answers_or_decline_alike() {
         .unwrap();
     let mut answered = false;
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {
@@ -453,7 +456,7 @@ async fn questions_show_only_their_answers_or_decline_alike() {
 /// A family run in steps: the child that the call `background_call` delegated waits at each of
 /// its turns until the test lets it go on.
 struct FamilyScript {
-    routed: tickloop_harness_test_support::routed::RoutedModel,
+    routed: tickloop_harness::test_support::routed::RoutedModel,
     background_call: &'static str,
     background_turns: tokio::sync::Semaphore,
 }
@@ -468,7 +471,7 @@ impl FamilyScript {
         respond: impl Fn(&ModelRequest) -> Vec<Content> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            routed: tickloop_harness_test_support::routed::RoutedModel::new(respond),
+            routed: tickloop_harness::test_support::routed::RoutedModel::new(respond),
             background_call,
             background_turns: tokio::sync::Semaphore::new(0),
         }
@@ -477,9 +480,9 @@ impl FamilyScript {
     /// The root delegates a foreground child that reports and a background one that writes to
     /// it before it reports.
     fn reporting() -> Self {
-        use tickloop_harness_test_support::routed::{has_tool_result, history_text, state};
-        let call = tickloop_harness_test_support::call;
-        let text = tickloop_harness_test_support::text;
+        use tickloop_harness::test_support::routed::{has_tool_result, history_text, state};
+        let call = tickloop_harness::test_support::call;
+        let text = tickloop_harness::test_support::text;
         Self::new("logs", move |request| {
             let delegation = &state(request)["delegation"];
             let history = history_text(request);
@@ -541,7 +544,7 @@ impl ModelClient for FamilyScript {
         _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -554,7 +557,7 @@ impl ModelClient for FamilyScript {
         events: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        let delegation = &tickloop_harness_test_support::routed::state(&request)["delegation"];
+        let delegation = &tickloop_harness::test_support::routed::state(&request)["delegation"];
         if delegation["parent_call_id"] == self.background_call {
             self.background_turns.acquire().await.unwrap().forget();
         }
@@ -581,8 +584,8 @@ async fn settle(agent: &Agent, chat: Uuid, ready: impl Fn(&ChatSnapshot) -> bool
             let idle = snapshot.pending_inputs.is_empty()
                 && !matches!(
                     snapshot.chat_loop.state,
-                    tickloop_harness_protocol::LoopState::Running
-                        | tickloop_harness_protocol::LoopState::Queued
+                    tickloop_harness::protocol::LoopState::Running
+                        | tickloop_harness::protocol::LoopState::Queued
                 );
             if idle && ready(&snapshot) {
                 return snapshot;
@@ -601,7 +604,7 @@ async fn settle(agent: &Agent, chat: Uuid, ready: impl Fn(&ChatSnapshot) -> bool
 
 fn says(snapshot: &ChatSnapshot, reply: &str) -> bool {
     snapshot.messages.iter().any(|message| {
-        message.role == tickloop_harness_protocol::Role::Assistant
+        message.role == tickloop_harness::protocol::Role::Assistant
             && message
                 .content
                 .iter()
@@ -614,21 +617,21 @@ async fn family(
     model: Arc<FamilyScript>,
     mode: ExecutionMode,
     workdir: &std::path::Path,
-) -> (tickloop_harness_runtime::Agent, Agent, Uuid) {
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+) -> (tickloop_harness::runtime::Agent, Agent, Uuid) {
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model,
     );
-    core.set_auto_reviewer(Arc::new(tickloop_harness_test_support::ScriptedModel::new(
-        vec![
-            tickloop_harness_test_support::text(
-                &tickloop_harness_test_support::auto_classification(false).to_string(),
+    core.set_auto_reviewer(Arc::new(
+        tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text(
+                &tickloop_harness::test_support::auto_classification(false).to_string(),
             );
             20
-        ],
-    )))
+        ]),
+    ))
     .await;
-    let agent = Agent::from_embedded(core.clone(), tickloop_harness_test_support::config());
+    let agent = Agent::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let chat = agent.create_chat(workdir.into()).await.unwrap();
     agent.set_execution_mode(chat, mode).await.unwrap();
     (core, agent, chat)
@@ -781,14 +784,14 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
 
 #[tokio::test]
 async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
-    use tickloop_harness_test_support::routed::{has_tool_result, history_text, state};
+    use tickloop_harness::test_support::routed::{has_tool_result, history_text, state};
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let model = Arc::new(FamilyScript::new("scan", |request| {
         if !state(request)["delegation"].is_null() {
-            tickloop_harness_test_support::text("Background done.\nAll clear.\nNothing else.")
+            tickloop_harness::test_support::text("Background done.\nAll clear.\nNothing else.")
         } else if !has_tool_result(request, "scan") {
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "scan",
                 "Subagent",
                 serde_json::json!({
@@ -798,9 +801,9 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
                 }),
             )
         } else if history_text(request).contains("Background done.") {
-            tickloop_harness_test_support::text("Thanks.")
+            tickloop_harness::test_support::text("Thanks.")
         } else {
-            tickloop_harness_test_support::text("Started.")
+            tickloop_harness::test_support::text("Started.")
         }
     }));
     let (core, agent, chat) = family(model.clone(), ExecutionMode::FullAccess, &workdir).await;
@@ -856,8 +859,8 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
 async fn a_finished_user_shell_shows_the_result_the_agent_records() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shells = agent.subscribe_user_shells();

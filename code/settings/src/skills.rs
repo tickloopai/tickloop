@@ -7,7 +7,7 @@ use std::{
 };
 use tick_packages::{InstalledPackage, PackageStore};
 pub use tickloop_harness::policy::skills::*;
-use tickloop_harness_protocol::SkillSource;
+use tickloop_harness::protocol::SkillSource;
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_SKILLS_DIRECTORY: &str = ".tickloop/skills";

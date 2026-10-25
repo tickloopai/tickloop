@@ -21,8 +21,8 @@ use tickloop_code_local_environment::hosted::{
     views::HerdrViews,
     worker_control::{DaemonControl, WorkerControlGrant},
 };
-use tickloop_harness_protocol::{HostEndpointIdentity, HostToolAuthority};
-use tickloop_harness_runtime::host_tools::HostToolProvider;
+use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
+use tickloop_harness::runtime::host_tools::HostToolProvider;
 use tokio_util::sync::CancellationToken;
 
 /// A Herdr that counts requests and refuses them all: choosing an authority must never need it.
@@ -74,7 +74,7 @@ fn hosted_tools(directory: &Path) -> HostedTickTools {
 fn tools() -> Tools {
     let directory = tempfile::Builder::new()
         .prefix("ttr")
-        .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let socket = directory.path().join("herdr.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -274,7 +274,10 @@ async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
     assert_eq!(tools.herdr.requests.load(Ordering::SeqCst), 0);
 }
 
-fn tool<'a>(definitions: &'a [tickloop_harness_protocol::ToolDefinition], name: &str) -> &'a Value {
+fn tool<'a>(
+    definitions: &'a [tickloop_harness::protocol::ToolDefinition],
+    name: &str,
+) -> &'a Value {
     &definitions
         .iter()
         .find(|definition| definition.name == name)
@@ -423,8 +426,8 @@ async fn peers_with_the_old_delegation_authority_schema_are_rejected_at_handshak
 
 #[tokio::test]
 async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_runtime::Agent;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::runtime::Agent;
     let directory = tempfile::tempdir().unwrap();
     let endpoint = directory.path().join("not-a-socket");
     std::fs::write(&endpoint, "fixture").unwrap();
@@ -434,15 +437,15 @@ async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
             Path::new("/private/tmp/unused/tickloop"),
         )),
     );
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "redirect",
             "TickCall",
             json!({"tick_instance_id":"artifact:doc","tool":"read","args":{}}),
         ),
-        tickloop_harness_test_support::text("Done."),
+        tickloop_harness::test_support::text("Done."),
     ]));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     agent.install_host_tools(provider).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -452,7 +455,7 @@ async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
         .unwrap();
     let result = loop {
         if let EventKind::ToolCompleted { result, .. } =
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
         {

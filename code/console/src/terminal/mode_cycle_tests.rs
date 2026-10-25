@@ -18,7 +18,7 @@ use tickloop_code_access::{
     DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
 };
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_MODE_CYCLE_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_MODE_CYCLE_DIRECTORY";
@@ -112,9 +112,9 @@ fn mode_cycle_pty_fixture() {
 
 async fn run_mode_cycle_fixture() {
     let directory = PathBuf::from(std::env::var_os(DIRECTORY_VARIABLE).unwrap());
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(CountingDaemon {
@@ -122,7 +122,7 @@ async fn run_mode_cycle_fixture() {
         directory,
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),

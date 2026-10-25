@@ -1,6 +1,6 @@
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
-use tickloop_harness_test_support::input_dialog;
+use tickloop_harness::test_support::input_dialog;
 
 use crate::support;
 
@@ -87,7 +87,7 @@ impl Terminal {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -382,7 +382,7 @@ impl Drop for Terminal {
 }
 
 fn save_model(root: &Path) {
-    let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
     tickloop_code_settings::UserSettings::in_root(&root.join("state"))
@@ -398,7 +398,7 @@ fn assert_saved_model(root: &Path) {
 }
 
 fn save_key(root: &Path, key: &str) {
-    tickloop_harness_model::credentials::save_api_key(&root.join("state"), TEST_KEY_NAME, key)
+    tickloop_harness::model::credentials::save_api_key(&root.join("state"), TEST_KEY_NAME, key)
         .unwrap();
 }
 
@@ -467,7 +467,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
     terminal.wait_for("API key · DeepSeek");
     terminal.send(b"candidate-123-key");
     assert_eq!(
-        tickloop_harness_model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
+        tickloop_harness::model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
             .unwrap()
             .as_deref(),
         Some(TEST_KEY)
@@ -483,7 +483,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
         frame.contains("Connection · DeepSeek") && frame.contains("Replace API key")
     });
     assert_eq!(
-        tickloop_harness_model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
+        tickloop_harness::model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
             .unwrap()
             .as_deref(),
         Some(TEST_KEY)
@@ -499,7 +499,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
         frame.contains("Connection · DeepSeek") && frame.contains("API key saved")
     });
     assert_eq!(
-        tickloop_harness_model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
+        tickloop_harness::model::credentials::load_api_key(&root.join("state"), TEST_KEY_NAME)
             .unwrap()
             .as_deref(),
         Some("committed-456-key")

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tickloop_code_access::{
     AccessError, ObservationValue, Page, RecordedMessage, RecordedTranscript, TranscriptRef,
 };
-use tickloop_harness_runtime::{AgentError, transcript::records};
+use tickloop_harness::runtime::{AgentError, transcript::records};
 
 use crate::access_error::agent_access_error;
 

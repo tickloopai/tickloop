@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Offset};
 use chrono_tz::Tz;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_harness_protocol::{ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskKind};
+use tickloop_harness::protocol::{ScheduledTask, ScheduledTaskConfirmation, ScheduledTaskKind};
 use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
@@ -107,8 +107,8 @@ pub(super) fn view(
             task.scheduled_for_ms.and_then(at)
         },
         source: match task.creator {
-            tickloop_harness_protocol::ScheduledTaskCreator::User => "user",
-            tickloop_harness_protocol::ScheduledTaskCreator::Agent => "agent",
+            tickloop_harness::protocol::ScheduledTaskCreator::User => "user",
+            tickloop_harness::protocol::ScheduledTaskCreator::Agent => "agent",
         },
         skipped: task.skipped,
         pending_confirmation: task.confirmation == Some(ScheduledTaskConfirmation::Pending),
@@ -223,7 +223,7 @@ impl TickActionBackend for PauseAction {
                     .update_tick_subscription(
                         ctx.chat,
                         row.id,
-                        tickloop_harness_protocol::TickSubscriptionChange::Paused(paused),
+                        tickloop_harness::protocol::TickSubscriptionChange::Paused(paused),
                     )
                     .await
                     .map_err(|error| error.to_string())?;

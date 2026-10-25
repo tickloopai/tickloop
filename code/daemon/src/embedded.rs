@@ -25,14 +25,14 @@ use tickloop_code_access::{
     PendingRequestKind, PersistenceState, QueuedCommandFailure, REPLAY_CAPACITY, RequestRef,
     ResetReason, TaskAction, TaskOrigin, TaskRef, TranscriptRef, UserInput, bounded_update,
 };
-use tickloop_harness_model::cards::model_for_persistent_selection;
-use tickloop_harness_protocol::{
+use tickloop_harness::model::cards::model_for_persistent_selection;
+use tickloop_harness::protocol::{
     BranchRequest, DirectedHumanSource, Event, HerdrInteraction, HostCallContext,
     LoopTriggerNotice, ShellTaskAction, ShellTaskOrigin, SubagentRegistration, TaskNotification,
     UserShellRecord,
 };
 
-use tickloop_harness_runtime::{
+use tickloop_harness::runtime::{
     Agent, Delivery, QuestionReply, ShellTaskCenter, TurnOp, TurnRequest,
 };
 
@@ -50,7 +50,7 @@ struct Inner {
     executions: Mutex<HashMap<ExecutionRef, Uuid>>,
     references: Mutex<HashMap<Uuid, ExecutionRef>>,
     launches: Mutex<HashMap<ExecutionRef, LaunchSpec>>,
-    account_models: tickloop_harness_model::availability::AccountModelDiscovery,
+    account_models: tickloop_harness::model::availability::AccountModelDiscovery,
     receipts: ReceiptStore,
     answers: Mutex<HashMap<(ExecutionRef, Uuid, PendingRequestKind), AnswerState>>,
     queue: Mutex<HashMap<Uuid, QueuedAction>>,
@@ -68,7 +68,7 @@ struct Inner {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EmbeddedCheckpoint {
-    pub(crate) runtime: tickloop_harness_runtime::upgrade::AgentUpgradeCheckpoint,
+    pub(crate) runtime: tickloop_harness::runtime::upgrade::AgentUpgradeCheckpoint,
     executions: Vec<(ExecutionRef, Uuid)>,
     launches: Vec<(ExecutionRef, LaunchSpec)>,
     receipts: super::receipts::ReceiptCheckpoint,
@@ -527,7 +527,7 @@ impl EmbeddedAgentAccess {
                     .await?;
             }
             if let Some(host) = origin.host {
-                let pane = tickloop_harness_protocol::HerdrPane {
+                let pane = tickloop_harness::protocol::HerdrPane {
                     pane_id: host
                         .pane
                         .ok_or_else(|| AccessError::invalid("interaction source has no Pane"))?,
@@ -1172,7 +1172,7 @@ impl EmbeddedAgentAccess {
         command_id: Uuid,
         request: Uuid,
         reply: QuestionReply,
-    ) -> Result<(), tickloop_harness_runtime::AgentError> {
+    ) -> Result<(), tickloop_harness::runtime::AgentError> {
         self.inner
             .agent
             .advance(
@@ -1333,7 +1333,7 @@ impl EmbeddedAgentAccess {
                     .await
                 {
                     Ok(view) => Ok(CommandResult::Permissions(Box::new(view))),
-                    Err(tickloop_harness_runtime::PermissionChangeError::Conflict { latest }) => {
+                    Err(tickloop_harness::runtime::PermissionChangeError::Conflict { latest }) => {
                         Err(AccessError {
                             code: AccessErrorCode::VersionConflict,
                             message: "permissions changed while editing".into(),
@@ -1629,12 +1629,12 @@ impl EmbeddedAgentAccess {
 
     fn builtin_config(
         &self,
-        config: tickloop_harness_protocol::ModelConfig,
-    ) -> Result<tickloop_harness_protocol::ModelConfig, AccessError> {
+        config: tickloop_harness::protocol::ModelConfig,
+    ) -> Result<tickloop_harness::protocol::ModelConfig, AccessError> {
         if !self.inner.builtin_catalog_only.load(Ordering::SeqCst) {
             return Ok(config);
         }
-        tickloop_harness_model::cards::ModelCatalog::defaults()
+        tickloop_harness::model::cards::ModelCatalog::defaults()
             .get(&config.provider_id, &config.model_id)
             .ok_or_else(|| {
                 AccessError::invalid("Only built-in Provider/model selections are supported")
@@ -1644,7 +1644,7 @@ impl EmbeddedAgentAccess {
     async fn observe_account_models(
         &self,
         execution: ExecutionRef,
-        config: tickloop_harness_protocol::ModelConfig,
+        config: tickloop_harness::protocol::ModelConfig,
         refresh: bool,
     ) -> Result<Observation, AccessError> {
         self.chat(execution).await?;
@@ -1701,7 +1701,7 @@ impl EmbeddedAgentAccess {
     async fn observe_search_test(
         &self,
         execution: ExecutionRef,
-        config: tickloop_harness_protocol::SearchConfig,
+        config: tickloop_harness::protocol::SearchConfig,
     ) -> Result<Observation, AccessError> {
         self.chat(execution).await?;
         let root = self
@@ -1723,7 +1723,7 @@ impl EmbeddedAgentAccess {
             let result = tokio::select! {
                 biased;
                 () = sender.closed() => return,
-                result = tickloop_harness_tools::web_search::test_connection(&config, root.as_deref(), cancel.clone()) => result,
+                result = tickloop_harness::tools::web_search::test_connection(&config, root.as_deref(), cancel.clone()) => result,
             };
             let _ = sender
                 .send(ObservationUpdate {
@@ -1753,7 +1753,7 @@ impl EmbeddedAgentAccess {
                 let launches = self.inner.launches.lock().await;
                 let launch = launches.get(&execution);
                 ObservationValue::ProviderCredentials(Box::new(
-                    tickloop_harness_model::auth::current_provider_credential_scope(
+                    tickloop_harness::model::auth::current_provider_credential_scope(
                         launch.and_then(|launch| launch.config_root.clone()),
                     ),
                 ))
@@ -2042,7 +2042,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                     {
                         continue;
                     }
-                    let state = tickloop_harness_runtime::summary_state(
+                    let state = tickloop_harness::runtime::summary_state(
                         &summary.chat_loop,
                         &summary.user_shells,
                     );
@@ -2473,7 +2473,7 @@ fn action_label(action: &AfterTurnAction) -> String {
 
 /// The Folder of a Chat a local launch shows; this daemon runs only Chats with one.
 fn chat_folder(
-    snapshot: &tickloop_harness_protocol::ChatSnapshot,
+    snapshot: &tickloop_harness::protocol::ChatSnapshot,
 ) -> Result<std::path::PathBuf, AccessError> {
     snapshot.folder.clone().ok_or_else(|| {
         AccessError::new(

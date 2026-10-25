@@ -221,7 +221,7 @@ async fn incompatible_startup_confirmation_opens_the_new_daemon_with_original_op
         );
         assert_eq!(
             opened.policy.mode,
-            tickloop_harness_protocol::ExecutionMode::AcceptEdits
+            tickloop_harness::protocol::ExecutionMode::AcceptEdits
         );
         view.close().await;
     })

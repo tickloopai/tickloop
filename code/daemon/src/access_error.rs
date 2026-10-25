@@ -1,6 +1,6 @@
 use tickloop_code_access::{AccessError, AccessErrorCode};
 
-use tickloop_harness_runtime::AgentError;
+use tickloop_harness::runtime::AgentError;
 
 pub(crate) fn agent_access_error(error: AgentError) -> AccessError {
     let code = match &error {

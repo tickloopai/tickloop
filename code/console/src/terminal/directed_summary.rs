@@ -6,13 +6,13 @@ use uuid::Uuid;
 
 use super::{console::Console, safe_line, workflows};
 use tickloop_code_access::{AccessError, AccessErrorCode};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest, SummaryDirection,
 };
 
 #[derive(Clone, Copy)]
 pub(super) struct SummaryTaskMetadata {
-    pub(super) chat: tickloop_harness_protocol::ChatId,
+    pub(super) chat: tickloop_harness::protocol::ChatId,
 }
 
 pub(super) enum SummaryTaskCompletion {
@@ -48,13 +48,13 @@ impl DirectedSummaryTasks {
         direction
     }
 
-    pub(super) fn contains(&self, chat: tickloop_harness_protocol::ChatId) -> bool {
+    pub(super) fn contains(&self, chat: tickloop_harness::protocol::ChatId) -> bool {
         self.metadata.values().any(|metadata| metadata.chat == chat)
     }
 
     pub(super) fn active_chats(
         &self,
-    ) -> impl Iterator<Item = tickloop_harness_protocol::ChatId> + '_ {
+    ) -> impl Iterator<Item = tickloop_harness::protocol::ChatId> + '_ {
         self.metadata.values().map(|metadata| metadata.chat)
     }
 

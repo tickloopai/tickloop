@@ -8,7 +8,7 @@ const HARNESS_PACKAGES = new Set([
   "tickloop-harness-policy", "tickloop-harness-cron", "tickloop-harness-artifacts",
   "tickloop-harness-base", "tickloop-harness-test-support",
 ]);
-const ACCESS_PACKAGES = new Set(["tickloop-code-access", "tickloop-code-access"]);
+const ACCESS_PACKAGES = new Set(["tickloop-code-access"]);
 
 export function checkAgentAccessBoundary(metadata) {
   const members = new Set(metadata.workspace_members);

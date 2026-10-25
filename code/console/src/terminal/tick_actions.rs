@@ -90,7 +90,7 @@ impl TickActionUi<'_> {
         &mut self,
         subscription: Uuid,
         all_on_instance: bool,
-    ) -> Option<tickloop_harness_protocol::TickSubscriptionChange> {
+    ) -> Option<tickloop_harness::protocol::TickSubscriptionChange> {
         self.state
             .monitor
             .request_next_subscription(subscription, all_on_instance)

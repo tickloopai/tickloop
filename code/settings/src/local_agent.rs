@@ -1,12 +1,12 @@
 //! File-backed Agent composition for local integration tests.
 use crate::UserSettings;
 use std::{path::PathBuf, sync::Arc};
+use tickloop_harness::model::{ModelClient, ModelClients, ModelError};
+use tickloop_harness::protocol::{AgentHostOptions, ModelConfig};
 use tickloop_harness::runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
     transcript::JsonlTranscriptStore,
 };
-use tickloop_harness_model::{ModelClient, ModelClients, ModelError};
-use tickloop_harness_protocol::{AgentHostOptions, ModelConfig};
 
 pub trait LocalAgent {
     fn open(

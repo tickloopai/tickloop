@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::execution::ConsoleExecution;
 use crate::monitor_rows::{MemberFindings, MemberState, ProbeError, TickProbe, TickResources};
 use tick_protocol::InstanceRef;
-use tickloop_harness_protocol::HostedMemberState;
+use tickloop_harness::protocol::HostedMemberState;
 
 pub(super) struct HostedProbe {
     agent: ConsoleExecution,

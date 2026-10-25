@@ -2,7 +2,7 @@ use std::fs;
 use tickloop_code_settings::skills::SkillDiscovery;
 
 use tickloop_code_settings::skills::SkillRegistry;
-use tickloop_harness_protocol::{RemoteSkillDefinition, SkillSource};
+use tickloop_harness::protocol::{RemoteSkillDefinition, SkillSource};
 
 fn registry_with_project_skills(
     count: usize,

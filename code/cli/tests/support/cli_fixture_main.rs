@@ -21,8 +21,8 @@ use support::fixture_cli::{BUILD_IDENTITY_MODE, CLI_MODE, build_identity};
 use tickloop_code_client::DAEMON_RUN_ARGUMENTS;
 use tickloop_code_daemon::WORKER_ARGUMENT;
 use tickloop_code_local_environment::hosted::controller::TICKHOST_EXECUTABLE;
-use tickloop_harness_model::{LocalModelClients, ModelClients};
-use tickloop_harness_protocol::{ATTACH_ARGUMENTS, ModelConfig};
+use tickloop_harness::model::{LocalModelClients, ModelClients};
+use tickloop_harness::protocol::{ATTACH_ARGUMENTS, ModelConfig};
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";
@@ -288,7 +288,7 @@ fn use_transport_fixture(path: &OsString) {
         std::env::set_var("DEEPSEEK_API_KEY", "fixture-compiled-selection-key");
     }
     if let Some(root) = std::env::var_os("TICKLOOP_CONFIG_DIR") {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let model = std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ModelConfig>(&bytes).ok())
@@ -348,14 +348,14 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
 /// transport.
 struct TransportModels {
     local: LocalModelClients,
-    transport: Arc<dyn tickloop_harness_model::ModelClient>,
+    transport: Arc<dyn tickloop_harness::model::ModelClient>,
 }
 
 impl ModelClients for TransportModels {
     fn client(
         &self,
         config: &ModelConfig,
-    ) -> Result<Arc<dyn tickloop_harness_model::ModelClient>, tickloop_harness_model::ModelError>
+    ) -> Result<Arc<dyn tickloop_harness::model::ModelClient>, tickloop_harness::model::ModelError>
     {
         self.local.client(config)?;
         Ok(self.transport.clone())
@@ -363,36 +363,39 @@ impl ModelClients for TransportModels {
 }
 
 struct TransportClient {
-    inner: Arc<dyn tickloop_harness_model::ModelClient>,
+    inner: Arc<dyn tickloop_harness::model::ModelClient>,
     config: ModelConfig,
 }
 
 #[async_trait]
-impl tickloop_harness_model::ModelClient for TransportClient {
+impl tickloop_harness::model::ModelClient for TransportClient {
     fn connection_id(&self) -> Option<String> {
         self.inner.connection_id()
     }
 
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
         self.inner.identity()
     }
     async fn complete(
         &self,
-        mut request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        mut request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        if tickloop_harness_model::validate_reasoning_effort(&self.config, request.reasoning_effort)
-            .is_err()
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        if tickloop_harness::model::validate_reasoning_effort(
+            &self.config,
+            request.reasoning_effort,
+        )
+        .is_err()
         {
             request.reasoning_effort = None;
         }

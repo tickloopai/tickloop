@@ -19,10 +19,10 @@ use tickloop_code_client::{LocalAgentClient, worker_link};
 use tickloop_code_daemon::{
     DaemonServer, EmbeddedAgentAccess, WorkerFactory, serve_listener, serve_worker_listener,
 };
-use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::protocol::Content;
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -61,12 +61,12 @@ async fn read_json_frame(stream: &mut UnixStream) -> Option<Value> {
 
 #[tokio::test]
 async fn legacy_wire_schema_is_rejected_before_pipelined_create_can_execute() {
-    let directory = tempfile::tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT).unwrap();
+    let directory = tempfile::tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT).unwrap();
     let socket = directory.path().join("worker.sock");
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::text("fixture reply"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::text("fixture reply"),
     ]));
-    let runtime = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let runtime = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let epoch = Uuid::new_v4();
     let access = Arc::new(EmbeddedAgentAccess::for_worker(runtime.clone(), epoch));
     let listener = UnixListener::bind(&socket).unwrap();
@@ -144,15 +144,15 @@ fn tool_result(request: &ModelRequest, id: &str) -> Option<Value> {
 impl ModelClient for MessageBurstModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-        tickloop_harness_test_support::ScriptedModel::new(vec![]).identity()
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+        tickloop_harness::test_support::ScriptedModel::new(vec![]).identity()
     }
 
     async fn complete(
@@ -193,21 +193,21 @@ impl ModelClient for MessageBurstModel {
                     events.send(ModelDelta::Text(delta.clone())).unwrap();
                     body.push_str(&delta);
                 }
-                tickloop_harness_test_support::text(&body)
+                tickloop_harness::test_support::text(&body)
             } else if tool_result(&request, "ready").is_none() {
-                tickloop_harness_test_support::call(
+                tickloop_harness::test_support::call(
                     "ready",
                     "SendMessage",
                     json!({"to":"parent","message":format!("READY {task}")}),
                 )
             } else {
-                tickloop_harness_test_support::text("Ready for the next pushed context.")
+                tickloop_harness::test_support::text("Ready for the next pushed context.")
             }
         } else if tool_result(&request, "delegate-A").is_none() {
             ["A", "B", "C"]
                 .into_iter()
                 .flat_map(|label| {
-                    tickloop_harness_test_support::call(
+                    tickloop_harness::test_support::call(
                         &format!("delegate-{label}"),
                         "Subagent",
                         json!({"task":format!("Child {label}")}),
@@ -221,10 +221,10 @@ impl ModelClient for MessageBurstModel {
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             }
             ["A", "B", "C"].into_iter().flat_map(|label| {
-                tickloop_harness_test_support::call(&format!("send-{label}"), "SendMessage", json!({"to":tool_result(&request, &format!("delegate-{label}")).unwrap()["child_chat_id"],"message":"GO-BURST"}))
+                tickloop_harness::test_support::call(&format!("send-{label}"), "SendMessage", json!({"to":tool_result(&request, &format!("delegate-{label}")).unwrap()["child_chat_id"],"message":"GO-BURST"}))
             }).collect()
         } else {
-            tickloop_harness_test_support::text(
+            tickloop_harness::test_support::text(
                 "Parent received the accepted messages and child results.",
             )
         };
@@ -252,7 +252,7 @@ impl WorkerFactory for SocketWorkerFactory {
         epoch: Uuid,
     ) -> Result<Arc<dyn AgentAccess>, AccessError> {
         let runtime =
-            Agent::new_embedded(tickloop_harness_test_support::config(), self.model.clone());
+            Agent::new_embedded(tickloop_harness::test_support::config(), self.model.clone());
         *self.runtime.lock().await = Some(runtime.clone());
         let served = Arc::new(EmbeddedAgentAccess::for_worker(runtime, epoch));
         let socket = self.directory.join("worker.sock");
@@ -379,7 +379,7 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         .iter()
         .filter(|event| {
             matches!(&event.kind,
-        tickloop_harness_protocol::EventKind::ToolCompleted { call_id, result, .. }
+        tickloop_harness::protocol::EventKind::ToolCompleted { call_id, result, .. }
         if call_id.starts_with("send-") && !result.is_error && result.content.contains("accepted"))
         })
         .count();

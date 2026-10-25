@@ -15,7 +15,7 @@ use tickhost_connect::herdr::{
 };
 
 use crate::terminal::attach::{AttachEnd, run_view};
-use tickloop_harness_protocol::{ATTACH_ENVIRONMENT, HostedViewGrant, VIEW_PANE_ENVIRONMENT};
+use tickloop_harness::protocol::{ATTACH_ENVIRONMENT, HostedViewGrant, VIEW_PANE_ENVIRONMENT};
 
 const MONITOR_USAGE: &str = "Usage: tickloop monitor attach
        tickloop monitor popup install --herdr-socket SOCKET

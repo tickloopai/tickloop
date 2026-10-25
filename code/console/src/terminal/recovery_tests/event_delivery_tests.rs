@@ -4,7 +4,7 @@ use tickloop_code_access::{
     Cursor, HistoryAction, LiveChatSnapshot, ObservationUpdate, PersistenceState, ReceiptState,
     ResetReason,
 };
-use tickloop_harness_protocol::Event;
+use tickloop_harness::protocol::Event;
 
 struct ControlledDelivery {
     daemon: EmbeddedAgentAccess,
@@ -130,18 +130,18 @@ impl ControlledDelivery {
 }
 
 async fn delivery_fixture() -> (
-    tickloop_harness_runtime::Agent,
+    tickloop_harness::runtime::Agent,
     Agent,
     Arc<ControlledDelivery>,
     mpsc::UnboundedReceiver<RecoveryFact>,
 ) {
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "retained-question",
-                tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME,
-                tickloop_harness_test_support::single_question("Which fixture?"),
+                tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME,
+                tickloop_harness::test_support::single_question("Which fixture?"),
             ),
         ])),
     );
@@ -155,7 +155,7 @@ async fn delivery_fixture() -> (
         delayed_compaction: Mutex::new(None),
     });
     let mut launch = LaunchSpec::embedded(std::env::current_dir().unwrap());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         access.clone(),

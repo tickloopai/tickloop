@@ -2,7 +2,7 @@ use super::*;
 
 use tickloop_code_access::{AgentAccess, ViewRef};
 
-use tickloop_harness_test_support::screen::SELECTED_MARK;
+use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 /// The family panel's rows under its heading; a conversation's `› Message from` lines are not
 /// among them.
@@ -182,10 +182,10 @@ async fn continue_waiting(
         execution,
         "same Agent waits for context",
         |current| {
-            current.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Running
+            current.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Running
                 && current.events.iter().any(|event| {
                     matches!(&event.kind,
-                tickloop_harness_protocol::EventKind::ToolStarted { name, .. }
+                tickloop_harness::protocol::EventKind::ToolStarted { name, .. }
                     if name == "Bash")
                 })
         },
@@ -294,7 +294,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             if rows.len() == 3
                 && rows
                     .iter()
-                    .all(|row| row.state == tickloop_harness_protocol::LoopState::Idle)
+                    .all(|row| row.state == tickloop_harness::protocol::LoopState::Idle)
             {
                 break rows;
             }
@@ -574,7 +574,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         };
         wait_snapshot(&client,target,"follow-up is admitted before releasing the tool",|current| {
             current.pending_inputs.iter().any(|input|input.input == follow_up)
-                || current.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_harness_protocol::Content::Text {text} if text==follow_up))
+                || current.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_harness::protocol::Content::Text {text} if text==follow_up))
         }).await;
         release_family_boundary(&fixture.path(&format!("work/{id}.pipe"))).await;
         let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
@@ -587,7 +587,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             let has_context = current.conversation.messages.iter().any(|message| {
                 message.content.iter().any(|content| {
                     matches!(content,
-                    tickloop_harness_protocol::Content::Text { text } if text == follow_up)
+                    tickloop_harness::protocol::Content::Text { text } if text == follow_up)
                 })
             });
             assert_eq!(
@@ -602,7 +602,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         assert_eq!(current.conversation.chat_loop.run_id, run);
         assert_eq!(
             current.conversation.chat_loop.state,
-            tickloop_harness_protocol::LoopState::Running
+            tickloop_harness::protocol::LoopState::Running
         );
     }
     assert_eq!(

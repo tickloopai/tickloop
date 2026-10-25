@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use crate::support;
-use tickloop_harness_test_support::model_http_support;
+use tickloop_harness::test_support::model_http_support;
 
 use std::{
     fs::{File, OpenOptions},
@@ -26,7 +26,7 @@ use tickloop_code_access::{
 };
 use tickloop_code_client::LocalAgentClient;
 use tickloop_code_daemon::{serve_daemon_listener, serve_worker_listener};
-use tickloop_harness_protocol::{Content, Protocol};
+use tickloop_harness::protocol::{Content, Protocol};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -516,7 +516,7 @@ async fn launch_active_worker(
     let (base_url, requests, release) =
         model_http_support::serve_responses_with_gated_response(vec![(200, String::new())], 0)
             .await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.protocol = Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
     model.api_key_env = "TICKLOOP_STOP_FIXTURE_KEY".into();

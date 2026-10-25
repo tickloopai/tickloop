@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_test_support::screen::SELECTED_MARK;
+use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 fn request_state(request: &Value) -> Value {
     request["messages"]
@@ -135,12 +135,12 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
                 .values()
                 .any(|source| source.original_submission.contains("@audit DIRECT-HELLO"))
                 && current.conversation.chat_loop.state
-                    == tickloop_harness_protocol::LoopState::Idle
+                    == tickloop_harness::protocol::LoopState::Idle
         },
     )
     .await;
-    assert!(target.conversation.messages.iter().any(|message| message.role == tickloop_harness_protocol::Role::User && message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "DIRECT-HELLO"))));
-    let sibling = wait_snapshot(&client, echo, "model sibling delivery completes", |current| !current.conversation.agent_message_origins.is_empty() && current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "Sibling context received")))).await;
+    assert!(target.conversation.messages.iter().any(|message| message.role == tickloop_harness::protocol::Role::User && message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "DIRECT-HELLO"))));
+    let sibling = wait_snapshot(&client, echo, "model sibling delivery completes", |current| !current.conversation.agent_message_origins.is_empty() && current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "Sibling context received")))).await;
     pty.wait_for(
         "the sibling's background completion as one teammate block",
         |frame| {
@@ -163,7 +163,7 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
         after.conversation.prompt_execution_modes, before.conversation.prompt_execution_modes,
         "directed input is not a source human checkpoint"
     );
-    assert!(after.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_harness_protocol::Content::Text {text} if text.starts_with("<task-notification>") && text.contains("@echo"))),"the sibling's background completion must reach the root");
+    assert!(after.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_harness::protocol::Content::Text {text} if text.starts_with("<task-notification>") && text.contains("@echo"))),"the sibling's background completion must reach the root");
     let mut child_requests = 0;
     while let Ok((_, request)) = requests.try_recv() {
         if request_state(&request)["delegation"].is_null() {
@@ -202,7 +202,7 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     );
     assert_eq!(
         echo_snapshot.conversation.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Idle
+        tickloop_harness::protocol::LoopState::Idle
     );
     pty.close().await;
 }
@@ -238,7 +238,7 @@ async fn run_auto_family_review(fixture: &PrivateFixture) {
             captured.lock().unwrap().push(context);
             return chat_reply(
                 None,
-                &tickloop_harness_test_support::auto_classification(block).to_string(),
+                &tickloop_harness::test_support::auto_classification(block).to_string(),
             );
         }
         let state = request_state(request);
@@ -352,7 +352,7 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
         {
             return chat_reply(
                 None,
-                &tickloop_harness_test_support::auto_classification(
+                &tickloop_harness::test_support::auto_classification(
                     context["operation"]["tool"] == "SubagentHandback",
                 )
                 .to_string(),
@@ -425,7 +425,7 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
     assert_eq!(parent.conversation.agent_message_origins.len(), 1);
     assert!(matches!(
         child.conversation.subagent_reports.values().next(),
-        Some(tickloop_harness_protocol::SubagentReport::Delivered { .. })
+        Some(tickloop_harness::protocol::SubagentReport::Delivered { .. })
     ));
     let output = String::from_utf8_lossy(&pty.output.lock().unwrap()).into_owned();
     assert!(!output.contains("Permission required"));
@@ -539,7 +539,7 @@ async fn run_continued_child_notice(fixture: &PrivateFixture) {
         .unwrap()
         .execution;
     wait_snapshot(&client, child, "the child failed", |current| {
-        current.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Failed
+        current.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Failed
     })
     .await;
     open_family_row(&mut pty, CHILD_TASK, |frame| {
@@ -551,11 +551,11 @@ async fn run_continued_child_notice(fixture: &PrivateFixture) {
         current.conversation.family_completions.len() == 2
             && matches!(
                 current.conversation.family_completions[1].notification,
-                tickloop_harness_protocol::SubagentNotificationDelivery::Queued
+                tickloop_harness::protocol::SubagentNotificationDelivery::Queued
             )
             && current.conversation.messages.iter().any(|message| {
                 message.content.iter().any(|content| {
-                    matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "Root received the resumed report")
+                    matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "Root received the resumed report")
                 })
             })
     })

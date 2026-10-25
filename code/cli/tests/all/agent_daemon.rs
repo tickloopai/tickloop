@@ -28,7 +28,7 @@ use tickloop_code_access::{
     ReceiptState, TaskOrigin, TaskRef, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef,
 };
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use tokio::{
     net::UnixListener,
     sync::{Mutex, Notify},
@@ -41,20 +41,20 @@ struct FixtureFactory {
     accesses: Mutex<Vec<Arc<dyn AgentAccess>>>,
     availability: Mutex<Vec<Arc<AtomicBool>>>,
     exits: Mutex<Vec<Arc<AtomicBool>>>,
-    model: Arc<tickloop_harness_test_support::ScriptedModel>,
+    model: Arc<tickloop_harness::test_support::ScriptedModel>,
     gate: Option<Arc<Notify>>,
     snapshot_gate: Option<Arc<SnapshotGate>>,
 }
 
 impl FixtureFactory {
-    fn new(replies: Vec<Vec<tickloop_harness_protocol::Content>>) -> Self {
+    fn new(replies: Vec<Vec<tickloop_harness::protocol::Content>>) -> Self {
         Self {
             started: AtomicUsize::new(0),
             runtimes: Mutex::new(Vec::new()),
             accesses: Mutex::new(Vec::new()),
             availability: Mutex::new(Vec::new()),
             exits: Mutex::new(Vec::new()),
-            model: Arc::new(tickloop_harness_test_support::ScriptedModel::new(replies)),
+            model: Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies)),
             gate: None,
             snapshot_gate: None,
         }
@@ -80,12 +80,12 @@ impl WorkerFactory for FixtureFactory {
         let runtime = match &launch.config_root {
             Some(root) => Agent::open_embedded(
                 root.clone(),
-                tickloop_harness_test_support::config(),
+                tickloop_harness::test_support::config(),
                 self.model.clone(),
             )
             .unwrap(),
             None => {
-                Agent::new_embedded(tickloop_harness_test_support::config(), self.model.clone())
+                Agent::new_embedded(tickloop_harness::test_support::config(), self.model.clone())
             }
         };
         self.runtimes.lock().await.push(runtime.clone());
@@ -445,7 +445,7 @@ async fn an_accepted_create_survives_a_lost_ack_and_can_be_queried_after_reconne
 async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("Finished."),
+        tickloop_harness::test_support::text("Finished."),
     ]));
     let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     let (client, server) = serve(temporary.path(), daemon).await;
@@ -527,7 +527,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     let epoch = Uuid::new_v4();
     let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
     launch.session_persistence = false;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     launch.model = Some(model);
     let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
@@ -605,7 +605,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = replacement.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-            if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.user_shells.iter().any(|record| record.id == shell.command_id && record.state == tickloop_harness_protocol::UserShellState::Completed)) { break; }
+            if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.user_shells.iter().any(|record| record.id == shell.command_id && record.state == tickloop_harness::protocol::UserShellState::Completed)) { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.unwrap();
@@ -879,7 +879,7 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
     for label in ["alpha", "beta"] {
         let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
         launch.session_persistence = false;
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.name = label.into();
         model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
         launch.model = Some(model);
@@ -949,13 +949,13 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
                 if let ObservationValue::Agent(snapshot) = observation.initial {
                     assert_eq!(
                         snapshot.model,
-                        tickloop_harness_model::cards::ModelCatalog::defaults()
+                        tickloop_harness::model::cards::ModelCatalog::defaults()
                             .get("deepseek-api", "deepseek-flash")
                             .unwrap()
                     );
                     if snapshot.user_shells.iter().any(|record| {
                         record.id == *task_id
-                            && record.state == tickloop_harness_protocol::UserShellState::Completed
+                            && record.state == tickloop_harness::protocol::UserShellState::Completed
                     }) {
                         break;
                     }
@@ -1081,7 +1081,7 @@ async fn start_daemon_with_agent_executable(
         .unwrap();
     let mut launch = LaunchSpec::embedded(workdir.to_path_buf());
     launch.session_persistence = false;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     launch.model = Some(model);
     launch.environment = [
@@ -1335,7 +1335,7 @@ async fn a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts() {
     let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            tickloop_harness_test_support::test_path!(daemon_holder_child_process).as_str(),
+            tickloop_harness::test_support::test_path!(daemon_holder_child_process).as_str(),
             "--nocapture",
         ])
         .env(DAEMON_HOLDER_REPORT, &report)
@@ -1368,7 +1368,7 @@ async fn a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts() {
     let next = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            tickloop_harness_test_support::test_path!(next_test_process_child_process).as_str(),
+            tickloop_harness::test_support::test_path!(next_test_process_child_process).as_str(),
         ])
         .env(NEXT_TEST_PROCESS, "1")
         .stdout(std::process::Stdio::null())
@@ -1572,7 +1572,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("state");
     let first_factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("Recorded result."),
+        tickloop_harness::test_support::text("Recorded result."),
     ]));
     let first = DaemonServer::new(Uuid::new_v4(), first_factory.clone());
     let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
@@ -1608,7 +1608,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     };
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         let snapshot = first.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle) { break; }
+        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     first
@@ -1634,7 +1634,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
         .await
         .unwrap();
     assert!(
-        matches!(preview.initial, ObservationValue::Transcript(transcript) if transcript.messages.iter().any(|entry| entry.message.content.iter().any(|block| matches!(block, tickloop_harness_protocol::Content::Text { text } if text == "Recorded result."))))
+        matches!(preview.initial, ObservationValue::Transcript(transcript) if transcript.messages.iter().any(|entry| entry.message.content.iter().any(|block| matches!(block, tickloop_harness::protocol::Content::Text { text } if text == "Recorded result."))))
     );
     assert_eq!(factory.started.load(Ordering::SeqCst), 0);
     assert!(agents(&daemon).await.is_empty());
@@ -1800,7 +1800,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("state");
     let factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("Saved before disconnect."),
+        tickloop_harness::test_support::text("Saved before disconnect."),
     ]));
     let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
@@ -1824,7 +1824,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     );
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         let snapshot = daemon.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle) { break; }
+        if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
     let saved = daemon
@@ -1899,34 +1899,34 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
 
 /// A scripted model that holds each request until the test releases it, so a run stays in flight.
 struct HeldModel {
-    script: tickloop_harness_test_support::ScriptedModel,
+    script: tickloop_harness::test_support::ScriptedModel,
     entered: Notify,
     release: Notify,
 }
 
 #[async_trait]
-impl tickloop_harness_model::ModelClient for HeldModel {
+impl tickloop_harness::model::ModelClient for HeldModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-        tickloop_harness_model::ModelClient::identity(&self.script)
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+        tickloop_harness::model::ModelClient::identity(&self.script)
     }
     async fn complete(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         self.entered.notify_one();
         self.release.notified().await;
-        tickloop_harness_model::ModelClient::complete(&self.script, request, events, cancel).await
+        tickloop_harness::model::ModelClient::complete(&self.script, request, events, cancel).await
     }
 }
 
@@ -1952,11 +1952,11 @@ struct LinkWorker {
 }
 
 impl LinkFixtureFactory {
-    fn new(directory: &Path, replies: Vec<Vec<tickloop_harness_protocol::Content>>) -> Self {
+    fn new(directory: &Path, replies: Vec<Vec<tickloop_harness::protocol::Content>>) -> Self {
         Self {
             directory: directory.to_path_buf(),
             model: Arc::new(HeldModel {
-                script: tickloop_harness_test_support::ScriptedModel::new(replies),
+                script: tickloop_harness::test_support::ScriptedModel::new(replies),
                 entered: Notify::new(),
                 release: Notify::new(),
             }),
@@ -2026,7 +2026,7 @@ impl WorkerFactory for LinkFixtureFactory {
         let index = self.started.fetch_add(1, Ordering::SeqCst);
         let runtime = Agent::open_embedded(
             launch.config_root.clone().unwrap(),
-            tickloop_harness_test_support::config(),
+            tickloop_harness::test_support::config(),
             self.model.clone(),
         )
         .unwrap();
@@ -2142,7 +2142,7 @@ async fn wait_until_completed(access: &dyn AgentAccess, target: ExecutionRef) {
                 })
                 .await
                 .unwrap();
-            if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle)
+            if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle)
             {
                 break;
             }
@@ -2158,7 +2158,7 @@ async fn a_live_worker_whose_daemon_link_closes_keeps_its_execution_and_is_never
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
-        vec![tickloop_harness_test_support::text(
+        vec![tickloop_harness::test_support::text(
             "Finished after the link closed.",
         )],
     ));
@@ -2200,7 +2200,7 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
-        vec![tickloop_harness_test_support::text(
+        vec![tickloop_harness::test_support::text(
             "Finished without its daemon.",
         )],
     ));
@@ -2271,7 +2271,7 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
-        vec![tickloop_harness_test_support::text(
+        vec![tickloop_harness::test_support::text(
             "Finished without its daemon.",
         )],
     ));
@@ -2352,8 +2352,8 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
 async fn an_execution_feed_can_close_while_the_daemon_connection_stays_available() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime));
     let socket = temporary.path().join("feed.sock");
@@ -2508,8 +2508,8 @@ async fn oversized_response_fixture(
     tokio::task::JoinHandle<Result<(), AccessError>>,
 ) {
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let inner = EmbeddedAgentAccess::new(runtime);
     let epoch = inner.daemon_epoch();
@@ -2729,7 +2729,7 @@ async fn moving_a_source_pane_requires_a_new_display_version_before_the_next_inp
     let host = serve_host_socket(listener, pane.clone(), Arc::new(AtomicUsize::new(0)));
     let first = host_location(&socket, &*pane.lock().await);
     let factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("The moved source was accepted."),
+        tickloop_harness::test_support::text("The moved source was accepted."),
     ]));
     let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     let (client, server) = serve(temporary.path(), daemon).await;
@@ -2832,7 +2832,7 @@ async fn a_nonterminal_creation_receipt_keeps_the_console_dispatch_gate_closed()
     let gate = Arc::new(Notify::new());
     let factory = Arc::new(FixtureFactory {
         gate: Some(gate.clone()),
-        ..FixtureFactory::new(vec![tickloop_harness_test_support::text(
+        ..FixtureFactory::new(vec![tickloop_harness::test_support::text(
             "The original dispatch finished.",
         )])
     });
@@ -2913,7 +2913,7 @@ async fn a_nonterminal_creation_receipt_keeps_the_console_dispatch_gate_closed()
 async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing_it() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("Explicit correction worked."),
+        tickloop_harness::test_support::text("Explicit correction worked."),
     ]));
     let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     let (client, server) = serve(temporary.path(), daemon).await;
@@ -3035,9 +3035,9 @@ async fn an_unknown_first_skill_registers_no_agent_runs_no_model_and_deduplicate
 async fn default_history_pages_return_multiple_records_and_transcript_messages() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![
-        tickloop_harness_test_support::text("One"),
-        tickloop_harness_test_support::text("Two"),
-        tickloop_harness_test_support::text("Three"),
+        tickloop_harness::test_support::text("One"),
+        tickloop_harness::test_support::text("Two"),
+        tickloop_harness::test_support::text("Three"),
     ]));
     let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     let (client, server) = serve(temporary.path(), daemon).await;
@@ -3064,7 +3064,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let observed = client.observe(ObservationRequest::Agent { execution: *ids.last().unwrap(), detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
-                if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle && snapshot.conversation.messages.len() > 1) { break; }
+                if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle && snapshot.conversation.messages.len() > 1) { break; }
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
@@ -3273,7 +3273,7 @@ async fn a_client_rejected_oversized_create_does_not_mark_acceptance_unknown() {
 /// serves the limits its bootstrap carries.
 struct SocketWorkerFactory {
     directory: PathBuf,
-    model: Arc<tickloop_harness_test_support::ScriptedModel>,
+    model: Arc<tickloop_harness::test_support::ScriptedModel>,
     runtimes: Mutex<Vec<Agent>>,
     announced: Mutex<Vec<ProtocolLimits>>,
     servers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -3287,7 +3287,7 @@ impl WorkerFactory for SocketWorkerFactory {
         epoch: Uuid,
     ) -> Result<Arc<dyn AgentAccess>, AccessError> {
         let runtime =
-            Agent::new_embedded(tickloop_harness_test_support::config(), self.model.clone());
+            Agent::new_embedded(tickloop_harness::test_support::config(), self.model.clone());
         self.runtimes.lock().await.push(runtime.clone());
         let served = Arc::new(EmbeddedAgentAccess::for_worker(runtime, epoch));
         let socket = self.directory.join("worker.sock");
@@ -3320,9 +3320,9 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(SocketWorkerFactory {
         directory: temporary.path().into(),
-        model: Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("First reply."),
-            tickloop_harness_test_support::text("Second reply."),
+        model: Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("First reply."),
+            tickloop_harness::test_support::text("Second reply."),
         ])),
         runtimes: Mutex::new(Vec::new()),
         announced: Mutex::new(Vec::new()),
@@ -3381,7 +3381,7 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if matches!(feed.recv().await.unwrap().change,
-                    ObservationChange::Event(event) if matches!(event.kind, tickloop_harness_protocol::EventKind::Completed { .. }))
+                    ObservationChange::Event(event) if matches!(event.kind, tickloop_harness::protocol::EventKind::Completed { .. }))
                 {
                     break;
                 }
@@ -3417,7 +3417,7 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
         .messages
         .iter()
         .flat_map(|message| &message.content)
-        .filter(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if *text == prompt))
+        .filter(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if *text == prompt))
         .count();
     assert_eq!(prompts, 2);
     assert_eq!(factory.model.requests.lock().unwrap().len(), 2);

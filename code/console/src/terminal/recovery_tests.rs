@@ -12,8 +12,8 @@ use tickloop_code_access::{
     ObservationChange, ObservationRequest, ObservationValue, REPLAY_CAPACITY, UserInput, ViewRef,
 };
 use tickloop_code_daemon::EmbeddedAgentAccess;
-use tickloop_harness_model::*;
-use tickloop_harness_protocol::{Event, LoopState, ModelIdentity, ModelProvider, Protocol, Usage};
+use tickloop_harness::model::*;
+use tickloop_harness::protocol::{Event, LoopState, ModelIdentity, ModelProvider, Protocol, Usage};
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -30,8 +30,8 @@ fn plain_replayed_reply_fixture() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut observation = agent.observe(chat, 0).await.unwrap();
@@ -103,14 +103,14 @@ mod startup_status_tests;
 mod thinking_stream_tests;
 mod working_activity_tests;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 #[tokio::test]
 async fn model_retry_replay_updates_the_live_row_and_preserves_final_failure() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let run_id = Uuid::new_v4();
@@ -270,11 +270,11 @@ struct GatedReply {
 impl ModelClient for GatedReply {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -324,7 +324,7 @@ impl ModelClient for GatedReply {
         }
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(REPLY),
+            content: tickloop_harness::test_support::text(REPLY),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -406,8 +406,8 @@ async fn run_completed_reply_recovery_fixture() {
     let route = std::env::var(ROUTE_VARIABLE).unwrap();
     let (finish_model, finish) = oneshot::channel();
     let flood_acknowledgements = Arc::new(tokio::sync::Semaphore::new(0));
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         Arc::new(GatedReply {
             release: Mutex::new(Some(gate)),
             finish: Mutex::new(if route == "running" {
@@ -428,7 +428,7 @@ async fn run_completed_reply_recovery_fixture() {
         view_id: Uuid::new_v4(),
     };
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
@@ -1054,11 +1054,11 @@ struct GuardedReplies {
 impl ModelClient for GuardedReplies {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -1084,7 +1084,7 @@ impl ModelClient for GuardedReplies {
         }
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(&text),
+            content: tickloop_harness::test_support::text(&text),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -1099,7 +1099,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
         let (release_current, current_gate) = oneshot::channel();
         let (release_other, other_gate) = oneshot::channel();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+            tickloop_harness::test_support::config(),
             Arc::new(GuardedReplies {
                 replies: Mutex::new(std::collections::VecDeque::from([
                     ("prior reply".into(), prior_gate, fails),
@@ -1116,7 +1116,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
         buffer_actual_text(&mut events, &prior, &mut buffered).await;
         release_prior.send(()).unwrap();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id == prior.run_id
                 && matches!(
                     event.kind,
@@ -1186,7 +1186,7 @@ async fn buffer_actual_text(
     buffered: &mut HashMap<Uuid, ReplyLines>,
 ) -> u64 {
     loop {
-        let event = tickloop_harness_test_support::next_event(events).await;
+        let event = tickloop_harness::test_support::next_event(events).await;
         if event.chat_id == receipt.chat_id
             && event.run_id == receipt.run_id
             && let EventKind::Text(text) = event.kind
@@ -1258,15 +1258,15 @@ fn routine_restore_pty_fixture() {
                 let mut replies = Vec::new();
                 if route == RAW_TOOL_ROUTE {
                     std::fs::write("raw-tool.txt", RAW_TOOL_CONTENT).unwrap();
-                    replies.push(tickloop_harness_test_support::call(
+                    replies.push(tickloop_harness::test_support::call(
                         "raw-read",
                         "Read",
                         serde_json::json!({"file_path":"raw-tool.txt"}),
                     ));
                 }
-                replies.push(tickloop_harness_test_support::text(ROUTINE_REPLY));
+                replies.push(tickloop_harness::test_support::text(ROUTINE_REPLY));
                 let expected_requests = replies.len();
-                let model = Arc::new(tickloop_harness_test_support::ScriptedModel::with_usages(
+                let model = Arc::new(tickloop_harness::test_support::ScriptedModel::with_usages(
                     replies,
                     vec![Usage {
                         input_tokens: Some(31),
@@ -1274,7 +1274,7 @@ fn routine_restore_pty_fixture() {
                         ..Usage::default()
                     }; expected_requests],
                 ));
-                let core = tickloop_harness_runtime::Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+                let core = tickloop_harness::runtime::Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
                 let workdir = std::env::current_dir().unwrap();
                 let access = EmbeddedAgentAccess::new(core.clone());
                 let adapter = Arc::new(SavedInputObservation {
@@ -1282,7 +1282,7 @@ fn routine_restore_pty_fixture() {
                     pending_run: Uuid::new_v4(),
                 });
                 let mut launch = LaunchSpec::embedded(workdir.clone());
-                launch.model = Some(tickloop_harness_test_support::config());
+                launch.model = Some(tickloop_harness::test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     adapter,
@@ -1301,7 +1301,7 @@ fn routine_restore_pty_fixture() {
                     let mut events = core.subscribe();
                     agent.submit(chat, ROUTINE_INPUT.into()).await.unwrap();
                     loop {
-                        let event = tickloop_harness_test_support::next_event(&mut events).await;
+                        let event = tickloop_harness::test_support::next_event(&mut events).await;
                         if matches!(event.kind, EventKind::Completed { .. }) {
                             break;
                         }
@@ -1443,11 +1443,11 @@ const RETAINED_COMPLETION_STAGE: &str = "retained-completion-stage";
 impl ModelClient for RetainedCompletionModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -1495,7 +1495,7 @@ impl ModelClient for RetainedCompletionModel {
         events.send(ModelDelta::Text(reply.into())).unwrap();
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(reply),
+            content: tickloop_harness::test_support::text(reply),
             usage: Usage {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
@@ -1533,13 +1533,13 @@ async fn run_retained_completion_lifecycle_fixture() {
     let model = Arc::new(RetainedCompletionModel {
         turns: std::sync::atomic::AtomicUsize::new(0),
     });
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model.clone(),
     );
     let access = EmbeddedAgentAccess::new(core.clone());
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         Arc::new(access.clone()),
@@ -1944,7 +1944,7 @@ fn run_routine_restore_pty(route: &str) {
 
 /// Holds each model request until the test releases it, in arrival order.
 struct HeldRequests {
-    model: Arc<tickloop_harness_test_support::ScriptedModel>,
+    model: Arc<tickloop_harness::test_support::ScriptedModel>,
     gates: Mutex<std::collections::VecDeque<oneshot::Receiver<()>>>,
     entered: mpsc::UnboundedSender<()>,
 }
@@ -1953,11 +1953,11 @@ struct HeldRequests {
 impl ModelClient for HeldRequests {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -2073,16 +2073,16 @@ async fn run_merge_boundary_fixture() {
     let (release_first, first) = oneshot::channel();
     let (release_second, second) = oneshot::channel();
     let (entered, mut requests) = mpsc::unbounded_channel();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "shell",
             "Bash",
             serde_json::json!({"command": "printf merged"}),
         ),
-        tickloop_harness_test_support::text("answered all three"),
+        tickloop_harness::test_support::text("answered all three"),
     ]));
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         Arc::new(HeldRequests {
             model: model.clone(),
             gates: Mutex::new([first, second].into()),
@@ -2095,7 +2095,7 @@ async fn run_merge_boundary_fixture() {
         release: CancellationToken::new(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
@@ -2110,7 +2110,7 @@ async fn run_merge_boundary_fixture() {
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     core.set_execution_mode(
         chat.into(),
-        tickloop_harness_protocol::ExecutionMode::FullAccess,
+        tickloop_harness::protocol::ExecutionMode::FullAccess,
     )
     .await
     .unwrap();

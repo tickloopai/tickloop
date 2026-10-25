@@ -845,7 +845,7 @@ mod tests {
 
     use tickloop_code_access::{AccessErrorCode, AgentCommand, CommandResult, PersistenceState};
 
-    use tickloop_harness_runtime::Agent;
+    use tickloop_harness::runtime::Agent;
 
     struct OneWorker(Arc<dyn AgentAccess>);
     #[async_trait]
@@ -876,8 +876,8 @@ mod tests {
 
     fn runtime() -> Agent {
         Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         )
     }
 

@@ -656,7 +656,7 @@ mod tests {
         let owner = state.input_owner;
         assert!(state.freeze_delayed_submission(Vec::new(), None));
         let image = Image {
-            media_type: tickloop_harness_protocol::ImageMediaType::Png,
+            media_type: tickloop_harness::protocol::ImageMediaType::Png,
             data: "a".repeat(MAX_DELAYED_BYTES),
             width: 1,
             height: 1,

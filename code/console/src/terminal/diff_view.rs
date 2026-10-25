@@ -5,8 +5,8 @@ use std::{
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use tickloop_harness_protocol::FileChangeAction;
-use tickloop_harness_tools::file_change::{FileChangeLineKind, FileChangeReview};
+use tickloop_harness::protocol::FileChangeAction;
+use tickloop_harness::tools::file_change::{FileChangeLineKind, FileChangeReview};
 
 const TAB_COLUMNS: usize = 4;
 const MAX_CONSECUTIVE_ZERO_WIDTH_CHARACTERS: usize = 16;
@@ -904,8 +904,8 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use tickloop_harness_protocol::FileVersion;
-    use tickloop_harness_tools::file_change::{FileChangeHunk, FileChangeLine};
+    use tickloop_harness::protocol::FileVersion;
+    use tickloop_harness::tools::file_change::{FileChangeHunk, FileChangeLine};
 
     fn version(bytes: u64, lines: u64, newline: bool) -> FileVersion {
         FileVersion {

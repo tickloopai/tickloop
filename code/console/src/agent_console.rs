@@ -11,7 +11,7 @@ use tickloop_code_access::{
     ExecutionRef, HostLocation, InteractionSource, LaunchSpec, MAX_PAGE_LIMIT, ObservationRequest,
     ObservationValue, Page, ReceiptState, TranscriptRef, UserInput, ViewRef,
 };
-use tickloop_harness_protocol::{LoopState, RunId};
+use tickloop_harness::protocol::{LoopState, RunId};
 
 use uuid::Uuid;
 const FINISHED_CHILD_GRACE_MS: u64 = 30_000;
@@ -139,7 +139,7 @@ impl AgentConsole {
             closed: false,
             unconfirmed_dispatch: None,
             created: None,
-            clock: Arc::new(tickloop_harness_base::private_fs::unix_time_milliseconds),
+            clock: Arc::new(tickloop_harness::base::private_fs::unix_time_milliseconds),
             last_viewed: HashMap::new(),
             retirements: HashMap::new(),
         }

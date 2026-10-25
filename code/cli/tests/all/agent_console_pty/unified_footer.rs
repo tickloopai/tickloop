@@ -1,8 +1,8 @@
 use super::*;
 use tickloop_code_access::AgentAccess;
-use tickloop_harness_protocol::ShellTask;
+use tickloop_harness::protocol::ShellTask;
 
-use tickloop_harness_test_support::screen::SELECTED_MARK;
+use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 const TASK_TITLE: &str = "Inspect the shared task panel";
 const TASK_REPLY: &str = "SHARED-TASK-READY";

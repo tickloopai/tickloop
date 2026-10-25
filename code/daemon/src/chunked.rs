@@ -103,7 +103,7 @@ mod tests {
     use tickloop_code_access::{
         Cursor, ObservationValue, RecordedMessage, RecordedTranscript, TranscriptRef,
     };
-    use tickloop_harness_protocol::{Content, Message, Role};
+    use tickloop_harness::protocol::{Content, Message, Role};
 
     use tokio::io::AsyncReadExt;
     use uuid::Uuid;

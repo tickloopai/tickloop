@@ -14,7 +14,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 use tick_oauth_test_server::{AuthorizationServer, TokenReply, USER_CODE};
 use tick_packages::{CURRENT_TARGET, OAuthToken, PackageCredentials};
-use tickloop_harness_test_support::{input_dialog, screen};
+use tickloop_harness::test_support::{input_dialog, screen};
 
 use crate::tick_package_commands::{
     Fixture, Reply, Server, archive_of, marketplace_json, oauth2, offered, path_text, succeeded,
@@ -69,7 +69,7 @@ impl Terminal {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "TMUX"] {
             command.env_remove(name);
         }
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }

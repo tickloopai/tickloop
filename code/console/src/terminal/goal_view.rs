@@ -61,8 +61,8 @@ pub(super) struct GoalView<'a> {
 }
 
 impl<'a> GoalView<'a> {
-    pub(super) fn from_snapshot(goal: &'a tickloop_harness_protocol::GoalSnapshot) -> Self {
-        use tickloop_harness_protocol::{GoalStatus, GoalVerdict};
+    pub(super) fn from_snapshot(goal: &'a tickloop_harness::protocol::GoalSnapshot) -> Self {
+        use tickloop_harness::protocol::{GoalStatus, GoalVerdict};
         Self {
             condition: &goal.objective,
             state: match goal.status {
@@ -211,10 +211,10 @@ fn format_elapsed(milliseconds: u64) -> String {
 mod tests;
 
 pub(super) fn notice_pieces(
-    notice: &tickloop_harness_protocol::GoalNotice,
+    notice: &tickloop_harness::protocol::GoalNotice,
     objective: &str,
 ) -> Vec<super::console::ConversationPiece> {
-    use tickloop_harness_protocol::{GoalBlock, GoalNotice};
+    use tickloop_harness::protocol::{GoalBlock, GoalNotice};
     let (mut text, role): (String, Role) = match notice {
         GoalNotice::Set => ("Goal set".into(), Role::Accent),
         GoalNotice::Completed => ("Goal achieved".into(), Role::Success),
@@ -258,7 +258,10 @@ pub(super) fn notice_pieces(
 
 pub(super) fn continuation_runs() -> Vec<(String, Option<Role>)> {
     vec![(
-        format!("\n{}\n", tickloop_harness_protocol::GOAL_CONTINUATION_EVENT),
+        format!(
+            "\n{}\n",
+            tickloop_harness::protocol::GOAL_CONTINUATION_EVENT
+        ),
         Some(Role::MutedText),
     )]
 }

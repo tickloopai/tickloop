@@ -1,6 +1,6 @@
 use super::*;
 use tickloop_code_access::AgentCommand;
-use tickloop_harness_protocol::{GoalAction, GoalSnapshot, GoalStatus};
+use tickloop_harness::protocol::{GoalAction, GoalSnapshot, GoalStatus};
 
 const MAX_OBJECTIVE_CHARACTERS: usize = 4000;
 const NO_GOAL: &str = "No Goal is set; use /goal CONDITION.";

@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult, AutoRule, AutoRuleSource,
     DenialPersistence, DisplaySummary, LoopState, SubagentRegistration,
 };
@@ -147,11 +147,11 @@ fn merged_provider_diagnostics_resize_with_the_selected_connection_and_live_clea
             chat,
             HashMap::from([(
                 "deepseek-api".into(),
-                tickloop_harness_protocol::ProviderHttpFailure {
+                tickloop_harness::protocol::ProviderHttpFailure {
                     provider_id: "deepseek-api".into(),
                     provider_name: "DeepSeek".into(),
                     status: 403,
-                    class: tickloop_harness_protocol::ProviderFailureClass::UsageLimit,
+                    class: tickloop_harness::protocol::ProviderFailureClass::UsageLimit,
                     message: "Bounded provider notice".into(),
                     hint: "Check allowance".into(),
                     retry_after: None,
@@ -391,12 +391,14 @@ fn content_height_user_confirmation_is_natural_without_agent_request_ownership()
 async fn content_height_permission_rule_editor_stays_visible_or_blocks_input_when_tiny() {
     let directory = tempfile::tempdir().unwrap();
     let agent = crate::terminal::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut view = agent.permissions_view(chat).await.unwrap();
-    view.execution_mode = tickloop_harness_protocol::ExecutionMode::Auto;
+    view.execution_mode = tickloop_harness::protocol::ExecutionMode::Auto;
     let mut surface =
         PermissionsSurface::open(view, PermissionsReturn::ModePicker { settings: false });
     surface.open_auto();
@@ -508,7 +510,7 @@ fn content_height_resume_fits_empty_short_and_overflow_lists_without_moving_focu
 #[test]
 fn content_height_artifacts_fits_loading_groups_and_overflow() {
     use crate::terminal::artifacts_picker::ArtifactsPicker;
-    use tickloop_harness_artifacts::{ArtifactMetadata, ArtifactPage};
+    use tickloop_harness::artifacts::{ArtifactMetadata, ArtifactPage};
     for (height, count, expected) in [
         (24, 0, 5),
         (24, 2, 10),
@@ -555,12 +557,14 @@ fn content_height_artifacts_fits_loading_groups_and_overflow() {
 async fn content_height_permission_management_history_fits_loaded_and_empty_records() {
     let directory = tempfile::tempdir().unwrap();
     let agent = crate::terminal::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut view = agent.permissions_view(chat).await.unwrap();
-    view.execution_mode = tickloop_harness_protocol::ExecutionMode::AcceptEdits;
+    view.execution_mode = tickloop_harness::protocol::ExecutionMode::AcceptEdits;
     let record = ApprovalRecord {
         id: Uuid::new_v4(),
         chat_id: chat.into(),
@@ -666,7 +670,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
             assert!(frame.last().unwrap().text().contains("r retry"));
         }
     }
-    view.execution_mode = tickloop_harness_protocol::ExecutionMode::Auto;
+    view.execution_mode = tickloop_harness::protocol::ExecutionMode::Auto;
     for (height, count, expected) in [
         (24, 0, 10),
         (40, 2, 12),
@@ -678,7 +682,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
             .map(|index| AutoRule {
                 clears: None,
                 id: format!("controlled-{index}"),
-                kind: tickloop_harness_protocol::AutoRuleKind::SoftAllow,
+                kind: tickloop_harness::protocol::AutoRuleKind::SoftAllow,
                 text: format!("Controlled rule {index}"),
                 source: AutoRuleSource::User,
             })

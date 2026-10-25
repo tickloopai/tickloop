@@ -10,7 +10,7 @@ use super::{
         navigate_error, render_diff, render_error,
     },
 };
-use tickloop_harness_protocol::{FileChangeAction, FileChangeReviewSummary};
+use tickloop_harness::protocol::{FileChangeAction, FileChangeReviewSummary};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DiffDialogMode {
@@ -453,8 +453,8 @@ mod tests {
     use crate::terminal::diff_catalog::{
         CatalogFileChange, CatalogFileChangeId, CatalogUnavailableKind, ChangeSourceState,
     };
-    use tickloop_harness_protocol::{FileChangeAction, FileVersion};
-    use tickloop_harness_tools::file_change::{
+    use tickloop_harness::protocol::{FileChangeAction, FileVersion};
+    use tickloop_harness::tools::file_change::{
         FileChangeHunk, FileChangeLine, FileChangeLineKind, FileChangeReview,
     };
 

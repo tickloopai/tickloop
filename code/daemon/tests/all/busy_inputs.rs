@@ -20,11 +20,11 @@ use tickloop_code_access::{
     ObservationRequest, ObservationValue, ReceiptState, UserInput,
 };
 use tickloop_code_daemon::EmbeddedAgentAccess;
-use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness_protocol::{EventKind, LoopState, ModelIdentity, Receipt};
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::protocol::{EventKind, LoopState, ModelIdentity, Receipt};
 
-use tickloop_harness_runtime::Agent;
-use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+use tickloop_harness::runtime::Agent;
+use tickloop_harness::test_support::{ScriptedModel, call, config, text};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -48,11 +48,11 @@ struct GatedFirstRequest {
 impl ModelClient for GatedFirstRequest {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -97,14 +97,14 @@ impl Busy {
     /// An Agent whose first run is waiting on its first model request.
     async fn start(
         directory: &Path,
-        replies: Vec<Vec<tickloop_harness_protocol::Content>>,
+        replies: Vec<Vec<tickloop_harness::protocol::Content>>,
     ) -> Self {
         Self::start_with_archive(directory, replies, None).await
     }
 
     async fn start_with_archive(
         directory: &Path,
-        replies: Vec<Vec<tickloop_harness_protocol::Content>>,
+        replies: Vec<Vec<tickloop_harness::protocol::Content>>,
         archive: Option<PathBuf>,
     ) -> Self {
         let source = directory.canonicalize().unwrap().join("source.txt");
@@ -245,9 +245,9 @@ impl Busy {
             .map(|input| {
                 requests.iter().position(|request| {
                     request.messages.iter().any(|message| {
-                        message.role == tickloop_harness_protocol::Role::User
+                        message.role == tickloop_harness::protocol::Role::User
                             && message.content.iter().any(|content| {
-                                matches!(content, tickloop_harness_protocol::Content::Text { text } if text == input)
+                                matches!(content, tickloop_harness::protocol::Content::Text { text } if text == input)
                             })
                     })
                 })
@@ -431,7 +431,7 @@ async fn assert_text_only_batch(count: usize) {
     );
     for (input, receipt) in INPUTS[..count].iter().zip(&accepted) {
         let index = settled.conversation.messages.iter().position(|message| {
-            message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == input))
+            message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == input))
         }).unwrap();
         assert_eq!(
             settled.conversation.message_runs.get(&index),
@@ -530,7 +530,7 @@ async fn a_started_input_batch_is_recoverable_before_its_model_reply() {
     }));
     for (input, receipt) in INPUTS.iter().zip(&accepted) {
         let index = started.conversation.messages.iter().position(|message| {
-            message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == input))
+            message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == input))
         }).expect("each accepted input is already in the started batch");
         assert_eq!(
             started.conversation.message_runs.get(&index),
@@ -543,7 +543,7 @@ async fn a_started_input_batch_is_recoverable_before_its_model_reply() {
     let history = recovered.resume_chat(busy.active.chat_id).await.unwrap();
     for (input, receipt) in INPUTS.iter().zip(&accepted) {
         let indexes = history.messages.iter().enumerate().filter_map(|(index, message)| {
-            message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == input)).then_some(index)
+            message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == input)).then_some(index)
         }).collect::<Vec<_>>();
         assert_eq!(
             indexes.len(),
@@ -614,9 +614,9 @@ async fn assert_direct_skill_boundary(tool_boundary: bool) {
         .iter()
         .position(|request| {
             request.messages.iter().any(|message| {
-                message.role == tickloop_harness_protocol::Role::User
+                message.role == tickloop_harness::protocol::Role::User
                     && message.content.iter().any(|content| {
-                        matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "/queued-boundary typed Skill input")
+                        matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "/queued-boundary typed Skill input")
                     })
             })
         });
@@ -762,7 +762,7 @@ async fn a_foreground_shell_barrier_splits_text_only_input_batches() {
         .unwrap();
     assert_eq!(
         record.state,
-        tickloop_harness_protocol::UserShellState::Completed
+        tickloop_harness::protocol::UserShellState::Completed
     );
     let third = {
         let requests = busy.model.requests.lock().unwrap();
@@ -870,8 +870,8 @@ async fn worker_submissions_are_ledger_inputs_settled_by_their_answers() {
     );
     assert!(settled.iter().all(|(_, state)| matches!(
         state,
-        tickloop_harness_transcript::InputState::Settled {
-            outcome: tickloop_harness_transcript::SettledOutcome::Completed { .. }
+        tickloop_harness::transcript::InputState::Settled {
+            outcome: tickloop_harness::transcript::SettledOutcome::Completed { .. }
         }
     )));
 }

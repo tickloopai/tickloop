@@ -1,10 +1,10 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use tickloop_harness_model::{
+use tickloop_harness::model::{
     GenerationBudget, ModelClients, ModelError, ModelRequest, ModelResponseRejection,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, ChatStatus, Content, ExecutionMode, LoopState, Message, Role,
 };
 use tokio_util::sync::CancellationToken;
@@ -65,9 +65,9 @@ pub(super) async fn generate(
     if request.cancel.is_cancelled() {
         return SuggestionResult::empty("cancelled");
     }
-    let model = tickloop_harness_model::auxiliary::auxiliary_model_config(
+    let model = tickloop_harness::model::auxiliary::auxiliary_model_config(
         &snapshot.model,
-        tickloop_harness_model::auxiliary::AuxiliaryTask::PromptSuggestion,
+        tickloop_harness::model::auxiliary::AuxiliaryTask::PromptSuggestion,
     )
     .unwrap_or_else(|| snapshot.model.clone());
     // Unit-test Views can retain real Provider identities while replacing their main client.
@@ -118,7 +118,7 @@ pub(super) async fn generate(
     if !recent.iter().any(|message| message["role"] == "user") {
         return SuggestionResult::empty("suppressed: no recent user prompt");
     }
-    let policy = tickloop_harness_model::auxiliary::AuxiliaryTask::PromptSuggestion.budget();
+    let policy = tickloop_harness::model::auxiliary::AuxiliaryTask::PromptSuggestion.budget();
     let budget = GenerationBudget::new(
         policy.output_tokens().min(model.max_output_tokens),
         policy.timeout(),

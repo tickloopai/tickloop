@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const QUEUE_FIXTURE: &str = "TICKLOOP_PENDING_INPUT_FIXTURE";
 const QUEUE_ROUTE: &str = "TICKLOOP_PENDING_INPUT_ROUTE";
@@ -48,11 +48,11 @@ impl AgentAccess for QueueAccess {
 impl ModelClient for QueueModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -85,7 +85,7 @@ impl ModelClient for QueueModel {
                 std::env::var(QUEUE_ROUTE).as_deref(),
                 Ok("tool" | "external")
             ) {
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 &format!("queue-read-{call}"),
                 "Read",
                 serde_json::json!({"file_path":"queue-input.txt"}),
@@ -94,7 +94,7 @@ impl ModelClient for QueueModel {
             events
                 .send(ModelDelta::Text(format!("Queue reply {call}")))
                 .unwrap();
-            tickloop_harness_test_support::text(&format!("Queue reply {call}"))
+            tickloop_harness::test_support::text(&format!("Queue reply {call}"))
         };
         Ok(ModelOutput {
             private_source: None,
@@ -124,11 +124,11 @@ fn pending_input_pty_fixture() {
                     calls: AtomicUsize::new(0),
                     requests: Mutex::new(Vec::new()),
                 });
-                let core = tickloop_harness_runtime::Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+                let core = tickloop_harness::runtime::Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
                 let access = Arc::new(QueueAccess {daemon:EmbeddedAgentAccess::new(core.clone())});
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
-                launch.model = Some(tickloop_harness_test_support::config());
+                launch.model = Some(tickloop_harness::test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
@@ -184,7 +184,7 @@ fn pending_input_pty_fixture() {
                 let (console, input) = Console::start(true).unwrap();
                 initialize_startup_console(
                     &console,
-                    Some(&tickloop_harness_test_support::config()),
+                    Some(&tickloop_harness::test_support::config()),
                     &workdir,
                     ExecutionMode::AcceptEdits,
                     Vec::new(),

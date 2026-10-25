@@ -8,20 +8,20 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::InstanceRef;
-use tickloop_harness_model::judgment::{
+use tickloop_harness::model::judgment::{
     Answer, Evaluation, EvaluationRequest, JudgmentClient, JudgmentError, Question,
 };
-use tickloop_harness_runtime::{
+use tickloop_harness::runtime::{
     Agent,
     host_tools::{HostCallResult, HostToolPermission, HostToolProvider, PreparedHostCall},
 };
 use tokio_util::sync::CancellationToken;
 
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ApprovalPath, ChatId, Decision, EventKind, ExecutionMode, LoopState, PermissionRule,
     PreparedApprovalFacts, ToolDefinition, ToolResult, Usage,
 };
-use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+use tickloop_harness::test_support::{ScriptedModel, call, config, text};
 
 /// TickManage as a Tick tool provider declares it, recording each call that was dispatched.
 #[derive(Default)]
@@ -161,7 +161,7 @@ async fn tick_modification_mode_rules_and_human_recovery_apply_to_new_messages_f
             agent
                 .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
                     text(
-                        &tickloop_harness_test_support::auto_classification(true).to_string()
+                        &tickloop_harness::test_support::auto_classification(true).to_string()
                     );
                     14
                 ])))
@@ -222,7 +222,7 @@ async fn tick_modification_mode_rules_and_human_recovery_apply_to_new_messages_f
                 .unwrap();
             let mut prompted = false;
             loop {
-                match tickloop_harness_test_support::next_event(&mut events)
+                match tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind
                 {
@@ -281,7 +281,7 @@ async fn assert_mode_admits_tick_modification_without_human(mode: ExecutionMode,
         text("Closed."),
     ]));
     let reviewer = Arc::new(ScriptedModel::new(vec![text(
-        &tickloop_harness_test_support::auto_classification(false).to_string(),
+        &tickloop_harness::test_support::auto_classification(false).to_string(),
     )]));
     let agent = Agent::new_embedded(config(), model);
     agent.install_host_tools(host.clone()).unwrap();
@@ -301,7 +301,7 @@ async fn assert_mode_admits_tick_modification_without_human(mode: ExecutionMode,
         .await
         .unwrap();
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {

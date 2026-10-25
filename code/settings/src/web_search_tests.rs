@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_protocol::{SearchConfig, SearchProviderKind};
+use tickloop_harness::protocol::{SearchConfig, SearchProviderKind};
 
 #[test]
 fn search_defaults_and_explicit_off_survive_settings_reload() {

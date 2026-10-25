@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::{Url, redirect::Policy};
 use serde::Deserialize;
-use tickloop_harness_base::network::{HttpPolicy, build_http_client};
+use tickloop_harness::base::network::{HttpPolicy, build_http_client};
 
 const RELEASE_API: &str = "https://api.github.com/repos/tickloopai/homebrew-tap/releases/latest";
 const MAX_METADATA_BYTES: usize = 1024 * 1024;

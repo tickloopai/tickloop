@@ -6,15 +6,15 @@ use tickloop_code_console::monitor_rows::{
     TickDescriptor, TickGlyph, TickGroup, TickIntent,
 };
 use tickloop_code_local_environment::AgentLocalExt;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     EventKind, ObservationKind, TickSubscriptionChange, TickSubscriptionFrequency,
 };
-use tickloop_harness_runtime::{
+use tickloop_harness::runtime::{
     Agent, ShellTaskCenter,
     tick_adapter::{ShellAdapter, TickAdapter, TickAdapters},
     tick_stream::{InMemoryTickStream, TickObservation, TickStreamPort},
 };
-use tickloop_harness_test_support::*;
+use tickloop_harness::test_support::*;
 use uuid::Uuid;
 
 struct CalendarAdapter {
@@ -67,7 +67,9 @@ const SHELL_QUIET_WAIT: Duration = Duration::from_secs(2);
 fn calendar() -> InstanceRef {
     InstanceRef::new("cal", "a").unwrap()
 }
-async fn complete(events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>) {
+async fn complete(
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
+) {
     loop {
         if matches!(next_event(events).await.kind, EventKind::Completed { .. }) {
             return;
@@ -316,12 +318,12 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
 #[test]
 fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     let instance = InstanceRef::new("cal", "remote").unwrap();
-    let mut chat: tickloop_harness_protocol::ChatSnapshot = serde_json::from_value(
+    let mut chat: tickloop_harness::protocol::ChatSnapshot = serde_json::from_value(
         json!({"id":Uuid::new_v4(),"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
     chat.monitor.remove(instance.clone());
-    let subscription = |accumulated: u64| -> tickloop_harness_protocol::TickSubscriptionStatus {
+    let subscription = |accumulated: u64| -> tickloop_harness::protocol::TickSubscriptionStatus {
         serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
     };
     let unread = |rows: &[tickloop_code_console::monitor_rows::TickDescriptor]| {
@@ -334,7 +336,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     let listed = |subscriptions| {
         MonitorRowsRegistry::builtin().list(&MonitorContext {
             chat: Some(std::sync::Arc::new(
-                tickloop_harness_protocol::ChatStatus::of(&chat),
+                tickloop_harness::protocol::ChatStatus::of(&chat),
             )),
             subscriptions,
             ..Default::default()
@@ -364,7 +366,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert_eq!(unread(&rows), Some(1));
 
     let mut interrupted = subscription(0);
-    interrupted.loop_state = tickloop_harness_protocol::LoopState::Interrupted;
+    interrupted.loop_state = tickloop_harness::protocol::LoopState::Interrupted;
     assert_eq!(
         listed(vec![interrupted]).len(),
         1,
@@ -375,7 +377,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
 /// Built-in rows only describe what each key means; the Console decides how to carry it out.
 #[test]
 fn built_in_rows_describe_their_actions_as_intents() {
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{
         MonitorMember, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
         ShellTaskSnapshot, ShellTaskState, TickSubscriptionStatus,
     };
@@ -417,10 +419,10 @@ fn built_in_rows_describe_their_actions_as_intents() {
         subscription("calendar:pane"),
         subscription("artifact:https://docs.example/a"),
     );
-    let snapshot: tickloop_harness_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
+    let snapshot: tickloop_harness::protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"},"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(std::sync::Arc::new(
-            tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            tickloop_harness::protocol::ChatStatus::of(&snapshot),
         )),
         shells: Some(ShellTaskSnapshot {
             chat_id: chat.into(),
@@ -535,7 +537,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
 
 #[test]
 fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_order() {
-    use tickloop_harness_protocol::TickSubscriptionStatus;
+    use tickloop_harness::protocol::TickSubscriptionStatus;
     let row = |time: Option<u64>,
                title: Option<&str>,
                frequency: &str,
@@ -587,7 +589,7 @@ async fn shell_subscription_refuses_a_foreign_chat_before_its_baseline() {
         )
         .await
         .unwrap();
-    let shell_stream = tickloop_harness_runtime::tick_adapter::ShellTickStream::new(agent.clone());
+    let shell_stream = tickloop_harness::runtime::tick_adapter::ShellTickStream::new(agent.clone());
     let target = InstanceRef::shell(task.command_id);
     assert!(
         shell_stream
@@ -606,7 +608,7 @@ async fn shell_subscription_refuses_a_foreign_chat_before_its_baseline() {
             .revalidate_watch(
                 owner.into(),
                 &target,
-                Some(&tickloop_harness_protocol::HostToolAuthority::Mcp {
+                Some(&tickloop_harness::protocol::HostToolAuthority::Mcp {
                     server_id: "https://unrelated.example".into(),
                     account_id: "unrelated".into()
                 })
@@ -659,7 +661,7 @@ async fn an_artifact_row_prefers_its_cached_title_over_the_joined_one() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let tick = tickloop_harness_protocol::ArtifactTick {
+    let tick = tickloop_harness::protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: "Joined title".into(),
@@ -688,7 +690,7 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let tick = tickloop_harness_protocol::ArtifactTick {
+    let tick = tickloop_harness::protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: "Linked".into(),
@@ -708,7 +710,7 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
         }
         let mut context = MonitorContext {
             chat: Some(std::sync::Arc::new(
-                tickloop_harness_protocol::ChatStatus::of(&snapshot),
+                tickloop_harness::protocol::ChatStatus::of(&snapshot),
             )),
             ..Default::default()
         };

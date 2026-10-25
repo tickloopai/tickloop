@@ -59,7 +59,7 @@ impl LocalCommand {
 
 async fn start_feedback_view(fixture: &PrivateFixture, base_url: &str) -> PtyView {
     fixture.set_chat_model(base_url);
-    tickloop_harness_model::credentials::save_api_key(
+    tickloop_harness::model::credentials::save_api_key(
         &fixture.path("config").canonicalize().unwrap(),
         "DEEPSEEK_API_KEY",
         "fixture-deepseek-key",
@@ -129,7 +129,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
         rows[0].execution,
         "first model run completes before navigation",
         |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         },
     )
     .await;
@@ -279,7 +279,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
                 panic!("expected background Agent status");
             };
             if status.chat.chat_loop.run_id != before.conversation.chat_loop.run_id
-                && status.chat.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+                && status.chat.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
             {
                 break;
             }
@@ -292,7 +292,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
     assert!(completed.conversation.messages.iter().any(|message| {
         message.content.iter().any(|content| {
             matches!(content,
-                tickloop_harness_protocol::Content::Text { text } if text == SECOND_REPLY)
+                tickloop_harness::protocol::Content::Text { text } if text == SECOND_REPLY)
         })
     }));
     assert!(

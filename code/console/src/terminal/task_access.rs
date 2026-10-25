@@ -9,7 +9,7 @@ use super::execution::ConsoleExecution;
 use tickloop_code_access::{
     AccessError, AgentCommand, ExecutionAvailability, TaskAction, TaskOrigin, TaskRef,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatStatus, ShellTask, ShellTaskAction, ShellTaskCenterError, ShellTaskOrigin,
     ShellTaskOutputChunk, ShellTaskSnapshot, ShellTaskState, UserShellState,
 };
@@ -268,9 +268,11 @@ mod timestamp_tests {
     #[tokio::test]
     async fn completed_shell_time_is_recovered_when_an_older_daemon_snapshot_is_resynced() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         runtime.install_own_tickhost();
         let access = Arc::new(OlderTaskRecords(EmbeddedAgentAccess::new(runtime.clone())));
@@ -294,7 +296,7 @@ mod timestamp_tests {
             loop {
                 let record = events.recv().await.unwrap();
                 if record.id == receipt.command_id
-                    && record.state == tickloop_harness_protocol::UserShellState::Failed
+                    && record.state == tickloop_harness::protocol::UserShellState::Failed
                 {
                     break record;
                 }
@@ -320,9 +322,11 @@ mod timestamp_tests {
     #[tokio::test]
     async fn a_snapshot_holds_only_its_own_chats_tasks() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
         let agent = ConsoleExecution::from_access_for_test(
@@ -444,9 +448,9 @@ mod availability_tests {
             FailureProjection::Unavailable,
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let runtime = tickloop_harness_runtime::Agent::new_embedded(
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            let runtime = tickloop_harness::runtime::Agent::new_embedded(
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
             );
             let actual = EmbeddedAgentAccess::new(runtime.clone());
             let epoch = actual.daemon_epoch();

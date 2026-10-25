@@ -56,7 +56,7 @@ use crate::monitor_rows::{
     SubscriptionMark, TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
 };
 use tick_protocol::InstanceRef;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatStatus, MonitorMembership, ShellTaskSnapshot, TickSubscriptionFrequency,
     TickSubscriptionStatus,
 };
@@ -133,7 +133,7 @@ pub(super) struct Monitor {
     task_flashes: HashMap<Uuid, u64>,
     pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
     pub(super) subscriptions: Vec<TickSubscriptionStatus>,
-    pub(super) metadata: HashMap<String, Option<tickloop_harness_artifacts::ArtifactMetadata>>,
+    pub(super) metadata: HashMap<String, Option<tickloop_harness::artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
     pub(super) member_findings: crate::monitor_rows::MemberFindings,
     /// Pages already loaded, retained when scrolling back.
@@ -238,14 +238,14 @@ impl Monitor {
         if let Some(status) = &self.chat_status
             && matches!(
                 status.goal.as_ref()?.status,
-                tickloop_harness_protocol::GoalStatus::Active
+                tickloop_harness::protocol::GoalStatus::Active
             )
             && matches!(
                 status.chat_loop.state,
-                tickloop_harness_protocol::LoopState::Running
-                    | tickloop_harness_protocol::LoopState::WaitingPermission
-                    | tickloop_harness_protocol::LoopState::WaitingQuestion
-                    | tickloop_harness_protocol::LoopState::WaitingPlan
+                tickloop_harness::protocol::LoopState::Running
+                    | tickloop_harness::protocol::LoopState::WaitingPermission
+                    | tickloop_harness::protocol::LoopState::WaitingQuestion
+                    | tickloop_harness::protocol::LoopState::WaitingPlan
             )
         {
             let since = status
@@ -254,7 +254,7 @@ impl Monitor {
                 .updated_at_ms
                 .max(status.chat_loop.run_started_at.unwrap_or(u64::MAX));
             view.elapsed_ms = view.elapsed_ms.saturating_add(
-                tickloop_harness_base::private_fs::unix_time_milliseconds().saturating_sub(since),
+                tickloop_harness::base::private_fs::unix_time_milliseconds().saturating_sub(since),
             );
         }
         Some(view)
@@ -288,12 +288,12 @@ impl Monitor {
             .iter()
             .find(|entry| &entry.instance == instance)
     }
-    fn tasks(&self) -> &[tickloop_harness_protocol::ScheduledTask] {
+    fn tasks(&self) -> &[tickloop_harness::protocol::ScheduledTask] {
         self.chat_status
             .as_ref()
             .map_or(&[], |chat| chat.scheduled_tasks.as_slice())
     }
-    pub(super) fn selected_task(&self) -> Option<&tickloop_harness_protocol::ScheduledTask> {
+    pub(super) fn selected_task(&self) -> Option<&tickloop_harness::protocol::ScheduledTask> {
         let MonitorTarget::ScheduledTask(id) = self.selected.as_ref()? else {
             return None;
         };
@@ -354,7 +354,7 @@ impl Monitor {
     }
     fn waiting_task(&self, id: &Uuid) -> bool {
         self.chat_status.as_ref().is_some_and(|chat| chat.pending_inputs.iter().any(|input| {
-            matches!(&input.trigger_source, Some(tickloop_harness_protocol::TriggerSource::ScheduledTask { task_id, .. }) if task_id == id)
+            matches!(&input.trigger_source, Some(tickloop_harness::protocol::TriggerSource::ScheduledTask { task_id, .. }) if task_id == id)
         }))
     }
     fn tasks_paused(&self) -> bool {
@@ -458,7 +458,7 @@ impl Monitor {
                         .as_ref()
                         .and_then(|goal| goal.last_continued_at_ms)
             {
-                let now_ms = tickloop_harness_base::private_fs::unix_time_milliseconds();
+                let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
                 self.goal_continued_at_ms = Some(now_ms);
                 self.note_entry_flash(RowFlash::TakeIn, now_ms);
             }
@@ -493,7 +493,7 @@ impl Monitor {
         self.chat_status = Some(status);
     }
     pub(super) fn rebuild(&mut self) {
-        self.rebuild_at(tickloop_harness_base::private_fs::unix_time_milliseconds());
+        self.rebuild_at(tickloop_harness::base::private_fs::unix_time_milliseconds());
     }
     /// The Chat's subscriptions as Monitor shows them: at the frequency the user last asked for
     /// until the Agent reports it.
@@ -522,7 +522,7 @@ impl Monitor {
         &mut self,
         subscription: uuid::Uuid,
         all_on_instance: bool,
-    ) -> Option<tickloop_harness_protocol::TickSubscriptionChange> {
+    ) -> Option<tickloop_harness::protocol::TickSubscriptionChange> {
         let rows = self.shown_subscriptions();
         let row = rows.iter().find(|row| row.id == subscription)?;
         let next = match row.frequency {
@@ -539,8 +539,8 @@ impl Monitor {
         }
         self.rebuild();
         Some(next.map_or(
-            tickloop_harness_protocol::TickSubscriptionChange::Cancel,
-            tickloop_harness_protocol::TickSubscriptionChange::Frequency,
+            tickloop_harness::protocol::TickSubscriptionChange::Cancel,
+            tickloop_harness::protocol::TickSubscriptionChange::Frequency,
         ))
     }
 
@@ -752,7 +752,7 @@ impl Monitor {
     }
     /// When time alone next changes the list: the next finished Shell to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
-        let handled = |task: &tickloop_harness_protocol::ShellTask| {
+        let handled = |task: &tickloop_harness::protocol::ShellTask| {
             self.chat_status
                 .as_ref()
                 .and_then(|chat| chat.monitor.handled_at(&InstanceRef::shell(task.id)))
@@ -864,14 +864,14 @@ impl Monitor {
 
     pub(super) fn flash_trigger(
         &mut self,
-        source: &tickloop_harness_protocol::TriggerIdentity,
+        source: &tickloop_harness::protocol::TriggerIdentity,
         since_ms: u64,
     ) {
         match source {
-            tickloop_harness_protocol::TriggerIdentity::ScheduledTask { task_id, .. } => {
+            tickloop_harness::protocol::TriggerIdentity::ScheduledTask { task_id, .. } => {
                 self.task_flashes.insert(*task_id, since_ms);
             }
-            tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. } => {
+            tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. } => {
                 self.goal_continued_at_ms = Some(since_ms);
             }
             _ => return,
@@ -1208,7 +1208,7 @@ impl Monitor {
         }
         if let Some(task) = self.selected_task() {
             let pause = if task.confirmation
-                == Some(tickloop_harness_protocol::ScheduledTaskConfirmation::Pending)
+                == Some(tickloop_harness::protocol::ScheduledTaskConfirmation::Pending)
             {
                 ""
             } else if task.paused_at_ms.is_some() {
@@ -1416,7 +1416,7 @@ impl Monitor {
 
     fn task_lines(
         &self,
-        task: &tickloop_harness_protocol::ScheduledTask,
+        task: &tickloop_harness::protocol::ScheduledTask,
         width: usize,
         display: DisplayProfile,
         now_ms: u64,
@@ -1976,7 +1976,7 @@ mod signal_tests {
     use crate::monitor_rows::{MonitorRows, RowUpdate};
     use std::sync::{Arc, Mutex};
     use tickloop_code_settings::DisplayPreferences;
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{
         LoopState, TickLinkState, TickSubscriptionFrequency, TickSubscriptionStatus,
     };
 
@@ -2707,11 +2707,11 @@ mod signal_tests {
     fn hosted_subscriptions_keep_their_terminal_or_protocol_type() {
         for (kind, glyph) in [
             (
-                tickloop_harness_protocol::ObservationKind::Terminal { truncated: false },
+                tickloop_harness::protocol::ObservationKind::Terminal { truncated: false },
                 Glyph::TerminalTick,
             ),
             (
-                tickloop_harness_protocol::ObservationKind::Protocol,
+                tickloop_harness::protocol::ObservationKind::Protocol,
                 Glyph::ProtocolTick,
             ),
         ] {
@@ -2728,8 +2728,8 @@ mod signal_tests {
         let mut status = subscription(TickSubscriptionFrequency::High, Some(60_000));
         status.instance = InstanceRef::new("hosted", "exited-terminal").unwrap();
         status.kind =
-            Some(tickloop_harness_protocol::ObservationKind::Terminal { truncated: false });
-        status.program_exit = Some(tickloop_harness_protocol::HostedProgramExit {
+            Some(tickloop_harness::protocol::ObservationKind::Terminal { truncated: false });
+        status.program_exit = Some(tickloop_harness::protocol::HostedProgramExit {
             code: Some(3),
             signal: None,
         });
@@ -3082,7 +3082,7 @@ mod signal_tests {
 mod rebuild_benchmarks {
     use super::*;
 
-    fn chat_with_messages(count: usize) -> tickloop_harness_protocol::ChatSnapshot {
+    fn chat_with_messages(count: usize) -> tickloop_harness::protocol::ChatSnapshot {
         let messages: Vec<_> = (0..count)
             .map(|index| {
                 serde_json::json!({
@@ -3145,7 +3145,7 @@ mod rebuild_benchmarks {
 #[cfg(test)]
 mod scheduled_tests {
     use super::*;
-    use tickloop_harness_protocol::{ChatSnapshot, PauseReason, Receiving, ScheduledTask};
+    use tickloop_harness::protocol::{ChatSnapshot, PauseReason, Receiving, ScheduledTask};
 
     fn task() -> ScheduledTask {
         serde_json::from_value(serde_json::json!({
@@ -3283,7 +3283,7 @@ mod queued_scheduled_tests {
     use super::*;
     #[test]
     fn a_delivered_task_waiting_for_an_idle_loop_keeps_its_full_bar() {
-        let chat: tickloop_harness_protocol::ChatSnapshot =
+        let chat: tickloop_harness::protocol::ChatSnapshot =
             serde_json::from_value(serde_json::json!({
                 "id":uuid::Uuid::nil(), "messages":[],
                 "chat_loop":{"id":uuid::Uuid::nil(),"state":"Running"},
@@ -3332,7 +3332,7 @@ mod scrolling_tests {
             status
                 .monitor
                 .members
-                .push(tickloop_harness_protocol::MonitorMember {
+                .push(tickloop_harness::protocol::MonitorMember {
                     instance: format!("calendar:{index:03}").parse().unwrap(),
                     title: Some(format!("Tick {index:03}")),
                     is_terminal: false,

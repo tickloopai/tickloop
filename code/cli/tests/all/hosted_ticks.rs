@@ -124,7 +124,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let directory = tempfile::Builder::new()
         .prefix("tht")
-        .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let observed = Arc::new(Observed::default());
@@ -284,9 +284,9 @@ mod channel {
         DaemonServer, EmbeddedAgentAccess, WorkerFactory, build_runtime_with_models,
         worker_control::WorkerControl,
     };
-    use tickloop_harness_model::ModelClient;
-    use tickloop_harness_protocol::ToolResult;
-    use tickloop_harness_protocol::{
+    use tickloop_harness::model::ModelClient;
+    use tickloop_harness::protocol::ToolResult;
+    use tickloop_harness::protocol::{
         EventKind, HostEndpointIdentity, HostToolAuthority, TickLinkState, TickSubscriptionChange,
     };
 
@@ -298,7 +298,7 @@ mod channel {
             DaemonControl, HostedAdmission, WorkerControlGrant, WorkerRequest, root_identity,
         },
     };
-    use tickloop_harness_runtime::{
+    use tickloop_harness::runtime::{
         Agent, HarnessOptions, HarnessSeams,
         host_tools::{HostCallResult, HostToolProvider},
         tick_adapter::TickAdapters,
@@ -307,7 +307,7 @@ mod channel {
             TickConnectionState, TickStreamEvent, TickStreamPort,
         },
     };
-    use tickloop_harness_test_support::harness::ChosenModels;
+    use tickloop_harness::test_support::harness::ChosenModels;
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -335,9 +335,9 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_dispatched_cancellation_is_shared_by_both_adapters() {
-        use tickloop_harness_runtime::environment::{ExecutionScope, OpenSpec};
-        use tickloop_harness_test_support::execution_contracts::dispatched_cancellation_contract;
-        use tickloop_harness_test_support::execution_environment::MemoryEnvironment;
+        use tickloop_harness::runtime::environment::{ExecutionScope, OpenSpec};
+        use tickloop_harness::test_support::execution_contracts::dispatched_cancellation_contract;
+        use tickloop_harness::test_support::execution_environment::MemoryEnvironment;
         let memory = MemoryEnvironment::new();
         memory.install_tick_program("/counter", serde_json::from_value(json!({
             "protocol":3,"revision":"1","kind":"example.counter","title":"Counter","description":"Counter",
@@ -384,8 +384,8 @@ for line in sys.stdin:
     fn port_scope(
         chat: Uuid,
         folder: &Path,
-    ) -> tickloop_harness_runtime::environment::ExecutionScope {
-        tickloop_harness_runtime::environment::ExecutionScope {
+    ) -> tickloop_harness::runtime::environment::ExecutionScope {
+        tickloop_harness::runtime::environment::ExecutionScope {
             chat: chat.into(),
             folder: Some(folder.to_string_lossy().into_owned()),
         }
@@ -394,8 +394,8 @@ for line in sys.stdin:
     fn port_open(
         command: Vec<String>,
         folder: &Path,
-    ) -> tickloop_harness_runtime::environment::OpenSpec {
-        tickloop_harness_runtime::environment::OpenSpec {
+    ) -> tickloop_harness::runtime::environment::OpenSpec {
+        tickloop_harness::runtime::environment::OpenSpec {
             command,
             cwd: Some(folder.to_string_lossy().into_owned()),
             protocol: true,
@@ -405,7 +405,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_scope_and_revocation_contracts_match_both_adapters() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             execution_contracts::{authority_contract, ownership_contract},
             execution_environment::counter_environment,
         };
@@ -450,7 +450,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_revision_contract_matches_both_adapters() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             execution_contracts::revision_contract, execution_environment::counter_environment,
         };
         let memory = counter_environment();
@@ -489,7 +489,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_observation_contract_matches_both_adapters() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             execution_contracts::observation_contract, execution_environment::counter_environment,
         };
         let memory = counter_environment();
@@ -511,7 +511,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_restart_contract_matches_both_adapters() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             execution_contracts::restart_contract, execution_environment::counter_environment,
         };
         let memory = counter_environment();
@@ -543,8 +543,8 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_view_failure_contract_matches_both_adapters() {
-        use tickloop_harness_runtime::environment::{ViewPlacement, ViewPosition};
-        use tickloop_harness_test_support::{
+        use tickloop_harness::runtime::environment::{ViewPlacement, ViewPosition};
+        use tickloop_harness::test_support::{
             execution_contracts::view_failure_contract, execution_environment::counter_environment,
         };
         let view = Some(ViewPlacement {
@@ -562,11 +562,13 @@ for line in sys.stdin:
         .await;
         let directory = tempfile::Builder::new()
             .prefix("epv")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
         let daemon = Daemon::start_in_herdr(
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
             herdr.socket.clone(),
             1,
         )
@@ -598,7 +600,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_terminal_baselines_match_both_adapters() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             execution_contracts::terminal_baseline_contract,
             execution_environment::MemoryEnvironment,
         };
@@ -641,8 +643,8 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_latest_delivery_contract_on_memory() {
-        use tickloop_harness_runtime::environment::ExecutionTools;
-        use tickloop_harness_test_support::{
+        use tickloop_harness::runtime::environment::ExecutionTools;
+        use tickloop_harness::test_support::{
             ScriptedModel, execution_contracts::latest_delivery_contract,
             execution_environment::counter_environment,
         };
@@ -660,7 +662,7 @@ for line in sys.stdin:
                 environment: Some(environment.clone()),
                 models: ChosenModels::new(model.clone()),
             },
-            HarnessOptions::local(tickloop_harness_test_support::config()),
+            HarnessOptions::local(tickloop_harness::test_support::config()),
         )
         .unwrap();
         agent
@@ -689,7 +691,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn execution_port_latest_delivery_contract_on_native() {
-        use tickloop_harness_test_support::{
+        use tickloop_harness::test_support::{
             ScriptedModel, execution_contracts::latest_delivery_contract,
         };
         let model = Arc::new(ScriptedModel::new(Vec::new()));
@@ -715,7 +717,7 @@ for line in sys.stdin:
     /// How long a hosted test waits for a `high` subscription to deliver: the first delivery
     /// comes one period after subscribing.
     fn high_delivery_wait() -> Duration {
-        tickloop_harness_protocol::TickSubscriptionFrequency::High
+        tickloop_harness::protocol::TickSubscriptionFrequency::High
             .period()
             .unwrap()
             + Duration::from_secs(15)
@@ -784,7 +786,7 @@ for line in sys.stdin:
                             models: ChosenModels::new(self.model.clone()),
                         },
                         HarnessOptions {
-                            ..HarnessOptions::local(tickloop_harness_test_support::config())
+                            ..HarnessOptions::local(tickloop_harness::test_support::config())
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
@@ -843,7 +845,9 @@ for line in sys.stdin:
     impl Daemon {
         async fn start(chats: usize) -> Self {
             Self::start_with(
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                    Vec::new(),
+                )),
                 super::support::hosted::IDLE_TIMEOUT,
                 chats,
             )
@@ -881,14 +885,14 @@ for line in sys.stdin:
         ) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thc")
-                .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+                .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
                 .unwrap();
             let root = directory.path().canonicalize().unwrap();
             let config_root = root.join("state");
             std::fs::create_dir(&config_root).unwrap();
             // A Herdr worker is built as in production, on the bundled default model; its key is
             // saved here so no test reads the developer's own.
-            tickloop_harness_model::credentials::save_api_key(
+            tickloop_harness::model::credentials::save_api_key(
                 &config_root,
                 "DEEPSEEK_API_KEY",
                 "fixture-deepseek-key",
@@ -1078,7 +1082,7 @@ for line in sys.stdin:
         let mut results = BTreeMap::new();
         loop {
             let event =
-                tickloop_harness_test_support::next_event_within(&mut events, HOSTED_EVENT_WAIT)
+                tickloop_harness::test_support::next_event_within(&mut events, HOSTED_EVENT_WAIT)
                     .await;
             match event.kind {
                 EventKind::ToolCompleted {
@@ -1208,7 +1212,7 @@ for line in sys.stdin:
     async fn an_open_approved_for_a_replaced_working_directory_is_refused() {
         let directory = tempfile::Builder::new()
             .prefix("thw")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let work = directory.path().join("work");
         std::fs::create_dir(&work).unwrap();
@@ -1263,7 +1267,7 @@ for line in sys.stdin:
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let directory = tempfile::Builder::new()
             .prefix("thr")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let endpoint = directory.path().join("w.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
@@ -1323,7 +1327,7 @@ for line in sys.stdin:
             &tools,
             chat,
             "TickManage",
-            json!({"action":"open","command":["/bin/sh"],"cwd":tickloop_harness_test_support::SHORT_TEMP_ROOT,"placement":{"type":"hidden"}}),
+            json!({"action":"open","command":["/bin/sh"],"cwd":tickloop_harness::test_support::SHORT_TEMP_ROOT,"placement":{"type":"hidden"}}),
         )
         .await;
         let HostCallResult::CompletedWithEffect(result, _) = settled else {
@@ -1665,8 +1669,8 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     async fn a_package_program_starts_with_its_credentials_which_nothing_else_shows() {
         use tick_packages::{ApiKey, OAUTH_TOKEN_FILE_VARIABLE, PackageCredentials};
-        use tickloop_harness_protocol::ExecutionMode;
-        use tickloop_harness_test_support::{ScriptedModel, auto_classification, call, text};
+        use tickloop_harness::protocol::ExecutionMode;
+        use tickloop_harness::test_support::{ScriptedModel, auto_classification, call, text};
         const KEY: &str = "sample-key-7f3a9c";
         let model = Arc::new(ScriptedModel::new(Vec::new()));
         let daemon =
@@ -1758,8 +1762,8 @@ for line in sys.stdin:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_cleanup_supplies_the_creation_exception_for_the_chats_own_tick() {
-        use tickloop_harness_protocol::ExecutionMode;
-        use tickloop_harness_test_support::{
+        use tickloop_harness::protocol::ExecutionMode;
+        use tickloop_harness::test_support::{
             ScriptedModel, auto_classification, call, next_event, text,
         };
         let model = Arc::new(ScriptedModel::new(Vec::new()));
@@ -1821,7 +1825,7 @@ for line in sys.stdin:
         assert!(!prompted);
         {
             let requests = reviewer.requests.lock().unwrap();
-            let tickloop_harness_protocol::Content::Text { text } =
+            let tickloop_harness::protocol::Content::Text { text } =
                 &requests[1].messages[1].content[0]
             else {
                 panic!()
@@ -1848,7 +1852,9 @@ for line in sys.stdin:
     async fn ticks_nobody_watches_or_views_outlast_the_idle_timeout_until_closed() {
         let idle_timeout = Duration::from_secs(2);
         let daemon = Daemon::start_with(
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
             idle_timeout,
             1,
         )
@@ -1902,26 +1908,28 @@ for line in sys.stdin:
     /// extension and Terminal Tick keep running.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_tick_update_reaches_the_loop_subscribed_to_it() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon = Daemon::start_with(model.clone(), Duration::from_secs(2), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch the counter".into())
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -1940,7 +1948,7 @@ for line in sys.stdin:
             2,
             "a quiet Tick wakes nothing"
         );
-        model.enqueue(tickloop_harness_test_support::text("update observed"));
+        model.enqueue(tickloop_harness::test_support::text("update observed"));
         run_tool(
             &tools,
             chat,
@@ -2030,14 +2038,14 @@ for line in sys.stdin:
 "#;
 
     /// The Tick delivery payload in the newest user message of `messages`.
-    fn delivery_payload(messages: &[tickloop_harness_protocol::Message]) -> Value {
+    fn delivery_payload(messages: &[tickloop_harness::protocol::Message]) -> Value {
         let text = messages
             .iter()
             .rev()
-            .filter(|message| message.role == tickloop_harness_protocol::Role::User)
+            .filter(|message| message.role == tickloop_harness::protocol::Role::User)
             .flat_map(|message| &message.content)
             .find_map(|content| match content {
-                tickloop_harness_protocol::Content::Text { text }
+                tickloop_harness::protocol::Content::Text { text }
                     if text.contains("<tick-delivery>") =>
                 {
                     Some(text.clone())
@@ -2061,7 +2069,9 @@ for line in sys.stdin:
     /// it merged, their seq span, and what it trimmed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_large_tick_state_is_delivered_trimmed_never_empty() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon = Daemon::start_with(model.clone(), Duration::from_secs(2), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
@@ -2075,19 +2085,19 @@ for line in sys.stdin:
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch the candles".into())
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -2097,7 +2107,7 @@ for line in sys.stdin:
             }
         }
 
-        model.enqueue(tickloop_harness_test_support::text("candles noted"));
+        model.enqueue(tickloop_harness::test_support::text("candles noted"));
         for _ in 0..3 {
             run_tool(
                 &tools,
@@ -2121,7 +2131,7 @@ for line in sys.stdin:
 
         let payload = delivery_payload(&model.requests.lock().unwrap()[2].messages);
         assert!(
-            payload.to_string().len() <= tickloop_harness_protocol::MAX_DELIVERY_PAYLOAD_BYTES,
+            payload.to_string().len() <= tickloop_harness::protocol::MAX_DELIVERY_PAYLOAD_BYTES,
             "{payload}"
         );
         let item = &payload["items"][0];
@@ -2158,7 +2168,7 @@ for line in sys.stdin:
         watch: Uuid,
         instance: &tick_protocol::InstanceRef,
         wanted: impl Fn(&Value) -> bool,
-    ) -> tickloop_harness_runtime::tick_stream::TickObservation {
+    ) -> tickloop_harness::runtime::tick_stream::TickObservation {
         for _ in 0..400 {
             if let Some(sampled) = stream.sample(tickloop_ids::Id::from(watch), instance).await
                 && wanted(&sampled.data)
@@ -2221,8 +2231,8 @@ for line in sys.stdin:
         assert!(refused.contains("terminal Tick"), "{refused}");
 
         let (first, second) = (
-            tickloop_harness_runtime::tick_stream::WatchId::new(),
-            tickloop_harness_runtime::tick_stream::WatchId::new(),
+            tickloop_harness::runtime::tick_stream::WatchId::new(),
+            tickloop_harness::runtime::tick_stream::WatchId::new(),
         );
         let stream = HostedTickStream::with_environment(
             Arc::new(LocalEnvironment::with_ticks(tools.clone())),
@@ -2285,7 +2295,7 @@ for line in sys.stdin:
         .await;
         assert_eq!(
             changed.kind,
-            tickloop_harness_protocol::ObservationKind::Terminal { truncated: false }
+            tickloop_harness::protocol::ObservationKind::Terminal { truncated: false }
         );
         assert_eq!(changed.data["exit"], Value::Null);
         assert!(
@@ -2368,11 +2378,11 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(
             member.state,
-            tickloop_harness_protocol::HostedMemberState::Exited
+            tickloop_harness::protocol::HostedMemberState::Exited
         );
         assert_eq!(
             member.exit,
-            Some(tickloop_harness_protocol::HostedProgramExit {
+            Some(tickloop_harness::protocol::HostedProgramExit {
                 code: Some(0),
                 signal: None
             })
@@ -2413,26 +2423,28 @@ for line in sys.stdin:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn changing_a_hosted_terminal_frequency_keeps_its_pending_screen() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let opened = run_tool(&tools, chat, "TickManage", cat_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch this terminal".into())
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -2459,9 +2471,9 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         for frequency in [
-            tickloop_harness_protocol::TickSubscriptionFrequency::Medium,
-            tickloop_harness_protocol::TickSubscriptionFrequency::Low,
-            tickloop_harness_protocol::TickSubscriptionFrequency::High,
+            tickloop_harness::protocol::TickSubscriptionFrequency::Medium,
+            tickloop_harness::protocol::TickSubscriptionFrequency::Low,
+            tickloop_harness::protocol::TickSubscriptionFrequency::High,
         ] {
             runtime
                 .update_tick_subscription(
@@ -2493,26 +2505,28 @@ for line in sys.stdin:
     /// the new text and the exit code.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_high_subscription_to_a_terminal_tick_delivers_its_changed_screen_and_exit() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let opened = run_tool(&tools, chat, "TickManage", cat_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch the terminal".into())
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -2524,14 +2538,14 @@ for line in sys.stdin:
         let subscriptions = runtime.tick_subscriptions(chat.into()).await.unwrap();
         assert_eq!(
             subscriptions[0].frequency,
-            tickloop_harness_protocol::TickSubscriptionFrequency::High
+            tickloop_harness::protocol::TickSubscriptionFrequency::High
         );
         assert_eq!(
             subscriptions[0].link,
-            tickloop_harness_protocol::TickLinkState::Live
+            tickloop_harness::protocol::TickLinkState::Live
         );
 
-        model.enqueue(tickloop_harness_test_support::text("screen observed"));
+        model.enqueue(tickloop_harness::test_support::text("screen observed"));
         run_tool(
             &tools,
             chat,
@@ -2564,7 +2578,9 @@ for line in sys.stdin:
     /// and exit code, long before the subscription's period would have read it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subscribed_terminal_tick_that_fails_is_delivered_at_once() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
@@ -2577,19 +2593,19 @@ for line in sys.stdin:
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch the quote script".into())
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -2599,7 +2615,7 @@ for line in sys.stdin:
             }
         }
 
-        model.enqueue(tickloop_harness_test_support::text("the script failed"));
+        model.enqueue(tickloop_harness::test_support::text("the script failed"));
         run_tool(
             &tools,
             chat,
@@ -2607,7 +2623,7 @@ for line in sys.stdin:
             json!({"action":"send_input","tick_instance_id":instance,"text":"700.HK","keys":["Enter"]}),
         )
         .await;
-        let period = tickloop_harness_protocol::TickSubscriptionFrequency::High
+        let period = tickloop_harness::protocol::TickSubscriptionFrequency::High
             .period()
             .unwrap();
         let immediately = Duration::from_secs(10);
@@ -2696,15 +2712,17 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     async fn a_herdr_worker_opens_hidden_by_default_and_streams_the_hosted_tick() {
         use tickloop_code_access::ConfigurationChange;
-        use tickloop_harness_protocol::EventKind;
-        use tickloop_harness_protocol::ExecutionMode;
+        use tickloop_harness::protocol::EventKind;
+        use tickloop_harness::protocol::ExecutionMode;
 
         let directory = tempfile::Builder::new()
             .prefix("thh")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon = Daemon::start_in_herdr(model.clone(), herdr.socket.clone(), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         daemon
@@ -2718,12 +2736,12 @@ for line in sys.stdin:
             .await;
         let mut open = counter_command(&daemon);
         open.as_object_mut().unwrap().remove("placement");
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "open",
             "TickManage",
             open,
         ));
-        model.enqueue(tickloop_harness_test_support::text("opened"));
+        model.enqueue(tickloop_harness::test_support::text("opened"));
         let results = run_turn(&runtime, chat, "Open the counter").await;
         assert!(!results["open"].is_error, "{}", results["open"].content);
         let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
@@ -2761,12 +2779,12 @@ for line in sys.stdin:
             "opening never subscribes"
         );
 
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch the counter").await;
         assert!(
             !results["subscribe"].is_error,
@@ -2778,7 +2796,7 @@ for line in sys.stdin:
             1
         );
         let mut events = runtime.subscribe();
-        model.enqueue(tickloop_harness_test_support::text("update observed"));
+        model.enqueue(tickloop_harness::test_support::text("update observed"));
         run_tool(
             &daemon.tools(),
             chat,
@@ -2803,17 +2821,17 @@ for line in sys.stdin:
             "{woken}"
         );
 
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "visible",
             "TickManage",
             json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"workspace_id":HERDR_WORKSPACE,"placement":{"type":"new_tab"}}),
         ));
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "close",
             "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("done"));
+        model.enqueue(tickloop_harness::test_support::text("done"));
         let results = run_turn(&runtime, chat, "Show cat, then close the counter").await;
         assert!(
             herdr.methods().contains(&"layout.apply".to_owned()),
@@ -2849,13 +2867,15 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delegated_child_cannot_open_or_use_its_parents_hosted_tick() {
         use tickloop_code_access::ConfigurationChange;
-        use tickloop_harness_protocol::ExecutionMode;
+        use tickloop_harness::protocol::ExecutionMode;
         let directory = tempfile::Builder::new()
             .prefix("thd")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon = Daemon::start_in_herdr(model.clone(), herdr.socket.clone(), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         daemon
@@ -2873,19 +2893,19 @@ for line in sys.stdin:
         let mut child_open = counter_command(&daemon);
         child_open.as_object_mut().unwrap().remove("placement");
         for reply in [
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "delegate",
                 "Subagent",
                 json!({"task":"Inspect the counter."}),
             ),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "child-read",
                 "TickRead",
                 json!({"tick_instance_id":instance}),
             ),
-            tickloop_harness_test_support::call("child-open", "TickManage", child_open),
-            tickloop_harness_test_support::text("The child is done."),
-            tickloop_harness_test_support::text("Delegated."),
+            tickloop_harness::test_support::call("child-open", "TickManage", child_open),
+            tickloop_harness::test_support::text("The child is done."),
+            tickloop_harness::test_support::text("Delegated."),
         ] {
             model.enqueue(reply);
         }
@@ -3179,18 +3199,18 @@ for line in sys.stdin:
                 .to_string_lossy()
                 .into_owned(),
         )
-        .chain(tickloop_harness_protocol::ATTACH_ARGUMENTS.map(String::from))
+        .chain(tickloop_harness::protocol::ATTACH_ARGUMENTS.map(String::from))
         .collect::<Vec<_>>();
         let reported = match layout
             .create_view(
                 &attach,
                 &std::collections::BTreeMap::from([
                     (
-                        tickloop_harness_protocol::ATTACH_ENVIRONMENT.to_owned(),
+                        tickloop_harness::protocol::ATTACH_ENVIRONMENT.to_owned(),
                         serde_json::to_string(&grant).unwrap(),
                     ),
                     (
-                        tickloop_harness_protocol::VIEW_PANE_ENVIRONMENT.to_owned(),
+                        tickloop_harness::protocol::VIEW_PANE_ENVIRONMENT.to_owned(),
                         "1".to_owned(),
                     ),
                 ]),
@@ -3262,7 +3282,9 @@ for line in sys.stdin:
     /// the Chat's Monitor under the lost Tick's title without any subscription.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_model_reopens_a_lost_tick_only_after_approval_as_a_new_instance() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
@@ -3278,12 +3300,12 @@ for line in sys.stdin:
         let host_paths =
             tickhost::paths::HostPaths::of_config_root(Some(&daemon.root.join("state")));
 
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "reopen",
             "TickManage",
             json!({"action":"reopen","tick_instance_id":lost}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("reopened"));
+        model.enqueue(tickloop_harness::test_support::text("reopened"));
         let mut events = runtime.subscribe();
         let receipt = runtime
             .submit(chat.into(), "Reopen the counter".into())
@@ -3291,7 +3313,7 @@ for line in sys.stdin:
             .unwrap();
         let mut result = None;
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             match event.kind {
                 EventKind::PermissionRequested { request } => {
                     assert_eq!(request.input["action"], "reopen");
@@ -3361,7 +3383,9 @@ for line in sys.stdin:
     /// closed as gone, calling no model and never rebinding to a later host.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_watch_delivers_and_fails_closed_once_its_host_dies() {
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
@@ -3369,18 +3393,18 @@ for line in sys.stdin:
         let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut events = runtime.subscribe();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "watch",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let receipt = runtime
             .submit(chat.into(), "Watch it".into())
             .await
             .unwrap();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
                 break;
             }
@@ -3389,7 +3413,7 @@ for line in sys.stdin:
         assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
 
         let before = model.requests.lock().unwrap().len();
-        model.enqueue(tickloop_harness_test_support::text("update observed"));
+        model.enqueue(tickloop_harness::test_support::text("update observed"));
         run_tool(
             &tools,
             chat,
@@ -3479,7 +3503,9 @@ for line in sys.stdin:
             (3, Duration::from_secs(5)),
             "the production reconnect budget"
         );
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
@@ -3498,12 +3524,12 @@ for line in sys.stdin:
         let served_before = logged(&describes, "served");
         std::fs::write(daemon.root.join(REFUSE_DESCRIBE), "").unwrap();
 
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch it").await;
         let subscribed: Value = serde_json::from_str(&results["subscribe"].content).unwrap();
         assert_eq!(subscribed["ready"], false, "{subscribed}");
@@ -3536,12 +3562,12 @@ for line in sys.stdin:
             .update_tick_subscription(chat.into(), rows[0].id, TickSubscriptionChange::Cancel)
             .await
             .unwrap();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "again",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":instance}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching again"));
+        model.enqueue(tickloop_harness::test_support::text("watching again"));
         let results = run_turn(&runtime, chat, "Watch it again").await;
         let again: Value = serde_json::from_str(&results["again"].content).unwrap();
         assert_eq!(again["ready"], true, "{again}");
@@ -3637,8 +3663,8 @@ for line in sys.stdin:
         .await;
         let counter = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let (large, small) = (
-            tickloop_harness_runtime::tick_stream::WatchId::new(),
-            tickloop_harness_runtime::tick_stream::WatchId::new(),
+            tickloop_harness::runtime::tick_stream::WatchId::new(),
+            tickloop_harness::runtime::tick_stream::WatchId::new(),
         );
         let stream = HostedTickStream::with_environment(
             Arc::new(LocalEnvironment::with_ticks(tools.clone())),
@@ -3843,7 +3869,7 @@ for line in sys.stdin:
         use std::collections::HashSet;
         use tickhost_connect::page::MAX_PAGE_SIZE;
         use tickloop_code_local_environment::hosted::worker_control::HostedTickPage;
-        use tickloop_harness_protocol::HostedMemberState;
+        use tickloop_harness::protocol::HostedMemberState;
         const TICKS: usize = MAX_PAGE_SIZE + 2;
         const OPENS_AT_ONCE: usize = 26;
         let daemon = Daemon::start(1).await;
@@ -3988,8 +4014,10 @@ for line in sys.stdin:
     /// user asked for it, and asking again never starts a second one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tick_lost_with_its_host_reopens_only_explicitly_as_a_new_instance() {
-        use tickloop_harness_protocol::{EventKind, HostedMemberState, TickSubscriptionFrequency};
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+        use tickloop_harness::protocol::{EventKind, HostedMemberState, TickSubscriptionFrequency};
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat, execution) = (
@@ -4001,12 +4029,12 @@ for line in sys.stdin:
         let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let lost: tick_protocol::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
-        model.enqueue(tickloop_harness_test_support::call(
+        model.enqueue(tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":lost}),
         ));
-        model.enqueue(tickloop_harness_test_support::text("watching"));
+        model.enqueue(tickloop_harness::test_support::text("watching"));
         let mut events = runtime.subscribe();
         runtime
             .submit(chat.into(), "Watch it".into())
@@ -4014,7 +4042,7 @@ for line in sys.stdin:
             .unwrap();
         loop {
             if matches!(
-                tickloop_harness_test_support::next_event(&mut events)
+                tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind,
                 EventKind::Completed { .. }
@@ -4248,7 +4276,7 @@ for line in sys.stdin:
         fn with_idle_timeout(idle_timeout: Duration) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thl")
-                .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+                .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
                 .unwrap();
             let paths = HostPaths::of_config_root(Some(directory.path()));
             Self {

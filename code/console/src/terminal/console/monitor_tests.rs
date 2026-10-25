@@ -1,6 +1,6 @@
 use super::*;
 use crate::terminal::monitor::{MonitorEntry, TickGroup};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, ChatStatus, MonitorMember, MonitorMembership, ShellTaskState,
     TickSubscriptionStatus,
 };
@@ -97,7 +97,7 @@ fn shell_tick_enter_opens_its_view_and_no_monitor_detail() {
 
 #[test]
 fn shell_ticks_only_list_background_executions_and_ctrl_x_twice_removes_a_finished_one() {
-    use tickloop_harness_protocol::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
+    use tickloop_harness::protocol::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
     for origin in [ShellTaskOrigin::Agent, ShellTaskOrigin::User] {
         let chat = Uuid::new_v4();
         let mut snapshot = tests::task_snapshot(chat, 1);
@@ -139,7 +139,7 @@ fn shell_ticks_only_list_background_executions_and_ctrl_x_twice_removes_a_finish
         snapshot.tasks[0].was_background = true;
         snapshot.tasks[0].state = ShellTaskState::Completed;
         snapshot.tasks[0].updated_at_ms =
-            Some(tickloop_harness_base::private_fs::unix_time_milliseconds());
+            Some(tickloop_harness::base::private_fs::unix_time_milliseconds());
         console
             .refresh_monitor_ticks(snapshot.clone(), None)
             .unwrap();
@@ -526,9 +526,11 @@ fn monitor_row_clicks_ignore_non_targets_and_other_input_surfaces() {
 #[tokio::test]
 async fn permission_surface_blocks_stale_tick_row_clicks() {
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = core.create_chat(directory.path().into()).await.unwrap();
     let view = core.permissions_view(chat).await.unwrap();
@@ -608,16 +610,18 @@ fn an_artifact_row_routes_copy_and_feedback_to_artifact_actions() {
 #[tokio::test]
 async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifies() {
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
         core.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let tick = tickloop_harness_protocol::ArtifactTick {
+    let tick = tickloop_harness::protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: "Original".into(),
@@ -667,7 +671,7 @@ async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifi
 fn an_artifact_renamed_in_the_chat_replaces_its_cached_metadata_title() {
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let tick = |title: &str| tickloop_harness_protocol::ArtifactTick {
+    let tick = |title: &str| tickloop_harness::protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: title.into(),
@@ -1147,7 +1151,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
         state.monitor.entries()[0].subscription,
         Some(crate::monitor_rows::SubscriptionMark {
             paused: false,
-            frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+            frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
             is_waiting: false,
             next_check: None,
         })
@@ -1756,7 +1760,7 @@ fn monitor_rows_clip_names_to_keep_details_on_the_same_line() {
     subscribed.notes = vec!["feedback unavailable".into()];
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         paused: false,
-        frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+        frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
         is_waiting: true,
         next_check: None,
     });
@@ -1810,7 +1814,7 @@ fn row_details_and_subscription_marks_end_at_the_monitor_edge_at_any_width() {
     subscribed.instance = "hosted:python".parse().unwrap();
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         paused: false,
-        frequency: tickloop_harness_protocol::TickSubscriptionFrequency::Low,
+        frequency: tickloop_harness::protocol::TickSubscriptionFrequency::Low,
         is_waiting: true,
         next_check: None,
     });
@@ -1818,7 +1822,7 @@ fn row_details_and_subscription_marks_end_at_the_monitor_edge_at_any_width() {
     subscribed.update = unread.clone();
     let mut running = shell(Uuid::new_v4(), "cargo nextest run --workspace");
     running.tone = StatusTone::Running {
-        since_ms: Some(tickloop_harness_base::private_fs::unix_time_milliseconds() - 119_000),
+        since_ms: Some(tickloop_harness::base::private_fs::unix_time_milliseconds() - 119_000),
     };
     running.update = unread;
     for width in [80, 140] {
@@ -1944,9 +1948,9 @@ fn the_row_clock_redraws_while_a_visible_row_blinks_and_stops_when_none_runs() {
 fn running_background_shells_are_named_by_key_command_and_count_from_their_start() {
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let mut snapshot = tests::task_snapshot(chat, 1);
-    snapshot.tasks[0].state = tickloop_harness_protocol::ShellTaskState::Background;
+    snapshot.tasks[0].state = tickloop_harness::protocol::ShellTaskState::Background;
     snapshot.tasks[0].command = "cd /tmp && cargo test -p console 2>&1 | tail -20".into();
     snapshot.tasks[0].description = Some("Run the console tests".into());
     let task = snapshot.tasks[0].id;
@@ -2017,13 +2021,13 @@ impl crate::terminal::tick_actions::TickDetailView for RowDetail {
 
 #[test]
 fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
-    use tickloop_harness_protocol::FINISHED_SHELL_DISPLAY_MS;
+    use tickloop_harness::protocol::FINISHED_SHELL_DISPLAY_MS;
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let ended = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let ended = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let mut snapshot = tests::task_snapshot(chat, 1);
     snapshot.tasks[0].was_background = true;
-    snapshot.tasks[0].state = tickloop_harness_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].state = tickloop_harness::protocol::ShellTaskState::Completed;
     snapshot.tasks[0].exit_code = Some(0);
     snapshot.tasks[0].updated_at_ms = Some(ended);
     console
@@ -2091,10 +2095,10 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
 fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_it() {
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let ended = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let ended = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let mut snapshot = tests::task_snapshot(chat, 1);
     snapshot.tasks[0].was_background = true;
-    snapshot.tasks[0].state = tickloop_harness_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].state = tickloop_harness::protocol::ShellTaskState::Completed;
     snapshot.tasks[0].exit_code = Some(0);
     snapshot.tasks[0].updated_at_ms = Some(ended);
     snapshot.tasks[0].command = "make test".into();
@@ -2168,7 +2172,7 @@ fn reading_a_shells_output_flashes_its_row_cold_and_a_chat_switch_does_not_repla
             .fill
     };
 
-    let used = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let used = tickloop_harness::base::private_fs::unix_time_milliseconds();
     chat_snapshot.monitor.mark_used(shell.clone(), used);
     chat_snapshot.monitor.mark_handled(shell, used);
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
@@ -2282,13 +2286,13 @@ fn dragging_the_separator_resizes_monitor_within_its_bounds_and_saves_on_release
 
 #[test]
 fn a_finished_background_shell_a_loop_subscribes_to_stays_as_its_shell_row() {
-    use tickloop_harness_protocol::FINISHED_SHELL_DISPLAY_MS;
+    use tickloop_harness::protocol::FINISHED_SHELL_DISPLAY_MS;
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let ended = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let ended = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let mut snapshot = tests::task_snapshot(chat, 1);
     snapshot.tasks[0].was_background = true;
-    snapshot.tasks[0].state = tickloop_harness_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].state = tickloop_harness::protocol::ShellTaskState::Completed;
     snapshot.tasks[0].exit_code = Some(0);
     snapshot.tasks[0].updated_at_ms = Some(ended);
     let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
@@ -2326,7 +2330,7 @@ fn a_subscribed_shell_row_is_marked_immediate_and_offers_no_frequency() {
     let mut state = console.state.lock().unwrap();
     let mut subscription = tests::subscription_row(3);
     subscription.instance = shell.clone();
-    subscription.frequency = tickloop_harness_protocol::TickSubscriptionFrequency::Immediate;
+    subscription.frequency = tickloop_harness::protocol::TickSubscriptionFrequency::Immediate;
     state.monitor.subscriptions = vec![subscription];
     state.monitor.rebuild();
     let entries = state.monitor.entries();
@@ -2361,7 +2365,7 @@ fn subscribed_fixture(subscriptions: usize) -> State {
             row
         })
         .collect();
-    let mut snapshot: tickloop_harness_protocol::ChatSnapshot = serde_json::from_value(
+    let mut snapshot: tickloop_harness::protocol::ChatSnapshot = serde_json::from_value(
         serde_json::json!({"id":Uuid::from_u128(77),"folder":"/fixture","messages":[],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}}),
     )
     .unwrap();
@@ -2370,7 +2374,7 @@ fn subscribed_fixture(subscriptions: usize) -> State {
         Some("calendar".into()),
     );
     state.monitor.chat_status = Some(std::sync::Arc::new(
-        tickloop_harness_protocol::ChatStatus::of(&snapshot),
+        tickloop_harness::protocol::ChatStatus::of(&snapshot),
     ));
     state.monitor.rebuild();
     state.monitor.focus(false, None);
@@ -2465,8 +2469,8 @@ fn subscriptions_have_one_key_and_a_fixed_monitor_footer() {
 fn the_row_switch_updates_all_periodic_subscriptions_of_the_instance() {
     let mut state = subscribed_fixture(3);
     for frequency in [
-        Some(tickloop_harness_protocol::TickSubscriptionFrequency::Medium),
-        Some(tickloop_harness_protocol::TickSubscriptionFrequency::Low),
+        Some(tickloop_harness::protocol::TickSubscriptionFrequency::Medium),
+        Some(tickloop_harness::protocol::TickSubscriptionFrequency::Low),
         None,
     ] {
         assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
@@ -2507,7 +2511,7 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
     };
-    use tickloop_harness_runtime::{
+    use tickloop_harness::runtime::{
         tick_adapter::{TickAdapter, TickAdapters},
         tick_stream::{InMemoryTickStream, TickStreamPort},
     };
@@ -2521,15 +2525,15 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
         }
     }
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "subscribe",
                 "TickManage",
                 serde_json::json!({"action":"subscribe","tick_instance_id":"cal:watched"}),
             ),
-            tickloop_harness_test_support::text("watching"),
+            tickloop_harness::test_support::text("watching"),
         ])),
     );
     core.install_tick_stream(Arc::new(
@@ -2538,19 +2542,19 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
     ))
     .await;
     let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+        ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     core.submit(chat.into(), "watch the calendar".into())
         .await
         .unwrap();
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {
-            tickloop_harness_protocol::EventKind::Completed { .. } => break,
-            tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+            tickloop_harness::protocol::EventKind::Completed { .. } => break,
+            tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
@@ -2608,12 +2612,14 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
         tick_actions::{TickActionContext, execute},
     };
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+        ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let quotes = tick_protocol::InstanceRef::new("calendar", "quotes-run").unwrap();
     let joined = core
@@ -2687,7 +2693,7 @@ fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
         .monitor
         .record_opened(gone.clone(), Some("Quotes".into()));
     console.update_monitor_chat(snapshot.clone()).unwrap();
-    let went = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let went = tickloop_harness::base::private_fs::unix_time_milliseconds();
     console
         .update_member_findings(
             chat,
@@ -2737,12 +2743,14 @@ async fn a_running_shell_is_stopped_from_its_row_after_confirmation_silently() {
         tick_actions::{TickActionContext, execute},
     };
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+        ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let gate = directory.path().join("release");
     let receipt = agent
@@ -2754,7 +2762,7 @@ async fn a_running_shell_is_stopped_from_its_row_after_confirmation_silently() {
         .await
         .unwrap();
     let center = ShellTaskCenter::new(agent.clone());
-    let task_state = |snapshot: &tickloop_harness_protocol::ShellTaskSnapshot| {
+    let task_state = |snapshot: &tickloop_harness::protocol::ShellTaskSnapshot| {
         snapshot
             .tasks
             .iter()
@@ -2980,7 +2988,7 @@ fn chat_with_messages(chat: Uuid, messages: usize) -> ChatSnapshot {
 fn refresh_status(
     console: &Console,
     snapshot: &Arc<ChatStatus>,
-    tasks: &tickloop_harness_protocol::ShellTaskSnapshot,
+    tasks: &tickloop_harness::protocol::ShellTaskSnapshot,
     changed: bool,
 ) {
     let chat = snapshot.id;
@@ -3087,12 +3095,12 @@ fn monitor_groups_list_artifacts_then_ticks_then_shells() {
 async fn subscribed_calendar_chat(
     directory: &std::path::Path,
 ) -> (
-    tickloop_harness_runtime::Agent,
+    tickloop_harness::runtime::Agent,
     crate::terminal::execution::ConsoleExecution,
     Console,
     Uuid,
 ) {
-    use tickloop_harness_runtime::{
+    use tickloop_harness::runtime::{
         tick_adapter::{TickAdapter, TickAdapters},
         tick_stream::{InMemoryTickStream, TickStreamPort},
     };
@@ -3105,15 +3113,15 @@ async fn subscribed_calendar_chat(
             Some(Arc::new(self.0.clone()))
         }
     }
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "subscribe",
                 "TickManage",
                 serde_json::json!({"action":"subscribe","tick_instance_id":"cal:watched"}),
             ),
-            tickloop_harness_test_support::text("watching"),
+            tickloop_harness::test_support::text("watching"),
         ])),
     );
     core.install_tick_stream(Arc::new(
@@ -3123,7 +3131,7 @@ async fn subscribed_calendar_chat(
     .await;
     let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
         core.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
     );
     let chat = agent.create_chat(directory.into()).await.unwrap();
     let mut events = core.subscribe();
@@ -3131,12 +3139,12 @@ async fn subscribed_calendar_chat(
         .await
         .unwrap();
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {
-            tickloop_harness_protocol::EventKind::Completed { .. } => break,
-            tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+            tickloop_harness::protocol::EventKind::Completed { .. } => break,
+            tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
@@ -3169,7 +3177,7 @@ async fn run_intent(
 async fn rapid_subscription_presses_across_the_first_reply_each_advance_one_step() {
     use crate::monitor_rows::TickIntent;
     use crate::terminal::tick_actions::{TickActionUi, builtin, execute};
-    use tickloop_harness_protocol::TickSubscriptionFrequency::Low;
+    use tickloop_harness::protocol::TickSubscriptionFrequency::Low;
     let directory = tempfile::tempdir().unwrap();
     let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
     let context = crate::terminal::tick_actions::TickActionContext {
@@ -3216,7 +3224,7 @@ async fn rapid_subscription_presses_across_the_first_reply_each_advance_one_step
 #[tokio::test]
 async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_notice() {
     use crate::monitor_rows::TickIntent;
-    use tickloop_harness_protocol::TickSubscriptionFrequency::{High, Medium};
+    use tickloop_harness::protocol::TickSubscriptionFrequency::{High, Medium};
     let directory = tempfile::tempdir().unwrap();
     let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
     let context = crate::terminal::tick_actions::TickActionContext {
@@ -3314,7 +3322,7 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
         DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
     };
     use tickloop_code_daemon::EmbeddedAgentAccess;
-    use tickloop_harness_protocol::*;
+    use tickloop_harness::protocol::*;
 
     struct HostedRemote {
         inner: EmbeddedAgentAccess,
@@ -3355,9 +3363,9 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
         }
     }
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let remote = Arc::new(HostedRemote {
         inner: EmbeddedAgentAccess::new(core.clone()),
@@ -3418,16 +3426,16 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
         tick_actions::{TickActionContext, execute},
     };
     let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+        ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     core.schedule_task(
         chat.into(),
-        tickloop_harness_runtime::NewScheduledTask::new(
+        tickloop_harness::runtime::NewScheduledTask::new(
             "* * * * *",
             "remind me about weather",
             true,
@@ -3495,7 +3503,7 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     for index in 0..4 {
         core.schedule_task(
             chat.into(),
-            tickloop_harness_runtime::NewScheduledTask::new(
+            tickloop_harness::runtime::NewScheduledTask::new(
                 "* * * * *",
                 format!("extra instruction {index}"),
                 true,
@@ -3546,39 +3554,39 @@ async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
 #[tokio::test]
 async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
     use crate::terminal::execution::ConsoleExecution;
-    use tickloop_harness_protocol::{Content, EventKind};
+    use tickloop_harness::protocol::{Content, EventKind};
     for folder in [false, true] {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("ready"),
-            tickloop_harness_test_support::text("ready"),
-            tickloop_harness_test_support::text("ready"),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("ready"),
+            tickloop_harness::test_support::text("ready"),
+            tickloop_harness::test_support::text("ready"),
         ]));
-        let mut options = tickloop_harness_runtime::HarnessOptions::local(
-            tickloop_harness_test_support::config(),
+        let mut options = tickloop_harness::runtime::HarnessOptions::local(
+            tickloop_harness::test_support::config(),
         );
         if !folder {
-            options.waits = tickloop_harness_runtime::WaitHosting::Durable;
-            options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DenyOnPrompt;
-            options.tools = tickloop_harness_runtime::ToolPolicy {
+            options.waits = tickloop_harness::runtime::WaitHosting::Durable;
+            options.host.prompt_policy = tickloop_harness::protocol::PromptPolicy::DenyOnPrompt;
+            options.tools = tickloop_harness::runtime::ToolPolicy {
                 user_skills: true,
-                ..tickloop_harness_runtime::ToolPolicy::durable_chat()
+                ..tickloop_harness::runtime::ToolPolicy::durable_chat()
             };
         }
-        let core = tickloop_harness_runtime::Agent::with_seams(
-            tickloop_harness_runtime::HarnessSeams {
+        let core = tickloop_harness::runtime::Agent::with_seams(
+            tickloop_harness::runtime::HarnessSeams {
                 transcripts: None,
                 environment: folder.then(|| {
-                    Arc::new(tickloop_harness_runtime::environment::FolderEnvironment::bare())
-                        as Arc<dyn tickloop_harness_runtime::environment::ExecutionEnvironment>
+                    Arc::new(tickloop_harness::runtime::environment::FolderEnvironment::bare())
+                        as Arc<dyn tickloop_harness::runtime::environment::ExecutionEnvironment>
                 }),
-                models: tickloop_harness_test_support::harness::ChosenModels::new(model.clone()),
+                models: tickloop_harness::test_support::harness::ChosenModels::new(model.clone()),
             },
             options,
         )
         .unwrap();
         let agent =
-            ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+            ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
         let chat = if folder {
             agent.create_chat(directory.path().into()).await.unwrap()
         } else {
@@ -3598,7 +3606,7 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
                     .unwrap()
             };
             loop {
-                let event = tickloop_harness_test_support::next_event(&mut events).await;
+                let event = tickloop_harness::test_support::next_event(&mut events).await;
                 if event.run_id != receipt.run_id {
                     continue;
                 }
@@ -3656,7 +3664,7 @@ fn monitor_render_output_aligns_tick_shell_scheduled_and_goal_icons() {
     subscribed.glyph = Glyph::ProtocolTick;
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         paused: false,
-        frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+        frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
         is_waiting: false,
         next_check: None,
     });
@@ -3757,7 +3765,7 @@ fn a_trailing_subscription_mark_counts_toward_the_selected_name_clipping() {
         None,
         Some(crate::monitor_rows::SubscriptionMark {
             paused: false,
-            frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+            frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
             is_waiting: false,
             next_check: None,
         }),
@@ -3821,7 +3829,7 @@ fn docked_subscribed_monitor_fixture(task_count: usize, tick_count: usize) -> St
     entries[0].status = "live".into();
     entries[0].subscription = Some(crate::monitor_rows::SubscriptionMark {
         paused: false,
-        frequency: tickloop_harness_protocol::TickSubscriptionFrequency::High,
+        frequency: tickloop_harness::protocol::TickSubscriptionFrequency::High,
         is_waiting: false,
         next_check: None,
     });
@@ -3942,7 +3950,7 @@ fn selected_tick_status_is_immediately_above_the_input_divider_in_side_and_overl
         state.task_title = Some("Chat title".into());
         let mut output = Vec::new();
         state.draw_frame(&mut output).unwrap();
-        let terminal = tickloop_harness_test_support::screen::visible_screen(
+        let terminal = tickloop_harness::test_support::screen::visible_screen(
             &String::from_utf8_lossy(&output),
             state.width,
             state.height,
@@ -4468,7 +4476,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
         }),
         "artifact" => snapshot
             .artifact_ticks
-            .push(tickloop_harness_protocol::ArtifactTick {
+            .push(tickloop_harness::protocol::ArtifactTick {
                 artifact_id: "doc".into(),
                 origin: "https://docs.example".into(),
                 title: "New Artifact".into(),
@@ -4855,11 +4863,11 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
     state
         .scrollback
         .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
-    state.queued_inputs = vec![tickloop_harness_protocol::QueuedInput {
+    state.queued_inputs = vec![tickloop_harness::protocol::QueuedInput {
         id: Uuid::new_v4(),
         chat_id: state.chat.unwrap().into(),
         loop_id: Some(Uuid::new_v4().into()),
-        kind: tickloop_harness_protocol::QueuedInputKind::Message,
+        kind: tickloop_harness::protocol::QueuedInputKind::Message,
         text: "/loop 每分钟看看 qqq.us 的股价是多少".into(),
         contexts: Vec::new(),
         queued_sequence: 1,
@@ -4867,7 +4875,7 @@ fn monitor_separator_continues_through_queued_input_to_input_divider() {
     }];
     let mut output = Vec::new();
     state.draw_frame(&mut output).unwrap();
-    let terminal = tickloop_harness_test_support::screen::visible_screen(
+    let terminal = tickloop_harness::test_support::screen::visible_screen(
         &String::from_utf8_lossy(&output),
         state.width,
         state.height,
@@ -5030,11 +5038,11 @@ fn queued_input_layout_is_bounded_by_conversation_width_before_rendering() {
     state
         .scrollback
         .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
-    state.queued_inputs = vec![tickloop_harness_protocol::QueuedInput {
+    state.queued_inputs = vec![tickloop_harness::protocol::QueuedInput {
         id: Uuid::new_v4(),
         chat_id: state.chat.unwrap().into(),
         loop_id: Some(Uuid::new_v4().into()),
-        kind: tickloop_harness_protocol::QueuedInputKind::Message,
+        kind: tickloop_harness::protocol::QueuedInputKind::Message,
         text: format!("/loop {}", "每分钟看看 qqq.us 的股价是多少".repeat(20)),
         contexts: Vec::new(),
         queued_sequence: 1,
@@ -5115,7 +5123,7 @@ fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
             );
             let mut output = Vec::new();
             state.draw_frame(&mut output).unwrap();
-            let terminal = tickloop_harness_test_support::screen::visible_screen(
+            let terminal = tickloop_harness::test_support::screen::visible_screen(
                 &String::from_utf8_lossy(&output),
                 state.width,
                 state.height,
@@ -5173,7 +5181,7 @@ fn side_monitor_leaves_a_bottom_row_above_the_chat_title_and_yields_it_when_shor
             state.task_title = Some("Chat title".into());
             let mut output = Vec::new();
             state.draw_frame(&mut output).unwrap();
-            let terminal = tickloop_harness_test_support::screen::visible_screen(
+            let terminal = tickloop_harness::test_support::screen::visible_screen(
                 &String::from_utf8_lossy(&output),
                 state.width,
                 state.height,
@@ -5279,7 +5287,7 @@ fn monitor_bottom_padding_does_not_reduce_the_overlay() {
     state.monitor.focus(true, None);
     let mut output = Vec::new();
     state.draw_frame(&mut output).unwrap();
-    let terminal = tickloop_harness_test_support::screen::visible_screen(
+    let terminal = tickloop_harness::test_support::screen::visible_screen(
         &String::from_utf8_lossy(&output),
         state.width,
         state.height,
@@ -5378,7 +5386,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
                     tickloop_code_settings::MonitorPreference::Hidden
                 };
                 let instance = state.monitor.entries()[0].instance.clone();
-                let since = tickloop_harness_base::private_fs::unix_time_milliseconds() - elapsed;
+                let since = tickloop_harness::base::private_fs::unix_time_milliseconds() - elapsed;
                 state.monitor.flash_received(instance, since);
                 let line = monitor_entry_span(&mut state);
                 let entry = line
@@ -5431,7 +5439,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
     let instance = state.monitor.entries()[0].instance.clone();
     state.monitor.flash_received(
         instance,
-        tickloop_harness_base::private_fs::unix_time_milliseconds(),
+        tickloop_harness::base::private_fs::unix_time_milliseconds(),
     );
     assert!(
         monitor_entry_span(&mut state)
@@ -5440,7 +5448,7 @@ fn collapsed_monitor_entry_uses_row_colours_but_expanded_entry_stays_static() {
             .any(|span| span.text.contains("Monitor ") && span.role == Some(Role::MutedText))
     );
     assert_eq!(
-        state.next_row_clock(tickloop_harness_base::private_fs::unix_time_milliseconds()),
+        state.next_row_clock(tickloop_harness::base::private_fs::unix_time_milliseconds()),
         None
     );
 }
@@ -5454,7 +5462,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
         let instance = if artifact {
             snapshot
                 .artifact_ticks
-                .push(tickloop_harness_protocol::ArtifactTick {
+                .push(tickloop_harness::protocol::ArtifactTick {
                     artifact_id: "doc".into(),
                     origin: "https://docs.example".into(),
                     title: "Stream Artifact".into(),
@@ -5480,15 +5488,15 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
             .set_monitor_preference(tickloop_code_settings::MonitorPreference::Hidden)
             .unwrap();
         let message = if artifact {
-            tickloop_harness_protocol::LocalMessage::ArtifactRequest {
+            tickloop_harness::protocol::LocalMessage::ArtifactRequest {
                 artifact_id: "doc".into(),
                 request_id: "feedback".into(),
                 title: None,
                 body: "Review this".into(),
             }
         } else {
-            tickloop_harness_protocol::LocalMessage::TickDelivery {
-                items: vec![tickloop_harness_protocol::TickDeliveryLine {
+            tickloop_harness::protocol::LocalMessage::TickDelivery {
+                items: vec![tickloop_harness::protocol::TickDeliveryLine {
                     instance: instance.clone(),
                     title: None,
                     kind: None,
@@ -5502,7 +5510,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
         console
             .record_local_deliveries(&snapshot, input, std::slice::from_ref(&message))
             .unwrap();
-        let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
         {
             let mut state = console.state.lock().unwrap();
             assert!(!state.monitor_visible());
@@ -5549,16 +5557,16 @@ fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapsh
         .set_monitor_preference(tickloop_code_settings::MonitorPreference::Hidden)
         .unwrap();
     console
-        .write_shell_notification(&tickloop_harness_protocol::TaskNotification {
+        .write_shell_notification(&tickloop_harness::protocol::TaskNotification {
             chat_id: chat.into(),
             task_id: shells.tasks[0].id.into(),
             tool_use_id: None,
             output_file: "output.txt".into(),
-            status: tickloop_harness_protocol::TaskNotificationStatus::Completed,
+            status: tickloop_harness::protocol::TaskNotificationStatus::Completed,
             summary: "make test completed".into(),
         })
         .unwrap();
-    let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
     {
         let state = console.state.lock().unwrap();
         assert_eq!(
@@ -5620,7 +5628,7 @@ fn artifact_metadata_updates_flash_live_rows_and_hidden_entries_without_replayin
             Some(metadata("2020-01-01T00:00:00Z")),
         )
         .unwrap();
-    let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
     assert_eq!(
         console
             .state
@@ -5636,7 +5644,7 @@ fn artifact_metadata_updates_flash_live_rows_and_hidden_entries_without_replayin
         instance.to_string(),
         Some(metadata("2099-01-01T00:00:00Z")),
     );
-    let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let first_frame;
     {
         let state = console.state.lock().unwrap();
@@ -5670,7 +5678,7 @@ fn artifact_metadata_updates_flash_live_rows_and_hidden_entries_without_replayin
 
 #[test]
 fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_not() {
-    use tickloop_harness_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    use tickloop_harness::protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     for goal in [false, true] {
         let chat = Uuid::new_v4();
         let source = auto_reveal_sources(chat, if goal { "goal" } else { "scheduled" });
@@ -5719,7 +5727,7 @@ fn consumed_scheduled_and_goal_inputs_flash_rows_and_entries_but_history_does_no
                 super::super::workflows::write_public_history(&console, &snapshot).unwrap();
             }
             super::super::consume_input_echo_from_snapshot(&console, &snapshot, input).unwrap();
-            let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+            let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
             let mut state = console.state.lock().unwrap();
             assert_eq!(
                 state.monitor.entry_flash_role(state.display, now),
@@ -5783,7 +5791,7 @@ fn collapsed_monitor_flash_render_evidence() {
         state.monitor.focused = false;
         state.monitor_preference = tickloop_code_settings::MonitorPreference::Hidden;
         let instance = state.monitor.entries()[0].instance.clone();
-        let since = tickloop_harness_base::private_fs::unix_time_milliseconds() - elapsed;
+        let since = tickloop_harness::base::private_fs::unix_time_milliseconds() - elapsed;
         state.monitor.flash_received(instance, since);
         let line = monitor_entry_span(&mut state);
         let resolved = line.resolve(state.display.theme(), state.width);
@@ -5864,7 +5872,7 @@ fn p_pauses_periodic_ticks_and_scheduled_tasks_and_does_nothing_elsewhere() {
         format!("{chat}/{TASK_ID}/p")
     );
     snapshot.scheduled_tasks[0].confirmation =
-        Some(tickloop_harness_protocol::ScheduledTaskConfirmation::Pending);
+        Some(tickloop_harness::protocol::ScheduledTaskConfirmation::Pending);
     state
         .monitor
         .set_chat_status(Arc::new(ChatStatus::of(&snapshot)));
@@ -5934,7 +5942,7 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
     let task = core
         .schedule_task(
             chat.into(),
-            tickloop_harness_runtime::NewScheduledTask::new("*/10 * * * *", "check build", true),
+            tickloop_harness::runtime::NewScheduledTask::new("*/10 * * * *", "check build", true),
         )
         .await
         .unwrap();
@@ -5969,7 +5977,7 @@ async fn p_actions_toggle_runtime_state_and_report_paused_and_resumed() {
 #[test]
 fn single_line_monitor_render_output_preserves_paused_rows_and_pinned_sections() {
     use crate::monitor_rows::{StatusTone, SubscriptionMark};
-    use tickloop_harness_protocol::TickSubscriptionFrequency;
+    use tickloop_harness::protocol::TickSubscriptionFrequency;
 
     let title = "检查 mixed 中文 build long selected name 👩‍💻 that must stay on one line";
     for paused in [false, true] {
@@ -5989,7 +5997,7 @@ fn single_line_monitor_render_output_preserves_paused_rows_and_pinned_sections()
         state.monitor.select(&instance);
         let mut output = Vec::new();
         state.draw_frame(&mut output).unwrap();
-        let screen = tickloop_harness_test_support::screen::visible_screen(
+        let screen = tickloop_harness::test_support::screen::visible_screen(
             &String::from_utf8_lossy(&output),
             state.width,
             state.height,
@@ -6102,7 +6110,7 @@ fn monitor_failures_stay_at_the_bottom_of_side_overlay_and_detail_views() {
             state.monitor.action_error = Some("Cannot close Tick: denied".into());
             let mut output = Vec::new();
             state.draw_frame(&mut output).unwrap();
-            let terminal = tickloop_harness_test_support::screen::visible_screen(
+            let terminal = tickloop_harness::test_support::screen::visible_screen(
                 &String::from_utf8_lossy(&output),
                 state.width,
                 state.height,

@@ -9,7 +9,7 @@ use super::{
     style::{Role, RoleLine},
 };
 use crate::monitor_rows::{StatusTone, SubscriptionMark};
-use tickloop_harness_protocol::TickSubscriptionFrequency;
+use tickloop_harness::protocol::TickSubscriptionFrequency;
 
 /// The indentation of panel rows outside Monitor.
 pub(super) const ROW_INDENT: &str = "  ";

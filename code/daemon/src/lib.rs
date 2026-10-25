@@ -39,13 +39,13 @@ use tickloop_code_client::{
         remove_stale_socket, validate_directory, validate_file,
     },
 };
-use tickloop_harness_model::{LocalModelClients, ModelClients, cards::launch_model};
+use tickloop_harness::model::{LocalModelClients, ModelClients, cards::launch_model};
 
 use tickloop_code_access::{AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec};
 use tickloop_code_local_environment::environment::LocalEnvironment;
 use tickloop_code_settings::UserSettings;
-use tickloop_harness_protocol::OtherTickhost;
-use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
+use tickloop_harness::protocol::OtherTickhost;
+use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
 
 mod chunked;
 pub mod daemon_control;
@@ -673,11 +673,11 @@ pub async fn build_runtime_with_models(
             .config_root
             .clone()
             .ok_or("saved sessions require a config root")?;
-        let store = tickloop_harness_runtime::transcript::JsonlTranscriptStore::open(root)
+        let store = tickloop_harness::runtime::transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| format!("storage failure: {error}"))?;
         Some(Arc::new(store)
             as Arc<
-                dyn tickloop_harness_runtime::transcript::TranscriptStore,
+                dyn tickloop_harness::runtime::transcript::TranscriptStore,
             >)
     } else {
         None
@@ -751,15 +751,15 @@ pub async fn build_runtime_with_models(
     )
     .map_err(|error| error.to_string())?;
     environment.install(&agent);
-    use tickloop_harness_runtime::tick_adapter::TickAdapters;
+    use tickloop_harness::runtime::tick_adapter::TickAdapters;
     let tick_tools = hosted
         .clone()
-        .map(|hosted| hosted as Arc<dyn tickloop_harness_runtime::host_tools::HostToolProvider>);
+        .map(|hosted| hosted as Arc<dyn tickloop_harness::runtime::host_tools::HostToolProvider>);
     let adapters = Arc::new(TickAdapters::builtin(
         agent.clone(),
         hosted.map(|tools| {
             Arc::new(
-                tickloop_harness_runtime::tick_stream::HostedTickStream::with_environment(
+                tickloop_harness::runtime::tick_stream::HostedTickStream::with_environment(
                     Arc::new(environment.clone()),
                     tools.authority(),
                 ),
@@ -768,11 +768,11 @@ pub async fn build_runtime_with_models(
     ));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()
-        && let Ok(artifact) = tickloop_harness_artifacts::ArtifactClient::new(root)
+        && let Ok(artifact) = tickloop_harness::artifacts::ArtifactClient::new(root)
     {
         agent
             .install_host_tools(Arc::new(
-                tickloop_harness_runtime::mcp_tools::McpHostToolProvider::new(
+                tickloop_harness::runtime::mcp_tools::McpHostToolProvider::new(
                     artifact,
                     tick_tools.clone(),
                 ),

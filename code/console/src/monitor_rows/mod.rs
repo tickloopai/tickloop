@@ -15,8 +15,8 @@ use std::{
     sync::Arc,
 };
 use tick_protocol::InstanceRef;
-use tickloop_harness_artifacts::ArtifactMetadata;
-use tickloop_harness_protocol::{
+use tickloop_harness::artifacts::ArtifactMetadata;
+use tickloop_harness::protocol::{
     ChatStatus, MonitorMember, MonitorMembership, ShellTaskSnapshot, TickSubscriptionFrequency,
     TickSubscriptionStatus,
 };
@@ -311,7 +311,7 @@ pub struct MonitorContext {
     pub now_ms: u64,
 }
 
-pub(crate) fn terminal_exit_status(exit: tickloop_harness_protocol::HostedProgramExit) -> String {
+pub(crate) fn terminal_exit_status(exit: tickloop_harness::protocol::HostedProgramExit) -> String {
     match (exit.code, exit.signal) {
         (Some(code), _) => format!("exited {code}"),
         (_, Some(signal)) => format!("exited by signal {signal}"),
@@ -402,7 +402,7 @@ fn active_subscriptions(
 fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     let terminal = matches!(
         row.kind,
-        Some(tickloop_harness_protocol::ObservationKind::Terminal { .. })
+        Some(tickloop_harness::protocol::ObservationKind::Terminal { .. })
     );
     TickDescriptor {
         instance: row.instance.clone(),
@@ -424,7 +424,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         owner: TickOwner::Unknown,
         updated_at_ms: row.updated_at_ms,
         update: builtin::subscription_update(row),
-        running: row.link == tickloop_harness_protocol::TickLinkState::Live,
+        running: row.link == tickloop_harness::protocol::TickLinkState::Live,
         resources: None,
         actions: vec![remove_from_monitor(&row.instance)],
     }

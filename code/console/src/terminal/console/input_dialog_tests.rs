@@ -1,6 +1,6 @@
 use super::*;
 use crate::monitor_rows::{MonitorAction, TickIntent};
-use tickloop_harness_protocol::ChatSnapshot;
+use tickloop_harness::protocol::ChatSnapshot;
 
 #[test]
 fn completed_login_has_one_return_option() {
@@ -69,8 +69,10 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
     };
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let view = agent.permissions_view(chat).await.unwrap();
@@ -419,8 +421,10 @@ async fn review_regression_management_loads_finish_behind_the_visible_request() 
     use crate::terminal::execution::ConsoleExecution;
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let view = agent.permissions_view(chat).await.unwrap();
@@ -521,8 +525,10 @@ async fn review_regression_management_updates_reach_suspended_and_cached_dialogs
     use crate::terminal::execution::ConsoleExecution;
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     for cached in [false, true] {
@@ -571,8 +577,10 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
     };
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let view = agent.permissions_view(chat).await.unwrap();
@@ -765,8 +773,10 @@ async fn review_regression_permissions_click_opens_an_unselected_option_like_ent
     use crate::terminal::execution::ConsoleExecution;
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let view = agent.permissions_view(chat).await.unwrap();
@@ -1773,19 +1783,19 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
 #[tokio::test]
 async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_across_switches() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let markdown = (0..30)
         .map(|index| format!("Plan line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::submit_plan("plan", &markdown),
-        tickloop_harness_test_support::text("Implementation started."),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::submit_plan("plan", &markdown),
+        tickloop_harness::test_support::text("Implementation started."),
     ]));
     let agent =
-        ConsoleExecution::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        ConsoleExecution::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let other = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -1796,7 +1806,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     agent.submit(chat, "Plan the task".into()).await.unwrap();
     let request = loop {
         if let EventKind::PermissionRequested { request } =
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
         {
@@ -1905,7 +1915,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         .unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Completed { .. }
@@ -1944,15 +1954,18 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
 #[tokio::test]
 async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let agent = ConsoleExecution::open_embedded(
         root.clone(),
-        tickloop_harness_test_support::persisted_config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("plan", "Saved plan for restored approval."),
+        tickloop_harness::test_support::persisted_config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan(
+                "plan",
+                "Saved plan for restored approval.",
+            ),
         ])),
     )
     .unwrap();
@@ -1965,7 +1978,7 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
     let receipt = agent.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::PermissionRequested { .. }
@@ -1974,12 +1987,12 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
         }
     }
     agent.shutdown().await;
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::text("Restored execution started."),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::text("Restored execution started."),
     ]));
     let restored = ConsoleExecution::open_embedded(
         root,
-        tickloop_harness_test_support::persisted_config(),
+        tickloop_harness::test_support::persisted_config(),
         model.clone(),
     )
     .unwrap();
@@ -2014,7 +2027,7 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
     assert_eq!(effect.receipt.unwrap().loop_id, receipt.loop_id);
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Completed { .. }
@@ -2075,15 +2088,15 @@ fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() 
 #[tokio::test]
 async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::ExecutionMode;
-    use tickloop_harness_protocol::{BranchRequest, EventKind};
+    use tickloop_harness::protocol::ExecutionMode;
+    use tickloop_harness::protocol::{BranchRequest, EventKind};
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::open_embedded(
         directory.path().join("state"),
-        tickloop_harness_test_support::persisted_config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("plan", "Shared pending plan."),
-            tickloop_harness_test_support::text("Copy implementation started."),
+        tickloop_harness::test_support::persisted_config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("plan", "Shared pending plan."),
+            tickloop_harness::test_support::text("Copy implementation started."),
         ])),
     )
     .unwrap();
@@ -2096,7 +2109,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     let receipt = agent.submit(source, "Plan".into()).await.unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::PermissionRequested { .. }
@@ -2107,7 +2120,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     agent.decline_plan(source, 1, None).await.unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Interrupted
@@ -2154,7 +2167,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
         .unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Completed { .. }
@@ -2185,15 +2198,15 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
 #[tokio::test]
 async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let original = ConsoleExecution::open_embedded(
         root.clone(),
-        tickloop_harness_test_support::persisted_config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("plan", "Review this plan."),
+        tickloop_harness::test_support::persisted_config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("plan", "Review this plan."),
         ])),
     )
     .unwrap();
@@ -2206,7 +2219,7 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
     original.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::PermissionRequested { .. }
@@ -2215,12 +2228,12 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
         }
     }
     original.shutdown().await;
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::text("Implementation started."),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::text("Implementation started."),
     ]));
     let agent = ConsoleExecution::open_embedded(
         root,
-        tickloop_harness_test_support::persisted_config(),
+        tickloop_harness::test_support::persisted_config(),
         model.clone(),
     )
     .unwrap();
@@ -2265,7 +2278,7 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
         .unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Completed { .. }
@@ -2325,23 +2338,23 @@ fn a_child_cannot_use_plan_or_change_its_mode() {
 #[tokio::test]
 async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, open_current_plan};
-    use tickloop_harness_protocol::{EventKind, ExecutionMode};
+    use tickloop_harness::protocol::{EventKind, ExecutionMode};
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "delegate",
             "Subagent",
             serde_json::json!({"task":"Plan the delegated task."}),
         ),
-        tickloop_harness_test_support::text("Child plan: write child-plan.txt."),
-        tickloop_harness_test_support::text("The parent observed the child plan."),
+        tickloop_harness::test_support::text("Child plan: write child-plan.txt."),
+        tickloop_harness::test_support::text("The parent observed the child plan."),
     ]));
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model.clone(),
     );
     let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+        ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
@@ -2354,7 +2367,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
         .unwrap();
     let mut child = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::Completed { .. } if event.chat_id == parent => break,
             EventKind::Completed { .. } => child = Some(event.chat_id),
@@ -2387,15 +2400,15 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
 #[tokio::test]
 async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::EventKind;
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::EventKind;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let original = ConsoleExecution::open_embedded(
         root.clone(),
-        tickloop_harness_test_support::persisted_config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan("plan", "First plan."),
+        tickloop_harness::test_support::persisted_config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("plan", "First plan."),
         ])),
     )
     .unwrap();
@@ -2408,7 +2421,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     original.submit(chat, "Plan".into()).await.unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::PermissionRequested { .. }
@@ -2419,15 +2432,15 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     original.shutdown().await;
     let agent = ConsoleExecution::open_embedded(
         root,
-        tickloop_harness_test_support::persisted_config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        tickloop_harness::test_support::persisted_config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "read",
                 "Read",
-                serde_json::json!({"file_path":tickloop_harness_test_support::PLAN_FILE}),
+                serde_json::json!({"file_path":tickloop_harness::test_support::PLAN_FILE}),
             ),
-            tickloop_harness_test_support::submit_plan("revised", "Revised plan."),
-            tickloop_harness_test_support::text("Implementation started."),
+            tickloop_harness::test_support::submit_plan("revised", "Revised plan."),
+            tickloop_harness::test_support::text("Implementation started."),
         ])),
     )
     .unwrap();
@@ -2453,7 +2466,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
         .unwrap();
     let revised = loop {
         if let EventKind::PermissionRequested { request } =
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
         {
@@ -2497,7 +2510,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
         .unwrap();
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Completed { .. }
@@ -2748,8 +2761,10 @@ async fn input_dialog_background_provider_completion_updates_only_its_origin_pag
     use crate::terminal::login::{LoginFlow, LoginMethod, LoginSession};
     let directory = tempfile::tempdir().unwrap();
     let agent = crate::terminal::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let first = agent.create_chat(directory.path().into()).await.unwrap();
     let second = agent.create_chat(directory.path().into()).await.unwrap();

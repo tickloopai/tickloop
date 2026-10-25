@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::{fs, path::Path};
 use tickloop_code_settings::UserSettings;
-use tickloop_harness_model::cards::ModelCatalog;
+use tickloop_harness::model::cards::ModelCatalog;
 
 fn builtin_selection_with_ignored_overrides(root: &Path) {
     fs::create_dir_all(root.join("providers")).unwrap();
@@ -26,7 +26,7 @@ fn builtin_selection_with_ignored_overrides(root: &Path) {
     );
     assert_eq!(
         loaded.reasoning_effort(),
-        Some(tickloop_harness_protocol::ReasoningEffort::Low)
+        Some(tickloop_harness::protocol::ReasoningEffort::Low)
     );
     assert!(loaded.thinking_enabled());
     loaded.configured_model().unwrap();

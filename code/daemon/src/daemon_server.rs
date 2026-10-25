@@ -23,8 +23,8 @@ use tickloop_code_access::{
     Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
     PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion, TranscriptRef,
 };
-use tickloop_harness_protocol::OtherTickhost;
-use tickloop_harness_protocol::{chat_display_title, chat_has_work, chat_preview};
+use tickloop_harness::protocol::OtherTickhost;
+use tickloop_harness::protocol::{chat_display_title, chat_has_work, chat_preview};
 
 #[async_trait]
 pub trait WorkerFactory: Send + Sync {
@@ -504,7 +504,7 @@ impl DaemonServer {
                         store_root,
                         chat_id: snapshot.conversation.id.into(),
                     });
-                let state = tickloop_harness_runtime::summary_state(
+                let state = tickloop_harness::runtime::summary_state(
                     &snapshot.conversation.chat_loop,
                     &snapshot.user_shells,
                 );

@@ -8,7 +8,7 @@ use tickloop_code_access::{
     ExecutionRef, LaunchSpec, ObservationRequest, ObservationValue, RuntimeVersion, UserInput,
 };
 use tickloop_code_client::{LocalAgentClient, connect_or_start_at};
-use tickloop_harness_protocol::UserShellState;
+use tickloop_harness::protocol::UserShellState;
 
 use uuid::Uuid;
 
@@ -156,7 +156,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
         )
     };
     let (model_url, mut model_requests, finish_first_turn) =
-        tickloop_harness_test_support::model_http_support::serve_responses_with_gated_response(
+        tickloop_harness::test_support::model_http_support::serve_responses_with_gated_response(
             vec![
                 (200, reply("answer-before-upgrade")),
                 (200, reply("answer-after-upgrade")),
@@ -165,8 +165,8 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
         )
         .await;
     let transport_path = workdir.path().join("transport.json");
-    let mut transport = tickloop_harness_test_support::config();
-    transport.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    let mut transport = tickloop_harness::test_support::config();
+    transport.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     transport.base_url = model_url.trim_end_matches("/anthropic").into();
     transport.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     std::fs::write(&transport_path, serde_json::to_vec(&transport).unwrap()).unwrap();
@@ -185,9 +185,9 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     launch.config_root = Some(runtime.config_root().to_path_buf());
     launch.session_persistence = false;
     launch.host_options.execution_mode_override =
-        Some(tickloop_harness_protocol::ExecutionMode::FullAccess);
-    launch.host_options.prompt_policy = tickloop_harness_protocol::PromptPolicy::Unrestricted;
-    let mut model = tickloop_harness_test_support::config();
+        Some(tickloop_harness::protocol::ExecutionMode::FullAccess);
+    launch.host_options.prompt_policy = tickloop_harness::protocol::PromptPolicy::Unrestricted;
+    let mut model = tickloop_harness::test_support::config();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     launch.model = Some(model);
     launch.environment = [
@@ -373,7 +373,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let current = snapshot(&replacement, execution).await;
-            if current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text.contains("answer-after-upgrade")))) { break; }
+            if current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text.contains("answer-after-upgrade")))) { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.expect("new Worker did not finish the second model turn");

@@ -24,11 +24,11 @@ struct HiddenReplyModel {
 impl ModelClient for HiddenReplyModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -72,7 +72,7 @@ impl ModelClient for HiddenReplyModel {
         };
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(&text),
+            content: tickloop_harness::test_support::text(&text),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -180,8 +180,8 @@ async fn run_hidden_view_fixture() {
         flood_acknowledgements: flood_acknowledgements.clone(),
         lagged,
     });
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model.clone(),
     );
     let (overview_entered, entered) = oneshot::channel();
@@ -201,7 +201,7 @@ async fn run_hidden_view_fixture() {
     });
     let workdir = std::env::current_dir().unwrap();
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let view = ViewRef {
         session_id: Uuid::new_v4(),
@@ -276,7 +276,7 @@ async fn run_hidden_view_fixture() {
     let running = core.snapshot(chat.into()).await.unwrap();
     assert_eq!(
         running.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     assert_eq!(running.chat_loop.run_id, Some(Into::into(run)));
     assert_eq!(model.requests.load(Ordering::SeqCst), 1);
@@ -300,7 +300,7 @@ async fn run_hidden_view_fixture() {
         release_model.take().unwrap().send(()).unwrap();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
             while core.snapshot(chat.into()).await.unwrap().chat_loop.state
-                != tickloop_harness_protocol::LoopState::Idle
+                != tickloop_harness::protocol::LoopState::Idle
             {
                 tokio::task::yield_now().await;
             }
@@ -403,9 +403,9 @@ async fn run_hidden_view_fixture() {
         assert_eq!(
             snapshot.chat_loop.state,
             if lagged {
-                tickloop_harness_protocol::LoopState::Idle
+                tickloop_harness::protocol::LoopState::Idle
             } else {
-                tickloop_harness_protocol::LoopState::Running
+                tickloop_harness::protocol::LoopState::Running
             }
         );
     }
@@ -430,7 +430,7 @@ async fn run_hidden_view_fixture() {
     if route == INTERRUPT_OVERVIEW_ROUTE {
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
             while core.snapshot(chat.into()).await.unwrap().chat_loop.state
-                != tickloop_harness_protocol::LoopState::Interrupted
+                != tickloop_harness::protocol::LoopState::Interrupted
             {
                 tokio::task::yield_now().await;
             }
@@ -486,7 +486,7 @@ fn double_control_c_in_overview_exits_only_the_view() {
 }
 
 fn run_hidden_view_pty(route: &str) {
-    let directory = tempfile::tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT).unwrap();
+    let directory = tempfile::tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

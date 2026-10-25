@@ -73,3 +73,17 @@ test("Harness cannot depend on local Tickhost or package storage in any dependen
     }
   }
 });
+
+test("Code uses the Harness facade for every dependency kind", () => {
+  const actual = JSON.parse(readFileSync(new URL("./dependency-boundaries.json", import.meta.url), "utf8"));
+  const code = Object.entries(actual.layers).filter(([, layer]) => layer === "code");
+  const harness = Object.entries(actual.layers).filter(([, layer]) => layer === "harness");
+  for (const [from] of code) {
+    for (const [to] of harness) {
+      for (const kind of ["normal", "build", "dev"]) {
+        const edgePolicy = { ...actual, exceptions: actual.exceptions.filter(edge => edge.from === from && edge.to === to && edge.kind === kind) };
+        assert.ok(checkBoundaries(metadata([[from, to, kind === "normal" ? null : kind]]), edgePolicy).some(error => error.startsWith(`${from} -> ${to} (`)), `${from} must use the facade instead of ${to} (${kind})`);
+      }
+    }
+  }
+});

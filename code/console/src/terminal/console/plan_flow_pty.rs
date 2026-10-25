@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tickloop_code_local_environment::AgentLocalExt;
 #[cfg(test)]
 use tickloop_code_settings::local_agent::LocalAgent;
-use tickloop_harness_protocol::{Content, ExecutionMode, Role as MessageRole};
-use tickloop_harness_test_support::ScriptedModel;
+use tickloop_harness::protocol::{Content, ExecutionMode, Role as MessageRole};
+use tickloop_harness::test_support::ScriptedModel;
 
 const FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 const FLOW_TIMEOUT: Duration = Duration::from_secs(20);
@@ -74,51 +74,51 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         SHIFT_TAB_ROUTE => (
             ExecutionMode::Auto,
             vec![
-                tickloop_harness_test_support::call(
+                tickloop_harness::test_support::call(
                     "wait",
                     "Bash",
                     json!({"command": format!("touch {STARTED_FILE}; while [ ! -f {GO_FILE} ]; do sleep 0.05; done"), "description": "Wait for the go file"}),
                 ),
-                tickloop_harness_test_support::submit_plan(
+                tickloop_harness::test_support::submit_plan(
                     "plan-1",
                     "# First plan\nCreate implemented.txt.",
                 ),
-                tickloop_harness_test_support::submit_plan(
+                tickloop_harness::test_support::submit_plan(
                     "plan-2",
                     "# Revised plan\nCreate implemented.txt with a test note.",
                 ),
-                tickloop_harness_test_support::call(
+                tickloop_harness::test_support::call(
                     "implement",
                     "Write",
                     json!({"file_path": "implemented.txt", "content": "approved"}),
                 ),
-                tickloop_harness_test_support::text("Implementation complete."),
-                tickloop_harness_test_support::text("Wrapped up outside Plan."),
+                tickloop_harness::test_support::text("Implementation complete."),
+                tickloop_harness::test_support::text("Wrapped up outside Plan."),
             ],
         ),
         CANCEL_ROUTE => (
             ExecutionMode::Plan,
             vec![
-                tickloop_harness_test_support::submit_plan(
+                tickloop_harness::test_support::submit_plan(
                     "plan",
                     "# Pending plan\nShip the reviewed change.",
                 ),
-                tickloop_harness_test_support::text("Continuing the approved plan."),
+                tickloop_harness::test_support::text("Continuing the approved plan."),
             ],
         ),
         ATTACH_ROUTE => (
             ExecutionMode::Plan,
             vec![
-                tickloop_harness_test_support::submit_plan(
+                tickloop_harness::test_support::submit_plan(
                     "plan",
                     "# Live plan\nImplement after approval.",
                 ),
-                tickloop_harness_test_support::text("Implementation started."),
+                tickloop_harness::test_support::text("Implementation started."),
             ],
         ),
         RESTORED_ROUTE => (
             ExecutionMode::Plan,
-            vec![tickloop_harness_test_support::text(
+            vec![tickloop_harness::test_support::text(
                 "Restored implementation started.",
             )],
         ),
@@ -136,10 +136,10 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     .unwrap();
     let scripted = Arc::new(ScriptedModel::new(replies));
     let (core, agent, model, restored_chat) = if route == RESTORED_ROUTE {
-        let model = tickloop_harness_test_support::persisted_config();
+        let model = tickloop_harness::test_support::persisted_config();
         let root = directory.join("agent-state");
         let chat = raise_plan_approval_then_stop(&root, &directory, model.clone()).await;
-        let core = tickloop_harness_runtime::Agent::open_embedded(
+        let core = tickloop_harness::runtime::Agent::open_embedded(
             root.clone(),
             model.clone(),
             scripted.clone(),
@@ -156,8 +156,8 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         );
         (core, agent, model, Some(chat))
     } else {
-        let model = tickloop_harness_test_support::config();
-        let core = tickloop_harness_runtime::Agent::new_embedded(model.clone(), scripted.clone());
+        let model = tickloop_harness::test_support::config();
+        let core = tickloop_harness::runtime::Agent::new_embedded(model.clone(), scripted.clone());
         record_phase(&directory, "agent-opened");
         core.install_own_tickhost();
         let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
@@ -167,8 +167,8 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         (core, agent, model, None)
     };
     core.set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
-        tickloop_harness_test_support::text(
-            &tickloop_harness_test_support::auto_classification(false).to_string(),
+        tickloop_harness::test_support::text(
+            &tickloop_harness::test_support::auto_classification(false).to_string(),
         );
         3
     ])))
@@ -255,14 +255,14 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
 async fn raise_plan_approval_then_stop(
     root: &Path,
     workdir: &Path,
-    model: tickloop_harness_protocol::ModelConfig,
+    model: tickloop_harness::protocol::ModelConfig,
 ) -> Uuid {
     record_phase(workdir, "first-agent-opening");
-    let core = tickloop_harness_runtime::Agent::open_embedded(
+    let core = tickloop_harness::runtime::Agent::open_embedded(
         root.to_owned(),
         model,
         Arc::new(ScriptedModel::new(vec![
-            tickloop_harness_test_support::submit_plan(
+            tickloop_harness::test_support::submit_plan(
                 "plan",
                 "# Restored plan\nResume after restart.",
             ),
@@ -284,16 +284,19 @@ async fn raise_plan_approval_then_stop(
 }
 
 async fn wait_for_plan_approval(
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
 ) {
     loop {
-        match tickloop_harness_test_support::next_event(events).await.kind {
-            tickloop_harness_protocol::EventKind::PermissionRequested { request }
-                if request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME =>
+        match tickloop_harness::test_support::next_event(events)
+            .await
+            .kind
+        {
+            tickloop_harness::protocol::EventKind::PermissionRequested { request }
+                if request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME =>
             {
                 return;
             }
-            tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+            tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
@@ -341,7 +344,7 @@ fn request_summaries(model: &ScriptedModel) -> Vec<Value> {
             json!({
                 "plan_mode": system.contains(PLAN_REMINDER),
                 "exit_notices": exit_notices,
-                "offers_exit_plan_mode": request.tools.iter().any(|tool| tool.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME),
+                "offers_exit_plan_mode": request.tools.iter().any(|tool| tool.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME),
                 "latest": latest,
             })
         })

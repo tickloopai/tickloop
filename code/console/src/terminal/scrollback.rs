@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use tickloop_harness_protocol::ModelRequestKind;
+use tickloop_harness::protocol::ModelRequestKind;
 use tickloop_ui::{
     hyperlink::web_url_ranges,
     markdown::{Continuation, MarkdownLine, Marks, StreamingLayout},
@@ -842,7 +842,7 @@ impl Scrollback {
 
     pub(super) fn sync_native_take_in(
         &mut self,
-        membership: &tickloop_harness_protocol::MonitorMembership,
+        membership: &tickloop_harness::protocol::MonitorMembership,
     ) {
         self.pending_take_in_lines.retain(|index| {
             let Some(style) = self.line_styles.get_mut(*index) else {
@@ -1228,7 +1228,7 @@ impl Scrollback {
             width,
             height,
             prefers_reduced_motion,
-            tickloop_harness_base::private_fs::unix_time_milliseconds(),
+            tickloop_harness::base::private_fs::unix_time_milliseconds(),
         )
     }
 
@@ -2123,7 +2123,7 @@ mod tests {
             None,
             Some(instance.clone()),
         );
-        let mut membership = tickloop_harness_protocol::MonitorMembership::default();
+        let mut membership = tickloop_harness::protocol::MonitorMembership::default();
         scroll.sync_native_take_in(&membership);
         assert!(scroll.line_styles.iter().all(|style| style.flash.is_none()));
         membership.mark_taken_in(instance.clone(), 1_000);

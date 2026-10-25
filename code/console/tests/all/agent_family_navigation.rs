@@ -21,9 +21,9 @@ struct Catalog {
 fn catalog(epoch: Uuid, rows: Vec<AgentSummary>) -> Arc<Catalog> {
     Arc::new(Catalog {
         daemon: EmbeddedAgentAccess::with_epoch(
-            tickloop_harness_runtime::Agent::new_embedded(
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::runtime::Agent::new_embedded(
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
             ),
             epoch,
         ),
@@ -115,7 +115,7 @@ async fn viewed_finished_children_survive_until_thirty_seconds_after_leaving_and
         .iter_mut()
         .find(|row| row.execution == child.execution)
         .unwrap()
-        .state = tickloop_harness_protocol::LoopState::Running;
+        .state = tickloop_harness::protocol::LoopState::Running;
     console.refresh().await.unwrap();
     assert_eq!(
         console.family(main.execution).len(),
@@ -282,7 +282,7 @@ async fn departure_grace_survives_an_unobserved_completion() {
     console.refresh().await.unwrap();
     console.visible_ready(Some(child.execution));
     clock.store(200_000, Ordering::SeqCst);
-    catalog.rows.lock().unwrap()[1].state = tickloop_harness_protocol::LoopState::Idle;
+    catalog.rows.lock().unwrap()[1].state = tickloop_harness::protocol::LoopState::Idle;
     catalog.rows.lock().unwrap()[1].updated_at = Some(199_000);
     console.interpret(Intent::NewDraft).unwrap();
     clock.store(229_999, Ordering::SeqCst);

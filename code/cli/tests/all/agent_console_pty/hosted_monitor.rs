@@ -1,7 +1,7 @@
 use super::*;
 use tickloop_code_access::AgentAccess;
-use tickloop_harness_test_support::kitty_keyboard::{DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard};
-use tickloop_harness_test_support::screen::SELECTED_MARK;
+use tickloop_harness::test_support::kitty_keyboard::{DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard};
+use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 /// A View whose Agent opened `count` keys Ticks hidden in the Tickhost, now in its Monitor.
 async fn view_with_keys_ticks(
@@ -187,7 +187,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
 async fn hosted_members(
     client: &LocalAgentClient,
     execution: ExecutionRef,
-) -> Vec<tickloop_harness_protocol::HostedMember> {
+) -> Vec<tickloop_harness::protocol::HostedMember> {
     let mut last_error = None;
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
@@ -305,7 +305,7 @@ async fn select_committed_hosted_state(view: &mut PtyView, subscribed: bool, gon
 async fn tick_subscriptions(
     client: &LocalAgentClient,
     execution: ExecutionRef,
-) -> Vec<tickloop_harness_protocol::TickSubscriptionStatus> {
+) -> Vec<tickloop_harness::protocol::TickSubscriptionStatus> {
     let observation = client
         .observe(ObservationRequest::Agent {
             execution,
@@ -349,7 +349,7 @@ const MEMBER_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// reopened one, with the record it was reopened from and its subscription, after confirmation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens_it() {
-    use tickloop_harness_protocol::{HostedMemberState, TickSubscriptionFrequency};
+    use tickloop_harness::protocol::{HostedMemberState, TickSubscriptionFrequency};
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
@@ -517,7 +517,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
         let client = fixture.client().await;
         let execution = catalog(&client).await[0].execution;
         wait_snapshot(&client, execution, "the opening turn finished", |snapshot| {
-            snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         })
         .await;
         let attached_output_start = view.output.lock().unwrap().len();
@@ -541,8 +541,8 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
             .unwrap();
         wait_snapshot(&client, execution, "the attached stream completed", |snapshot| {
             snapshot.events.iter().any(|event| {
-                matches!(&event.kind, tickloop_harness_protocol::EventKind::Text(text) if text.contains(ATTACHED_REPLY))
-            }) && snapshot.conversation.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+                matches!(&event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains(ATTACHED_REPLY))
+            }) && snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         })
         .await;
         let attached_output = view.output.lock().unwrap()[attached_output_start..].to_vec();
@@ -1268,7 +1268,7 @@ async fn actual_cli_enter_floats_every_local_tick_in_the_herdr_popup() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_s_keeps_a_terminal_update_pending_while_changing_frequency() {
-    use tickloop_harness_protocol::TickSubscriptionFrequency;
+    use tickloop_harness::protocol::TickSubscriptionFrequency;
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let script = fixture.path("work/frequency.py");

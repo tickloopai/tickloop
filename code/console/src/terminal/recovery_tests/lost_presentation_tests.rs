@@ -89,11 +89,11 @@ struct LostPresentationModel {
 impl ModelClient for LostPresentationModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -115,7 +115,7 @@ impl ModelClient for LostPresentationModel {
         if std::env::var(LOST_COMPLETED_VARIABLE).as_deref() == Ok("1") {
             return Ok(ModelOutput {
                 private_source: None,
-                content: tickloop_harness_test_support::text(
+                content: tickloop_harness::test_support::text(
                     "The controlled investigation completed.",
                 ),
                 usage: Usage::default(),
@@ -142,13 +142,13 @@ fn lost_presentation_pty_fixture() {
                 .build()
                 .unwrap();
             tokio::task::LocalSet::new().block_on(&runtime, async {
-                let mut config = tickloop_harness_test_support::config();
+                let mut config = tickloop_harness::test_support::config();
                 config.model = LOST_MODEL.into();
                 config.name = LOST_MODEL.into();
                 let model = Arc::new(LostPresentationModel {
                     calls: AtomicUsize::new(0),
                 });
-                let core = tickloop_harness_runtime::Agent::new_embedded(config.clone(), model.clone());
+                let core = tickloop_harness::runtime::Agent::new_embedded(config.clone(), model.clone());
                 let access = Arc::new(LostPresentationAccess {
                     daemon: EmbeddedAgentAccess::new(core.clone()),
                     commands: AtomicUsize::new(0),
@@ -180,7 +180,7 @@ fn lost_presentation_pty_fixture() {
                 }
                 if std::env::var(LOST_COMPLETED_VARIABLE).as_deref() == Ok("1") {
                     while core.snapshot(chat.into()).await.unwrap().chat_loop.state
-                        != tickloop_harness_protocol::LoopState::Idle
+                        != tickloop_harness::protocol::LoopState::Idle
                     {
                         tokio::task::yield_now().await;
                     }

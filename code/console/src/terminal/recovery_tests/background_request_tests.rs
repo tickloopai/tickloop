@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const BACKGROUND_FIXTURE_VARIABLE: &str = "TICKLOOP_BACKGROUND_REQUEST_FIXTURE";
 const BACKGROUND_STAGE_FILE: &str = "background-request-stage";
@@ -47,11 +47,11 @@ impl AgentAccess for RecoveringBackgroundAccess {
 impl ModelClient for AfterAnswerGate {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -71,7 +71,7 @@ impl ModelClient for AfterAnswerGate {
     ) -> Result<ModelOutput, ModelError> {
         let index = self.requests.fetch_add(1, Ordering::Relaxed);
         let write = || {
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "background-write",
                 "Write",
                 serde_json::json!({"file_path":"approved.txt", "content":"fixture approved"}),
@@ -79,10 +79,10 @@ impl ModelClient for AfterAnswerGate {
         };
         let content = if index == 0 {
             if self.question_first {
-                tickloop_harness_test_support::call(
+                tickloop_harness::test_support::call(
                     "background-question",
                     "AskUserQuestion",
-                    tickloop_harness_test_support::single_question("Which fixture?"),
+                    tickloop_harness::test_support::single_question("Which fixture?"),
                 )
             } else {
                 write()
@@ -99,7 +99,7 @@ impl ModelClient for AfterAnswerGate {
             if self.question_first && index == 1 {
                 write()
             } else {
-                tickloop_harness_test_support::text("Background work finished")
+                tickloop_harness::test_support::text("Background work finished")
             }
         };
         Ok(ModelOutput {
@@ -168,8 +168,8 @@ async fn run_background_request_fixture() {
         release: tokio::sync::Semaphore::new(0),
         question_first,
     });
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model.clone(),
     );
     let daemon = Arc::new(EmbeddedAgentAccess::new(core.clone()));
@@ -180,7 +180,7 @@ async fn run_background_request_fixture() {
     });
     let workdir = std::env::current_dir().unwrap();
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let view = || ViewRef {
         session_id: Uuid::new_v4(),
@@ -207,9 +207,9 @@ async fn run_background_request_fixture() {
     *monitor_access.background.lock().unwrap() = Some(monitor.reference(background).await.unwrap());
     core.set_permission_rules(
         background.into(),
-        vec![tickloop_harness_protocol::PermissionRule {
+        vec![tickloop_harness::protocol::PermissionRule {
             id: Uuid::new_v4(),
-            decision: tickloop_harness_protocol::Decision::Ask,
+            decision: tickloop_harness::protocol::Decision::Ask,
             tool: "Write".into(),
             specifier: None,
             input: None,
@@ -248,7 +248,7 @@ async fn run_background_request_fixture() {
         .await
         .unwrap();
     let request_id = loop {
-        let event = tickloop_harness_test_support::next_event(&mut daemon_events).await;
+        let event = tickloop_harness::test_support::next_event(&mut daemon_events).await;
         match event.kind {
             EventKind::PermissionRequested { request } if !question_first => break request.id,
             EventKind::QuestionAsked { request } if question_first => break request.id,
@@ -286,7 +286,7 @@ async fn run_background_request_fixture() {
             .answer_question(
                 background,
                 request_id,
-                vec![tickloop_harness_protocol::QuestionAnswer::option(
+                vec![tickloop_harness::protocol::QuestionAnswer::option(
                     "Unknown fixture",
                 )],
             )
@@ -297,7 +297,7 @@ async fn run_background_request_fixture() {
                 background,
                 request_id,
                 true,
-                tickloop_harness_protocol::PermissionScope::Session,
+                tickloop_harness::protocol::PermissionScope::Session,
             )
             .await
     };
@@ -312,7 +312,7 @@ async fn run_background_request_fixture() {
             .answer_question(
                 background,
                 request_id,
-                vec![tickloop_harness_protocol::QuestionAnswer::option("Weekly")],
+                vec![tickloop_harness::protocol::QuestionAnswer::option("Weekly")],
             )
             .await
             .unwrap();
@@ -332,7 +332,7 @@ async fn run_background_request_fixture() {
     assert!(snapshot.questions.is_empty());
     assert_eq!(
         snapshot.chat_loop.state,
-        tickloop_harness_protocol::LoopState::Running
+        tickloop_harness::protocol::LoopState::Running
     );
     background_phase(
         "answered",
@@ -346,7 +346,7 @@ async fn run_background_request_fixture() {
         monitor_access.unavailable.store(true, Ordering::Relaxed);
         model.release.add_permits(1);
         let next = loop {
-            let event = tickloop_harness_test_support::next_event(&mut daemon_events).await;
+            let event = tickloop_harness::test_support::next_event(&mut daemon_events).await;
             if let EventKind::PermissionRequested { request } = event.kind {
                 break request;
             }
@@ -363,7 +363,7 @@ async fn run_background_request_fixture() {
                 .answer_question(
                     background,
                     request_id,
-                    vec![tickloop_harness_protocol::QuestionAnswer::option("Weekly")]
+                    vec![tickloop_harness::protocol::QuestionAnswer::option("Weekly")]
                 )
                 .await
                 .is_err()
@@ -386,7 +386,7 @@ async fn run_background_request_fixture() {
         assert!(snapshot.permissions.is_empty());
         assert_eq!(
             snapshot.chat_loop.state,
-            tickloop_harness_protocol::LoopState::Running
+            tickloop_harness::protocol::LoopState::Running
         );
         background_phase(
             "answered-next",

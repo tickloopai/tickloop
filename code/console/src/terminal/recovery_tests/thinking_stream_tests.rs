@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const THINKING_FIXTURE_VARIABLE: &str = "TICKLOOP_THINKING_STREAM_FIXTURE";
 const THINKING_QUERY_FILE: &str = "thinking-queries";
@@ -27,11 +27,11 @@ struct ThinkingBurst {
 impl ModelClient for ThinkingBurst {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -53,7 +53,7 @@ impl ModelClient for ThinkingBurst {
             events.send(ModelDelta::Text(STREAM_REPLY.into())).unwrap();
             return Ok(ModelOutput {
                 private_source: None,
-                content: tickloop_harness_test_support::text(STREAM_REPLY),
+                content: tickloop_harness::test_support::text(STREAM_REPLY),
                 usage: Usage {
                     input_tokens: Some(37),
                     output_tokens: Some(11),
@@ -93,7 +93,7 @@ impl ModelClient for ThinkingBurst {
                 .unwrap();
         }
         if std::env::var(THINKING_TOOL_VARIABLE).as_deref() == Ok("1") {
-            let mut content = tickloop_harness_test_support::call(
+            let mut content = tickloop_harness::test_support::call(
                 "thinking-read",
                 "Read",
                 serde_json::json!({"file_path":"thinking-input.txt"}),
@@ -121,7 +121,7 @@ impl ModelClient for ThinkingBurst {
         events
             .send(ModelDelta::Text(format!("{STREAM_REPLY}\n")))
             .unwrap();
-        let mut content = tickloop_harness_test_support::text(STREAM_REPLY);
+        let mut content = tickloop_harness::test_support::text(STREAM_REPLY);
         if flood {
             content.insert(
                 0,
@@ -211,7 +211,7 @@ fn thinking_stream_pty_fixture() {
                 .build()
                 .unwrap();
             tokio::task::LocalSet::new().block_on(&runtime, async {
-                let core = tickloop_harness_runtime::Agent::new_embedded(tickloop_harness_test_support::config(), Arc::new(ThinkingBurst {requests: AtomicUsize::new(0)}));
+                let core = tickloop_harness::runtime::Agent::new_embedded(tickloop_harness::test_support::config(), Arc::new(ThinkingBurst {requests: AtomicUsize::new(0)}));
                 let mut events = core.subscribe();
                 tokio::spawn(async move {
                     while let Ok(event) = events.recv().await {
@@ -227,7 +227,7 @@ fn thinking_stream_pty_fixture() {
                 });
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
-                launch.model = Some(tickloop_harness_test_support::config());
+                launch.model = Some(tickloop_harness::test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),

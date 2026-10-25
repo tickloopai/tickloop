@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_protocol::{EventSourceBinding, ShellTask, ShellTaskState, TickLinkState};
+use tickloop_harness::protocol::{EventSourceBinding, ShellTask, ShellTaskState, TickLinkState};
 
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 's';
@@ -229,7 +229,7 @@ impl MonitorRows for ArtifactRows {
                     .unwrap_or_else(|| tick.title.clone());
                 let edited_at_ms = metadata
                     .and_then(|metadata| metadata.human_updated_at.as_deref())
-                    .and_then(tickloop_harness_base::timestamp::parse_timestamp_ms)
+                    .and_then(tickloop_harness::base::timestamp::parse_timestamp_ms)
                     .map(|value| value.max(0) as u64);
                 let requested_at_ms = binding.and_then(|binding| binding.last_request_at_ms);
                 let updated_at_ms = edited_at_ms.max(requested_at_ms);
@@ -241,7 +241,7 @@ impl MonitorRows for ArtifactRows {
                         group: TickGroup::Artifacts,
                         glyph: TickGlyph::Artifact,
                         title,
-                        kind: tickloop_harness_artifacts::artifact_type(
+                        kind: tickloop_harness::artifacts::artifact_type(
                             metadata.map_or(&tick.format, |metadata| &metadata.format),
                         )
                         .map_or_else(
@@ -746,7 +746,7 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::{
         FINISHED_SHELL_DISPLAY_MS, ObservationKind, ShellTaskCapabilities, ShellTaskOrigin,
         ShellTaskOwner, TickSubscriptionFrequency,
     };
@@ -931,7 +931,7 @@ mod tests {
             ShellRows
                 .list(&MonitorContext {
                     chat: Some(Arc::new(chat)),
-                    shells: Some(tickloop_harness_protocol::ShellTaskSnapshot {
+                    shells: Some(tickloop_harness::protocol::ShellTaskSnapshot {
                         chat_id: shell.chat_id,
                         live_revision: 1,
                         tasks: vec![shell.clone()],
@@ -1006,7 +1006,7 @@ mod tests {
             subscriptions: vec![TickSubscriptionStatus {
                 paused: false,
                 id: Uuid::from_u128(2),
-                loop_state: tickloop_harness_protocol::LoopState::Idle,
+                loop_state: tickloop_harness::protocol::LoopState::Idle,
                 instance: quote.clone(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 0,
@@ -1053,7 +1053,7 @@ mod tests {
         TickSubscriptionStatus {
             paused: false,
             id: Uuid::new_v4(),
-            loop_state: tickloop_harness_protocol::LoopState::Idle,
+            loop_state: tickloop_harness::protocol::LoopState::Idle,
             instance: instance.clone(),
             frequency: TickSubscriptionFrequency::High,
             accumulated,
@@ -1095,7 +1095,7 @@ mod tests {
         chat.artifact_ticks = vec![serde_json::from_value(serde_json::json!({"artifact_id":"doc-1","origin":"https://tickloop.ai","title":"Brief","format":"markdown","url":"https://tickloop.ai/a/doc-1","access_role":"owner","added_at_ms":1})).unwrap()];
         let mut context = MonitorContext {
             chat: Some(Arc::new(chat)),
-            shells: Some(tickloop_harness_protocol::ShellTaskSnapshot {
+            shells: Some(tickloop_harness::protocol::ShellTaskSnapshot {
                 chat_id: ended.chat_id,
                 live_revision: 1,
                 tasks: vec![ended],
@@ -1297,7 +1297,7 @@ mod tests {
         let shell_task = task("make", None);
         let shell = InstanceRef::shell(shell_task.id);
         let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
-            shells: Some(tickloop_harness_protocol::ShellTaskSnapshot {
+            shells: Some(tickloop_harness::protocol::ShellTaskSnapshot {
                 chat_id: shell_task.chat_id,
                 live_revision: 1,
                 tasks: vec![shell_task],
@@ -1354,7 +1354,7 @@ mod tests {
             .record_opened(pane.clone(), Some("make dev".into()));
         let context = MonitorContext {
             chat: Some(Arc::new(chat)),
-            shells: Some(tickloop_harness_protocol::ShellTaskSnapshot {
+            shells: Some(tickloop_harness::protocol::ShellTaskSnapshot {
                 chat_id: running.chat_id,
                 live_revision: 1,
                 tasks: vec![running.clone()],

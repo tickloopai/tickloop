@@ -1,6 +1,6 @@
 use super::*;
 use crate::terminal::questions::QuestionFlow;
-use tickloop_harness_protocol::{Question, QuestionOption, QuestionRequest};
+use tickloop_harness::protocol::{Question, QuestionOption, QuestionRequest};
 
 const REQUEST: Uuid = Uuid::from_u128(480);
 const DESCRIPTION: &str =

@@ -7,10 +7,10 @@ use tickloop_code_settings::local_agent::LocalAgent;
 use async_trait::async_trait;
 use serde_json::json;
 use tickloop_code_access::AgentAccess;
-use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness_protocol::{Content, Event, EventKind, Role, Usage};
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::protocol::{Content, Event, EventKind, Role, Usage};
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -48,14 +48,14 @@ impl ModelClient for FloodedReply {
         _: UnboundedSender<ModelDelta>,
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-        tickloop_harness_protocol::ModelIdentity {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+        tickloop_harness::protocol::ModelIdentity {
+            provider: tickloop_harness::protocol::ModelProvider::Api,
             profile: "stream-flood-fixture".into(),
-            protocol: tickloop_harness_protocol::Protocol::Messages,
+            protocol: tickloop_harness::protocol::Protocol::Messages,
             requested_model: "stream-flood-fixture".into(),
         }
     }
@@ -85,9 +85,9 @@ impl ModelClient for FloodedReply {
                 signature: None,
             });
             events.send(ModelDelta::Text("完整答案".into())).unwrap();
-            content.extend(tickloop_harness_test_support::text("完整答案"));
+            content.extend(tickloop_harness::test_support::text("完整答案"));
         } else {
-            content.extend(tickloop_harness_test_support::text(
+            content.extend(tickloop_harness::test_support::text(
                 &self.fragment.repeat(self.deltas),
             ));
         }
@@ -103,7 +103,7 @@ impl ModelClient for FloodedReply {
 async fn stream_flood_retains_reply_without_overrunning_live_events(thinking: bool, paced: bool) {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         Arc::new(FloodedReply {
             thinking,
             paced,
@@ -121,7 +121,7 @@ async fn stream_flood_retains_reply_without_overrunning_live_events(thinking: bo
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
             if snapshot.messages.len() > 1
-                && snapshot.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+                && snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
             {
                 break snapshot;
             }
@@ -206,7 +206,7 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
             let directory = tempfile::tempdir().unwrap();
             let expected = fragment.repeat(deltas);
             let agent = Agent::new_embedded(
-                tickloop_harness_test_support::config(),
+                tickloop_harness::test_support::config(),
                 Arc::new(FloodedReply {
                     thinking,
                     paced: false,
@@ -216,7 +216,7 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
             );
             let access = EmbeddedAgentAccess::new(agent.clone());
             let mut launch = LaunchSpec::embedded(directory.path().into());
-            launch.model = Some(tickloop_harness_test_support::config());
+            launch.model = Some(tickloop_harness::test_support::config());
             let created = access
                 .execute(CommandEnvelope {
                     daemon_epoch: access.daemon_epoch(),
@@ -293,18 +293,18 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
 impl ModelClient for StreamingModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-        tickloop_harness_protocol::ModelIdentity {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+        tickloop_harness::protocol::ModelIdentity {
+            provider: tickloop_harness::protocol::ModelProvider::Api,
             profile: "fixture".into(),
-            protocol: tickloop_harness_protocol::Protocol::Messages,
+            protocol: tickloop_harness::protocol::Protocol::Messages,
             requested_model: "fixture".into(),
         }
     }
@@ -344,7 +344,7 @@ impl ModelClient for StreamingModel {
 
 async fn wait_for(events: &mut broadcast::Receiver<Event>, predicate: impl Fn(&EventKind) -> bool) {
     loop {
-        let event = tickloop_harness_test_support::next_event(events).await;
+        let event = tickloop_harness::test_support::next_event(events).await;
         if predicate(&event.kind) {
             return;
         }
@@ -382,13 +382,13 @@ async fn snapshots_move_each_streamed_reply_into_history_once_across_a_real_tool
             ControlledReply {
                 control: second.clone(),
                 deltas: vec!["The file", " says hello."],
-                outcome: Ok(tickloop_harness_test_support::text("The file says hello.")),
+                outcome: Ok(tickloop_harness::test_support::text("The file says hello.")),
             },
         ])),
     });
     let agent = Agent::open_embedded(
         archive.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model.clone(),
     )
     .unwrap();
@@ -461,8 +461,10 @@ async fn snapshots_move_each_streamed_reply_into_history_once_across_a_real_tool
 
     let restored = Agent::open_embedded(
         archive,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     )
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
@@ -488,11 +490,11 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
             ControlledReply {
                 control: retry.clone(),
                 deltas: vec!["Recovered reply"],
-                outcome: Ok(tickloop_harness_test_support::text("Recovered reply")),
+                outcome: Ok(tickloop_harness::test_support::text("Recovered reply")),
             },
         ])),
     });
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, "Please answer".into()).await.unwrap();

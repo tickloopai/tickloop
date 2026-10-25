@@ -12,7 +12,8 @@ doctest = false
 
 [features]
 default = []
-engine = ["policy", "dep:tickloop-harness-runtime", "dep:tickloop-harness-tools", "model", "transcript", "cron", "artifacts"]
+engine = ["policy", "dep:tickloop-harness-runtime", "tools", "model", "transcript", "cron", "artifacts"]
+tools = ["dep:tickloop-harness-tools"]
 policy = ["dep:tickloop-harness-policy"]
 model = ["dep:tickloop-harness-model"]
 transcript = ["dep:tickloop-harness-transcript"]

@@ -33,8 +33,8 @@ use tickloop_code_client::{LocalAgentClient, RecoveringAgentClient};
 #[cfg(test)]
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_settings::new_chat::new_chat_settings;
-use tickloop_harness_model::judgment::jev_key_status_in;
-use tickloop_harness_protocol::{
+use tickloop_harness::model::judgment::jev_key_status_in;
+use tickloop_harness::protocol::{
     ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
     CompactionOutcome, DirectedSummaryOutcome, DirectedSummaryRequest, Event, ExecutionMode,
     HostedMember, InputContext, LoopState, LoopTriggerNotice, ModelChange, ModelConfig,
@@ -45,7 +45,7 @@ use tickloop_harness_protocol::{
     TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
-use tickloop_harness_tools::permissions::{canonical_directory, rule_views, validate_rule};
+use tickloop_harness::tools::permissions::{canonical_directory, rule_views, validate_rule};
 
 /// Why a New Agent Permissions change was not applied. Nothing was written or staged.
 pub(super) enum DraftPermissionsError {
@@ -493,7 +493,7 @@ impl EventForwarder {
                     sequence: event.sequence,
                     completed: matches!(
                         event.kind,
-                        tickloop_harness_protocol::EventKind::Completed { .. }
+                        tickloop_harness::protocol::EventKind::Completed { .. }
                     ),
                 });
             }
@@ -713,9 +713,9 @@ impl ConsoleExecution {
     #[cfg(test)]
     pub(super) fn new_embedded(
         model: ModelConfig,
-        client: Arc<dyn tickloop_harness_model::ModelClient>,
+        client: Arc<dyn tickloop_harness::model::ModelClient>,
     ) -> Self {
-        let core = tickloop_harness_runtime::Agent::new_embedded(model.clone(), client);
+        let core = tickloop_harness::runtime::Agent::new_embedded(model.clone(), client);
         core.install_own_tickhost();
         Self::from_embedded(core, model)
     }
@@ -724,10 +724,10 @@ impl ConsoleExecution {
     pub(super) fn open_embedded(
         root: PathBuf,
         model: ModelConfig,
-        client: Arc<dyn tickloop_harness_model::ModelClient>,
-    ) -> Result<Self, tickloop_harness_runtime::AgentError> {
+        client: Arc<dyn tickloop_harness::model::ModelClient>,
+    ) -> Result<Self, tickloop_harness::runtime::AgentError> {
         let core =
-            tickloop_harness_runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
+            tickloop_harness::runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
         core.install_own_tickhost();
         let mut execution = Self::from_embedded(core, model);
         Arc::get_mut(&mut execution.inner)
@@ -739,7 +739,7 @@ impl ConsoleExecution {
 
     #[cfg(test)]
     pub(super) fn from_embedded_launch(
-        core: tickloop_harness_runtime::Agent,
+        core: tickloop_harness::runtime::Agent,
         launch: LaunchSpec,
     ) -> Self {
         let model = launch
@@ -754,7 +754,10 @@ impl ConsoleExecution {
     }
 
     #[cfg(test)]
-    pub(super) fn from_embedded(core: tickloop_harness_runtime::Agent, model: ModelConfig) -> Self {
+    pub(super) fn from_embedded(
+        core: tickloop_harness::runtime::Agent,
+        model: ModelConfig,
+    ) -> Self {
         let adapter = EmbeddedAgentAccess::new(core);
         let epoch = adapter.daemon_epoch();
         let view = ViewRef {
@@ -877,7 +880,7 @@ impl ConsoleExecution {
                             LoopState::WaitingPlan | LoopState::Interrupted
                         )
                         && !status.chat.permissions.iter().any(|request| {
-                            request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME
+                            request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME
                                 && request.loop_id == plan.loop_id
                         })
                 })
@@ -2050,7 +2053,7 @@ impl ConsoleExecution {
     ) -> Result<ProviderCredentialScope, AccessError> {
         let ConfigTarget::Agent(chat) = target else {
             return Ok(
-                tickloop_harness_model::auth::current_provider_credential_scope(
+                tickloop_harness::model::auth::current_provider_credential_scope(
                     self.inner.launch.config_root.clone(),
                 ),
             );
@@ -2067,10 +2070,10 @@ impl ConsoleExecution {
     pub(super) async fn test_search(
         &self,
         target: ConfigTarget,
-        config: tickloop_harness_protocol::SearchConfig,
-    ) -> Result<tickloop_harness_protocol::SearchTestResult, String> {
+        config: tickloop_harness::protocol::SearchConfig,
+    ) -> Result<tickloop_harness::protocol::SearchTestResult, String> {
         let ConfigTarget::Agent(chat) = target else {
-            return Ok(tickloop_harness_tools::web_search::test_connection(
+            return Ok(tickloop_harness::tools::web_search::test_connection(
                 &config,
                 self.inner.launch.config_root.as_deref(),
                 tokio_util::sync::CancellationToken::new(),
@@ -2110,7 +2113,7 @@ impl ConsoleExecution {
         target: ConfigTarget,
         config: ModelConfig,
         refresh: bool,
-    ) -> Result<tickloop_harness_protocol::AccountModelDirectory, String> {
+    ) -> Result<tickloop_harness::protocol::AccountModelDirectory, String> {
         let ConfigTarget::Agent(chat) = target else {
             return Err("New Agent has no execution".into());
         };
@@ -2207,15 +2210,15 @@ impl ConsoleExecution {
         match change {
             ConfigurationChange::Model { config, thinking } => {
                 let config =
-                    tickloop_harness_model::cards::model_for_persistent_selection(config.clone());
-                tickloop_harness_model::validate_model_config(&config)
+                    tickloop_harness::model::cards::model_for_persistent_selection(config.clone());
+                tickloop_harness::model::validate_model_config(&config)
                     .map_err(|error| invalid(&error))?;
                 if let Some(effort) = thinking {
-                    tickloop_harness_model::validate_reasoning_effort(&config, *effort)
+                    tickloop_harness::model::validate_reasoning_effort(&config, *effort)
                         .map_err(|error| invalid(&error))?;
                 }
                 let clear_context_window =
-                    !tickloop_harness_model::compatible_private_history(&current.model, &config);
+                    !tickloop_harness::model::compatible_private_history(&current.model, &config);
                 save(&|settings| match thinking {
                     Some(effort) => {
                         settings.save_model_with_thinking(&config, clear_context_window, *effort)
@@ -2231,18 +2234,18 @@ impl ConsoleExecution {
                 save(&|settings| settings.save_search_config(config.as_ref()))?;
             }
             ConfigurationChange::ReasoningEffort { effort } => {
-                tickloop_harness_model::validate_reasoning_effort(&current.model, *effort)
+                tickloop_harness::model::validate_reasoning_effort(&current.model, *effort)
                     .map_err(|error| invalid(&error))?;
                 save(&|settings| settings.save_reasoning_effort(*effort))?;
             }
             ConfigurationChange::ThinkingEnabled { enabled } => {
-                tickloop_harness_model::validate_reasoning_effort(
+                tickloop_harness::model::validate_reasoning_effort(
                     &current.model,
                     (!enabled).then_some(ReasoningEffort::Off),
                 )
                 .map_err(|error| invalid(&error))?;
                 let enable_effort = (*enabled
-                    && tickloop_harness_model::validate_reasoning_effort(
+                    && tickloop_harness::model::validate_reasoning_effort(
                         &current.model,
                         Some(ReasoningEffort::On),
                     )
@@ -2325,7 +2328,7 @@ impl ConsoleExecution {
     /// here, replacing the startup choice, as the runtime's own default selection does.
     fn select_default_model(&self, config: ModelConfig) {
         *self.inner.default_model.lock().unwrap() =
-            Some(tickloop_harness_model::cards::model_for_persistent_selection(config));
+            Some(tickloop_harness::model::cards::model_for_persistent_selection(config));
     }
     /// The View's launch with the model its latest confirmed selection made the default.
     fn effective_launch(&self) -> LaunchSpec {
@@ -2529,8 +2532,8 @@ impl ConsoleExecution {
                 if view.preferred_reviewer == reviewer {
                     return Err(invalid("reviewer is unchanged"));
                 }
-                if reviewer == tickloop_harness_protocol::AutoReviewerPreference::Jev
-                    && view.jev_key_status == tickloop_harness_protocol::ApiKeyStatus::Missing
+                if reviewer == tickloop_harness::protocol::AutoReviewerPreference::Jev
+                    && view.jev_key_status == tickloop_harness::protocol::ApiKeyStatus::Missing
                 {
                     return Err(invalid("Jev key is missing"));
                 }
@@ -2618,21 +2621,21 @@ impl ConsoleExecution {
             arguments,
             tickloop_code_settings::skills::SkillCaller::User,
         )
-        .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+        .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
         .map(|_| ())
         .map_err(|error| error.to_string())
     }
     /// What the worker of the first Create starts with, read the way it will read it.
     fn new_agent_defaults(&self) -> AgentConfiguration {
         let launch = &self.effective_launch();
-        let model = tickloop_harness_model::cards::model_for_persistent_selection(
-            tickloop_harness_model::cards::launch_model(launch.model.as_ref()),
+        let model = tickloop_harness::model::cards::model_for_persistent_selection(
+            tickloop_harness::model::cards::launch_model(launch.model.as_ref()),
         );
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
         AgentConfiguration {
             search_config: saved.as_mut().map_or_else(
-                tickloop_harness_protocol::SearchConfig::enabled_default,
+                tickloop_harness::protocol::SearchConfig::enabled_default,
                 |saved| saved.search_config(),
             ),
             model,
@@ -2859,7 +2862,7 @@ impl ConsoleExecution {
     pub(super) async fn set_permission_rules(
         &self,
         chat: Uuid,
-        rules: Vec<tickloop_harness_protocol::PermissionRule>,
+        rules: Vec<tickloop_harness::protocol::PermissionRule>,
     ) -> Result<(), AccessError> {
         self.configure(chat, ConfigurationChange::ReplaceRules { rules })
             .await
@@ -2923,8 +2926,8 @@ impl ConsoleExecution {
     pub(super) async fn generate_auto_environment(
         &self,
         chat: Uuid,
-        options: tickloop_harness_protocol::AutoSetupOptions,
-    ) -> Result<tickloop_harness_protocol::AutoEnvironmentDraft, AccessError> {
+        options: tickloop_harness::protocol::AutoSetupOptions,
+    ) -> Result<tickloop_harness::protocol::AutoEnvironmentDraft, AccessError> {
         let execution = self.reference(chat).await?;
         match self
             .command(
@@ -3253,8 +3256,8 @@ impl ConsoleExecution {
     pub(super) async fn add_artifact_tick(
         &self,
         chat: Uuid,
-        tick: tickloop_harness_protocol::ArtifactTick,
-    ) -> Result<Vec<tickloop_harness_protocol::ArtifactTick>, AccessError> {
+        tick: tickloop_harness::protocol::ArtifactTick,
+    ) -> Result<Vec<tickloop_harness::protocol::ArtifactTick>, AccessError> {
         let execution = self.reference(chat).await?;
         match self
             .command(AgentCommand::AddArtifactTick { execution, tick }, None)
@@ -3267,8 +3270,8 @@ impl ConsoleExecution {
     pub(super) async fn link_artifact(
         &self,
         chat: Uuid,
-        tick: tickloop_harness_protocol::ArtifactTick,
-        history: tickloop_harness_protocol::ArtifactFeedbackHistory,
+        tick: tickloop_harness::protocol::ArtifactTick,
+        history: tickloop_harness::protocol::ArtifactFeedbackHistory,
     ) -> Result<(), AccessError> {
         let execution = self.reference(chat).await?;
         self.command(
@@ -3286,7 +3289,7 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         instance_id: String,
-    ) -> Result<Vec<tickloop_harness_protocol::ArtifactTick>, AccessError> {
+    ) -> Result<Vec<tickloop_harness::protocol::ArtifactTick>, AccessError> {
         let execution = self.reference(chat).await?;
         match self
             .command(
@@ -3345,7 +3348,7 @@ impl ConsoleExecution {
     pub(super) async fn artifact_ticks(
         &self,
         chat: Uuid,
-    ) -> Result<Vec<tickloop_harness_protocol::ArtifactTick>, AccessError> {
+    ) -> Result<Vec<tickloop_harness::protocol::ArtifactTick>, AccessError> {
         let execution = self.reference(chat).await?;
         match self
             .command(AgentCommand::ListArtifactTicks { execution }, None)
@@ -3358,7 +3361,7 @@ impl ConsoleExecution {
     /// The running Tickhost of another build the daemon keeps until the user replaces it.
     pub(super) async fn other_tickhost(
         &self,
-    ) -> Result<Option<tickloop_harness_protocol::OtherTickhost>, AccessError> {
+    ) -> Result<Option<tickloop_harness::protocol::OtherTickhost>, AccessError> {
         match self
             .inner
             .access
@@ -3445,7 +3448,7 @@ impl ConsoleExecution {
     ) -> Result<
         (
             tick_protocol::InstanceRef,
-            tickloop_harness_protocol::MonitorMembership,
+            tickloop_harness::protocol::MonitorMembership,
             Option<String>,
         ),
         AccessError,
@@ -3494,7 +3497,7 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         instance: tick_protocol::InstanceRef,
-    ) -> Result<tickloop_harness_protocol::HostedViewGrant, AccessError> {
+    ) -> Result<tickloop_harness::protocol::HostedViewGrant, AccessError> {
         let execution = self.reference(chat).await?;
         match self
             .command(
@@ -4066,36 +4069,36 @@ impl ConsoleExecution {
     }
     pub(super) async fn jev_key_status(
         &self,
-    ) -> Result<tickloop_harness_protocol::ApiKeyStatus, AccessError> {
+    ) -> Result<tickloop_harness::protocol::ApiKeyStatus, AccessError> {
         let root = self
             .inner
             .launch
             .config_root
             .as_ref()
             .ok_or_else(|| AccessError::invalid("Jev key storage is unavailable"))?;
-        tickloop_harness_model::credentials::api_key_status(
+        tickloop_harness::model::credentials::api_key_status(
             root,
-            tickloop_harness_model::judgment::JEV_API_KEY_ENV,
+            tickloop_harness::model::judgment::JEV_API_KEY_ENV,
         )
         .map_err(|error| AccessError::storage(error.to_string()))
     }
     pub(super) async fn save_jev_key(
         &self,
         value: &str,
-    ) -> Result<tickloop_harness_protocol::ApiKeyStatus, AccessError> {
+    ) -> Result<tickloop_harness::protocol::ApiKeyStatus, AccessError> {
         let root = self
             .inner
             .launch
             .config_root
             .as_ref()
             .ok_or_else(|| AccessError::invalid("Jev key storage is unavailable"))?;
-        tickloop_harness_model::credentials::save_api_key(
+        tickloop_harness::model::credentials::save_api_key(
             root,
-            tickloop_harness_model::judgment::JEV_API_KEY_ENV,
+            tickloop_harness::model::judgment::JEV_API_KEY_ENV,
             value,
         )
         .map_err(|error| AccessError::storage(error.to_string()))?;
-        Ok(tickloop_harness_protocol::ApiKeyStatus::Saved)
+        Ok(tickloop_harness::protocol::ApiKeyStatus::Saved)
     }
     pub(super) async fn refresh_configuration(&self, chat: Uuid) -> Result<(), AccessError> {
         let execution = self.reference(chat).await?;
@@ -4123,12 +4126,12 @@ mod tests {
     use serde_json::{Value, json};
     use std::os::unix::fs::MetadataExt;
     use tickloop_code_daemon::serve_listener;
-    use tickloop_harness_protocol::ToolDefinition;
+    use tickloop_harness::protocol::ToolDefinition;
 
     use tickloop_code_access::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
 
     use tickloop_code_access::test_support::TRANSPORT_LIMITS;
-    use tickloop_harness_runtime::host_tools::{
+    use tickloop_harness::runtime::host_tools::{
         HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -4138,11 +4141,11 @@ mod tests {
     #[tokio::test]
     async fn next_terminal_submit_reregisters_a_truly_expired_view_without_replaying_input() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("Accepted once."),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("Accepted once."),
         ]));
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
             model.clone(),
         );
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -4201,13 +4204,13 @@ mod tests {
             .await
             .unwrap();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id != accepted.run_id {
                 continue;
             }
             match event.kind {
-                tickloop_harness_protocol::EventKind::Completed { .. } => break,
-                tickloop_harness_protocol::EventKind::Failed(error) => {
+                tickloop_harness::protocol::EventKind::Completed { .. } => break,
+                tickloop_harness::protocol::EventKind::Failed(error) => {
                     panic!("renewed submission failed: {error}")
                 }
                 _ => {}
@@ -4229,7 +4232,10 @@ mod tests {
             snapshot
                 .events
                 .iter()
-                .filter(|event| matches!(event.kind, tickloop_harness_protocol::EventKind::Started))
+                .filter(|event| matches!(
+                    event.kind,
+                    tickloop_harness::protocol::EventKind::Started
+                ))
                 .count(),
             1
         );
@@ -4268,7 +4274,7 @@ mod tests {
 
         fn permission(
             &self,
-            _: tickloop_harness_protocol::ChatId,
+            _: tickloop_harness::protocol::ChatId,
             _: &str,
             _: &Value,
         ) -> HostToolPermission {
@@ -4277,7 +4283,7 @@ mod tests {
 
         async fn prepare_call_in_scope(
             &self,
-            chat: tickloop_harness_protocol::ChatId,
+            chat: tickloop_harness::protocol::ChatId,
             scope: &HostCallScope<'_>,
             name: &str,
             input: &Value,
@@ -4297,7 +4303,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _: tickloop_harness_protocol::ChatId,
+            _: tickloop_harness::protocol::ChatId,
             _: &str,
             input: Value,
             _: CancellationToken,
@@ -4341,12 +4347,12 @@ mod tests {
                 writer.write_all(&response).await.unwrap();
             }
         });
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call("source", "ReadInteractionSource", json!({})),
-            tickloop_harness_test_support::text("Read the new input source."),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call("source", "ReadInteractionSource", json!({})),
+            tickloop_harness::test_support::text("Read the new input source."),
         ]));
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
             model,
         );
         runtime
@@ -4392,14 +4398,14 @@ mod tests {
             .await
             .unwrap();
         let result = loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             match event.kind {
-                tickloop_harness_protocol::EventKind::ToolCompleted {
+                tickloop_harness::protocol::EventKind::ToolCompleted {
                     call_id, result, ..
                 } if call_id == "source" => {
                     break result;
                 }
-                tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+                tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
             }
         };
@@ -4434,11 +4440,11 @@ mod tests {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let socket = directory.path().join("a.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("Explicit correction worked."),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("Explicit correction worked."),
         ]));
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
             model.clone(),
         );
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -4482,12 +4488,12 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
-                tickloop_harness_protocol::EventKind::Completed { .. } => break,
-                tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+                tickloop_harness::protocol::EventKind::Completed { .. } => break,
+                tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
             }
         }
@@ -4523,9 +4529,9 @@ mod tests {
     #[tokio::test]
     async fn a_created_agent_this_view_cannot_attach_is_distinguished_from_a_rejected_creation() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
         let epoch = actual.daemon_epoch();
@@ -4717,24 +4723,27 @@ mod tests {
     fn recording_terminal(
         directory: &Path,
     ) -> (
-        tickloop_harness_runtime::Agent,
+        tickloop_harness::runtime::Agent,
         Arc<Recording>,
         ConsoleExecution,
     ) {
-        recording_terminal_with_model(directory, tickloop_harness_test_support::persisted_config())
+        recording_terminal_with_model(
+            directory,
+            tickloop_harness::test_support::persisted_config(),
+        )
     }
 
     fn recording_terminal_with_model(
         directory: &Path,
         model: ModelConfig,
     ) -> (
-        tickloop_harness_runtime::Agent,
+        tickloop_harness::runtime::Agent,
         Arc<Recording>,
         ConsoleExecution,
     ) {
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
             model.clone(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
         let epoch = actual.daemon_epoch();
@@ -4800,11 +4809,11 @@ mod tests {
 
     #[tokio::test]
     async fn dependent_model_and_effort_choices_replay_in_the_order_they_were_made() {
-        use tickloop_harness_model::cards::ModelCatalog;
+        use tickloop_harness::model::cards::ModelCatalog;
         let high = Some(ReasoningEffort::High);
         let profiles = ModelCatalog::defaults().profiles();
         let supports_high = |model: &ModelConfig| {
-            tickloop_harness_model::validate_reasoning_effort(model, high).is_ok()
+            tickloop_harness::model::validate_reasoning_effort(model, high).is_ok()
         };
         let lacking = profiles
             .iter()
@@ -5035,7 +5044,7 @@ mod tests {
         // only when it starts from the catalog model. No input is sent, so no key is read.
         let (runtime, access, terminal) = recording_terminal_with_model(
             directory.path(),
-            tickloop_harness_model::cards::ModelCatalog::defaults()
+            tickloop_harness::model::cards::ModelCatalog::defaults()
                 .get("deepseek-api", "deepseek-flash")
                 .unwrap(),
         );
@@ -5207,7 +5216,7 @@ mod tests {
             panic!("a session rule");
         };
         terminal
-            .stage_rule_change(tickloop_harness_protocol::PermissionChange::UpsertRule {
+            .stage_rule_change(tickloop_harness::protocol::PermissionChange::UpsertRule {
                 rule: rule.clone(),
             })
             .unwrap();
@@ -5538,7 +5547,7 @@ mod tests {
             .change_draft_permissions(
                 directory.path(),
                 &opened,
-                tickloop_harness_protocol::PermissionChange::UpsertRule {
+                tickloop_harness::protocol::PermissionChange::UpsertRule {
                     rule: first.clone(),
                 },
             )
@@ -5551,7 +5560,7 @@ mod tests {
             .change_draft_permissions(
                 directory.path(),
                 &opened,
-                tickloop_harness_protocol::PermissionChange::UpsertRule {
+                tickloop_harness::protocol::PermissionChange::UpsertRule {
                     rule: rule("/rule deny Write persistent"),
                 },
             )
@@ -5585,7 +5594,7 @@ mod tests {
             terminal
                 .save_project_rule_change(
                     directory.path(),
-                    &tickloop_harness_protocol::PermissionChange::RemoveRule { id: first.id },
+                    &tickloop_harness::protocol::PermissionChange::RemoveRule { id: first.id },
                     Some(&current.project_rules),
                 )
                 .unwrap(),
@@ -5599,15 +5608,15 @@ mod tests {
             .change_draft_permissions(
                 directory.path(),
                 &latest,
-                tickloop_harness_protocol::PermissionChange::SelectReviewer {
-                    reviewer: tickloop_harness_protocol::AutoReviewerPreference::Jev,
+                tickloop_harness::protocol::PermissionChange::SelectReviewer {
+                    reviewer: tickloop_harness::protocol::AutoReviewerPreference::Jev,
                 },
             )
             .await;
         assert!(matches!(reviewer, Err(DraftPermissionsError::Rejected(_))));
         assert_eq!(
             settings.auto_settings_with_revision().unwrap().0.reviewer,
-            tickloop_harness_protocol::AutoReviewerPreference::Llm,
+            tickloop_harness::protocol::AutoReviewerPreference::Llm,
             "Jev without a key changes nothing"
         );
 
@@ -5616,7 +5625,7 @@ mod tests {
             .change_draft_permissions(
                 directory.path(),
                 &latest,
-                tickloop_harness_protocol::PermissionChange::UpsertRule {
+                tickloop_harness::protocol::PermissionChange::UpsertRule {
                     rule: session.clone(),
                 },
             )
@@ -5655,9 +5664,9 @@ mod tests {
         let view_settings = tickloop_code_settings::UserSettings::in_root(&view_root);
         agent_settings.save_task_tools_enabled(false).unwrap();
         view_settings.save_task_tools_enabled(true).unwrap();
-        let model = tickloop_harness_test_support::config();
-        let client = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![]));
-        let runtime = tickloop_harness_runtime::Agent::new_with_user_settings_embedded(
+        let model = tickloop_harness::test_support::config();
+        let client = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![]));
+        let runtime = tickloop_harness::runtime::Agent::new_with_user_settings_embedded(
             model.clone(),
             client.clone(),
             agent_settings.clone(),
@@ -5760,7 +5769,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_saved_new_agent_model_is_the_launch_model_for_dispatch_and_the_first_create() {
-        use tickloop_harness_model::cards::ModelCatalog;
+        use tickloop_harness::model::cards::ModelCatalog;
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");

@@ -37,7 +37,7 @@ use tickloop_code_access::{
     AgentAccess, AgentDetailQuery, ExecutionRef, LiveChatSnapshot, ObservationRequest,
     ObservationValue,
 };
-use tickloop_harness_protocol::{HostEndpointIdentity, HostToolAuthority};
+use tickloop_harness::protocol::{HostEndpointIdentity, HostToolAuthority};
 
 use tickloop_code_local_environment::hosted::{
     controller::HostController,
@@ -49,7 +49,7 @@ use tickloop_code_local_environment::hosted::{
         WorkerEnvelope, WorkerRequest, root_identity,
     },
 };
-use tickloop_harness_runtime::tick_tools::TICK_MANAGE;
+use tickloop_harness::runtime::tick_tools::TICK_MANAGE;
 
 /// A worker request is small: an open carries argv, cwd and the launch environment.
 const REQUEST_FRAME_BYTES: usize = tick_protocol::MAX_REQUEST_BYTES;

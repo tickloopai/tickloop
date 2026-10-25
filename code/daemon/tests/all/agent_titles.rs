@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_settings::local_agent::LocalAgent;
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 
 use tickloop_code_access::{
     AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, LaunchSpec, ObservationRequest,
@@ -14,23 +14,23 @@ struct TitleModel {
 }
 
 #[async_trait::async_trait]
-impl tickloop_harness_model::ModelClient for TitleModel {
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-        tickloop_harness_test_support::config().identity()
+impl tickloop_harness::model::ModelClient for TitleModel {
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+        tickloop_harness::test_support::config().identity()
     }
     async fn complete(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         let is_title = request.tools.is_empty();
         if is_title {
-            tickloop_harness_model::validate_reasoning_effort(
-                &tickloop_harness_test_support::config(),
+            tickloop_harness::model::validate_reasoning_effort(
+                &tickloop_harness::test_support::config(),
                 request.reasoning_effort,
             )?;
-            let tickloop_harness_protocol::Content::Text { text } =
+            let tickloop_harness::protocol::Content::Text { text } =
                 &request.messages.last().unwrap().content[0]
             else {
                 panic!("title input is text");
@@ -41,15 +41,15 @@ impl tickloop_harness_model::ModelClient for TitleModel {
             ));
             assert!(request.messages.iter().all(|message| {
                 message.content.iter().all(|content| {
-                    matches!(content, tickloop_harness_protocol::Content::Text { .. })
+                    matches!(content, tickloop_harness::protocol::Content::Text { .. })
                 })
             }));
             self.requested.notify_one();
-            tokio::select! { _=self.release.notified()=>{}, _=cancel.cancelled()=>return Err(tickloop_harness_model::ModelError::Cancelled) }
+            tokio::select! { _=self.release.notified()=>{}, _=cancel.cancelled()=>return Err(tickloop_harness::model::ModelError::Cancelled) }
         }
-        Ok(tickloop_harness_model::ModelOutput {
+        Ok(tickloop_harness::model::ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(if is_title {
+            content: tickloop_harness::test_support::text(if is_title {
                 "Investigate artifact recovery"
             } else {
                 "Primary work finished"
@@ -70,7 +70,7 @@ async fn generated_title_is_background_work_and_survives_restart() {
     });
     let core = Agent::open_embedded(
         store.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model.clone(),
     )
     .unwrap();
@@ -92,7 +92,7 @@ async fn generated_title_is_background_work_and_survives_restart() {
             if event.run_id == receipt.run_id
                 && matches!(
                     event.kind,
-                    tickloop_harness_protocol::EventKind::Completed { .. }
+                    tickloop_harness::protocol::EventKind::Completed { .. }
                 )
             {
                 break;
@@ -129,19 +129,19 @@ async fn generated_title_is_background_work_and_survives_restart() {
         .request_usage
         .entries()
         .iter()
-        .filter(|entry| entry.kind == tickloop_harness_protocol::ModelRequestKind::Title)
+        .filter(|entry| entry.kind == tickloop_harness::protocol::ModelRequestKind::Title)
         .collect::<Vec<_>>();
     assert_eq!(title_requests.len(), 1);
     assert_eq!(
         title_requests[0].model,
-        tickloop_harness_test_support::config().identity()
+        tickloop_harness::test_support::config().identity()
     );
     assert!(title_requests[0].loop_id.is_none() && title_requests[0].run_id.is_none());
     core.shutdown().await;
     let restored = Agent::open_embedded(
         store,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     )
     .unwrap();
     let snapshot = restored.resume_chat(chat).await.unwrap();
@@ -156,9 +156,9 @@ async fn generated_title_is_background_work_and_survives_restart() {
 async fn overview_falls_back_to_a_short_prompt_without_renaming_the_root_main() {
     let directory = tempfile::tempdir().unwrap();
     let core = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("Ready"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("Ready"),
         ])),
     );
     let access = EmbeddedAgentAccess::new(core.clone());

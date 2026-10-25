@@ -20,7 +20,7 @@ use tickloop_code_access::{
     PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits, ReceiptState,
     RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput, ViewRef,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content, Decision,
     Event, EventKind, ExecutionMode, HostedMember, HostedMemberState, HostedProgramExit,
     HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality, Message,
@@ -717,7 +717,7 @@ fn observation_values_keep_their_recorded_wire() {
         execution: execution(),
         chat_id: id(0xc1),
         folder: Some("/work/project".into()),
-        state: tickloop_harness_protocol::LoopState::Running,
+        state: tickloop_harness::protocol::LoopState::Running,
         run_id: Some(tickloop_ids::Id::from(id(0x20))),
         title: "Counter check".into(),
         subagent: None,
@@ -759,7 +759,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
                 paused: false,
                 id: id(0x31),
-                loop_state: tickloop_harness_protocol::LoopState::Idle,
+                loop_state: tickloop_harness::protocol::LoopState::Idle,
                 instance: hosted_instance(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 2,

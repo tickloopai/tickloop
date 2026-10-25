@@ -9,7 +9,7 @@ use super::{
 use crate::agent_console::AttentionGroup;
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
-use tickloop_harness_protocol::{LoopState, SubagentRegistration};
+use tickloop_harness::protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
 pub(super) const NORMAL_LAYOUT_MIN_ROWS: usize = 16;
@@ -1561,7 +1561,7 @@ impl OverviewState {
                 Role::MutedText,
             ));
         }
-        let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
         let rooms = entries
             .iter()
             .filter_map(|entry| match entry {

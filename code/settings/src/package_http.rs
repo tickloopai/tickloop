@@ -1,7 +1,7 @@
 //! Code's proxy, redirect and timeout policy for Tick package operations.
 use reqwest::{Client, Url, redirect::Policy};
 use std::time::Duration;
-use tickloop_harness_base::network::{HttpPolicy, build_http_client};
+use tickloop_harness::base::network::{HttpPolicy, build_http_client};
 use tickloop_tick_installer::HttpRequest;
 
 const MAX_REDIRECTS: usize = 10;

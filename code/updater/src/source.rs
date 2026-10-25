@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tickloop_harness_base::private_fs::replace_file_atomically;
+use tickloop_harness::base::private_fs::replace_file_atomically;
 
 use crate::{Build, data_root, private_directory};
 
@@ -47,6 +47,8 @@ pub struct Installation {
 }
 
 const RECORD: &str = "installation.json";
+const CARGO_SUITE_PACKAGES: [&[&str]; 2] =
+    [&["tickloop-code", "tickloop-agent"], &["tickloop-tickhost"]];
 
 enum DetectedInstallation {
     Recorded(Installation),
@@ -157,15 +159,17 @@ pub(crate) fn cargo_source(root: &Path) -> Result<Option<(String, semver::Versio
         return Ok(None);
     };
     let mut sources = Vec::new();
-    for name in ["tickloop-agent", "tickloop-tickhost"] {
-        let mut found = installs
-            .keys()
-            .filter(|key| key.starts_with(&format!("{name} ")));
+    for names in CARGO_SUITE_PACKAGES {
+        let mut found = installs.keys().filter(|key| {
+            names
+                .iter()
+                .any(|name| key.starts_with(&format!("{name} ")))
+        });
         let Some(key) = found.next() else {
             return Ok(None);
         };
         if found.next().is_some() {
-            bail!("Cargo records more than one installation of {name}");
+            bail!("Cargo records more than one installation of {}", names[0]);
         }
         let mut parts = key.splitn(3, ' ');
         let _ = parts.next();
@@ -213,11 +217,12 @@ fn cargo_checkout(root: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let mut checkout = None;
-    for name in ["tickloop-agent", "tickloop-tickhost"] {
-        let Some(key) = installs
-            .keys()
-            .find(|key| key.starts_with(&format!("{name} ")))
-        else {
+    for names in CARGO_SUITE_PACKAGES {
+        let Some(key) = installs.keys().find(|key| {
+            names
+                .iter()
+                .any(|name| key.starts_with(&format!("{name} ")))
+        }) else {
             return Ok(None);
         };
         let Some(source) = key
@@ -254,10 +259,14 @@ pub(crate) fn cargo_revision(root: &Path) -> Result<String> {
         .as_object()
         .context("Missing Cargo install metadata")?;
     let mut revision = None;
-    for name in ["tickloop-agent", "tickloop-tickhost"] {
+    for names in CARGO_SUITE_PACKAGES {
         let key = installs
             .keys()
-            .find(|key| key.starts_with(&format!("{name} ")))
+            .find(|key| {
+                names
+                    .iter()
+                    .any(|name| key.starts_with(&format!("{name} ")))
+            })
             .context("Incomplete Cargo build")?;
         let sha = key
             .rsplit_once('#')

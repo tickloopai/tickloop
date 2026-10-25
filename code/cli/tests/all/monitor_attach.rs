@@ -11,7 +11,7 @@ use std::{
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tickloop_code_local_environment::hosted::controller::HostController;
-use tickloop_harness_protocol::HostedViewGrant;
+use tickloop_harness::protocol::HostedViewGrant;
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -30,7 +30,7 @@ impl Host {
     async fn start() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tma")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let controller = HostController::new(
             directory.path(),
@@ -117,7 +117,7 @@ impl View {
         command.env("HOME", home);
         command.env("TERM", "xterm-256color");
         command.env(
-            tickloop_harness_protocol::ATTACH_ENVIRONMENT,
+            tickloop_harness::protocol::ATTACH_ENVIRONMENT,
             serde_json::to_string(grant).unwrap(),
         );
         let child = pty.slave.spawn_command(command).unwrap();

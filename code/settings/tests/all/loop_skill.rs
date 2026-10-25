@@ -8,7 +8,7 @@ use tickloop_code_settings::loop_skill::{
 };
 use tickloop_code_settings::skills::{LOOP_SKILL, SkillCaller, SkillError, SkillRegistry};
 use tickloop_harness::cron::{Interval, IntervalError};
-use tickloop_harness_protocol::SkillSource;
+use tickloop_harness::protocol::SkillSource;
 
 fn minutes(minutes: u32) -> Interval {
     Interval::from_minutes(minutes).unwrap()

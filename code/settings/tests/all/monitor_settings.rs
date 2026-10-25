@@ -30,7 +30,7 @@ fn monitor_width_round_trips_and_ignores_values_that_are_not_column_counts() {
 
 #[test]
 fn shift_tab_modes_default_to_auto_and_plan_and_keep_the_cycle_order() {
-    use tickloop_harness_protocol::ExecutionMode;
+    use tickloop_harness::protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("settings.json");
     let settings = UserSettings::in_root(directory.path());

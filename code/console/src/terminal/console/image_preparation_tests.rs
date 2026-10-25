@@ -10,7 +10,7 @@ fn state() -> State {
 
 fn image() -> Image {
     Image {
-        media_type: tickloop_harness_protocol::ImageMediaType::Png,
+        media_type: tickloop_harness::protocol::ImageMediaType::Png,
         data: "aW1hZ2U=".into(),
         width: 1,
         height: 1,
@@ -263,7 +263,7 @@ fn delayed_dispatch_uses_frozen_retry_and_contexts_not_the_new_draft() {
     let mut state = state();
     let chat = state.chat;
     let retry = Uuid::new_v4();
-    let context = InputContext::File(tickloop_harness_protocol::TextContext {
+    let context = InputContext::File(tickloop_harness::protocol::TextContext {
         path: "frozen.txt".into(),
         content: "frozen context".into(),
         truncated: false,
@@ -273,7 +273,7 @@ fn delayed_dispatch_uses_frozen_retry_and_contexts_not_the_new_draft() {
     state.restored_contexts = vec![context.clone()];
     assert!(state.freeze_delayed_submission(vec!["accepted.txt".into()], None));
     state.insert("next draft");
-    let next_context = InputContext::File(tickloop_harness_protocol::TextContext {
+    let next_context = InputContext::File(tickloop_harness::protocol::TextContext {
         path: "next.txt".into(),
         content: "new draft context".into(),
         truncated: false,

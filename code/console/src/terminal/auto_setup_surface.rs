@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     AutoEnvironmentDraft, AutoEnvironmentEntry, AutoSetupOptions, AutoSetupPurpose,
 };
 use uuid::Uuid;

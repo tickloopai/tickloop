@@ -668,7 +668,7 @@ mod tests {
 
     use tickloop_code_access::{AccessErrorCode, AgentAccess, AgentCommand, CommandEnvelope};
 
-    use tickloop_harness_runtime::Agent;
+    use tickloop_harness::runtime::Agent;
     use tokio::sync::{Mutex, Notify};
 
     #[tokio::test]
@@ -722,8 +722,10 @@ mod tests {
                 }
             }));
             let runtime = Agent::new_embedded(
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                    Vec::new(),
+                )),
             );
             runtimes.push(runtime.clone());
             workers.push(crate::ManagedWorker {
@@ -923,8 +925,10 @@ mod tests {
         let worker = directory.path().join("worker.sock");
         let epoch = Uuid::new_v4();
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let access = Arc::new(EmbeddedAgentAccess::with_epoch(agent, epoch));
         let (listener, _) = crate::private_listener(&endpoint(&worker)).unwrap();

@@ -1,8 +1,8 @@
 use super::super::login::SignInTarget;
 use super::super::style::Role;
 use super::*;
-use tickloop_harness_model::{ModelConfigExt, ReasoningEffortExt};
-use tickloop_harness_protocol::{
+use tickloop_harness::model::{ModelConfigExt, ReasoningEffortExt};
+use tickloop_harness::protocol::{
     AccountModelDirectory, Adapter, ApiKeyStatus, ModelAuthSource, ModelAvailability,
     ModelDiscovery, ProviderCredentialScope,
 };
@@ -21,13 +21,13 @@ mod tests {
 
     #[test]
     fn configuring_an_authenticated_provider_replaces_credentials_even_during_setup() {
-        let mut model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let mut model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         model.api_key_env = "TICKLOOP_TEST_ONBOARDING_REPLACE_KEY".into();
         let provider = ProviderModels::group(vec![model.clone()]).remove(0);
         let mut menus = Menus::default();
-        let mut scope = tickloop_harness_model::auth::current_provider_credential_scope(None);
+        let mut scope = tickloop_harness::model::auth::current_provider_credential_scope(None);
         scope.environment_keys = vec![model.api_key_env];
         menus.provider.provider_scope = Some(scope);
         for reason in [ModelSetup::FirstRun, ModelSetup::RepairSaved] {
@@ -54,12 +54,14 @@ mod tests {
 
     #[tokio::test]
     async fn configured_model_picker_does_not_mark_an_unselected_setup_fallback() {
-        let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         let agent = Agent::new_embedded(
             model.clone(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let directory = tempfile::tempdir().unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -95,7 +97,7 @@ mod tests {
 
     #[test]
     fn lightweight_glm_models_offer_auto_off_and_on_without_fictitious_effort_levels() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         for provider in ["zhipu-cn-api", "zai-global-api"] {
             for model in ["glm-4.5-air", "glm-4.7-flash"] {
                 let config = catalog.get(provider, model).unwrap();
@@ -109,7 +111,7 @@ mod tests {
 
     #[test]
     fn scoped_discovery_preserves_other_and_newer_refreshes_until_check_completion() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let providers = ProviderModels::group(vec![
             catalog.get("anthropic-api", "claude-opus-5").unwrap(),
             catalog.get("openai-api", "gpt-6.1-sol").unwrap(),
@@ -163,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_grouped_discovery_keeps_refreshes_for_unqueried_providers() {
         let (mut menus, console, cancel, chat) = pending_model_discovery();
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let providers = ProviderModels::group(vec![
             catalog.get("anthropic-api", "claude-opus-5").unwrap(),
             catalog.get("openai-api", "gpt-6.1-sol").unwrap(),
@@ -191,12 +193,14 @@ mod tests {
 
     #[tokio::test]
     async fn provider_logout_confirmation_keeps_the_connection_surface_open() {
-        let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("openai-codex", "gpt-6-astra")
             .unwrap();
         let agent = Agent::new_embedded(
             model.clone(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let console = Console::test_interactive_for_chat(Uuid::new_v4());
         let mut menus = Menus::default();
@@ -244,7 +248,7 @@ mod tests {
     fn pending_model_discovery() -> (Menus, Console, tokio_util::sync::CancellationToken, Uuid) {
         let chat = Uuid::new_v4();
         let console = Console::test_for_chat(chat);
-        let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         let provider = ProviderModels::group(vec![model.clone()]).remove(0);
@@ -348,7 +352,7 @@ mod tests {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let console = Console::test_interactive_for_chat(first);
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let model = catalog.get("deepseek-api", "deepseek-flash").unwrap();
         let provider = ProviderModels::group(vec![model.clone()]).remove(0);
         let key = provider.key();
@@ -461,14 +465,14 @@ mod tests {
     }
 
     async fn pending_discovery_through_question_pages(multi_select: bool) {
-        use tickloop_harness_protocol::{Question, QuestionOption};
+        use tickloop_harness::protocol::{Question, QuestionOption};
         let directory = tempfile::tempdir().unwrap();
-        let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         let agent = Agent::new_embedded(
             model.clone(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let console = Console::test_interactive_for_chat(chat);
@@ -637,12 +641,12 @@ mod tests {
 
     #[tokio::test]
     async fn escape_queued_before_a_directory_result_still_returns_to_its_parent() {
-        let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         let agent = Agent::new_embedded(
             model.clone(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let (console, _) = Console::start(false).unwrap();
         let mut menus = Menus::default();
@@ -719,7 +723,7 @@ mod tests {
 
     #[test]
     fn directory_keeps_all_region_product_connections_in_metadata_order() {
-        let mut profiles = tickloop_harness_model::cards::built_in_model_profiles();
+        let mut profiles = tickloop_harness::model::cards::built_in_model_profiles();
         profiles.reverse();
         let choices = ProviderModels::group(profiles);
         let glm: Vec<_> = choices
@@ -760,7 +764,7 @@ mod tests {
 
     #[test]
     fn current_card_with_custom_credential_and_endpoint_remains_a_separate_connection() {
-        let profiles = tickloop_harness_model::cards::built_in_model_profiles();
+        let profiles = tickloop_harness::model::cards::built_in_model_profiles();
         let mut current = profiles
             .iter()
             .find(|model| model.provider_id == "deepseek-api" && model.model_id.contains("flash"))
@@ -795,7 +799,7 @@ mod tests {
 
     #[test]
     fn kimi_connection_initial_focus_uses_the_recommendation_and_preserves_explicit_focus() {
-        let profiles = tickloop_harness_model::cards::built_in_model_profiles()
+        let profiles = tickloop_harness::model::cards::built_in_model_profiles()
             .into_iter()
             .filter(|model| model.provider_id == "kimi-code-oauth")
             .collect();
@@ -845,7 +849,7 @@ mod tests {
 
     #[test]
     fn connection_search_filters_rows_by_name_or_endpoint() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let choices = ProviderModels::group(vec![
             catalog.get("kimi-code-oauth", "k3").unwrap(),
             catalog.get("kimi-global-api", "kimi-k3").unwrap(),
@@ -912,7 +916,7 @@ mod tests {
 
     #[test]
     fn model_rows_name_their_connection_only_while_every_connection_is_listed() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let kimi =
             ProviderModels::group(vec![catalog.get("kimi-code-oauth", "k3").unwrap()]).remove(0);
         let console = Console::test_interactive_for_chat(Uuid::new_v4());
@@ -959,7 +963,7 @@ mod tests {
 
     #[test]
     fn grouped_models_and_refreshed_details_keep_the_selected_connections_failure() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let kimi = catalog.get("kimi-code-oauth", "k3").unwrap();
         let mut deepseek = catalog.get("deepseek-api", "deepseek-flash").unwrap();
         deepseek.api_key_env = "MERGE_MENU_FIXTURE_KEY".into();
@@ -970,11 +974,11 @@ mod tests {
             let console = Console::test_interactive_for_chat(chat);
             let mut menus = Menus::new(None, Some(root.path().into()));
             menus.provider.provider_choices = ProviderModels::group(models.clone());
-            let failure = tickloop_harness_protocol::ProviderHttpFailure {
+            let failure = tickloop_harness::protocol::ProviderHttpFailure {
                 provider_id: kimi.provider_id.clone(),
                 provider_name: "Kimi Code".into(),
                 status: 403,
-                class: tickloop_harness_protocol::ProviderFailureClass::UsageOrPlan,
+                class: tickloop_harness::protocol::ProviderFailureClass::UsageOrPlan,
                 message: "Monthly usage limit reached".into(),
                 hint: "Usage limit OR plan access; check K3 plan access".into(),
                 retry_after: None,
@@ -1046,7 +1050,7 @@ mod tests {
 
     #[test]
     fn capability_order_is_stable_and_separate_from_default_recommendations() {
-        let mut profiles = tickloop_harness_model::cards::built_in_model_profiles();
+        let mut profiles = tickloop_harness::model::cards::built_in_model_profiles();
         let forward = ProviderModels::group(profiles.clone());
         profiles.reverse();
         let reversed = ProviderModels::group(profiles);
@@ -1070,7 +1074,7 @@ mod tests {
             .iter()
             .find(|provider| provider.models[0].provider_id == "deepseek-api")
             .unwrap();
-        let access = tickloop_harness_model::access::AccessCatalog::defaults();
+        let access = tickloop_harness::model::access::AccessCatalog::defaults();
         assert_eq!(deepseek.models[0].model_id, "deepseek-v4-pro");
         assert_eq!(
             access.recommended_model("deepseek-api"),
@@ -1105,12 +1109,12 @@ mod tests {
 
     #[test]
     fn codex_menu_uses_current_families_and_keeps_retired_cards_loadable() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let retired = catalog.get("openai-codex", "gpt-5.5").unwrap();
         let old_sol = catalog.get("openai-codex", "gpt-5.6-sol").unwrap();
         let profiles = super::super::super::settings::model_choices_with_profiles(
             &old_sol,
-            tickloop_harness_model::cards::built_in_model_profiles(),
+            tickloop_harness::model::cards::built_in_model_profiles(),
         );
         let grouped = ProviderModels::group(profiles);
         let codex = grouped
@@ -1128,7 +1132,7 @@ mod tests {
         assert!(!codex.models.contains(&old_sol));
         assert!(!codex.models.contains(&retired));
         assert_eq!(
-            tickloop_harness_model::access::AccessCatalog::defaults()
+            tickloop_harness::model::access::AccessCatalog::defaults()
                 .recommended_model("openai-codex"),
             Some("gpt-6.1-sol")
         );
@@ -1136,7 +1140,7 @@ mod tests {
 
     #[test]
     fn api_key_page_names_the_environment_variable_of_the_connection() {
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         let token_plan = catalog
             .get("alibaba-cn-token-plan", "qwen3.8-flash")
             .unwrap();
@@ -1169,21 +1173,21 @@ mod tests {
 
     #[test]
     fn retired_glm_card_is_not_offered_even_as_the_current_model() {
-        let defaults = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let defaults = tickloop_harness::model::cards::ModelCatalog::defaults();
         let retired = defaults.get("zhipu-cn-api", "glm-5.2").unwrap();
-        let profiles = tickloop_harness_model::cards::built_in_model_profiles();
+        let profiles = tickloop_harness::model::cards::built_in_model_profiles();
         let choices =
             super::super::super::settings::model_choices_with_profiles(&retired, profiles);
         assert!(!choices.contains(&retired));
         let current = defaults.get("zhipu-cn-api", "glm-5.3-flash").unwrap();
         let choices = super::super::super::settings::model_choices_with_profiles(
             &current,
-            tickloop_harness_model::cards::built_in_model_profiles(),
+            tickloop_harness::model::cards::built_in_model_profiles(),
         );
         assert!(choices.contains(&current));
         assert_eq!(current.name, "GLM-5.3-Flash");
         assert_eq!(
-            tickloop_harness_model::access::AccessCatalog::defaults()
+            tickloop_harness::model::access::AccessCatalog::defaults()
                 .series_for(&current)
                 .unwrap()
                 .name
@@ -1203,7 +1207,7 @@ pub(super) fn provider_group(provider: &ProviderModels) -> Option<&str> {
     model
         .connection()
         .map(|connection| connection.vendor.as_str())
-        .or_else(|| tickloop_harness_model::cards::provider_group(&model.provider_id))
+        .or_else(|| tickloop_harness::model::cards::provider_group(&model.provider_id))
 }
 
 pub(super) fn connection_key(model: &ModelConfig) -> String {
@@ -1338,13 +1342,13 @@ impl ProviderModels {
     pub(super) fn group(models: Vec<ModelConfig>) -> Vec<Self> {
         Self::group_with_catalog(
             models,
-            &tickloop_harness_model::cards::ModelCatalog::defaults(),
+            &tickloop_harness::model::cards::ModelCatalog::defaults(),
         )
     }
 
     pub(super) fn group_with_catalog(
         models: Vec<ModelConfig>,
-        catalog: &tickloop_harness_model::cards::ModelCatalog,
+        catalog: &tickloop_harness::model::cards::ModelCatalog,
     ) -> Vec<Self> {
         use sha2::{Digest, Sha256};
         let mut choices: Vec<Self> = Vec::new();
@@ -1423,7 +1427,7 @@ impl ProviderModels {
                     .map(|connection| connection.sort_key()),
             )
         });
-        let access = tickloop_harness_model::access::AccessCatalog::defaults();
+        let access = tickloop_harness::model::access::AccessCatalog::defaults();
         for provider in &mut choices {
             provider.models.sort_by_key(|model| {
                 (
@@ -1443,7 +1447,7 @@ impl ProviderModels {
         let model = &self.models[0];
         if let Some(connection) = model.connection() {
             let label =
-                tickloop_harness_model::connection::connection_label(connection, &model.base_url);
+                tickloop_harness::model::connection::connection_label(connection, &model.base_url);
             if self.is_custom() {
                 format!("{label} · Custom")
             } else {
@@ -1466,13 +1470,13 @@ pub(super) struct ModelChoice {
 
 pub(super) fn thinking_choices(model: &ModelConfig) -> Vec<Option<ReasoningEffort>> {
     let mut choices = vec![None];
-    if tickloop_harness_model::cards::model_card(model)
-        .is_some_and(|card| card.thinking == tickloop_harness_protocol::ThinkingControl::Toggle)
+    if tickloop_harness::model::cards::model_card(model)
+        .is_some_and(|card| card.thinking == tickloop_harness::protocol::ThinkingControl::Toggle)
     {
         choices.push(Some(ReasoningEffort::Off));
         if model.adapter() == Adapter::MinimaxMessages
             || ReasoningEffort::choices(model).is_empty()
-                && tickloop_harness_model::validate_reasoning_effort(
+                && tickloop_harness::model::validate_reasoning_effort(
                     model,
                     Some(ReasoningEffort::On),
                 )
@@ -1575,7 +1579,7 @@ pub(super) enum ConnectionAction {
 pub(super) struct ProviderSession {
     pub(super) search: super::search::SearchSession,
     pub(super) provider_failures:
-        std::collections::HashMap<String, tickloop_harness_protocol::ProviderHttpFailure>,
+        std::collections::HashMap<String, tickloop_harness::protocol::ProviderHttpFailure>,
     pub(super) login_return: Option<(ConfigTarget, ProviderModels)>,
     pub(super) provider_choices: Vec<ProviderModels>,
     pub(super) provider_selected: usize,
@@ -1612,7 +1616,7 @@ impl Menus {
     pub(in crate::terminal) fn note_provider_failures(
         &mut self,
         chat: Uuid,
-        failures: &HashMap<String, tickloop_harness_protocol::ProviderHttpFailure>,
+        failures: &HashMap<String, tickloop_harness::protocol::ProviderHttpFailure>,
     ) {
         if self.provider_chat == Some(Some(chat)) {
             self.provider.provider_failures = failures.clone();
@@ -1658,7 +1662,7 @@ impl Menus {
 
     fn provider_api_status(&self, reference: &str) -> Result<ApiKeyStatus, String> {
         if let Some(root) = self.provider_root()
-            && tickloop_harness_model::credentials::load_api_key(root, reference)
+            && tickloop_harness::model::credentials::load_api_key(root, reference)
                 .map_err(|error| error.to_string())?
                 .is_some()
         {
@@ -2160,12 +2164,12 @@ impl Menus {
     pub(super) fn provider_authenticated(&self, provider: &ProviderModels) -> Result<bool, String> {
         let config = &provider.models[0];
         if let Some(region) =
-            tickloop_harness_model::auth::minimax::MiniMaxRegion::from_auth(config.auth_source)
+            tickloop_harness::model::auth::minimax::MiniMaxRegion::from_auth(config.auth_source)
         {
             return self
                 .provider_root()
                 .map(|root| {
-                    tickloop_harness_model::auth::minimax::MiniMaxAuth::new(root, region)
+                    tickloop_harness::model::auth::minimax::MiniMaxAuth::new(root, region)
                         .has_saved_login()
                         .map_err(|error| error.to_string())
                 })
@@ -2178,7 +2182,7 @@ impl Menus {
             let Some(root) = self.provider_root() else {
                 return Ok(false);
             };
-            let auth = tickloop_harness_model::auth::google::GoogleAuth::new(root);
+            let auth = tickloop_harness::model::auth::google::GoogleAuth::new(root);
             if config.auth_source == ModelAuthSource::GoogleCloud
                 && let Some(scope) = &self.provider.provider_scope
             {
@@ -2192,14 +2196,14 @@ impl Menus {
             .map_err(|error| error.to_string());
         }
         if let Some(kind) =
-            tickloop_harness_model::auth::device_subscriptions::DeviceSubscription::from_auth(
+            tickloop_harness::model::auth::device_subscriptions::DeviceSubscription::from_auth(
                 config.auth_source,
             )
         {
             let Some(root) = self.provider_root() else {
                 return Ok(false);
             };
-            return tickloop_harness_model::auth::device_subscriptions::SubscriptionAuth::new(
+            return tickloop_harness::model::auth::device_subscriptions::SubscriptionAuth::new(
                 root, kind,
             )
             .has_saved_login()
@@ -2209,7 +2213,7 @@ impl Menus {
             return self
                 .provider_root()
                 .map(|root| {
-                    tickloop_harness_model::auth::copilot::CopilotAuth::new(root)
+                    tickloop_harness::model::auth::copilot::CopilotAuth::new(root)
                         .has_saved_login()
                         .map_err(|error| error.to_string())
                 })
@@ -2273,7 +2277,7 @@ impl Menus {
         snapshot: &ChatSnapshot,
         run: Uuid,
     ) {
-        use tickloop_harness_protocol::{RequestFailure, RequestOutcome};
+        use tickloop_harness::protocol::{RequestFailure, RequestOutcome};
         let Some(request) = snapshot
             .request_usage
             .entries()
@@ -2623,7 +2627,7 @@ impl Menus {
                 if first.config.provider_id != "kimi-code-oauth" {
                     return None;
                 }
-                let recommended = tickloop_harness_model::access::AccessCatalog::defaults()
+                let recommended = tickloop_harness::model::access::AccessCatalog::defaults()
                     .recommended_model(&first.config.provider_id)?;
                 choices
                     .iter()
@@ -2874,7 +2878,7 @@ impl Menus {
             if let Some(status) = self.provider.model_directory_status.get(&provider.key()) {
                 context.push(status.clone());
             }
-            if let Some(notice) = tickloop_harness_model::access::AccessCatalog::defaults()
+            if let Some(notice) = tickloop_harness::model::access::AccessCatalog::defaults()
                 .provider(&provider.models[0].provider_id)
                 .and_then(|access| access.notice.as_deref())
             {
@@ -3150,7 +3154,7 @@ impl Menus {
             .as_ref()
             .map_or_else(
                 || {
-                    tickloop_harness_model::auth::google::GoogleAuth::new(root)
+                    tickloop_harness::model::auth::google::GoogleAuth::new(root)
                         .service_account_path()
                         .map_err(|error| error.to_string())
                 },
@@ -3410,7 +3414,7 @@ impl Drop for DiscoveryFlow {
 
 pub(in crate::terminal) enum ProviderUpdate {
     Models(Option<ModelDirectories>),
-    Search(Result<tickloop_harness_protocol::SearchTestResult, String>),
+    Search(Result<tickloop_harness::protocol::SearchTestResult, String>),
 }
 
 type ModelDirectories = Vec<(ProviderModels, Result<AccountModelDirectory, String>)>;
@@ -3468,14 +3472,14 @@ fn directory_status(
 }
 
 pub(in crate::terminal) fn provider_failure_context(
-    failure: &tickloop_harness_protocol::ProviderHttpFailure,
+    failure: &tickloop_harness::protocol::ProviderHttpFailure,
 ) -> Vec<String> {
-    let next_step = if failure.class == tickloop_harness_protocol::ProviderFailureClass::UsageOrPlan
-    {
-        "K3 may require a higher Kimi Code plan; check plan access and usage limits.".into()
-    } else {
-        failure.hint.clone()
-    };
+    let next_step =
+        if failure.class == tickloop_harness::protocol::ProviderFailureClass::UsageOrPlan {
+            "K3 may require a higher Kimi Code plan; check plan access and usage limits.".into()
+        } else {
+            failure.hint.clone()
+        };
     vec![
         format!("Last request failed: {}", failure.summary()),
         next_step,

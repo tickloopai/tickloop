@@ -1,6 +1,6 @@
 use super::*;
 use tickloop_code_access::AccessError;
-use tickloop_harness_protocol::ApiKeyStatus;
+use tickloop_harness::protocol::ApiKeyStatus;
 
 impl Menus {
     pub(in crate::terminal) async fn judgment_settings_from_permissions(

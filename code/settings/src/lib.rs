@@ -36,15 +36,15 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use tickloop_harness_base::output_style::OutputStyle;
-use tickloop_harness_base::private_fs::{
+use tickloop_harness::base::output_style::OutputStyle;
+use tickloop_harness::base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
 };
-use tickloop_harness_model::cards::{
+use tickloop_harness::model::cards::{
     ModelCatalog, ModelSelection, model_for_persistent_selection,
     upgrade_saved_legacy_builtin_model,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     AutoReviewerPreference, AutoRuleSettings, AutoSettingsRevision, Decision, ExecutionMode,
     ModelConfig, PermissionRule, ReasoningEffort,
 };
@@ -205,15 +205,15 @@ pub enum MonitorPopup {
 }
 
 impl LoadedSettings {
-    pub fn search_config(&mut self) -> Option<tickloop_harness_protocol::SearchConfig> {
+    pub fn search_config(&mut self) -> Option<tickloop_harness::protocol::SearchConfig> {
         let Some(value) = self.settings.get("webSearch").cloned() else {
-            return tickloop_harness_protocol::SearchConfig::enabled_default();
+            return tickloop_harness::protocol::SearchConfig::enabled_default();
         };
         if value.is_null() {
             return None;
         }
-        match serde_json::from_value::<tickloop_harness_protocol::SearchConfig>(value) {
-            Ok(config) if tickloop_harness_tools::web_search::validate_config(&config).is_ok() => {
+        match serde_json::from_value::<tickloop_harness::protocol::SearchConfig>(value) {
+            Ok(config) if tickloop_harness::tools::web_search::validate_config(&config).is_ok() => {
                 Some(config)
             }
             _ => {
@@ -238,7 +238,7 @@ impl LoadedSettings {
         }
     }
 
-    pub fn jev_config(&self) -> Result<tickloop_harness_model::judgment::JevConfig, String> {
+    pub fn jev_config(&self) -> Result<tickloop_harness::model::judgment::JevConfig, String> {
         if let Some(error) = &self.read_error {
             return Err(error.clone());
         }
@@ -247,7 +247,7 @@ impl LoadedSettings {
                 "invalid Jev settings; expected endpoint and model, with the key in Agent .env"
                     .into()
             }),
-            None => Ok(tickloop_harness_model::judgment::JevConfig::default()),
+            None => Ok(tickloop_harness::model::judgment::JevConfig::default()),
         }
     }
 
@@ -819,7 +819,7 @@ impl UserSettings {
                 expected: "a built-in Provider/model selection".into(),
             })?;
         if let Some(effort) = thinking_choice {
-            tickloop_harness_model::validate_reasoning_effort(&model, effort).map_err(|_| {
+            tickloop_harness::model::validate_reasoning_effort(&model, effort).map_err(|_| {
                 SettingsError::InvalidEntry {
                     path: self.path.clone(),
                     key: EFFORT_LEVEL_KEY.into(),
@@ -970,11 +970,11 @@ impl UserSettings {
 
     pub fn save_search_config(
         &self,
-        config: Option<&tickloop_harness_protocol::SearchConfig>,
+        config: Option<&tickloop_harness::protocol::SearchConfig>,
     ) -> Result<(), SettingsError> {
         self.update(|settings| {
             if let Some(config) = config {
-                tickloop_harness_tools::web_search::validate_config(config).map_err(|error| {
+                tickloop_harness::tools::web_search::validate_config(config).map_err(|error| {
                     InvalidEntry {
                         key: "webSearch".into(),
                         expected: error.to_string(),
@@ -1420,7 +1420,7 @@ mod tests {
     };
 
     use super::*;
-    use tickloop_harness_protocol::CustomAutoRule;
+    use tickloop_harness::protocol::CustomAutoRule;
 
     fn allow(tool: &str) -> PermissionRule {
         PermissionRule {

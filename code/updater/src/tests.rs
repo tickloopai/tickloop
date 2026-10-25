@@ -428,27 +428,29 @@ fn brew_source_requires_the_official_tap_receipt() {
 
 #[test]
 fn cargo_path_install_is_retained_as_a_checkout_instead_of_switching_to_binary_releases() {
-    let root = tempfile::tempdir().unwrap();
-    let cargo = root.path().join("cargo");
-    programs(&cargo.join("bin"), &build("1.2.3"));
-    let checkout = root.path().join("checkout");
-    let mut installs = serde_json::Map::new();
-    for (name, path) in [
-        ("tickloop-agent", "code/cli"),
-        ("tickloop-tickhost", "tickhost/host"),
+    for (package, path) in [
+        ("tickloop-agent", "agent/tickloop"),
+        ("tickloop-code", "code/cli"),
     ] {
-        let url = reqwest::Url::from_file_path(checkout.join(path)).unwrap();
-        installs.insert(format!("{name} 1.2.3 (path+{url})"), serde_json::json!({}));
-    }
-    std::fs::write(
-        cargo.join(".crates2.json"),
-        serde_json::to_vec(&serde_json::json!({"installs":installs})).unwrap(),
-    )
-    .unwrap();
-    let found = Installation::detect(&cargo.join("bin/tickloop"))
-        .unwrap()
+        let root = tempfile::tempdir().unwrap();
+        let cargo = root.path().join("cargo");
+        programs(&cargo.join("bin"), &build("1.2.3"));
+        let checkout = root.path().join("checkout");
+        let mut installs = serde_json::Map::new();
+        for (name, path) in [(package, path), ("tickloop-tickhost", "tickhost/host")] {
+            let url = reqwest::Url::from_file_path(checkout.join(path)).unwrap();
+            installs.insert(format!("{name} 1.2.3 (path+{url})"), serde_json::json!({}));
+        }
+        std::fs::write(
+            cargo.join(".crates2.json"),
+            serde_json::to_vec(&serde_json::json!({"installs":installs})).unwrap(),
+        )
         .unwrap();
-    assert!(matches!(found.source, Source::Checkout { root } if root == checkout));
+        let found = Installation::detect(&cargo.join("bin/tickloop"))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(found.source, Source::Checkout { root } if root == checkout));
+    }
 }
 
 #[tokio::test]
@@ -646,6 +648,37 @@ async fn cancellation_cleans_up_children_forked_as_the_installer_is_killed() {
         assert!(
             !finished.exists(),
             "a child escaped cancellation during fork on attempt {attempt}"
+        );
+    }
+}
+
+#[test]
+fn cargo_installation_detects_both_code_package_generations() {
+    for package in ["tickloop-code", "tickloop-agent"] {
+        let root = tempfile::tempdir().unwrap();
+        programs(&root.path().join("bin"), &build("1.2.3"));
+        let revision = "a".repeat(40);
+        let mut installs = serde_json::Map::new();
+        for (name, binary) in [(package, "tickloop"), ("tickloop-tickhost", "tickhost")] {
+            installs.insert(
+                format!("{name} 1.2.3 (git+https://github.com/example/tickloop#{revision})"),
+                serde_json::json!({"bins": [binary]}),
+            );
+        }
+        std::fs::write(
+            root.path().join(".crates2.json"),
+            serde_json::to_vec(&serde_json::json!({"installs": installs})).unwrap(),
+        )
+        .unwrap();
+        let found = Installation::detect(&root.path().join("bin/tickloop"))
+            .unwrap()
+            .expect("both package names identify the existing Cargo installation");
+        assert_eq!(
+            found.source,
+            Source::Cargo {
+                root: root.path().to_owned(),
+                repository: "https://github.com/example/tickloop".into(),
+            }
         );
     }
 }

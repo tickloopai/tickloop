@@ -1,7 +1,7 @@
 use crate::LoadedSettings;
+use tickloop_harness::model::ModelConfigExt;
 use tickloop_harness::policy::{new_chat, settings::SettingsSnapshot};
-use tickloop_harness_model::ModelConfigExt;
-use tickloop_harness_protocol::{AgentHostOptions, ModelConfig};
+use tickloop_harness::protocol::{AgentHostOptions, ModelConfig};
 
 pub use new_chat::NewChatSettings;
 

@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-harness = { path = "../../harness/sdk", features = ["artifacts", "model", "tools"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
 async-trait = "0.1"
 base64 = "0.22"
@@ -29,14 +30,9 @@ similar = { version = "2.7", features = ["inline"] }
 tempfile = "3"
 thiserror = "2"
 tickloop-code-access = { path = "../access" }
-tickloop-harness-artifacts = { path = "../../harness/artifacts" }
-tickloop-harness-base = { path = "../../harness/base" }
 tickloop-code-client = { path = "../client" }
 tickloop-code-settings = { path = "../settings" }
-tickloop-harness-model = { path = "../../harness/model" }
 tickloop-tick-installer = { path = "../../tick/installer" }
-tickloop-harness-protocol = { path = "../../harness/protocol" }
-tickloop-harness-tools = { path = "../../harness/tools" }
 tickloop-code-updater = { path = "../updater" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-packages = { path = "../../tick/packages" }
@@ -52,13 +48,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 vt100 = "0.16.2"
 
 [dev-dependencies]
+tickloop-harness = { path = "../../harness/sdk", features = ["engine", "test-support"] }
 tickloop-code-local-environment = { path = "../local-environment" }
 tickloop-code-settings = { path = "../settings", features = ["test-support"] }
 jsonschema = { version = "0.56", default-features = false }
 portable-pty = "0.9"
 tickloop-code-access = { path = "../access", features = ["test-support"] }
 tickloop-code-daemon = { path = "../daemon" }
-tickloop-harness-runtime = { path = "../../harness/runtime" }
-tickloop-harness-test-support = { path = "../../harness/test-support" }
 tickloop-tickhost = { path = "../../tickhost/host" }
 tokio = { version = "1", features = ["full", "test-util"] }

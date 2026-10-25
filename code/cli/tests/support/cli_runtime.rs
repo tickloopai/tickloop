@@ -66,13 +66,13 @@ pub fn configure_model(config_root: &Path) {
     let canonical_root = config_root.canonicalize().unwrap();
     let config_root = canonical_root.as_path();
     std::fs::set_permissions(config_root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let model = tickloop_harness_model::cards::ModelCatalog::defaults()
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
     tickloop_code_settings::UserSettings::in_root(config_root)
         .save_model(&model, false)
         .unwrap();
-    tickloop_harness_model::credentials::save_api_key(
+    tickloop_harness::model::credentials::save_api_key(
         config_root,
         "DEEPSEEK_API_KEY",
         "fixture-default-key",

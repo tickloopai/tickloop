@@ -1,6 +1,6 @@
 use super::{console::Console, execution::ConsoleExecution};
 use std::path::Path;
-use tickloop_harness_artifacts::{ArtifactClient, ArtifactError, artifact_type};
+use tickloop_harness::artifacts::{ArtifactClient, ArtifactError, artifact_type};
 use uuid::Uuid;
 
 pub(super) async fn refresh(
@@ -86,9 +86,9 @@ pub(super) async fn tick_action(
                     chat,
                     tick,
                     if action == 'h' {
-                        tickloop_harness_protocol::ArtifactFeedbackHistory::All
+                        tickloop_harness::protocol::ArtifactFeedbackHistory::All
                     } else {
-                        tickloop_harness_protocol::ArtifactFeedbackHistory::NewOnly
+                        tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly
                     },
                 )
                 .await
@@ -171,7 +171,7 @@ pub(super) async fn load_page(
     request: &super::artifacts_picker::ArtifactLoad,
 ) -> Result<
     (
-        tickloop_harness_artifacts::ArtifactPage,
+        tickloop_harness::artifacts::ArtifactPage,
         std::collections::HashSet<String>,
         bool,
     ),
@@ -227,7 +227,7 @@ async fn apply_choice_with_client(
             let chat = chat.ok_or("Select a Chat before adding an artifact")?;
             let tick = artifact.tick(
                 client.origin(),
-                tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                tickloop_harness::base::private_fs::unix_time_milliseconds(),
             );
             let id = tick.instance_id();
             agent
@@ -294,7 +294,7 @@ async fn apply_choice_with_client(
             if let Some(chat) = chat {
                 let instance = tick_protocol::artifact_instance_id(
                     client.origin(),
-                    &tickloop_harness_artifacts::canonical_artifact_id(&artifact.id),
+                    &tickloop_harness::artifacts::canonical_artifact_id(&artifact.id),
                 );
                 remove_local_artifact(agent, console, chat, &instance)
                     .await
@@ -381,13 +381,15 @@ mod tests {
     async fn artifact_fixture(
         directory: &Path,
         origin: &str,
-    ) -> (ConsoleExecution, tickloop_harness_runtime::Agent, Uuid) {
-        let core = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+    ) -> (ConsoleExecution, tickloop_harness::runtime::Agent, Uuid) {
+        let core = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         core.install_host_tools(Arc::new(
-            tickloop_harness_runtime::mcp_tools::McpHostToolProvider::new(
+            tickloop_harness::runtime::mcp_tools::McpHostToolProvider::new(
                 ArtifactClient::for_origin(directory.canonicalize().unwrap(), origin).unwrap(),
                 None,
             ),
@@ -592,14 +594,16 @@ mod tests {
     #[tokio::test]
     async fn feedback_action_without_the_artifact_service_links_nothing() {
         let directory = tempfile::tempdir().unwrap();
-        let core = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        let core = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let agent =
-            ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+            ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let tick = tickloop_harness_protocol::ArtifactTick {
+        let tick = tickloop_harness::protocol::ArtifactTick {
             artifact_id: "doc".into(),
             origin: "https://docs.example".into(),
             title: "Feedback".into(),
@@ -639,8 +643,8 @@ mod tests {
         inner: EmbeddedAgentAccess,
         linked: Mutex<
             Vec<(
-                tickloop_harness_protocol::ArtifactTick,
-                tickloop_harness_protocol::ArtifactFeedbackHistory,
+                tickloop_harness::protocol::ArtifactTick,
+                tickloop_harness::protocol::ArtifactFeedbackHistory,
             )>,
         >,
     }
@@ -672,9 +676,11 @@ mod tests {
     #[tokio::test]
     async fn feedback_key_links_the_artifact_directly() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
-        let runtime = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        ));
+        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
             model.clone(),
         );
         let inner = EmbeddedAgentAccess::new(runtime.clone());
@@ -693,7 +699,7 @@ mod tests {
             None,
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let tick = tickloop_harness_protocol::ArtifactTick {
+        let tick = tickloop_harness::protocol::ArtifactTick {
             artifact_id: "doc".into(),
             origin: "https://docs.example".into(),
             title: "Feedback".into(),
@@ -711,7 +717,7 @@ mod tests {
             *remote.linked.lock().unwrap(),
             vec![(
                 tick.clone(),
-                tickloop_harness_protocol::ArtifactFeedbackHistory::NewOnly
+                tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly
             )]
         );
         tick_action(&agent, &console, None, chat, tick.instance_id(), 'h')
@@ -721,7 +727,7 @@ mod tests {
             remote.linked.lock().unwrap()[1],
             (
                 tick,
-                tickloop_harness_protocol::ArtifactFeedbackHistory::All
+                tickloop_harness::protocol::ArtifactFeedbackHistory::All
             )
         );
         assert!(console.test_status_text().is_empty());
@@ -764,14 +770,16 @@ mod tests {
     #[tokio::test]
     async fn x_removes_an_artifact_that_delivers_nothing_here_without_asking() {
         let directory = tempfile::tempdir().unwrap();
-        let core = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        let core = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let agent =
-            ConsoleExecution::from_embedded(core.clone(), tickloop_harness_test_support::config());
+            ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let tick = tickloop_harness_protocol::ArtifactTick {
+        let tick = tickloop_harness::protocol::ArtifactTick {
             artifact_id: "doc".into(),
             origin: "https://docs.example".into(),
             title: "Elsewhere".into(),

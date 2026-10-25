@@ -5,7 +5,7 @@ use tickloop_code_local_environment::AgentLocalExt;
 
 const SUGGESTION_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-use tickloop_harness_test_support::model_http_support as suggestion_http;
+use tickloop_harness::test_support::model_http_support as suggestion_http;
 
 #[test]
 #[ignore]
@@ -21,46 +21,46 @@ fn prompt_suggestion_pty_fixture() {
                 .block_on(async {
                     let user_case = directory.join("user-case").exists();
                     let mut model = if user_case {
-                        tickloop_harness_model::cards::ModelCatalog::defaults()
+                        tickloop_harness::model::cards::ModelCatalog::defaults()
                             .get("kimi-cn-api", "kimi-k3")
                             .unwrap()
                     } else {
-                        tickloop_harness_test_support::config()
+                        tickloop_harness::test_support::config()
                     };
                     model.base_url = std::fs::read_to_string(directory.join("model-url")).unwrap();
                     model.api_key_env.clear();
                     let replies = if user_case {
                         vec![
-                            tickloop_harness_test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child"})),
-                            tickloop_harness_test_support::call("child-report", "SubagentHandback", serde_json::json!({"message":"Child completed."})),
-                            tickloop_harness_test_support::text("Parent completed."),
-                            tickloop_harness_test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
+                            tickloop_harness::test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child"})),
+                            tickloop_harness::test_support::call("child-report", "SubagentHandback", serde_json::json!({"message":"Child completed."})),
+                            tickloop_harness::test_support::text("Parent completed."),
+                            tickloop_harness::test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
                             if directory.join("delegated-view").exists() {
-                                let mut reply = tickloop_harness_test_support::text("当前目录包含 settings.json 和 model-url。");
-                                reply.extend(tickloop_harness_test_support::call("follow-up-report", "SubagentHandback", serde_json::json!({"message":"当前目录包含 settings.json 和 model-url。"})));
+                                let mut reply = tickloop_harness::test_support::text("当前目录包含 settings.json 和 model-url。");
+                                reply.extend(tickloop_harness::test_support::call("follow-up-report", "SubagentHandback", serde_json::json!({"message":"当前目录包含 settings.json 和 model-url。"})));
                                 reply
                             } else {
-                                tickloop_harness_test_support::text("当前目录包含 settings.json 和 model-url。")
+                                tickloop_harness::test_support::text("当前目录包含 settings.json 和 model-url。")
                             },
-                            tickloop_harness_test_support::text("Accepted fixture prompt."),
+                            tickloop_harness::test_support::text("Accepted fixture prompt."),
                         ]
                     } else if directory.join("fail-turn").exists() {
                         vec![]
                     } else {
                         vec![
-                            tickloop_harness_test_support::text("Completed fixture turn."),
-                            tickloop_harness_test_support::text("Accepted fixture prompt."),
+                            tickloop_harness::test_support::text("Completed fixture turn."),
+                            tickloop_harness::test_support::text("Accepted fixture prompt."),
                         ]
                     };
                     let scripted =
-                        Arc::new(tickloop_harness_test_support::ScriptedModel::new(replies));
-                    let core = tickloop_harness_runtime::Agent::new_embedded(
+                        Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies));
+                    let core = tickloop_harness::runtime::Agent::new_embedded(
                         model.clone(),
                         scripted.clone(),
                     );
                     core.install_own_tickhost();
-                    core.set_auto_reviewer(Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-                        tickloop_harness_test_support::text(&tickloop_harness_test_support::auto_classification(false).to_string()); 3
+                    core.set_auto_reviewer(Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+                        tickloop_harness::test_support::text(&tickloop_harness::test_support::auto_classification(false).to_string()); 3
                     ]))).await;
                     let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
                         core.clone(),
@@ -68,23 +68,23 @@ fn prompt_suggestion_pty_fixture() {
                     );
                     let mut chat = agent.create_chat(directory.clone()).await.unwrap();
                     if user_case {
-                        core.set_execution_mode(chat.into(), tickloop_harness_protocol::ExecutionMode::Auto).await.unwrap();
+                        core.set_execution_mode(chat.into(), tickloop_harness::protocol::ExecutionMode::Auto).await.unwrap();
                         let mut events = core.subscribe();
                         let receipt = core.submit(chat.into(), "Complete the fixture family".into()).await.unwrap();
                         loop {
-                            let event = tickloop_harness_test_support::next_event(&mut events).await;
-                            assert!(!matches!(event.kind, tickloop_harness_protocol::EventKind::Failed(_)), "{event:?}");
-                            if event.run_id == receipt.run_id && matches!(event.kind, tickloop_harness_protocol::EventKind::Completed { .. }) { break; }
+                            let event = tickloop_harness::test_support::next_event(&mut events).await;
+                            assert!(!matches!(event.kind, tickloop_harness::protocol::EventKind::Failed(_)), "{event:?}");
+                            if event.run_id == receipt.run_id && matches!(event.kind, tickloop_harness::protocol::EventKind::Completed { .. }) { break; }
                         }
                         let child = agent.catalog().await.unwrap().into_iter().find(|row| row.parent.is_some()).unwrap();
-                        assert_eq!(child.state, tickloop_harness_protocol::LoopState::Idle);
+                        assert_eq!(child.state, tickloop_harness::protocol::LoopState::Idle);
                         if directory.join("delegated-view").exists() { chat = child.chat_id; }
                     }
                     if directory.join("plan-mode").exists() {
                         agent
                             .set_execution_mode(
                                 chat,
-                                tickloop_harness_protocol::ExecutionMode::Plan,
+                                tickloop_harness::protocol::ExecutionMode::Plan,
                             )
                             .await
                             .unwrap();
@@ -101,7 +101,7 @@ fn prompt_suggestion_pty_fixture() {
                         &console,
                         Some(&model),
                         &directory,
-                        tickloop_harness_protocol::ExecutionMode::Auto,
+                        tickloop_harness::protocol::ExecutionMode::Auto,
                         vec![],
                     )
                     .unwrap();
@@ -143,10 +143,10 @@ fn prompt_suggestion_pty_fixture() {
                         .unwrap()
                         .iter()
                         .flat_map(|request| &request.messages)
-                        .filter(|message| message.role == tickloop_harness_protocol::Role::User)
+                        .filter(|message| message.role == tickloop_harness::protocol::Role::User)
                         .flat_map(|message| &message.content)
                         .filter_map(|content| match content {
-                            tickloop_harness_protocol::Content::Text { text } => Some(text.clone()),
+                            tickloop_harness::protocol::Content::Text { text } => Some(text.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>();

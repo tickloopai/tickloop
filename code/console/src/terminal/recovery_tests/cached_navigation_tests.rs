@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tickloop_code_access::{AgentFilter, Page};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CACHED_NAVIGATION_FIXTURE";
 const SOURCE_TASK: &str = "NAV-SOURCE-TASK";
@@ -102,7 +102,7 @@ fn cached_navigation_pty_fixture() {
 
 async fn complete_input(
     access: &RejectedNavigationAccess,
-    core: &tickloop_harness_runtime::Agent,
+    core: &tickloop_harness::runtime::Agent,
     execution: ExecutionRef,
     chat: Uuid,
     text: &str,
@@ -132,7 +132,7 @@ async fn complete_input(
             let snapshot = core.snapshot(chat.into()).await.unwrap();
             if snapshot.chat_loop.id == receipt.loop_id
                 && snapshot.chat_loop.run_id == Some(receipt.run_id)
-                && snapshot.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+                && snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
             {
                 break;
             }
@@ -155,14 +155,14 @@ async fn wait_for_control(name: &str) {
 
 async fn run_cached_navigation_fixture() {
     let route = std::env::var(ROUTE_VARIABLE).unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::text(SOURCE_REPLY),
-        tickloop_harness_test_support::text(TARGET_REPLY),
-        tickloop_harness_test_support::text(ADVANCED_REPLY),
-        tickloop_harness_test_support::text(FOLLOW_UP_REPLY),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::text(SOURCE_REPLY),
+        tickloop_harness::test_support::text(TARGET_REPLY),
+        tickloop_harness::test_support::text(ADVANCED_REPLY),
+        tickloop_harness::test_support::text(FOLLOW_UP_REPLY),
     ]));
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         model.clone(),
     );
     let access = Arc::new(RejectedNavigationAccess {
@@ -176,7 +176,7 @@ async fn run_cached_navigation_fixture() {
     });
     let workdir = std::env::current_dir().unwrap();
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let view = ViewRef {
         session_id: Uuid::new_v4(),
@@ -316,9 +316,9 @@ async fn run_cached_navigation_fixture() {
         .map(|location| location.execution)
         .collect::<Vec<_>>();
     let accepted = access.submits.lock().unwrap().clone();
-    let contains_follow_up = |snapshot: &tickloop_harness_protocol::ChatSnapshot| {
+    let contains_follow_up = |snapshot: &tickloop_harness::protocol::ChatSnapshot| {
         snapshot.messages.iter().any(|message| {
-            message.role == tickloop_harness_protocol::Role::User
+            message.role == tickloop_harness::protocol::Role::User
                 && message
                     .content
                     .iter()
@@ -348,7 +348,7 @@ fn a_rejected_display_registration_keeps_the_visible_editor_and_submit_on_the_so
 }
 
 fn run_rejected_navigation_pty(route: &str) {
-    let directory = tempfile::tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT).unwrap();
+    let directory = tempfile::tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

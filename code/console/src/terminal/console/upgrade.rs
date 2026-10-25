@@ -498,8 +498,8 @@ mod tests {
             state.scrollback.scroll(ScrollAction::First);
         }
         console.select_chat(Some(second)).unwrap();
-        let image = tickloop_harness_protocol::Image {
-            media_type: tickloop_harness_protocol::ImageMediaType::Png,
+        let image = tickloop_harness::protocol::Image {
+            media_type: tickloop_harness::protocol::ImageMediaType::Png,
             data: "fixture".into(),
             width: 1,
             height: 1,
@@ -570,8 +570,8 @@ mod tests {
                     &marker,
                     0..marker.len(),
                     id,
-                    tickloop_harness_protocol::Image {
-                        media_type: tickloop_harness_protocol::ImageMediaType::Png,
+                    tickloop_harness::protocol::Image {
+                        media_type: tickloop_harness::protocol::ImageMediaType::Png,
                         data: "fixture".into(),
                         width: 1,
                         height: 1,

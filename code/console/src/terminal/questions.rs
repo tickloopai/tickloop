@@ -8,7 +8,7 @@ use super::{
     display::{DisplayProfile, Glyph},
     safe_line, safe_text,
 };
-use tickloop_harness_protocol::{Question, QuestionAnswer, QuestionRequest};
+use tickloop_harness::protocol::{Question, QuestionAnswer, QuestionRequest};
 
 const OTHER_LABEL: &str = "Other";
 const OTHER_PLACEHOLDER: &str = "Type something.";
@@ -499,7 +499,7 @@ fn typed_draft(question: &Question, text: &str) -> Result<QuestionDraft, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_protocol::QuestionOption;
+    use tickloop_harness::protocol::QuestionOption;
     use uuid::Uuid;
 
     fn question(text: &str, header: &str, labels: &[&str], multi_select: bool) -> Question {

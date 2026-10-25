@@ -2,10 +2,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tickloop_code_local_environment::AgentLocalExt;
 use tickloop_code_settings::local_agent::LocalAgent;
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 
-use tickloop_harness_protocol::{EventKind, ExecutionMode};
-use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+use tickloop_harness::protocol::{EventKind, ExecutionMode};
+use tickloop_harness::test_support::{ScriptedModel, call, config, text};
 
 #[tokio::test]
 async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
@@ -39,7 +39,7 @@ async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -81,7 +81,7 @@ async fn invalid_handles_never_create_a_child_or_reserve_a_name() {
         let receipt = core.submit(parent, "Check handles".into()).await.unwrap();
         let mut refused = false;
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id != receipt.run_id {
                 continue;
             }
@@ -130,7 +130,7 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -161,7 +161,7 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -389,7 +389,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
     };
     let mut child = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::Failed(error) = &event.kind {
             panic!("initial delegation failed: {error}");
         }
@@ -482,7 +482,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
         };
         let mut result_seen = false;
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id != run.run_id {
                 continue;
             }
@@ -613,7 +613,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     };
     let mut child = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id != parent_run.chat_id {
             child = Some(event.chat_id);
             if let EventKind::ToolCompleted { result, .. } = &event.kind {
@@ -695,7 +695,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     };
     let mut results = std::collections::BTreeMap::new();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id != run.run_id {
             continue;
         }
@@ -731,7 +731,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         "the child never reached Herdr"
     );
 
-    let transcript = tickloop_harness_test_support::transcript_file(&store, child.into());
+    let transcript = tickloop_harness::test_support::transcript_file(&store, child.into());
     let single_authority = std::fs::read_to_string(&transcript)
         .unwrap()
         .lines()
@@ -765,17 +765,17 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
 
 #[tokio::test]
 async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_dispatch() {
-    use tickloop_harness_protocol::HostCallContext;
-    use tickloop_harness_runtime::host_tools::{HostCallResult, HostToolProvider};
+    use tickloop_harness::protocol::HostCallContext;
+    use tickloop_harness::runtime::host_tools::{HostCallResult, HostToolProvider};
     let directory = tempfile::Builder::new()
         .prefix("tl-host-")
         .tempdir_in("/tmp")
         .unwrap();
     let original = ScopedHostSocket::start(directory.path().join("host.sock"));
     let provider = original.tools();
-    let local_files = tickloop_harness_tools::Tools::new(directory.path().join("chat"))
+    let local_files = tickloop_harness::tools::Tools::new(directory.path().join("chat"))
         .local_file_reader(
-            &tickloop_harness_tools::Workspace {
+            &tickloop_harness::tools::Workspace {
                 folder: Some(directory.path().into()),
                 additional_directories: Vec::new(),
             },
@@ -784,7 +784,7 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
     let call = provider
         .prepare_call_in_scope(
             uuid::Uuid::new_v4().into(),
-            &tickloop_harness_runtime::host_tools::HostCallScope {
+            &tickloop_harness::runtime::host_tools::HostCallScope {
                 local_files: local_files.as_ref(),
                 context: Some(&HostCallContext {
                     folder: directory.path().into(),
@@ -818,7 +818,7 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
 
 #[tokio::test]
 async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
-    use tickloop_harness_protocol::PermissionScope;
+    use tickloop_harness::protocol::PermissionScope;
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("state");
     let denied_input = json!({"file_path":".bashrc","content":"fixture=denied"});
@@ -845,7 +845,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             agent
                 .answer_permission_with_scope(parent, request.id, false, PermissionScope::Session)
@@ -856,7 +856,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
     }
     loop {
         if matches!(
-            tickloop_harness_test_support::next_event(&mut events)
+            tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind,
             EventKind::Interrupted
@@ -875,7 +875,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
     let mut child = None;
     let mut denial_returned = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id != parent {
             child = Some(event.chat_id);
             if let EventKind::ToolCompleted {
@@ -927,7 +927,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         .unwrap();
     let mut denied = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::ToolCompleted { result, .. } = event.kind {
             assert!(result.is_error);
             denied = true;
@@ -942,7 +942,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
 
 #[tokio::test]
 async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
-    use tickloop_harness_protocol::PermissionScope;
+    use tickloop_harness::protocol::PermissionScope;
     let directory = tempfile::tempdir().unwrap();
     let input = json!({"file_path":".bashrc","content":"fixture=denied"});
     let store = directory.path().join("state");
@@ -972,7 +972,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         .await
         .unwrap();
     let (child, child_request) = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             assert_ne!(event.chat_id, parent);
             break (event.chat_id, request);
@@ -980,7 +980,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
     };
     agent.interrupt(parent).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent && matches!(event.kind, EventKind::Interrupted) {
             break;
         }
@@ -990,7 +990,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == denial.run_id
             && let EventKind::PermissionRequested { request } = event.kind
         {
@@ -1006,7 +1006,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == child {
             assert!(
                 !matches!(event.kind, EventKind::ToolStarted { .. }),
@@ -1049,7 +1049,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         .unwrap();
     let mut denied = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         assert!(!matches!(
             event.kind,
             EventKind::PermissionRequested { .. } | EventKind::ToolStarted { .. }
@@ -1094,7 +1094,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         .await
         .unwrap();
     let result = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent
             && let EventKind::ToolCompleted {
                 call_id, result, ..
@@ -1126,7 +1126,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     assert_eq!(metadata.parent_run_id, parent_receipt.run_id);
     assert_eq!(metadata.parent_call_id, "delegate");
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -1136,7 +1136,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -1147,7 +1147,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         assert!(requests[1].tools.iter().any(|tool| tool.name == "Subagent"));
     }
     agent.shutdown().await;
-    let transcript = std::fs::read_to_string(tickloop_harness_test_support::transcript_file(
+    let transcript = std::fs::read_to_string(tickloop_harness::test_support::transcript_file(
         &store,
         child.into(),
     ))
@@ -1180,8 +1180,8 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
 
 #[tokio::test]
 async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_inherited() {
-    use tickloop_harness_protocol::UserShellState;
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::UserShellState;
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let outside_file = outside.path().join("private.txt");
@@ -1239,7 +1239,7 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
     let mut child = None;
     let mut refused = std::collections::BTreeSet::new();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id != parent {
             child = Some(event.chat_id);
         }
@@ -1303,7 +1303,7 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         .unwrap();
     let mut newly_restricted = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id != follow_up.run_id {
             continue;
         }
@@ -1369,8 +1369,8 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
 
 #[tokio::test]
 async fn permission_and_question_requests_belong_to_the_child() {
-    use tickloop_harness_protocol::QuestionAnswer;
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::QuestionAnswer;
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1386,7 +1386,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
         call(
             "question",
             "AskUserQuestion",
-            tickloop_harness_test_support::single_question("Which cadence?"),
+            tickloop_harness::test_support::single_question("Which cadence?"),
         ),
         text("The approved weekly report is ready."),
         text("The child returned the approved report."),
@@ -1420,7 +1420,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
     let mut child = None;
     let mut asked = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::PermissionRequested { request } => {
                 assert_ne!(event.chat_id, parent);
@@ -1480,7 +1480,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         ObservationValue, Page, PendingRequestKind, RequestRef, UserInput, ViewRef,
     };
 
-    use tickloop_harness_protocol::{LoopState, QuestionAnswer};
+    use tickloop_harness::protocol::{LoopState, QuestionAnswer};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1491,7 +1491,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         call(
             "question",
             "AskUserQuestion",
-            tickloop_harness_test_support::single_question("Which cadence?"),
+            tickloop_harness::test_support::single_question("Which cadence?"),
         ),
         text("The child confirmed Weekly."),
         text("The actual child completed."),
@@ -1713,7 +1713,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         .iter()
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
-            tickloop_harness_protocol::Content::ToolResult {
+            tickloop_harness::protocol::Content::ToolResult {
                 tool_use_id,
                 content,
                 is_error: false,
@@ -1727,12 +1727,12 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     assert_eq!(parent_result["status"], "completed");
     assert_eq!(
         parent_result["delegation_id"],
-        tickloop_ids::IdContext::new().model_text(tickloop_harness_protocol::DelegationId::from(
+        tickloop_ids::IdContext::new().model_text(tickloop_harness::protocol::DelegationId::from(
             metadata.delegation_id
         ))
     );
     let original_child_run =
-        tickloop_harness_protocol::RunId::parse(parent_result["child_run_id"].as_str().unwrap())
+        tickloop_harness::protocol::RunId::parse(parent_result["child_run_id"].as_str().unwrap())
             .unwrap()
             .uuid();
     let follow_up = access
@@ -1804,7 +1804,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
 
 #[tokio::test]
 async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
-    use tickloop_harness_protocol::{LoopState, QuestionAnswer};
+    use tickloop_harness::protocol::{LoopState, QuestionAnswer};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1815,7 +1815,7 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         call(
             "question",
             "AskUserQuestion",
-            tickloop_harness_test_support::single_question("Which cadence?"),
+            tickloop_harness::test_support::single_question("Which cadence?"),
         ),
         text("The child completed after the parent stopped waiting."),
     ]));
@@ -1831,14 +1831,14 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         .await
         .unwrap();
     let (child, request) = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::QuestionAsked { request } = event.kind {
             break (event.chat_id, request);
         }
     };
     agent.interrupt(parent).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent && matches!(event.kind, EventKind::Interrupted) {
             break;
         }
@@ -1856,7 +1856,7 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -1886,7 +1886,7 @@ async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -1899,7 +1899,7 @@ async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming
         .unwrap()
         .id;
     agent.shutdown().await;
-    let transcript = tickloop_harness_test_support::transcript_file(&store, child.into());
+    let transcript = tickloop_harness::test_support::transcript_file(&store, child.into());
     let original = std::fs::read_to_string(&transcript).unwrap();
     for remove_record in [false, true] {
         let rewritten = original
@@ -1958,7 +1958,7 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -1981,7 +1981,7 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
     )
     .unwrap();
     agent.shutdown().await;
-    let transcript = tickloop_harness_test_support::transcript_file(&store, child.into());
+    let transcript = tickloop_harness::test_support::transcript_file(&store, child.into());
     let original = std::fs::read_to_string(&transcript).unwrap();
     for reorder in [false, true] {
         let mut initial_user = None;
@@ -2079,7 +2079,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         .unwrap();
     let mut result = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::ToolCompleted {
             call_id,
             result: output,
@@ -2143,7 +2143,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         .await
         .unwrap();
     let (child, request) = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             assert_ne!(event.chat_id, root);
             assert_eq!(request.name, "Bash");
@@ -2165,7 +2165,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         .unwrap();
     let mut result = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::ToolCompleted {
             call_id,
             result: output,
@@ -2196,27 +2196,27 @@ struct HeldChildModel {
     release: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
-impl tickloop_harness_model::ModelClient for HeldChildModel {
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+impl tickloop_harness::model::ModelClient for HeldChildModel {
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
         self.model.identity()
     }
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         self.model.generate_title(request, events, cancel).await
     }
     async fn complete(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.hold_at {
             self.entered.notify_one();
-            tokio::select! { ()=self.release.notified()=>{}, ()=cancel.cancelled()=>return Err(tickloop_harness_model::ModelError::Cancelled) }
+            tokio::select! { ()=self.release.notified()=>{}, ()=cancel.cancelled()=>return Err(tickloop_harness::model::ModelError::Cancelled) }
         }
         self.model.complete(request, events, cancel).await
     }
@@ -2262,7 +2262,7 @@ async fn parent_mode_tightening_turns_the_childs_frozen_full_access_bash_into_as
         .unwrap();
     model.release.notify_one();
     let observed = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::PermissionRequested { request } if request.name == "Bash" => {
                 break Some((event.chat_id, request));
@@ -2307,7 +2307,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == root_run.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -2325,7 +2325,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
     let receipt =
         sent.expect("direct child Shell must be accepted without awaiting or bypassing approval");
     let request = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.chat_id == child
             && let EventKind::PermissionRequested { request } = event.kind
         {
@@ -2348,7 +2348,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
             let snapshot = core.snapshot(child).await.unwrap();
             if snapshot.user_shells.iter().any(|shell| {
                 shell.id == receipt.command_id
-                    && shell.state == tickloop_harness_protocol::UserShellState::Completed
+                    && shell.state == tickloop_harness::protocol::UserShellState::Completed
             }) {
                 break snapshot;
             }
@@ -2372,7 +2372,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
 
 #[tokio::test]
 async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let command = "python3 -c 'print(5438)'";
     for decision in [Decision::Allow, Decision::Deny] {
         let directory = tempfile::tempdir().unwrap();
@@ -2413,7 +2413,7 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
             .unwrap();
         let mut result = None;
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             match event.kind {
                 EventKind::PermissionRequested { request } => {
                     core.answer_permission(event.chat_id, request.id, false)
@@ -2446,7 +2446,7 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
 
 #[tokio::test]
 async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_child_waits() {
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let command =
         r#"python3 -c 'from pathlib import Path; Path("not-admitted").write_text("bad")'"#;
@@ -2470,7 +2470,7 @@ async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_chil
         .await
         .unwrap();
     let (child, request) = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             break (event.chat_id, request);
         }
@@ -2494,7 +2494,7 @@ async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_chil
         .unwrap();
     let mut refused = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::ToolStarted { call_id, .. } if call_id == "python" => {
                 panic!("late parent Deny must win over child Once")
@@ -2523,26 +2523,26 @@ struct BackgroundResultModel {
     scripted: ScriptedModel,
 }
 #[async_trait::async_trait]
-impl tickloop_harness_model::ModelClient for BackgroundResultModel {
-    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+impl tickloop_harness::model::ModelClient for BackgroundResultModel {
+    fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
         self.scripted.identity()
     }
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         self.scripted.generate_title(request, events, cancel).await
     }
     async fn complete(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        use tickloop_harness_model::ModelOutput;
-        use tickloop_harness_protocol::{Content, Role, Usage};
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        use tickloop_harness::model::ModelOutput;
+        use tickloop_harness::protocol::{Content, Role, Usage};
         let already_ready = request.messages.iter().any(|message| {
             message.role == Role::Assistant
                 && message
@@ -2595,7 +2595,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -2606,7 +2606,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
             let snapshot = core.snapshot(child).await.unwrap();
             let command = snapshot.commands.last().unwrap();
             if command.output_bytes > 0
-                && command.state == tickloop_harness_protocol::CommandState::Completed
+                && command.state == tickloop_harness::protocol::CommandState::Completed
             {
                 break command.output_ref.clone();
             }
@@ -2625,7 +2625,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         .unwrap();
     let mut result = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::PermissionRequested { .. } => panic!("own session output must not prompt"),
             EventKind::ToolCompleted {
@@ -2672,7 +2672,7 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
             .await
             .unwrap();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
                 break;
             }
@@ -2687,7 +2687,7 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
             .await
             .unwrap();
         let request = loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if let EventKind::PermissionRequested { request } = event.kind {
                 break request;
             }
@@ -2716,7 +2716,7 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
         };
         assert_eq!(
             stopped.state,
-            tickloop_harness_protocol::UserShellState::Failed
+            tickloop_harness::protocol::UserShellState::Failed
         );
         assert!(
             core.answer_permission(child, request.id, true)
@@ -2733,7 +2733,7 @@ async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_reques
                     .find(|shell| shell.id == queued.command_id)
                     .unwrap()
                     .state,
-                tickloop_harness_protocol::UserShellState::Failed
+                tickloop_harness::protocol::UserShellState::Failed
             );
             assert!(!directory.path().join("queued-after-stop").exists());
         }
@@ -2770,7 +2770,7 @@ async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admis
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -2793,7 +2793,7 @@ async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admis
         .await
         .unwrap();
     let request = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             assert_eq!(event.chat_id, child);
             break request;
@@ -2820,7 +2820,7 @@ async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admis
 
 #[tokio::test]
 async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command() {
-    use tickloop_harness_protocol::PermissionScope;
+    use tickloop_harness::protocol::PermissionScope;
     let directory = tempfile::tempdir().unwrap();
     let core = Agent::new_embedded(
         config(),
@@ -2839,7 +2839,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
     let mut events = core.subscribe();
     let receipt = core.submit(root, "Create a child".into()).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -2851,7 +2851,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
         .await
         .unwrap();
     let request = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             break request;
         }
@@ -2869,7 +2869,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
                 .iter()
                 .any(|shell| {
                     shell.id == first.command_id
-                        && shell.state == tickloop_harness_protocol::UserShellState::Completed
+                        && shell.state == tickloop_harness::protocol::UserShellState::Completed
                 })
             {
                 break;
@@ -2892,7 +2892,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
             );
             if snapshot.user_shells.iter().any(|shell| {
                 shell.id == second.command_id
-                    && shell.state == tickloop_harness_protocol::UserShellState::Completed
+                    && shell.state == tickloop_harness::protocol::UserShellState::Completed
             }) {
                 break;
             }
@@ -2906,7 +2906,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
 
 #[tokio::test]
 async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_it() {
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(HeldChildModel {
         hold_at: 2,
@@ -2940,7 +2940,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -2970,7 +2970,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
     model.release.notify_one();
     let mut denied = false;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::ToolStarted { call_id, .. } if call_id == "scoped-python" => {
                 panic!("a frozen parent Loop denial must remain a denial")
@@ -3010,7 +3010,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
     let mut events = core.subscribe();
     let initial = core.submit(root, "Create a child".into()).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -3020,7 +3020,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
         .await
         .unwrap();
     let request = loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::PermissionRequested { request } = event.kind {
             break request;
         }
@@ -3033,7 +3033,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
     model.enqueue(text("Root stopped child"));
     core.submit(root, "Stop the child".into()).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if let EventKind::ToolCompleted {
             call_id, result, ..
         } = event.kind
@@ -3054,7 +3054,7 @@ async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_s
 
 #[tokio::test]
 async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
-    use tickloop_harness_protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let command = "python3 -c 'print(5438)'";
     let model = Arc::new(ScriptedModel::new(vec![
@@ -3091,7 +3091,7 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
         .unwrap();
     let mut result = None;
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         match event.kind {
             EventKind::PermissionRequested { .. } => {
                 panic!("a frozen matching persistent Allow must not be deleted by refresh")
@@ -3115,8 +3115,8 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
 struct NoLocalReads;
 
 #[async_trait::async_trait]
-impl tickloop_harness_tools::LocalReadAdmission for NoLocalReads {
-    async fn admit(&self, _: &tickloop_harness_tools::PreparedTool) -> Result<bool, String> {
+impl tickloop_harness::tools::LocalReadAdmission for NoLocalReads {
+    async fn admit(&self, _: &tickloop_harness::tools::PreparedTool) -> Result<bool, String> {
         Err("no local file is read here".into())
     }
 }

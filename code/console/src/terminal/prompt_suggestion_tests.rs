@@ -1,15 +1,15 @@
 use super::prompt_suggestion::{SuggestionRequest, generate};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tickloop_harness_model::{LocalModelClients, ModelClients};
-use tickloop_harness_runtime::Agent;
-use tickloop_harness_test_support::harness::{ChosenModels, embedded_agent};
+use tickloop_harness::model::{LocalModelClients, ModelClients};
+use tickloop_harness::runtime::Agent;
+use tickloop_harness::test_support::harness::{ChosenModels, embedded_agent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use tickloop_harness_protocol::{ChatSnapshot, Content, EventKind, Message, Role};
-use tickloop_harness_test_support::model_http_support as http;
+use tickloop_harness::protocol::{ChatSnapshot, Content, EventKind, Message, Role};
+use tickloop_harness::test_support::model_http_support as http;
 
 fn request() -> SuggestionRequest {
     SuggestionRequest {
@@ -23,23 +23,23 @@ fn conversation() -> Vec<Message> {
     vec![
         Message {
             role: Role::User,
-            content: tickloop_harness_test_support::text("修好了检查一下"),
+            content: tickloop_harness::test_support::text("修好了检查一下"),
         },
         Message {
             role: Role::Assistant,
-            content: tickloop_harness_test_support::text("All fixture tests passed."),
+            content: tickloop_harness::test_support::text("All fixture tests passed."),
         },
     ]
 }
 
 async fn snapshot(
-    model: tickloop_harness_protocol::ModelConfig,
+    model: tickloop_harness::protocol::ModelConfig,
     messages: Vec<Message>,
 ) -> ChatSnapshot {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
         model,
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut snapshot = agent.snapshot(chat).await.unwrap();
@@ -131,9 +131,9 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
         let prefix = prefix_bytes.map(|count| "x".repeat(count));
         let (url, received) =
             http::serve_response(200, responses_reasoning_reply(&summary, prefix.as_deref())).await;
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.base_url = url;
-        model.protocol = tickloop_harness_protocol::Protocol::Responses;
+        model.protocol = tickloop_harness::protocol::Protocol::Responses;
         let context = snapshot(model, conversation()).await;
         let request = request();
         let output = generate(&request, &context, &LocalModelClients::new(None)).await;
@@ -150,9 +150,9 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
 
 #[tokio::test]
 async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasoning() {
-    let client = tickloop_harness_test_support::ScriptedModel::new(vec![vec![
+    let client = tickloop_harness::test_support::ScriptedModel::new(vec![vec![
         Content::ProtocolData {
-            protocol: tickloop_harness_protocol::Protocol::Responses,
+            protocol: tickloop_harness::protocol::Protocol::Responses,
             value: json!({"type":"reasoning","summary":[{"type":"summary_text","text":"x".repeat(2_048)}],"encrypted_content":"opaque-fixture"}),
         },
         Content::Text {
@@ -161,11 +161,11 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
     ]]);
     let cancel = CancellationToken::new();
     let result =
-        tickloop_harness_model::GenerationBudget::new(1_024, std::time::Duration::from_secs(10))
+        tickloop_harness::model::GenerationBudget::new(1_024, std::time::Duration::from_secs(10))
             .complete(
                 &client,
                 Uuid::new_v4().into(),
-                tickloop_harness_model::ModelRequest {
+                tickloop_harness::model::ModelRequest {
                     history_sources: vec![],
                     messages: conversation(),
                     tools: vec![],
@@ -178,8 +178,8 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
             .await;
     assert!(matches!(
         result,
-        Err(tickloop_harness_model::ModelError::ResponseRejected(
-            tickloop_harness_model::ModelResponseRejection::OutputLimit
+        Err(tickloop_harness::model::ModelError::ResponseRejected(
+            tickloop_harness::model::ModelResponseRejection::OutputLimit
         ))
     ));
     assert!(cancel.is_cancelled());
@@ -189,13 +189,13 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
 async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensitive_original() {
     const ORIGINAL: &str = "sensitive original fixture credential excluded from public summary";
     let directory = tempfile::tempdir().unwrap();
-    let models = ChosenModels::new(Arc::new(tickloop_harness_test_support::ScriptedModel::new(
-        vec![
-            tickloop_harness_test_support::text(ORIGINAL),
-            tickloop_harness_test_support::text("Public compacted summary."),
-        ],
-    )));
-    let agent = embedded_agent(tickloop_harness_test_support::config(), models.clone());
+    let models = ChosenModels::new(Arc::new(
+        tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text(ORIGINAL),
+            tickloop_harness::test_support::text("Public compacted summary."),
+        ]),
+    ));
+    let agent = embedded_agent(tickloop_harness::test_support::config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let initial = agent
@@ -203,7 +203,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -223,7 +223,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
         ),
     ])
     .await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
     model.provider_id = "fixture-next-provider".into();
     model.name = "Next Provider fixture".into();
@@ -234,7 +234,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
         .await
         .unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id == next.run_id && matches!(event.kind, EventKind::Completed { .. }) {
             break;
         }
@@ -295,9 +295,9 @@ async fn prompt_suggestion_openai_stream_hits_the_output_budget_before_the_deadl
             "bounded request should close the transport"
         );
     });
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
-    model.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+    model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     let context = snapshot(model, conversation()).await;
     let request = request();
     let running = request.clone();
@@ -325,7 +325,7 @@ async fn prompt_suggestion_http_uses_current_model_without_tools_or_private_hist
         response(json!({"type":"text","text":"进度怎么样了"}), "end_turn"),
     )
     .await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
     model.max_output_tokens = 16_000;
     let mut messages = conversation();
@@ -333,7 +333,7 @@ async fn prompt_suggestion_http_uses_current_model_without_tools_or_private_hist
         0,
         Message {
             role: Role::System,
-            content: tickloop_harness_test_support::text("private system fixture"),
+            content: tickloop_harness::test_support::text("private system fixture"),
         },
     );
     messages[2].content.push(Content::Thinking {
@@ -386,7 +386,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
             response(json!({"type":"text","text":text}), "end_turn"),
         )
         .await;
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.base_url = url;
         assert!(
             generate(
@@ -401,7 +401,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
         );
     }
     let (url, _) = http::serve_response(200, response(json!({"type":"tool_use","id":"proposal","name":"Shell","input":{"command":"touch forbidden"}}), "tool_use")).await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
     assert!(
         generate(
@@ -426,7 +426,7 @@ async fn prompt_suggestion_http_cancellation_and_deadline_drop_a_delayed_result(
             0,
         )
         .await;
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.base_url = url;
         let request = request();
         let running = request.clone();
@@ -483,7 +483,7 @@ async fn prompt_suggestion_diagnostics_distinguish_empty_filtered_and_incomplete
     ] {
         let (url, received) =
             http::serve_response(200, response(json!({"type":"text","text":text}), stop)).await;
-        let mut model = tickloop_harness_test_support::config();
+        let mut model = tickloop_harness::test_support::config();
         model.base_url = url;
         let result = generate(
             &request(),
@@ -500,7 +500,7 @@ async fn prompt_suggestion_diagnostics_distinguish_empty_filtered_and_incomplete
 #[tokio::test]
 async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_never_connect() {
     let (url, received) = http::serve_response(500, "fixture private error payload".into()).await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
     let result = generate(
         &request(),
@@ -516,7 +516,7 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
         response(json!({"type":"text","text":"run the tests"}), "end_turn"),
     )
     .await;
-    let mut model = tickloop_harness_test_support::config();
+    let mut model = tickloop_harness::test_support::config();
     model.base_url = url;
     let request = request();
     request.cancel.cancel();

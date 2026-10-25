@@ -7,11 +7,11 @@ const EXTERNAL_MODEL: &str = "external-fixture";
 
 fn startup_config(model: &str) -> ModelConfig {
     if model == STARTUP_MODEL {
-        return tickloop_harness_model::cards::ModelCatalog::defaults()
+        return tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
     }
-    let mut config = tickloop_harness_test_support::config();
+    let mut config = tickloop_harness::test_support::config();
     config.model = model.into();
     config.name = model.into();
     config.protocol = Protocol::ChatCompletions;
@@ -34,9 +34,11 @@ fn startup_status_pty_fixture() {
                 .unwrap();
             tokio::task::LocalSet::new().block_on(&runtime, async {
                 let config = startup_config(STARTUP_MODEL);
-                let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new()));
+                let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                    Vec::new(),
+                ));
                 let core =
-                    tickloop_harness_runtime::Agent::new_embedded(config.clone(), model.clone());
+                    tickloop_harness::runtime::Agent::new_embedded(config.clone(), model.clone());
                 core.hold_goal_continuations_for_tests();
                 let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
                 let workdir = std::env::current_dir().unwrap();

@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent_console::AttentionGroup;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     LoopState, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
     ShellTaskSnapshot, ShellTaskState, SubagentRegistration,
 };
@@ -16,7 +16,7 @@ fn fixture() -> Console {
     tests::console_with_state(state)
 }
 
-fn task(content: &str) -> tickloop_harness_protocol::SharedTask {
+fn task(content: &str) -> tickloop_harness::protocol::SharedTask {
     crate::terminal::status_area::test_task_board(&[content])
         .tasks
         .remove(0)
@@ -72,7 +72,7 @@ fn key(console: &Console, code: KeyCode) -> Option<InputEvent> {
         .key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn update(console: &Console, todos: Vec<tickloop_harness_protocol::SharedTask>) {
+fn update(console: &Console, todos: Vec<tickloop_harness::protocol::SharedTask>) {
     console
         .update_status_area(
             "Auto".into(),
@@ -117,8 +117,8 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
                 title.into()
             },
             description: title.into(),
-            created_at: tickloop_harness_base::private_fs::unix_time_milliseconds(),
-            color: Some(tickloop_harness_protocol::AgentColor::ALL[(id % 8) as usize]),
+            created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
+            color: Some(tickloop_harness::protocol::AgentColor::ALL[(id % 8) as usize]),
         }),
     }
 }
@@ -349,7 +349,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             .position(|row| row.contains("Subagents 1"))
             .unwrap();
         assert!(
-            focused[entry + 1].starts_with(tickloop_harness_test_support::screen::SELECTED_MARK)
+            focused[entry + 1].starts_with(tickloop_harness::test_support::screen::SELECTED_MARK)
                 && focused[entry + 1].contains("main"),
             "the first Down lands on a row: {focused:?}"
         );

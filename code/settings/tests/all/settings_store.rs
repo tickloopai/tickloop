@@ -5,7 +5,7 @@ use tickloop_harness::policy::{
     ProjectRuleChanges,
     settings::{MemorySettingsStore, SettingsStore, SettingsStoreError, SettingsUpdate},
 };
-use tickloop_harness_protocol::{AutoReviewerPreference, Decision, ExecutionMode, PermissionRule};
+use tickloop_harness::protocol::{AutoReviewerPreference, Decision, ExecutionMode, PermissionRule};
 
 #[test]
 fn file_and_memory_stores_keep_preferences_and_partitioned_permission_edits() {
@@ -76,7 +76,7 @@ fn file_and_memory_stores_keep_preferences_and_partitioned_permission_edits() {
 
 #[test]
 fn file_and_memory_stores_preserve_thinking_choices_across_effort_changes() {
-    use tickloop_harness_protocol::ReasoningEffort;
+    use tickloop_harness::protocol::ReasoningEffort;
     let directory = tempfile::tempdir().unwrap();
     let stores: [Arc<dyn SettingsStore>; 2] = [
         Arc::new(UserSettings::in_root(directory.path())),

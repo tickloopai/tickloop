@@ -9,7 +9,7 @@ use std::{
 use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
 
 use tickloop_code_settings::{LoadedSettings, UserSettings, config_root_directory};
-use tickloop_harness_tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
+use tickloop_harness::tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
 mod agent_messaging;
@@ -136,8 +136,8 @@ use tickloop_code_access::{
     ConfigurationChange, EnvironmentValue, ExecutionAvailability, ExecutionRef, HostLocation,
     HostWorkContext, LaunchSpec, ObservationRequest, ObservationValue, UserInput, ViewRef,
 };
-use tickloop_harness_model::{ModelConfigExt, ReasoningEffortExt};
-use tickloop_harness_protocol::{
+use tickloop_harness::model::{ModelConfigExt, ReasoningEffortExt};
+use tickloop_harness::protocol::{
     AgentHostOptions, BranchOutcome, BranchRequest, ChatId, ChatSnapshot, ChatStatus, Decision,
     DirectoryTrustPolicy, EventKind, ExecutionMode, InputContext, ModelConfig, ModelRequestKind,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
@@ -190,7 +190,7 @@ impl RunningActivity {
     ) -> Result<Vec<(String, Option<Role>)>, String> {
         let display = console.display_profile()?;
         let reduced_motion = display.preferences().prefers_reduced_motion;
-        let dot = display.working_dot(tickloop_harness_base::private_fs::unix_time_milliseconds());
+        let dot = display.working_dot(tickloop_harness::base::private_fs::unix_time_milliseconds());
         if let Some(preview) = preview {
             return Ok(preview.spans(console.conversation_width()?, dot, reduced_motion));
         }
@@ -1184,10 +1184,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     // A built-in preview is not a model selection, even when its API key exists.
     let model_selected = saved_model.is_some();
     let config = saved_model.unwrap_or_else(|| {
-        tickloop_harness_model::cards::ModelCatalog::defaults()
+        tickloop_harness::model::cards::ModelCatalog::defaults()
             .get(
                 "deepseek-api",
-                tickloop_harness_model::access::AccessCatalog::defaults()
+                tickloop_harness::model::access::AccessCatalog::defaults()
                     .recommended_model("deepseek-api")
                     .expect("built-in recommendation"),
             )
@@ -1408,7 +1408,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
 /// before startup; `-r` opens the picker.
 enum StartupChat {
     New,
-    Resumed(Box<tickloop_harness_protocol::ChatSnapshot>, bool),
+    Resumed(Box<tickloop_harness::protocol::ChatSnapshot>, bool),
     Picker { as_new_chat: bool },
     Upgrade(Box<StartupChat>, Box<view_upgrade::ViewHandoff>),
 }
@@ -1457,7 +1457,7 @@ async fn open_saved_chat(
     agent: &Agent,
     chat: ChatId,
     as_new_chat: bool,
-) -> Result<tickloop_harness_protocol::ChatSnapshot, String> {
+) -> Result<tickloop_harness::protocol::ChatSnapshot, String> {
     let opened = if as_new_chat {
         agent.resume_as_new_chat(chat.into()).await
     } else {
@@ -1522,7 +1522,7 @@ fn write_banner(
 /// this View, unless the Chat already has one there.
 fn ensure_snapshot_banner(
     console: &Console,
-    snapshot: &tickloop_harness_protocol::ChatSnapshot,
+    snapshot: &tickloop_harness::protocol::ChatSnapshot,
 ) -> Result<(), String> {
     console.ensure_chat_banner(
         snapshot.id.into(),
@@ -1757,7 +1757,7 @@ async fn interact_with_herdr(
     let mut view_activation_notice = None;
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     // Prompt suggestions reach the Chat's model directly with this View's credentials.
-    let suggestion_models = Arc::new(tickloop_harness_model::LocalModelClients::new(
+    let suggestion_models = Arc::new(tickloop_harness::model::LocalModelClients::new(
         config_root.clone(),
     ));
     let mut artifact_loads = tokio::task::JoinSet::new();
@@ -2257,7 +2257,7 @@ async fn interact_with_herdr(
                         receipt.chat_id == chat
                             && status.chat_loop.run_id == Some(receipt.run_id)
                             && status.chat_loop.state
-                                == tickloop_harness_protocol::LoopState::Running
+                                == tickloop_harness::protocol::LoopState::Running
                     })
                     .or_else(|| pending.values().find(|receipt| receipt.chat_id == chat));
                 let running_loop = running_receipt.map(|receipt| receipt.loop_id);
@@ -2268,7 +2268,7 @@ async fn interact_with_herdr(
                     chat,
                     agent.disconnected().is_some(),
                     status.chat_loop.run_id.is_some()
-                        && status.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+                        && status.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
                         && !pending.values().any(|receipt| receipt.chat_id == chat)
                         && agent.unknown_input(chat.into()).is_none()
                         && status.queued_inputs().is_empty()
@@ -2304,11 +2304,11 @@ async fn interact_with_herdr(
                     && !run_is_working
                     && !directed_summaries.contains(chat)
                     && (status.goal.as_ref().is_some_and(|goal| {
-                        matches!(goal.status, tickloop_harness_protocol::GoalStatus::Active)
+                        matches!(goal.status, tickloop_harness::protocol::GoalStatus::Active)
                     }) || status.scheduled_tasks.iter().any(|task| {
                         matches!(
                             task.kind,
-                            tickloop_harness_protocol::ScheduledTaskKind::SelfPaced { .. }
+                            tickloop_harness::protocol::ScheduledTaskKind::SelfPaced { .. }
                         )
                     })))
                 .then_some(chat);
@@ -2804,7 +2804,7 @@ async fn interact_with_herdr(
                             }
                         }
                     }
-                    Err(tickloop_harness_model::auth::AuthError::Cancelled) => outln!(console, "Logout cancelled; saved login remains."),
+                    Err(tickloop_harness::model::auth::AuthError::Cancelled) => outln!(console, "Logout cancelled; saved login remains."),
                     Err(error) => outln!(console, "Cannot log out: {}", safe_text(&error.to_string())),
                 }
                 reauthenticate_after_logout = false;
@@ -3575,7 +3575,7 @@ async fn interact_with_herdr(
                         && let Some(chat) = selected_chat
                     {
                         let status=agent.status(chat.into()).await.map_err(|error|error.to_string())?;
-                        let is_busy=matches!(status.chat_loop.state,tickloop_harness_protocol::LoopState::Running|tickloop_harness_protocol::LoopState::WaitingPermission|tickloop_harness_protocol::LoopState::WaitingQuestion);
+                        let is_busy=matches!(status.chat_loop.state,tickloop_harness::protocol::LoopState::Running|tickloop_harness::protocol::LoopState::WaitingPermission|tickloop_harness::protocol::LoopState::WaitingQuestion);
                         if is_busy {
                             let queued=agent.queue_command(chat.into(),original_input.clone());
                             match send_input(agent,chat,retry_of,queued,|result|match result {
@@ -3634,7 +3634,7 @@ async fn interact_with_herdr(
                         command if command == "/artifacts" || command.starts_with("/artifacts ") => {
                             if command.trim() != "/artifacts" { outln!(console, "Use /artifacts"); continue; }
                             let Some(root) = config_root.as_ref() else { outln!(console, "Tickloop Artifacts needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
-                            match tickloop_harness_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
+                            match tickloop_harness::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
                                     Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat.map(Into::into), interactive).await { outln!(console, "Cannot open Tickloop Artifacts: {}", safe_text(&error)); } }
                                     Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start the Tickloop Artifacts login: {}", safe_text(&error)) },
@@ -3668,7 +3668,7 @@ async fn interact_with_herdr(
                                 let mut shell_stop_failed=false;
                                 let tasks=task_center.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
                                 for shell in tasks.tasks.iter().filter(|task|task.chat_id==chat && agent.disconnected().is_none() && !task.was_background && task.capabilities.can_stop && matches!(task.state,ShellTaskState::Running|ShellTaskState::Queued|ShellTaskState::WaitingPermission)) {
-                                    if let Err(error)=task_center.dispatch(chat.into(),shell.id,tickloop_harness_protocol::ShellTaskAction::Stop).await {
+                                    if let Err(error)=task_center.dispatch(chat.into(),shell.id,tickloop_harness::protocol::ShellTaskAction::Stop).await {
                                         console.set_status(&format!("Cannot clear the foreground Shell: {}",safe_line(&error.to_string())))?;
                                         shell_stop_failed=true;
                                         break;
@@ -3773,7 +3773,7 @@ async fn interact_with_herdr(
                             };
                             match agent.permissions_view(chat.into()).await {
                                 Ok(view) => {
-                                    let rules=view.rules.into_iter().filter(|entry| matches!(entry.source,tickloop_harness_protocol::PermissionRuleSource::ChatSession | tickloop_harness_protocol::PermissionRuleSource::ProjectUser)).map(|entry|entry.rule).collect::<Vec<_>>();
+                                    let rules=view.rules.into_iter().filter(|entry| matches!(entry.source,tickloop_harness::protocol::PermissionRuleSource::ChatSession | tickloop_harness::protocol::PermissionRuleSource::ProjectUser)).map(|entry|entry.rule).collect::<Vec<_>>();
                                     outln!(console,"Permission rules (deny takes precedence over ask and allow):\n{}",safe_text(&serde_json::to_string_pretty(&rules).map_err(|_|"cannot render permission rules")?));
                                 },
                                 Err(error) => outln!(console,"Cannot list permission rules: {}",safe_text(&error.to_string())),
@@ -4540,7 +4540,7 @@ async fn interact_with_herdr(
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
                         },
-                        EventKind::ScheduledTasksChanged { notice: Some(tickloop_harness_protocol::ScheduledTaskNotice::WakeupCancelled { .. }) } => {
+                        EventKind::ScheduledTasksChanged { notice: Some(tickloop_harness::protocol::ScheduledTaskNotice::WakeupCancelled { .. }) } => {
                             outln!(console, "\nPending wakeup cancelled");
                         },
                         EventKind::GoalUpdated {goal, notice} => {
@@ -4572,7 +4572,7 @@ async fn interact_with_herdr(
                         let frame_hold=console.hold_frames()?;
                         let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat.uuid()).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                         drop(frame_hold);
-                        failed |= observation.snapshot.chat_loop.state==tickloop_harness_protocol::LoopState::Failed;
+                        failed |= observation.snapshot.chat_loop.state==tickloop_harness::protocol::LoopState::Failed;
                         displayed_sequences.insert(chat.into(),observation.snapshot.last_sequence);
                         let status=ChatStatus::of(&observation.snapshot);
                         sync_status(&status,&mut pending,&mut permissions,&mut questions);
@@ -4778,7 +4778,7 @@ async fn interact_with_herdr(
                                         if outcome_pending {
                                             if !overview_active && Some(status.id)==selected_chat {
                                                 let restored=restore_view(console,agent,&mut tools,status.id,*displayed_sequences.get(&status.id.uuid()).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
-                                                failed |= restored.snapshot.chat_loop.state==tickloop_harness_protocol::LoopState::Failed;
+                                                failed |= restored.snapshot.chat_loop.state==tickloop_harness::protocol::LoopState::Failed;
                                                 displayed_sequences.insert(status.id.into(),restored.snapshot.last_sequence);
                                                 merged_echoes.close_all();
                                                 sync_snapshot(&restored.snapshot,&mut pending,&mut permissions,&mut questions);
@@ -5343,7 +5343,7 @@ impl TurnSnapshot {
 /// snapshot was last applied, that snapshot has nothing new to tell.
 #[derive(PartialEq)]
 struct MemberWork {
-    state: tickloop_harness_protocol::LoopState,
+    state: tickloop_harness::protocol::LoopState,
     run_id: Option<RunId>,
     updated_at: Option<u64>,
     waiting_permissions: usize,
@@ -5461,7 +5461,7 @@ fn sync_status(
 /// The runs `status` still has in progress: each armed queued input and the Loop's run while it
 /// runs or waits on the user. A run outside them has ended, whether or not its end event arrived.
 fn receipts_in_progress(status: &ChatStatus) -> impl Iterator<Item = Receipt> + '_ {
-    use tickloop_harness_protocol::LoopState;
+    use tickloop_harness::protocol::LoopState;
     let queued = status
         .pending_inputs
         .iter()
@@ -5492,7 +5492,7 @@ struct PermissionRequestOwner {
 }
 
 impl PermissionRequestOwner {
-    fn new(chat_id: ChatId, request: &tickloop_harness_protocol::PermissionRequest) -> Self {
+    fn new(chat_id: ChatId, request: &tickloop_harness::protocol::PermissionRequest) -> Self {
         Self {
             chat_id,
             loop_id: request.loop_id.into(),
@@ -5574,11 +5574,11 @@ fn announced_feed_gaps(
 /// A feed announces its gap before it forwards the events after the gap, so a gap announced by
 /// the time an event arrives is restored first and no later event shows ahead of the lost ones.
 async fn next_event(
-    events: &mut broadcast::Receiver<tickloop_harness_protocol::Event>,
+    events: &mut broadcast::Receiver<tickloop_harness::protocol::Event>,
     feed_gaps: &mut broadcast::Receiver<uuid::Uuid>,
-    deferred_events: &mut VecDeque<tickloop_harness_protocol::Event>,
+    deferred_events: &mut VecDeque<tickloop_harness::protocol::Event>,
     visual_pacing_pending: bool,
-) -> Result<tickloop_harness_protocol::Event, EventInterruption> {
+) -> Result<tickloop_harness::protocol::Event, EventInterruption> {
     let mut lost = None;
     loop {
         lost = announced_feed_gaps(feed_gaps, lost);
@@ -5693,7 +5693,7 @@ fn render_restored_observation(
         console.reset_chat(chat.into())?;
         tools.restore(&conversation_events);
         workflows::write_public_history(console, &observation.snapshot)?;
-        if observation.snapshot.chat_loop.state == tickloop_harness_protocol::LoopState::Failed {
+        if observation.snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Failed {
             let error=observation.snapshot.events.iter().rev().find_map(|event| {
                 if let EventKind::Failed(error)=&event.kind {Some(error.as_str())} else {None}
             }).unwrap_or("The execution failed before this View received its final update; inspect the saved execution history.");
@@ -6143,7 +6143,7 @@ async fn command_control(
 
 fn print_command(
     console: &Console,
-    command: &tickloop_harness_protocol::CommandSnapshot,
+    command: &tickloop_harness::protocol::CommandSnapshot,
 ) -> Result<(), String> {
     outln!(
         console,
@@ -6350,7 +6350,7 @@ impl MergedEchoes {
     /// show as one block, if any. An event a restore or reload already showed only ends the block.
     fn observe(
         &mut self,
-        event: &tickloop_harness_protocol::Event,
+        event: &tickloop_harness::protocol::Event,
         displayed_through: u64,
     ) -> Option<(InputEcho, InputEcho)> {
         let previous = self.open.remove(&event.chat_id.uuid());
@@ -6529,7 +6529,7 @@ fn consumed_input_text(
     let trigger = snapshot.trigger_origins.get(&tickloop_ids::Id::from(input));
     if matches!(
         trigger,
-        Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. })
+        Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. })
     ) {
         return None;
     }
@@ -6539,7 +6539,7 @@ fn consumed_input_text(
         .enumerate()
         .find_map(|(index, message)| {
             if snapshot.message_runs.get(&index) != Some(&tickloop_ids::Id::from(input))
-                || message.role != tickloop_harness_protocol::Role::User
+                || message.role != tickloop_harness::protocol::Role::User
                 || snapshot.host_notes.contains_key(&index)
             {
                 return None;
@@ -6552,7 +6552,7 @@ fn consumed_input_text(
                 return None;
             }
             message.content.iter().find_map(|content| match content {
-                tickloop_harness_protocol::Content::Text { text }
+                tickloop_harness::protocol::Content::Text { text }
                     if presentation::typed_local_message(text, false).is_none()
                         && !conversation::is_interruption_placeholder(message.role, text) =>
                 {
@@ -6592,7 +6592,7 @@ fn show_consumed_family_input(
                 Some(Role::MutedText),
             )])?;
             for content in &message.content {
-                if let tickloop_harness_protocol::Content::Text { text } = content {
+                if let tickloop_harness::protocol::Content::Text { text } = content {
                     console.write(&format!("{}\n", safe_text(text)))?;
                 }
             }
@@ -6603,7 +6603,7 @@ fn show_consumed_family_input(
             .iter()
             .filter(|_| snapshot.agent_message_origins.contains_key(id))
             .filter_map(|content| match content {
-                tickloop_harness_protocol::Content::Text { text } => Some(text),
+                tickloop_harness::protocol::Content::Text { text } => Some(text),
                 _ => None,
             });
         for text in agent_texts {
@@ -6642,7 +6642,7 @@ fn show_consumed_family_input(
 /// its call. A notice that later failed to reach the parent adds that line on its own.
 fn show_family_completion(
     console: &Console,
-    completion: &tickloop_harness_protocol::FamilyCompletion,
+    completion: &tickloop_harness::protocol::FamilyCompletion,
     snapshot: &ChatSnapshot,
 ) -> Result<(), String> {
     if !completion.notification.is_background() {
@@ -6650,7 +6650,7 @@ fn show_family_completion(
         return Ok(());
     }
     if console.input_is_echoed(snapshot.id.into(), completion.child_run_id.into())? {
-        if let tickloop_harness_protocol::SubagentNotificationDelivery::Rejected(rejection) =
+        if let tickloop_harness::protocol::SubagentNotificationDelivery::Rejected(rejection) =
             &completion.notification
         {
             console.write_roles(&[(
@@ -6751,7 +6751,7 @@ async fn show_consumed_input(
     console: &Console,
     agent: &Agent,
     turn_snapshot: &mut TurnSnapshot,
-    event: &tickloop_harness_protocol::Event,
+    event: &tickloop_harness::protocol::Event,
 ) -> Result<Option<InputEcho>, String> {
     if console.input_is_echoed(event.chat_id.into(), event.run_id.into())? {
         return Ok(None);
@@ -6765,7 +6765,7 @@ async fn show_consumed_input(
     if !console.is_interactive()
         && !matches!(
             snapshot.trigger_origins.get(&event.run_id),
-            Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. })
+            Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. })
         )
     {
         return Ok(None);
@@ -6783,7 +6783,7 @@ fn consume_input_echo_from_snapshot(
     }
     if matches!(
         snapshot.trigger_origins.get(&tickloop_ids::Id::from(input)),
-        Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. })
+        Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. })
     ) {
         let _frame_hold = console.hold_frames()?;
         console.set_queued_inputs(snapshot.id.into(), snapshot.queued_inputs())?;
@@ -6798,12 +6798,12 @@ fn consume_input_echo_from_snapshot(
         .enumerate()
         .filter(|(index, message)| {
             snapshot.message_runs.get(index) == Some(&tickloop_ids::Id::from(input))
-                && message.role == tickloop_harness_protocol::Role::User
+                && message.role == tickloop_harness::protocol::Role::User
                 && !snapshot.host_notes.contains_key(index)
         })
         .flat_map(|(_, message)| &message.content)
         .filter_map(|content| match content {
-            tickloop_harness_protocol::Content::Text { text } => {
+            tickloop_harness::protocol::Content::Text { text } => {
                 presentation::typed_local_message(text, false)
             }
             _ => None,
@@ -6811,8 +6811,8 @@ fn consume_input_echo_from_snapshot(
         .filter(|message| {
             matches!(
                 message,
-                tickloop_harness_protocol::LocalMessage::ArtifactRequest { .. }
-                    | tickloop_harness_protocol::LocalMessage::TickDelivery { .. }
+                tickloop_harness::protocol::LocalMessage::ArtifactRequest { .. }
+                    | tickloop_harness::protocol::LocalMessage::TickDelivery { .. }
             )
         })
         .collect::<Vec<_>>();
@@ -7110,7 +7110,7 @@ async fn open_chat(
     agent: &Agent,
     command: &str,
     current_chat: Option<ChatId>,
-) -> Result<tickloop_harness_protocol::ChatSnapshot, String> {
+) -> Result<tickloop_harness::protocol::ChatSnapshot, String> {
     let fields = command.split_whitespace().collect::<Vec<_>>();
     let [_, chat] = fields.as_slice() else {
         return Err("use /resume [CHAT]".into());
@@ -7186,7 +7186,7 @@ fn write_warning(console: &Console, warning: &str) -> Result<(), String> {
 fn show_opened_chat(
     console: &Console,
     agent: &Agent,
-    snapshot: &tickloop_harness_protocol::ChatSnapshot,
+    snapshot: &tickloop_harness::protocol::ChatSnapshot,
     has_history: bool,
 ) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
@@ -7252,7 +7252,7 @@ impl BackgroundRunNotice {
     }
 }
 
-fn background_run_notice(event: &tickloop_harness_protocol::Event) -> Option<BackgroundRunNotice> {
+fn background_run_notice(event: &tickloop_harness::protocol::Event) -> Option<BackgroundRunNotice> {
     let (message, necessary) = match &event.kind {
         EventKind::Completed { .. } => (REPLY_COMPLETED_NOTICE.to_owned(), false),
         EventKind::Failed(error) => (format!("failed: {}", safe_line(error)), true),
@@ -7269,7 +7269,7 @@ fn background_run_notice(event: &tickloop_harness_protocol::Event) -> Option<Bac
 /// Single-line notice printed in pipe mode when a background Chat raises a permission request or
 /// question.
 fn background_request_notice(
-    event: &tickloop_harness_protocol::Event,
+    event: &tickloop_harness::protocol::Event,
     label: &str,
 ) -> Option<String> {
     let request = match &event.kind {
@@ -7286,7 +7286,7 @@ fn background_request_notice(
 /// status bar; returns whether the status bar needs a refresh.
 fn announce_background_event(
     console: &Console,
-    event: &tickloop_harness_protocol::Event,
+    event: &tickloop_harness::protocol::Event,
     label: &str,
     background_notice: &mut Option<(ChatId, BackgroundRunNotice)>,
 ) -> Result<bool, String> {
@@ -7311,7 +7311,7 @@ fn announce_background_event(
 /// foreground Chat. Runs waiting on a permission or question always count as pending, matching how
 /// `sync_snapshot` restores them from a snapshot.
 fn track_run_requests(
-    event: &tickloop_harness_protocol::Event,
+    event: &tickloop_harness::protocol::Event,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
@@ -7510,7 +7510,7 @@ fn recover_background_chat(
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) -> BackgroundRecovery {
-    use tickloop_harness_protocol::LoopState;
+    use tickloop_harness::protocol::LoopState;
     let runs_before = pending
         .values()
         .filter(|receipt| receipt.chat_id == status.id)
@@ -7752,7 +7752,7 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
 /// Human status text for an Agent row; the Loop state names are internal.
 fn agent_status_label(row: &AgentSummary) -> &'static str {
     use tickloop_code_access::ExecutionAvailability;
-    use tickloop_harness_protocol::LoopState;
+    use tickloop_harness::protocol::LoopState;
     if row.availability == ExecutionAvailability::Lost {
         return "Lost · outcome unknown";
     }
@@ -7794,7 +7794,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 group,
                 glyph: console::status_glyph(
                     group,
-                    row.state == tickloop_harness_protocol::LoopState::Idle,
+                    row.state == tickloop_harness::protocol::LoopState::Idle,
                 ),
                 preview: row.preview.as_deref().map(safe_line),
                 updated_at: row.updated_at,
@@ -7826,7 +7826,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 .unwrap_or(root.group);
             root.glyph = console::status_glyph(
                 root.group,
-                root.state == tickloop_harness_protocol::LoopState::Idle,
+                root.state == tickloop_harness::protocol::LoopState::Idle,
             );
         }
     } else {
@@ -8238,23 +8238,23 @@ mod tests {
         let chat = uuid::Uuid::new_v4();
         let run = uuid::Uuid::new_v4();
         let loop_id = uuid::Uuid::new_v4();
-        let record = tickloop_harness_protocol::FamilyInputRecord {
+        let record = tickloop_harness::protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
             target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
             target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_harness_protocol::LoopState::Idle),
+            state: Some(tickloop_harness::protocol::LoopState::Idle),
         };
-        let completion = tickloop_harness_protocol::FamilyCompletion {
-            notification: tickloop_harness_protocol::SubagentNotificationDelivery::Pending,
+        let completion = tickloop_harness::protocol::FamilyCompletion {
+            notification: tickloop_harness::protocol::SubagentNotificationDelivery::Pending,
             usage: Default::default(),
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
             handle: "audit".into(),
-            state: tickloop_harness_protocol::LoopState::Idle,
+            state: tickloop_harness::protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8267,19 +8267,19 @@ mod tests {
         )
         .unwrap();
         snapshot.events = vec![
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 1,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyInputUpdated { record },
+                kind: tickloop_harness::protocol::EventKind::FamilyInputUpdated { record },
             },
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 2,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyRunCompleted { completion },
+                kind: tickloop_harness::protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
         snapshot.last_sequence = 2;
@@ -8295,8 +8295,8 @@ mod tests {
         };
         let console = super::Console::test_interactive_for_chat(chat);
         let agent = super::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::test_support::config(),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
@@ -8340,23 +8340,23 @@ mod tests {
         let chat = uuid::Uuid::new_v4();
         let run = uuid::Uuid::new_v4();
         let loop_id = uuid::Uuid::new_v4();
-        let record = tickloop_harness_protocol::FamilyInputRecord {
+        let record = tickloop_harness::protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
             target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
             target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_harness_protocol::LoopState::Idle),
+            state: Some(tickloop_harness::protocol::LoopState::Idle),
         };
-        let completion = tickloop_harness_protocol::FamilyCompletion {
-            notification: tickloop_harness_protocol::SubagentNotificationDelivery::Foreground,
+        let completion = tickloop_harness::protocol::FamilyCompletion {
+            notification: tickloop_harness::protocol::SubagentNotificationDelivery::Foreground,
             usage: Default::default(),
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
             handle: "audit".into(),
-            state: tickloop_harness_protocol::LoopState::Idle,
+            state: tickloop_harness::protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8369,19 +8369,19 @@ mod tests {
         )
         .unwrap();
         snapshot.events = vec![
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 1,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyInputUpdated { record },
+                kind: tickloop_harness::protocol::EventKind::FamilyInputUpdated { record },
             },
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 2,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyRunCompleted { completion },
+                kind: tickloop_harness::protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
         snapshot.last_sequence = 2;
@@ -8397,8 +8397,8 @@ mod tests {
         };
         let console = super::Console::test_interactive_for_chat(chat);
         let agent = super::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::test_support::config(),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
@@ -8442,19 +8442,19 @@ mod tests {
         let chat = uuid::Uuid::new_v4();
         let run = uuid::Uuid::new_v4();
         let loop_id = uuid::Uuid::new_v4();
-        let record = tickloop_harness_protocol::FamilyInputRecord {
+        let record = tickloop_harness::protocol::FamilyInputRecord {
             message_id: uuid::Uuid::new_v4(),
             target_chat_id: uuid::Uuid::new_v4().into(),
             target_handle: "audit".into(),
             target_run_id: run.into(),
             submitted_at: 1,
             response: Some("Actual reply preview".into()),
-            state: Some(tickloop_harness_protocol::LoopState::Idle),
+            state: Some(tickloop_harness::protocol::LoopState::Idle),
         };
-        let completion = tickloop_harness_protocol::FamilyCompletion {
-            notification: tickloop_harness_protocol::SubagentNotificationDelivery::Rejected(
-                tickloop_harness_protocol::FamilyMessageRejection {
-                    code: tickloop_harness_protocol::FamilyMessageRejectionCode::StaleTarget,
+        let completion = tickloop_harness::protocol::FamilyCompletion {
+            notification: tickloop_harness::protocol::SubagentNotificationDelivery::Rejected(
+                tickloop_harness::protocol::FamilyMessageRejection {
+                    code: tickloop_harness::protocol::FamilyMessageRejectionCode::StaleTarget,
                     message: "The receiving parent is unavailable".into(),
                 },
             ),
@@ -8463,7 +8463,7 @@ mod tests {
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
             handle: "audit".into(),
-            state: tickloop_harness_protocol::LoopState::Idle,
+            state: tickloop_harness::protocol::LoopState::Idle,
             result: "Actual child completion".into(),
             error: None,
             started_at: Some(1),
@@ -8476,19 +8476,19 @@ mod tests {
         )
         .unwrap();
         snapshot.events = vec![
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 1,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyInputUpdated { record },
+                kind: tickloop_harness::protocol::EventKind::FamilyInputUpdated { record },
             },
-            tickloop_harness_protocol::Event {
+            tickloop_harness::protocol::Event {
                 sequence: 2,
                 chat_id: chat.into(),
                 loop_id: loop_id.into(),
                 run_id: run.into(),
-                kind: tickloop_harness_protocol::EventKind::FamilyRunCompleted { completion },
+                kind: tickloop_harness::protocol::EventKind::FamilyRunCompleted { completion },
             },
         ];
         snapshot.last_sequence = 2;
@@ -8504,8 +8504,8 @@ mod tests {
         };
         let console = super::Console::test_interactive_for_chat(chat);
         let agent = super::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            std::sync::Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            tickloop_harness::test_support::config(),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
@@ -8550,7 +8550,7 @@ mod tests {
     fn a_child_report_and_its_completion_draw_one_block_whichever_arrives_first() {
         use super::{ChatSnapshot, Console, show_consumed_family_input, show_family_completion};
         let child_run = uuid::Uuid::new_v4();
-        let report = tickloop_harness_protocol::SubagentReportMessage {
+        let report = tickloop_harness::protocol::SubagentReportMessage {
             note: None,
             report: "Report line".into(),
         };
@@ -8558,18 +8558,18 @@ mod tests {
             "<agent-message>{}</agent-message>",
             serde_json::json!({"source":{"message_id":child_run,"sender_handle":"audit","sender_label":"audit","is_result":true},"message":report.text()})
         );
-        let completion = tickloop_harness_protocol::FamilyCompletion {
-            child_chat_id: tickloop_harness_protocol::ChatId::new(),
+        let completion = tickloop_harness::protocol::FamilyCompletion {
+            child_chat_id: tickloop_harness::protocol::ChatId::new(),
             child_loop_id: uuid::Uuid::new_v4().into(),
             child_run_id: child_run.into(),
             handle: "audit".into(),
-            state: tickloop_harness_protocol::LoopState::Idle,
-            result: tickloop_harness_protocol::SUBAGENT_REPORT_RECEIPT.into(),
+            state: tickloop_harness::protocol::LoopState::Idle,
+            result: tickloop_harness::protocol::SUBAGENT_REPORT_RECEIPT.into(),
             error: None,
             started_at: Some(1_000),
             finished_at: 3_000,
             triggering_message_ids: Vec::new(),
-            notification: tickloop_harness_protocol::SubagentNotificationDelivery::Queued,
+            notification: tickloop_harness::protocol::SubagentNotificationDelivery::Queued,
             usage: Default::default(),
             run_status: None,
         };
@@ -8614,7 +8614,7 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let instance = "hosted:7247ea8b-fced-497c-8e04-2885648826e";
         let payload = serde_json::json!({"items":[{"instance":instance,"title":"Stock watcher","seq":"7","updates":1,"data":{"text":"second check"}}]});
-        let text = tickloop_harness_protocol::local_messages::tick_delivery(&payload);
+        let text = tickloop_harness::protocol::local_messages::tick_delivery(&payload);
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
             "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         })).unwrap();
@@ -8679,7 +8679,7 @@ mod tests {
         use super::{ChatSnapshot, consume_input_echo_from_snapshot};
         let chat = uuid::Uuid::new_v4();
         let run = uuid::Uuid::new_v4();
-        let tick = tickloop_harness_protocol::local_messages::tick_delivery(
+        let tick = tickloop_harness::protocol::local_messages::tick_delivery(
             &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
         );
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}})).unwrap();
@@ -8709,7 +8709,7 @@ mod tests {
         snapshot.artifact_ticks.push(serde_json::from_value(serde_json::json!({"artifact_id":"doc","origin":"https://docs.example","title":"doc","format":"html","url":"https://docs.example/artifact/doc","access_role":"owner","added_at_ms":1})).unwrap());
         snapshot.monitor.mark_taken_in(
             tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap(),
-            tickloop_harness_base::private_fs::unix_time_milliseconds(),
+            tickloop_harness::base::private_fs::unix_time_milliseconds(),
         );
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
         snapshot.message_runs.insert(0, run.into());
@@ -8835,27 +8835,29 @@ mod tests {
         collections::{HashMap, HashSet},
         path::PathBuf,
     };
-    use tickloop_harness_protocol::{Decision, PermissionRule};
-    use tickloop_harness_protocol::{ModelRequestKind, RequestOutcome, RequestOwner};
+    use tickloop_harness::protocol::{Decision, PermissionRule};
+    use tickloop_harness::protocol::{ModelRequestKind, RequestOutcome, RequestOwner};
     use uuid::Uuid;
 
     #[tokio::test]
     async fn context_starts_at_zero_and_uses_the_effective_model_window() {
         let agent = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         );
         let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
         let mut snapshot = agent.snapshot(chat_id).await.unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&snapshot)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
             None
         );
-        snapshot.model = tickloop_harness_model::cards::ModelCatalog::defaults()
+        snapshot.model = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("anthropic-api", "claude-haiku-5-5")
             .unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&snapshot)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
             Some((0, 1_000_000))
         );
 
@@ -8872,7 +8874,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&snapshot)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
             Some((0, 1_000_000))
         );
         let mut without_report = snapshot.clone();
@@ -8881,11 +8883,11 @@ mod tests {
             .finish(request, RequestOutcome::Accepted)
             .unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&without_report)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&without_report)),
             Some((0, 1_000_000))
         );
         let measurement =
-            tickloop_harness_protocol::ContextMeasurement::capture(&snapshot, 1000, 1000);
+            tickloop_harness::protocol::ContextMeasurement::capture(&snapshot, 1000, 1000);
         snapshot
             .request_usage
             .record_context_measurement(request, measurement)
@@ -8894,7 +8896,7 @@ mod tests {
             .request_usage
             .observe(
                 request,
-                tickloop_harness_protocol::Usage {
+                tickloop_harness::protocol::Usage {
                     input_tokens: Some(10_000),
                     output_tokens: None,
                     cache_read_input_tokens: Some(2_000),
@@ -8903,7 +8905,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&snapshot)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
             Some((12_500, 1_000_000))
         );
         snapshot
@@ -8923,7 +8925,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            context_usage(&tickloop_harness_protocol::ChatStatus::of(&snapshot)),
+            context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
             Some((12_500, 1_000_000))
         );
     }
@@ -8931,9 +8933,9 @@ mod tests {
     fn user_shell_record(
         chat_id: Uuid,
         id: Uuid,
-        state: tickloop_harness_protocol::UserShellState,
+        state: tickloop_harness::protocol::UserShellState,
         starts_in_background: bool,
-    ) -> tickloop_harness_protocol::UserShellRecord {
+    ) -> tickloop_harness::protocol::UserShellRecord {
         serde_json::from_value(serde_json::json!({
             "id": id,
             "chat_id": chat_id,
@@ -8954,7 +8956,7 @@ mod tests {
 
     #[test]
     fn a_running_update_received_after_backgrounding_keeps_the_shell_in_the_background() {
-        use tickloop_harness_protocol::UserShellState;
+        use tickloop_harness::protocol::UserShellState;
         let chat = Uuid::new_v4();
         let command = Uuid::new_v4();
         let mut foreground_shells = HashMap::from([(chat, command)]);
@@ -8988,7 +8990,7 @@ mod tests {
 
     #[test]
     fn a_shell_backgrounded_elsewhere_leaves_the_foreground() {
-        use tickloop_harness_protocol::UserShellState;
+        use tickloop_harness::protocol::UserShellState;
         let chat = Uuid::new_v4();
         let command = Uuid::new_v4();
         let mut foreground_shells = HashMap::new();
@@ -9154,9 +9156,9 @@ mod tests {
         let archive = directory.path().join("state");
         let agent = Agent::open_embedded(
             archive.clone(),
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-                tickloop_harness_test_support::text("source answer"),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+                tickloop_harness::test_support::text("source answer"),
             ])),
         )
         .unwrap();
@@ -9167,7 +9169,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -9214,8 +9216,10 @@ mod tests {
 
         let reopened = Agent::open_embedded(
             archive,
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
         )
         .unwrap();
         let (picker, workflow) = Workflow::chats(&reopened, directory.path(), None, false)
@@ -9311,9 +9315,9 @@ mod tests {
     async fn rewind_entry_keeps_busy_and_permission_guards_without_starting_model_work() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("approval-required.txt");
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("Recorded a real prompt"),
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("Recorded a real prompt"),
+            tickloop_harness::test_support::call(
                 "write",
                 "Write",
                 serde_json::json!({
@@ -9321,7 +9325,7 @@ mod tests {
                 }),
             ),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_permission_rules(
@@ -9363,7 +9367,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -9405,7 +9409,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -9430,8 +9434,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_interrupt_before_any_reply_puts_the_prompt_back_only_into_an_empty_editor() {
-        use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput};
-        use tickloop_harness_protocol::{ImageContext, ImageOrigin, InputContext};
+        use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput};
+        use tickloop_harness::protocol::{ImageContext, ImageOrigin, InputContext};
 
         struct UntilInterrupted(tokio::sync::Notify);
 
@@ -9439,25 +9443,25 @@ mod tests {
         impl ModelClient for UntilInterrupted {
             async fn generate_title(
                 &self,
-                request: tickloop_harness_model::ModelRequest,
+                request: tickloop_harness::model::ModelRequest,
                 _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
                 _: tokio_util::sync::CancellationToken,
             ) -> Result<ModelOutput, ModelError> {
-                Ok(tickloop_harness_test_support::title_output(request))
+                Ok(tickloop_harness::test_support::title_output(request))
             }
 
-            fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-                tickloop_harness_protocol::ModelIdentity {
-                    provider: tickloop_harness_protocol::ModelProvider::Api,
+            fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+                tickloop_harness::protocol::ModelIdentity {
+                    provider: tickloop_harness::protocol::ModelProvider::Api,
                     profile: "fixture".into(),
-                    protocol: tickloop_harness_protocol::Protocol::Messages,
+                    protocol: tickloop_harness::protocol::Protocol::Messages,
                     requested_model: "fixture".into(),
                 }
             }
 
             async fn complete(
                 &self,
-                _: tickloop_harness_model::ModelRequest,
+                _: tickloop_harness::model::ModelRequest,
                 _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
                 cancel: tokio_util::sync::CancellationToken,
             ) -> Result<ModelOutput, ModelError> {
@@ -9469,7 +9473,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(UntilInterrupted(tokio::sync::Notify::new()));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut png = Vec::new();
         ::image::DynamicImage::ImageRgba8(::image::RgbaImage::new(4, 3))
@@ -9480,7 +9484,7 @@ mod tests {
             .unwrap();
         let image = ImageContext {
             origin: ImageOrigin::Pasted { id: 1 },
-            image: tickloop_harness_base::image::prepare(&png).unwrap(),
+            image: tickloop_harness::base::image::prepare(&png).unwrap(),
         };
         let prompt = "Explain [Image #1]";
         let mut events = agent.subscribe();
@@ -9496,7 +9500,7 @@ mod tests {
         model.0.notified().await;
         agent.interrupt(chat).await.unwrap();
         loop {
-            let event = tickloop_harness_test_support::next_event(&mut events).await;
+            let event = tickloop_harness::test_support::next_event(&mut events).await;
             if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Interrupted) {
                 break;
             }
@@ -9541,15 +9545,15 @@ mod tests {
     #[tokio::test]
     async fn lagged_recovery_restores_background_requests_and_reports_runs_that_ended() {
         let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "write",
                 "Write",
                 serde_json::json!({"file_path": "background.txt", "content": "needs approval"}),
             ),
-            tickloop_harness_test_support::text("Wrote the background file"),
+            tickloop_harness::test_support::text("Wrote the background file"),
         ]));
-        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
         let background_chat = agent.create_chat(directory.path().into()).await.unwrap();
         let foreground_chat = Some(agent.create_chat(directory.path().into()).await.unwrap());
         agent
@@ -9573,7 +9577,7 @@ mod tests {
             .await
             .unwrap();
         let request = loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -9598,7 +9602,7 @@ mod tests {
         let mut questions = HashMap::new();
         let snapshot = agent.snapshot(background_chat).await.unwrap();
         let recovery = recover_background_chat(
-            &tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            &tickloop_harness::protocol::ChatStatus::of(&snapshot),
             &label,
             &mut pending,
             &mut permissions,
@@ -9645,7 +9649,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            match tickloop_harness_test_support::next_event(&mut events)
+            match tickloop_harness::test_support::next_event(&mut events)
                 .await
                 .kind
             {
@@ -9658,7 +9662,7 @@ mod tests {
         // the snapshot and the end notice is restored.
         let snapshot = agent.snapshot(background_chat).await.unwrap();
         let recovery = recover_background_chat(
-            &tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            &tickloop_harness::protocol::ChatStatus::of(&snapshot),
             &label,
             &mut pending,
             &mut permissions,
@@ -9692,7 +9696,7 @@ mod tests {
         let (alpha, bravo, charlie) = (echo(), echo(), echo());
         let chat = Uuid::from_u128(1);
         let into = Uuid::from_u128(2);
-        let merged = |sequence: u64, run: u128, into: Uuid| tickloop_harness_protocol::Event {
+        let merged = |sequence: u64, run: u128, into: Uuid| tickloop_harness::protocol::Event {
             sequence,
             chat_id: chat.into(),
             loop_id: Uuid::from_u128(3).into(),
@@ -9743,7 +9747,7 @@ mod tests {
         echoes.observe(&merged(5, 10, into), 0);
         assert_eq!(echoes.observe(&merged(6, 11, Uuid::from_u128(4)), 0), None);
         echoes.observe(
-            &tickloop_harness_protocol::Event {
+            &tickloop_harness::protocol::Event {
                 kind: EventKind::Text("reply".into()),
                 ..merged(7, 11, into)
             },
@@ -9764,7 +9768,7 @@ mod tests {
         let mut scrollback = Scrollback::new();
         let (alpha, bravo) = (scrollback.mark_input(0..1), scrollback.mark_input(1..2));
         let into = Uuid::from_u128(2);
-        let merged = |sequence: u64, run: u128| tickloop_harness_protocol::Event {
+        let merged = |sequence: u64, run: u128| tickloop_harness::protocol::Event {
             sequence,
             chat_id: Uuid::from_u128(1).into(),
             loop_id: Uuid::from_u128(3).into(),
@@ -9802,19 +9806,19 @@ mod tests {
     #[tokio::test]
     async fn direct_shell_permission_tracks_its_owner_without_a_pending_model_run() {
         let chat = Uuid::new_v4();
-        let request = tickloop_harness_protocol::PermissionRequest {
+        let request = tickloop_harness::protocol::PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
-            execution: tickloop_harness_protocol::PermissionExecution::UserShell {
+            execution: tickloop_harness::protocol::PermissionExecution::UserShell {
                 command_id: Uuid::new_v4(),
             },
             name: "Bash".into(),
             input: serde_json::json!({"command":"python3 -c 'print(1)'"}),
             file_change: None,
             approval_reason: None,
-            approval_source: tickloop_harness_protocol::PermissionApprovalSource::PermissionPolicy,
+            approval_source: tickloop_harness::protocol::PermissionApprovalSource::PermissionPolicy,
         };
-        let event = tickloop_harness_protocol::Event {
+        let event = tickloop_harness::protocol::Event {
             sequence: 1,
             chat_id: chat.into(),
             loop_id: request.loop_id,
@@ -9832,14 +9836,14 @@ mod tests {
         assert_eq!(wait.chat_id, chat);
         assert_eq!(wait.request_id, request.id);
         let directory = tempfile::tempdir().unwrap();
-        let core = tickloop_harness_runtime::Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        let core = tickloop_harness::runtime::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
         );
         let other = core.create_chat(directory.path().into()).await.unwrap();
         let mut snapshot = core.snapshot(other).await.unwrap();
         super::sync_status_requests(
-            &tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            &tickloop_harness::protocol::ChatStatus::of(&snapshot),
             &mut permissions,
             &mut questions,
         );
@@ -9853,7 +9857,7 @@ mod tests {
             },
             chat_id: chat,
             folder: Some(PathBuf::new()),
-            state: tickloop_harness_protocol::LoopState::WaitingPermission,
+            state: tickloop_harness::protocol::LoopState::WaitingPermission,
             run_id: None,
             title: "Lost child".into(),
             subagent: None,
@@ -9884,7 +9888,7 @@ mod tests {
         );
         snapshot.id = chat.into();
         super::sync_status_requests(
-            &tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            &tickloop_harness::protocol::ChatStatus::of(&snapshot),
             &mut permissions,
             &mut questions,
         );
@@ -9915,7 +9919,7 @@ mod tests {
             ),
             (4, EventKind::InputTakenBack),
         ] {
-            let event = tickloop_harness_protocol::Event {
+            let event = tickloop_harness::protocol::Event {
                 sequence: 1,
                 chat_id: chat_id.into(),
                 loop_id: Uuid::from_u128(2).into(),

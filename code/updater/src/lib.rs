@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tickloop_harness_base::private_fs::{
+use tickloop_harness::base::private_fs::{
     create_private_directory, replace_file_atomically, verify_private_directory,
 };
 
@@ -529,7 +529,7 @@ async fn update(
                 .arg(stage.path())
                 .arg("--target-dir")
                 .arg(&target)
-                .args(["tickloop-agent", "tickloop-tickhost"]);
+                .args(["tickloop-code", "tickloop-tickhost"]);
             run_process(&mut cargo).await?;
             let bin = stage.path().join("bin");
             let candidate = bundle::read_build(&bin)?;
@@ -543,12 +543,13 @@ async fn update(
             let mut cargo = tokio::process::Command::new("cargo");
             cargo
                 .args([
-                    "install", "--locked", "--git", repository, "--rev", &revision, "--root",
+                    "install", "--force", "--locked", "--git", repository, "--rev", &revision,
+                    "--root",
                 ])
                 .arg(root)
                 .arg("--target-dir")
                 .arg(&target)
-                .args(["tickloop-agent", "tickloop-tickhost"]);
+                .args(["tickloop-code", "tickloop-tickhost"]);
             run_process(&mut cargo).await?;
             bundle::verify(&root.join("bin"), &candidate)?;
             if source::cargo_revision(root)? != revision {

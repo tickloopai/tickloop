@@ -2,7 +2,7 @@
 
 use serde_json::json;
 use tickloop_code_access::{ExecutionRef, LiveChatSnapshot};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, ChatStatus, CommandSnapshot, CommandState, Event, EventKind, PermissionExecution,
     PermissionRequest, QuestionRequest,
 };

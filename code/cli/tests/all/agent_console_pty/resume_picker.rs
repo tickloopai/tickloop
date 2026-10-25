@@ -1,8 +1,8 @@
 use super::*;
 use tickloop_code_settings::local_agent::LocalAgent;
 
-use tickloop_harness_protocol::{ChatId, EventKind};
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::protocol::{ChatId, EventKind};
+use tickloop_harness::runtime::Agent;
 use unicode_width::UnicodeWidthStr;
 
 const LONG_PROMPT: &str = "请分析腾讯控股最近三个季度的财报，\n比较营收增长与利润率变化，并整理一份包含风险提示、估值区间和后续跟踪指标的长篇研究备忘录";
@@ -17,7 +17,7 @@ async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, prompt.into()).await.unwrap();
     loop {
-        let event = tickloop_harness_test_support::next_event(&mut events).await;
+        let event = tickloop_harness::test_support::next_event(&mut events).await;
         if event.run_id != receipt.run_id {
             continue;
         }
@@ -36,11 +36,11 @@ async fn save_conversations(fixture: &PrivateFixture) -> Vec<ChatId> {
     let workdir = fixture.path("work").canonicalize().unwrap();
     let agent = Agent::open_embedded(
         root.clone(),
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text(LONG_REPLY),
-            tickloop_harness_test_support::text(OLDER_DUPLICATE_REPLY),
-            tickloop_harness_test_support::text(NEWER_DUPLICATE_REPLY),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text(LONG_REPLY),
+            tickloop_harness::test_support::text(OLDER_DUPLICATE_REPLY),
+            tickloop_harness::test_support::text(NEWER_DUPLICATE_REPLY),
         ])),
     )
     .unwrap();
@@ -56,7 +56,7 @@ async fn save_conversations(fixture: &PrivateFixture) -> Vec<ChatId> {
     for (chat, age) in chats.iter().zip([10_800, 7_200, 60]) {
         std::fs::File::options()
             .write(true)
-            .open(tickloop_harness_test_support::transcript_file(
+            .open(tickloop_harness::test_support::transcript_file(
                 &root,
                 (*chat).into(),
             ))

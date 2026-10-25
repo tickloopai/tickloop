@@ -19,7 +19,7 @@ use super::{
     },
 };
 use crate::monitor_rows::{SUBSCRIBE_KEY, SubscriptionOperation, UNSUBSCRIBE_KEY};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     LoopState, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
     TickSubscriptionStatus,
 };
@@ -324,7 +324,7 @@ fn last_delivery(row: &TickSubscriptionStatus) -> String {
 
 /// `HH:MM:SS` of a UTC timestamp, taken from the one timestamp format the Agent writes.
 fn clock_time(milliseconds: u64) -> String {
-    tickloop_harness_base::timestamp::format_timestamp(milliseconds)
+    tickloop_harness::base::timestamp::format_timestamp(milliseconds)
         .get(11..19)
         .unwrap_or_default()
         .to_owned()

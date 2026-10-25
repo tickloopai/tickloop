@@ -1,7 +1,7 @@
 use crate::support;
 use tickloop_code_settings::local_agent::LocalAgent;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
@@ -428,10 +428,12 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
         .build()
         .unwrap()
         .block_on(async {
-            let agent = tickloop_harness_runtime::Agent::open_embedded(
+            let agent = tickloop_harness::runtime::Agent::open_embedded(
                 workdir.join("state"),
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                    Vec::new(),
+                )),
             )
             .unwrap();
             let chat = agent.create_chat(workdir.clone()).await.unwrap();
@@ -506,11 +508,11 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
         .build()
         .unwrap()
         .block_on(async {
-            let agent = tickloop_harness_runtime::Agent::open_embedded(
+            let agent = tickloop_harness::runtime::Agent::open_embedded(
                 workdir.join("state"),
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-                    tickloop_harness_test_support::text("Ready"),
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+                    tickloop_harness::test_support::text("Ready"),
                 ])),
             )
             .unwrap();
@@ -521,12 +523,12 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
                 .await
                 .unwrap();
             loop {
-                match tickloop_harness_test_support::next_event(&mut events)
+                match tickloop_harness::test_support::next_event(&mut events)
                     .await
                     .kind
                 {
-                    tickloop_harness_protocol::EventKind::Completed { .. } => break,
-                    tickloop_harness_protocol::EventKind::Failed(error) => panic!("{error}"),
+                    tickloop_harness::protocol::EventKind::Completed { .. } => break,
+                    tickloop_harness::protocol::EventKind::Failed(error) => panic!("{error}"),
                     _ => {}
                 }
             }
@@ -534,7 +536,7 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
                 agent
                     .schedule_task(
                         chat,
-                        tickloop_harness_runtime::NewScheduledTask::new("* * * * *", prompt, true),
+                        tickloop_harness::runtime::NewScheduledTask::new("* * * * *", prompt, true),
                     )
                     .await
                     .unwrap();
@@ -572,10 +574,12 @@ fn monitor_keeps_neighbouring_ticks_visible_when_keyboard_navigation_crosses_a_p
         .build()
         .unwrap()
         .block_on(async {
-            let agent = tickloop_harness_runtime::Agent::open_embedded(
+            let agent = tickloop_harness::runtime::Agent::open_embedded(
                 workdir.join("state"),
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                    Vec::new(),
+                )),
             )
             .unwrap();
             let chat = agent.create_chat(workdir.clone()).await.unwrap();

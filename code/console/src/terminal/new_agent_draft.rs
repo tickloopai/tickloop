@@ -11,11 +11,11 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use tickloop_harness_model::{validate_model_config, validate_reasoning_effort};
+use tickloop_harness::model::{validate_model_config, validate_reasoning_effort};
 
 use super::completion::CHILD_AUTHORIZATION_FIXED;
 use tickloop_code_access::{AccessError, ConfigurationChange, LaunchSpec};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatStatus, ExecutionMode, ModelConfig, PermissionChange, PermissionRule, ReasoningEffort,
 };
 
@@ -44,7 +44,7 @@ impl ConfigTarget {
 /// The configuration settings menus read, for a visible Agent or the New Agent draft.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct AgentConfiguration {
-    pub(super) search_config: Option<tickloop_harness_protocol::SearchConfig>,
+    pub(super) search_config: Option<tickloop_harness::protocol::SearchConfig>,
     pub(super) model: ModelConfig,
     pub(super) pending_model: Option<ModelConfig>,
     pub(super) reasoning_effort: Option<ReasoningEffort>,
@@ -285,7 +285,7 @@ fn apply_preview(configuration: &mut AgentConfiguration, change: &ConfigurationC
     match change {
         ConfigurationChange::Model { config, thinking } => {
             configuration.model =
-                tickloop_harness_model::cards::model_for_persistent_selection(config.clone());
+                tickloop_harness::model::cards::model_for_persistent_selection(config.clone());
             match thinking {
                 Some(effort) => {
                     configuration.reasoning_effort =
@@ -325,7 +325,7 @@ fn apply_preview(configuration: &mut AgentConfiguration, change: &ConfigurationC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_model::cards::ModelCatalog;
+    use tickloop_harness::model::cards::ModelCatalog;
 
     fn model(provider: &str, id: &str) -> ModelConfig {
         ModelCatalog::defaults()
@@ -335,7 +335,7 @@ mod tests {
 
     fn base() -> AgentConfiguration {
         AgentConfiguration {
-            search_config: tickloop_harness_protocol::SearchConfig::enabled_default(),
+            search_config: tickloop_harness::protocol::SearchConfig::enabled_default(),
             model: model("deepseek-api", "deepseek-flash"),
             pending_model: None,
             reasoning_effort: None,

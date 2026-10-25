@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_harness_tools::{WEB_FETCH_TOOL_NAME, permissions::is_supported_rule_content};
+use tickloop_harness::tools::{WEB_FETCH_TOOL_NAME, permissions::is_supported_rule_content};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use super::denials_surface::{DenialsEffect, DenialsSurface};
 use super::editor::{Editor, EditorCommand};
 use super::style::{Role, RoleLine};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ApiKeyStatus, AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoReviewerPreference,
     AutoRuleChange, AutoRuleKind, AutoRuleSettings, AutoRuleSource, AutoSettingsRevision, Decision,
     ExecutionMode, PermissionChange, PermissionRule, PermissionRuleScope, PermissionRuleSource,
@@ -282,7 +282,7 @@ enum AutoDraftPurpose {
     Update { kind: AutoRuleKind, id: String },
     Replace(AutoRuleKind),
     Environment,
-    EnvironmentEntry(tickloop_harness_protocol::AutoEnvironmentEntry),
+    EnvironmentEntry(tickloop_harness::protocol::AutoEnvironmentEntry),
 }
 
 impl AutoDraftPurpose {
@@ -508,7 +508,7 @@ enum Focus {
 pub(super) enum PermissionsEffect {
     GenerateEnvironment {
         generation: Uuid,
-        options: tickloop_harness_protocol::AutoSetupOptions,
+        options: tickloop_harness::protocol::AutoSetupOptions,
     },
     None,
     Close {
@@ -717,7 +717,7 @@ impl PermissionsSurface {
     pub(super) fn environment_generated(
         &mut self,
         generation: Uuid,
-        result: Result<tickloop_harness_protocol::AutoEnvironmentDraft, String>,
+        result: Result<tickloop_harness::protocol::AutoEnvironmentDraft, String>,
     ) {
         let result = result.and_then(|draft| match &self.subject {
             PermissionsSubject::Agent { revision, .. } if *revision == draft.revision => Ok(draft),
@@ -859,7 +859,10 @@ impl PermissionsSurface {
         self.clamp_selection();
     }
 
-    pub(super) fn replace_denials(&mut self, view: tickloop_harness_protocol::ApprovalHistoryView) {
+    pub(super) fn replace_denials(
+        &mut self,
+        view: tickloop_harness::protocol::ApprovalHistoryView,
+    ) {
         self.denials.replace_view(view);
     }
 
@@ -1043,7 +1046,10 @@ impl PermissionsSurface {
         }
     }
 
-    fn auto_group_rules(&self, group: &AutoGroupState) -> Vec<tickloop_harness_protocol::AutoRule> {
+    fn auto_group_rules(
+        &self,
+        group: &AutoGroupState,
+    ) -> Vec<tickloop_harness::protocol::AutoRule> {
         let query = group.query.to_lowercase();
         self.view
             .auto_policy
@@ -1688,8 +1694,8 @@ impl PermissionsSurface {
                         return PermissionsEffect::None;
                     }
                     (KeyCode::Enter, _) if selected == 3 => {
-                        let latest_batch = self.view.auto_rule_settings.environment_entries.iter().filter_map(|entry| match entry.source { tickloop_harness_protocol::AutoEnvironmentEntrySource::Generated { batch, generated_at_ms, .. } => Some((generated_at_ms, batch)), _ => None }).max().map(|(_, batch)| batch);
-                        let entries = self.view.auto_rule_settings.environment_entries.iter().filter(|entry| entry.changes.is_empty() && matches!(entry.source, tickloop_harness_protocol::AutoEnvironmentEntrySource::Generated { batch, .. } if Some(batch) == latest_batch)).cloned().collect();
+                        let latest_batch = self.view.auto_rule_settings.environment_entries.iter().filter_map(|entry| match entry.source { tickloop_harness::protocol::AutoEnvironmentEntrySource::Generated { batch, generated_at_ms, .. } => Some((generated_at_ms, batch)), _ => None }).max().map(|(_, batch)| batch);
+                        let entries = self.view.auto_rule_settings.environment_entries.iter().filter(|entry| entry.changes.is_empty() && matches!(entry.source, tickloop_harness::protocol::AutoEnvironmentEntrySource::Generated { batch, .. } if Some(batch) == latest_batch)).cloned().collect();
                         self.preview(
                             PermissionChange::ChangeAutoRules {
                                 change: AutoRuleChange::RemoveEnvironmentEntries { entries },

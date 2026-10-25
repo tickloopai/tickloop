@@ -15,7 +15,7 @@ use tickloop_code_access::{
     LaunchSpec, Observation, ObservationRequest, ViewRef,
 };
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FIXTURE";
 const UNREACHABLE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FLAG";
@@ -79,9 +79,9 @@ fn daemon_loss_pty_fixture() {
 }
 
 async fn run_daemon_loss_fixture() {
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(SwitchableDaemon {
@@ -89,7 +89,7 @@ async fn run_daemon_loss_fixture() {
         unreachable: std::env::var_os(UNREACHABLE_VARIABLE).unwrap().into(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),

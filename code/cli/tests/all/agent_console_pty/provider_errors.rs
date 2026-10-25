@@ -13,7 +13,7 @@ async fn kimi_http_refusal_shows_its_message_next_steps_and_clickable_link() {
     std::fs::set_permissions(credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
     let body = r#"{"error":{"message":"You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota","type":"access_terminated_error"}}"#;
     let (url, captured) = model_http_support::serve_response(403, body.into()).await;
-    let mut model = tickloop_harness_model::cards::ModelCatalog::defaults()
+    let mut model = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("kimi-code-oauth", "k3")
         .unwrap();
     model.base_url = url;

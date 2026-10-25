@@ -4,7 +4,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tickloop_code_access::{FEED_CHANGE_BYTES, ObservationUpdate, ResetReason};
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const GAP_FIXTURE_VARIABLE: &str = "TICKLOOP_FEED_GAP_FIXTURE";
 const GAP_ROUTE_VARIABLE: &str = "TICKLOOP_FEED_GAP_ROUTE";
@@ -39,11 +39,11 @@ struct GapScript {
 impl ModelClient for GapScript {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -61,7 +61,7 @@ impl ModelClient for GapScript {
         events: mpsc::UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        let call = tickloop_harness_test_support::call;
+        let call = tickloop_harness::test_support::call;
         let workdir = std::env::current_dir().unwrap().display().to_string();
         let request = self.requests.fetch_add(1, Ordering::Relaxed);
         let thinking = THINKING[request.min(THINKING.len() - 1)];
@@ -104,7 +104,7 @@ impl ModelClient for GapScript {
                     }
                 }
                 events.send(ModelDelta::Text(FINAL_REPLY.into())).unwrap();
-                tickloop_harness_test_support::text(FINAL_REPLY)
+                tickloop_harness::test_support::text(FINAL_REPLY)
             }
         };
         let mut content = vec![Content::Thinking {
@@ -247,8 +247,8 @@ async fn run_feed_gap_fixture() {
         "TODO: fix cache\nDONE: ship the build\n".into()
     };
     std::fs::write(NOTES_FILE, notes).unwrap();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
-        tickloop_harness_test_support::config(),
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
         Arc::new(GapScript {
             requests: AtomicUsize::new(0),
         }),
@@ -259,7 +259,7 @@ async fn run_feed_gap_fixture() {
     });
     let workdir = std::env::current_dir().unwrap();
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(tickloop_harness_test_support::config());
+    launch.model = Some(tickloop_harness::test_support::config());
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         access.clone(),

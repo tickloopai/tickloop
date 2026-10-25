@@ -16,7 +16,7 @@ use tickloop_code_access::{
     ViewRef,
 };
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const DIRECTORY: &str = "TICKLOOP_SETTINGS_UX_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,15 +28,15 @@ fn settings_ux_pty_fixture() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap()).canonicalize().unwrap();
             let root = directory.join("config");
-            tickloop_harness_model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
-            tickloop_harness_model::credentials::save_api_key(&root, "MINIMAX_GLOBAL_API_KEY", "fixture-minimax-key").unwrap();
+            tickloop_harness::model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
+            tickloop_harness::model::credentials::save_api_key(&root, "MINIMAX_GLOBAL_API_KEY", "fixture-minimax-key").unwrap();
             let discovery = std::env::var("TICKLOOP_SETTINGS_UX_MODE").as_deref() == Ok("discovery");
-            if discovery { tickloop_harness_model::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture-anthropic-key").unwrap(); }
+            if discovery { tickloop_harness::model::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture-anthropic-key").unwrap(); }
             let model = if discovery {
-                tickloop_harness_model::cards::ModelCatalog::defaults().get("anthropic-api", "claude-opus-5").unwrap()
-            } else { tickloop_harness_model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap() };
+                tickloop_harness::model::cards::ModelCatalog::defaults().get("anthropic-api", "claude-opus-5").unwrap()
+            } else { tickloop_harness::model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap() };
             let settings = UserSettings::in_root(&root);
-            let core = tickloop_harness_runtime::Agent::new_with_user_settings_embedded(model.clone(), Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())), settings.clone());
+            let core = tickloop_harness::runtime::Agent::new_with_user_settings_embedded(model.clone(), Arc::new(tickloop_harness::test_support::ScriptedModel::new(Vec::new())), settings.clone());
             let embedded = EmbeddedAgentAccess::new(core.clone());
             let epoch = embedded.daemon_epoch();
             let access = Arc::new(FixtureAccess { inner: embedded, directory: directory.clone(), epoch });
@@ -161,22 +161,22 @@ impl AgentAccess for FixtureAccess {
             while !self.directory.join("release-discovery").exists() {
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
-            let models = tickloop_harness_model::cards::ModelCatalog::defaults()
+            let models = tickloop_harness::model::cards::ModelCatalog::defaults()
                 .profiles()
                 .into_iter()
                 .filter(|model| model.provider_id == config.provider_id)
                 .map(|model| {
                     (
                         model.model,
-                        tickloop_harness_protocol::ModelAvailability::DirectoryListed,
+                        tickloop_harness::protocol::ModelAvailability::DirectoryListed,
                     )
                 })
                 .collect();
             return Ok(Observation::single(
                 ObservationValue::AccountModels(Ok(
-                    tickloop_harness_protocol::AccountModelDirectory {
+                    tickloop_harness::protocol::AccountModelDirectory {
                         models,
-                        semantics: tickloop_harness_protocol::DirectorySemantics::Directory,
+                        semantics: tickloop_harness::protocol::DirectorySemantics::Directory,
                         complete: true,
                     },
                 )),
@@ -204,15 +204,15 @@ impl AgentAccess for FixtureAccess {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let status = if directory.join("reject-search").exists() {
-                    tickloop_harness_protocol::SearchTestStatus::Unavailable
+                    tickloop_harness::protocol::SearchTestStatus::Unavailable
                 } else {
-                    tickloop_harness_protocol::SearchTestStatus::Available
+                    tickloop_harness::protocol::SearchTestStatus::Available
                 };
                 let _ = sender
                     .send(tickloop_code_access::ObservationUpdate {
                         cursor,
                         change: tickloop_code_access::ObservationChange::SearchTest(
-                            tickloop_harness_protocol::SearchTestResult {
+                            tickloop_harness::protocol::SearchTestResult {
                                 status,
                                 detail: "Controlled fixture search test".into(),
                             },
@@ -627,7 +627,7 @@ fn settings_ux_pty_provider_credential_escape_leaves_field_then_pages() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| !frame.contains("Choose Provider") && frame.contains("ctrl+g editor"));
     assert_eq!(
-        tickloop_harness_model::credentials::load_api_key(
+        tickloop_harness::model::credentials::load_api_key(
             &fixture
                 .directory
                 .path()
@@ -826,7 +826,7 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
         .unwrap()
         .join("config");
     assert!(
-        tickloop_harness_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+        tickloop_harness::model::credentials::load_api_key(&root, "TAVILY_API_KEY")
             .unwrap()
             .is_none()
     );
@@ -850,14 +850,14 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
         .unwrap()
         .join("config");
     assert_eq!(
-        tickloop_harness_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+        tickloop_harness::model::credentials::load_api_key(&root, "TAVILY_API_KEY")
             .unwrap()
             .as_deref(),
         Some("fixture-search-secret")
     );
     assert_eq!(
         UserSettings::in_root(&root).load().search_config(),
-        tickloop_harness_protocol::SearchConfig::enabled_default()
+        tickloop_harness::protocol::SearchConfig::enabled_default()
     );
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
@@ -876,7 +876,7 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
             .search_config()
             .unwrap()
             .provider,
-        tickloop_harness_protocol::SearchProviderKind::Tavily
+        tickloop_harness::protocol::SearchProviderKind::Tavily
     );
     std::fs::write(fixture.directory.path().join("reject-search"), "reject").unwrap();
     fixture.select("Tavily");

@@ -24,11 +24,11 @@ struct ActivityModel(AtomicUsize);
 impl ModelClient for ActivityModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -65,7 +65,7 @@ impl ModelClient for ActivityModel {
             .unwrap();
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(&format!("Activity reply {request}")),
+            content: tickloop_harness::test_support::text(&format!("Activity reply {request}")),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -181,7 +181,7 @@ impl AgentAccess for ActivityAccess {
                                 .unwrap()
                                 .chat_loop
                                 .state
-                                == tickloop_harness_protocol::LoopState::Idle
+                                == tickloop_harness::protocol::LoopState::Idle
                         {
                             break;
                         }
@@ -231,8 +231,8 @@ fn working_activity_pty_fixture() {
                 .build()
                 .unwrap();
             tokio::task::LocalSet::new().block_on(&runtime, async {
-                let core = tickloop_harness_runtime::Agent::new_embedded(
-                    tickloop_harness_test_support::config(),
+                let core = tickloop_harness::runtime::Agent::new_embedded(
+                    tickloop_harness::test_support::config(),
                     Arc::new(ActivityModel(AtomicUsize::new(0))),
                 );
                 let (probe, mut facts) = mpsc::unbounded_channel();
@@ -246,7 +246,7 @@ fn working_activity_pty_fixture() {
                 std::fs::write(ACTIVITY_INTERRUPTS, r#"{"phase":"ready","count":0}"#).unwrap();
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
-                launch.model = Some(tickloop_harness_test_support::config());
+                launch.model = Some(tickloop_harness::test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
@@ -303,7 +303,7 @@ fn working_activity_pty_fixture() {
                 let route = std::env::var(ACTIVITY_ROUTE).unwrap();
                 if route == "idle-goal" || route == "idle-both" {
                     core.set_execution_mode(chat.into(), ExecutionMode::Plan).await.unwrap();
-                    core.manage_goal(chat.into(), tickloop_harness_protocol::GoalAction::Set {
+                    core.manage_goal(chat.into(), tickloop_harness::protocol::GoalAction::Set {
                         objective: "Verify idle Escape".into(), token_budget: None, replace: false,
                     }).await.unwrap();
                 }

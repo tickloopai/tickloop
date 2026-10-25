@@ -387,8 +387,8 @@ impl Role {
         }
     }
 
-    pub(super) const fn agent(color: tickloop_harness_protocol::AgentColor) -> Self {
-        use tickloop_harness_protocol::AgentColor;
+    pub(super) const fn agent(color: tickloop_harness::protocol::AgentColor) -> Self {
+        use tickloop_harness::protocol::AgentColor;
         match color {
             AgentColor::Red => Self::AgentRed,
             AgentColor::Blue => Self::AgentBlue,
@@ -1855,7 +1855,7 @@ mod tests {
                         .and_then(|sent| sent.strip_suffix('m'))
                         .unwrap();
                     assert!(
-                        tickloop_harness_test_support::screen::SELECTION_BACKGROUNDS
+                        tickloop_harness::test_support::screen::SELECTION_BACKGROUNDS
                             .contains(&parameters),
                         "{name:?} {role:?} {depth:?}: {sent:?}"
                     );

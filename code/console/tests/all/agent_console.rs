@@ -10,9 +10,9 @@ use tickloop_code_access::{
 use tickloop_code_console::agent_console::{AgentConsole, Destination, Intent};
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_local_environment::AgentLocalExt;
-use tickloop_harness_protocol::LoopState;
+use tickloop_harness::protocol::LoopState;
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use uuid::Uuid;
 
 async fn create(access: &dyn AgentAccess, epoch: Uuid, directory: PathBuf) -> ExecutionRef {
@@ -39,9 +39,9 @@ async fn overview_filters_never_change_new_dispatch_directory_or_visible_executi
     let directory = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("background reply"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("background reply"),
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -97,10 +97,10 @@ async fn overview_filters_never_change_new_dispatch_directory_or_visible_executi
 async fn overview_keeps_each_completed_state_group_contiguous_without_changing_the_target() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("first done"),
-            tickloop_harness_test_support::text("second done"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("first done"),
+            tickloop_harness::test_support::text("second done"),
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -196,11 +196,11 @@ fn order(rows: &[AgentSummary]) -> Vec<ExecutionRef> {
 async fn overview_completed_families_rank_by_recent_finish() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("older finish"),
-            tickloop_harness_test_support::text("latest finish"),
-            tickloop_harness_test_support::text("finished again"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("older finish"),
+            tickloop_harness::test_support::text("latest finish"),
+            tickloop_harness::test_support::text("finished again"),
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -286,7 +286,7 @@ async fn overview_completed_families_rank_by_recent_finish() {
     image::DynamicImage::new_rgb8(1, 1)
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
-    let image = tickloop_harness_base::image::prepare(&png.into_inner()).unwrap();
+    let image = tickloop_harness::base::image::prepare(&png.into_inner()).unwrap();
     access
         .execute(CommandEnvelope {
             daemon_epoch: epoch,
@@ -295,9 +295,9 @@ async fn overview_completed_families_rank_by_recent_finish() {
                 execution: latest,
                 input: UserInput::Text {
                     text: "Describe this chart.".into(),
-                    contexts: vec![tickloop_harness_protocol::InputContext::Image(
-                        tickloop_harness_protocol::ImageContext {
-                            origin: tickloop_harness_protocol::ImageOrigin::Pasted { id: 1 },
+                    contexts: vec![tickloop_harness::protocol::InputContext::Image(
+                        tickloop_harness::protocol::ImageContext {
+                            origin: tickloop_harness::protocol::ImageOrigin::Pasted { id: 1 },
                             image,
                         },
                     )],
@@ -326,26 +326,26 @@ async fn overview_completed_families_rank_by_recent_finish() {
 async fn overview_prioritizes_a_waiting_child_family_before_an_independent_running_agent() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "running",
                 "Bash",
                 serde_json::json!({
                     "command":"while [ ! -f finish ]; do sleep 0.02; done",
                 }),
             ),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "delegate",
                 "Subagent",
                 serde_json::json!({
                     "task":"Ask the user which bounded cadence to use.",
                 }),
             ),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "child-question",
                 "AskUserQuestion",
-                tickloop_harness_test_support::single_question("Which cadence?"),
+                tickloop_harness::test_support::single_question("Which cadence?"),
             ),
         ])),
     );
@@ -367,7 +367,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
                 provider: None,
                 execution,
                 change: ConfigurationChange::ExecutionMode {
-                    mode: tickloop_harness_protocol::ExecutionMode::FullAccess,
+                    mode: tickloop_harness::protocol::ExecutionMode::FullAccess,
                 },
             },
             AgentCommand::Submit {
@@ -399,7 +399,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
                         detail: AgentDetailQuery::Snapshot,
                         after: None,
                     }).await.unwrap();
-                    if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness_protocol::EventKind::ToolStarted { name, .. } if name == "Bash"))) {
+                    if matches!(observed.initial, ObservationValue::Agent(snapshot) if snapshot.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::ToolStarted { name, .. } if name == "Bash"))) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -534,8 +534,8 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
 async fn late_navigation_and_closed_view_cannot_replace_newer_target() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
@@ -560,8 +560,8 @@ async fn late_navigation_and_closed_view_cannot_replace_newer_target() {
 async fn same_host_multiple_views_require_choice_and_focus_does_not_forge_local_display() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
@@ -629,8 +629,8 @@ async fn same_host_multiple_views_require_choice_and_focus_does_not_forge_local_
 async fn an_unavailable_pane_falls_back_in_place_until_a_fresh_display_is_registered() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
@@ -763,10 +763,10 @@ impl AgentAccess for LostCreationReply {
 async fn unknown_creation_requires_receipt_or_explicit_acknowledgement_and_never_replays() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("first"),
-            tickloop_harness_test_support::text("second"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("first"),
+            tickloop_harness::test_support::text("second"),
         ])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
@@ -861,8 +861,8 @@ async fn an_accepted_dispatch_names_its_actual_execution_without_moving_filter_t
     let monitored = tempfile::tempdir().unwrap();
     let launch_directory = launch.path().canonicalize().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
@@ -978,8 +978,8 @@ async fn an_accepted_dispatch_names_its_actual_execution_without_moving_filter_t
 async fn only_a_resolved_creation_receipt_produces_a_created_execution() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
     let epoch = actual.daemon_epoch();
@@ -1053,9 +1053,9 @@ async fn wait_for_overview(
 async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("done"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("done"),
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
@@ -1069,7 +1069,7 @@ async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() 
                 provider: None,
                 execution: configured,
                 change: ConfigurationChange::ExecutionMode {
-                    mode: tickloop_harness_protocol::ExecutionMode::FullAccess,
+                    mode: tickloop_harness::protocol::ExecutionMode::FullAccess,
                 },
             },
         })
@@ -1158,9 +1158,9 @@ impl AgentAccess for LostWorkerDirectory {
 async fn a_lost_execution_stays_an_error_even_before_it_ever_worked() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("done"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("done"),
         ])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
@@ -1206,9 +1206,9 @@ async fn a_lost_execution_stays_an_error_even_before_it_ever_worked() {
 async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::text("done"),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text("done"),
         ])),
     );
     runtime.install_own_tickhost();
@@ -1325,10 +1325,10 @@ async fn overview_refresh_cost_with_many_long_histories() {
     for (turns, history_bytes) in [(1, 1_000), (1, 200_000), (40, 1_000)] {
         let directory = tempfile::tempdir().unwrap();
         let runtime = Agent::new_embedded(
-            tickloop_harness_test_support::config(),
-            Arc::new(tickloop_harness_test_support::ScriptedModel::new(
+            tickloop_harness::test_support::config(),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
                 (0..AGENTS * turns)
-                    .map(|_| tickloop_harness_test_support::text("done"))
+                    .map(|_| tickloop_harness::test_support::text("done"))
                     .collect(),
             )),
         );

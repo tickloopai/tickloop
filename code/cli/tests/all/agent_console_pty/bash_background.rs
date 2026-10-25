@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_protocol::CommandState;
+use tickloop_harness::protocol::CommandState;
 
 const HINT: &str = "(ctrl+b to run in background)";
 const BACKGROUNDED_REPLY: &str = "BASH-BACKGROUNDED-REPLY";
@@ -74,7 +74,7 @@ async fn ctrl_b_backgrounds_the_models_running_bash(fixture: &PrivateFixture) {
         request["messages"].to_string().contains(&format!(
             "Command was manually backgrounded by user with ID: {}",
             tickloop_ids::IdContext::new().model_text(
-                tickloop_harness_protocol::ShellTaskId::from(running.operation_id)
+                tickloop_harness::protocol::ShellTaskId::from(running.operation_id)
             )
         )),
         "{request}"

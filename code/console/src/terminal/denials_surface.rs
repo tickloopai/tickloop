@@ -1,6 +1,6 @@
 use super::style::{Role, RoleLine};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ApprovalAttemptOutcome, ApprovalFailureKind, ApprovalFallbackReason, ApprovalHistoryView,
     ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, AutoReviewerPreference,
     DenialCategory, DenialPersistence, PermissionApprovalSource,
@@ -522,7 +522,7 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
                 ApprovalAttemptOutcome::Allow => "allowed",
                 ApprovalAttemptOutcome::Block
                     if attempt.stage
-                        == Some(tickloop_harness_protocol::ApprovalStage::RiskScreen) =>
+                        == Some(tickloop_harness::protocol::ApprovalStage::RiskScreen) =>
                 {
                     "potential risk"
                 }
@@ -810,7 +810,7 @@ fn failure_label(failure: ApprovalFailureKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_protocol::{ApprovalHistoryView, DisplaySummary};
+    use tickloop_harness::protocol::{ApprovalHistoryView, DisplaySummary};
     use unicode_width::UnicodeWidthStr;
 
     fn record(outcome: ApprovalResult) -> ApprovalRecord {

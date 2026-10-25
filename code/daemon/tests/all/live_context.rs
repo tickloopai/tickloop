@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use tickloop_harness_protocol::{Content, EventKind, Usage};
-use tickloop_harness_runtime::Agent;
-use tickloop_harness_test_support::{ScriptedModel, next_event, text};
+use tickloop_harness::protocol::{Content, EventKind, Usage};
+use tickloop_harness::runtime::Agent;
+use tickloop_harness::test_support::{ScriptedModel, next_event, text};
 use uuid::Uuid;
 
 async fn wait_for_completion(
-    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
 ) {
     loop {
         match next_event(events).await.kind {
@@ -31,7 +31,7 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
             ..Usage::default()
         }],
     ));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), client);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent.set_context_window(chat, 1_000_000).await.unwrap();
     let mut events = agent.subscribe();
@@ -72,7 +72,7 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
     assert_eq!(restored.status().chat.context_tokens, Some(after));
     let mut reopened = live.conversation.clone();
     reopened.request_usage = Default::default();
-    let estimated = tickloop_harness_protocol::ChatStatus::of(&reopened)
+    let estimated = tickloop_harness::protocol::ChatStatus::of(&reopened)
         .context_tokens
         .unwrap();
     assert!(

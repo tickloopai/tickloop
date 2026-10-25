@@ -1,7 +1,7 @@
 use super::super::style::Role;
 use super::*;
 use sha2::{Digest, Sha256};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ApiKeyStatus, SearchConfig, SearchProviderKind, SearchTestResult, SearchTestStatus,
 };
 
@@ -74,7 +74,7 @@ impl Menus {
                 return_to_settings,
             } => {
                 if let Some(index) = index {
-                    if index == tickloop_harness_protocol::SearchProviderKind::ALL.len() {
+                    if index == tickloop_harness::protocol::SearchProviderKind::ALL.len() {
                         agent
                             .change_configuration(
                                 target,
@@ -85,7 +85,7 @@ impl Menus {
                         self.search_settings(agent, console, target, return_to_settings)
                             .await?;
                     } else {
-                        let kind = *tickloop_harness_protocol::SearchProviderKind::ALL
+                        let kind = *tickloop_harness::protocol::SearchProviderKind::ALL
                             .get(index)
                             .ok_or("search provider does not exist")?;
                         let current = agent
@@ -96,7 +96,7 @@ impl Menus {
                         let config = current
                             .filter(|config| config.provider == kind)
                             .unwrap_or_else(|| {
-                                tickloop_harness_protocol::SearchConfig::for_provider(kind)
+                                tickloop_harness::protocol::SearchConfig::for_provider(kind)
                             });
                         let needs_key = config
                             .api_key_env
@@ -157,11 +157,11 @@ impl Menus {
                             .as_deref()
                             .or(config.provider.credential_env())
                             && self.search_key_status(name)?
-                                == tickloop_harness_protocol::ApiKeyStatus::Missing
+                                == tickloop_harness::protocol::ApiKeyStatus::Missing
                         {
                             self.search_key(console, target, config, return_to_settings)?;
                         } else if config.provider
-                            == tickloop_harness_protocol::SearchProviderKind::Searxng
+                            == tickloop_harness::protocol::SearchProviderKind::Searxng
                             && config.endpoint.is_empty()
                         {
                             self.search_endpoint(console, target, config, return_to_settings)?;
@@ -196,7 +196,7 @@ impl Menus {
                             .as_deref()
                             .or(config.provider.credential_env())
                             .ok_or("This provider has no API key")?;
-                        tickloop_harness_model::credentials::remove_api_key(root, name)
+                        tickloop_harness::model::credentials::remove_api_key(root, name)
                             .map_err(|error| error.to_string())?;
                         self.invalidate_search_test(config.provider);
                         self.open_search_provider(
@@ -223,7 +223,7 @@ impl Menus {
                         .as_deref()
                         .or(config.provider.credential_env())
                         .ok_or("This provider has no API key")?;
-                    if let Err(error) = tickloop_harness_model::credentials::save_api_key(
+                    if let Err(error) = tickloop_harness::model::credentials::save_api_key(
                         root,
                         name,
                         comment.as_deref().unwrap_or(""),
@@ -244,7 +244,8 @@ impl Menus {
             } => {
                 if index == Some(0) {
                     config.endpoint = comment.as_deref().unwrap_or("").trim().to_owned();
-                    if let Err(error) = tickloop_harness_tools::web_search::validate_config(&config)
+                    if let Err(error) =
+                        tickloop_harness::tools::web_search::validate_config(&config)
                     {
                         self.search_endpoint(console, target, config, return_to_settings)?;
                         return Err(error);
@@ -383,7 +384,7 @@ impl Menus {
 
     pub(super) fn search_key_status(&self, name: &str) -> Result<ApiKeyStatus, String> {
         if let Some(root) = self.provider_root()
-            && tickloop_harness_model::credentials::load_api_key(root, name)
+            && tickloop_harness::model::credentials::load_api_key(root, name)
                 .map_err(|error| error.to_string())?
                 .is_some()
         {
@@ -619,7 +620,7 @@ impl Menus {
             .or(config.provider.credential_env());
         let saved = match (self.provider_root(), name) {
             (Some(root), Some(name)) => {
-                tickloop_harness_model::credentials::load_api_key(root, name)
+                tickloop_harness::model::credentials::load_api_key(root, name)
                     .map_err(|error| error.to_string())?
                     .map(|key| Sha256::digest(key.as_bytes()).into())
             }
@@ -757,7 +758,7 @@ mod tests {
     async fn search_test_results_are_invalidated_by_replaced_credentials_and_isolated_by_agent() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
-        tickloop_harness_model::credentials::save_api_key(
+        tickloop_harness::model::credentials::save_api_key(
             &root,
             "TAVILY_API_KEY",
             "first-private-key",
@@ -765,7 +766,7 @@ mod tests {
         .unwrap();
         let (mut menus, console, _) = pending(&root);
         assert!(menus.search_test_active());
-        tickloop_harness_model::credentials::save_api_key(
+        tickloop_harness::model::credentials::save_api_key(
             &root,
             "TAVILY_API_KEY",
             "replacement-private-key",

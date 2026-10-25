@@ -27,12 +27,12 @@ use tickloop_code_access::{
     Cursor, ExecutionRef, LaunchSpec, ObservationRequest, ObservationUpdate, ObservationValue,
     Page, ServerMessage, UserInput, bounded_update, decode_frame, encode_frame,
 };
-use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness_protocol::{
+use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_harness::protocol::{
     Event, EventKind, ModelIdentity, ModelProvider, Protocol, ToolResult,
 };
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 
 thread_local! {
     static ALLOCATED: Cell<u64> = const { Cell::new(0) };
@@ -96,7 +96,7 @@ impl ModelClient for LongChatModel {
         _: mpsc::UnboundedSender<ModelDelta>,
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -125,7 +125,7 @@ impl ModelClient for LongChatModel {
         }
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text(&"r".repeat(self.reply_bytes)),
+            content: tickloop_harness::test_support::text(&"r".repeat(self.reply_bytes)),
             usage: Default::default(),
             stop_reason: "end_turn".into(),
         })
@@ -149,7 +149,7 @@ impl LongChat {
             reply_bytes,
             release: Notify::new(),
         });
-        let runtime = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        let runtime = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let access = EmbeddedAgentAccess::new(runtime.clone());
         let mut events = runtime.subscribe();
         let created = access

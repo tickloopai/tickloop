@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use tickloop_harness_protocol::{SharedTaskStatus, TaskBoard};
+use tickloop_harness::protocol::{SharedTaskStatus, TaskBoard};
 use uuid::Uuid;
 
 const COMPLETED_TASK_RETENTION: Duration = Duration::from_secs(30);

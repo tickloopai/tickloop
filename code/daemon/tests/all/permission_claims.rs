@@ -19,10 +19,10 @@ use tickloop_code_access::{
 };
 use tickloop_code_client::LocalAgentClient;
 use tickloop_code_daemon::{EmbeddedAgentAccess, serve_listener};
-use tickloop_harness_protocol::{Decision, EventKind, LoopState, PermissionScope};
+use tickloop_harness::protocol::{Decision, EventKind, LoopState, PermissionScope};
 
 use tickloop_code_settings::UserSettings;
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use tokio::{net::UnixListener, task::JoinHandle};
 use uuid::Uuid;
 
@@ -40,7 +40,7 @@ struct Fixture {
     _external: tempfile::TempDir,
     root: PathBuf,
     runtime: Agent,
-    model: Arc<tickloop_harness_test_support::ScriptedModel>,
+    model: Arc<tickloop_harness::test_support::ScriptedModel>,
     first: Arc<dyn AgentAccess>,
     second: Arc<dyn AgentAccess>,
     server: Option<JoinHandle<()>>,
@@ -56,23 +56,23 @@ impl Fixture {
         let source = external.path().join("source.txt");
         std::fs::write(&source, "scoped original information").unwrap();
         let root = directory.path().join("state");
-        let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-            tickloop_harness_test_support::call(
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::call(
                 "first-read",
                 "Read",
                 serde_json::json!({"file_path": source}),
             ),
-            tickloop_harness_test_support::text("First read completed."),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::text("First read completed."),
+            tickloop_harness::test_support::call(
                 "second-read",
                 "Read",
                 serde_json::json!({"file_path": source}),
             ),
-            tickloop_harness_test_support::text("Second read completed."),
+            tickloop_harness::test_support::text("Second read completed."),
         ]));
         let runtime = Agent::open_embedded(
             root.clone(),
-            tickloop_harness_test_support::config(),
+            tickloop_harness::test_support::config(),
             model.clone(),
         )
         .unwrap();
@@ -166,7 +166,7 @@ impl Fixture {
         tokio::time::timeout(WAIT, async {
             loop {
                 let current = snapshot(&*self.second, self.execution).await;
-                if current.conversation.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == message)) {
+                if current.conversation.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == message)) {
                     assert!(current.permissions.is_empty());
                     break;
                 }
@@ -198,7 +198,7 @@ impl Fixture {
             loop {
                 let current = snapshot(&*self.second, self.execution).await;
                 if let Some(request) = current.request_refs.into_iter().find(|request| request.kind == PendingRequestKind::Permission) { break Some(request); }
-                if current.conversation.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text == "Second read completed.")) { break None; }
+                if current.conversation.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text == "Second read completed.")) { break None; }
                 tokio::task::yield_now().await;
             }
         }).await.unwrap()

@@ -249,8 +249,8 @@ async fn prompt_suggestion_settings_menu_saves_off_and_cancels_generation_immedi
     let directory = tempfile::tempdir().unwrap();
     let settings = tickloop_code_settings::UserSettings::in_root(directory.path());
     let agent = crate::terminal::execution::ConsoleExecution::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let console = console();

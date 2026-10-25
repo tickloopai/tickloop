@@ -2,7 +2,7 @@
 
 use tick_protocol::InstanceRef;
 use tickloop_code_access::{AgentCommand, CommandResult, ExecutionRef, LiveChatSnapshot};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, FamilyCompletion, FamilyMessageRejection, FamilyMessageRejectionCode, LoopState,
     MonitorMember, SubagentNotificationDelivery, Usage,
 };

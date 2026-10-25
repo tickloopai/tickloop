@@ -18,9 +18,9 @@ use tickloop_code_access::{
     AccessError, AgentAccess, CommandEnvelope, CommandReceipt, DisplayReceipt, DisplayUpdate,
     ExecutionAvailability, LaunchSpec, Observation, ObservationRequest, ViewRef,
 };
-use tickloop_harness_protocol::LoopState;
+use tickloop_harness::protocol::LoopState;
 
-use tickloop_harness_test_support::{input_dialog, screen};
+use tickloop_harness::test_support::{input_dialog, screen};
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_DIRECTORY";
@@ -101,74 +101,74 @@ async fn run_child_config_fixture() {
     let config_root = (auto_permissions || model_dialog)
         .then(|| directory.canonicalize().unwrap().join("config-root"));
     let model = if model_dialog {
-        tickloop_harness_model::credentials::save_api_key(
+        tickloop_harness::model::credentials::save_api_key(
             config_root.as_ref().unwrap(),
             "DEEPSEEK_API_KEY",
             "fixture-key",
         )
         .unwrap();
-        tickloop_harness_model::cards::ModelCatalog::defaults()
+        tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap()
     } else {
-        tickloop_harness_test_support::config()
+        tickloop_harness::test_support::config()
     };
     let replies = if requester {
         vec![
-            tickloop_harness_test_support::call("delegate", "Subagent", json!({"task":TASK})),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call("delegate", "Subagent", json!({"task":TASK})),
+            tickloop_harness::test_support::call(
                 "child-question",
                 "AskUserQuestion",
-                tickloop_harness_test_support::single_question("Which window?"),
+                tickloop_harness::test_support::single_question("Which window?"),
             ),
-            tickloop_harness_test_support::call(
+            tickloop_harness::test_support::call(
                 "child-write",
                 "Write",
                 json!({"file_path":".bashrc","content":"fixture=approved"}),
             ),
-            tickloop_harness_test_support::text("child approved"),
-            tickloop_harness_test_support::text("parent done"),
+            tickloop_harness::test_support::text("child approved"),
+            tickloop_harness::test_support::text("parent done"),
         ]
     } else {
         vec![
-            tickloop_harness_test_support::call("delegate", "Subagent", json!({"task":TASK})),
+            tickloop_harness::test_support::call("delegate", "Subagent", json!({"task":TASK})),
             if auto_permissions {
-                let mut reply = tickloop_harness_test_support::text("child reviewed");
-                reply.extend(tickloop_harness_test_support::call(
+                let mut reply = tickloop_harness::test_support::text("child reviewed");
+                reply.extend(tickloop_harness::test_support::call(
                     "child-report",
                     "SubagentHandback",
                     json!({"message":"child reviewed"}),
                 ));
                 reply
             } else {
-                tickloop_harness_test_support::text("child reviewed")
+                tickloop_harness::test_support::text("child reviewed")
             },
-            tickloop_harness_test_support::text("parent done"),
+            tickloop_harness::test_support::text("parent done"),
             if auto_permissions {
-                let mut reply = tickloop_harness_test_support::text("child follow-up done");
-                reply.extend(tickloop_harness_test_support::call(
+                let mut reply = tickloop_harness::test_support::text("child follow-up done");
+                reply.extend(tickloop_harness::test_support::call(
                     "follow-up-report",
                     "SubagentHandback",
                     json!({"message":"child follow-up done"}),
                 ));
                 reply
             } else {
-                tickloop_harness_test_support::text("child follow-up done")
+                tickloop_harness::test_support::text("child follow-up done")
             },
         ]
     };
-    let core = tickloop_harness_runtime::Agent::new_embedded(
+    let core = tickloop_harness::runtime::Agent::new_embedded(
         model.clone(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(replies)),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies)),
     );
-    core.set_auto_reviewer(Arc::new(tickloop_harness_test_support::ScriptedModel::new(
-        vec![
-            tickloop_harness_test_support::text(
-                &tickloop_harness_test_support::auto_classification(false).to_string(),
+    core.set_auto_reviewer(Arc::new(
+        tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::text(
+                &tickloop_harness::test_support::auto_classification(false).to_string(),
             );
             3
-        ],
-    )))
+        ]),
+    ))
     .await;
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(RecordingDaemon {
@@ -193,9 +193,9 @@ async fn run_child_config_fixture() {
     core.set_execution_mode(
         root.into(),
         if auto_permissions {
-            tickloop_harness_protocol::ExecutionMode::Auto
+            tickloop_harness::protocol::ExecutionMode::Auto
         } else {
-            tickloop_harness_protocol::ExecutionMode::AcceptEdits
+            tickloop_harness::protocol::ExecutionMode::AcceptEdits
         },
     )
     .await
@@ -329,7 +329,7 @@ impl ChildPty {
         command.env("HOME", directory);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
         command.env("TICKLOOP_TMPDIR", directory);
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -338,7 +338,7 @@ impl ChildPty {
             command.env("DEEPSEEK_API_KEY", "fixture-key");
         }
         if route == "auto-permissions" {
-            command.env_remove(tickloop_harness_model::judgment::JEV_API_KEY_ENV);
+            command.env_remove(tickloop_harness::model::judgment::JEV_API_KEY_ENV);
         }
         command.cwd(directory);
         let child = pair.slave.spawn_command(command).unwrap();

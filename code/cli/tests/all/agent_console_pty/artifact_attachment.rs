@@ -1,5 +1,5 @@
 use super::*;
-use tickloop_harness_artifacts::ArtifactClient;
+use tickloop_harness::artifacts::ArtifactClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CREATED_TITLE: &str = "LIVE-CREATED-ARTIFACT";

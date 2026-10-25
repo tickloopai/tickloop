@@ -3,8 +3,8 @@ use crate::agent_console::AttentionGroup;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-use tickloop_harness_protocol::{AgentColor, LoopState, SubagentRegistration};
-use tickloop_harness_test_support::screen::{self, SELECTED_MARK};
+use tickloop_harness::protocol::{AgentColor, LoopState, SubagentRegistration};
+use tickloop_harness::test_support::screen::{self, SELECTED_MARK};
 
 const ROOT_AGENT: Uuid = Uuid::from_u128(100);
 const CHILD_AGENT: Uuid = Uuid::from_u128(101);
@@ -531,7 +531,7 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
             child_chat_id: id.into(),
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
-            created_at: tickloop_harness_base::private_fs::unix_time_milliseconds(),
+            created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
     }
@@ -1411,7 +1411,7 @@ fn agent_layout_runtime_banner_updates_preserve_the_reading_anchor_and_full_buil
 
 #[test]
 fn agent_layout_runtime_version_follows_the_complete_real_startup_banner() {
-    let config = tickloop_harness_test_support::config();
+    let config = tickloop_harness::test_support::config();
     let banner = super::super::startup_banner_spans(
         &config,
         std::path::Path::new("/fixture/runtime-banner"),
@@ -3808,7 +3808,7 @@ fn fleet_row(
             child_chat_id: id.into(),
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
-            created_at: tickloop_harness_base::private_fs::unix_time_milliseconds(),
+            created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
     }
@@ -5224,7 +5224,7 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
 
 #[test]
 fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
-    let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+    let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
     let six_minutes_ago = now - 6 * 60_000 - 30_000;
     let finished = Uuid::from_u128(0xa100);
     let asking = Uuid::from_u128(0xa200);

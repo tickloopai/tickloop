@@ -13,7 +13,7 @@ use std::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use tickloop_harness_base::private_fs::{
+use tickloop_harness::base::private_fs::{
     PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, unix_time_milliseconds,
 };
 

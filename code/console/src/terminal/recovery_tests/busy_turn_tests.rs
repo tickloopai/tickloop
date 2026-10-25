@@ -5,7 +5,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tickloop_code_access::FEED_CHANGE_BYTES;
 use tickloop_code_local_environment::AgentLocalExt;
-use tickloop_harness_protocol::Content;
+use tickloop_harness::protocol::Content;
 
 const BUSY_FIXTURE_VARIABLE: &str = "TICKLOOP_BUSY_TURN_FIXTURE";
 const BUSY_STAGE_FILE: &str = "busy-stage";
@@ -31,11 +31,11 @@ struct BusyTurnModel {
 impl ModelClient for BusyTurnModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
+        request: tickloop_harness::model::ModelRequest,
         _: mpsc::UnboundedSender<ModelDelta>,
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        Ok(tickloop_harness_model::fixture_title(request))
+        Ok(tickloop_harness::model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -55,7 +55,7 @@ impl ModelClient for BusyTurnModel {
     ) -> Result<ModelOutput, ModelError> {
         let request = self.requests.fetch_add(1, Ordering::SeqCst);
         let content = match request.checked_sub(HISTORY_TURNS) {
-            None => tickloop_harness_test_support::text(&"h".repeat(HISTORY_REPLY_BYTES)),
+            None => tickloop_harness::test_support::text(&"h".repeat(HISTORY_REPLY_BYTES)),
             Some(0) => {
                 wait_for_busy_stage("go", &cancel).await;
                 for index in 0..THINKING_DELTAS {
@@ -67,13 +67,13 @@ impl ModelClient for BusyTurnModel {
                 events
                     .send(ModelDelta::Text("Reading the input.\n".into()))
                     .unwrap();
-                tickloop_harness_test_support::call(
+                tickloop_harness::test_support::call(
                     "busy-read",
                     "Read",
                     serde_json::json!({"file_path": BUSY_FILE}),
                 )
             }
-            Some(1) => tickloop_harness_test_support::call(
+            Some(1) => tickloop_harness::test_support::call(
                 "busy-edit",
                 "Edit",
                 serde_json::json!({
@@ -82,7 +82,7 @@ impl ModelClient for BusyTurnModel {
                     "new_string": BUSY_EDITED_LINE,
                 }),
             ),
-            Some(2) => tickloop_harness_test_support::call(
+            Some(2) => tickloop_harness::test_support::call(
                 "busy-shell",
                 "Bash",
                 serde_json::json!({"command": format!("touch {BUSY_MARKER}")}),
@@ -91,7 +91,7 @@ impl ModelClient for BusyTurnModel {
                 events
                     .send(ModelDelta::Text(format!("{BUSY_REPLY}\n")))
                     .unwrap();
-                tickloop_harness_test_support::text(BUSY_REPLY)
+                tickloop_harness::test_support::text(BUSY_REPLY)
             }
         };
         let stop_reason = if content
@@ -207,8 +207,8 @@ fn busy_turn_pty_fixture() {
                 .build()
                 .unwrap();
             tokio::task::LocalSet::new().block_on(&runtime, async {
-                let core = tickloop_harness_runtime::Agent::new_embedded(
-                    tickloop_harness_test_support::config(),
+                let core = tickloop_harness::runtime::Agent::new_embedded(
+                    tickloop_harness::test_support::config(),
                     Arc::new(BusyTurnModel {
                         requests: AtomicUsize::new(0),
                     }),
@@ -225,7 +225,7 @@ fn busy_turn_pty_fixture() {
                     catalogs: AtomicUsize::new(0),
                 });
                 let mut launch = LaunchSpec::embedded(workdir.clone());
-                launch.model = Some(tickloop_harness_test_support::config());
+                launch.model = Some(tickloop_harness::test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),

@@ -1,7 +1,7 @@
 //! Bounded image work off the terminal input thread. Only prepared results cross back to the UI.
 use std::{collections::HashMap, sync::mpsc, thread};
 
-use tickloop_harness_protocol::Image;
+use tickloop_harness::protocol::Image;
 use uuid::Uuid;
 
 use super::{image_cache::ImageCache, paste_blocks::PasteBlockId};

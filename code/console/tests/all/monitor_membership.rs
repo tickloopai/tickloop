@@ -8,10 +8,10 @@ use tickloop_code_console::monitor_rows::{
     MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, TickDescriptor, TickGlyph,
     TickGroup, TickIntent, TickOwner,
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatId, EventKind, TickSubscriptionChange, ToolDefinition, ToolResult,
 };
-use tickloop_harness_runtime::{
+use tickloop_harness::runtime::{
     Agent,
     host_tools::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
@@ -118,7 +118,7 @@ async fn run_turn(agent: &Agent, chat: ChatId, text: &str) {
     let mut events = agent.subscribe();
     agent.submit(chat, text.into()).await.unwrap();
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {
@@ -153,11 +153,11 @@ async fn monitor_rows(agent: &Agent, chat: ChatId) -> Vec<TickDescriptor> {
 #[tokio::test]
 async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model_work() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call("open", OPEN_TOOL, json!({})),
-        tickloop_harness_test_support::text("opened"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call("open", OPEN_TOOL, json!({})),
+        tickloop_harness::test_support::text("opened"),
     ]));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     agent.install_host_tools(Arc::new(OpeningHost)).unwrap();
     agent.install_tick_stream(adapters()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -193,7 +193,7 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
         .await
         .unwrap();
     let branch = agent
-        .branch_chat(tickloop_harness_protocol::BranchRequest {
+        .branch_chat(tickloop_harness::protocol::BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id: chat,
             name: Some("Branch".into()),
@@ -217,17 +217,17 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
 async fn removal_outlives_restart_but_never_hides_a_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call(
             "subscribe",
             "TickManage",
             json!({"action":"subscribe","tick_instance_id":"cal:watched","frequency":"low"}),
         ),
-        tickloop_harness_test_support::text("watching"),
+        tickloop_harness::test_support::text("watching"),
     ]));
     let agent = Agent::open_embedded(
         store.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model,
     )
     .unwrap();
@@ -261,8 +261,10 @@ async fn removal_outlives_restart_but_never_hides_a_subscription() {
 
     let restored = Agent::open_embedded(
         store,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     )
     .unwrap();
     restored.install_tick_stream(adapters()).await;
@@ -280,8 +282,10 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
     let store = directory.path().join("archive");
     let agent = Agent::open_embedded(
         store.clone(),
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -298,8 +302,10 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
 
     let restored = Agent::open_embedded(
         store,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     )
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
@@ -313,22 +319,22 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
 #[tokio::test(start_paused = true)]
 async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
         ["high", "medium"]
             .into_iter()
             .flat_map(|frequency| {
                 vec![
-                    tickloop_harness_test_support::call(
+                    tickloop_harness::test_support::call(
                         &format!("s-{frequency}"),
                         "TickManage",
                         json!({"action":"subscribe","tick_instance_id":"cal:shared","frequency":frequency}),
                     ),
-                    tickloop_harness_test_support::text("watching"),
+                    tickloop_harness::test_support::text("watching"),
                 ]
             })
             .collect(),
     ));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     agent.install_tick_stream(adapters()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     run_turn(&agent, chat, "first watcher").await;
@@ -346,7 +352,7 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     let context = MonitorContext {
         chat: Some(std::sync::Arc::new(
-            tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            tickloop_harness::protocol::ChatStatus::of(&snapshot),
         )),
         subscriptions: subscriptions.clone(),
         ..Default::default()
@@ -394,7 +400,7 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     snapshot.monitor.remove(calendar("m000"));
     let changed = MonitorContext {
         chat: Some(std::sync::Arc::new(
-            tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            tickloop_harness::protocol::ChatStatus::of(&snapshot),
         )),
         subscriptions,
         ..Default::default()
@@ -411,16 +417,16 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
 async fn rewind_and_compaction_keep_membership_and_restart_reads_it_back() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call("open", OPEN_TOOL, json!({})),
-        tickloop_harness_test_support::text("opened"),
-        tickloop_harness_test_support::text("second reply"),
-        tickloop_harness_test_support::text("summary of the conversation"),
-        tickloop_harness_test_support::text("third reply"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call("open", OPEN_TOOL, json!({})),
+        tickloop_harness::test_support::text("opened"),
+        tickloop_harness::test_support::text("second reply"),
+        tickloop_harness::test_support::text("summary of the conversation"),
+        tickloop_harness::test_support::text("third reply"),
     ]));
     let agent = Agent::open_embedded(
         store.clone(),
-        tickloop_harness_test_support::config(),
+        tickloop_harness::test_support::config(),
         model,
     )
     .unwrap();
@@ -450,7 +456,7 @@ async fn rewind_and_compaction_keep_membership_and_restart_reads_it_back() {
         .rewind(
             chat,
             point.message_id,
-            tickloop_harness_protocol::RewindMode::Conversation,
+            tickloop_harness::protocol::RewindMode::Conversation,
         )
         .await
         .unwrap();
@@ -464,8 +470,10 @@ async fn rewind_and_compaction_keep_membership_and_restart_reads_it_back() {
 
     let restored = Agent::open_embedded(
         store,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     )
     .unwrap();
     restored.resume_chat(chat).await.unwrap();
@@ -482,8 +490,10 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
     use tickloop_code_console::monitor_rows::{MemberState, TickResources};
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let (running, exited, gone, lost, foreign) = (
@@ -506,13 +516,13 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
         rss_bytes: Some(8 << 20),
         sampled_at_ms: 1,
     };
-    let only_subscribed: tickloop_harness_protocol::TickSubscriptionStatus = serde_json::from_value(
+    let only_subscribed: tickloop_harness::protocol::TickSubscriptionStatus = serde_json::from_value(
         serde_json::json!({"id":uuid::Uuid::new_v4(),"loop_id":uuid::Uuid::new_v4(),"loop_state":"Idle","instance":foreign,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"title":"Shared","link":"Live"}),
     )
     .unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(std::sync::Arc::new(
-            tickloop_harness_protocol::ChatStatus::of(&snapshot),
+            tickloop_harness::protocol::ChatStatus::of(&snapshot),
         )),
         subscriptions: vec![only_subscribed],
         member_states: HashMap::from([

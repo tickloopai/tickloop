@@ -39,7 +39,7 @@ pub fn build_identity() -> String {
             TypeId::of::<percent_encoding::AsciiSet>(),
             TypeId::of::<portable_pty::CommandBuilder>(),
             TypeId::of::<serde_yaml_ng::Value>(),
-            TypeId::of::<tickloop_harness_test_support::ScriptedModel>(),
+            TypeId::of::<tickloop_harness::test_support::ScriptedModel>(),
             TypeId::of::<vt100::Parser>(),
         ]
     )

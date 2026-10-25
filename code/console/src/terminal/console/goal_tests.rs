@@ -1,17 +1,17 @@
 use super::*;
 #[cfg(test)]
 use tickloop_code_settings::local_agent::LocalAgent;
-use tickloop_harness_protocol::{GoalSnapshot, GoalStatus};
+use tickloop_harness::protocol::{GoalSnapshot, GoalStatus};
 
 #[test]
 fn goal_set_history_shows_its_recorded_condition_on_one_clipped_line() {
     let chat = Uuid::new_v4();
     let mut snapshot = super::monitor_tests::chat_snapshot(chat);
     snapshot.goal = Some(goal());
-    snapshot.goal_history = vec![tickloop_harness_protocol::GoalHistoryEntry {
+    snapshot.goal_history = vec![tickloop_harness::protocol::GoalHistoryEntry {
         after_message_id: None,
         objective: "不用tick查询到特斯拉现在的夜盘股价\n第二行\t尾部\x1b".into(),
-        notice: tickloop_harness_protocol::GoalNotice::Set,
+        notice: tickloop_harness::protocol::GoalNotice::Set,
         timestamp: "2026-10-23T00:00:00Z".into(),
     }];
     let console = Console::test_interactive_for_chat(chat);
@@ -65,7 +65,7 @@ fn goal_event_clipping_keeps_whole_emoji_and_restores_text_when_widened() {
         let console = Console::test_interactive_for_chat(Uuid::new_v4());
         console
             .write_pieces(&super::super::goal_view::notice_pieces(
-                &tickloop_harness_protocol::GoalNotice::Set,
+                &tickloop_harness::protocol::GoalNotice::Set,
                 &emoji.repeat(3),
             ))
             .unwrap();
@@ -91,7 +91,7 @@ fn goal_event_clipping_keeps_whole_emoji_and_restores_text_when_widened() {
 
 #[test]
 fn goal_history_uses_each_events_condition_after_replacement() {
-    use tickloop_harness_protocol::{GoalHistoryEntry, GoalNotice, GoalPause};
+    use tickloop_harness::protocol::{GoalHistoryEntry, GoalNotice, GoalPause};
     let chat = Uuid::new_v4();
     let mut snapshot = super::monitor_tests::chat_snapshot(chat);
     snapshot.goal = Some(goal());
@@ -134,9 +134,9 @@ fn goal_history_uses_each_events_condition_after_replacement() {
 
 #[tokio::test]
 async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event() {
-    use tickloop_harness_protocol::{GoalAction, Role as MessageRole, TriggerSource};
-    use tickloop_harness_runtime::Agent;
-    use tickloop_harness_test_support::{ScriptedModel, config, text};
+    use tickloop_harness::protocol::{GoalAction, Role as MessageRole, TriggerSource};
+    use tickloop_harness::runtime::Agent;
+    use tickloop_harness::test_support::{ScriptedModel, config, text};
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("Progress recorded")]));
@@ -165,7 +165,7 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
     let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
-            if snapshot.chat_loop.state == tickloop_harness_protocol::LoopState::Idle
+            if snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
                 && snapshot
                     .messages
                     .iter()
@@ -178,7 +178,7 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
     })
     .await
     .unwrap();
-    let raw = snapshot.messages.iter().find(|message| message.role == MessageRole::User && message.content.iter().any(|content| matches!(content, tickloop_harness_protocol::Content::Text { text } if text.contains("<objective>")))).unwrap().clone();
+    let raw = snapshot.messages.iter().find(|message| message.role == MessageRole::User && message.content.iter().any(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text.contains("<objective>")))).unwrap().clone();
     assert!(
         model
             .requests
@@ -232,7 +232,7 @@ async fn persisted_goal_continuation_keeps_model_text_and_reopens_as_one_event()
 
 #[test]
 fn goal_continuation_live_and_reopened_history_show_one_event() {
-    use tickloop_harness_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    use tickloop_harness::protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     let chat = Uuid::new_v4();
     let run = Uuid::new_v4();
     let mut snapshot = super::monitor_tests::chat_snapshot(chat);
@@ -287,7 +287,7 @@ fn goal_continuation_live_and_reopened_history_show_one_event() {
 
 #[test]
 fn scheduled_skill_live_and_history_show_the_users_instruction() {
-    use tickloop_harness_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    use tickloop_harness::protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     let chat = Uuid::new_v4();
     let run = Uuid::new_v4();
     let mut snapshot = super::monitor_tests::chat_snapshot(chat);
@@ -301,10 +301,10 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
             task_id: uuid::Uuid::from_u128(0x1234_5678),
             scheduled_for_ms: 1,
             wrappers: vec![
-                tickloop_harness_protocol::ScheduledInputWrapper::Skill {
+                tickloop_harness::protocol::ScheduledInputWrapper::Skill {
                     instruction: "/review main".into(),
                 },
-                tickloop_harness_protocol::ScheduledInputWrapper::FinalRun,
+                tickloop_harness::protocol::ScheduledInputWrapper::FinalRun,
             ],
         },
     );
@@ -324,22 +324,22 @@ fn scheduled_skill_live_and_history_show_the_users_instruction() {
 
 #[test]
 fn scheduled_live_and_history_preserve_unrecorded_wrappers() {
-    use tickloop_harness_protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
+    use tickloop_harness::protocol::{Content, Message, Role as MessageRole, TriggerIdentity};
     for instruction in [
-        tickloop_harness_protocol::scheduled_skill_prompt(
+        tickloop_harness::protocol::scheduled_skill_prompt(
             &uuid::Uuid::from_u128(0x1234_5678).to_string(),
             "review",
             "main",
         ),
-        tickloop_harness_protocol::loop_instructions_prompt(
+        tickloop_harness::protocol::loop_instructions_prompt(
             "loop.md. Hidden instruction",
             "Visible instruction",
         ),
-        tickloop_harness_protocol::loop_instructions_error_prompt(
+        tickloop_harness::protocol::loop_instructions_error_prompt(
             &uuid::Uuid::from_u128(0x1234_5678).to_string(),
             "permission denied",
         ),
-        tickloop_harness_protocol::final_scheduled_run_prompt("Check the release"),
+        tickloop_harness::protocol::final_scheduled_run_prompt("Check the release"),
     ] {
         let chat = Uuid::new_v4();
         let run = Uuid::new_v4();
@@ -389,11 +389,11 @@ fn continue_prompt_preserves_typed_and_pasted_messages_before_menu_cancellation_
         ] {
             let chat = Uuid::new_v4();
             let console = Console::test_interactive_for_chat(chat);
-            let mut status = tickloop_harness_protocol::ChatStatus::of(
+            let mut status = tickloop_harness::protocol::ChatStatus::of(
                 &super::monitor_tests::chat_snapshot(chat),
             );
-            status.chat_loop.receiving = tickloop_harness_protocol::Receiving::Paused {
-                reason: tickloop_harness_protocol::PauseReason::HistoryLoaded,
+            status.chat_loop.receiving = tickloop_harness::protocol::Receiving::Paused {
+                reason: tickloop_harness::protocol::PauseReason::HistoryLoaded,
             };
             let mut menus = super::super::menus::Menus::default();
             menus.offer_continue(&console, &status).unwrap();
@@ -436,10 +436,10 @@ fn goal() -> GoalSnapshot {
     })).unwrap()
 }
 
-fn status(goal: GoalSnapshot) -> tickloop_harness_protocol::ChatStatus {
+fn status(goal: GoalSnapshot) -> tickloop_harness::protocol::ChatStatus {
     let mut snapshot = super::monitor_tests::chat_snapshot(Uuid::from_u128(707));
     snapshot.goal = Some(goal);
-    tickloop_harness_protocol::ChatStatus::of(&snapshot)
+    tickloop_harness::protocol::ChatStatus::of(&snapshot)
 }
 
 #[test]
@@ -514,13 +514,13 @@ fn status_bar_omits_every_goal_state_in_wide_and_short_console_frames() {
         (GoalStatus::Active, "Pursuing goal (12.5K / 50K)"),
         (
             GoalStatus::Paused {
-                by: tickloop_harness_protocol::GoalPause::User,
+                by: tickloop_harness::protocol::GoalPause::User,
             },
             "Goal paused (/goal resume)",
         ),
         (
             GoalStatus::Blocked {
-                by: tickloop_harness_protocol::GoalBlock::NoProgress,
+                by: tickloop_harness::protocol::GoalBlock::NoProgress,
             },
             "Goal stalled (/goal resume)",
         ),
@@ -630,15 +630,15 @@ fn goal_ui_pty_fixture() {
         .build()
         .unwrap()
         .block_on(async {
-            let core = tickloop_harness_runtime::Agent::new_embedded(
-                tickloop_harness_test_support::config(),
-                Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+            let core = tickloop_harness::runtime::Agent::new_embedded(
+                tickloop_harness::test_support::config(),
+                Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
             );
             core.hold_goal_continuations_for_tests();
             let root =
                 PathBuf::from(std::env::var_os("TICKLOOP_DIALOG_HEIGHT_FIXTURE_DIR").unwrap());
             let agent =
-                ConsoleExecution::from_embedded(core, tickloop_harness_test_support::config());
+                ConsoleExecution::from_embedded(core, tickloop_harness::test_support::config());
             let chat = agent.create_chat(root).await.unwrap();
             let (console, mut input) = Console::start(true).unwrap();
             console.select_chat(Some(chat)).unwrap();
@@ -750,7 +750,7 @@ fn goal_ui_pty_records_monitor_menu_and_escape() {
         let wait = |expected: &str| -> Result<String, String> {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
-                let frame = tickloop_harness_test_support::screen::visible_screen(
+                let frame = tickloop_harness::test_support::screen::visible_screen(
                     &String::from_utf8_lossy(&output.lock().unwrap()),
                     140,
                     30,
@@ -848,8 +848,8 @@ fn paused_triggers_keep_model_in_the_same_status_line() {
             .status_area
             .update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
         let mut status = status(goal());
-        status.chat_loop.receiving = tickloop_harness_protocol::Receiving::Paused {
-            reason: tickloop_harness_protocol::PauseReason::HistoryLoaded,
+        status.chat_loop.receiving = tickloop_harness::protocol::Receiving::Paused {
+            reason: tickloop_harness::protocol::PauseReason::HistoryLoaded,
         };
         state.chat = Some(status.id.into());
         state.monitor.set_chat_status(Arc::new(status));
@@ -865,11 +865,11 @@ fn paused_triggers_keep_model_in_the_same_status_line() {
 #[tokio::test]
 async fn goal_budget_input_renders_compact_prefill_and_unit_help() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
-    use tickloop_harness_protocol::GoalAction;
-    let config = tickloop_harness_test_support::config();
-    let core = tickloop_harness_runtime::Agent::new_embedded(
+    use tickloop_harness::protocol::GoalAction;
+    let config = tickloop_harness::test_support::config();
+    let core = tickloop_harness::runtime::Agent::new_embedded(
         config.clone(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     core.hold_goal_continuations_for_tests();
     let agent = ConsoleExecution::from_embedded(core.clone(), config);

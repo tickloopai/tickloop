@@ -1,7 +1,7 @@
-use tickloop_harness_model::cards::built_in_model_profiles;
+use tickloop_harness::model::cards::built_in_model_profiles;
 #[cfg(test)]
-use tickloop_harness_model::cards::upgrade_saved_legacy_builtin_model;
-use tickloop_harness_protocol::{ExecutionMode, ModelConfig, Protocol};
+use tickloop_harness::model::cards::upgrade_saved_legacy_builtin_model;
+use tickloop_harness::protocol::{ExecutionMode, ModelConfig, Protocol};
 
 #[cfg(test)]
 const LEGACY_DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -21,8 +21,8 @@ pub(super) fn model_choices_with_profiles(
     current: &ModelConfig,
     profiles: Vec<ModelConfig>,
 ) -> Vec<ModelConfig> {
-    let defaults = tickloop_harness_model::cards::ModelCatalog::defaults();
-    if tickloop_harness_model::access::AccessCatalog::defaults()
+    let defaults = tickloop_harness::model::cards::ModelCatalog::defaults();
+    if tickloop_harness::model::access::AccessCatalog::defaults()
         .ordinary_candidate(current, &defaults)
         == Some(false)
     {
@@ -41,7 +41,7 @@ pub(super) fn model_choices_with_profiles(
 
 pub(super) fn model_name(config: &ModelConfig) -> &str {
     if let Some(series) =
-        tickloop_harness_model::access::AccessCatalog::defaults().series_for(config)
+        tickloop_harness::model::access::AccessCatalog::defaults().series_for(config)
     {
         &series.name
     } else if config.name.trim().is_empty() {
@@ -103,13 +103,13 @@ pub(super) fn execution_modes() -> Vec<(ExecutionMode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_model::ModelConfigExt;
+    use tickloop_harness::model::ModelConfigExt;
 
     #[test]
     fn ordinary_profiles_offer_only_the_deepseek_primary_protocol() {
-        let current = tickloop_harness_model::cards::migrate_legacy_model(
+        let current = tickloop_harness::model::cards::migrate_legacy_model(
             serde_json::from_str(
-                tickloop_harness_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG,
+                tickloop_harness::test_support::legacy_models::DEEPSEEK_CHAT_CONFIG,
             )
             .unwrap(),
         );
@@ -121,9 +121,9 @@ mod tests {
                 .iter()
                 .filter(|model| model.provider_id == "deepseek-api")
                 .all(|model| model.adapter()
-                    == tickloop_harness_protocol::Adapter::DeepseekChatCompletions)
+                    == tickloop_harness::protocol::Adapter::DeepseekChatCompletions)
         );
-        let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
         assert!(
             catalog
                 .get("deepseek-api", "deepseek-flash-messages")
@@ -138,13 +138,13 @@ mod tests {
 
     #[test]
     fn default_deepseek_chat_completions_profile_keeps_legacy_identity_and_accepts_images() {
-        let mut example = tickloop_harness_model::cards::migrate_legacy_model(
+        let mut example = tickloop_harness::model::cards::migrate_legacy_model(
             serde_json::from_str(
-                tickloop_harness_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG,
+                tickloop_harness::test_support::legacy_models::DEEPSEEK_CHAT_CONFIG,
             )
             .unwrap(),
         );
-        let default = tickloop_harness_model::cards::ModelCatalog::defaults()
+        let default = tickloop_harness::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
         assert_eq!(default.connection(), example.connection());

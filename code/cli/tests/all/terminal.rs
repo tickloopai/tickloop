@@ -1,4 +1,4 @@
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 use crate::support;
 
@@ -602,7 +602,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
     });
     let directory = tempfile::tempdir().unwrap();
     support::cli_runtime::adopt(&directory.path().join("config-root"));
-    let mut config = tickloop_harness_model::cards::ModelCatalog::defaults()
+    let mut config = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
     config.base_url = format!("http://{address}");
@@ -1827,7 +1827,9 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
                 "Write",
                 json!({"file_path":requested_path,"content":"checked output"}),
             ),
-            messages_stream(&tickloop_harness_test_support::auto_classification(false).to_string()),
+            messages_stream(
+                &tickloop_harness::test_support::auto_classification(false).to_string(),
+            ),
             messages_stream("Checked output saved."),
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -2149,8 +2151,8 @@ async fn terminal_can_configure_a_search_service_and_return_source_links() {
     let directory = tempfile::tempdir().unwrap();
     support::cli_runtime::adopt(&directory.path().join("config-root"));
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let search_config = tickloop_harness_protocol::SearchConfig {
-        provider: tickloop_harness_protocol::SearchProviderKind::Searxng,
+    let search_config = tickloop_harness::protocol::SearchConfig {
+        provider: tickloop_harness::protocol::SearchProviderKind::Searxng,
         endpoint: format!("http://{search_address}/search"),
         api_key_env: None,
     };
@@ -3894,7 +3896,7 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
     };
     assert_eq!(
         snapshot.policy.mode,
-        tickloop_harness_protocol::ExecutionMode::Auto,
+        tickloop_harness::protocol::ExecutionMode::Auto,
         "the staged mode replaces the startup acceptEdits mode before the first input runs"
     );
 }

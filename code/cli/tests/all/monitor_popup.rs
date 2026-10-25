@@ -31,7 +31,7 @@ impl State {
     fn new() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tms")
-            .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         std::fs::create_dir(directory.path().join("config")).unwrap();
         std::fs::create_dir(directory.path().join("home")).unwrap();
@@ -351,7 +351,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
 
     let directory = tempfile::Builder::new()
         .prefix("tmp")
-        .tempdir_in(tickloop_harness_test_support::SHORT_TEMP_ROOT)
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
         .unwrap();
     let controller = HostController::new(
         directory.path(),
@@ -383,7 +383,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         })
         .await
         .unwrap();
-    let popup = |grant: &tickloop_harness_protocol::HostedViewGrant| {
+    let popup = |grant: &tickloop_harness::protocol::HostedViewGrant| {
         herdr.request(
             "plugin.pane.open",
             json!({
@@ -501,7 +501,7 @@ fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
     let mut client = HerdrClient::attach(&herdr);
     client.shows("popup");
 
-    let unreachable = tickloop_harness_protocol::HostedViewGrant {
+    let unreachable = tickloop_harness::protocol::HostedViewGrant {
         endpoint: herdr.root.path().join("no-tickhost.sock"),
         host_epoch: Uuid::new_v4(),
         instance: "hosted:00000000-0000-0000-0000-000000000000"

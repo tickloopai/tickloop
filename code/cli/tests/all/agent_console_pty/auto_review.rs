@@ -1,7 +1,7 @@
 use super::*;
 
 async fn malformed_review_recovery(fixture: &PrivateFixture) {
-    let findings = tickloop_harness_test_support::auto_classification(false).to_string();
+    let findings = tickloop_harness::test_support::auto_classification(false).to_string();
     let (url, mut requests, release) = model_http_support::serve_responses_with_gated_response(
         vec![
             (200, chat_reply(Some(("Bash", "checked-command", json!({"command":"env sh -c 'printf admitted > admission-marker'", "description":"controlled approval probe"}))), "Review the requested command.")),

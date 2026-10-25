@@ -6,7 +6,7 @@ use tickloop_code_daemon::EmbeddedAgentAccess;
 
 use tickloop_code_access::{LaunchSpec, ViewRef};
 
-use tickloop_harness_test_support::{input_dialog as dialog, screen};
+use tickloop_harness::test_support::{input_dialog as dialog, screen};
 
 const DIRECTORY: &str = "TICKLOOP_MODEL_DIALOG_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -29,9 +29,9 @@ fn model_dialog_pty_fixture() {
         runtime.block_on(async {
             let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap()).canonicalize().unwrap();
             let root = directory.join("config");
-            tickloop_harness_model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
-            let model = tickloop_harness_model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap();
-            let core = tickloop_harness_runtime::Agent::new_embedded(model.clone(), Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())));
+            tickloop_harness::model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
+            let model = tickloop_harness::model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap();
+            let core = tickloop_harness::runtime::Agent::new_embedded(model.clone(), Arc::new(tickloop_harness::test_support::ScriptedModel::new(Vec::new())));
             let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
             let mut launch = LaunchSpec::embedded(directory.clone());
             launch.model = Some(model);

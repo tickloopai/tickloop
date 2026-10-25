@@ -10,14 +10,14 @@ use tickloop_code_access::{
 };
 use tickloop_code_client::LocalAgentClient;
 use tickloop_code_daemon::{EmbeddedAgentAccess, serve_listener};
-use tickloop_harness_base::image::{MAX_BASE64_BYTES, prepare};
-use tickloop_harness_model::*;
-use tickloop_harness_protocol::{
+use tickloop_harness::base::image::{MAX_BASE64_BYTES, prepare};
+use tickloop_harness::model::*;
+use tickloop_harness::protocol::{
     Content, EventKind, Image, ImageContext, ImageOrigin, ImageSource, InputContext, ModelIdentity,
     ModelProvider, Protocol, RewindMode, Role, Usage,
 };
 
-use tickloop_harness_runtime::Agent;
+use tickloop_harness::runtime::Agent;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -43,11 +43,11 @@ struct TextModel {
 impl ModelClient for TextModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -86,7 +86,7 @@ impl ModelClient for TextModel {
         self.prompt_counts.lock().unwrap().push(count);
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text("The entire original prompt is present."),
+            content: tickloop_harness::test_support::text("The entire original prompt is present."),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -97,11 +97,11 @@ impl ModelClient for TextModel {
 impl ModelClient for ImageModel {
     async fn generate_title(
         &self,
-        request: tickloop_harness_model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        request: tickloop_harness::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
-        Ok(tickloop_harness_test_support::title_output(request))
+    ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
+        Ok(tickloop_harness::test_support::title_output(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -135,7 +135,7 @@ impl ModelClient for ImageModel {
         self.image_counts.lock().unwrap().push(count);
         Ok(ModelOutput {
             private_source: None,
-            content: tickloop_harness_test_support::text("The images remain readable."),
+            content: tickloop_harness::test_support::text("The images remain readable."),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -285,7 +285,7 @@ async fn repeated_legal_images_case(
         image_digest: digest,
         image_counts: std::sync::Mutex::new(Vec::new()),
     });
-    let runtime = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let runtime = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let socket = directory.path().join("history.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -513,7 +513,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
         prompt_digest: digest,
         prompt_counts: std::sync::Mutex::new(Vec::new()),
     });
-    let runtime = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+    let runtime = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let socket = directory.path().join("text.sock");
     let listener = UnixListener::bind(&socket).unwrap();

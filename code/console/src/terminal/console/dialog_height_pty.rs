@@ -2,7 +2,7 @@ use super::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const DIRECTORY: &str = "TICKLOOP_DIALOG_HEIGHT_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(15);

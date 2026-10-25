@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use tickloop_code_access::AgentSummary;
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     AgentColor, ChatId, ChatSnapshot, Content, FamilyCompletion, LocalMessage, LoopState,
     SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SubagentNotificationDelivery,
     SubagentReportMessage, VerifiedUserRelay,
@@ -115,7 +115,7 @@ pub(super) fn subagent_call_runs(
             Some(Role::MutedText),
         ),
         (
-            tool_name(tickloop_harness_protocol::SUBAGENT_TOOL_NAME),
+            tool_name(tickloop_harness::protocol::SUBAGENT_TOOL_NAME),
             Some(Role::ToolName),
         ),
         ("(".into(), None),
@@ -228,8 +228,8 @@ pub(super) fn subagent_report(
 ) -> Option<SubagentReportMessage> {
     let child_run = launch["child_run_id"]
         .as_str()
-        .and_then(tickloop_harness_protocol::RunId::parse)
-        .map(tickloop_harness_protocol::RunId::uuid);
+        .and_then(tickloop_harness::protocol::RunId::parse)
+        .map(tickloop_harness::protocol::RunId::uuid);
     reported(launch["result"].as_str().unwrap_or_default(), || {
         delivered_report(snapshot, child_run?)
     })
@@ -595,7 +595,7 @@ mod tests {
     use super::*;
     use crate::terminal::presentation::joined;
     use serde_json::json;
-    use tickloop_harness_protocol::{FamilyMessageRejection, FamilyMessageRejectionCode};
+    use tickloop_harness::protocol::{FamilyMessageRejection, FamilyMessageRejectionCode};
 
     fn completion(state: LoopState, result: &str, error: Option<&str>) -> FamilyCompletion {
         FamilyCompletion {

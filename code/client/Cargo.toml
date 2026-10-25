@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-harness = { path = "../../harness/sdk" }
 async-trait = "0.1"
 base64 = "0.22"
 libc = "0.2"
@@ -20,7 +21,6 @@ sha2 = "0.10"
 shell-words = "1"
 tempfile = "3"
 tickloop-code-access = { path = "../access" }
-tickloop-harness-protocol = { path = "../../harness/protocol" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tokio = { version = "1", features = ["full"] }

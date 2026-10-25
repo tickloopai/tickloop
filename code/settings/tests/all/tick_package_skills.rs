@@ -9,7 +9,7 @@ use tick_packages::{InstalledPackage, MANIFEST_FILE_NAME, PackageStore, REGISTRY
 use tickloop_code_settings::skills::{
     PACKAGE_ROOT_VARIABLE, SkillCaller, SkillError, SkillRegistry,
 };
-use tickloop_harness_protocol::{InvokedSkill, SkillSource};
+use tickloop_harness::protocol::{InvokedSkill, SkillSource};
 
 /// A package directory `name` under `directory` with its program and `skills`, each a Skill
 /// directory name and its SKILL.md.

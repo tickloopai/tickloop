@@ -3,8 +3,8 @@ use tickloop_code_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tickloop_harness_protocol::{ArtifactTick, ChatId, EventKind, ToolDefinition, ToolResult};
-use tickloop_harness_runtime::{
+use tickloop_harness::protocol::{ArtifactTick, ChatId, EventKind, ToolDefinition, ToolResult};
+use tickloop_harness::runtime::{
     Agent,
     host_tools::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
@@ -62,7 +62,7 @@ async fn run_artifact_tool(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
     agent.submit(chat, prompt.into()).await.unwrap();
     loop {
-        match tickloop_harness_test_support::next_event(&mut events)
+        match tickloop_harness::test_support::next_event(&mut events)
             .await
             .kind
         {
@@ -76,11 +76,11 @@ async fn run_artifact_tool(agent: &Agent, chat: ChatId, prompt: &str) {
 #[tokio::test]
 async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call("create", "create_custom_document", json!({})),
-        tickloop_harness_test_support::text("done"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call("create", "create_custom_document", json!({})),
+        tickloop_harness::test_support::text("done"),
     ]));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     agent
         .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
@@ -122,14 +122,16 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
     let store = directory.path().join("archive");
     let response = || {
         vec![
-            tickloop_harness_test_support::call("create", "create_custom_document", json!({})),
-            tickloop_harness_test_support::text("done"),
+            tickloop_harness::test_support::call("create", "create_custom_document", json!({})),
+            tickloop_harness::test_support::text("done"),
         ]
     };
     let agent = Agent::open_embedded(
         store.clone(),
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(response())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            response(),
+        )),
     )
     .unwrap();
     agent
@@ -145,8 +147,8 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
     drop(agent);
     let restored = Agent::open_embedded(
         store,
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
             [response(), response(), response()].concat(),
         )),
     )
@@ -158,7 +160,7 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
     run_artifact_tool(&restored, chat, "Create the document").await;
     assert!(restored.artifact_ticks(chat).await.unwrap().is_empty());
     let branch = restored
-        .branch_chat(tickloop_harness_protocol::BranchRequest {
+        .branch_chat(tickloop_harness::protocol::BranchRequest {
             request_id: uuid::Uuid::new_v4(),
             source_chat_id: chat,
             name: Some("Removed artifact branch".into()),
@@ -213,21 +215,21 @@ impl HostToolProvider for ArtifactEffects {
 #[tokio::test]
 async fn repeated_confirmed_effects_refresh_metadata_but_failure_and_unknown_do_not_attach() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
         (0..4)
             .flat_map(|index| {
                 vec![
-                    tickloop_harness_test_support::call(
+                    tickloop_harness::test_support::call(
                         &format!("effect-{index}"),
                         "create_custom_document",
                         json!({}),
                     ),
-                    tickloop_harness_test_support::text("done"),
+                    tickloop_harness::test_support::text("done"),
                 ]
             })
             .collect(),
     ));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     let mut created = artifact("Created title");
     created.added_at_ms = 17;
     let mut refreshed = artifact("Updated title");
@@ -285,21 +287,21 @@ async fn repeated_body_reads_show_one_monitor_row_without_feedback_or_subscripti
     };
 
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
         (0..2)
             .flat_map(|index| {
                 vec![
-                    tickloop_harness_test_support::call(
+                    tickloop_harness::test_support::call(
                         &format!("read-{index}"),
                         "read_custom_document",
                         json!({"action":"read","artifact_id":"document-one"}),
                     ),
-                    tickloop_harness_test_support::text("Read."),
+                    tickloop_harness::test_support::text("Read."),
                 ]
             })
             .collect(),
     ));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     let read = |title| {
         let mut tick = artifact(title);
         tick.access_role = "viewer".into();
@@ -360,11 +362,11 @@ async fn repeated_body_reads_show_one_monitor_row_without_feedback_or_subscripti
 #[tokio::test]
 async fn created_slides_attach_to_monitor_under_their_type_name() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
-        tickloop_harness_test_support::call("create", "create_custom_document", json!({})),
-        tickloop_harness_test_support::text("done"),
+    let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+        tickloop_harness::test_support::call("create", "create_custom_document", json!({})),
+        tickloop_harness::test_support::text("done"),
     ]));
-    let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model);
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model);
     let mut slides = artifact("Launch review");
     slides.format = "slides".into();
     agent

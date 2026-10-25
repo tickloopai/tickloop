@@ -11,11 +11,11 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, Content, FileChangeAction, FileChangeReviewSummary, FileIdentity,
     OperationRecord, OperationState, Role, RunId,
 };
-use tickloop_harness_tools::file_change::{
+use tickloop_harness::tools::file_change::{
     FileChangeArtifactError, FileChangeReview, build_file_change_review, load_file_change_review,
 };
 
@@ -841,12 +841,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-    use tickloop_harness_protocol::OperationRecord;
-    use tickloop_harness_protocol::PreparedFileChange;
-    use tickloop_harness_protocol::{InputModality, Message, ModelConfig, Protocol};
-    use tickloop_harness_runtime::Agent;
-    use tickloop_harness_tools::{Tools, Workspace};
+    use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_harness::protocol::OperationRecord;
+    use tickloop_harness::protocol::PreparedFileChange;
+    use tickloop_harness::protocol::{InputModality, Message, ModelConfig, Protocol};
+    use tickloop_harness::runtime::Agent;
+    use tickloop_harness::tools::{Tools, Workspace};
 
     struct UnusedModel;
 
@@ -854,19 +854,19 @@ mod tests {
     impl ModelClient for UnusedModel {
         async fn generate_title(
             &self,
-            request: tickloop_harness_model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+            request: tickloop_harness::model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_harness::model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError>
+        ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError>
         {
-            Ok(tickloop_harness_model::fixture_title(request))
+            Ok(tickloop_harness::model::fixture_title(request))
         }
 
-        fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
-            tickloop_harness_protocol::ModelIdentity {
-                provider: tickloop_harness_protocol::ModelProvider::Api,
+        fn identity(&self) -> tickloop_harness::protocol::ModelIdentity {
+            tickloop_harness::protocol::ModelIdentity {
+                provider: tickloop_harness::protocol::ModelProvider::Api,
                 profile: "fixture".into(),
-                protocol: tickloop_harness_protocol::Protocol::Messages,
+                protocol: tickloop_harness::protocol::Protocol::Messages,
                 requested_model: "fixture".into(),
             }
         }
@@ -883,8 +883,8 @@ mod tests {
 
     fn model_config() -> ModelConfig {
         ModelConfig {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
-            auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_harness::protocol::ModelProvider::Api,
+            auth_source: tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv,
             name: "catalog-test".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -1053,7 +1053,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| line.kind
-                    == tickloop_harness_tools::file_change::FileChangeLineKind::Added
+                    == tickloop_harness::tools::file_change::FileChangeLineKind::Added
                     && line.text == "staged")
         );
 
@@ -1075,7 +1075,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == tickloop_harness_tools::file_change::FileChangeLineKind::Removed
+                    line.kind == tickloop_harness::tools::file_change::FileChangeLineKind::Removed
                         && line.text == "staged"
                 })
         );
@@ -1085,7 +1085,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == tickloop_harness_tools::file_change::FileChangeLineKind::Added
+                    line.kind == tickloop_harness::tools::file_change::FileChangeLineKind::Added
                         && line.text == "working"
                 })
         );
@@ -1170,7 +1170,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == tickloop_harness_tools::file_change::FileChangeLineKind::Added
+                    line.kind == tickloop_harness::tools::file_change::FileChangeLineKind::Added
                         && line.text == "staged"
                 })
         );
@@ -1180,7 +1180,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == tickloop_harness_tools::file_change::FileChangeLineKind::Removed
+                    line.kind == tickloop_harness::tools::file_change::FileChangeLineKind::Removed
                         && line.text == "staged"
                 })
         );

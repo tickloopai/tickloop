@@ -1,7 +1,7 @@
 //! The AgentAccess contract: the commands, observations, receipts and errors a View, the daemon
 //! and its workers exchange, and the messages that carry them over one connection.
 
-use tickloop_harness_protocol::OtherTickhost;
+use tickloop_harness::protocol::OtherTickhost;
 
 use std::{
     collections::BTreeMap,
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
     CommandSnapshot, DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode,
@@ -153,7 +153,7 @@ pub struct RecordedMessage {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecordedTranscript {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub goal_history: Vec<tickloop_harness_protocol::GoalHistoryEntry>,
+    pub goal_history: Vec<tickloop_harness::protocol::GoalHistoryEntry>,
     pub record: TranscriptRef,
     pub title: Option<String>,
     pub folder: PathBuf,
@@ -277,7 +277,7 @@ pub enum AgentCommand {
     LinkArtifact {
         execution: ExecutionRef,
         tick: ArtifactTick,
-        history: tickloop_harness_protocol::ArtifactFeedbackHistory,
+        history: tickloop_harness::protocol::ArtifactFeedbackHistory,
     },
     ListArtifactTicks {
         execution: ExecutionRef,
@@ -381,7 +381,7 @@ pub enum AgentCommand {
     /// A `/goal` command for the Chat's goal.
     ManageGoal {
         execution: ExecutionRef,
-        action: tickloop_harness_protocol::GoalAction,
+        action: tickloop_harness::protocol::GoalAction,
     },
     ClearCompletedTasks {
         execution: ExecutionRef,
@@ -449,7 +449,7 @@ pub enum ConfigurationChange {
         enabled: bool,
     },
     GenerateAutoEnvironment {
-        options: tickloop_harness_protocol::AutoSetupOptions,
+        options: tickloop_harness::protocol::AutoSetupOptions,
     },
     Model {
         config: ModelConfig,
@@ -561,7 +561,7 @@ pub enum LoopAction {
     /// requests: confirming starts its timing, rejecting deletes it.
     DecideScheduledTask {
         task_id: Uuid,
-        decision: tickloop_harness_protocol::ScheduledTaskDecision,
+        decision: tickloop_harness::protocol::ScheduledTaskDecision,
     },
 }
 
@@ -1034,7 +1034,7 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
-    AutoEnvironmentDraft(tickloop_harness_protocol::AutoEnvironmentDraft),
+    AutoEnvironmentDraft(tickloop_harness::protocol::AutoEnvironmentDraft),
     ArtifactTicks(Vec<ArtifactTick>),
     MonitorMembership(MonitorMembership),
     HostedTicks(Vec<HostedMember>),

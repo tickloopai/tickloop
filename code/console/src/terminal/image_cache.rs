@@ -17,10 +17,10 @@ use uuid::Uuid;
 
 use super::hyperlink::Hyperlink;
 use tickloop_code_settings::IMAGE_CACHE_DIRECTORY;
-use tickloop_harness_base::private_fs::{
+use tickloop_harness::base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
 };
-use tickloop_harness_protocol::{Image, ImageMediaType};
+use tickloop_harness::protocol::{Image, ImageMediaType};
 
 const PLACEHOLDER_PREFIX: &str = "[Image #";
 const PLACEHOLDER_SUFFIX: char = ']';
@@ -132,7 +132,7 @@ mod tests {
         ::image::DynamicImage::ImageRgba8(::image::RgbaImage::new(width, height))
             .write_to(&mut io::Cursor::new(&mut bytes), ::image::ImageFormat::Png)
             .unwrap();
-        tickloop_harness_base::image::prepare(&bytes).unwrap()
+        tickloop_harness::base::image::prepare(&bytes).unwrap()
     }
 
     #[test]

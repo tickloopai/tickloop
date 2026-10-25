@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     time::{Duration, Instant},
 };
-use tickloop_harness_artifacts::{ArtifactMetadata, ArtifactPage};
+use tickloop_harness::artifacts::{ArtifactMetadata, ArtifactPage};
 use uuid::Uuid;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -29,7 +29,7 @@ pub(super) struct ArtifactLoad {
 }
 #[derive(Clone, Debug)]
 pub(super) enum ArtifactPickerAction {
-    Add(tickloop_harness_protocol::ArtifactFeedbackHistory),
+    Add(tickloop_harness::protocol::ArtifactFeedbackHistory),
     Open,
     Copy,
     Pin(bool),
@@ -236,9 +236,9 @@ impl ArtifactsPicker {
                 (KeyCode::Enter, KeyModifiers::NONE) if self.feedback_history_visible => {
                     let artifact = artifact.clone();
                     let history = if *selected == 0 {
-                        tickloop_harness_protocol::ArtifactFeedbackHistory::NewOnly
+                        tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly
                     } else {
-                        tickloop_harness_protocol::ArtifactFeedbackHistory::All
+                        tickloop_harness::protocol::ArtifactFeedbackHistory::All
                     };
                     self.feedback_history = None;
                     return self.choice(artifact, ArtifactPickerAction::Add(history));
@@ -484,7 +484,7 @@ impl ArtifactsPicker {
         let mut targets = Vec::new();
         let mut selected_row = 0;
         let mut previous_group = None;
-        let now = tickloop_harness_base::private_fs::unix_time_milliseconds();
+        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
         for index in self.picker.matching_indices() {
             let artifact = &self.entries[*index];
             let added = self.added.contains(&artifact.id);
@@ -525,7 +525,7 @@ impl ArtifactsPicker {
             let updated = artifact
                 .updated_at
                 .as_deref()
-                .and_then(tickloop_harness_base::timestamp::parse_timestamp_ms)
+                .and_then(tickloop_harness::base::timestamp::parse_timestamp_ms)
                 .map(|value| value.max(0) as u64);
             rows.push(RoleLine::role(
                 format!(
@@ -624,14 +624,14 @@ mod tests {
         picker.frame(80, 8, DisplayProfile::default());
         assert!(
             matches!(picker.key(enter), ArtifactPickerEffect::Choice(choice)
-            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_harness_protocol::ArtifactFeedbackHistory::NewOnly)))
+            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly)))
         );
         picker.key(enter);
         picker.frame(80, 8, DisplayProfile::default());
         picker.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(
             matches!(picker.key(enter), ArtifactPickerEffect::Choice(choice)
-            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_harness_protocol::ArtifactFeedbackHistory::All)))
+            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_harness::protocol::ArtifactFeedbackHistory::All)))
         );
     }
 

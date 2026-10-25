@@ -16,9 +16,9 @@ use tickloop_code_access::{
     HostLocation, HostWorkContext, LaunchSpec, UserInput, ViewRef,
 };
 use tickloop_code_daemon::EmbeddedAgentAccess;
-use tickloop_harness_protocol::{EventKind, UserShellRecord, UserShellState};
+use tickloop_harness::protocol::{EventKind, UserShellRecord, UserShellState};
 
-use tickloop_harness_runtime::Agent as RuntimeAgent;
+use tickloop_harness::runtime::Agent as RuntimeAgent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -111,7 +111,7 @@ async fn run_navigation(
     let destination_host = host_location(socket, &second_pane);
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let mut launch_a = LaunchSpec::embedded(work_a.clone());
-    launch_a.model = Some(tickloop_harness_test_support::config());
+    launch_a.model = Some(tickloop_harness::test_support::config());
     launch_a.session_persistence = false;
     launch_a.host_work_context = Some(HostWorkContext {
         socket: socket.into(),
@@ -360,8 +360,10 @@ async fn isolated_herdr_terminal_navigation_focuses_then_recovers_moved_and_clos
     let workspace = created["workspace"]["workspace_id"].as_str().unwrap();
     let first_pane: Pane = serde_json::from_value(created["root_pane"].clone()).unwrap();
     let runtime = RuntimeAgent::new_embedded(
-        tickloop_harness_test_support::config(),
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(Vec::new())),
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+            Vec::new(),
+        )),
     );
     let result = AssertUnwindSafe(run_navigation(
         &host,

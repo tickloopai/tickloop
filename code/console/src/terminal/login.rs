@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use tickloop_harness_model::auth::{
+use tickloop_harness::model::auth::{
     AuthError, BrowserCallback, CodexAuth,
     copilot::{self, CopilotAuth},
     minimax::{MiniMaxAuth, MiniMaxRegion},
@@ -14,7 +14,7 @@ use super::{
     console::{Console, Menu},
     safe_text,
 };
-use tickloop_harness_protocol::ModelAuthSource;
+use tickloop_harness::protocol::ModelAuthSource;
 
 #[derive(Clone, Copy)]
 pub(super) enum LoginMethod {
@@ -24,7 +24,7 @@ pub(super) enum LoginMethod {
     MiniMax(MiniMaxRegion),
     Copilot,
     Google,
-    Subscription(tickloop_harness_model::auth::device_subscriptions::DeviceSubscription),
+    Subscription(tickloop_harness::model::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl LoginMethod {
@@ -48,7 +48,7 @@ pub(super) enum SignInTarget {
     MiniMax(MiniMaxRegion),
     Copilot,
     Google,
-    Subscription(tickloop_harness_model::auth::device_subscriptions::DeviceSubscription),
+    Subscription(tickloop_harness::model::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl SignInTarget {
@@ -57,7 +57,7 @@ impl SignInTarget {
             return Some(Self::Google);
         }
         if let Some(provider) =
-            tickloop_harness_model::auth::device_subscriptions::DeviceSubscription::from_auth(
+            tickloop_harness::model::auth::device_subscriptions::DeviceSubscription::from_auth(
                 source,
             )
         {
@@ -192,7 +192,7 @@ impl LoginFlow {
         let task = tokio::spawn(async move {
             if let LoginMethod::Artifact = method {
                 let result = async {
-                    let client = tickloop_harness_artifacts::ArtifactClient::new(root)
+                    let client = tickloop_harness::artifacts::ArtifactClient::new(root)
                         .map_err(|error| error.to_string())?;
                     let device = client
                         .start_device_login()
@@ -213,7 +213,7 @@ impl LoginFlow {
                 return;
             }
             if let LoginMethod::Google = method {
-                let auth = tickloop_harness_model::auth::google::GoogleAuth::new(root);
+                let auth = tickloop_harness::model::auth::google::GoogleAuth::new(root);
                 let result = async {
                     let login = auth.start_browser_login(&task_cancel).await?;
                     let address = login.browser.authorization_url.clone();
@@ -224,13 +224,13 @@ impl LoginFlow {
                     tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
                 }.await;
                 let _ = updates.send(LoginUpdate::Finished(
-                    result.map_err(|error: tickloop_harness_model::ModelError| error.to_string()),
+                    result.map_err(|error: tickloop_harness::model::ModelError| error.to_string()),
                 ));
                 return;
             }
             if let LoginMethod::Subscription(provider) = method {
                 let auth =
-                    tickloop_harness_model::auth::device_subscriptions::SubscriptionAuth::new(
+                    tickloop_harness::model::auth::device_subscriptions::SubscriptionAuth::new(
                         root, provider,
                     );
                 let result = async {
@@ -245,7 +245,7 @@ impl LoginFlow {
                 let _ = updates.send(LoginUpdate::Finished(
                     result
                         .map(|access| access.identity.to_string())
-                        .map_err(|error: tickloop_harness_model::ModelError| error.to_string()),
+                        .map_err(|error: tickloop_harness::model::ModelError| error.to_string()),
                 ));
                 return;
             }
@@ -578,41 +578,42 @@ impl LogoutFlow {
         ))?;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
-        let task = tokio::spawn(async move {
-            match target {
-                SignInTarget::MiniMax(region) => MiniMaxAuth::new(root, region)
-                    .logout(&task_cancel)
-                    .await
-                    .map_err(|error| match error {
-                        tickloop_harness_model::auth::minimax::MiniMaxAuthError::Cancelled => {
-                            AuthError::Cancelled
-                        }
-                        _ => AuthError::MiniMax(error.to_string()),
-                    }),
-                SignInTarget::Copilot => {
-                    CopilotAuth::new(root)
+        let task =
+            tokio::spawn(async move {
+                match target {
+                    SignInTarget::MiniMax(region) => MiniMaxAuth::new(root, region)
+                        .logout(&task_cancel)
+                        .await
+                        .map_err(|error| match error {
+                            tickloop_harness::model::auth::minimax::MiniMaxAuthError::Cancelled => {
+                                AuthError::Cancelled
+                            }
+                            _ => AuthError::MiniMax(error.to_string()),
+                        }),
+                    SignInTarget::Copilot => CopilotAuth::new(root)
                         .logout(&task_cancel)
                         .await
                         .map_err(|error| match error {
                             copilot::CopilotAuthError::Cancelled => AuthError::Cancelled,
                             _ => AuthError::Copilot(error.to_string()),
-                        })
+                        }),
+                    SignInTarget::Google => {
+                        tickloop_harness::model::auth::google::GoogleAuth::new(root)
+                            .logout(&task_cancel)
+                            .await
+                            .map_err(|error| AuthError::Provider(error.to_string()))
+                    }
+                    SignInTarget::Subscription(provider) => {
+                        tickloop_harness::model::auth::device_subscriptions::SubscriptionAuth::new(
+                            root, provider,
+                        )
+                        .logout(&task_cancel)
+                        .await
+                        .map_err(|error| AuthError::Provider(error.to_string()))
+                    }
+                    SignInTarget::Codex => terminal_auth(root).logout(&task_cancel).await,
                 }
-                SignInTarget::Google => tickloop_harness_model::auth::google::GoogleAuth::new(root)
-                    .logout(&task_cancel)
-                    .await
-                    .map_err(|error| AuthError::Provider(error.to_string())),
-                SignInTarget::Subscription(provider) => {
-                    tickloop_harness_model::auth::device_subscriptions::SubscriptionAuth::new(
-                        root, provider,
-                    )
-                    .logout(&task_cancel)
-                    .await
-                    .map_err(|error| AuthError::Provider(error.to_string()))
-                }
-                SignInTarget::Codex => terminal_auth(root).logout(&task_cancel).await,
-            }
-        });
+            });
         Ok(Self { cancel, task })
     }
 
@@ -703,7 +704,7 @@ async fn launch_browser_result(address: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_test_support::{input_dialog, screen};
+    use tickloop_harness::test_support::{input_dialog, screen};
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::json;
@@ -931,7 +932,7 @@ mod tests {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -1095,7 +1096,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         if let Some(model) = selected_model {
-            let config = tickloop_harness_model::cards::ModelCatalog::defaults()
+            let config = tickloop_harness::model::cards::ModelCatalog::defaults()
                 .get("openai-codex", model)
                 .unwrap();
             tickloop_code_settings::UserSettings::in_root(&root.join("state"))
@@ -1288,7 +1289,7 @@ mod tests {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use tickloop_code_settings::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
-use tickloop_harness_base::private_fs::{PRIVATE_FILE_MODE, unix_time_milliseconds};
+use tickloop_harness::base::private_fs::{PRIVATE_FILE_MODE, unix_time_milliseconds};
 
 const HISTORY_FILE_NAME: &str = "history.jsonl";
 const MAX_HISTORY_ITEMS: usize = 100;

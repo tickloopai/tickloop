@@ -1,4 +1,4 @@
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ChatSnapshot, CommandSnapshot, Content, Event, EventKind, FamilyCompletion, FamilyInputRecord,
     ModelRequestKind, Protocol, Role,
 };
@@ -201,7 +201,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             .flatten();
         if matches!(
             trigger,
-            Some(tickloop_harness_protocol::TriggerIdentity::GoalContinuation { .. })
+            Some(tickloop_harness::protocol::TriggerIdentity::GoalContinuation { .. })
         ) {
             blocks.push(ConversationBlock {
                 id: ConversationBlockId::MessageContent {
@@ -516,7 +516,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         ),
         EventKind::Interrupted => outcome_block(event, ConversationOutcome::Interrupted),
         EventKind::ScheduledTasksChanged {
-            notice: Some(tickloop_harness_protocol::ScheduledTaskNotice::WakeupCancelled { .. }),
+            notice: Some(tickloop_harness::protocol::ScheduledTaskNotice::WakeupCancelled { .. }),
         } => ConversationBlock {
             id: ConversationBlockId::Event {
                 chat_id: event.chat_id.into(),
@@ -720,9 +720,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use tickloop_harness_protocol::Message;
-    use tickloop_harness_protocol::ToolResult;
-    use tickloop_harness_protocol::{
+    use tickloop_harness::protocol::Message;
+    use tickloop_harness::protocol::ToolResult;
+    use tickloop_harness::protocol::{
         HostNote, PermissionRequest, Plan, Question, QuestionOption, QuestionRequest,
     };
 
@@ -736,9 +736,9 @@ mod tests {
             "chat_loop": {"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
         }))
         .unwrap();
-        snapshot.model = tickloop_harness_protocol::ModelConfig {
-            provider: tickloop_harness_protocol::ModelProvider::Api,
-            auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
+        snapshot.model = tickloop_harness::protocol::ModelConfig {
+            provider: tickloop_harness::protocol::ModelProvider::Api,
+            auth_source: tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv,
             name: "fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -750,7 +750,7 @@ mod tests {
             model_id: String::new(),
             connection: None,
             card: None,
-            input_modalities: vec![tickloop_harness_protocol::InputModality::Text],
+            input_modalities: vec![tickloop_harness::protocol::InputModality::Text],
         };
         snapshot
     }
@@ -849,7 +849,7 @@ mod tests {
         snapshot.permissions.push(PermissionRequest {
             id: permission_id,
             loop_id: loop_id.into(),
-            execution: tickloop_harness_protocol::PermissionExecution::ToolCall {
+            execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
                 run_id: run_id.into(),
                 call_id: "call".into(),
             },
@@ -857,7 +857,7 @@ mod tests {
             input: json!({"command":"pwd"}),
             file_change: None,
             approval_reason: None,
-            approval_source: tickloop_harness_protocol::PermissionApprovalSource::default(),
+            approval_source: tickloop_harness::protocol::PermissionApprovalSource::default(),
         });
         snapshot.questions.push(QuestionRequest {
             id: question_id,
@@ -1138,7 +1138,7 @@ mod tests {
             run_id: Uuid::new_v4().into(),
             kind: EventKind::ScheduledTasksChanged {
                 notice: Some(
-                    tickloop_harness_protocol::ScheduledTaskNotice::WakeupCancelled {
+                    tickloop_harness::protocol::ScheduledTaskNotice::WakeupCancelled {
                         task_id: Uuid::from_u128(0x0123_abcd),
                     },
                 ),

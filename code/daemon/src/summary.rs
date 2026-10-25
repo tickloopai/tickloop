@@ -1,7 +1,7 @@
 //! The facts an Agent row summarizes from a Chat's Loops and user Shells, shared by the daemon
 //! and its workers.
 
-use tickloop_harness_protocol::{LoopSnapshot, LoopState, RunId, UserShellRecord};
+use tickloop_harness::protocol::{LoopSnapshot, LoopState, RunId, UserShellRecord};
 
 /// The Loop's run when the row reports the Loop's own state.
 pub(crate) fn summary_run_id(chat_loop: &LoopSnapshot, state: &LoopState) -> Option<RunId> {
@@ -49,7 +49,7 @@ mod tests {
         );
         let mut waiting = chat_loop.clone();
         waiting.state = LoopState::WaitingQuestion;
-        let state = tickloop_harness_runtime::summary_state(&waiting, &[]);
+        let state = tickloop_harness::runtime::summary_state(&waiting, &[]);
         assert_eq!(summary_run_id(&waiting, &state), waiting.run_id);
         assert_eq!(run_started_at(&waiting, &state), None);
         chat_loop.state_since = Some(30_000);
@@ -68,7 +68,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            tickloop_harness_runtime::summary_state(&chat_loop, std::slice::from_ref(&shell)),
+            tickloop_harness::runtime::summary_state(&chat_loop, std::slice::from_ref(&shell)),
             LoopState::Running
         );
         assert_eq!(

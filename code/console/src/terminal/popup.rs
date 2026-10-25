@@ -24,11 +24,11 @@ use tickhost_connect::{
 use tokio_util::sync::CancellationToken;
 
 use tickloop_code_settings::{MonitorPopup, UserSettings};
-use tickloop_harness_base::private_fs::{
+use tickloop_harness::base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, current_uid, replace_file_atomically,
     verify_private_directory,
 };
-use tickloop_harness_protocol::{ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedViewGrant};
+use tickloop_harness::protocol::{ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedViewGrant};
 
 pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
 const PLUGIN_NAME: &str = "Tickloop Monitor";

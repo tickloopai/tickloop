@@ -2,7 +2,7 @@ use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture, TIMEOUT};
 use super::*;
 #[cfg(test)]
 use tickloop_code_local_environment::AgentLocalExt;
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 const SEND_NOW_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// What a terminal speaking the kitty keyboard protocol sends for ctrl+enter.
@@ -14,8 +14,8 @@ const QUEUED_REPLY: &str = "Answered the queued message.";
 
 /// A Bash call that only ends when the fixture directory gets a `finish` file, which the
 /// driver never writes: only an interruption ends it.
-fn waiting_tool(id: &str) -> Vec<tickloop_harness_protocol::Content> {
-    tickloop_harness_test_support::call(
+fn waiting_tool(id: &str) -> Vec<tickloop_harness::protocol::Content> {
+    tickloop_harness::test_support::call(
         id,
         "Bash",
         serde_json::json!({
@@ -73,15 +73,15 @@ fn send_now_pty_fixture() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let model = tickloop_harness_test_support::config();
+                    let model = tickloop_harness::test_support::config();
                     let scripted =
-                        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
+                        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
                             waiting_tool("first-wait"),
-                            tickloop_harness_test_support::text(TYPED_NOW_REPLY),
+                            tickloop_harness::test_support::text(TYPED_NOW_REPLY),
                             waiting_tool("second-wait"),
-                            tickloop_harness_test_support::text(QUEUED_REPLY),
+                            tickloop_harness::test_support::text(QUEUED_REPLY),
                         ]));
-                    let core = tickloop_harness_runtime::Agent::new_embedded(
+                    let core = tickloop_harness::runtime::Agent::new_embedded(
                         model.clone(),
                         scripted.clone(),
                     );
@@ -93,15 +93,15 @@ fn send_now_pty_fixture() {
                     let chat = agent.create_chat(directory.clone()).await.unwrap();
                     core.set_execution_mode(
                         chat.into(),
-                        tickloop_harness_protocol::ExecutionMode::AcceptEdits,
+                        tickloop_harness::protocol::ExecutionMode::AcceptEdits,
                     )
                     .await
                     .unwrap();
                     core.set_permission_rules(
                         chat.into(),
-                        vec![tickloop_harness_protocol::PermissionRule {
+                        vec![tickloop_harness::protocol::PermissionRule {
                             id: Uuid::new_v4(),
-                            decision: tickloop_harness_protocol::Decision::Allow,
+                            decision: tickloop_harness::protocol::Decision::Allow,
                             tool: "Bash".into(),
                             specifier: None,
                             input: None,
@@ -117,7 +117,7 @@ fn send_now_pty_fixture() {
                         &console,
                         Some(&model),
                         &directory,
-                        tickloop_harness_protocol::ExecutionMode::AcceptEdits,
+                        tickloop_harness::protocol::ExecutionMode::AcceptEdits,
                         vec![],
                     )
                     .unwrap();
@@ -150,11 +150,11 @@ fn send_now_pty_fixture() {
                                 .messages
                                 .iter()
                                 .filter(|message| {
-                                    message.role == tickloop_harness_protocol::Role::User
+                                    message.role == tickloop_harness::protocol::Role::User
                                 })
                                 .flat_map(|message| &message.content)
                                 .filter_map(|content| match content {
-                                    tickloop_harness_protocol::Content::Text { text } => {
+                                    tickloop_harness::protocol::Content::Text { text } => {
                                         Some(text.clone())
                                     }
                                     _ => None,

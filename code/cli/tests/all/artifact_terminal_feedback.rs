@@ -10,7 +10,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_harness_artifacts::ArtifactClient;
+use tickloop_harness::artifacts::ArtifactClient;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

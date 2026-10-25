@@ -1,4 +1,4 @@
-use tickloop_harness_test_support::screen;
+use tickloop_harness::test_support::screen;
 
 use crate::support;
 
@@ -38,7 +38,7 @@ impl TerminalFixture {
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
         command.env("HOME", root.join("home"));
         command.env("TICKLOOP_TMPDIR", root.join("tmp"));
-        for model in tickloop_harness_model::cards::built_in_model_profiles() {
+        for model in tickloop_harness::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }

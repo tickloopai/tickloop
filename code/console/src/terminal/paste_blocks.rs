@@ -1,5 +1,5 @@
 use std::{fmt, ops::Range};
-use tickloop_harness_protocol::{Image, ImageContext, ImageOrigin};
+use tickloop_harness::protocol::{Image, ImageContext, ImageOrigin};
 
 pub(super) const LARGE_PASTE_CHARACTER_THRESHOLD: usize = 800;
 pub(super) const LARGE_PASTE_LINE_THRESHOLD: usize = 3;
@@ -889,7 +889,7 @@ mod tests {
 
     fn image(width: u32) -> Image {
         Image {
-            media_type: tickloop_harness_protocol::ImageMediaType::Png,
+            media_type: tickloop_harness::protocol::ImageMediaType::Png,
             data: "iVBORw0KGgo=".into(),
             width,
             height: 1,

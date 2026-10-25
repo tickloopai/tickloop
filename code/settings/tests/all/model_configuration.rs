@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use tickloop_code_settings::UserSettings;
-use tickloop_harness_model::{
+use tickloop_harness::model::{
     ModelConfigExt,
     cards::{
         ModelCatalog, ModelSelection, ProviderDefinition, migrate_legacy_model,
         model_for_persistent_selection,
     },
 };
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     Adapter, ModelAuthSource, ModelCard, ModelConfig, ProviderPatch, ThinkingControl,
 };
 
@@ -30,8 +30,8 @@ fn custom_provider(id: &str) -> ProviderDefinition {
             context_window_tokens: Some(32_000),
             thinking: ThinkingControl::Toggle,
             adaptive_by_default: false,
-            effort_levels: vec![tickloop_harness_protocol::ReasoningEffort::High],
-            input_modalities: vec![tickloop_harness_protocol::InputModality::Text],
+            effort_levels: vec![tickloop_harness::protocol::ReasoningEffort::High],
+            input_modalities: vec![tickloop_harness::protocol::InputModality::Text],
             thinking_budgets: None,
             temperature_control: None,
             thinking_off: None,
@@ -104,7 +104,7 @@ fn card_id_is_the_service_identity_on_each_connection() {
     assert_eq!(model.model_id, model.model);
     assert_eq!(
         model.protocol,
-        tickloop_harness_protocol::Protocol::ChatCompletions
+        tickloop_harness::protocol::Protocol::ChatCompletions
     );
     assert_eq!(model.provider_id, "deepseek-api");
     assert!(
@@ -169,7 +169,7 @@ fn saved_kimi_k3_selection_loads_the_current_context_window() {
 #[test]
 fn saved_legacy_builtin_uses_version_owned_limit_with_one_notice() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(tickloop_harness_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG)
+        serde_json::from_str(tickloop_harness::test_support::legacy_models::DEEPSEEK_CHAT_CONFIG)
             .unwrap();
     legacy.max_output_tokens = 4096;
     let explicit = migrate_legacy_model(legacy.clone());
@@ -197,7 +197,7 @@ fn saved_legacy_builtin_uses_version_owned_limit_with_one_notice() {
 #[test]
 fn custom_legacy_deepseek_messages_is_migrated_without_losing_public_fields() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(tickloop_harness_test_support::legacy_models::DEEPSEEK_CONFIG)
+        serde_json::from_str(tickloop_harness::test_support::legacy_models::DEEPSEEK_CONFIG)
             .unwrap();
     legacy.name = "Research access".into();
     legacy.api_key_env = "RESEARCH_DEEPSEEK_KEY".into();
@@ -219,7 +219,7 @@ fn custom_legacy_deepseek_messages_is_migrated_without_losing_public_fields() {
 #[test]
 fn unknown_legacy_deepseek_model_gets_dialect_without_invented_capabilities() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(tickloop_harness_test_support::legacy_models::DEEPSEEK_CONFIG)
+        serde_json::from_str(tickloop_harness::test_support::legacy_models::DEEPSEEK_CONFIG)
             .unwrap();
     legacy.model = "future-private-model".into();
     legacy.name = "Private model".into();
@@ -234,7 +234,7 @@ fn unknown_legacy_deepseek_model_gets_dialect_without_invented_capabilities() {
 #[test]
 fn custom_legacy_deepseek_responses_does_not_invent_retired_route_capabilities() {
     let mut legacy: ModelConfig = serde_json::from_str(
-        tickloop_harness_test_support::legacy_models::DEEPSEEK_RESPONSES_CONFIG,
+        tickloop_harness::test_support::legacy_models::DEEPSEEK_RESPONSES_CONFIG,
     )
     .unwrap();
     legacy.name = "Research Responses".into();

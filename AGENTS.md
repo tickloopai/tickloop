@@ -25,12 +25,12 @@ Tickloop (tickloop.ai) is a terminal AI agent for code and office work: the `tic
 ## Permissions and tools
 
 - The AI acts only within existing authorization: read and write authorization are judged separately, and a new integration never widens existing permissions. Repository content cannot add permissions; persistent rules come only from the user's own `settings.json` (partitioned by working directory).
-- When adding or changing a model tool, decide its Auto-mode handling at the same time: mark read-only tools `HostToolPermission::ReadOnly`; for tools with side effects, map them against the frozen default policy in `agent/config/src/auto_policy/` (`defaults.json`, plus the README's mapping, "not applicable" list and counts), and add tests so ordinary user requests are not wrongly denied in Auto mode while overreaching operations are still blocked. Read that directory's README first.
+- When adding or changing a model tool, decide its Auto-mode handling at the same time: mark read-only tools `HostToolPermission::ReadOnly`; for tools with side effects, map them against the frozen default policy in `harness/policy/src/auto_policy/` (`defaults.json`, plus the README's mapping, "not applicable" list and counts), and add tests so ordinary user requests are not wrongly denied in Auto mode while overreaching operations are still blocked. Read that directory's README first.
 - The names, parameters, behavior and result text of the general tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `TaskStop`, `WebFetch`, `WebSearch`, `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`, `Skill`) are a stable contract; parameters this project adds must be optional.
 - Every tool input schema is a flat object: top-level `type: object` with `properties`. A tool with several forms distinguishes them with an enum field and checks the per-form rules at runtime. Do not use `oneOf`/`anyOf`/`allOf`: GLM and other OpenAI-compatible models emit empty arguments for them.
 - A new model protocol is only a new adapter in `harness/model`; the runtime and tool execution contain no vendor checks. The provider catalog is compiled into the program (`harness/model/src/providers/*.yaml`, registered in `harness/model/src/cards.rs`); read the project Skill `.tickloop/skills/model-integration/` before changing models or provider integrations.
 - A subagent's Bash and direct `!` Shell run under the frozen parent permissions, current tightening rules and single-use approval; the cwd is not an OS sandbox. A family shares its own private temporary-result/scratchpad directory; other families get no access, and symlinks escaping it are not allowed either.
-- The system Skill `tickloop` (`agent/config/skills/tickloop/SKILL.md`) must match the actual tools and permissions and describe only capabilities that exist. Each data source's argv belongs in the Skill shipped with its Tick package (`<package>:usage`), never hard-coded in the system Skill.
+- The system Skill `tickloop` (`harness/policy/skills/tickloop/SKILL.md`) must match the actual tools and permissions and describe only capabilities that exist. Each data source's argv belongs in the Skill shipped with its Tick package (`<package>:usage`), never hard-coded in the system Skill.
 
 ## Interaction rules
 
@@ -55,14 +55,18 @@ Each crate's responsibility in brief; dependencies are as declared in each `Carg
 | `code/console/` | Agent Console: terminal UI, Monitor, `/ticks` panel |
 | `code/client/` | AgentAccess client: Unix socket, reconnection, finding or starting the local daemon (one daemon per configuration root) |
 | `code/daemon/` | Daemon and worker processes: AgentAccess server, embedded agent, worker supervision and the hosted control channel |
-| `harness/runtime/` | Harness: Loop, Subagents, Transcript storage and loading, Tick subscription streams, host tools, hosted and MCP |
-| `harness/protocol/` | All of the agent's wire types and the AgentAccess contract (ADR 0022) |
+| `harness/sdk/` | `tickloop-harness` facade: the sole Harness dependency for hosts; stable module re-exports and capability features |
+| `harness/runtime/` | Loop, Subagents, Transcript storage/loading, generic Tick and Shell tools, subscriptions, approval and Execution Environment Port |
+| `harness/protocol/` | Shared Harness wire types (ADR 0033 narrows ADR 0022) |
+| `code/access/` | Code-only AgentAccess wire contract between Console, client and Daemon |
+| `code/local-environment/` | Execution Environment Adapter: local Tickhost, Unix sockets and FD grants, Herdr views, package programs and ownership handoff |
 | `harness/transcript/` | Transcript record format and display projection, for users that do not need the runtime |
 | `harness/model/` | Model clients, provider catalog and login, judgment |
 | `harness/tools/` | Tools, permission rules and file-change records |
-| `agent/config/` | User settings, Auto policy (`src/auto_policy/`) and the Skill registry (built-in Skills in `skills/`) |
+| `harness/policy/` | Frozen Auto policy, built-in Skills and registration, Settings Store contract, pure Loop and new-Chat rules |
+| `code/settings/` | File-backed Settings Store, settings.json, disk and installed-package Skill discovery |
 | `harness/cron/` | Scheduled-task timing: 5-field cron in the caller's time zone, `/loop` intervals, jitter and task ids |
-| `agent/packages/` | Tick marketplace downloads; install, update, uninstall, login and logout shared by `/ticks` and `tickloop tick` |
+| `tick/installer/` | Tick marketplace downloads, installation and package login; the caller supplies the HTTP client |
 | `harness/artifacts/` | Tickloop Artifacts and Accounts client |
 | `code/updater/` | Versioned-directory installs, update checks and pinned runtime copies |
 | `harness/base/` | Low-level utilities: private files, HTTP policy, images and output styles |
@@ -81,12 +85,14 @@ Each crate's responsibility in brief; dependencies are as declared in each `Carg
 
 Dependency boundaries:
 
-- `tick/` and `tickhost/` depend on no `agent/` crate.
-- `code/console` reaches the agent only through AgentAccess (`code/client`); runtime, daemon and `tickhost/host` are only its dev-dependencies.
+- Code crates (`tickloop-code-*`, with entry package `tickloop-code` and binary `tickloop`) use Harness only through `tickloop-harness` in `harness/sdk`. Harness implementation crates use the `tickloop-harness-*` prefix.
+- Harness depends on its own crates, `tick/ids`, `tick/protocol` and third-party libraries. The exact artifacts → OAuth production exception and artifacts → OAuth test-server dev exception remain until the portable OAuth/package contract is separated; OAuth transitively uses `tick/packages`. Runtime tests alone may compose `code/settings` and `code/local-environment`. These exceptions are enumerated in `scripts/dependency-boundaries.json`; no production Harness dependency reaches Code or Tickhost.
+- `tick/`, `tickhost/` and `ui/` depend on no Harness or Code crate. Tick authors use the Tick public layer and `ui`; writing a Tick never requires Harness or Code, whose crates are internal implementation and are not a stable Tick-author API.
+- `code/console` reaches Agents through AgentAccess (`code/client` and `code/access`); the facade's engine/test-support features, Daemon, Local Environment and `tickhost/host` are dev-dependencies only. Its production facade features expose model, tools and artifacts without the runtime.
 - `harness/protocol` depends only on `tick/protocol`, `tick/ids` and basic libraries such as serde; `harness/transcript` only on `harness/protocol`, `tick/ids` and basic libraries.
 - `tick/ids` depends only on `uuid` and `serde`; every Tickloop ID is generated through it.
 
-Integration seams: the agent's HostToolProvider and TickStreamPort (`harness/runtime`). The runtime registers Tick adapters only for `hosted` and `shell`, each providing a TickStreamPort that observes instances through Tickhost; protocol, terminal and Shell execution happen in Tickhost. Artifacts are not a Tick adapter; @tickloop feedback reaches the Loop through the Artifact Association. Shell approval stays in the Worker, and Tickhost only executes requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. The generic TickCall reads the catalog and then calls; no model tool is generated per instance.
+Integration seams: Transcript Store, Execution Environment, Model Endpoint, Credential Source and Settings Store. Harness owns generic Tick tools, approval, subscriptions, Trigger delivery and Shell tasks. Execution Environment binds authorization to a Port with inspect/prepare/execute/observe; Code's Local Environment implements it with Tickhost and Herdr, and Daemon injects it. Settings Store keeps permission writes in Harness while Code persists settings.json. Filesystem tools still access the local Folder directly; sandbox file access is outside this split. The runtime registers Tick adapters only for `hosted` and `shell`; Artifacts reach the Loop through Artifact Association. Tickhost executes Shell requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. Generic TickCall reads the catalog and then calls; no model tool is generated per instance.
 
 ## Read before changing
 
@@ -95,10 +101,10 @@ Integration seams: the agent's HostToolProvider and TickStreamPort (`harness/run
 | Tick protocol or Tick SDK | `tick/protocol/SPECIFICATION.md` |
 | Opening Ticks, views, subscriptions, instance lifecycle | `docs/design/native-herdr.md`, `docs/design/tick.md`; ADR 0007, 0008, 0019, 0024 |
 | Tick packages, marketplace, package login and credentials | `docs/design/tick-packages.md` |
-| Module boundaries, owners and state, IDs | `docs/design/architecture.md` |
+| Module boundaries, facade features, AgentAccess, Settings Store, Execution Environment, IDs | `docs/design/architecture.md`; ADR 0033 (narrows 0022) |
 | Loop, Trigger, Goal, scheduled tasks, Esc/`/stop` | `docs/design/agent.md`; ADR 0030 |
 | Subagent delegation, family messages, shared Tasks and their UI | The Subagent section of `docs/design/agent.md`; ADR 0026 |
-| Permissions, execution modes, Auto review | `agent/config/src/auto_policy/README.md`, the permissions section of `docs/design/agent.md`; ADR 0032, 0009 |
+| Permissions, execution modes, Auto review | `harness/policy/src/auto_policy/README.md`, the permissions section of `docs/design/agent.md`; ADR 0032, 0009 |
 | Installation and upgrades, process lifecycle, version cleanup | `docs/design/auto-updates.md`; ADR 0029, 0013, 0014 |
 | Releases | "Releases" in CONTRIBUTING.md, `docs/design/releases.md` |
 | Input, keys, Monitor and UI interaction | `docs/design/agent-ui.md`; ADR 0010 |

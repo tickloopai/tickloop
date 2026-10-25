@@ -487,7 +487,7 @@ impl TickActionBackend for RemoveFromMonitor {
                 .update_tick_subscription(
                     ctx.chat,
                     subscription.id,
-                    tickloop_harness_protocol::TickSubscriptionChange::Cancel,
+                    tickloop_harness::protocol::TickSubscriptionChange::Cancel,
                 )
                 .await
                 .map_err(|error| format!("Cannot cancel the Tick Subscription: {error}"))?;
@@ -539,7 +539,7 @@ impl TickActionBackend for CloseHosted {
                 .update_tick_subscription(
                     ctx.chat,
                     subscription.id,
-                    tickloop_harness_protocol::TickSubscriptionChange::Cancel,
+                    tickloop_harness::protocol::TickSubscriptionChange::Cancel,
                 )
                 .await
                 .map_err(|error| format!("Cannot cancel the Tick Subscription: {error}"))?;
@@ -652,10 +652,10 @@ impl TickActionBackend for Subscribe {
             .min_by_key(|row| row.frequency.period())
         {
             let change = match row.frequency {
-                tickloop_harness_protocol::TickSubscriptionFrequency::Low => {
-                    tickloop_harness_protocol::TickSubscriptionChange::Cancel
+                tickloop_harness::protocol::TickSubscriptionFrequency::Low => {
+                    tickloop_harness::protocol::TickSubscriptionChange::Cancel
                 }
-                frequency => tickloop_harness_protocol::TickSubscriptionChange::Frequency(
+                frequency => tickloop_harness::protocol::TickSubscriptionChange::Frequency(
                     frequency.next_periodic().expect("periodic subscription"),
                 ),
             };
@@ -699,7 +699,7 @@ impl TickActionBackend for StopShell {
             .dispatch(
                 ctx.chat,
                 self.task,
-                tickloop_harness_protocol::ShellTaskAction::Stop,
+                tickloop_harness::protocol::ShellTaskAction::Stop,
             )
             .await
             .map_err(|error| format!("Cannot stop the Shell: {}", safe_text(&error.to_string())))?;

@@ -250,7 +250,7 @@ fn narrow_and_wide_unicode_views_fit_and_resolve_in_both_themes() {
 
 #[test]
 fn goal_notices_use_semantic_roles_and_keep_untrusted_reasons_on_one_line() {
-    use tickloop_harness_protocol::{GoalBlock, GoalNotice, GoalPause};
+    use tickloop_harness::protocol::{GoalBlock, GoalNotice, GoalPause};
     for (notice, role) in [
         (GoalNotice::Set, Role::Accent),
         (GoalNotice::Completed, Role::Success),

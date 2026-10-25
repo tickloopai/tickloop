@@ -17,7 +17,7 @@ use tickloop_code_access::{
     LaunchSpec, LoopAction, ObservationRequest, ObservationValue, UserInput,
 };
 use tickloop_code_client::{LocalAgentClient, connect_or_start_at};
-use tickloop_harness_protocol::{
+use tickloop_harness::protocol::{
     ExecutionMode, PendingInput, PromptPolicy, Receipt, TriggerSource,
 };
 
@@ -76,8 +76,8 @@ impl Scenario {
             .trust_working_directory(workdir.path())
             .unwrap();
         let transport_path = workdir.path().join("transport.json");
-        let mut transport = tickloop_harness_test_support::config();
-        transport.protocol = tickloop_harness_protocol::Protocol::ChatCompletions;
+        let mut transport = tickloop_harness::test_support::config();
+        transport.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
         transport.base_url = model_url.trim_end_matches("/anthropic").into();
         transport.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
         std::fs::write(&transport_path, serde_json::to_vec(&transport).unwrap()).unwrap();
@@ -86,7 +86,7 @@ impl Scenario {
         launch.session_persistence = false;
         launch.host_options.execution_mode_override = Some(ExecutionMode::FullAccess);
         launch.host_options.prompt_policy = PromptPolicy::Unrestricted;
-        launch.model = Some(tickloop_harness_test_support::config());
+        launch.model = Some(tickloop_harness::test_support::config());
         launch.environment = [
             ("PATH", "/usr/bin:/bin"),
             ("TICKLOOP_FIXTURE_API_KEY", "fixture-key"),
@@ -212,7 +212,7 @@ async fn wait_for_text(client: &LocalAgentClient, execution: ExecutionRef, text:
         loop {
             let current = snapshot(client, execution).await;
             if current.conversation.messages.iter().any(|message| message.content.iter()
-                .any(|block| matches!(block, tickloop_harness_protocol::Content::Text { text: value } if value.contains(text)))) {
+                .any(|block| matches!(block, tickloop_harness::protocol::Content::Text { text: value } if value.contains(text)))) {
                 return;
             }
             tokio::time::sleep(POLL).await;
@@ -316,7 +316,7 @@ fn seed_queued_tick(checkpoint: &mut Value) -> Uuid {
 #[tokio::test]
 async fn queued_tick_revalidates_against_the_real_successor_worker_during_release() {
     let workdir = tempfile::tempdir().unwrap();
-    let (url, mut requests) = tickloop_harness_test_support::model_http_support::serve_responses(vec![
+    let (url, mut requests) = tickloop_harness::test_support::model_http_support::serve_responses(vec![
         (200, response(None, Some(("open", "TickManage", json!({"action":"open","command":support::hosted::counter_program(),"cwd":workdir.path().canonicalize().unwrap(),"protocol":true,"placement":{"type":"hidden"}}))))),
         (200, response(Some("counter opened"), None)),
         (200, response(Some("queued tick consumed"), None)),
@@ -371,7 +371,7 @@ async fn queued_tick_revalidates_against_the_real_successor_worker_during_releas
     tokio::time::timeout(WAIT, async {
         loop {
             let status = scenario.client.observe(ObservationRequest::Agent { execution: scenario.execution, detail: AgentDetailQuery::Subscriptions, after: None }).await.unwrap();
-            if matches!(status.initial, ObservationValue::Subscriptions(ref subscriptions) if subscriptions.iter().any(|subscription| subscription.link == tickloop_harness_protocol::TickLinkState::Live)) { break; }
+            if matches!(status.initial, ObservationValue::Subscriptions(ref subscriptions) if subscriptions.iter().any(|subscription| subscription.link == tickloop_harness::protocol::TickLinkState::Live)) { break; }
             tokio::time::sleep(POLL).await;
         }
     }).await.unwrap();
@@ -419,7 +419,7 @@ async fn queued_tick_revalidates_against_the_real_successor_worker_during_releas
             .events
             .iter()
             .filter(|event| event.run_id == queued_run
-                && matches!(event.kind, tickloop_harness_protocol::EventKind::Started))
+                && matches!(event.kind, tickloop_harness::protocol::EventKind::Started))
             .count(),
         1
     );
@@ -447,7 +447,7 @@ async fn live_worker_retries_an_unstarted_tool_request_while_its_daemon_changes(
         host_error::HostError,
         hosted::{BUSINESS_FRAME_BYTES, error, read_frame, write_frame},
     };
-    let (url, mut requests, first_reply) = tickloop_harness_test_support::model_http_support::serve_responses_with_gated_response(vec![
+    let (url, mut requests, first_reply) = tickloop_harness::test_support::model_http_support::serve_responses_with_gated_response(vec![
         (200, response(None, Some(("once", "Bash", json!({"command":"printf exactly-once >> tool-effects","description":"Record one effect"}))))),
         (200, response(Some("tool-control completed"), None)),
     ], 0).await;

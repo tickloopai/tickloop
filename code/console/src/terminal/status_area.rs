@@ -10,7 +10,7 @@ use super::{
     style::{Role, RoleLine},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_harness_protocol::{LoopState, SharedTask, SharedTaskStatus, TaskBoard};
+use tickloop_harness::protocol::{LoopState, SharedTask, SharedTaskStatus, TaskBoard};
 
 const MAX_PANEL_ITEMS: usize = 8;
 const MIN_COMPACT_TASK_ROWS: usize = 3;
@@ -136,8 +136,8 @@ pub(super) struct StatusArea {
     task_view: TaskViewState,
     task_views: HashMap<
         (
-            tickloop_harness_protocol::ChatId,
-            tickloop_harness_protocol::LoopId,
+            tickloop_harness::protocol::ChatId,
+            tickloop_harness::protocol::LoopId,
         ),
         TaskViewState,
     >,
@@ -959,7 +959,7 @@ impl StatusArea {
             width,
             row_count,
             display,
-            tickloop_harness_base::private_fs::unix_time_milliseconds(),
+            tickloop_harness::base::private_fs::unix_time_milliseconds(),
         )
     }
 
@@ -1094,13 +1094,13 @@ pub(super) fn test_task_board(titles: &[&str]) -> TaskBoard {
     board.tasks = titles
         .iter()
         .enumerate()
-        .map(|(index, title)| tickloop_harness_protocol::SharedTask {
+        .map(|(index, title)| tickloop_harness::protocol::SharedTask {
             id: Uuid::from_u128(2000 + index as u128).into(),
             title: (*title).into(),
             description: "Verify the task".into(),
             dependencies: vec![],
             status: SharedTaskStatus::InProgress,
-            owner: Some(tickloop_harness_protocol::TaskOwner {
+            owner: Some(tickloop_harness::protocol::TaskOwner {
                 chat_id: Uuid::from_u128(1010).into(),
                 name: "main".into(),
             }),
@@ -1126,7 +1126,7 @@ mod tests {
             parent_id: parent,
             title: title.into(),
             status: "Running".into(),
-            state: tickloop_harness_protocol::LoopState::Running,
+            state: tickloop_harness::protocol::LoopState::Running,
             project: String::new(),
             workspace: None,
             approvals: 0,
@@ -1136,11 +1136,11 @@ mod tests {
             preview: None,
             updated_at: None,
             run_started_at: None,
-            subagent: parent.map(|_| tickloop_harness_protocol::SubagentRegistration {
+            subagent: parent.map(|_| tickloop_harness::protocol::SubagentRegistration {
                 child_chat_id: Uuid::from_u128(id).into(),
                 handle: title.into(),
                 description: title.into(),
-                created_at: tickloop_harness_base::private_fs::unix_time_milliseconds(),
+                created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
                 color: None,
             }),
         };
@@ -1174,7 +1174,7 @@ mod tests {
             parent_id: Some(root),
             title: String::new(),
             status: "Running".into(),
-            state: tickloop_harness_protocol::LoopState::Running,
+            state: tickloop_harness::protocol::LoopState::Running,
             project: String::new(),
             workspace: None,
             approvals: 0,
@@ -1184,7 +1184,7 @@ mod tests {
             preview: None,
             updated_at: None,
             run_started_at: Some(0),
-            subagent: Some(tickloop_harness_protocol::SubagentRegistration {
+            subagent: Some(tickloop_harness::protocol::SubagentRegistration {
                 child_chat_id: Uuid::from_u128(2).into(),
                 handle: "👩‍💻中文 mixed long name".into(),
                 description: "Mixed 描述 👩‍💻 long description".repeat(10),
@@ -1221,7 +1221,7 @@ mod tests {
             parent_id: parent,
             title: title.into(),
             status: "Running".into(),
-            state: tickloop_harness_protocol::LoopState::Running,
+            state: tickloop_harness::protocol::LoopState::Running,
             project: String::new(),
             workspace: None,
             approvals: 0,
@@ -1231,12 +1231,12 @@ mod tests {
             preview: Some("Run sleep 30".into()),
             updated_at: Some(100_000),
             run_started_at: Some(100_000),
-            subagent: parent.map(|_| tickloop_harness_protocol::SubagentRegistration {
+            subagent: parent.map(|_| tickloop_harness::protocol::SubagentRegistration {
                 child_chat_id: id.into(),
                 handle: title.into(),
                 description: "Run sleep 30".into(),
                 created_at: 10_000,
-                color: Some(tickloop_harness_protocol::AgentColor::Cyan),
+                color: Some(tickloop_harness::protocol::AgentColor::Cyan),
             }),
         };
         let mut area = StatusArea::default();
@@ -1334,7 +1334,7 @@ mod tests {
             "only the run time ticks"
         );
         rows[1].group = AttentionGroup::Idle;
-        rows[1].state = tickloop_harness_protocol::LoopState::Idle;
+        rows[1].state = tickloop_harness::protocol::LoopState::Idle;
         rows[1].status = "Idle".into();
         rows[1].glyph = Glyph::AgentIdle;
         area.update_agents(rows.clone(), Some(child));
@@ -1346,7 +1346,7 @@ mod tests {
         assert!(idle.text().ends_with("idle"), "{idle:?}");
         assert_eq!(area.next_frame_ms(181_000), None);
         rows[1].group = AttentionGroup::Working;
-        rows[1].state = tickloop_harness_protocol::LoopState::Running;
+        rows[1].state = tickloop_harness::protocol::LoopState::Running;
         rows[1].status = "Running".into();
         rows[1].glyph = Glyph::AgentRunning;
         area.update_agents(rows, Some(child));
@@ -1573,7 +1573,7 @@ mod tests {
     #[test]
     fn subagent_panel_dots_wear_agent_colors_and_remember_the_selection() {
         use crate::agent_console::AttentionGroup;
-        use tickloop_harness_protocol::{AgentColor, SubagentRegistration};
+        use tickloop_harness::protocol::{AgentColor, SubagentRegistration};
         let root = Uuid::from_u128(1);
         let row = |id: u128, state: LoopState, group: AttentionGroup| AgentRow {
             agent_id: Uuid::from_u128(id),
@@ -1753,7 +1753,7 @@ mod shared_task_tests {
         board.tasks[3].dependencies = vec![board.tasks[2].id];
         let owner_chat = Uuid::from_u128(9000);
         for index in [0, 1] {
-            board.tasks[index].owner = Some(tickloop_harness_protocol::TaskOwner {
+            board.tasks[index].owner = Some(tickloop_harness::protocol::TaskOwner {
                 chat_id: owner_chat.into(),
                 name: "reader".into(),
             });
@@ -1774,12 +1774,12 @@ mod shared_task_tests {
                 preview: None,
                 updated_at: None,
                 run_started_at: None,
-                subagent: Some(tickloop_harness_protocol::SubagentRegistration {
+                subagent: Some(tickloop_harness::protocol::SubagentRegistration {
                     child_chat_id: owner_chat.into(),
                     handle: "reader".into(),
                     description: "Read notes".into(),
                     created_at: 0,
-                    color: Some(tickloop_harness_protocol::AgentColor::Blue),
+                    color: Some(tickloop_harness::protocol::AgentColor::Blue),
                 }),
             }],
             None,

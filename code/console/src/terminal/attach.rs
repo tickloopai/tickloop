@@ -21,7 +21,7 @@ use tickhost_connect::{
         MIN_ROWS, Role,
     },
 };
-use tickloop_harness_protocol::HostedViewGrant;
+use tickloop_harness::protocol::HostedViewGrant;
 
 /// A lone Esc closes the view and leaves the Tick running.
 const ESCAPE: u8 = 0x1b;
@@ -846,7 +846,7 @@ mod tests {
     /// application cursor and keypad keys, before the Console takes the terminal back.
     #[test]
     fn the_view_reads_legacy_keys_on_its_screen_and_turns_off_the_ticks_input_modes() {
-        use tickloop_harness_test_support::kitty_keyboard::{
+        use tickloop_harness::test_support::kitty_keyboard::{
             DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard,
         };
         let mut output = b"\x1b[?1049h\x1b[>1u\x1b[?1049l".to_vec();

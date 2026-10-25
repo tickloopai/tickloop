@@ -24,7 +24,7 @@ use tickloop_code_client::{
     frame::{read_frame, write_frame},
     negotiate,
 };
-use tickloop_harness_protocol::{Event, EventKind};
+use tickloop_harness::protocol::{Event, EventKind};
 
 use tickloop_code_access::test_support::TRANSPORT_LIMITS;
 
@@ -50,9 +50,9 @@ fn transcript_initial(text: String) -> ObservationValue {
         folder: "/tmp/workdir".into(),
         messages: vec![RecordedMessage {
             id: Uuid::new_v4(),
-            message: tickloop_harness_protocol::Message {
-                role: tickloop_harness_protocol::Role::User,
-                content: vec![tickloop_harness_protocol::Content::Text { text }],
+            message: tickloop_harness::protocol::Message {
+                role: tickloop_harness::protocol::Role::User,
+                content: vec![tickloop_harness::protocol::Content::Text { text }],
             },
             loop_id: None,
             run_id: None,
@@ -429,7 +429,7 @@ async fn completing_a_cancelled_lookup_returns_exactly_one_terminal_reply() {
                     },
                     detail: AgentDetailQuery::AccountModels {
                         config: Box::new(
-                            tickloop_harness_model::cards::ModelCatalog::defaults()
+                            tickloop_harness::model::cards::ModelCatalog::defaults()
                                 .get("openai-api", "gpt-6.1-sol")
                                 .unwrap(),
                         ),

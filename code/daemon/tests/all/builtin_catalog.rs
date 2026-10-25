@@ -1,5 +1,5 @@
 use tickloop_code_access::AgentAccess;
-use tickloop_harness_model::cards::ModelCatalog;
+use tickloop_harness::model::cards::ModelCatalog;
 
 #[tokio::test]
 async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
@@ -10,7 +10,7 @@ async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
         AgentCommand, CommandEnvelope, CommandResult, ConfigurationChange, LaunchSpec,
     };
 
-    use tickloop_harness_runtime::Agent;
+    use tickloop_harness::runtime::Agent;
     use uuid::Uuid;
     let directory = tempfile::tempdir().unwrap();
     let model = ModelCatalog::defaults()
@@ -19,7 +19,7 @@ async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
     assert!(model.card.as_ref().unwrap().context_window_tokens.is_none());
     let runtime = Agent::new_embedded(
         model,
-        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
     );
     let epoch = Uuid::new_v4();
     let access = EmbeddedAgentAccess::for_worker(runtime.clone(), epoch);
