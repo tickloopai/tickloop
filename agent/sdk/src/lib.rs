@@ -19,3 +19,6 @@ pub use tickloop_agent_test_support as test_support;
 pub use tickloop_agent_tools as tools;
 #[cfg(feature = "transcript")]
 pub use tickloop_agent_transcript as transcript;
+
+#[cfg(feature = "policy")]
+pub use tickloop_agent_policy as policy;

@@ -735,7 +735,7 @@ pub async fn build_runtime_with_models(
                 .as_ref()
                 .and_then(|settings| settings.root().map(ToOwned::to_owned)),
             settings: settings.map(|settings| {
-                Arc::new(settings) as Arc<dyn tickloop_agent_policy::settings::SettingsStore>
+                Arc::new(settings) as Arc<dyn tickloop_harness::policy::settings::SettingsStore>
             }),
             host: launch.host_options,
             ..HarnessOptions::local(model)

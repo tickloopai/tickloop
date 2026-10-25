@@ -18,7 +18,7 @@
 pub mod loop_skill;
 pub mod package_http;
 mod store;
-pub use tickloop_agent_policy::{AutoSettings, ProjectRuleChanges};
+pub use tickloop_harness::policy::{AutoSettings, ProjectRuleChanges};
 pub mod new_chat;
 pub mod skills;
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::{
     skills::{SkillDiscovery, SkillRegistry},
 };
 use std::path::Path;
-use tickloop_agent_policy::settings::{
+use tickloop_harness::policy::settings::{
     PermissionChanges, ProjectSettings, SettingsSnapshot, SettingsStore, SettingsStoreError,
     SettingsUpdate,
 };
@@ -147,8 +147,8 @@ impl SettingsStore for UserSettings {
         &self,
         folder: Option<&Path>,
     ) -> Result<
-        tickloop_agent_policy::loop_skill::LoopInstructions,
-        tickloop_agent_policy::loop_skill::LoopFileError,
+        tickloop_harness::policy::loop_skill::LoopInstructions,
+        tickloop_harness::policy::loop_skill::LoopFileError,
     > {
         crate::loop_skill::LoopFiles::new(folder, self.root()).instructions()
     }

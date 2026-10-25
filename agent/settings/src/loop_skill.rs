@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
-pub use tickloop_agent_policy::loop_skill::*;
+pub use tickloop_harness::policy::loop_skill::*;
 const LOOP_FILE_NAME: &str = "loop.md";
 const PROJECT_LOOP_FILE: &str = ".tickloop/loop.md";
 /// Reading this far past the limit is enough to tell a file was cut off.
@@ -120,10 +120,6 @@ fn read_loop_file(path: &Path) -> io::Result<Option<(String, bool)>> {
         true,
     )))
 }
-
-/// The `/loop` Skill body, then any loop instructions as data, then last the host's reading of
-/// `arguments`: the form, the interval actually used with its cron expression, what to run now
-/// and the scheduled prompt for CronCreate or ScheduleWakeup.
 
 impl LoopInstructionSource for LoopFiles {
     fn instructions(&self) -> Result<LoopInstructions, LoopFileError> {

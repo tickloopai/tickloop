@@ -72,7 +72,6 @@ check: check-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check-workspace:
-	node scripts/check-settings-boundaries.mjs
 	node scripts/check-boundaries.mjs
 	node scripts/check-public-api.mjs
 	cargo fmt --all --check

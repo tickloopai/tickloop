@@ -12,7 +12,8 @@ doctest = false
 
 [features]
 default = []
-engine = ["dep:tickloop-agent-runtime", "dep:tickloop-agent-tools", "model", "transcript", "cron", "artifacts"]
+engine = ["policy", "dep:tickloop-agent-runtime", "dep:tickloop-agent-tools", "model", "transcript", "cron", "artifacts"]
+policy = ["dep:tickloop-agent-policy"]
 model = ["dep:tickloop-agent-model"]
 transcript = ["dep:tickloop-agent-transcript"]
 cron = ["dep:tickloop-agent-cron"]
@@ -20,6 +21,7 @@ artifacts = ["dep:tickloop-agent-artifacts"]
 test-support = ["engine", "dep:tickloop-agent-test-support"]
 
 [dependencies]
+tickloop-agent-policy = { path = "../policy", optional = true }
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-ids = { path = "../../tick/ids" }

@@ -160,6 +160,9 @@ impl LoopInstructionSource for MaintenanceInstructions {
     }
 }
 
+/// The `/loop` Skill body, then any loop instructions as data, then last the host's reading of
+/// `arguments`: the form, the interval actually used with its cron expression, what to run now
+/// and the scheduled prompt for CronCreate or ScheduleWakeup.
 pub(crate) fn expand(
     body: &str,
     arguments: &str,

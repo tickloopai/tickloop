@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use tickloop_agent_policy::{
+use tickloop_agent_protocol::{AutoReviewerPreference, Decision, ExecutionMode, PermissionRule};
+use tickloop_agent_settings::UserSettings;
+use tickloop_harness::policy::{
     ProjectRuleChanges,
     settings::{MemorySettingsStore, SettingsStore, SettingsStoreError, SettingsUpdate},
 };
-use tickloop_agent_protocol::{AutoReviewerPreference, Decision, ExecutionMode, PermissionRule};
-use tickloop_agent_settings::UserSettings;
 
 #[test]
 fn file_and_memory_stores_keep_preferences_and_partitioned_permission_edits() {

@@ -11,7 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-tickloop-agent-policy = { path = "../policy" }
+tickloop-harness = { path = "../sdk", features = ["policy"] }
 async-trait = "0.1"
 base64 = "0.22"
 libc = "0.2"

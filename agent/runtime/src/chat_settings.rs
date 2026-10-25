@@ -177,7 +177,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         self.write_user_settings(move |settings| {
             settings.write(SettingsUpdate::Model {
-                model: config,
+                model: Box::new(config),
                 clear_context_window,
                 thinking: None,
             })
@@ -193,7 +193,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         self.write_user_settings(move |settings| {
             settings.write(SettingsUpdate::Model {
-                model: config,
+                model: Box::new(config),
                 clear_context_window,
                 thinking: Some(effort),
             })

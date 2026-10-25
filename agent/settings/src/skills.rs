@@ -6,8 +6,8 @@ use std::{
     sync::Arc,
 };
 use tick_packages::{InstalledPackage, PackageStore};
-pub use tickloop_agent_policy::skills::*;
 use tickloop_agent_protocol::SkillSource;
+pub use tickloop_harness::policy::skills::*;
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_SKILLS_DIRECTORY: &str = ".tickloop/skills";

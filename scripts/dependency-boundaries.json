@@ -9,7 +9,6 @@
     "tickloop-tick-packages": "tick",
     "tickloop-tick-oauth-test-server": "tick",
     "tickloop-agent-client": "code",
-    "tickloop-agent-config": "code",
     "tickloop-agent-cron": "harness",
     "tickloop-agent-model": "harness",
     "tickloop-agent-test-support": "harness",
@@ -19,13 +18,15 @@
     "tickloop-tickhost": "tickhost",
     "tickloop-tickhost-connect": "tickhost",
     "tickloop-agent-console": "code",
-    "tickloop-agent-packages": "code",
     "tickloop-agent-updater": "code",
     "tickloop-ui": "ui",
     "tickloop-agent-daemon": "code",
     "tickloop-agent": "code",
     "tickloop-tick-sdk": "tick",
-    "tickloop-harness": "facade"
+    "tickloop-harness": "facade",
+    "tickloop-agent-settings": "code",
+    "tickloop-agent-policy": "harness",
+    "tickloop-tick-installer": "tick"
   },
   "allowed": {
     "harness": [
@@ -86,60 +87,39 @@
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
     {
-      "from": "tickloop-agent-config",
+      "from": "tickloop-agent-settings",
       "to": "tickloop-agent-base",
       "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
     {
-      "from": "tickloop-agent-config",
-      "to": "tickloop-agent-cron",
-      "kind": "normal",
-      "target": null,
-      "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
-    },
-    {
-      "from": "tickloop-agent-config",
+      "from": "tickloop-agent-settings",
       "to": "tickloop-agent-model",
       "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
     {
-      "from": "tickloop-agent-config",
+      "from": "tickloop-agent-settings",
       "to": "tickloop-agent-protocol",
       "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
     {
-      "from": "tickloop-agent-config",
+      "from": "tickloop-agent-settings",
       "to": "tickloop-agent-tools",
       "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
     {
-      "from": "tickloop-agent-config",
+      "from": "tickloop-agent-settings",
       "to": "tickloop-agent-test-support",
       "kind": "dev",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
-    },
-    {
-      "from": "tickloop-agent-test-support",
-      "to": "tickloop-agent-config",
-      "kind": "normal",
-      "target": null,
-      "reason": "Ticket 02 splits Settings Store from policy."
-    },
-    {
-      "from": "tickloop-agent-runtime",
-      "to": "tickloop-agent-config",
-      "kind": "normal",
-      "target": null,
-      "reason": "Ticket 02 splits Settings Store from policy."
     },
     {
       "from": "tickloop-agent-runtime",
@@ -208,13 +188,6 @@
       "from": "tickloop-agent-console",
       "to": "tickloop-agent-test-support",
       "kind": "dev",
-      "target": null,
-      "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
-    },
-    {
-      "from": "tickloop-agent-packages",
-      "to": "tickloop-agent-base",
-      "kind": "normal",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
     },
@@ -315,6 +288,13 @@
       "kind": "dev",
       "target": null,
       "reason": "Ticket 06 routes Tickloop Code through the facade (ticket 02 moves the installer)."
+    },
+    {
+      "from": "tickloop-agent-runtime",
+      "to": "tickloop-agent-settings",
+      "kind": "dev",
+      "target": null,
+      "reason": "File-backed Settings Store and Skill discovery adapters are exercised only by runtime tests."
     }
   ]
 }

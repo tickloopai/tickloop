@@ -3,7 +3,7 @@ use crate::UserSettings;
 use std::{path::PathBuf, sync::Arc};
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{AgentHostOptions, ModelConfig};
-use tickloop_agent_runtime::{
+use tickloop_harness::runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, environment::LocalEnvironment,
     transcript::JsonlTranscriptStore,
 };
@@ -119,7 +119,7 @@ fn local_options(model: ModelConfig, settings: Option<crate::UserSettings>) -> H
             .as_ref()
             .and_then(|settings| settings.root().map(ToOwned::to_owned)),
         settings: settings.map(|settings| {
-            Arc::new(settings) as Arc<dyn tickloop_agent_policy::settings::SettingsStore>
+            Arc::new(settings) as Arc<dyn tickloop_harness::policy::settings::SettingsStore>
         }),
         ..HarnessOptions::local(model)
     }

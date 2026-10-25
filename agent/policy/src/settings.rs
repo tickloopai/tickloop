@@ -76,7 +76,7 @@ pub fn empty_auto_settings_revision() -> AutoSettingsRevision {
 /// Purpose-level changes; the adapter preserves unrelated preferences atomically.
 pub enum SettingsUpdate {
     Model {
-        model: ModelConfig,
+        model: Box<ModelConfig>,
         clear_context_window: bool,
         thinking: Option<Option<ReasoningEffort>>,
     },
@@ -216,7 +216,7 @@ impl SettingsStore for MemorySettingsStore {
                     state.snapshot.reasoning_effort =
                         effort.filter(|effort| *effort != ReasoningEffort::Off);
                 }
-                state.snapshot.model = Some(model);
+                state.snapshot.model = Some(*model);
             }
             SettingsUpdate::AutoReviewer { ref expected, .. }
             | SettingsUpdate::AutoRules { ref expected, .. } => {

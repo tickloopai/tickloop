@@ -30,7 +30,7 @@ pub fn new_chat_settings(
         };
     };
     let execution_mode = host_mode
-        .or_else(|| saved.execution_mode)
+        .or(saved.execution_mode)
         .unwrap_or(ExecutionMode::Auto);
     let context_window_tokens = if model.maximum_context_window_tokens().is_some() {
         None

@@ -197,6 +197,16 @@ fn network_failure(error: &reqwest::Error) -> String {
     format!("{summary} ({cause})")
 }
 
+fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,14 +261,4 @@ mod tests {
             assert!(any.download_url("tick-sample.tar.gz").is_err());
         }
     }
-}
-
-fn is_loopback(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
 }
