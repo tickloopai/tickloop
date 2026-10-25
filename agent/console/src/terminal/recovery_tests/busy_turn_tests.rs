@@ -3,7 +3,8 @@
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_protocol::{Content, FEED_CHANGE_BYTES};
+use tickloop_agent_access::FEED_CHANGE_BYTES;
+use tickloop_agent_protocol::Content;
 
 const BUSY_FIXTURE_VARIABLE: &str = "TICKLOOP_BUSY_TURN_FIXTURE";
 const BUSY_STAGE_FILE: &str = "busy-stage";

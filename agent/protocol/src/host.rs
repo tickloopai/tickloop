@@ -72,3 +72,24 @@ pub enum HostToolAuthority {
         account_id: String,
     },
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OtherTickhost {
+    /// Which build runs and which the daemon is.
+    pub description: String,
+    /// What replacing it ends; `None` from a Tickhost too old to say.
+    pub occupancy: Option<TickhostOccupancy>,
+}
+
+/// What stopping a Tickhost ends.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TickhostOccupancy {
+    /// Each Tick it holds, by its title, or its instance when it has none.
+    pub ticks: Vec<String>,
+    pub shells: usize,
+    /// Ticks and Shells it is starting, which stopping it ends before they run.
+    pub pending: usize,
+    /// The views attached to its Ticks and Shells, which stopping it closes; `None` from a
+    /// Tickhost too old to say.
+    pub views: Option<usize>,
+}

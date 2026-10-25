@@ -4,7 +4,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 
-use tickloop_agent_protocol::{LaunchSpec, ViewRef};
+use tickloop_agent_access::{LaunchSpec, ViewRef};
+
 use tickloop_agent_test_support::{input_dialog as dialog, screen};
 
 const DIRECTORY: &str = "TICKLOOP_MODEL_DIALOG_FIXTURE_DIR";

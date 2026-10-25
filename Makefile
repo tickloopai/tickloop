@@ -72,6 +72,8 @@ check: check-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check-workspace:
+	node --test scripts/check-agent-access.test.mjs
+	node scripts/check-agent-access.mjs
 	node scripts/check-boundaries.mjs
 	node scripts/check-public-api.mjs
 	cargo fmt --all --check

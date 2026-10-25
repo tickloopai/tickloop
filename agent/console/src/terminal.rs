@@ -131,18 +131,21 @@ const EXECUTION_UNAVAILABLE_FOR_INPUT: &str =
     "This execution is unavailable; inspect cached history or use /resume explicitly";
 use task_access::ShellTaskCenter;
 use thinking_preview::ThinkingPreview;
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AfterTurnAction, AgentDetailQuery, AgentSummary, CommandResult,
+    ConfigurationChange, EnvironmentValue, ExecutionAvailability, ExecutionRef, HostLocation,
+    HostWorkContext, LaunchSpec, ObservationRequest, ObservationValue, UserInput, ViewRef,
+};
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AfterTurnAction, AgentDetailQuery, AgentHostOptions,
-    AgentSummary, BranchOutcome, BranchRequest, ChatId, ChatSnapshot, ChatStatus, CommandResult,
-    ConfigurationChange, Decision, DirectoryTrustPolicy, EnvironmentValue, EventKind,
-    ExecutionAvailability, ExecutionMode, ExecutionRef, HostLocation, HostWorkContext,
-    InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
+    AgentHostOptions, BranchOutcome, BranchRequest, ChatId, ChatSnapshot, ChatStatus, Decision,
+    DirectoryTrustPolicy, EventKind, ExecutionMode, InputContext, ModelConfig, ModelRequestKind,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
     QueuedInputKind, ReasoningEffort, Receipt, RunId, ShellTaskNotice, ShellTaskOrigin,
     ShellTaskPromptWatchdog, ShellTaskState, TaskNotification, TaskNotificationStatus, Usage,
-    UserInput, UserShellRecord, UserShellState, ViewRef,
+    UserShellRecord, UserShellState,
 };
+
 use workflows::Workflow;
 
 const SUBSCRIPTION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -5988,7 +5991,8 @@ async fn parse_after_turn(
     chat: ChatId,
     command: &str,
 ) -> Result<AfterTurnAction, AccessError> {
-    use tickloop_agent_protocol::{AfterTurnAction, ConfigurationChange, HistoryAction, UserInput};
+    use tickloop_agent_access::{AfterTurnAction, ConfigurationChange, HistoryAction, UserInput};
+
     let invalid = |message: &str| AccessError::invalid(message);
     let (name, arguments) = command
         .trim()
@@ -7746,7 +7750,7 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
 
 /// Human status text for an Agent row; the Loop state names are internal.
 fn agent_status_label(row: &AgentSummary) -> &'static str {
-    use tickloop_agent_protocol::ExecutionAvailability;
+    use tickloop_agent_access::ExecutionAvailability;
     use tickloop_agent_protocol::LoopState;
     if row.availability == ExecutionAvailability::Lost {
         return "Lost · outcome unknown";
@@ -8142,20 +8146,20 @@ mod tests {
     #[test]
     fn global_overview_keeps_the_root_title_and_aggregates_requests_without_child_rows() {
         let epoch = uuid::Uuid::new_v4();
-        let root = tickloop_agent_protocol::ExecutionRef {
+        let root = tickloop_agent_access::ExecutionRef {
             daemon_epoch: epoch,
             agent_id: uuid::Uuid::from_u128(1),
             generation: 1,
         };
-        let child = tickloop_agent_protocol::ExecutionRef {
+        let child = tickloop_agent_access::ExecutionRef {
             agent_id: uuid::Uuid::from_u128(2),
             ..root
         };
-        let row = |execution: tickloop_agent_protocol::ExecutionRef,
-                   parent: Option<tickloop_agent_protocol::ExecutionRef>,
+        let row = |execution: tickloop_agent_access::ExecutionRef,
+                   parent: Option<tickloop_agent_access::ExecutionRef>,
                    title: &str,
                    questions: usize| {
-            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"folder":"/test","state":"Idle","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
+            serde_json::from_value::<tickloop_agent_access::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"folder":"/test","state":"Idle","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
         };
         let projection = crate::agent_console::Projection {
             overview: true,
@@ -8182,23 +8186,23 @@ mod tests {
 
     #[test]
     fn family_root_aggregate_request_glyph_keeps_warning_role() {
-        let root = tickloop_agent_protocol::ExecutionRef {
+        let root = tickloop_agent_access::ExecutionRef {
             daemon_epoch: uuid::Uuid::new_v4(),
             agent_id: uuid::Uuid::from_u128(1),
             generation: 1,
         };
-        let child = tickloop_agent_protocol::ExecutionRef {
+        let child = tickloop_agent_access::ExecutionRef {
             agent_id: uuid::Uuid::from_u128(2),
             ..root
         };
         let make_row = |execution, parent, state, questions| {
-            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":uuid::Uuid::new_v4(),"folder":"/test","state":state,"title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[]})).unwrap()
+            serde_json::from_value::<tickloop_agent_access::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":uuid::Uuid::new_v4(),"folder":"/test","state":state,"title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[]})).unwrap()
         };
         let rows = super::agent_rows(
             &[
                 make_row(
                     root,
-                    None::<tickloop_agent_protocol::ExecutionRef>,
+                    None::<tickloop_agent_access::ExecutionRef>,
                     "Interrupted",
                     0,
                 ),
@@ -8212,16 +8216,16 @@ mod tests {
 
     #[test]
     fn family_child_description_never_emits_terminal_controls() {
-        let child = tickloop_agent_protocol::ExecutionRef {
+        let child = tickloop_agent_access::ExecutionRef {
             daemon_epoch: uuid::Uuid::new_v4(),
             agent_id: uuid::Uuid::new_v4(),
             generation: 1,
         };
-        let parent = tickloop_agent_protocol::ExecutionRef {
+        let parent = tickloop_agent_access::ExecutionRef {
             agent_id: uuid::Uuid::new_v4(),
             ..child
         };
-        let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"folder":"/test","state":"Idle","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
+        let row: tickloop_agent_access::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"folder":"/test","state":"Idle","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
         let display = super::display::DisplayProfile::default();
         let line = super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
@@ -8279,7 +8283,7 @@ mod tests {
         ];
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
@@ -8381,7 +8385,7 @@ mod tests {
         ];
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
@@ -8488,7 +8492,7 @@ mod tests {
         ];
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
-            execution: tickloop_agent_protocol::ExecutionRef {
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
@@ -9839,9 +9843,9 @@ mod tests {
             &mut questions,
         );
         assert!(permissions.contains_key(&request.id));
-        let lost = tickloop_agent_protocol::AgentSummary {
-            availability: tickloop_agent_protocol::ExecutionAvailability::Lost,
-            execution: tickloop_agent_protocol::ExecutionRef {
+        let lost = tickloop_agent_access::AgentSummary {
+            availability: tickloop_agent_access::ExecutionAvailability::Lost,
+            execution: tickloop_agent_access::ExecutionRef {
                 daemon_epoch: Uuid::new_v4(),
                 agent_id: chat,
                 generation: 1,

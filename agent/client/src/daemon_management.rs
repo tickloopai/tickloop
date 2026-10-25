@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tickloop_agent_protocol::daemon_management::CONTROL_FRAME_BYTES;
+use tickloop_agent_access::daemon_management::CONTROL_FRAME_BYTES;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub async fn write<W: AsyncWrite + Unpin, T: Serialize>(

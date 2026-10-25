@@ -1,5 +1,6 @@
 use super::*;
-use tickloop_agent_protocol::{AgentCommand, GoalAction, GoalSnapshot, GoalStatus};
+use tickloop_agent_access::AgentCommand;
+use tickloop_agent_protocol::{GoalAction, GoalSnapshot, GoalStatus};
 
 const MAX_OBJECTIVE_CHARACTERS: usize = 4000;
 const NO_GOAL: &str = "No Goal is set; use /goal CONDITION.";
@@ -180,7 +181,7 @@ async fn apply(agent: &Agent, chat: Uuid, action: GoalAction) -> Result<(), Stri
         )
         .await
     {
-        if error.code == tickloop_agent_protocol::AccessErrorCode::Invalid {
+        if error.code == tickloop_agent_access::AccessErrorCode::Invalid {
             let latest = agent.status(chat).await.ok();
             return Err(latest
                 .as_ref()

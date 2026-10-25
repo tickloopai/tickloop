@@ -1,5 +1,5 @@
+use tickloop_agent_access::daemon_management::{CONTROL_MAJOR, Error, Hello, Reply, Request};
 use tickloop_agent_client::daemon_management::{read, write};
-use tickloop_agent_protocol::daemon_management::{CONTROL_MAJOR, Error, Hello, Reply, Request};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 

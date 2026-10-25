@@ -143,18 +143,17 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails,
-    ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
-    ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
-    CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
-    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext,
-    LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
-    MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
-    PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionScope, PromptPolicy, QueuedInput, QueuedInputKind, ReasoningEffort,
-    Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
-    SubagentRegistration, TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState,
-    VerdictEvidence, projection,
+    AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind,
+    ApprovalFallbackReason, ApprovalOutcome, ApprovalPath, ApprovalReviewerKind, AutoBlockKind,
+    AutoReviewerHealth, ChatId, ChatSnapshot, CompactionMarker, Content, Decision,
+    DelegationMetadata, DenialReference, DirectedHumanSource, DirectoryTrustPolicy, Event,
+    EventKind, ExecutionMode, HostCallContext, InputContext, LedgerError, LoopId, LoopSnapshot,
+    LoopState, Message, ModelConfig, ModelRequestKind, MonitorMembership, OperationRecord,
+    OperationState, PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution,
+    PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PromptPolicy,
+    QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
+    ResponseRejection, Role, RunId, SubagentRegistration, TaskNotification, TriggerSource, Usage,
+    UserShellRecord, UserShellState, VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -227,34 +226,6 @@ impl From<transcript::TranscriptError> for AgentError {
 impl From<projection::InvalidConversation> for AgentError {
     fn from(error: projection::InvalidConversation) -> Self {
         Self::Invalid(error.0)
-    }
-}
-
-impl From<AgentError> for AccessError {
-    fn from(error: AgentError) -> Self {
-        let code = match &error {
-            AgentError::NotFound => AccessErrorCode::NotFound,
-            AgentError::Busy => AccessErrorCode::Busy,
-            AgentError::UntrustedWorkingDirectory { .. } => {
-                AccessErrorCode::UntrustedWorkingDirectory
-            }
-            AgentError::Storage(_) | AgentError::Fenced => AccessErrorCode::Storage,
-            AgentError::Invalid(message) if message.starts_with("Unsupported:") => {
-                AccessErrorCode::Unsupported
-            }
-            _ => AccessErrorCode::Invalid,
-        };
-        let path = if let AgentError::UntrustedWorkingDirectory { path } = &error {
-            Some(path.clone())
-        } else {
-            None
-        };
-        Self {
-            code,
-            message: error.to_string(),
-            latest_permissions: None,
-            path,
-        }
     }
 }
 

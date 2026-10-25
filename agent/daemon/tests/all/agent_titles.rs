@@ -3,7 +3,7 @@ use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_settings::local_agent::LocalAgent;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, LaunchSpec, ObservationRequest,
     ObservationValue, Page, UserInput,
 };

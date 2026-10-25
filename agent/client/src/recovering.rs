@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use super::LocalAgentClient;
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AgentAccess, CommandEnvelope, CommandReceipt, Cursor,
     DisplayReceipt, DisplayUpdate, FEED_CAPACITY, Observation, ObservationChange,
     ObservationRequest, ObservationUpdate, ObservationValue, ResetReason, bounded_update,

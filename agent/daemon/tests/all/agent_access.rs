@@ -1,12 +1,13 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tickloop_agent_settings::local_agent::LocalAgent;
 
-use tickloop_agent_daemon::EmbeddedAgentAccess;
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandResult, LaunchSpec,
-    ObservationRequest, ObservationValue, PendingRequestKind, QuestionAnswer, RequestRef,
-    UserInput,
+    ObservationRequest, ObservationValue, PendingRequestKind, RequestRef, UserInput,
 };
+use tickloop_agent_daemon::EmbeddedAgentAccess;
+use tickloop_agent_protocol::QuestionAnswer;
+
 use tickloop_agent_runtime::Agent;
 use uuid::Uuid;
 
@@ -121,8 +122,8 @@ async fn embedded_caller_can_answer_the_original_request_and_observe_the_result(
 
 async fn live(
     access: &dyn AgentAccess,
-    execution: tickloop_agent_protocol::ExecutionRef,
-) -> tickloop_agent_protocol::LiveChatSnapshot {
+    execution: tickloop_agent_access::ExecutionRef,
+) -> tickloop_agent_access::LiveChatSnapshot {
     match access
         .observe(ObservationRequest::Agent {
             execution,
@@ -140,7 +141,8 @@ async fn live(
 
 #[tokio::test]
 async fn failed_question_validation_advances_the_version_and_only_one_answer_wins() {
-    use tickloop_agent_protocol::{AccessErrorCode, ReceiptState};
+    use tickloop_agent_access::{AccessErrorCode, ReceiptState};
+
     let temporary = tempfile::tempdir().unwrap();
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call(
@@ -199,7 +201,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
     let updated = current.request_refs[0];
     assert_eq!(updated.request_id, request.request_id);
     assert_eq!(updated.version, request.version + 1);
-    let wire: tickloop_agent_protocol::LiveChatSnapshot =
+    let wire: tickloop_agent_access::LiveChatSnapshot =
         serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
     assert_eq!(wire.model.name, "fixture");
     assert_eq!(wire.clone().into_snapshot().model.name, "fixture");
@@ -259,7 +261,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
 
 #[tokio::test]
 async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_action() {
-    use tickloop_agent_protocol::AfterTurnAction;
+    use tickloop_agent_access::AfterTurnAction;
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -358,7 +360,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
 
 #[tokio::test]
 async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retry() {
-    use tickloop_agent_protocol::AccessErrorCode;
+    use tickloop_agent_access::AccessErrorCode;
     use tickloop_agent_protocol::PermissionScope;
     let temporary = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
@@ -458,8 +460,8 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
 
 #[tokio::test]
 async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
-    use tickloop_agent_protocol::FEED_CHANGE_BYTES;
-    use tickloop_agent_protocol::ObservationChange;
+    use tickloop_agent_access::FEED_CHANGE_BYTES;
+    use tickloop_agent_access::ObservationChange;
     let temporary = tempfile::tempdir().unwrap();
     let output = "result ".repeat(20_000);
     let runtime = Agent::new_embedded(
@@ -542,7 +544,8 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
 
 #[tokio::test]
 async fn embedded_directory_observation_reports_a_new_execution_after_its_snapshot() {
-    use tickloop_agent_protocol::{AgentFilter, Page};
+    use tickloop_agent_access::{AgentFilter, Page};
+
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -591,7 +594,8 @@ async fn embedded_directory_observation_reports_a_new_execution_after_its_snapsh
 
 #[tokio::test]
 async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation() {
-    use tickloop_agent_protocol::{AgentFilter, Page};
+    use tickloop_agent_access::{AgentFilter, Page};
+
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -697,7 +701,7 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
             let observation = access
                 .observe(ObservationRequest::Overview {
                     filter: Default::default(),
-                    page: tickloop_agent_protocol::Page {
+                    page: tickloop_agent_access::Page {
                         offset: 0,
                         limit: 16,
                     },
@@ -860,9 +864,9 @@ async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
 
 #[tokio::test]
 async fn search_connection_check_uses_selected_agent_credentials_and_cancels_with_observation() {
-    use tickloop_agent_protocol::{
-        ObservationChange, SearchConfig, SearchProviderKind, SearchTestStatus,
-    };
+    use tickloop_agent_access::ObservationChange;
+    use tickloop_agent_protocol::{SearchConfig, SearchProviderKind, SearchTestStatus};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap().join("credentials");

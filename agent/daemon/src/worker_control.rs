@@ -33,10 +33,12 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::DaemonServer;
-use tickloop_agent_protocol::{
-    AgentAccess, AgentDetailQuery, ExecutionRef, HostEndpointIdentity, HostToolAuthority,
-    LiveChatSnapshot, ObservationRequest, ObservationValue,
+use tickloop_agent_access::{
+    AgentAccess, AgentDetailQuery, ExecutionRef, LiveChatSnapshot, ObservationRequest,
+    ObservationValue,
 };
+use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
+
 use tickloop_agent_runtime::{
     hosted::{
         controller::HostController,

@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_protocol::AccessErrorCode;
+use tickloop_agent_access::AccessErrorCode;
 
 const LOST_FIXTURE_VARIABLE: &str = "TICKLOOP_LOST_PRESENTATION_FIXTURE";
 const LOST_COMPLETED_VARIABLE: &str = "TICKLOOP_LOST_COMPLETED_FIXTURE";

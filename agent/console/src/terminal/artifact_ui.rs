@@ -311,7 +311,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
         DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
     };

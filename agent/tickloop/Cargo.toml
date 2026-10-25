@@ -29,6 +29,7 @@ harness = false
 [dependencies]
 crossterm = "0.29"
 serde_json = "1"
+tickloop-agent-access = { path = "../access" }
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-settings = { path = "../settings" }
 tickloop-agent-console = { path = "../console" }
@@ -59,6 +60,7 @@ sha2 = "0.10"
 shell-words = "1"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
+tickloop-agent-access = { path = "../access", features = ["test-support"] }
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-runtime = { path = "../runtime" }

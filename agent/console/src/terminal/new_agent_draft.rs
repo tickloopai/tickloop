@@ -14,9 +14,9 @@ use uuid::Uuid;
 use tickloop_agent_model::{validate_model_config, validate_reasoning_effort};
 
 use super::completion::CHILD_AUTHORIZATION_FIXED;
+use tickloop_agent_access::{AccessError, ConfigurationChange, LaunchSpec};
 use tickloop_agent_protocol::{
-    AccessError, ChatStatus, ConfigurationChange, ExecutionMode, LaunchSpec, ModelConfig,
-    PermissionChange, PermissionRule, ReasoningEffort,
+    ChatStatus, ExecutionMode, ModelConfig, PermissionChange, PermissionRule, ReasoningEffort,
 };
 
 /// Which configuration a settings menu or command shows and changes.

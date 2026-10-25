@@ -1,6 +1,8 @@
 //! The AgentAccess contract: the commands, observations, receipts and errors a View, the daemon
 //! and its workers exchange, and the messages that carry them over one connection.
 
+use tickloop_agent_protocol::OtherTickhost;
+
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -13,19 +15,20 @@ use tick_protocol::InstanceRef;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{
-    AccessLimits, AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
-    BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, CodeRewind, CommandSnapshot,
-    DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode, FEED_CAPACITY,
-    FEED_CHANGE_BYTES, FEED_MAX_BYTES, HostedMember, HostedViewGrant, InputContext, LoopState,
-    LoopTriggerNotice, Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord,
-    PendingCommand, PendingInput, PermissionChange, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionScope, PermissionsRevision, PermissionsView, ProviderPatch,
-    QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
-    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult,
-    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
+use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
+use tickloop_agent_protocol::{
+    AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
+    BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
+    CommandSnapshot, DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode,
+    HostedMember, HostedViewGrant, InputContext, LoopState, LoopTriggerNotice, Message,
+    ModelChange, ModelConfig, MonitorMembership, OperationRecord, PendingCommand, PendingInput,
+    PermissionChange, PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope,
+    PermissionsRevision, PermissionsView, ProviderCredentialScope, ProviderPatch, QuestionAnswer,
+    QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger, RewindDraft,
+    RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult, ShellTask,
+    ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
     TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery,
-    UserShellReceipt, UserShellRecord, chat_status::ProcessState,
+    UserShellReceipt, UserShellRecord,
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
@@ -150,7 +153,7 @@ pub struct RecordedMessage {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecordedTranscript {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub goal_history: Vec<crate::GoalHistoryEntry>,
+    pub goal_history: Vec<tickloop_agent_protocol::GoalHistoryEntry>,
     pub record: TranscriptRef,
     pub title: Option<String>,
     pub folder: PathBuf,
@@ -202,14 +205,6 @@ impl std::fmt::Debug for EnvironmentValue {
             .field("name", &String::from_utf8_lossy(&self.name))
             .finish_non_exhaustive()
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderCredentialScope {
-    pub config_root: Option<PathBuf>,
-    pub environment_keys: Vec<String>,
-    pub service_account_path: Result<Option<String>, String>,
-    pub service_account_configured: Result<bool, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -282,7 +277,7 @@ pub enum AgentCommand {
     LinkArtifact {
         execution: ExecutionRef,
         tick: ArtifactTick,
-        history: crate::ArtifactFeedbackHistory,
+        history: tickloop_agent_protocol::ArtifactFeedbackHistory,
     },
     ListArtifactTicks {
         execution: ExecutionRef,
@@ -386,7 +381,7 @@ pub enum AgentCommand {
     /// A `/goal` command for the Chat's goal.
     ManageGoal {
         execution: ExecutionRef,
-        action: crate::GoalAction,
+        action: tickloop_agent_protocol::GoalAction,
     },
     ClearCompletedTasks {
         execution: ExecutionRef,
@@ -454,7 +449,7 @@ pub enum ConfigurationChange {
         enabled: bool,
     },
     GenerateAutoEnvironment {
-        options: crate::AutoSetupOptions,
+        options: tickloop_agent_protocol::AutoSetupOptions,
     },
     Model {
         config: ModelConfig,
@@ -566,7 +561,7 @@ pub enum LoopAction {
     /// requests: confirming starts its timing, rejecting deletes it.
     DecideScheduledTask {
         task_id: Uuid,
-        decision: crate::ScheduledTaskDecision,
+        decision: tickloop_agent_protocol::ScheduledTaskDecision,
     },
 }
 
@@ -699,27 +694,6 @@ pub enum ObservationRequest {
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user
 /// replaces it.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct OtherTickhost {
-    /// Which build runs and which the daemon is.
-    pub description: String,
-    /// What replacing it ends; `None` from a Tickhost too old to say.
-    pub occupancy: Option<TickhostOccupancy>,
-}
-
-/// What stopping a Tickhost ends.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TickhostOccupancy {
-    /// Each Tick it holds, by its title, or its instance when it has none.
-    pub ticks: Vec<String>,
-    pub shells: usize,
-    /// Ticks and Shells it is starting, which stopping it ends before they run.
-    pub pending: usize,
-    /// The views attached to its Ticks and Shells, which stopping it closes; `None` from a
-    /// Tickhost too old to say.
-    pub views: Option<usize>,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Cursor {
     pub daemon_epoch: Uuid,
@@ -871,7 +845,7 @@ impl LiveChatSnapshot {
             subagent: self.subagent.clone(),
             chat: ChatStatus::assemble(
                 &self.conversation,
-                ProcessState {
+                ChatStatusInput {
                     model: &self.model,
                     pending_model: &self.pending_model,
                     reasoning_effort: self.reasoning_effort,
@@ -1060,7 +1034,7 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
-    AutoEnvironmentDraft(crate::AutoEnvironmentDraft),
+    AutoEnvironmentDraft(tickloop_agent_protocol::AutoEnvironmentDraft),
     ArtifactTicks(Vec<ArtifactTick>),
     MonitorMembership(MonitorMembership),
     HostedTicks(Vec<HostedMember>),

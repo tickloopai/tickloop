@@ -397,8 +397,8 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
 
 #[tokio::test]
 async fn peers_with_the_old_delegation_authority_schema_are_rejected_at_handshake() {
+    use tickloop_agent_access::AccessErrorCode;
     use tickloop_agent_client::LocalAgentClient;
-    use tickloop_agent_protocol::AccessErrorCode;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixListener,

@@ -40,9 +40,9 @@ use tickloop_agent_client::{
     },
 };
 use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model};
-use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
-};
+
+use tickloop_agent_access::{AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec};
+use tickloop_agent_protocol::OtherTickhost;
 use tickloop_agent_runtime::{Agent, HarnessOptions, HarnessSeams, environment::LocalEnvironment};
 use tickloop_agent_settings::UserSettings;
 
@@ -154,8 +154,8 @@ impl WorkerFactory for ProcessWorkerFactory {
 
     async fn runtime_version(
         &self,
-        routes: &[(tickloop_agent_protocol::ExecutionRef, Arc<dyn AgentAccess>)],
-    ) -> tickloop_agent_protocol::RuntimeVersion {
+        routes: &[(tickloop_agent_access::ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> tickloop_agent_access::RuntimeVersion {
         self.version(routes).await
     }
     async fn start(
@@ -659,7 +659,7 @@ pub async fn build_runtime_with_models(
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
     executable: &Path,
 ) -> Result<Agent, String> {
-    let model = launch_model(launch);
+    let model = launch_model(launch.model.as_ref());
     let settings = launch
         .config_root
         .as_ref()
@@ -845,3 +845,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
+
+mod access_error;
+mod records;

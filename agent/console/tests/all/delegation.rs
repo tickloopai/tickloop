@@ -286,9 +286,10 @@ fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> Sco
 
 async fn access_command(
     access: &tickloop_agent_daemon::EmbeddedAgentAccess,
-    command: tickloop_agent_protocol::AgentCommand,
-) -> tickloop_agent_protocol::CommandResult {
-    use tickloop_agent_protocol::{AgentAccess, CommandEnvelope};
+    command: tickloop_agent_access::AgentCommand,
+) -> tickloop_agent_access::CommandResult {
+    use tickloop_agent_access::{AgentAccess, CommandEnvelope};
+
     let receipt = access
         .execute(CommandEnvelope {
             daemon_epoch: access.daemon_epoch(),
@@ -304,10 +305,12 @@ async fn access_command(
 #[tokio::test]
 async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_workspace() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentCommand, CommandResult, ConfigurationChange, HostLocation, HostWorkContext,
         InteractionSource, LaunchSpec, TranscriptRef, UserInput, ViewRef,
     };
+
     let directory = tempfile::Builder::new()
         .prefix("tl-host-")
         .tempdir_in("/tmp")
@@ -527,10 +530,12 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
 #[tokio::test]
 async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentCommand, CommandResult, ConfigurationChange, HostWorkContext, LaunchSpec,
         TranscriptRef, UserInput,
     };
+
     let directory = tempfile::Builder::new()
         .prefix("tl-host-")
         .tempdir_in("/tmp")
@@ -1463,11 +1468,13 @@ async fn permission_and_question_requests_belong_to_the_child() {
 async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_ceiling() {
     use tickloop_agent_console::agent_console::{AgentConsole, Destination, Intent};
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter, CommandEnvelope, CommandResult,
         ConfigurationChange, DisplayUpdate, HostLocation, LaunchSpec, ObservationRequest,
         ObservationValue, Page, PendingRequestKind, RequestRef, UserInput, ViewRef,
     };
+
     use tickloop_agent_protocol::{LoopState, QuestionAnswer};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![

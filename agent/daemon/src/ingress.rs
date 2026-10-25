@@ -10,10 +10,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tickhost_connect::hosted::same_secret;
 use tickloop_agent_client::frame::write_frame;
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AccessLimits, CLIENT_HANDOFF_VERSION, ClientHandoffHello,
     ServerHandoffHello, ServerMessage, VIEW_LEASE_SECONDS,
 };
+
 use tokio::{
     net::unix::OwnedWriteHalf,
     sync::{Mutex, Notify, mpsc, oneshot},

@@ -9,11 +9,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tickloop_agent_access::ExecutionRef;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    Content, Decision, Event, ExecutionRef, LocalMessage, ModelIdentity, ModelProvider,
-    PermissionRule, PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ToolResult, Usage,
+    Content, Decision, Event, LocalMessage, ModelIdentity, ModelProvider, PermissionRule,
+    PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ToolResult, Usage,
 };
+
 use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

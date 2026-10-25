@@ -35,14 +35,14 @@ use super::{
     style::ThemeName,
     workflows::{self, Workflow},
 };
+use tickloop_agent_access::{ConfigurationChange, DisplayedView, ExecutionRef};
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
-    AutoReviewerPreference, ChatSnapshot, ChatStatus, ConfigurationChange, CounterSummary,
-    CounterTotal, DirectedSummaryRequest, DisplayedView, ExecutionMode, ExecutionRef, ModelConfig,
-    ModelRequestKind, PermissionApprovalSource, PermissionChange, PermissionRequest,
-    PermissionScope, Protocol, ProtocolFailure, QuestionRequest, ReasoningEffort, Receipt,
-    RequestFailure, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome, SummaryDirection,
-    UsageCounter, UsageCoverage, UsageSummary,
+    AutoReviewerPreference, ChatSnapshot, ChatStatus, CounterSummary, CounterTotal,
+    DirectedSummaryRequest, ExecutionMode, ModelConfig, ModelRequestKind, PermissionApprovalSource,
+    PermissionChange, PermissionRequest, PermissionScope, Protocol, ProtocolFailure,
+    QuestionRequest, ReasoningEffort, Receipt, RequestFailure, RequestOutcome, ResponseRejection,
+    RewindMode, RewindOutcome, SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
 };
 
 const SHIFT_TAB_MODES_SETTING_INDEX: usize = 4;
@@ -3670,7 +3670,7 @@ mod tests {
             model.clone(),
             std::sync::Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
         );
-        let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.path().into());
+        let mut launch = tickloop_agent_access::LaunchSpec::embedded(directory.path().into());
         launch.model = Some(model);
         launch.config_root = Some(invalid_root);
         let agent = Agent::from_embedded_launch(core, launch);
@@ -3807,9 +3807,11 @@ mod tests {
     #[tokio::test]
     async fn connection_management_uses_the_captured_agents_store_from_a_different_view_root() {
         use tickloop_agent_daemon::EmbeddedAgentAccess;
-        use tickloop_agent_protocol::{
+
+        use tickloop_agent_access::{
             AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, ViewRef,
         };
+
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().canonicalize().unwrap();
         let root_a = project.join("a");
@@ -3904,9 +3906,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_account_directory_observation_cancels_the_pending_http_request() {
         use tickloop_agent_daemon::EmbeddedAgentAccess;
-        use tickloop_agent_protocol::{
+
+        use tickloop_agent_access::{
             AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec,
         };
+
         use tokio::io::AsyncReadExt;
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().canonicalize().unwrap();
@@ -3947,9 +3951,9 @@ mod tests {
             panic!("Agent not created")
         };
         let observation = access
-            .observe(tickloop_agent_protocol::ObservationRequest::Agent {
+            .observe(tickloop_agent_access::ObservationRequest::Agent {
                 execution,
-                detail: tickloop_agent_protocol::AgentDetailQuery::AccountModels {
+                detail: tickloop_agent_access::AgentDetailQuery::AccountModels {
                     config: Box::new(config),
                     refresh: false,
                 },
@@ -3989,9 +3993,11 @@ mod tests {
     async fn execution_directory_over_ipc_preserves_more_than_eight_kib_of_models() {
         use tickloop_agent_client::LocalAgentClient;
         use tickloop_agent_daemon::EmbeddedAgentAccess;
-        use tickloop_agent_protocol::{
+
+        use tickloop_agent_access::{
             AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, ViewRef,
         };
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let directory = tempfile::Builder::new()
             .prefix("pmdir-")
@@ -4055,7 +4061,7 @@ mod tests {
             listener,
             access,
             epoch,
-            tickloop_agent_test_support::TRANSPORT_LIMITS,
+            tickloop_agent_access::test_support::TRANSPORT_LIMITS,
         ));
         let client = std::sync::Arc::new(LocalAgentClient::connect(&endpoint).await.unwrap());
         let view = Agent::from_access_for_test(
@@ -4089,9 +4095,11 @@ mod tests {
     #[tokio::test]
     async fn resumed_agent_warmup_and_first_model_page_share_one_execution_directory() {
         use tickloop_agent_daemon::EmbeddedAgentAccess;
-        use tickloop_agent_protocol::{
+
+        use tickloop_agent_access::{
             AgentAccess, AgentCommand, CommandEnvelope, CommandResult, LaunchSpec, ViewRef,
         };
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().canonicalize().unwrap();

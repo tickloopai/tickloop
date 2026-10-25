@@ -22,13 +22,16 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{EmbeddedAgentAccess, chunked::EncodedResponse};
+use tickloop_agent_access::{
+    AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter, CommandEnvelope, CommandResult,
+    Cursor, ExecutionRef, LaunchSpec, ObservationRequest, ObservationUpdate, ObservationValue,
+    Page, ServerMessage, UserInput, bounded_update, decode_frame, encode_frame,
+};
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter, CommandEnvelope, CommandResult,
-    Cursor, Event, EventKind, ExecutionRef, LaunchSpec, ModelIdentity, ModelProvider,
-    ObservationRequest, ObservationUpdate, ObservationValue, Page, Protocol, ServerMessage,
-    ToolResult, UserInput, bounded_update, decode_frame, encode_frame,
+    Event, EventKind, ModelIdentity, ModelProvider, Protocol, ToolResult,
 };
+
 use tickloop_agent_runtime::Agent;
 
 thread_local! {
@@ -319,7 +322,7 @@ fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
             execution: None,
             sequence: 1,
         },
-        change: tickloop_agent_protocol::ObservationChange::Event(Event {
+        change: tickloop_agent_access::ObservationChange::Event(Event {
             sequence: 1,
             chat_id: tickloop_ids::generate().into(),
             loop_id: tickloop_ids::generate().into(),
@@ -328,7 +331,7 @@ fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
                 sources: Vec::new(),
                 call_id: "read".into(),
                 result: ToolResult {
-                    content: "x".repeat(tickloop_agent_protocol::FEED_CHANGE_BYTES),
+                    content: "x".repeat(tickloop_agent_access::FEED_CHANGE_BYTES),
                     is_error: false,
                     output_ref: None,
                 },
@@ -337,7 +340,7 @@ fn an_event_too_long_for_the_feed_is_replaced_by_a_resync() {
     };
     assert!(matches!(
         bounded_update(update).change,
-        tickloop_agent_protocol::ObservationChange::Resync { .. }
+        tickloop_agent_access::ObservationChange::Resync { .. }
     ));
 }
 

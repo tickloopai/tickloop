@@ -1316,15 +1316,15 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
             .is_none(),
         "nothing is resent: {transcript:?}"
     );
-    use tickloop_agent_protocol::AgentAccess as _;
+    use tickloop_agent_access::AgentAccess as _;
     let client =
         tickloop_agent_client::LocalAgentClient::connect(runtime_directory.join("daemon.sock"))
             .await
             .unwrap();
     let catalog = client
-        .observe(tickloop_agent_protocol::ObservationRequest::Overview {
+        .observe(tickloop_agent_access::ObservationRequest::Overview {
             filter: Default::default(),
-            page: tickloop_agent_protocol::Page {
+            page: tickloop_agent_access::Page {
                 offset: 0,
                 limit: 50,
             },
@@ -1332,13 +1332,13 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         })
         .await
         .unwrap();
-    let tickloop_agent_protocol::ObservationValue::Overview(rows) = catalog.initial else {
+    let tickloop_agent_access::ObservationValue::Overview(rows) = catalog.initial else {
         panic!("expected the daemon catalog");
     };
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].availability,
-        tickloop_agent_protocol::ExecutionAvailability::Lost,
+        tickloop_agent_access::ExecutionAvailability::Lost,
         "the daemon does not present the lost worker as live"
     );
     server.abort();
@@ -3775,11 +3775,13 @@ fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
 
 async fn daemon_catalog(
     runtime_directory: &std::path::Path,
-) -> Vec<tickloop_agent_protocol::AgentSummary> {
+) -> Vec<tickloop_agent_access::AgentSummary> {
     use tickloop_agent_client::LocalAgentClient;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AgentAccess, AgentFilter, ObservationRequest, ObservationValue, Page,
     };
+
     let client = LocalAgentClient::connect(runtime_directory.join("daemon.sock"))
         .await
         .unwrap();
@@ -3877,17 +3879,17 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
         tickloop_agent_client::LocalAgentClient::connect(runtime_directory.join("daemon.sock"))
             .await
             .unwrap();
-    let observation = tickloop_agent_protocol::AgentAccess::observe(
+    let observation = tickloop_agent_access::AgentAccess::observe(
         &client,
-        tickloop_agent_protocol::ObservationRequest::Agent {
+        tickloop_agent_access::ObservationRequest::Agent {
             execution: rows[0].execution,
-            detail: tickloop_agent_protocol::AgentDetailQuery::Snapshot,
+            detail: tickloop_agent_access::AgentDetailQuery::Snapshot,
             after: None,
         },
     )
     .await
     .unwrap();
-    let tickloop_agent_protocol::ObservationValue::Agent(snapshot) = observation.initial else {
+    let tickloop_agent_access::ObservationValue::Agent(snapshot) = observation.initial else {
         panic!("expected the created Agent");
     };
     assert_eq!(

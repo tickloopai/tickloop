@@ -4,10 +4,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::execution::ConsoleExecution;
+use tickloop_agent_access::{
+    AccessError, AgentCommand, ExecutionAvailability, TaskAction, TaskOrigin, TaskRef,
+};
 use tickloop_agent_protocol::{
-    AccessError, AgentCommand, ChatStatus, ExecutionAvailability, ShellTask, ShellTaskAction,
-    ShellTaskCenterError, ShellTaskOrigin, ShellTaskOutputChunk, ShellTaskSnapshot, ShellTaskState,
-    TaskAction, TaskOrigin, TaskRef, UserShellState,
+    ChatStatus, ShellTask, ShellTaskAction, ShellTaskCenterError, ShellTaskOrigin,
+    ShellTaskOutputChunk, ShellTaskSnapshot, ShellTaskState, UserShellState,
 };
 
 #[derive(Clone)]
@@ -224,7 +226,8 @@ fn runtime_error(error: AccessError) -> ShellTaskCenterError {
 mod timestamp_tests {
     use super::*;
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AccessError, AgentAccess, CommandEnvelope, CommandReceipt, DisplayReceipt, DisplayUpdate,
         LaunchSpec, Observation, ObservationRequest, ObservationValue, ViewRef,
     };
@@ -366,7 +369,8 @@ mod availability_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{
+
+    use tickloop_agent_access::{
         AccessError, AgentAccess, AgentDetailQuery, CommandEnvelope, CommandReceipt,
         DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest,
         ObservationValue, ViewRef,

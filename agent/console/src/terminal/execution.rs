@@ -18,25 +18,28 @@ use super::new_agent_draft::{
 use super::permissions_surface::{
     DraftPolicyRevision, PermissionsContent, PermissionsPage, PermissionsSubject,
 };
+use tickloop_agent_access::{
+    AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
+    AgentFilter, AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
+    DisplayUpdate, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
+    InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction, MAX_PAGE_LIMIT,
+    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
+    PendingRequestKind, REPLAY_CAPACITY, ReceiptState, RequestRef, TaskAction, TaskOrigin, TaskRef,
+    TranscriptRef, UserInput, ViewRef,
+};
 use tickloop_agent_client::{LocalAgentClient, RecoveringAgentClient};
 #[cfg(test)]
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use tickloop_agent_model::judgment::jev_key_status_in;
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
-    AgentFilter, AgentSummary, ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot,
-    ChatStatus, CommandEnvelope, CommandReceipt, CommandResult, CommandSnapshot, CompactionOutcome,
-    ConfigurationChange, DirectedSummaryOutcome, DirectedSummaryRequest, DisplayUpdate, Event,
-    ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction, HostLocation, HostedMember,
-    InputContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
-    LoopState, LoopTriggerNotice, MAX_PAGE_LIMIT, ModelChange, ModelConfig, MonitorMembership,
-    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    OperationRecord, Page, PendingRequestKind, PermissionChange, PermissionRule, PermissionScope,
+    ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
+    CompactionOutcome, DirectedSummaryOutcome, DirectedSummaryRequest, Event, ExecutionMode,
+    HostedMember, InputContext, LoopState, LoopTriggerNotice, ModelChange, ModelConfig,
+    MonitorMembership, OperationRecord, PermissionChange, PermissionRule, PermissionScope,
     PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer, QueuedInput,
-    REPLAY_CAPACITY, ReasoningEffort, Receipt, ReceiptState, RequestRef, RewindMode, RewindOutcome,
-    SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskAction,
-    TaskNotification, TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus,
-    ToolResult, TranscriptRef, UserInput, UserShellReceipt, UserShellRecord, ViewRef,
+    ReasoningEffort, Receipt, RewindMode, RewindOutcome, SavedChat, ShellTask, ShellTaskOrigin,
+    ShellTaskOutputChunk, TakenBackPrompt, TaskNotification, TickSubscriptionChange,
+    TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
 use tickloop_agent_settings::new_chat::new_chat_settings;
@@ -574,7 +577,7 @@ impl ConsoleExecution {
     ) -> Self {
         let epoch = client.daemon_epoch();
         let upgrades_supported = client.protocol().upgrade_protocol
-            == Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION);
+            == Some(tickloop_agent_access::RUNTIME_HANDOFF_VERSION);
         let view = ViewRef {
             session_id: client.session_id(),
             view_id: tickloop_ids::generate(),
@@ -720,7 +723,7 @@ impl ConsoleExecution {
         root: PathBuf,
         model: ModelConfig,
         client: Arc<dyn tickloop_agent_model::ModelClient>,
-    ) -> Result<Self, AccessError> {
+    ) -> Result<Self, tickloop_agent_runtime::AgentError> {
         let core =
             tickloop_agent_runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
         core.install_own_tickhost();
@@ -2625,7 +2628,7 @@ impl ConsoleExecution {
     fn new_agent_defaults(&self) -> AgentConfiguration {
         let launch = &self.effective_launch();
         let model = tickloop_agent_model::cards::model_for_persistent_selection(
-            tickloop_agent_model::cards::launch_model(launch),
+            tickloop_agent_model::cards::launch_model(launch.model.as_ref()),
         );
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
@@ -3403,7 +3406,7 @@ impl ConsoleExecution {
 
     pub(super) async fn runtime_version(
         &self,
-    ) -> Result<tickloop_agent_protocol::RuntimeVersion, AccessError> {
+    ) -> Result<tickloop_agent_access::RuntimeVersion, AccessError> {
         match self
             .inner
             .access
@@ -4123,11 +4126,13 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use tickloop_agent_daemon::serve_listener;
     use tickloop_agent_protocol::ToolDefinition;
-    use tickloop_agent_protocol::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
+
+    use tickloop_agent_access::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
+
+    use tickloop_agent_access::test_support::TRANSPORT_LIMITS;
     use tickloop_agent_runtime::host_tools::{
         HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall,
     };
-    use tickloop_agent_test_support::TRANSPORT_LIMITS;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     struct ReadInteractionSource;

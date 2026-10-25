@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use tickloop_agent_protocol::{ExecutionRef, RuntimeVersion, WorkerRuntimeVersion};
+use tickloop_agent_access::{ExecutionRef, RuntimeVersion, WorkerRuntimeVersion};
+
 use tickloop_agent_updater::{Build, SelectedRuntime, UpdateNotice};
 
 use super::Agent;
@@ -69,7 +70,7 @@ pub(super) async fn check(agent: Agent, initial_launch: bool) -> Result<Activati
     }
     let requested = match selected {
         Some(target) => Some(target),
-        None if initial_launch => tickloop_agent_protocol::build_identity()
+        None if initial_launch => tickloop_agent_access::build_identity()
             .filter(|own| *own != running.build_id)
             .map(|identity| {
                 std::env::current_exe().map(|executable| SelectedRuntime {

@@ -10,11 +10,12 @@ use tickloop_agent_daemon::EmbeddedAgentAccess;
 #[cfg(test)]
 use tickloop_agent_settings::local_agent::LocalAgent;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AgentAccess, AgentDetailQuery, CommandEnvelope, CommandReceipt, Cursor,
     DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ObservationValue,
     ViewRef,
 };
+
 use tickloop_agent_test_support::screen;
 
 const DIRECTORY: &str = "TICKLOOP_SETTINGS_UX_FIXTURE_DIR";
@@ -208,9 +209,9 @@ impl AgentAccess for FixtureAccess {
                     tickloop_agent_protocol::SearchTestStatus::Available
                 };
                 let _ = sender
-                    .send(tickloop_agent_protocol::ObservationUpdate {
+                    .send(tickloop_agent_access::ObservationUpdate {
                         cursor,
-                        change: tickloop_agent_protocol::ObservationChange::SearchTest(
+                        change: tickloop_agent_access::ObservationChange::SearchTest(
                             tickloop_agent_protocol::SearchTestResult {
                                 status,
                                 detail: "Controlled fixture search test".into(),

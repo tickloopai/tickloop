@@ -1,5 +1,6 @@
 use super::*;
-use tickloop_agent_protocol::{AccessError, ApiKeyStatus};
+use tickloop_agent_access::AccessError;
+use tickloop_agent_protocol::ApiKeyStatus;
 
 impl Menus {
     pub(in crate::terminal) async fn judgment_settings_from_permissions(

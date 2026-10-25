@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use super::{ClientInner, negotiate_handoff};
 use crate::frame::{verify_peer, write_frame};
-use tickloop_agent_protocol::{
+
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, CLIENT_HANDOFF_VERSION, ClientHandoffHello, ClientMessage,
     SessionResume,
 };

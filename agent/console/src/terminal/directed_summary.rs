@@ -5,9 +5,9 @@ use tokio::task::{Id, JoinSet};
 use uuid::Uuid;
 
 use super::{console::Console, safe_line, workflows};
+use tickloop_agent_access::{AccessError, AccessErrorCode};
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest,
-    SummaryDirection,
+    ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest, SummaryDirection,
 };
 
 #[derive(Clone, Copy)]

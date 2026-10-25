@@ -26,7 +26,8 @@
     "tickloop-harness": "facade",
     "tickloop-agent-settings": "code",
     "tickloop-agent-policy": "harness",
-    "tickloop-tick-installer": "tick"
+    "tickloop-tick-installer": "tick",
+    "tickloop-agent-access": "code"
   },
   "allowed": {
     "harness": [
@@ -295,6 +296,13 @@
       "kind": "dev",
       "target": null,
       "reason": "File-backed Settings Store and Skill discovery adapters are exercised only by runtime tests."
+    },
+    {
+      "from": "tickloop-agent-access",
+      "to": "tickloop-agent-protocol",
+      "kind": "normal",
+      "target": null,
+      "reason": "Ticket 06 routes Code access through the Harness facade; Harness never depends on access."
     }
   ]
 }

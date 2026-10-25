@@ -14,12 +14,14 @@ use std::{
 use tickloop_agent_daemon::EmbeddedAgentAccess;
 use uuid::Uuid;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope,
     CommandReceipt, CommandResult, ConfigurationChange, DisplayReceipt, DisplayUpdate,
-    ExecutionRef, LaunchSpec, LoopState, Observation, ObservationRequest, ObservationValue,
-    ReceiptState, TaskAction, ViewRef,
+    ExecutionRef, LaunchSpec, Observation, ObservationRequest, ObservationValue, ReceiptState,
+    TaskAction, ViewRef,
 };
+use tickloop_agent_protocol::LoopState;
+
 use tickloop_agent_test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_LATE_RECEIPT_FIXTURE";

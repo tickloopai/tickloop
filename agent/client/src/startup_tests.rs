@@ -1,9 +1,10 @@
 use std::os::unix::fs::PermissionsExt;
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessLimits, CLIENT_HANDOFF_VERSION, ClientHandoffHello, ClientMessage,
     HANDSHAKE_FRAME_BYTES, ServerHandoffHello, ServerHello, ServerMessage,
 };
+
 use tokio::{net::UnixListener, sync::oneshot};
 use uuid::Uuid;
 

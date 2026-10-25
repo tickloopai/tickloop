@@ -16,11 +16,11 @@ use tickloop_agent_protocol::{
 
 const MODEL_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MODEL_DELTA_BATCH_COUNT: usize = 256;
+const MODEL_EVENT_BYTES: usize = 8 * 1024;
 const MODEL_DELTA_ENVELOPE_BYTES: usize = 1024;
 const MAX_JSON_ESCAPE_EXPANSION: usize = 6;
-const MODEL_DELTA_BATCH_BYTES: usize = (tickloop_agent_protocol::FEED_CHANGE_BYTES
-    - MODEL_DELTA_ENVELOPE_BYTES)
-    / MAX_JSON_ESCAPE_EXPANSION;
+const MODEL_DELTA_BATCH_BYTES: usize =
+    (MODEL_EVENT_BYTES - MODEL_DELTA_ENVELOPE_BYTES) / MAX_JSON_ESCAPE_EXPANSION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RequestContext {

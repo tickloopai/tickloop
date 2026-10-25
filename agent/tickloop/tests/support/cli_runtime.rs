@@ -5,7 +5,9 @@ use std::{
 };
 
 use tickloop_agent_client::LocalAgentClient;
-use tickloop_agent_protocol::{AgentAccess, AgentCommand, CommandEnvelope};
+
+use tickloop_agent_access::{AgentAccess, AgentCommand, CommandEnvelope};
+
 use uuid::Uuid;
 
 const DAEMON_SOCKET: &str = "daemon.sock";

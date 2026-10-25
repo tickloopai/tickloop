@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tickloop_agent_protocol::{AgentFilter, Content, Page};
+use tickloop_agent_access::{AgentFilter, Page};
+use tickloop_agent_protocol::Content;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CACHED_NAVIGATION_FIXTURE";
 const SOURCE_TASK: &str = "NAV-SOURCE-TASK";

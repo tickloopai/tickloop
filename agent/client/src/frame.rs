@@ -3,7 +3,7 @@ use tokio::{
     net::UnixStream,
 };
 
-use tickloop_agent_protocol::{
+use tickloop_agent_access::{
     AccessError, AccessErrorCode, check_frame_length, decode_frame, encode_frame,
 };
 

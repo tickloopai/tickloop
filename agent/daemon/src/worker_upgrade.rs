@@ -421,7 +421,7 @@ fn prepare_record(
         .map_err(|error| error.to_string())?;
     let pending = PendingUpgrade {
         record: TransferRecord {
-            version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+            version: tickloop_agent_access::RUNTIME_HANDOFF_VERSION,
             transfer_id,
             epoch: worker.grant.daemon_epoch,
             phase: Phase::Prepared,
@@ -479,7 +479,7 @@ async fn advance(
             worker.endpoint = pending.record.successor_endpoint.clone();
             worker.pid = pid;
             worker.executable = pending.record.executable.clone();
-            worker.build_id = tickloop_agent_protocol::build_identity().map(str::to_owned);
+            worker.build_id = tickloop_agent_access::build_identity().map(str::to_owned);
             return Err("upgraded Worker exited after activation; the committed execution is lost and is not replayed".into());
         }
         pending.candidate.take();
@@ -568,7 +568,7 @@ async fn advance(
     let old_process = worker.process.lock().await.replace(candidate.process);
     worker.endpoint = pending.record.successor_endpoint.clone();
     worker.pid = pid;
-    worker.build_id = tickloop_agent_protocol::build_identity().map(str::to_owned);
+    worker.build_id = tickloop_agent_access::build_identity().map(str::to_owned);
     worker.executable_lease = upgrade::retain_executable(&pending.record.executable)
         .map_err(|error| error.to_string())?;
     worker.executable = pending.record.executable.clone();
@@ -665,7 +665,9 @@ async fn spawn_replacement(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tickloop_agent_protocol::{AccessErrorCode, AgentAccess, AgentCommand, CommandEnvelope};
+
+    use tickloop_agent_access::{AccessErrorCode, AgentAccess, AgentCommand, CommandEnvelope};
+
     use tickloop_agent_runtime::Agent;
     use tokio::sync::{Mutex, Notify};
 
@@ -732,7 +734,7 @@ mod tests {
                 build_id: Some("previous-build".into()),
                 endpoint: worker_endpoint.clone(),
                 grant: control.grant(),
-                launch: tickloop_agent_protocol::LaunchSpec::embedded(directory.path().into()),
+                launch: tickloop_agent_access::LaunchSpec::embedded(directory.path().into()),
                 executable: directory.path().join("previous-runtime"),
                 link: Arc::new(std::sync::RwLock::new(upgrade::WorkerAddress {
                     endpoint: worker_endpoint,
@@ -743,7 +745,7 @@ mod tests {
                 executable_lease: None,
             });
         }
-        let execution = || tickloop_agent_protocol::ExecutionRef {
+        let execution = || tickloop_agent_access::ExecutionRef {
             daemon_epoch: epoch,
             agent_id: Uuid::new_v4(),
             generation: 1,
@@ -760,7 +762,7 @@ mod tests {
             directory: directory.path().into(),
             listener_identity: (0, 0),
             control_identity: (0, 0),
-            limits: tickloop_agent_test_support::TRANSPORT_LIMITS,
+            limits: tickloop_agent_access::test_support::TRANSPORT_LIMITS,
             workers: Mutex::new(workers),
             shutting_down: AtomicBool::new(false),
             control,
@@ -769,7 +771,7 @@ mod tests {
             lifecycle: Arc::new(crate::lifecycle::DaemonLifecycle::new(shutdown.clone())),
             ingress: Arc::new(crate::ingress::DaemonIngress::new(
                 epoch,
-                tickloop_agent_test_support::TRANSPORT_LIMITS,
+                tickloop_agent_access::test_support::TRANSPORT_LIMITS,
             )),
         });
         let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
@@ -856,7 +858,7 @@ mod tests {
         let mut workers = factory.workers.lock().await;
         let mut pending = PendingUpgrade {
             record: TransferRecord {
-                version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+                version: tickloop_agent_access::RUNTIME_HANDOFF_VERSION,
                 transfer_id: Uuid::new_v4(),
                 epoch,
                 phase: Phase::Activated,
