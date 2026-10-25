@@ -4344,6 +4344,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickloop-harness"
+version = "0.2.24"
+dependencies = [
+ "tickloop-agent-artifacts",
+ "tickloop-agent-base",
+ "tickloop-agent-cron",
+ "tickloop-agent-model",
+ "tickloop-agent-protocol",
+ "tickloop-agent-runtime",
+ "tickloop-agent-test-support",
+ "tickloop-agent-tools",
+ "tickloop-agent-transcript",
+ "tickloop-ids",
+]
+
+[[package]]
 name = "tickloop-ids"
 version = "0.2.24"
 dependencies = [

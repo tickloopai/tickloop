@@ -1,0 +1,32 @@
+[package]
+name = "tickloop-harness"
+description = "The shared Tickloop Harness API for hosts"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = []
+engine = ["dep:tickloop-agent-runtime", "dep:tickloop-agent-tools", "model", "transcript", "cron", "artifacts"]
+model = ["dep:tickloop-agent-model"]
+transcript = ["dep:tickloop-agent-transcript"]
+cron = ["dep:tickloop-agent-cron"]
+artifacts = ["dep:tickloop-agent-artifacts"]
+test-support = ["engine", "dep:tickloop-agent-test-support"]
+
+[dependencies]
+tickloop-agent-base = { path = "../base" }
+tickloop-agent-protocol = { path = "../protocol" }
+tickloop-ids = { path = "../../tick/ids" }
+tickloop-agent-runtime = { path = "../runtime", optional = true }
+tickloop-agent-tools = { path = "../tools", optional = true }
+tickloop-agent-model = { path = "../model", optional = true }
+tickloop-agent-transcript = { path = "../transcript", optional = true }
+tickloop-agent-cron = { path = "../cron", optional = true }
+tickloop-agent-artifacts = { path = "../artifacts", optional = true }
+tickloop-agent-test-support = { path = "../test-support", optional = true }
