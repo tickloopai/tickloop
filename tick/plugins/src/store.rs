@@ -362,7 +362,7 @@ impl PluginStore {
             same_revision: SameRevision::Keep,
         };
         self.install(request, |staged| {
-            copy_named_plugin(checkout.root(), staged, name, entry)
+            staging::copy_directory(checkout.root(), staged)
         })
     }
 
@@ -393,7 +393,7 @@ impl PluginStore {
                     "plugin source contains the plugins directory".into(),
                 ));
             }
-            copy_named_plugin(root, staged, name, Some(entry))
+            staging::copy_directory(root, staged)
         })
     }
 
@@ -475,7 +475,11 @@ impl PluginStore {
         )))?;
         fill(&staged)?;
         staging::check_tree(&staged)?;
-        let manifest = PluginManifest::load(&staged, &request.default_name, request.entry)?;
+        let manifest = if request.marketplace == LOCAL_MARKETPLACE {
+            PluginManifest::load(&staged, &request.default_name, request.entry)?
+        } else {
+            PluginManifest::load_from_marketplace(&staged, &request.default_name, request.entry)?
+        };
         if let Some(document) = manifest.written_manifest(request.entry) {
             write_manifest(&staged, &document)?;
         }
@@ -625,8 +629,12 @@ impl PluginStore {
             .join(&entry.revision)
             .canonicalize()
             .map_err(|error| format!("its directory cannot be opened: {error}"))?;
-        let manifest =
-            PluginManifest::load(&root, name, None).map_err(|error| error.to_string())?;
+        let manifest = if entry.marketplace == LOCAL_MARKETPLACE {
+            PluginManifest::load(&root, name, None)
+        } else {
+            PluginManifest::load_from_marketplace(&root, name, None)
+        }
+        .map_err(|error| error.to_string())?;
         if manifest.name != name {
             return Err(format!("its manifest names the plugin {}", manifest.name));
         }
@@ -816,21 +824,4 @@ fn move_aside(path: &Path, aside: &Path) -> Result<bool, PluginError> {
             error,
         )),
     }
-}
-
-fn copy_named_plugin(
-    source: &Path,
-    staged: &Path,
-    name: &str,
-    entry: Option<&Map<String, Value>>,
-) -> Result<(), PluginError> {
-    staging::copy_directory(source, staged)?;
-    let manifest = PluginManifest::load(staged, name, entry)?;
-    if manifest.name != name {
-        return Err(PluginError::Invalid(format!(
-            "the plugin is named {}, not {name}",
-            manifest.name
-        )));
-    }
-    Ok(())
 }

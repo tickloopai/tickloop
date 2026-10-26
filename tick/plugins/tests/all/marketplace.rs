@@ -308,7 +308,7 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
 }
 
 #[tokio::test]
-async fn local_marketplace_plugins_reinstall_and_cannot_escape_or_change_names() {
+async fn local_marketplace_plugins_reinstall_and_reject_escape_or_invalid_manifests() {
     let fixture = Fixture::new();
     let root = fixture.source("local-market");
     crate::support::write_skill(&root.join("review/skills/check"), "check");
@@ -341,7 +341,7 @@ async fn local_marketplace_plugins_reinstall_and_cannot_escape_or_change_names()
     let before = fixture.registry();
     write_json(
         &root.join("review/.claude-plugin/plugin.json"),
-        &json!({"name": "wrong"}),
+        &json!({"name": "wrong", "version": "invalid version"}),
     );
     assert!(
         fixture
@@ -350,7 +350,7 @@ async fn local_marketplace_plugins_reinstall_and_cannot_escape_or_change_names()
             .await
             .unwrap_err()
             .to_string()
-            .contains("not review")
+            .contains("version")
     );
     assert_eq!(fixture.registry(), before);
     for relative in ["./../review", "./escape"] {
@@ -850,4 +850,283 @@ fn the_builtin_tick_override_keeps_its_identity_with_a_differently_named_catalog
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn marketplace_entry_names_own_identity_even_when_manifest_names_collide_or_are_uppercase() {
+    let fixture = Fixture::new();
+    let root = fixture.source("identities");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name":"identities", "plugins":[
+            {"name":"first", "source":"./shared"},
+            {"name":"second", "source":"./shared"},
+            {"name":"notion", "source":"./notion"}
+        ]}),
+    );
+    write_json(
+        &root.join("shared/.claude-plugin/plugin.json"),
+        &json!({"name":"astronomer-data"}),
+    );
+    write_json(
+        &root.join("notion/.claude-plugin/plugin.json"),
+        &json!({"name":"Notion Tools"}),
+    );
+    crate::support::write_skill(&root.join("shared/skills/check"), "check");
+    crate::support::write_skill(&root.join("notion/skills/check"), "check");
+    fixture
+        .store
+        .add_marketplace(&MarketplaceSource::Directory(root.clone()), &no_http)
+        .await
+        .unwrap();
+    for (name, display) in [
+        ("first", "astronomer-data"),
+        ("second", "astronomer-data"),
+        ("notion", "Notion Tools"),
+    ] {
+        let installed = fixture
+            .store
+            .install_marketplace_plugin("identities", name, &no_http)
+            .await
+            .unwrap()
+            .plugin;
+        assert_eq!(installed.name(), name);
+        assert_eq!(installed.id(), format!("{name}@identities"));
+        assert_eq!(installed.manifest.display_name.as_deref(), Some(display));
+        let loaded = fixture.store.get(name).unwrap();
+        assert_eq!(loaded.manifest.name, name);
+        assert_eq!(loaded.manifest.display_name.as_deref(), Some(display));
+        assert!(loaded.root.ends_with(format!("identities/{name}/local")));
+        assert!(
+            fixture
+                .store
+                .credentials(name)
+                .unwrap()
+                .directory()
+                .ends_with(format!("credentials/{name}"))
+        );
+    }
+    assert!(
+        fixture.store.install_path(&root.join("notion")).is_err(),
+        "local install retains strict names"
+    );
+    assert_eq!(fixture.store.installed().unwrap().plugins.len(), 3);
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("notion/.claude-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["name"], "Notion Tools");
+}
+
+#[test]
+fn marketplace_archives_also_use_the_entry_name_as_identity() {
+    let fixture = Fixture::new();
+    let root = fixture.tick_package("original", "original", "1.0");
+    let archive = fixture.root().join("original.tar.gz");
+    let sha256 = crate::support::pack(&root, &archive);
+    let installed = fixture
+        .store
+        .install_archive(
+            &archive,
+            tick_plugins::ExpectedArchive {
+                marketplace: "aliases",
+                name: "alias",
+                version: "1.0",
+                sha256: &sha256,
+                url: "https://example.test/original.tar.gz",
+            },
+        )
+        .unwrap()
+        .plugin;
+    assert_eq!(installed.name(), "alias");
+    assert_eq!(installed.manifest.display_name.as_deref(), Some("original"));
+    assert_eq!(fixture.store.get("alias").unwrap().manifest.name, "alias");
+    assert_eq!(
+        installed.executable(),
+        Some(installed.root.join("bin/tick-original"))
+    );
+}
+
+#[tokio::test]
+async fn git_rejects_untrusted_options_refs_and_transports_before_starting_the_program() {
+    let fixture = Fixture::new();
+    let git = tick_plugins::GitClient::new(
+        fixture.root().join("must-not-run"),
+        std::time::Duration::from_secs(1),
+    );
+    let base = GitSource {
+        url: "file:///unused".to_owned(),
+        reference: None,
+        sha: None,
+        subdirectory: None,
+    };
+    for reference in [
+        "--upload-pack=unexpected",
+        "main^{}",
+        "main:other",
+        "main space",
+        "main~1",
+    ] {
+        let source = GitSource {
+            reference: Some(reference.to_owned()),
+            ..base.clone()
+        };
+        let error = match git.checkout(&source, &fixture.root()).await {
+            Ok(_) => panic!("unsafe ref accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("invalid Git ref"),
+            "{reference}: {error}"
+        );
+    }
+    for sha in ["--option", "123456", "xyz1234", &"a".repeat(41)] {
+        let source = GitSource {
+            sha: Some(sha.to_owned()),
+            ..base.clone()
+        };
+        let error = match git.checkout(&source, &fixture.root()).await {
+            Ok(_) => panic!("unsafe SHA accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("SHA"), "{error}");
+    }
+    for url in [
+        "--upload-pack=unexpected",
+        "ext::unexpected",
+        "git://example.test/repo",
+        "http://example.test/repo",
+    ] {
+        let source = GitSource {
+            url: url.to_owned(),
+            ..base.clone()
+        };
+        let error = match git.checkout(&source, &fixture.root()).await {
+            Ok(_) => panic!("unsafe transport accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Git source requires"), "{error}");
+    }
+    for path in ["--option", "../outside", ".git", "./.git/objects"] {
+        let source = GitSource {
+            subdirectory: Some(path.to_owned()),
+            ..base.clone()
+        };
+        let error = match git.checkout(&source, &fixture.root()).await {
+            Ok(_) => panic!("unsafe path accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("subdirectory"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn git_short_sha_pins_resolve_older_commits_and_record_the_full_commit() {
+    let fixture = Fixture::new();
+    let root = fixture.source("short-sha");
+    crate::support::write_skill(&root.join("skills/check"), "old");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "old"]);
+    let old = git(&root, &["rev-parse", "HEAD"]);
+    crate::support::write_skill(&root.join("skills/check"), "new");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "new"]);
+    let source = GitSource {
+        url: format!("file://{}", root.display()),
+        reference: None,
+        sha: Some(old[..8].to_uppercase()),
+        subdirectory: None,
+    };
+    let checkout = tick_plugins::GitClient::default()
+        .checkout(&source, &fixture.root())
+        .await
+        .unwrap();
+    assert_eq!(checkout.commit(), old);
+    let plugin = fixture
+        .store
+        .install_checkout(&checkout, "pinned", "review", None)
+        .unwrap()
+        .plugin;
+    assert_eq!(plugin.revision, old[..12]);
+    assert!(
+        std::fs::read_to_string(plugin.root.join("skills/check/SKILL.md"))
+            .unwrap()
+            .contains("name: old")
+    );
+}
+
+#[tokio::test]
+async fn git_protocol_allowlist_blocks_a_configured_rewrite_to_an_executable_transport() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let marker = fixture.root().join("must-not-execute");
+    let helper = fixture.root().join("transport-helper");
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ntouch {}\nexit 1\n",
+            quote(&marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = fixture.root().join("configured-git");
+    let rewrite = format!("url.ext::{}.insteadOf=file:///rewritten", helper.display());
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nexec git -c protocol.ext.allow=always -c {} \"$@\"\n",
+            quote(&rewrite)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = GitSource {
+        url: "file:///rewritten".into(),
+        reference: None,
+        sha: None,
+        subdirectory: None,
+    };
+    let client = tick_plugins::GitClient::new(executable, std::time::Duration::from_secs(10));
+    let error = match client.checkout(&source, &fixture.root()).await {
+        Ok(_) => panic!("executable transport accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        !marker.exists(),
+        "Git executed a transport outside the allowed list"
+    );
+    assert!(
+        error.to_string().contains("transport 'ext' not allowed"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn short_git_pins_can_select_a_commit_on_another_branch() {
+    let fixture = Fixture::new();
+    let root = fixture.source("branches");
+    crate::support::write_skill(&root.join("skills/check"), "main");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "main"]);
+    git(&root, &["checkout", "-b", "feature"]);
+    crate::support::write_skill(&root.join("skills/check"), "feature");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feature"]);
+    let feature = git(&root, &["rev-parse", "HEAD"]);
+    git(&root, &["checkout", "main"]);
+    let source = GitSource {
+        url: format!("file://{}", root.display()),
+        reference: None,
+        sha: Some(feature[..7].to_owned()),
+        subdirectory: None,
+    };
+    let checkout = tick_plugins::GitClient::default()
+        .checkout(&source, &fixture.root())
+        .await
+        .unwrap();
+    assert_eq!(checkout.commit(), feature);
 }

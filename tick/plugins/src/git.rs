@@ -11,6 +11,8 @@ use tokio::process::Command;
 use crate::{GitSource, PluginError};
 
 pub(crate) const COMMIT_REVISION_LENGTH: usize = 12;
+const REMOTE_BRANCHES: &str = "+refs/heads/*:refs/remotes/origin/*";
+const REMOTE_TAGS: &str = "+refs/tags/*:refs/tags/*";
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
@@ -71,23 +73,76 @@ impl GitClient {
                 "--depth",
                 "1",
                 "--no-checkout",
-                "--",
+                "--end-of-options",
                 &source.url,
                 &destination,
             ],
         )
         .await?;
         let root = directory.path();
-        let target = if let Some(reference) = source.reference.as_deref().or(source.sha.as_deref())
-        {
-            self.run(root, &["fetch", "--depth", "1", "--", "origin", reference])
+        let target = if let Some(reference) = source.reference.as_deref() {
+            self.run(
+                root,
+                &[
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "--end-of-options",
+                    "origin",
+                    reference,
+                ],
+            )
+            .await?;
+            "FETCH_HEAD".to_owned()
+        } else if let Some(sha) = &source.sha {
+            let sha = sha.to_ascii_lowercase();
+            if sha.len() == 40 {
+                self.run(
+                    root,
+                    &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
+                )
                 .await?;
-            "FETCH_HEAD"
+                "FETCH_HEAD".to_owned()
+            } else {
+                let revision = format!("{sha}^{{commit}}");
+                if self
+                    .run(
+                        root,
+                        &["rev-parse", "--verify", "--end-of-options", &revision],
+                    )
+                    .await
+                    .is_err()
+                {
+                    // Servers cannot fetch an abbreviated object id; obtain history to resolve it locally.
+                    self.run(
+                        root,
+                        &[
+                            "fetch",
+                            "--unshallow",
+                            "--no-tags",
+                            "--end-of-options",
+                            "origin",
+                            REMOTE_BRANCHES,
+                            REMOTE_TAGS,
+                        ],
+                    )
+                    .await?;
+                }
+                sha
+            }
         } else {
-            "HEAD"
+            "HEAD".to_owned()
         };
         let commit = self
-            .run(root, &["rev-parse", &format!("{target}^{{commit}}")])
+            .run(
+                root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{target}^{{commit}}"),
+                ],
+            )
             .await?;
         if !valid_sha(&commit) {
             return Err(PluginError::Invalid(
@@ -97,7 +152,7 @@ impl GitClient {
         if source
             .sha
             .as_ref()
-            .is_some_and(|sha| !sha.eq_ignore_ascii_case(&commit))
+            .is_some_and(|sha| !commit.starts_with(&sha.to_ascii_lowercase()))
         {
             return Err(PluginError::Invalid(format!(
                 "Git commit SHA mismatch: expected {}, got {commit}",
@@ -112,13 +167,14 @@ impl GitClient {
                 &[
                     "sparse-checkout",
                     "set",
-                    "--",
-                    path.trim_start_matches("./"),
+                    "--end-of-options",
+                    path.strip_prefix("./").unwrap_or(path),
                 ],
             )
             .await?;
         }
-        self.run(root, &["checkout", "--detach", &commit]).await?;
+        self.run(root, &["checkout", "--detach", "--end-of-options", &commit])
+            .await?;
         let plugin_root = match &source.subdirectory {
             Some(path) => contained_directory(root, path)?,
             None => root.to_path_buf(),
@@ -145,6 +201,7 @@ impl GitClient {
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ALLOW_PROTOCOL", "https:ssh:file")
             .env("GIT_ASKPASS", "/usr/bin/false")
             .env("SSH_ASKPASS", "/usr/bin/false")
             .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
@@ -202,14 +259,17 @@ impl GitSource {
         if self.reference.as_ref().is_some_and(|reference| {
             reference.is_empty()
                 || reference.starts_with('-')
-                || reference.contains(':')
-                || reference.chars().any(char::is_whitespace)
+                || !reference
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
         }) {
             return Err(PluginError::Invalid("invalid Git ref".into()));
         }
-        if self.sha.as_ref().is_some_and(|sha| !valid_sha(sha)) {
+        if self.sha.as_ref().is_some_and(|sha| {
+            !(7..=40).contains(&sha.len()) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
             return Err(PluginError::Invalid(
-                "Git SHA must be a full hexadecimal commit id".into(),
+                "Git SHA must contain 7 to 40 hexadecimal characters".into(),
             ));
         }
         if let Some(path) = &self.subdirectory {
@@ -226,7 +286,11 @@ pub(crate) fn validate_relative_directory(path: &str) -> Result<(), PluginError>
         || path.starts_with('-')
         || Path::new(path)
             .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+            .any(|component| match component {
+                Component::Normal(name) => name == ".git",
+                Component::CurDir => false,
+                _ => true,
+            })
     {
         return Err(PluginError::Invalid(format!(
             "invalid plugin subdirectory {path:?}"

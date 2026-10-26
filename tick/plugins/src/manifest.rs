@@ -125,6 +125,8 @@ pub struct TickProgram {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginManifest {
     pub name: String,
+    /// The manifest's own name when a marketplace entry supplies a different identity.
+    pub display_name: Option<String>,
     pub version: Option<String>,
     pub description: Option<String>,
     pub format: ManifestFormat,
@@ -146,6 +148,24 @@ impl PluginManifest {
         default_name: &str,
         entry: Option<&Map<String, Value>>,
     ) -> Result<Self, PluginError> {
+        Self::load_with_identity(root, default_name, entry, None)
+    }
+
+    pub(crate) fn load_from_marketplace(
+        root: &Path,
+        name: &str,
+        entry: Option<&Map<String, Value>>,
+    ) -> Result<Self, PluginError> {
+        validate_plugin_name(name)?;
+        Self::load_with_identity(root, name, entry, Some(name))
+    }
+
+    fn load_with_identity(
+        root: &Path,
+        default_name: &str,
+        entry: Option<&Map<String, Value>>,
+        marketplace_name: Option<&str>,
+    ) -> Result<Self, PluginError> {
         let root = root
             .canonicalize()
             .map_err(PluginError::io(format!("cannot open {}", printable(root))))?;
@@ -159,11 +179,18 @@ impl PluginManifest {
                 if tick_package.is_file() {
                     warnings.push(format!("{TICK_PACKAGE_MANIFEST} is ignored beside {path}"));
                 }
-                return from_document(&root, &document, format, None, warnings);
+                return from_document(&root, &document, format, None, marketplace_name, warnings);
             }
         }
         if tick_package.is_file() {
-            return from_tick_package(&root);
+            let mut manifest = from_tick_package(&root)?;
+            if let Some(name) = marketplace_name {
+                if manifest.name != name {
+                    manifest.display_name = Some(manifest.name.clone());
+                }
+                manifest.name = name.to_owned();
+            }
+            return Ok(manifest);
         }
         match entry {
             Some(entry) => from_document(
@@ -171,6 +198,7 @@ impl PluginManifest {
                 entry,
                 ManifestFormat::MarketplaceEntry,
                 Some(default_name),
+                marketplace_name,
                 warnings,
             ),
             None => from_document(
@@ -178,6 +206,7 @@ impl PluginManifest {
                 &Map::new(),
                 ManifestFormat::Directory,
                 Some(default_name),
+                marketplace_name,
                 warnings,
             ),
         }
@@ -274,6 +303,7 @@ fn from_document(
     document: &Map<String, Value>,
     format: ManifestFormat,
     default_name: Option<&str>,
+    marketplace_name: Option<&str>,
     mut warnings: Vec<String>,
 ) -> Result<PluginManifest, PluginError> {
     let source = format.label();
@@ -287,6 +317,10 @@ fn from_document(
         (None, Some(default_name)) => default_name.to_owned(),
         (None, None) => return Err(PluginError::Invalid(format!("{source} has no name"))),
     };
+    let display_name = marketplace_name
+        .filter(|identity| *identity != name)
+        .map(|_| name.clone());
+    let name = marketplace_name.map_or(name, str::to_owned);
     validate_plugin_name(&name)?;
     let version = match document.get("version") {
         None | Some(Value::Null) => None,
@@ -341,6 +375,7 @@ fn from_document(
     }
     Ok(PluginManifest {
         name,
+        display_name,
         version,
         description,
         format,
@@ -362,6 +397,7 @@ fn from_tick_package(root: &Path) -> Result<PluginManifest, PluginError> {
     insert_default_components(root, &mut components);
     Ok(PluginManifest {
         name: package.name,
+        display_name: None,
         version: Some(package.version),
         description: Some(package.description),
         format: ManifestFormat::TickPackage,
