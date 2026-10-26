@@ -143,9 +143,22 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.spawn(async move {
                 let result = blocking({
                     let name = name.clone();
-                    move || store.set_enabled(&name, enabled).map(|_| ()).map_err(|error| error.to_string())
-                }).await;
-                (panel, TickPackageResult::Enabled { name, enabled, result })
+                    move || {
+                        store
+                            .set_enabled(&name, enabled)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .await;
+                (
+                    panel,
+                    TickPackageResult::Enabled {
+                        name,
+                        enabled,
+                        result,
+                    },
+                )
             });
         }
         TickPackageRequest::Uninstall(name) => {

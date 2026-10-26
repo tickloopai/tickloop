@@ -11704,8 +11704,12 @@ impl State {
         if monitor_notice_expired {
             self.monitor_notice = None;
         }
-        let plugin_expired = self.ticks_panel.as_mut().is_some_and(|panel| panel.expire_confirmation());
-        plugin_expired || exit_expired
+        let plugin_expired = self
+            .ticks_panel
+            .as_mut()
+            .is_some_and(|panel| panel.expire_confirmation());
+        plugin_expired
+            || exit_expired
             || escape_expired
             || copy_notice_expired
             || monitor_expired
@@ -12023,9 +12027,15 @@ impl State {
                     let outcome = self.run_external_editor(&query);
                     let panel = self.ticks_panel.as_mut().unwrap();
                     match outcome {
-                        Some(ExternalEditorOutcome::Updated { content }) => panel.replace_filter(&content),
-                        Some(ExternalEditorOutcome::Failed(error)) => panel.report(error.to_string()),
-                        Some(ExternalEditorOutcome::Unavailable) => panel.report("No external editor found; set VISUAL or EDITOR".into()),
+                        Some(ExternalEditorOutcome::Updated { content }) => {
+                            panel.replace_filter(&content)
+                        }
+                        Some(ExternalEditorOutcome::Failed(error)) => {
+                            panel.report(error.to_string())
+                        }
+                        Some(ExternalEditorOutcome::Unavailable) => {
+                            panel.report("No external editor found; set VISUAL or EDITOR".into())
+                        }
                         _ => {}
                     }
                     None

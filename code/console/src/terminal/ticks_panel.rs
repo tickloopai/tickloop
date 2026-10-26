@@ -49,7 +49,10 @@ pub(super) enum TickPackageRequest {
     /// Installs or updates to the version the marketplace offers.
     Install(MarketplacePackage),
     Uninstall(String),
-    SetEnabled { name: String, enabled: bool },
+    SetEnabled {
+        name: String,
+        enabled: bool,
+    },
     /// Logs the package in at `issuer` with an OAuth device authorization the user approves;
     /// the panel numbers each `attempt` as it starts, and its results carry the number.
     LogIn {
@@ -187,9 +190,19 @@ impl TickPackageResult {
                 result: Err(error),
                 ..
             } => Notice::failure(format!("Cannot log in to {name}: {error}")),
-            Self::Enabled { name, enabled, result } => match result {
-                Ok(()) => Notice::success(format!("{} {name}", if *enabled { "Enabled" } else { "Disabled" })),
-                Err(error) => Notice::failure(format!("Cannot {} {name}: {error}", if *enabled { "enable" } else { "disable" })),
+            Self::Enabled {
+                name,
+                enabled,
+                result,
+            } => match result {
+                Ok(()) => Notice::success(format!(
+                    "{} {name}",
+                    if *enabled { "Enabled" } else { "Disabled" }
+                )),
+                Err(error) => Notice::failure(format!(
+                    "Cannot {} {name}: {error}",
+                    if *enabled { "enable" } else { "disable" }
+                )),
             },
             Self::KeySaved {
                 name,
@@ -209,7 +222,7 @@ impl TickPackageResult {
             } => {
                 let manifest = &installation.plugin.manifest;
                 let (name, version) = (&manifest.name, &installation.plugin.version);
-                Notice::success(match &installation.outcome {
+                let mut text = match &installation.outcome {
                     InstallOutcome::Installed => format!("Installed {name} {version}"),
                     InstallOutcome::Replaced { previous_version }
                         if is_later(version, previous_version) =>
@@ -223,7 +236,22 @@ impl TickPackageResult {
                     InstallOutcome::AlreadyInstalled => {
                         format!("{name} {version} is already installed")
                     }
-                })
+                };
+                if manifest.tick.is_some() {
+                    text.push_str("; Its Tick program runs as you when opened");
+                }
+                let unsupported = manifest.unsupported();
+                if !unsupported.is_empty() {
+                    text.push_str(&format!(
+                        "; Not supported yet: {}",
+                        unsupported
+                            .iter()
+                            .map(|component| component.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Notice::success(text)
             }
             Self::Uninstallation {
                 name,
@@ -476,8 +504,13 @@ impl TicksPanel {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
-        if self.filtering && self.page == MARKETPLACE_PAGE && self.menus.is_empty() && self.login.is_none() {
-            self.filter.apply(EditorCommand::InsertPasted(compact_line(text)));
+        if self.filtering
+            && self.page == MARKETPLACE_PAGE
+            && self.menus.is_empty()
+            && self.login.is_none()
+        {
+            self.filter
+                .apply(EditorCommand::InsertPasted(compact_line(text)));
             self.selected[MARKETPLACE_PAGE] = 0;
             self.top[MARKETPLACE_PAGE] = 0;
             return;
@@ -492,7 +525,8 @@ impl TicksPanel {
     }
 
     pub(super) fn key(&mut self, key: KeyEvent) -> TicksPanelEffect {
-        let uninstall_key = key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL;
+        let uninstall_key =
+            key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL;
         if !uninstall_key {
             self.cancel_uninstall();
         }
@@ -524,11 +558,23 @@ impl TicksPanel {
             };
         }
         if uninstall_key && self.page == INSTALLED_PAGE {
-            if self.busy.is_some() { return TicksPanelEffect::None; }
-            let Some(name) = self.installed_entries().get(self.selected[INSTALLED_PAGE]).map(|entry| entry.name().to_owned()) else {
+            if self.busy.is_some() {
+                return TicksPanelEffect::None;
+            }
+            let Some(name) = self
+                .installed_entries()
+                .get(self.selected[INSTALLED_PAGE])
+                .map(|entry| entry.name().to_owned())
+            else {
                 return TicksPanelEffect::None;
             };
-            if self.uninstall_confirmation.as_ref().is_some_and(|(pending, at)| pending == &name && at.elapsed() < UNINSTALL_CONFIRMATION_WINDOW) {
+            if self
+                .uninstall_confirmation
+                .as_ref()
+                .is_some_and(|(pending, at)| {
+                    pending == &name && at.elapsed() < UNINSTALL_CONFIRMATION_WINDOW
+                })
+            {
                 self.cancel_uninstall();
                 return self.start(TickPackageRequest::Uninstall(name));
             }
@@ -551,7 +597,8 @@ impl TicksPanel {
             (KeyCode::Esc, _) => TicksPanelEffect::Close,
             (KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right, _) => {
                 self.page = 1 - self.page;
-                self.selected[self.page] = self.selected[self.page].min(self.entry_count(self.page).saturating_sub(1));
+                self.selected[self.page] =
+                    self.selected[self.page].min(self.entry_count(self.page).saturating_sub(1));
                 TicksPanelEffect::None
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.start(TickPackageRequest::Load),
@@ -562,11 +609,17 @@ impl TicksPanel {
 
     fn filter_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.filtering = false,
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.filtering = false
+            }
             (KeyCode::Char('g'), KeyModifiers::CONTROL) => return TicksPanelEffect::EditFilter,
             (KeyCode::Enter, _) => return self.open_selected(),
             (KeyCode::Char('n' | 'p'), KeyModifiers::CONTROL) => {
-                self.selected[MARKETPLACE_PAGE] = step(self.selected[MARKETPLACE_PAGE], self.entry_count(MARKETPLACE_PAGE), key.code == KeyCode::Char('n'));
+                self.selected[MARKETPLACE_PAGE] = step(
+                    self.selected[MARKETPLACE_PAGE],
+                    self.entry_count(MARKETPLACE_PAGE),
+                    key.code == KeyCode::Char('n'),
+                );
             }
             _ => {
                 let previous = self.filter.draft().to_owned();
@@ -673,10 +726,16 @@ impl TicksPanel {
     }
 
     pub(super) fn expire_confirmation(&mut self) -> bool {
-        if self.uninstall_confirmation.as_ref().is_some_and(|(_, at)| at.elapsed() >= UNINSTALL_CONFIRMATION_WINDOW) {
+        if self
+            .uninstall_confirmation
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= UNINSTALL_CONFIRMATION_WINDOW)
+        {
             self.cancel_uninstall();
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     pub(super) fn select_at_row(&mut self, row: usize) -> bool {
@@ -753,7 +812,10 @@ impl TicksPanel {
                 Some(_) => format!("Replacing {} with {}…", package.name, package.version),
                 None => format!("Installing {} {}…", package.name, package.version),
             },
-            TickPackageRequest::SetEnabled { name, enabled } => format!("{} {name}…", if *enabled { "Enabling" } else { "Disabling" }),
+            TickPackageRequest::SetEnabled { name, enabled } => format!(
+                "{} {name}…",
+                if *enabled { "Enabling" } else { "Disabling" }
+            ),
             TickPackageRequest::Uninstall(name) => format!("Uninstalling {name}…"),
             TickPackageRequest::LogIn { name, .. } => format!("Logging in to {name}…"),
             TickPackageRequest::SaveKey { name, .. } => format!("Saving the key for {name}…"),
@@ -879,7 +941,10 @@ impl TicksPanel {
                 }
                 options.push((
                     if package.enabled { "Disable" } else { "Enable" }.to_owned(),
-                    Choice::Run(TickPackageRequest::SetEnabled { name: name.clone(), enabled: !package.enabled }),
+                    Choice::Run(TickPackageRequest::SetEnabled {
+                        name: name.clone(),
+                        enabled: !package.enabled,
+                    }),
                 ));
                 (
                     format!("{name} {}", package.version),
@@ -957,9 +1022,18 @@ impl TicksPanel {
             _ => &empty,
         };
         let query = self.filter.draft().to_lowercase();
-        offers(marketplace, installed).into_iter().filter(|offer| {
-            self.page != MARKETPLACE_PAGE || format!("{} {} tickloop", offer.package.name, offer.package.description).to_lowercase().contains(&query)
-        }).collect()
+        offers(marketplace, installed)
+            .into_iter()
+            .filter(|offer| {
+                self.page != MARKETPLACE_PAGE
+                    || format!(
+                        "{} {} tickloop",
+                        offer.package.name, offer.package.description
+                    )
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .collect()
     }
 
     fn entry_count(&self, page: usize) -> usize {
@@ -995,22 +1069,46 @@ impl TicksPanel {
                 .map(|(index, entry)| {
                     let (details, glyph_role) = match entry {
                         InstalledEntry::Usable { package, login } => (
-                            format!("{} · {} · {} · {}", package.marketplace, if package.enabled { "enabled" } else { "disabled" }, package.version, login_label(*login)),
+                            format!(
+                                "{} · {} · {} · {}",
+                                package.marketplace,
+                                if package.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
+                                package.version,
+                                login_label(*login)
+                            ),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
                                 LoginState::Unknown => Role::MutedText,
                             },
                         ),
-                        InstalledEntry::Unusable(package) => {
-                            (format!("{} · {} · unusable; reinstall", package.marketplace, package.version), Role::Error)
-                        }
+                        InstalledEntry::Unusable(package) => (
+                            format!(
+                                "{} · {} · unusable; reinstall",
+                                package.marketplace, package.version
+                            ),
+                            Role::Error,
+                        ),
                     };
                     let mut lines = row(index, entry.name(), details, glyph_role);
                     if let InstalledEntry::Usable { package, .. } = entry {
                         let unsupported = package.manifest.unsupported();
                         if !unsupported.is_empty() {
-                            lines.push(RoleLine::role(format!("  Not supported yet: {}", unsupported.iter().map(|component| component.label()).collect::<Vec<_>>().join(", ")), Role::Warning));
+                            lines.push(RoleLine::role(
+                                format!(
+                                    "  Not supported yet: {}",
+                                    unsupported
+                                        .iter()
+                                        .map(|component| component.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                Role::Warning,
+                            ));
                         }
                     }
                     (index, lines)
@@ -1041,7 +1139,7 @@ impl TicksPanel {
                     row(
                         index,
                         &name,
-                        format!("{} · {state}", package.version),
+                        format!("tickloop · {} · {state}", package.version),
                         glyph_role,
                     ),
                 )
@@ -1060,12 +1158,28 @@ impl TicksPanel {
                     .map(|line| RoleLine::role(line, role)),
             );
         };
-        if self.page == MARKETPLACE_PAGE && self.menus.is_empty() && self.login.is_none()
-            && (self.filtering || !self.filter.draft().is_empty()) {
-            add(&format!("Filter: {}", if self.filtering { editor_window(&self.filter, width.saturating_sub(8)) } else { self.filter.draft().to_owned() }), Role::Text);
+        if self.page == MARKETPLACE_PAGE
+            && self.menus.is_empty()
+            && self.login.is_none()
+            && (self.filtering || !self.filter.draft().is_empty())
+        {
+            add(
+                &format!(
+                    "Filter: {}",
+                    if self.filtering {
+                        editor_window(&self.filter, width.saturating_sub(8))
+                    } else {
+                        self.filter.draft().to_owned()
+                    }
+                ),
+                Role::Text,
+            );
         }
         if self.uninstall_confirmation.is_some() {
-            add("Uninstall removes plugin files and data. Saved login and running Ticks stay.", Role::MutedText);
+            add(
+                "Uninstall removes plugin files and data. Saved login and running Ticks stay.",
+                Role::MutedText,
+            );
         }
         // A login under way shows itself in place of the list.
         if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
@@ -1170,18 +1284,45 @@ impl TicksPanel {
                 "enter install/update"
             };
             let hint = if self.filtering && self.page == MARKETPLACE_PAGE {
-                fit_hint(&[("ctrl+n/p select".into(), 8), ("enter install/update".into(), 7), ("ctrl+g editor".into(), 3), ("esc leave filter".into(), 9)], width, display)
-            } else { fit_hint(
-                &[
-                    (enter.to_owned(), 10),
-                    (if self.page == INSTALLED_PAGE { "ctrl+x uninstall" } else { "r refresh" }.to_owned(), 5),
-                    ("tab/←/→ page".to_owned(), 6),
-                    (if self.page == MARKETPLACE_PAGE { "/ filter" } else { "r refresh" }.to_owned(), 4),
-                    ("esc close".to_owned(), 9),
-                ],
-                width,
-                display,
-            ) };
+                fit_hint(
+                    &[
+                        ("ctrl+n/p select".into(), 8),
+                        ("enter install/update".into(), 7),
+                        ("ctrl+g editor".into(), 3),
+                        ("esc leave filter".into(), 9),
+                    ],
+                    width,
+                    display,
+                )
+            } else {
+                fit_hint(
+                    &[
+                        (enter.to_owned(), 10),
+                        (
+                            if self.page == INSTALLED_PAGE {
+                                "ctrl+x uninstall"
+                            } else {
+                                "r refresh"
+                            }
+                            .to_owned(),
+                            5,
+                        ),
+                        ("tab/←/→ page".to_owned(), 6),
+                        (
+                            if self.page == MARKETPLACE_PAGE {
+                                "/ filter"
+                            } else {
+                                "r refresh"
+                            }
+                            .to_owned(),
+                            4,
+                        ),
+                        ("esc close".to_owned(), 9),
+                    ],
+                    width,
+                    display,
+                )
+            };
             (hint, selected_rows)
         };
         let top = &mut self.top[self.page];
@@ -1212,7 +1353,10 @@ impl TicksPanel {
         lines.resize(height.saturating_sub(1 + status.len()), RoleLine::default());
         lines.extend(status);
         lines.push(match &self.uninstall_confirmation {
-            Some((name, _)) => RoleLine::role(format!("Press ctrl+x again to uninstall {name}"), Role::Error),
+            Some((name, _)) => RoleLine::role(
+                format!("Press ctrl+x again to uninstall {name}"),
+                Role::Error,
+            ),
             None => RoleLine::role(hint, Role::MutedText),
         });
         lines.truncate(height);
@@ -1242,7 +1386,11 @@ impl TicksPanel {
             }
             (_, _, Listing::Failed(error)) => (safe_line(error), Role::Error),
             (_, _, Listing::Loaded(_)) => (
-                if self.filter.draft().is_empty() { "No plugins available".to_owned() } else { format!("No plugins match \"{}\"", self.filter.draft()) },
+                if self.filter.draft().is_empty() {
+                    "No plugins available".to_owned()
+                } else {
+                    format!("No plugins match \"{}\"", self.filter.draft())
+                },
                 Role::MutedText,
             ),
         };
@@ -1613,7 +1761,10 @@ mod tests {
         assert!(shown.contains("enter confirm · esc back"));
         press(&mut panel, KeyCode::Esc);
         assert!(!text(&mut panel).contains('❯'));
-        assert!(matches!(press(&mut panel, KeyCode::Esc), TicksPanelEffect::Close));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Esc),
+            TicksPanelEffect::Close
+        ));
     }
 
     #[test]
@@ -1633,7 +1784,10 @@ mod tests {
         press(&mut panel, KeyCode::Esc);
         control(&mut panel, 'x');
         assert!(text(&mut panel).contains("Press ctrl+x again to uninstall beta"));
-        assert_eq!(work(control(&mut panel, 'x')), TickPackageRequest::Uninstall("beta".into()));
+        assert_eq!(
+            work(control(&mut panel, 'x')),
+            TickPackageRequest::Uninstall("beta".into())
+        );
         let shown = text(&mut panel);
         assert!(
             shown.contains("Uninstalling beta…") && !shown.contains('❯'),
