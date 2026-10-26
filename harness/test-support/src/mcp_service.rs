@@ -18,6 +18,7 @@ struct State {
     result: Value,
     calls: Vec<Value>,
     delay: std::time::Duration,
+    directory_delay: std::time::Duration,
     status: u16,
     error: Option<Value>,
     changed: bool,
@@ -32,6 +33,7 @@ impl McpService {
                 result: json!({"content":[]}),
                 calls: Vec::new(),
                 delay: std::time::Duration::ZERO,
+                directory_delay: std::time::Duration::ZERO,
                 status: 200,
                 error: None,
                 changed: false,
@@ -85,7 +87,7 @@ impl McpService {
                                 };
                                 let call = method == "tools/call";
                                 let changed = call && std::mem::take(&mut state.changed);
-                                (state.status, if call {state.delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed)
+                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed)
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
@@ -118,6 +120,9 @@ impl McpService {
     }
     pub fn set_delay(&self, delay: std::time::Duration) {
         self.state.lock().unwrap().delay = delay;
+    }
+    pub fn set_directory_delay(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().directory_delay = delay;
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;

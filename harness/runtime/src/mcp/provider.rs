@@ -3,6 +3,7 @@ use crate::host_tools::{
     HostToolPermission, HostToolProvider, McpResourceServer, McpServerInstructions,
     PreparedHostCall,
 };
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tickloop_harness_protocol::{ChatId, HostToolAuthority};
@@ -24,8 +25,8 @@ impl McpToolProvider {
     fn authority(entry: &Entry) -> HostToolAuthority {
         let mut hash = Sha256::new();
         hash.update(serde_json::to_vec(&entry.config).unwrap_or_default());
-        if let Some(token) = &entry.token {
-            hash.update(token);
+        if let Some(token) = entry.token.read().unwrap().as_ref() {
+            hash.update(token.secret());
         }
         HostToolAuthority::Mcp {
             server_id: entry.config.name.clone(),

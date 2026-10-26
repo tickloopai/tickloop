@@ -781,9 +781,7 @@ pub async fn build_runtime_with_models(
         sources.push(tick_tools);
     }
     if let Some(settings) = settings {
-        use tickloop_harness::runtime::mcp::{
-            HostCapabilities, McpConnections, McpToolProvider, MemoryMcpCredentials,
-        };
+        use tickloop_harness::runtime::mcp::{HostCapabilities, McpConnections, McpToolProvider};
         let startup_environment: std::collections::BTreeMap<String, String> = launch
             .environment
             .iter()
@@ -805,7 +803,7 @@ pub async fn build_runtime_with_models(
                 local_processes: true,
                 scripts: false,
             },
-            Arc::new(MemoryMcpCredentials::default()),
+            std::collections::BTreeMap::new(),
             startup_environment.clone(),
         )
         .with_stderr_directory(log_directory);

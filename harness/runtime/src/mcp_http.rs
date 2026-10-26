@@ -82,6 +82,10 @@ pub(crate) fn request_failure(error: &ServiceError, resource_uri: Option<&str>) 
     }
 }
 
+pub(crate) fn session_expired(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::TransportSend(error) if matches!(error.error.downcast_ref::<StreamableHttpError<McpHttpError>>(), Some(StreamableHttpError::Client(McpHttpError::Status(StatusCode::NOT_FOUND)))))
+}
+
 fn transport_failure(error: &StreamableHttpError<McpHttpError>) -> String {
     match error {
         StreamableHttpError::Client(McpHttpError::Status(StatusCode::UNAUTHORIZED)) => {
@@ -138,7 +142,6 @@ pub(crate) struct McpHttpClient {
     unauthorized: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
     headers: HashMap<HeaderName, HeaderValue>,
-    expired: Arc<AtomicBool>,
 }
 
 impl McpHttpClient {
@@ -155,7 +158,6 @@ impl McpHttpClient {
             unauthorized: Arc::new(AtomicBool::new(false)),
             artifact: None,
             headers: HashMap::new(),
-            expired: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -204,10 +206,6 @@ impl McpHttpClient {
             http.headers.insert(name, value);
         }
         Ok(http)
-    }
-
-    pub(crate) fn expired(&self) -> bool {
-        self.expired.load(Ordering::SeqCst)
     }
 
     pub(crate) fn with_artifact_credentials(
@@ -292,9 +290,6 @@ impl McpHttpClient {
     }
 
     fn verify_status(&self, status: StatusCode) -> Result<(), StreamableHttpError<McpHttpError>> {
-        if status == StatusCode::NOT_FOUND {
-            self.expired.store(true, Ordering::SeqCst);
-        }
         if status == StatusCode::UNAUTHORIZED {
             self.unauthorized.store(true, Ordering::SeqCst);
         }

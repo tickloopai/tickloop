@@ -51,7 +51,7 @@ impl Transport<RoleClient> for ProcessTransport {
         self.io.receive()
     }
     async fn close(&mut self) -> Result<(), Self::Error> {
-        let _ = self.io.close().await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), self.io.close()).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         unsafe {
             libc::kill(-self.group, libc::SIGTERM);

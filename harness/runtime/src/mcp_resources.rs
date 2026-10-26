@@ -91,7 +91,7 @@ impl PreparedResourceCall {
         }
         let skill = if let Some(target) = &uri {
             let definition = provider.remote_skills().into_iter().find(|definition| {
-                matches!(&definition.source, SkillSource::Remote {resources, ..} if resources.iter().any(|resource| &resource.uri == target))
+                matches!(&definition.source, SkillSource::Remote {server_id, account_id, resources, ..} if sources.iter().any(|source| source.authority == tickloop_harness_protocol::HostToolAuthority::Mcp {server_id:server_id.clone(),account_id:account_id.clone()}) && resources.iter().any(|resource| &resource.uri == target))
             });
             if let Some(definition) = definition {
                 let SkillSource::Remote { uri, .. } = &definition.source else {

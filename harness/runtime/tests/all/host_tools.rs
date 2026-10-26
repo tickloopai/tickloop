@@ -978,19 +978,20 @@ async fn multiple_host_sources_keep_their_tools_and_route_calls() {
     wait_for_completion(&agent, chat).await;
     assert_eq!(read.calls.lock().unwrap().len(), 1);
     assert_eq!(write.0.calls.lock().unwrap().len(), 1);
-    let requests = model.requests.lock().unwrap();
-    assert!(
-        requests[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "ReadWorkspace")
-    );
-    assert!(
-        requests[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "ModifyLayout")
-    );
-    drop(requests);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ReadWorkspace")
+        );
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ModifyLayout")
+        );
+    }
     agent.shutdown().await;
 }
