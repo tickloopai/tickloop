@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -140,6 +140,7 @@ pub(crate) enum ResponsePart {
     ToolDirectory,
 }
 type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePart) + Send + Sync>;
+type DirectoryRequests = Arc<Mutex<HashMap<rmcp::model::RequestId, tokio::time::Instant>>>;
 
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
@@ -150,6 +151,7 @@ pub(crate) struct McpHttpClient {
     insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
     redactor: Option<ResponseRedactor>,
+    directory_requests: DirectoryRequests,
     headers: HashMap<HeaderName, HeaderValue>,
 }
 
@@ -168,6 +170,7 @@ impl McpHttpClient {
             insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
             redactor: None,
+            directory_requests: Arc::default(),
             headers: HashMap::new(),
         })
     }
@@ -364,7 +367,7 @@ fn sse_stream(
     response: reqwest::Response,
     max_event_bytes: usize,
     redactor: Option<ResponseRedactor>,
-    directory_request: Option<rmcp::model::RequestId>,
+    directory_requests: DirectoryRequests,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let mut event_bytes = 0_usize;
     let mut line_bytes = 0_usize;
@@ -392,13 +395,11 @@ fn sse_stream(
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
                         event.data = Some(
-                            redact_message(&data, redact, directory_request.as_ref()).map_err(
-                                |_| {
-                                    SseError::Body(Box::new(io::Error::other(
-                                        "invalid MCP event response",
-                                    )))
-                                },
-                            )?,
+                            redact_message(&data, redact, &directory_requests).map_err(|_| {
+                                SseError::Body(Box::new(io::Error::other(
+                                    "invalid MCP event response",
+                                )))
+                            })?,
                         );
                     }
                     for value in [&mut event.id, &mut event.event].into_iter().flatten() {
@@ -416,13 +417,32 @@ fn sse_stream(
 fn redact_message(
     text: &str,
     redact: &ResponseRedactor,
-    directory_request: Option<&rmcp::model::RequestId>,
+    directory_requests: &DirectoryRequests,
 ) -> Result<String, serde_json::Error> {
     let mut message: serde_json::Value = serde_json::from_str(text)?;
-    let directory_response = message.get("method").is_none()
-        && directory_request
-            .is_some_and(|id| serde_json::to_value(id).ok().as_ref() == message.get("id"));
-    if let Some(id) = message.get_mut("id").filter(|id| id.is_string()) {
+    let pending = if message.get("method").is_none() {
+        message
+            .get("id")
+            .and_then(|id| serde_json::from_value::<rmcp::model::RequestId>(id.clone()).ok())
+            .and_then(|id| {
+                let mut pending = directory_requests.lock().unwrap();
+                pending.remove_entry(&id).or_else(|| match id {
+                    rmcp::model::RequestId::String(id) => {
+                        id.parse::<i64>().ok().and_then(|number| {
+                            pending.remove_entry(&rmcp::model::RequestId::Number(number))
+                        })
+                    }
+                    _ => None,
+                })
+            })
+            .filter(|(_, started)| started.elapsed() <= REQUEST_TIMEOUT)
+    } else {
+        None
+    };
+    let directory_response = pending.is_some();
+    if let Some((id, _)) = pending {
+        message["id"] = serde_json::to_value(id)?;
+    } else if let Some(id) = message.get_mut("id").filter(|id| id.is_string()) {
         redact(id, ResponsePart::Data);
     }
     for field in ["params", "result", "error"] {
@@ -517,6 +537,13 @@ impl StreamableHttpClient for McpHttpClient {
             }
             _ => None,
         };
+        if self.redactor.is_some()
+            && let Some(id) = &directory_request
+        {
+            let mut pending = self.directory_requests.lock().unwrap();
+            pending.retain(|_, started| started.elapsed() <= REQUEST_TIMEOUT);
+            pending.insert(id.clone(), tokio::time::Instant::now());
+        }
         let preserve_custom_result = matches!(
             &message,
             ClientJsonRpcMessage::Request(request)
@@ -557,7 +584,7 @@ impl StreamableHttpClient for McpHttpClient {
                     response,
                     max_sse_event_size,
                     self.redactor.clone(),
-                    directory_request,
+                    self.directory_requests.clone(),
                 ),
                 session_id,
             ));
@@ -569,7 +596,7 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(redact) = &self.redactor {
             let text =
                 String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
-            body = redact_message(&text, redact, directory_request.as_ref())
+            body = redact_message(&text, redact, &self.directory_requests)
                 .map_err(|_| unexpected("invalid MCP JSON response"))?
                 .into_bytes();
         }
@@ -645,7 +672,7 @@ impl StreamableHttpClient for McpHttpClient {
             response,
             max_sse_event_size,
             self.redactor.clone(),
-            None,
+            self.directory_requests.clone(),
         ))
     }
 

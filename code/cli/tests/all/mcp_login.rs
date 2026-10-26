@@ -289,3 +289,40 @@ fn a_browser_callback_closes_the_editor_owned_by_the_login() {
         Some(libc::ESRCH)
     );
 }
+
+#[test]
+fn sensitive_plugin_values_are_not_printed_in_the_authorization_link() {
+    use std::io::Read;
+    let fixture = Fixture::new();
+    let server = AuthorizationServer::start();
+    let source = fixture.root.join("source");
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    let secret = "private-client +/值";
+    fs::write(source.join(".claude-plugin/plugin.json"),json!({"name":"private-client","userConfig":{"client":{"type":"string","sensitive":true,"default":secret}},"mcpServers":{"remote":{"url":server.resource(),"oauth":{"clientId":"${user_config.client}"}}}}).to_string()).unwrap();
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", source.to_str().unwrap()]));
+    let mut login = Login::start(&fixture, "plugin:private-client:remote");
+    assert!(
+        matches!(
+            login.lines.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "the CLI printed a login link containing private configuration"
+    );
+    assert!(!login.child.wait().unwrap().success());
+    let mut error = String::new();
+    login
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(error.contains("sensitive plugin configuration"), "{error}");
+    assert!(!error.contains(secret));
+    assert!(
+        !fixture
+            .root
+            .join("config/credentials/private-client/mcp/remote.json")
+            .exists()
+    );
+}

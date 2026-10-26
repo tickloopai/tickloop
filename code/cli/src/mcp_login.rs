@@ -51,7 +51,7 @@ pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
     let cancel = CancellationToken::new();
     let operation = async {
         if *command == "login" {
-            login(&connector, &cancel).await?;
+            login(&connector, &server.sensitive_values, &cancel).await?;
             println!(
                 "Logged in to MCP {}. Available from the next Agent request.",
                 safe_line(name)
@@ -121,11 +121,39 @@ fn resolve(root: &Path, name: &str) -> Result<McpServerConfig, String> {
         })
 }
 
-async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), String> {
+async fn login(
+    connector: &Connector,
+    sensitive_values: &[serde_json::Value],
+    cancel: &CancellationToken,
+) -> Result<(), String> {
     let pending = connector
         .start_login(None, cancel)
         .await
         .map_err(|error| error.to_string())?;
+    let secrets = sensitive_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut decoded = pending.authorization_url().to_owned();
+    for _ in 0..=AUTHORIZATION_URL_ENCODING_LAYERS {
+        if secrets.iter().any(|secret| decoded.contains(secret)) {
+            return Err("The authorization link contains sensitive plugin configuration and cannot be displayed; OAuth client identifiers and resource addresses must be public.".into());
+        }
+        let form = decoded.replace('+', " ");
+        let next = percent_encoding::percent_decode_str(&form)
+            .decode_utf8_lossy()
+            .into_owned();
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
     println!("Open this link in your browser to log in:");
     println!("{}", pending.authorization_url());
     println!(
@@ -256,6 +284,8 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
     result
 }
 
+// A resource URI may already contain escapes before it is encoded into the login URL.
+const AUTHORIZATION_URL_ENCODING_LAYERS: usize = 2;
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 struct RawInput;
 impl RawInput {

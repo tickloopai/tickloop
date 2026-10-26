@@ -1445,3 +1445,54 @@ async fn http_private_configuration_preserves_protocol_flags_and_original_schema
     assert_eq!(server.calls().len(), 1);
     connections.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
+    let server = McpService::start().await;
+    server.resume_tool_directory_once();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271}}}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+            sensitive_values: vec![json!(839271)],
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(server.directory_resumes(), 1);
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(connections.snapshot()[0].tools.len(), 1);
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":0}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::NotDispatched(_)
+    ));
+    assert!(server.calls().is_empty());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":839272}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    connections.shutdown().await;
+}

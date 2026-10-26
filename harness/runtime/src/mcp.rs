@@ -130,6 +130,14 @@ impl Entry {
     ) {
         let mut originals = self.tool_schemas.write().unwrap();
         tools.retain(|name, tool| {
+            if matches!(self.config.transport, McpTransport::Http { .. })
+                && !originals.contains_key(&tool.original)
+            {
+                warnings.push(format!(
+                    "{name}: original input schema unavailable; tool omitted"
+                ));
+                return false;
+            }
             if let Some(schema) = originals.get(&tool.original) {
                 if jsonschema::validator_for(schema).is_err() {
                     warnings.push(format!("{name}: invalid input schema; tool omitted"));
@@ -406,6 +414,7 @@ impl McpConnections {
                             _ = connection.changed.notified() => {
                                 if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
                                 let revision = connection.revision.load(Ordering::SeqCst);
+                                entry.tool_schemas.write().unwrap().clear();
                                 let tools = tokio::select! {
                                     _ = entry.cancel.cancelled() => continue,
                                     tools = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.list_all_tools()) => tools,
@@ -979,6 +988,7 @@ async fn open(
         .map(|info| info.capabilities.clone())
         .unwrap_or_default();
     let tools = if capabilities.tools.is_some() {
+        entry.tool_schemas.write().unwrap().clear();
         service.peer().list_all_tools().await.map_err(|_| {
             if http.as_ref().is_some_and(McpHttpClient::insufficient_scope) {
                 "MCP scope required"

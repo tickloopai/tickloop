@@ -26,6 +26,9 @@ struct State {
     bearer: Option<String>,
     requests: usize,
     notification: Option<String>,
+    resume_directory: bool,
+    directory_response: Option<Value>,
+    directory_resumes: usize,
     resources_capability: Option<Value>,
     resources: Value,
     resource_text: String,
@@ -49,6 +52,9 @@ impl McpService {
                 bearer: None,
                 requests: 0,
                 notification: None,
+                resume_directory: false,
+                directory_response: None,
+                directory_resumes: 0,
                 resources_capability: Some(json!({})),
                 resources: json!([{"uri":"fixture://text","name":"text"}]),
                 resource_text: "resource text".into(),
@@ -77,6 +83,20 @@ impl McpService {
                                 if bytes.len() > 65536 { return; }
                             };
                             let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                            if headers.starts_with("GET ") && headers.lines().any(|line| line.to_ascii_lowercase().starts_with("last-event-id:")) {
+                                let response = {
+                                    let mut state = state.lock().unwrap();
+                                    let response = state.directory_response.take();
+                                    if response.is_some() { state.directory_resumes += 1; }
+                                    response
+                                };
+                                if let Some(response) = response {
+                                    let body = format!("data: {response}\n\n");
+                                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                                    let _ = stream.write_all(reply.as_bytes()).await;
+                                    return;
+                                }
+                            }
                             if !headers.starts_with("POST ") {
                                 let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
@@ -117,7 +137,16 @@ impl McpService {
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
                             let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
-                            let (status, content_type, body) = if request.get("id").is_none() {
+                            let resume_directory = {
+                                let mut state = state.lock().unwrap();
+                                if request["method"] == "tools/list" && std::mem::take(&mut state.resume_directory) {
+                                    state.directory_response = Some(response.clone());
+                                    true
+                                } else { false }
+                            };
+                            let (status, content_type, body) = if resume_directory {
+                                (200, "text/event-stream", "id: directory-cut\nretry: 0\n\n".into())
+                            } else if request.get("id").is_none() {
                                 (202, "application/json", String::new())
                             } else if !notifications.is_empty() {
                                 let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
@@ -153,6 +182,12 @@ impl McpService {
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
+    }
+    pub fn resume_tool_directory_once(&self) {
+        self.state.lock().unwrap().resume_directory = true;
+    }
+    pub fn directory_resumes(&self) -> usize {
+        self.state.lock().unwrap().directory_resumes
     }
     pub fn notify_log(&self, text: &str) {
         self.state.lock().unwrap().notification = Some(
