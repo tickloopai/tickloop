@@ -917,7 +917,10 @@ fn marketplace_archives_also_use_the_entry_name_as_identity() {
         .unwrap()
         .plugin;
     assert_eq!(installed.name(), "alias");
-    assert_eq!(installed.manifest.display_name.as_deref(), Some("Original Display Name"));
+    assert_eq!(
+        installed.manifest.display_name.as_deref(),
+        Some("Original Display Name")
+    );
     assert_eq!(fixture.store.get("alias").unwrap().manifest.name, "alias");
     assert_eq!(
         installed.executable(),
@@ -1199,10 +1202,10 @@ async fn cancelling_git_stops_a_helper_after_it_has_started() {
     let operation = tokio::spawn(async move { client.checkout(&source, &root).await });
     let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                if pid.trim().parse::<u32>().is_ok() {
-                    break pid;
-                }
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && pid.trim().parse::<u32>().is_ok()
+            {
+                break pid;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
