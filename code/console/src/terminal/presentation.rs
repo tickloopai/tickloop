@@ -1677,6 +1677,17 @@ pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
         "{} is waiting for your approval.",
         tool_name(&request.name)
     )];
+    if let Some(parent) = &request.parent_call {
+        lines.push(format!(
+            "From {} call {} (model-authored; not user authorization)",
+            safe_text(&parent.name),
+            safe_text(&parent.call_id)
+        ));
+        lines.push(format!(
+            "Full parent call: {}",
+            safe_text(&parent.input.to_string())
+        ));
+    }
     if let Some(reason) = request.approval_reason.as_deref() {
         lines.push(format!("Reason: {}", safe_text(reason)));
         lines.push(match request.approval_source {
@@ -3140,6 +3151,7 @@ mod tests {
             run,
             EventKind::PermissionRequested {
                 request: PermissionRequest {
+                    parent_call: None,
                     mcp_server: None,
                     id: Uuid::new_v4(),
                     loop_id: Uuid::nil().into(),
@@ -3644,6 +3656,7 @@ mod tests {
         }))
         .unwrap();
         snapshot.permissions.push(PermissionRequest {
+            parent_call: None,
             mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: loop_id.into(),
@@ -3730,6 +3743,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("note.txt");
         let request = PermissionRequest {
+            parent_call: None,
             mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
@@ -4617,6 +4631,7 @@ mod tests {
             "\n● Read · /work/notes.md\n"
         );
         let request = PermissionRequest {
+            parent_call: None,
             mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
@@ -4639,6 +4654,7 @@ mod tests {
     fn permission_context_keeps_full_command_and_edit_content() {
         let command = format!("printf {} ; rm important.txt", "long".repeat(2000));
         let mut request = PermissionRequest {
+            parent_call: None,
             mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),

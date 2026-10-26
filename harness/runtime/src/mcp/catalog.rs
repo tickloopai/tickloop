@@ -7,12 +7,14 @@ use tickloop_harness_protocol::ToolDefinition;
 pub(super) struct Tool {
     pub original: String,
     pub schema: Value,
+    pub annotations: Value,
     pub definition: ToolDefinition,
 }
 pub(super) fn directory(
-    server: &str,
+    config: &tickloop_harness_protocol::mcp::McpServerConfig,
     tools: Vec<rmcp::model::Tool>,
 ) -> (BTreeMap<String, Tool>, Vec<String>) {
+    let server = &config.name;
     let mut names = BTreeMap::<String, usize>::new();
     for tool in &tools {
         *names.entry(normalize(server, &tool.name)).or_default() += 1;
@@ -29,9 +31,20 @@ pub(super) fn directory(
         };
         let schema = Value::Object((*tool.input_schema).clone());
         let flattened = flatten(schema.clone()).filter(|schema| schema["type"] == "object");
-        let Some(mut input_schema) = flattened else {
-            warnings.push(format!("{name}: unsupported input schema; tool omitted"));
-            continue;
+        let exposure = crate::tool_exposure::effective_exposure(
+            config.exposure,
+            &config.tool_exposure,
+            &original,
+        );
+        let mut input_schema = match flattened {
+            Some(schema) => schema,
+            None if exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct => {
+                json!({"type":"object","properties":{}})
+            }
+            None => {
+                warnings.push(format!("{name}: unsupported input schema; tool omitted"));
+                continue;
+            }
         };
         input_schema
             .as_object_mut()
@@ -53,6 +66,7 @@ pub(super) fn directory(
             Tool {
                 original,
                 schema,
+                annotations: serde_json::to_value(tool.annotations).unwrap_or(Value::Null),
                 definition: ToolDefinition {
                     name,
                     description,

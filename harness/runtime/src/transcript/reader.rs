@@ -85,7 +85,9 @@ impl RetainedState {
                     .insert(entry.message_id, entry.clone());
             }
             Line::ContentReplacement(entry) => self.content_replacements.push(entry.clone()),
-            Line::Response(_) | Line::Input(_) | Line::Wait(_) => self.lifecycle.push(line.clone()),
+            Line::Response(_) | Line::Input(_) | Line::Wait(_) | Line::NestedCall(_) => {
+                self.lifecycle.push(line.clone())
+            }
             // The snapshot repeats what a load from it needs; a load of everything also reads the
             // Lines before it, which older branches may still need.
             Line::RetainedSnapshot(snapshot) => {

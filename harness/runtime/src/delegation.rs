@@ -80,6 +80,7 @@ mod ancestry_authority_tests {
             };
             let input = json!({"task":"delegate again"});
             let operation = OperationRecord {
+                parent_call_id: None,
                 task_binding: None,
                 id: Uuid::new_v4(),
                 loop_id: receipt.loop_id,

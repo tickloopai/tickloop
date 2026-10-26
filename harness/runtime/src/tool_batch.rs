@@ -458,42 +458,7 @@ impl Agent {
         {
             self.mark_tool_use(chat, tool_use);
         }
-        match host_effect {
-            Some(HostEffect::CreatedArtifact(tick)) => {
-                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
-                    self.mark_joined(chat, [instance]);
-                }
-            }
-            Some(HostEffect::ReadArtifact(tick)) => {
-                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
-                    self.mark_taken_in(chat, [instance]);
-                }
-            }
-            Some(HostEffect::RenamedArtifact { instance, title }) => {
-                self.retitle_artifact_tick(chat, &instance, &title)
-            }
-            Some(HostEffect::OpenedTick {
-                instance,
-                title,
-                is_terminal,
-            }) => {
-                if let Some(operation) = chat.snapshot.operations.iter().find(|operation| {
-                    operation.run_id == receipt.run_id
-                        && operation.call_id == call_id
-                        && operation.state == OperationState::Completed
-                }) {
-                    chat.bookkeeping.tick_creation_receipts.push(
-                        approval_context::TickCreationReceipt {
-                            loop_id: receipt.loop_id.into(),
-                            operation_id: operation.id,
-                            instance: instance.clone(),
-                        },
-                    );
-                }
-                self.record_opened_tick(chat, instance, title, is_terminal);
-            }
-            None => {}
-        }
+        self.apply_completed_host_effect(chat, receipt, call_id, host_effect);
         if is_appended && let Some(sources) = &sources {
             let index = chat.snapshot.messages.len() - 1;
             let message_id = *chat
@@ -559,6 +524,76 @@ impl Agent {
             return Err(result.tool.content);
         }
         Ok(())
+    }
+
+    pub(super) async fn complete_nested_call(
+        &self,
+        receipt: &Receipt,
+        call_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        outcome: ToolCallOutcome,
+    ) -> Result<tickloop_harness_protocol::ToolResult, String> {
+        let completion = self
+            .complete_call(receipt, call_id, name, Ok(outcome))
+            .await?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&receipt.chat_id)
+            .ok_or("chat is unavailable")?;
+        if !completion.result.tool.is_error
+            && let Some(tool_use) = monitor_members::ToolUse::of(name, input)
+        {
+            self.mark_tool_use(chat, tool_use);
+        }
+        self.apply_completed_host_effect(chat, receipt, call_id, completion.host_effect);
+        self.save(&chat.snapshot);
+        Ok(completion.result.tool)
+    }
+
+    fn apply_completed_host_effect(
+        &self,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        call_id: &str,
+        host_effect: Option<HostEffect>,
+    ) {
+        match host_effect {
+            Some(HostEffect::CreatedArtifact(tick)) => {
+                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
+                    self.mark_joined(chat, [instance]);
+                }
+            }
+            Some(HostEffect::ReadArtifact(tick)) => {
+                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick) {
+                    self.mark_taken_in(chat, [instance]);
+                }
+            }
+            Some(HostEffect::RenamedArtifact { instance, title }) => {
+                self.retitle_artifact_tick(chat, &instance, &title)
+            }
+            Some(HostEffect::OpenedTick {
+                instance,
+                title,
+                is_terminal,
+            }) => {
+                if let Some(operation) = chat.snapshot.operations.iter().find(|operation| {
+                    operation.run_id == receipt.run_id
+                        && operation.call_id == call_id
+                        && operation.state == OperationState::Completed
+                }) {
+                    chat.bookkeeping.tick_creation_receipts.push(
+                        approval_context::TickCreationReceipt {
+                            loop_id: receipt.loop_id.into(),
+                            operation_id: operation.id,
+                            instance: instance.clone(),
+                        },
+                    );
+                }
+                self.record_opened_tick(chat, instance, title, is_terminal);
+            }
+            None => {}
+        }
     }
 
     /// Turns an executed call's outcome into the result the conversation records, and the host

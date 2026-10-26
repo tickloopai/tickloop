@@ -466,6 +466,8 @@ impl PermissionExecution {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PermissionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call: Option<crate::ProposedToolCall>,
     /// The resolved MCP service, captured when the call was prepared, never inferred from its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
@@ -503,6 +505,8 @@ pub enum OperationState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<crate::TaskExecutionBinding>,
     pub id: Uuid,

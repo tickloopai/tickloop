@@ -3809,6 +3809,7 @@ mod tests {
         snapshot
             .permissions
             .push(tickloop_harness::protocol::PermissionRequest {
+                parent_call: None,
                 mcp_server: None,
                 id: permission,
                 loop_id: receipt.loop_id,

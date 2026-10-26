@@ -57,12 +57,41 @@ impl McpToolProvider {
 #[async_trait]
 impl HostToolProvider for McpToolProvider {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        self.connections
-            .snapshot()
+        self.discovery_tools()
             .into_iter()
-            .flat_map(|server| server.tools)
+            .filter(|tool| tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden)
+            .map(|tool| tool.definition)
             .collect()
     }
+    fn has_tool_search(&self) -> bool {
+        !self.connections.snapshot().is_empty()
+    }
+    fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+        self.connections
+            .catalog()
+            .into_iter()
+            .map(|(entry, _, tool)| {
+                let mut original_schema = tool.schema;
+                redact_schema(&entry, &mut original_schema);
+                let mut annotations = tool.annotations;
+                redact_schema(&entry, &mut annotations);
+                crate::tool_exposure::ExposureTool {
+                    exposure: crate::tool_exposure::effective_exposure(
+                        entry.config.exposure,
+                        &entry.config.tool_exposure,
+                        &tool.original,
+                    )
+                    .for_host(self.connections.inner.capabilities.scripts),
+                    server: entry.config.name.clone(),
+                    original_name: tool.original,
+                    definition: tool.definition,
+                    original_schema,
+                    annotations,
+                }
+            })
+            .collect()
+    }
+
     fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
         HostToolPermission::ThirdParty
     }
@@ -87,6 +116,7 @@ impl HostToolProvider for McpToolProvider {
         let configuration = (self.configuration)();
         self.connections.reconcile(configuration.servers).await;
         *self.warnings.write().unwrap() = configuration.warnings;
+        self.connections.wait_for_direct(cancel).await;
         Ok(())
     }
     async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
@@ -112,17 +142,33 @@ impl HostToolProvider for McpToolProvider {
         serde_json::json!({"mcp": {"warnings": *self.warnings.read().unwrap()}})
     }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
-        self.connections.snapshot().into_iter().filter(|snapshot| snapshot.state != McpServerState::Disabled).filter_map(|snapshot| {
-            let entries = self.connections.inner.entries.read().unwrap();
-            let entry = entries.get(&snapshot.name)?;
-            let login_hint = if snapshot.state == McpServerState::NeedsLogin {
-                " Ask the user to log in from /mcp or with tickloop mcp login <server>. Only the user can log in."
-            } else { "" };
-            Some(McpServerInstructions {
-                server: McpResourceServer { name: snapshot.name.clone(), authority: Self::authority(entry), third_party: true },
-                text: format!("MCP server: {}; source: {}; status: {:?}.{} Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, login_hint, redact(entry, snapshot.instructions)),
+        self.connections
+            .snapshot()
+            .into_iter()
+            .filter(|snapshot| snapshot.state != McpServerState::Disabled)
+            .filter_map(|snapshot| {
+                let entries = self.connections.inner.entries.read().unwrap();
+                let entry = entries.get(&snapshot.name)?;
+                Some(McpServerInstructions {
+                    text: crate::tool_exposure::server_message(
+                        &snapshot.name,
+                        &snapshot.source,
+                        &snapshot.state,
+                        entry
+                            .config
+                            .exposure
+                            .for_host(self.connections.inner.capabilities.scripts),
+                        &redact(entry, entry.config.description.clone()),
+                        &snapshot.instructions,
+                    ),
+                    server: McpResourceServer {
+                        name: snapshot.name,
+                        authority: Self::authority(entry),
+                        third_party: true,
+                    },
+                })
             })
-        }).collect()
+            .collect()
     }
 
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
@@ -175,6 +221,9 @@ impl HostToolProvider for McpToolProvider {
     ) -> Result<PreparedHostCall, String> {
         if cancel.is_cancelled() {
             return Err("MCP call cancelled before preparation".into());
+        }
+        if !self.definitions().iter().any(|tool| tool.name == name) {
+            return Err("MCP tool is unavailable or hidden".into());
         }
         let call = self
             .connections

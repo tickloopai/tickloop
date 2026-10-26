@@ -42,8 +42,8 @@ async fn configured_agent(
     std::fs::write(
         root.join("settings.json"),
         serde_json::to_vec_pretty(&json!({"mcpServers":{
-            "local":{"command":"python3","args":local.stdio_args()},
-            "remote":{"url":remote.url()}
+            "local":{"exposure":"direct","command":"python3","args":local.stdio_args()},
+            "remote":{"exposure":"direct","url":remote.url()}
         }}))
         .unwrap(),
     )
@@ -181,7 +181,7 @@ async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_req
         let source = canonical.join(format!("source-{name}"));
         std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
         std::fs::write(source.join(".claude-plugin/plugin.json"), json!({"name":name,"mcpServers":{
-            "shared":{"url":service.url(), "autoApprove":["*"], "permissions":{"allow":["*"]}}, "duplicate":{"url":remote.url()},
+            "shared":{"exposure":"direct","url":service.url(), "autoApprove":["*"], "permissions":{"allow":["*"]}}, "duplicate":{"url":remote.url()},
             "config":{"command":"never-run-this", "args":["${user_config.key}"]}
         }}).to_string()).unwrap();
         store.install_path(&source).unwrap();
@@ -273,7 +273,7 @@ async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_req
     let settings_path = canonical.join("settings.json");
     let mut settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
-    settings["mcpServers"]["mine"] = json!({"url":alpha.url()});
+    settings["mcpServers"]["mine"] = json!({"exposure":"direct","url":alpha.url()});
     std::fs::write(settings_path, settings.to_string()).unwrap();
     scripted.enqueue(text("configuration changed"));
     complete(&agent, chat, "Report the updated services").await;
@@ -403,7 +403,7 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
     );
     std::fs::write(source.join(".claude-plugin/plugin.json"), json!({
         "name":"configured", "userConfig":{"key":{"type":"string","required":true,"sensitive":true},"pin":{"type":"number","sensitive":true},"flag":{"type":"boolean","sensitive":true}},
-        "mcpServers":{"probe":{"command":"python3","args":args}}
+        "mcpServers":{"probe":{"exposure":"direct","command":"python3","args":args}}
     }).to_string()).unwrap();
     let plugin = tick_plugins::PluginStore::in_config_root(&canonical)
         .install_path(&source)
@@ -569,7 +569,7 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     );
     std::fs::write(
         root.join("settings.json"),
-        json!({"mcpServers":{"remote":{"url":server.url()}}}).to_string(),
+        json!({"mcpServers":{"remote":{"exposure":"direct","url":server.url()}}}).to_string(),
     )
     .unwrap();
     tickloop_harness::base::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture")
@@ -809,4 +809,72 @@ async fn agent_access_reports_servers_takes_up_disabling_and_reconnects_one() {
         .unwrap();
     assert!(refused.error.is_some(), "{refused:?}");
     agent.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated TICKLOOP_CONFIG_DIR with MOONSHOT_CN_API_KEY; calls the billed API"]
+async fn live_fold_search_describe_execute_with_kimi() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    );
+    assert!(
+        root.to_string_lossy()
+            .contains(".scratch/plugin-mcp/evidence/07-codex/")
+    );
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("kimi-cn-api", "kimi-k3")
+        .unwrap();
+    let (agent, local, remote) = configured_agent(
+        &root,
+        model,
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    )
+    .await;
+    let path = root.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in settings["mcpServers"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("exposure");
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if agent.mcp_servers().await.iter().all(|server| {
+                server.state == tickloop_harness::protocol::mcp::McpServerState::Connected
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    complete(&agent,chat,"Use SearchTools to find the configured local and remote acceptance marker tools, then DescribeTools to inspect their parameters, and ExecuteTools to call both once. Reply with both returned markers. Use only these three Fold tools; no shell, scripts, web or other tools.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    for name in ["SearchTools", "DescribeTools", "ExecuteTools"] {
+        assert!(
+            snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.name == name
+                    && operation
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| !result.is_error)),
+            "missing successful {name}"
+        );
+    }
+    assert_eq!(local.calls().len(), 1);
+    assert_eq!(remote.calls().len(), 1);
+    let messages = serde_json::to_string(&snapshot.messages).unwrap();
+    assert!(messages.contains("LOCAL_MCP_OK") && messages.contains("HTTP_MCP_OK"));
+    eprintln!(
+        "Live Fold acceptance passed: model=kimi-k3; SearchTools, DescribeTools, ExecuteTools; stdio=1; HTTP=1; LOCAL_MCP_OK; HTTP_MCP_OK"
+    );
 }

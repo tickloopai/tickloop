@@ -898,6 +898,7 @@ mod tests {
             "a grandchild inherits it"
         );
         let operation = OperationRecord {
+            parent_call_id: None,
             task_binding: None,
             id: Uuid::new_v4(),
             loop_id: child.chat_loop.id,
@@ -990,6 +991,7 @@ mod tests {
             snapshot.message_runs.insert(index, run.into());
         }
         let operation = OperationRecord {
+            parent_call_id: None,
             task_binding: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
@@ -1047,4 +1049,20 @@ mod tests {
             "unrelated repeated call IDs are not compaction rewrites"
         );
     }
+}
+
+pub(super) fn append_nested_evidence(context: &mut ApprovalSnapshot, text: String) {
+    use reply_history::{ReplyContext, ReplySource, ReplyTurn};
+    let Some(input) = context.original_user_inputs.last() else {
+        return;
+    };
+    context.reply_history.contexts.push(ReplyContext {
+        chat_id: input.chat_id,
+        user_message_id: input.message_id,
+        preceding: vec![ReplyTurn {
+            message_id: tickloop_ids::generate(),
+            source: ReplySource::Assistant,
+            text,
+        }],
+    });
 }

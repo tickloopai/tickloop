@@ -156,6 +156,9 @@ impl RetainedFold {
             (Retention::LatestById, Line::Input(entry)) => {
                 self.by_id.insert((kind, entry.input_id), kept);
             }
+            (Retention::LatestById, Line::NestedCall(entry)) => {
+                self.by_id.insert((kind, entry.operation.id), kept);
+            }
             (Retention::LatestById, Line::Wait(entry)) => {
                 self.by_id.insert((kind, entry.wait_id), kept);
             }
@@ -236,6 +239,7 @@ impl RetainedFold {
                         || response_inputs.contains(&entry.input_id)
                         || recent_external_inputs.contains(&entry.input_id)
                 }
+                Line::NestedCall(_) => true,
                 Line::Wait(entry) => {
                     matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
                         || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. })

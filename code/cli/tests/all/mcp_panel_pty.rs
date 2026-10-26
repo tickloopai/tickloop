@@ -95,13 +95,13 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     write_settings(&fixture, &configured);
     let mut terminal = started_agent(&fixture);
     let frame = terminal.press(b"/mcp\r", "the connected servers", |frame| {
-        row_shows(frame, "notes", "http · connected · 1 tool · direct")
+        row_shows(frame, "notes", "http · connected · 1 tool · search")
             && row_shows(
                 frame,
                 "plugin_docs_search",
-                "http · connected · 1 tool · direct",
+                "http · connected · 1 tool · search",
             )
-            && row_shows(frame, "broken", "stdio · failed · direct")
+            && row_shows(frame, "broken", "stdio · failed · search")
     });
     let dialog = dialog_text(&frame);
     let order = [
@@ -139,7 +139,7 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
         frame.contains("Reconnecting notes")
     });
     terminal.press(b"r", "notes connected again", |frame| {
-        row_shows(frame, "notes", "http · connected · 1 tool · direct")
+        row_shows(frame, "notes", "http · connected · 1 tool · search")
     });
 
     let mark = terminal.mark();
@@ -161,7 +161,7 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     });
     terminal.press(b"\r", "the plugin server disabled", |frame| {
         frame.contains("Disabled plugin_docs_search in this directory")
-            && row_shows(frame, "plugin_docs_search", "http · disabled · direct")
+            && row_shows(frame, "plugin_docs_search", "http · disabled · search")
     });
     assert_eq!(
         settings(&fixture)["projects"][path_text(&fixture.root)]["disabledMcpServers"],
@@ -169,7 +169,7 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     );
     let listed = succeeded(&fixture.tickloop(&["mcp", "list"]));
     assert!(
-        listed.contains("plugin_docs_search · http · direct · disabled in this directory"),
+        listed.contains("plugin_docs_search · http · search · disabled in this directory"),
         "{listed}"
     );
     terminal.press(b"\r", "the actions of the disabled server", |frame| {

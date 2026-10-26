@@ -535,6 +535,7 @@ mod tests {
             },
         ];
         let operation = tickloop_harness_protocol::OperationRecord {
+            parent_call_id: None,
             task_binding: None,
             id: uuid::Uuid::new_v4(),
             loop_id: loop_id.into(),

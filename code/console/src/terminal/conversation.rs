@@ -847,6 +847,7 @@ mod tests {
         ];
         snapshot.message_runs = BTreeMap::from([(0, run_id.into()), (1, run_id.into())]);
         snapshot.permissions.push(PermissionRequest {
+            parent_call: None,
             mcp_server: None,
             id: permission_id,
             loop_id: loop_id.into(),

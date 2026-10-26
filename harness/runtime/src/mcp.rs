@@ -39,7 +39,6 @@ use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, TokenErr
 pub use tickloop_harness_connector::{
     ConnectorCredential, ConnectorCredentials, InMemoryCredentials,
 };
-use tickloop_harness_protocol::mcp::DIRECT_EXPOSURE;
 pub use tickloop_harness_protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerSnapshot {
@@ -202,6 +201,7 @@ struct Inner {
     tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     reconcile_lock: tokio::sync::Mutex<()>,
     closed: AtomicBool,
+    direct_waited: AtomicBool,
     state_changed: Arc<tokio::sync::Notify>,
     local_slots: Arc<tokio::sync::Semaphore>,
     remote_slots: Arc<tokio::sync::Semaphore>,
@@ -222,12 +222,41 @@ impl McpConnections {
                 tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
                 reconcile_lock: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
+                direct_waited: AtomicBool::new(false),
                 state_changed: Arc::new(tokio::sync::Notify::new()),
                 local_slots: Arc::new(tokio::sync::Semaphore::new(4)),
                 remote_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             }),
         }
     }
+    async fn wait_for_direct(&self, cancel: CancellationToken) {
+        use tickloop_harness_protocol::mcp::ToolExposure;
+        if self.inner.direct_waited.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let wait = async {
+            loop {
+                let changed = self.inner.state_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let pending = self.inner.entries.read().unwrap().values().any(|entry| {
+                    *entry.state.read().unwrap() == McpServerState::Connecting
+                        && (entry.config.exposure == ToolExposure::Direct
+                            || entry
+                                .config
+                                .tool_exposure
+                                .iter()
+                                .any(|(_, exposure)| *exposure == ToolExposure::Direct))
+                });
+                if !pending {
+                    break;
+                }
+                changed.await;
+            }
+        };
+        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(Duration::from_secs(10), wait) => {} }
+    }
+
     pub fn with_stderr_directory(
         mut self,
         directory: tickloop_harness_base::private_fs::PrivateDirectory,
@@ -477,7 +506,7 @@ impl McpConnections {
                                     state_changed.notify_waiters();
                                 }
                                 if let Ok(Ok(tools)) = tools {
-                                    let (mut tools, mut warnings) = catalog::directory(&entry.config.name, tools);
+                                    let (mut tools, mut warnings) = catalog::directory(&entry.config, tools);
                                     entry.restore_tool_schemas(&mut tools, &mut warnings);
                                     *connection.tools.write().unwrap() = tools;
                                     *connection.warnings.write().unwrap() = warnings;
@@ -583,7 +612,12 @@ impl McpConnections {
                     name: entry.config.name.clone(),
                     source: entry.config.source.clone(),
                     transport,
-                    exposure: DIRECT_EXPOSURE.into(),
+                    exposure: entry
+                        .config
+                        .exposure
+                        .for_host(self.inner.capabilities.scripts)
+                        .as_str()
+                        .into(),
                     tools: catalog
                         .iter()
                         .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
@@ -691,7 +725,7 @@ impl McpConnections {
             .into_iter()
             .find(|(_, _, tool)| tool.definition.name == name);
         let (entry, connection, tool) = target.ok_or("MCP tool is unavailable")?;
-        if crate::validate_host_schema_input(name, &tool.schema, &input).is_err() {
+        if !jsonschema::validator_for(&tool.schema).is_ok_and(|schema| schema.is_valid(&input)) {
             return Err("invalid MCP tool arguments".into());
         }
         if *entry.state.read().unwrap() != McpServerState::Connected {
@@ -1119,7 +1153,7 @@ async fn open(
         }
         None => None,
     };
-    let (mut tools, mut warnings) = catalog::directory(&config.name, tools);
+    let (mut tools, mut warnings) = catalog::directory(config, tools);
     entry.restore_tool_schemas(&mut tools, &mut warnings);
     let instructions = service
         .peer()
