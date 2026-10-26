@@ -381,6 +381,7 @@ mod channel {
                     let tools = Arc::new(tools);
                     let runtime = Agent::with_seams(
                         HarnessSeams {
+                            search: None,
                             transcripts: None,
                             environment: Some(Arc::new(LocalEnvironment::with(
                                 Arc::new(DaemonControl::new(grant.clone())),

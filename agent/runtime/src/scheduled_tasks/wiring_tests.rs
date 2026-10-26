@@ -1064,6 +1064,7 @@ async fn a_history_load_drops_the_self_paced_loop_and_keeps_running_tasks() {
 fn stateless_agent(model: Arc<HoldingModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: None,
             models: ChosenModels::new(model),
@@ -1247,6 +1248,7 @@ async fn a_subagent_is_offered_no_scheduled_task_tools() {
 fn unprompted_worker(model: Arc<HoldingModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
             models: ChosenModels::new(model),
@@ -1508,6 +1510,7 @@ async fn the_loops_first_turn_is_recorded_with_its_task_before_it_runs() {
     );
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store.clone()),
             environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
             models: ChosenModels::new(model),
@@ -2097,6 +2100,7 @@ async fn schedule_wakeup_turns_off_without_the_cron_tools() {
     ]);
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: None,
             models: ChosenModels::new(model.clone()),

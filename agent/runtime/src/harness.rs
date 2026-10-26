@@ -23,6 +23,8 @@ const TITLE_SETTLE_LIMIT: Duration = Duration::from_secs(10);
 const QUIESCE_RECHECK: Duration = Duration::from_millis(100);
 
 pub struct HarnessSeams {
+    /// Optional search transport factory. `None` uses local settings and environment credentials.
+    pub search: Option<Arc<dyn tickloop_agent_tools::web_search::SearchProviderFactory>>,
     /// Where the Chats' Transcripts are kept; `None` keeps no Transcript.
     pub transcripts: Option<Arc<dyn TranscriptStore>>,
     /// `None`: the Chats have no Folder. Every local constructor gives a local environment.
@@ -414,6 +416,7 @@ impl Agent {
             client,
             recorder,
             seams.environment,
+            seams.search,
         ))
     }
 

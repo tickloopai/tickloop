@@ -386,6 +386,7 @@ fn process_on(
 ) -> Agent {
     Agent::with_seams(
         tickloop_agent_runtime::HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: Some(Arc::new(
                 tickloop_agent_runtime::environment::LocalEnvironment::bare(),

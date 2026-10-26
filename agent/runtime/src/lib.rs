@@ -347,6 +347,8 @@ struct Inner {
     /// User settings file; `None` for Agents that do not write settings (tests and the like).
     settings: Option<tickloop_agent_config::UserSettings>,
     search: SearchDefaults,
+    search_provider_factory:
+        Option<Arc<dyn tickloop_agent_tools::web_search::SearchProviderFactory>>,
     host_options: AgentHostOptions,
     waits: WaitHosting,
     /// Config root containing the settings file; user Skills and Skills of installed Tick packages
@@ -1861,6 +1863,7 @@ impl Agent {
             client,
             recorder,
             Some(Arc::new(environment::LocalEnvironment::bare())),
+            None,
         ))
     }
 
@@ -1926,6 +1929,7 @@ impl Agent {
             client,
             None,
             Some(Arc::new(environment::LocalEnvironment::bare())),
+            None,
         )
     }
 
@@ -1936,6 +1940,9 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         recorder: Option<persistence::ChatRecorder>,
         environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+        search_provider_factory: Option<
+            Arc<dyn tickloop_agent_tools::web_search::SearchProviderFactory>,
+        >,
     ) -> Self {
         let HarnessOptions {
             model,
@@ -1973,6 +1980,7 @@ impl Agent {
                 models,
                 settings,
                 search,
+                search_provider_factory,
                 host_options,
                 waits,
                 config_root,

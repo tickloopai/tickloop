@@ -59,6 +59,7 @@ fn cloud_harness(
 ) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

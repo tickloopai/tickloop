@@ -330,6 +330,7 @@ fn local_agent(store: Arc<dyn TranscriptStore>, replies: usize) -> Agent {
     );
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models: ChosenModels::new(Arc::new(model)),
@@ -493,6 +494,7 @@ async fn after_a_fenced_append_the_harness_writes_nothing_more() {
 fn folderless_agent(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

@@ -338,6 +338,7 @@ mod tests {
         options.citation_style = CitationStyle::Numbered;
         Agent::with_seams(
             crate::HarnessSeams {
+                search: None,
                 transcripts: Some(store),
                 environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
                 models: ChosenModels::new(model),

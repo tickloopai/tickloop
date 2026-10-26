@@ -3121,6 +3121,7 @@ async fn folderless_feedback_rejects_an_account_change_before_delivery_or_contin
         let model = Arc::new(ScriptedModel::new(vec![text("received")]));
         let agent = Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: None,
                 models: ChosenModels::new(model.clone()),
@@ -6536,6 +6537,7 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
     ]));
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: None,
             models: ChosenModels::new(model.clone()),

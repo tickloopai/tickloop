@@ -46,6 +46,7 @@ fn allow_web_fetch() -> PermissionRule {
 fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

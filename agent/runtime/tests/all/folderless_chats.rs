@@ -37,6 +37,7 @@ fn allow_web_fetch() -> PermissionRule {
 fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: None,
             models: ChosenModels::new(model),
@@ -395,6 +396,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
     let store = JsonlTranscriptStore::open(root.path().join("state")).unwrap();
     let folderless = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(Arc::new(store)),
             environment: None,
             models: models(),
@@ -413,6 +415,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
     assert_empty(&root.path().join("state"));
     let local = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models: models(),
@@ -425,6 +428,7 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
     let settings_root = tempfile::tempdir().unwrap();
     let with_settings = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: None,
             models: models(),

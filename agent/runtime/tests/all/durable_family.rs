@@ -186,6 +186,7 @@ fn held_child_family(held: usize) -> Arc<FamilyModel> {
 fn harness(store: Arc<dyn TranscriptStore>, model: Arc<FamilyModel>, waits: WaitHosting) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),
@@ -560,6 +561,7 @@ async fn subagent_search_local_reload_still_uses_saved_user_settings() {
         options
     };
     let seams = || HarnessSeams {
+        search: None,
         transcripts: Some(store.clone()),
         environment: Some(Arc::new(
             tickloop_agent_runtime::environment::LocalEnvironment::bare(),
@@ -617,6 +619,7 @@ async fn fixed_search_defaults_reach_every_chat_and_override_stored_family_setti
             options
         };
         let seams = || HarnessSeams {
+            search: None,
             transcripts: Some(store.clone()),
             environment: None,
             models: ChosenModels::new(model.clone()),
@@ -1191,6 +1194,7 @@ async fn a_member_waiting_for_its_children_holds_on_across_instances_without_pol
 fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<FamilyModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),
@@ -1332,6 +1336,7 @@ fn harness_with_rules(
 ) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

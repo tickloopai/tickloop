@@ -36,6 +36,7 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
     let settings = tickloop_agent_config::UserSettings::in_root(store.root());
     Agent::with_seams(
         crate::HarnessSeams {
+            search: None,
             transcripts: Some(Arc::new(store)),
             environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
             models,

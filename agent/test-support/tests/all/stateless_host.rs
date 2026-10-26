@@ -153,6 +153,7 @@ fn cloud_harness(
     move |store| {
         Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: Some(store),
                 environment: None,
                 models: ChosenModels::new(model.clone()),

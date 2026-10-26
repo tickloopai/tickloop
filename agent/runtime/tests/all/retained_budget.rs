@@ -75,6 +75,7 @@ impl ModelClient for Answers {
 fn harness(store: Arc<dyn TranscriptStore>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(Arc::new(Answers)),

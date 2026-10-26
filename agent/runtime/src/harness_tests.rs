@@ -36,6 +36,7 @@ fn harness(
     };
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts,
             environment,
             models: ChosenModels::new(model),
@@ -318,6 +319,7 @@ fn durable_chat_options() -> HarnessOptions {
 fn composed(environment: bool, options: HarnessOptions) -> Result<Agent, AgentError> {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: environment.then(|| Arc::new(LocalEnvironment::bare()) as _),
             models: ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
@@ -458,4 +460,103 @@ fn only_the_durable_chat_preset_asks_web_fetch_for_provenance() {
     ] {
         assert!(!allowed.iter().any(|tool| tool == reviewed), "{reviewed}");
     }
+}
+
+#[derive(Default)]
+struct RecordingSearchFactory(std::sync::Mutex<Vec<tickloop_agent_protocol::SearchConfig>>);
+
+#[async_trait]
+impl tickloop_agent_tools::web_search::SearchProviderFactory for RecordingSearchFactory {
+    async fn prepare(
+        &self,
+        config: &tickloop_agent_protocol::SearchConfig,
+        _: &tickloop_agent_tools::web_search::SearchRequest,
+    ) -> Result<
+        Arc<tickloop_agent_tools::web_search::PreparedSearch>,
+        tickloop_agent_tools::web_search::SearchError,
+    > {
+        self.0.lock().unwrap().push(config.clone());
+        Err(tickloop_agent_tools::web_search::SearchError::MissingCredential)
+    }
+}
+
+#[tokio::test]
+async fn search_seam_survives_dynamic_chat_configuration() {
+    use tickloop_agent_protocol::{SearchConfig, SearchProviderKind};
+    let factory = Arc::new(RecordingSearchFactory::default());
+    let initial = SearchConfig {
+        provider: SearchProviderKind::Tavily,
+        endpoint: String::new(),
+        api_key_env: None,
+    };
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: Some(factory.clone()),
+            transcripts: None,
+            environment: None,
+            models: ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
+        },
+        HarnessOptions {
+            search: SearchDefaults::Fixed(Some(initial.clone())),
+            ..durable_chat_options()
+        },
+    )
+    .unwrap();
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let tools = agent
+        .inner
+        .chats
+        .lock()
+        .await
+        .get(&chat)
+        .unwrap()
+        .tools
+        .clone();
+    let workspace = tickloop_agent_tools::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let ids = tickloop_ids::IdContext::new();
+    let input = serde_json::json!({"query": "Rust documentation"});
+    assert!(
+        tools
+            .prepare(
+                &ids,
+                &workspace,
+                tickloop_agent_tools::WEB_SEARCH_TOOL_NAME,
+                &input
+            )
+            .await
+            .is_err()
+    );
+    agent.set_search(chat, None).await.unwrap();
+    assert!(
+        tools
+            .prepare(
+                &ids,
+                &workspace,
+                tickloop_agent_tools::WEB_SEARCH_TOOL_NAME,
+                &input
+            )
+            .await
+            .is_err()
+    );
+    let updated = SearchConfig {
+        provider: SearchProviderKind::Brave,
+        ..initial.clone()
+    };
+    agent.set_search(chat, Some(updated.clone())).await.unwrap();
+    assert!(
+        tools
+            .prepare(
+                &ids,
+                &workspace,
+                tickloop_agent_tools::WEB_SEARCH_TOOL_NAME,
+                &input
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(*factory.0.lock().unwrap(), vec![initial, updated]);
+    agent.shutdown().await;
 }

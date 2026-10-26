@@ -65,6 +65,7 @@ async fn host_switch_controls_tools_and_remains_bounded_by_capability_policy() {
         options.tools.tasks = capability;
         let agent = Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: None,
                 models: ChosenModels::new(model.clone()),
@@ -109,6 +110,7 @@ async fn local_settings_override_either_host_value_and_keep_default_off() {
         options.settings = Some(settings.clone());
         let agent = Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: Some(Arc::new(LocalEnvironment::bare())),
                 models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![]))),
@@ -185,6 +187,7 @@ fn harness(
     }
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

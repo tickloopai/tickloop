@@ -40,6 +40,7 @@ impl ModelClients for ChosenModels {
 pub fn embedded_agent(model: ModelConfig, models: Arc<dyn ModelClients>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models,
@@ -55,6 +56,7 @@ pub fn opened_agent(root: PathBuf, model: ModelConfig, models: Arc<dyn ModelClie
     let settings = tickloop_agent_config::UserSettings::in_root(store.root());
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(Arc::new(store)),
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models,

@@ -174,6 +174,7 @@ fn harness(
 ) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
@@ -936,6 +937,7 @@ async fn a_refused_input_at_an_explicit_parent_leaves_the_conversation_uncut() {
         .retain(|modality| *modality != tickloop_agent_protocol::InputModality::Image);
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store.clone()),
             environment: Some(Arc::new(LocalEnvironment::bare())),
             models: tickloop_agent_test_support::harness::ChosenModels::new(model.clone()),
