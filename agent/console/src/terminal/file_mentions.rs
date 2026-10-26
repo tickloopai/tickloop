@@ -105,6 +105,9 @@ const CACHED_DIRECTORY_LIMIT: usize = 16;
 pub(super) enum MentionDirectory {
     Roots,
     Path(PathBuf),
+    // Explicit navigation is not an attachment or file-access grant.
+    Browse(PathBuf),
+    Home(PathBuf),
 }
 
 #[derive(Debug, Default)]
@@ -653,11 +656,20 @@ impl MentionDirectory {
     pub(super) fn for_query(draft: &str, cursor: usize) -> Option<Self> {
         let token = mention_token(draft, cursor)?;
         let query = unescape_path_token(&draft[token.start + 1..token.cursor]);
+        if query == "~" {
+            return Some(Self::Home(PathBuf::new()));
+        }
         let Some((parent, _)) = query.rsplit_once('/') else {
             return Some(Self::Roots);
         };
+        if let Some(relative) = parent
+            .strip_prefix("~/")
+            .or_else(|| (parent == "~").then_some(""))
+        {
+            return Some(Self::Home(PathBuf::from(relative.trim_start_matches('/'))));
+        }
         if query.starts_with('/') {
-            Some(Self::Path(PathBuf::from(if parent.is_empty() {
+            Some(Self::Browse(PathBuf::from(if parent.is_empty() {
                 "/"
             } else {
                 parent
@@ -690,6 +702,22 @@ impl FileMentionIndex {
         directory: MentionDirectory,
         canceled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
+        Self::build_directory_with_home(
+            working_directory,
+            additional_directories,
+            directory,
+            std::env::home_dir().as_deref(),
+            canceled,
+        )
+    }
+
+    fn build_directory_with_home(
+        working_directory: &Path,
+        additional_directories: &[PathBuf],
+        directory: MentionDirectory,
+        home: Option<&Path>,
+        canceled: &dyn Fn() -> bool,
+    ) -> io::Result<Self> {
         check_scan_canceled(canceled)?;
         let working_directory = working_directory.canonicalize()?;
         let mut allowed_roots = vec![working_directory.clone()];
@@ -701,7 +729,18 @@ impl FileMentionIndex {
             }
         }
         let mut entries = Vec::new();
+        let browsing = matches!(
+            directory,
+            MentionDirectory::Browse(_) | MentionDirectory::Home(_)
+        );
         let directories = match &directory {
+            MentionDirectory::Browse(path) => vec![path.clone()],
+            MentionDirectory::Home(relative) => {
+                let home = home.filter(|path| path.is_absolute()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable")
+                })?;
+                vec![home.join(relative)]
+            }
             MentionDirectory::Roots => allowed_roots.clone(),
             MentionDirectory::Path(path) => vec![if path.is_absolute() {
                 path.clone()
@@ -711,22 +750,32 @@ impl FileMentionIndex {
         };
         for selected in directories {
             check_scan_canceled(canceled)?;
+            // User-spelled aliases are later restored in the displayed path.
+            if !is_safe_display_path(&selected) {
+                continue;
+            }
             let canonical = selected.canonicalize()?;
-            let Some((root_index, root)) = allowed_roots
+            let (root_index, root) = match allowed_roots
                 .iter()
                 .enumerate()
                 .find(|(_, root)| canonical.starts_with(root))
-            else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "file mention directory is outside the allowed roots",
-                ));
+            {
+                Some(root) => root,
+                None if browsing => (usize::MAX, &canonical),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "file mention directory is outside the allowed roots",
+                    ));
+                }
             };
-            if canonical
-                .strip_prefix(root)
-                .unwrap()
-                .components()
-                .any(|component| component.as_os_str() == ".git")
+            if (if browsing {
+                canonical.as_path()
+            } else {
+                canonical.strip_prefix(root).unwrap()
+            })
+            .components()
+            .any(|component| component.as_os_str() == ".git")
             {
                 return Ok(Self {
                     directory,
@@ -734,9 +783,11 @@ impl FileMentionIndex {
                     entries,
                 });
             }
+            // Match ignore rules against canonical paths even when navigation used a symlink.
+            let scan_selected = if browsing { &canonical } else { &selected };
             let mut rules = Vec::new();
             let mut ancestor = root.clone();
-            for component in selected
+            for component in scan_selected
                 .strip_prefix(root)
                 .unwrap_or_else(|_| canonical.strip_prefix(root).unwrap())
                 .components()
@@ -755,15 +806,29 @@ impl FileMentionIndex {
                     });
                 }
             }
+            let first_entry = entries.len();
             scan_directory(
                 root,
-                &selected,
+                scan_selected,
                 root_index == 0,
-                &allowed_roots,
+                if browsing { None } else { Some(&allowed_roots) },
                 &rules,
                 &mut entries,
                 canceled,
             )?;
+            if browsing {
+                for entry in &mut entries[first_entry..] {
+                    let path = Path::new(entry.absolute_path.trim_end_matches('/'));
+                    let name = path.file_name().expect("a scanned child has a filename");
+                    let suffix = if entry.kind == MentionKind::Directory {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    entry.absolute_path =
+                        format!("{}{suffix}", normalize_path(&selected.join(name)));
+                }
+            }
         }
         check_scan_canceled(canceled)?;
         entries.sort_by(|left, right| left.absolute_path.cmp(&right.absolute_path));
@@ -786,7 +851,8 @@ impl FileMentionIndex {
         }
         let token = mention_token(draft, cursor)?;
         let query = unescape_path_token(&draft[token.start + 1..token.cursor]);
-        let uses_absolute_path = query.starts_with('/');
+        let uses_home_path = query == "~" || query.starts_with("~/");
+        let uses_absolute_path = query.starts_with('/') || uses_home_path;
         let uses_explicit_relative_path = query.starts_with("./");
         let query_for_matching = normalize_separators(
             query
@@ -813,20 +879,31 @@ impl FileMentionIndex {
                             .rsplit('/')
                             .next()
                             .unwrap_or(indexed_path),
-                        query_for_matching
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&query_for_matching),
+                        if query == "~" {
+                            ""
+                        } else {
+                            query_for_matching
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&query_for_matching)
+                        },
                     )
                 };
                 fuzzy_score(candidate, query).map(|score| (score, entry, indexed_path))
             })
             .collect::<Vec<_>>();
 
+        // Explicit dot-prefix queries still rank hidden entries by match quality.
+        let prefer_non_hidden = !query_for_matching
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .starts_with('.');
         matches.sort_by(
             |(left_score, left_entry, left_path), (right_score, right_entry, right_path)| {
-                left_score
-                    .cmp(right_score)
+                (prefer_non_hidden && is_hidden_entry(left_path))
+                    .cmp(&(prefer_non_hidden && is_hidden_entry(right_path)))
+                    .then_with(|| left_score.cmp(right_score))
                     .then_with(|| kind_rank(left_entry.kind).cmp(&kind_rank(right_entry.kind)))
                     .then_with(|| path_depth(left_path).cmp(&path_depth(right_path)))
                     .then_with(|| left_path.cmp(right_path))
@@ -837,7 +914,20 @@ impl FileMentionIndex {
             .into_iter()
             .take(limit)
             .map(|(_, entry, path)| {
-                let display_path = if uses_explicit_relative_path {
+                let display_path = if uses_home_path {
+                    let parent = query.rsplit_once('/').map_or("~", |(parent, _)| parent);
+                    let name = path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(path);
+                    let suffix = if entry.kind == MentionKind::Directory {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    format!("{parent}/{name}{suffix}")
+                } else if uses_explicit_relative_path {
                     format!("./{path}")
                 } else {
                     path.to_owned()
@@ -1038,7 +1128,7 @@ fn scan_directory(
     root: &Path,
     directory: &Path,
     exposes_relative_paths: bool,
-    allowed_roots: &[PathBuf],
+    allowed_roots: Option<&[PathBuf]>,
     inherited_rules: &[IgnoreRule],
     entries: &mut Vec<IndexedEntry>,
     canceled: &dyn Fn() -> bool,
@@ -1092,9 +1182,8 @@ fn scan_directory(
             Ok(path) => path,
             Err(_) => continue,
         };
-        if !allowed_roots
-            .iter()
-            .any(|allowed_root| canonical_path.starts_with(allowed_root))
+        if allowed_roots
+            .is_some_and(|roots| !roots.iter().any(|root| canonical_path.starts_with(root)))
         {
             continue;
         }
@@ -1338,6 +1427,13 @@ impl PartialOrd for FuzzyScore {
     }
 }
 
+fn is_hidden_entry(path: &str) -> bool {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with('.'))
+}
+
 fn kind_rank(kind: MentionKind) -> u8 {
     match kind {
         MentionKind::Directory => 0,
@@ -1435,6 +1531,261 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn explicit_absolute_navigation_does_not_grant_attachment_access() {
+        let project = Fixture::new();
+        let outside = Fixture::new();
+        outside.file("notes.txt");
+        outside.file("nested/deep.txt");
+        let root = project.index_for("@/");
+        assert!(!root.complete("@/", 2, 100).unwrap().candidates.is_empty());
+        assert_eq!(
+            root.allowed_roots,
+            vec![project.root.canonicalize().unwrap()]
+        );
+
+        let query = format!("@{}/", outside.root.display());
+        let index = project.index_for(&query);
+        let completion = index.complete(&query, query.len(), 100).unwrap();
+        assert_eq!(completion.candidates.len(), 2);
+        assert!(
+            !completion
+                .candidates
+                .iter()
+                .any(|entry| entry.display_path.ends_with("deep.txt"))
+        );
+        let candidate = completion
+            .candidates
+            .iter()
+            .position(|entry| entry.display_path.ends_with("notes.txt"))
+            .unwrap();
+        let applied = completion.apply(&query, candidate).unwrap();
+        assert_eq!(
+            index.revalidate(&applied).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut state = FileMentionState::with_index(index);
+        state.update_at(&query, query.len(), 100);
+        state.selected = Some(candidate);
+        let FileMentionAction::ReplaceDraft { draft, .. } =
+            state.handle_key(FileMentionKey::Choose)
+        else {
+            panic!("path navigation must allow choosing an outside candidate");
+        };
+        assert_eq!(
+            state
+                .revalidate_all_for_submission(&draft)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(project.index().allowed_roots, root.allowed_roots);
+    }
+
+    #[test]
+    fn home_navigation_preserves_prefix_and_requires_separate_attachment_authorization() {
+        let project = Fixture::new();
+        let home = Fixture::new();
+        home.file("目录 space/notes.txt");
+        home.file("目录 space/nested/deep.txt");
+        for query in ["@~", "@~/", "@~/目录\\ space/"] {
+            let index = FileMentionIndex::build_directory_with_home(
+                &project.root,
+                &[],
+                MentionDirectory::for_query(query, query.len()).unwrap(),
+                Some(&home.root),
+                &|| false,
+            )
+            .unwrap();
+            let completion = index.complete(query, query.len(), 100).unwrap();
+            assert!(!completion.candidates.is_empty());
+            assert!(
+                completion
+                    .candidates
+                    .iter()
+                    .all(|entry| entry.display_path.starts_with("~/"))
+            );
+            assert!(
+                !completion
+                    .candidates
+                    .iter()
+                    .any(|entry| entry.display_path.ends_with("deep.txt"))
+            );
+            let applied = completion.apply(query, 0).unwrap();
+            assert!(applied.token.starts_with("@~/"));
+            assert_eq!(
+                index.revalidate(&applied).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                index.allowed_roots,
+                vec![project.root.canonicalize().unwrap()]
+            );
+        }
+        let query = "@~/目录\\ space/notes";
+        let index = FileMentionIndex::build_directory_with_home(
+            &project.root,
+            std::slice::from_ref(&home.root),
+            MentionDirectory::for_query(query, query.len()).unwrap(),
+            Some(&home.root),
+            &|| false,
+        )
+        .unwrap();
+        let completion = index.complete(query, query.len(), 100).unwrap();
+        let applied = completion.apply(query, 0).unwrap();
+        assert_eq!(
+            index.revalidate(&applied).unwrap(),
+            home.root
+                .join("目录 space/notes.txt")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(
+            index
+                .complete(&applied.draft, applied.cursor, 100)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn home_navigation_rejects_missing_home_and_does_not_expand_other_users() {
+        let project = Fixture::new();
+        for home in [None, Some(Path::new("")), Some(Path::new("relative"))] {
+            assert_eq!(
+                FileMentionIndex::build_directory_with_home(
+                    &project.root,
+                    &[],
+                    MentionDirectory::Home(PathBuf::new()),
+                    home,
+                    &|| false,
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        assert_eq!(
+            MentionDirectory::for_query("@~someone/", 10),
+            Some(MentionDirectory::Path(PathBuf::from("~someone")))
+        );
+        assert_eq!(
+            MentionDirectory::for_query("@~//nested/", 11),
+            Some(MentionDirectory::Home(PathBuf::from("nested")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_navigation_follows_directory_aliases_without_authorizing_the_target() {
+        use std::os::unix::fs::symlink;
+        let project = Fixture::new();
+        let outside = Fixture::new();
+        outside.file("notes.txt");
+        outside.file("secret");
+        outside.file("bad\nname.txt");
+        outside.file(".git/config");
+        fs::write(outside.root.join(".gitignore"), "/secret\n").unwrap();
+        symlink(&outside.root, project.root.join("alias")).unwrap();
+        let query = format!("@{}/alias/", project.root.display());
+        let index = project.index_for(&query);
+        let completion = index.complete(&query, query.len(), 100).unwrap();
+        assert!(!completion.candidates.iter().any(|entry| {
+            entry.display_path.ends_with("/secret")
+                || entry.display_path.contains('\n')
+                || entry.display_path.ends_with("/.git/")
+        }));
+        let candidate = completion
+            .candidates
+            .iter()
+            .position(|entry| entry.display_path.ends_with("/notes.txt"))
+            .unwrap();
+        let applied = completion.apply(&query, candidate).unwrap();
+        assert!(applied.token.contains("/alias/notes.txt"));
+        assert_eq!(
+            applied.path,
+            outside.root.join("notes.txt").canonicalize().unwrap()
+        );
+        assert_eq!(
+            index.revalidate(&applied).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Implicit project completion still excludes the escaping link.
+        assert!(
+            !project
+                .index()
+                .complete("@", 1, 100)
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|entry| entry.display_path == "alias/")
+        );
+        let unsafe_alias = project.root.join("alias\u{1b}[31m");
+        symlink(&outside.root, &unsafe_alias).unwrap();
+        for directory in [
+            MentionDirectory::Browse(unsafe_alias.clone()),
+            MentionDirectory::Home(PathBuf::new()),
+        ] {
+            let index = FileMentionIndex::build_directory_with_home(
+                &project.root,
+                &[],
+                directory,
+                Some(&unsafe_alias),
+                &|| false,
+            )
+            .unwrap();
+            assert!(
+                index.entries.is_empty(),
+                "unsafe aliases must not reappear in displayed paths"
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_results_are_isolated_from_stale_generations_and_implicit_completion() {
+        let project = Fixture::new();
+        let outside = Fixture::new();
+        outside.file("outside.txt");
+        project.file("project.txt");
+        let query = format!("@{}/", outside.root.display());
+        let directory = MentionDirectory::for_query(&query, query.len()).unwrap();
+        let mut state = FileMentionState::default();
+        state.update_at(&query, query.len(), 100);
+        let stale = state.request_directory(directory.clone()).unwrap();
+        state.update_at("@", 1, 100);
+        let current = state.request_directory(MentionDirectory::Roots).unwrap();
+        assert_eq!(
+            state.replace_index(stale, project.index_for(&query)),
+            IndexReplacement::Stale
+        );
+        assert!(state.candidates().is_empty());
+        assert_eq!(
+            state.replace_index(current, project.index()),
+            IndexReplacement::Replaced
+        );
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .all(|entry| entry.display_path != "outside.txt")
+        );
+        state.update_at(&query, query.len(), 100);
+        let current = state.request_directory(directory).unwrap();
+        assert_eq!(
+            state.replace_index(current, project.index_for(&query)),
+            IndexReplacement::Replaced
+        );
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .any(|entry| entry.display_path.ends_with("outside.txt"))
+        );
+        state.update_at("@", 1, 100);
+        assert!(state.request_directory(MentionDirectory::Roots).is_none());
+        assert_eq!(state.candidates().len(), 1);
+        assert_eq!(state.candidates()[0].display_path, "project.txt");
     }
 
     #[test]
@@ -1664,6 +2015,84 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn non_hidden_entries_precede_hidden_entries_before_limiting_results() {
+        let fixture = Fixture::new();
+        fixture.directory(".cache");
+        fixture.directory("Documents");
+        fixture.file(".env");
+        fixture.file("notes.txt");
+        let absolute = format!("{}/", normalize_path(&fixture.root));
+        for (query, prefix) in [
+            ("@".to_owned(), ""),
+            ("@./".to_owned(), "./"),
+            (format!("@{absolute}"), absolute.as_str()),
+            ("@~".to_owned(), "~/"),
+            ("@~/".to_owned(), "~/"),
+        ] {
+            let index = FileMentionIndex::build_directory_with_home(
+                &fixture.root,
+                &[],
+                MentionDirectory::for_query(&query, query.len()).unwrap(),
+                Some(&fixture.root),
+                &|| false,
+            )
+            .unwrap();
+            for limit in [2, 100] {
+                let completion = index.complete(&query, query.len(), limit).unwrap();
+                let paths = completion
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.display_path.clone())
+                    .collect::<Vec<_>>();
+                let expected = ["Documents/", "notes.txt", ".cache/", ".env"]
+                    .into_iter()
+                    .take(limit)
+                    .map(|name| format!("{prefix}{name}"))
+                    .collect::<Vec<_>>();
+                assert_eq!(paths, expected, "query {query}, limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_entries_remain_matchable_and_explicit_dot_queries_keep_match_ranking() {
+        let fixture = Fixture::new();
+        fixture.directory(".cache");
+        fixture.file(".cache/.env");
+        fixture.file(".cache/notes.txt");
+        fixture.file(".env");
+        fixture.file("a.env.backup");
+        for (query, expected) in [
+            ("@env", vec!["a.env.backup", ".env"]),
+            ("@.env", vec![".env", "a.env.backup"]),
+            ("@./.ca", vec!["./.cache/"]),
+            ("@.cache/", vec![".cache/notes.txt", ".cache/.env"]),
+            ("@.cache/.e", vec![".cache/.env"]),
+        ] {
+            let completion = fixture
+                .index_for(query)
+                .complete(query, query.len(), 100)
+                .unwrap();
+            let paths = completion
+                .candidates
+                .iter()
+                .map(|candidate| candidate.display_path.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, expected, "query {query}");
+            let hidden = completion
+                .candidates
+                .iter()
+                .position(|candidate| is_hidden_entry(&candidate.display_path))
+                .unwrap();
+            let applied = completion.apply(query, hidden).unwrap();
+            assert_eq!(
+                fixture.index_for(query).revalidate(&applied).unwrap(),
+                applied.path
+            );
+        }
     }
 
     #[test]
