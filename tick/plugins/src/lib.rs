@@ -42,6 +42,9 @@ pub enum PluginError {
         "plugin {name} is already installed from marketplace {marketplace}; uninstall it first"
     )]
     NameTaken { name: String, marketplace: String },
+    /// A Tick package an earlier Tickloop installed has the plugin's name.
+    #[error("{0} is already installed as a Tick package; uninstall it first")]
+    TickPackageNameTaken(String),
     #[error("plugin {name} cannot be used ({reason}); install it again")]
     Unusable { name: String, reason: String },
     #[error("{} is damaged ({reason}); repair it, or remove it and reinstall your plugins", path.display())]

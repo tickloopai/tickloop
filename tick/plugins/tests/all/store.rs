@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use serde_json::json;
-use tick_packages::{ApiKey, LoginState};
+use tick_packages::{ApiKey, LoginState, PackageStore};
 use tick_plugins::{
     ExpectedArchive, InstallOutcome, ManifestFormat, PluginError, PluginSource,
     TICKLOOP_MARKETPLACE,
@@ -249,6 +249,29 @@ fn a_plugin_name_belongs_to_one_marketplace_at_a_time() {
         "plugin quotes is already installed from marketplace tickloop; uninstall it first"
     );
     assert_eq!(fixture.registry(), registry);
+}
+
+#[test]
+fn a_plugin_cannot_take_the_name_of_an_installed_tick_package() {
+    let fixture = Fixture::new();
+    let package = fixture.tick_package("quotes-package", "quotes", "1.0.0");
+    PackageStore::in_config_root(&fixture.config_root())
+        .install_path(&package)
+        .unwrap();
+    let plugin = fixture.claude_plugin("quotes-plugin", &json!({"name": "quotes"}), &["read"]);
+
+    let error = fixture.store.install_path(&plugin).unwrap_err();
+
+    assert!(
+        matches!(error, PluginError::TickPackageNameTaken(ref name) if name == "quotes"),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "quotes is already installed as a Tick package; uninstall it first"
+    );
+    assert!(fixture.store.installed().unwrap().plugins.is_empty());
+    assert!(!fixture.store.directory().join("installed.json").exists());
 }
 
 #[test]

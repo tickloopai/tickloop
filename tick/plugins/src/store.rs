@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use tick_packages::{LoginState, PackageCredentials};
+use tick_packages::{LoginState, PackageCredentials, PackageStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -435,6 +435,9 @@ impl PluginStore {
         }
 
         let name = manifest.name.clone();
+        if self.is_tick_package(&name)? {
+            return Err(PluginError::TickPackageNameTaken(name));
+        }
         let registry_path = self.registry_path();
         let mut registry = Registry::read(&registry_path)?;
         let previous = registry.plugins.get(&name).cloned();
@@ -524,6 +527,16 @@ impl PluginStore {
             },
             outcome,
         })
+    }
+
+    /// Whether a Tick package an earlier Tickloop installed, usable or not, is named `name`.
+    fn is_tick_package(&self, name: &str) -> Result<bool, PluginError> {
+        let packages = PackageStore::in_config_root(&self.config_root).installed()?;
+        Ok(packages
+            .packages
+            .iter()
+            .any(|package| package.manifest.name == name)
+            || packages.broken.iter().any(|package| package.name == name))
     }
 
     fn read_installed(&self) -> Result<InstalledPlugins, PluginError> {
