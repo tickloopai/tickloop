@@ -26,6 +26,7 @@ tickloop-code-client = { path = "../client" }
 tickloop-code-settings = { path = "../settings" }
 tickloop-code-updater = { path = "../updater" }
 tickloop-ids = { path = "../../tick/ids" }
+tickloop-tick-plugins = { path = "../../tick/plugins" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tickloop-tickhost = { path = "../../tickhost/host" }

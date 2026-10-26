@@ -1,7 +1,7 @@
 //! The process entries the `tickloop` executable dispatches before it starts the Console.
 
-mod package_command;
 mod plugin_command;
+mod plugin_tick;
 
 use std::ffi::OsString;
 
@@ -29,8 +29,11 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         (MONITOR_COMMAND, _) => {
             Some(tickloop_code_console::terminal::monitor_command::run(&arguments[1..]).await)
         }
-        (TICK_COMMAND, _) => Some(package_command::run(&arguments[1..]).await),
-        (PLUGIN_COMMAND, _) => Some(plugin_command::run(&arguments[1..])),
+        (TICK_COMMAND, _) => {
+            eprintln!("tickloop tick has been renamed; use tickloop plugin instead.");
+            Some(plugin_command::run(&arguments[1..]).await)
+        }
+        (PLUGIN_COMMAND, _) => Some(plugin_command::run(&arguments[1..]).await),
         _ => None,
     }
 }

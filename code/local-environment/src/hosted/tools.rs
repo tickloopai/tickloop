@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_packages::PackageStore;
+use tick_plugins::PluginStore;
 use tick_protocol::{InstanceRef, TickDescriptor};
 use tickhost::host::{Receipt, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
@@ -149,7 +149,7 @@ pub struct HostedTickTools {
     views: Option<std::sync::Arc<HerdrViews>>,
     /// The Tick packages installed in the worker's config root, whose programs an open finds and
     /// whose login states each model request sees.
-    packages: Option<PackageStore>,
+    plugins: Option<PluginStore>,
 }
 
 impl HostedTickTools {
@@ -334,14 +334,14 @@ impl HostedTickTools {
             environment,
             bindings: std::sync::Arc::new(Mutex::new(HashMap::new())),
             views: None,
-            packages: None,
+            plugins: None,
         }
     }
 
     /// The same tools, which also open the programs of the Tick packages installed in
     /// `packages` and report their login states.
-    pub fn with_tick_packages(mut self, packages: PackageStore) -> Self {
-        self.packages = Some(packages);
+    pub fn with_plugins(mut self, packages: PluginStore) -> Self {
+        self.plugins = Some(packages);
         self
     }
 
@@ -491,7 +491,7 @@ impl HostedTickTools {
                 let resolved = tickhost_connect::program::resolve_executable(
                     &words[0],
                     &cwd,
-                    self.packages.as_ref(),
+                    self.plugins.as_ref(),
                 )
                 .map_err(|error| error.to_string())?;
                 let executable = resolved.path;
@@ -509,11 +509,13 @@ impl HostedTickTools {
                     );
                 }
                 let adapter = if protocol
-                    || resolved
-                        .package
-                        .as_ref()
-                        .is_some_and(|package| package.manifest.protocol)
-                {
+                    || resolved.plugin.as_ref().is_some_and(|package| {
+                        package
+                            .manifest
+                            .tick
+                            .as_ref()
+                            .is_some_and(|tick| tick.protocol)
+                    }) {
                     TickAdapter::Protocol
                 } else {
                     TickAdapter::Terminal
@@ -522,14 +524,9 @@ impl HostedTickTools {
                 command[0] = executable.to_string_lossy().into_owned();
                 let command_line = words.join(" ");
                 let origin = resolved
-                    .package
+                    .plugin
                     .as_ref()
-                    .map(|package| {
-                        format!(
-                            " from Tick package {} {}",
-                            package.manifest.name, package.manifest.version
-                        )
-                    })
+                    .map(|package| format!(" from plugin {} {}", package.id(), package.version))
                     .unwrap_or_default();
                 let command_title = tickhost_connect::naming::command_title(&words);
                 normalized_input["protocol"] = json!(adapter == TickAdapter::Protocol);
@@ -1879,39 +1876,38 @@ impl HostToolProvider for HostedTickTools {
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         let mut context = WorkspaceHostContext::from_environment().with_tickhost();
-        if let Some(packages) = &self.packages {
-            context.tick_packages = packages
+        if let Some(packages) = &self.plugins {
+            context.plugins = packages
                 .installed()
                 .map(|installed| {
                     installed
-                        .packages
+                        .plugins
                         .into_iter()
                         .map(|package| {
                             use tickloop_harness::runtime::host_tools::{
-                                WorkspacePackageLogin, WorkspaceTickPackage,
+                                WorkspacePlugin, WorkspacePluginLogin,
                             };
                             let login = match packages.login_state(&package) {
                                 tick_packages::LoginState::LoggedIn => {
-                                    WorkspacePackageLogin::LoggedIn
+                                    WorkspacePluginLogin::LoggedIn
                                 }
                                 tick_packages::LoginState::LoggedOut => {
-                                    WorkspacePackageLogin::LoggedOut
+                                    WorkspacePluginLogin::LoggedOut
                                 }
-                                tick_packages::LoginState::Expired => {
-                                    WorkspacePackageLogin::Expired
-                                }
+                                tick_packages::LoginState::Expired => WorkspacePluginLogin::Expired,
                                 tick_packages::LoginState::NotRequired => {
-                                    WorkspacePackageLogin::NotRequired
+                                    WorkspacePluginLogin::NotRequired
                                 }
-                                tick_packages::LoginState::Unknown => {
-                                    WorkspacePackageLogin::Unknown
-                                }
+                                tick_packages::LoginState::Unknown => WorkspacePluginLogin::Unknown,
                             };
-                            WorkspaceTickPackage {
+                            WorkspacePlugin {
+                                id: package.id(),
+                                enabled: package.enabled,
+                                has_tick: package.manifest.tick.is_some(),
                                 login,
                                 executable: package.executable(),
                                 name: package.manifest.name,
-                                version: package.manifest.version,
+                                version: package.version,
                                 description: package.manifest.description,
                             }
                         })

@@ -195,7 +195,7 @@ fn save_login(fixture: &Fixture, name: &str) {
 }
 
 fn install_path(fixture: &Fixture, directory: &Path) {
-    succeeded(&fixture.tickloop(&["tick", "install", "--path", &path_text(directory)]));
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(directory)]));
 }
 
 /// Whether the row of `name` ends with `details`.
@@ -236,7 +236,7 @@ fn panel_is_open(frame: &str) -> bool {
 #[test]
 fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     let fixture = Fixture::new();
-    install_path(&fixture, &fixture.package_with_login("alpha", "1.0.0"));
+    fixture.install_official(&fixture.package_with_login("alpha", "1.0.0"));
     install_path(&fixture, &fixture.package_named("beta", "1.0.0"));
     let server = Server::start();
     let (alpha_archive, alpha_sha256) = archive_of(&fixture.package_with_login("alpha", "2.0.0"));
@@ -316,7 +316,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     assert!(
         fixture
             .root
-            .join("config/ticks/sample/bin/tick-sample")
+            .join("config/plugins/cache/tickloop/sample/1.0.0/bin/tick-sample")
             .exists()
     );
 
@@ -392,19 +392,27 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         frame.contains("Uninstalled sample 1.0.0; its running Ticks keep running until closed")
             && !frame.contains("◉ sample")
     });
-    assert!(!fixture.root.join("config/ticks/sample").exists());
+    assert!(
+        !fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample")
+            .exists()
+    );
 
     let frame = terminal.press(ESCAPE, "the closed panel", |frame| !panel_is_open(frame));
     assert!(frame.contains("────"), "the input is back:\n{frame}");
-    let listed = succeeded(&fixture.tickloop(&["tick", "list"]));
-    assert!(listed.starts_with("alpha  2.0.0  needs login"), "{listed}");
+    let listed = succeeded(&fixture.tickloop(&["plugin", "list"]));
+    assert!(
+        listed.starts_with("alpha@tickloop  2.0.0  enabled  needs login"),
+        "{listed}"
+    );
     terminal.exit();
 }
 
 #[test]
 fn the_installed_page_works_while_the_marketplace_cannot_be_read() {
     let fixture = Fixture::new();
-    install_path(&fixture, &fixture.package_with_login("alpha", "1.0.0"));
+    fixture.install_official(&fixture.package_with_login("alpha", "1.0.0"));
     let missing = path_text(&fixture.root.join("missing.json"));
     let mut terminal = Terminal::start(&fixture, &missing);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));

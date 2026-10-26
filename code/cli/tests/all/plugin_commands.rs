@@ -197,31 +197,26 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
 }
 
 #[test]
-fn a_plugin_cannot_take_a_tick_package_name_and_an_unusable_one_is_listed() {
+fn a_local_tick_plugin_can_be_replaced_and_an_unusable_plugin_is_listed() {
     let fixture = Fixture::new();
     succeeded(&fixture.tickloop(&[
-        "tick",
+        "plugin",
         "install",
         "--path",
         &path_text(&fixture.package_named("sample", "1.0.0")),
     ]));
     let clash = claude_plugin(&fixture, "sample", json!({"name": "sample"}), &[]);
 
-    assert_eq!(
-        failed(&plugin(
-            &fixture,
-            &["install", "--path", &path_text(&clash)]
-        )),
-        format!(
-            "Error: cannot install {}: sample is already installed as a Tick package; uninstall \
-             it first\n",
-            clash.display()
-        )
+    let replaced = succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&clash)],
+    ));
+    assert!(
+        replaced.contains("Replaced plugin sample@local"),
+        "{replaced}"
     );
-    assert_eq!(
-        succeeded(&plugin(&fixture, &["list"])),
-        "No plugins are installed.\n"
-    );
+    assert!(succeeded(&plugin(&fixture, &["list"])).contains("sample@local"));
+    succeeded(&plugin(&fixture, &["uninstall", "sample"]));
 
     let notes = claude_plugin(&fixture, "notes", json!({"name": "notes"}), &["write"]);
     succeeded(&plugin(
@@ -250,21 +245,18 @@ fn the_plugin_command_explains_its_usage() {
     for arguments in [
         &["plugin"][..],
         &["plugin", "install"],
-        &["plugin", "install", "notes"],
         &["plugin", "install", "--path"],
         &["plugin", "uninstall"],
         &["plugin", "uninstall", "notes", "--all"],
         &["plugin", "enable"],
         &["plugin", "disable", "--all"],
-        &["plugin", "list", "--available"],
         &["plugin", "validate"],
-        &["plugin", "login", "notes"],
         &["plugin", "update"],
     ] {
         let error = failed(&fixture.tickloop(arguments));
         assert!(
             error.starts_with(
-                "Error: Unknown plugin command. Usage: tickloop plugin install --path PATH"
+                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN"
             ),
             "{arguments:?}: {error}"
         );
@@ -278,8 +270,7 @@ fn the_plugin_command_explains_its_usage() {
         let help = succeeded(&fixture.tickloop(arguments));
         assert!(
             help.starts_with(
-                "Usage: tickloop plugin install --path PATH\n       \
-                 tickloop plugin uninstall PLUGIN [--keep-data]\n"
+                "Usage: tickloop plugin install PLUGIN\n       tickloop plugin install --path PATH\n"
             ),
             "{help}"
         );
@@ -290,9 +281,59 @@ fn the_plugin_command_explains_its_usage() {
     let console_help = succeeded(&fixture.tickloop(&["--help"]));
     assert!(
         console_help.contains(
-            "tickloop plugin install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list | validate DIRECTORY"
+            "tickloop plugin install PLUGIN | install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY"
         ),
         "{console_help}"
     );
     assert!(!fixture.root.join("config").exists());
+}
+
+#[test]
+fn tick_is_a_renamed_alias_and_installing_a_program_explains_its_execution_identity() {
+    let fixture = Fixture::new();
+    let source = fixture.package_named("sample", "1.0.0");
+    let output = fixture.tickloop(&["tick", "install", "--path", &path_text(&source)]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tickloop plugin"));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("sample@local"), "{text}");
+    assert!(text.contains("runs as your user"), "{text}");
+    let listed = succeeded(&plugin(&fixture, &["list"]));
+    assert!(listed.contains("sample@local"));
+    assert!(!fixture.root.join("config/ticks/installed.json").exists());
+}
+
+#[test]
+fn first_cli_use_migrates_an_earlier_package_and_reports_it_only_once() {
+    let fixture = Fixture::new();
+    let source = fixture.package_with_auth(
+        "sample",
+        "1.0.0",
+        json!({
+            "type": "api_key", "env": "SAMPLE_API_KEY", "label": "Sample key"
+        }),
+    );
+    let old = tick_packages::PackageStore::in_config_root(&fixture.root.join("config"));
+    old.install_path(&source).unwrap();
+    old.credentials("sample")
+        .unwrap()
+        .save_api_key(&tick_packages::ApiKey::new("saved-key").unwrap())
+        .unwrap();
+    let first = plugin(&fixture, &["list"]);
+    assert!(first.status.success());
+    assert!(
+        String::from_utf8_lossy(&first.stderr)
+            .contains("Migrated Tick packages to plugins: sample@local")
+    );
+    let listed = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        listed.contains("sample@local  1.0.0  enabled  logged in"),
+        "{listed}"
+    );
+    assert_eq!(succeeded(&plugin(&fixture, &["list"])), listed);
+    assert!(!fixture.root.join("config/ticks").exists());
 }

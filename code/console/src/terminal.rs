@@ -856,8 +856,8 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
-       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]
-       tickloop plugin install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list | validate DIRECTORY
+       tickloop tick ... (deprecated alias for tickloop plugin)
+       tickloop plugin install PLUGIN | install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.

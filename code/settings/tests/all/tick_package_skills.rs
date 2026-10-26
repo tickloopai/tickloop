@@ -5,7 +5,8 @@ use std::{
 };
 use tickloop_code_settings::skills::SkillDiscovery;
 
-use tick_packages::{InstalledPackage, MANIFEST_FILE_NAME, PackageStore, REGISTRY_FILE_NAME};
+use tick_packages::MANIFEST_FILE_NAME;
+use tick_plugins::{InstalledPlugin, PluginStore, REGISTRY_FILE_NAME};
 use tickloop_code_settings::skills::{
     PACKAGE_ROOT_VARIABLE, SkillCaller, SkillError, SkillRegistry,
 };
@@ -39,11 +40,11 @@ fn package_source(directory: &Path, name: &str, skills: &[(&str, &str)]) -> Path
     source
 }
 
-fn install(config_root: &Path, source: &Path) -> InstalledPackage {
-    PackageStore::in_config_root(config_root)
+fn install(config_root: &Path, source: &Path) -> InstalledPlugin {
+    PluginStore::in_config_root(config_root)
         .install_path(source)
         .unwrap()
-        .package
+        .plugin
 }
 
 fn skill(name: &str, description: &str, body: &str) -> String {
@@ -108,7 +109,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
     assert!(
         registry
             .model_listing()
-            .contains("- sample:guide [Tick package · sample]: Open sample Ticks\n")
+            .contains("- sample:guide [Plugin · sample]: Open sample Ticks\n")
     );
     let expansion = registry
         .expand("sample:guide", "", SkillCaller::Model)
@@ -123,8 +124,8 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
     )));
     assert_eq!(
         expansion.source,
-        SkillSource::TickPackage {
-            package: "sample".into(),
+        SkillSource::Plugin {
+            plugin: "sample".into(),
             path: package.root.join("skills/guide/SKILL.md"),
         }
     );
@@ -204,8 +205,8 @@ fn package_skills_get_no_authority_a_user_skill_lacks() {
         .expand("sample:tools", "", SkillCaller::User)
         .unwrap();
     assert_eq!(
-        InvokedSkill::try_from(expansion).unwrap_err(),
-        SkillError::AllowedToolsUnsupported("sample:tools".into())
+        InvokedSkill::try_from(expansion).unwrap().name,
+        "sample:tools"
     );
 }
 
@@ -221,20 +222,20 @@ fn an_unusable_package_or_registry_only_warns() {
             &[("guide", &skill("guide", "Guide", "Guide body"))],
         ),
     );
-    fs::remove_file(package.root.join(MANIFEST_FILE_NAME)).unwrap();
+    fs::write(package.root.join(MANIFEST_FILE_NAME), "not json").unwrap();
 
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
     assert!(!registry.contains("sample:guide"));
     assert!(registry.contains("tickloop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
-        registry.warnings()[0].starts_with("the Skills of Tick package sample are not loaded"),
+        registry.warnings()[0].starts_with("the Skills of plugin sample are not loaded"),
         "{:?}",
         registry.warnings()
     );
 
     fs::write(
-        config_root.join("ticks").join(REGISTRY_FILE_NAME),
+        config_root.join("plugins").join(REGISTRY_FILE_NAME),
         "not json",
     )
     .unwrap();
@@ -242,7 +243,7 @@ fn an_unusable_package_or_registry_only_warns() {
     assert!(registry.contains("tickloop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
-        registry.warnings()[0].starts_with("the Skills of installed Tick packages are not loaded"),
+        registry.warnings()[0].starts_with("the Skills of installed plugins are not loaded"),
         "{:?}",
         registry.warnings()
     );

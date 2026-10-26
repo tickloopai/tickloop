@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tickloop-tick-plugins = { path = "../../tick/plugins" }
 jsonschema = { version = "0.56", default-features = false }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -42,7 +43,6 @@ tickloop-harness = { path = "../../harness/sdk", features = ["test-support"] }
 tempfile = "3"
 
 tickloop-code-settings = { path = "../settings", features = ["test-support"] }
-tickloop-tick-plugins = { path = "../../tick/plugins" }
 base64 = "0.22"
 percent-encoding = "2"
 serde_yaml_ng = "0.10"

@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tick_packages::{InstalledPackage, PackageStore};
 use tick_plugins::{InstalledPlugin, PluginStore};
 pub use tickloop_harness::policy::skills::*;
 use tickloop_harness::protocol::SkillSource;
@@ -40,7 +39,6 @@ impl SkillDiscovery for SkillRegistry {
                 SkillOrigin::User,
                 &mut seen_files,
             );
-            load_tick_packages(&mut registry, root, &mut seen_files);
             load_plugins(&mut registry, root, &mut seen_files);
         }
         for directory in project_skill_directories(folder) {
@@ -58,38 +56,7 @@ impl SkillDiscovery for SkillRegistry {
 enum SkillOrigin<'a> {
     User,
     Project,
-    TickPackage(&'a InstalledPackage),
     Plugin(&'a PluginStore, &'a InstalledPlugin),
-}
-
-fn load_tick_packages(
-    registry: &mut SkillRegistry,
-    config_root: &Path,
-    seen_files: &mut HashSet<PathBuf>,
-) {
-    let installed = match PackageStore::in_config_root(config_root).installed() {
-        Ok(installed) => installed,
-        Err(error) => {
-            registry.warn(format!(
-                "the Skills of installed Tick packages are not loaded: {error}"
-            ));
-            return;
-        }
-    };
-    for broken in installed.broken {
-        registry.warn(format!(
-                "the Skills of Tick package {} are not loaded: it cannot be used ({}); install it again",
-                broken.name, broken.reason
-            ));
-    }
-    for package in &installed.packages {
-        load_directory(
-            registry,
-            &package.root.join(SKILLS_DIRECTORY),
-            SkillOrigin::TickPackage(package),
-            seen_files,
-        );
-    }
 }
 
 /// Loads the Skills of every enabled plugin; a disabled one stays installed but unloaded.
@@ -190,14 +157,6 @@ fn load_files(
             SkillOrigin::Project => {
                 registry.register_markdown(&markdown, SkillSource::Project { path }, &[])
             }
-            SkillOrigin::TickPackage(package) => registry.register_markdown(
-                &markdown,
-                SkillSource::TickPackage {
-                    package: package.manifest.name.clone(),
-                    path,
-                },
-                &[(PACKAGE_ROOT_VARIABLE, &package.root)],
-            ),
             SkillOrigin::Plugin(store, plugin) => {
                 let data = plugin_data_directory(registry, store, plugin, &markdown);
                 let skill_directory = path.parent().unwrap_or(&path).to_path_buf();

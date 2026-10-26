@@ -4,9 +4,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, path::PathBuf};
 
 use serde_json::json;
-use tick_packages::{
-    ApiKey, CURRENT_TARGET, InstallOutcome, Marketplace, MarketplacePackage, PackageStore,
-};
+use tick_packages::{ApiKey, CURRENT_TARGET, Marketplace, MarketplacePackage};
+use tick_plugins::{InstallOutcome, PluginStore};
 use tickloop_tick_installer::{
     InstalledVersion, MarketplaceSource, install, install_path, offers, uninstall,
 };
@@ -70,11 +69,15 @@ fn offered<'a>(marketplace: &'a Marketplace, name: &str) -> &'a MarketplacePacka
 fn offers_pair_each_package_with_what_is_installed_of_it() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let store = PackageStore::in_config_root(&root.join("config"));
+    let store = PluginStore::in_config_root(&root.join("config"));
     install_path(&store, &package_directory(root, "current", "1.0.0")).unwrap();
     install_path(&store, &package_directory(root, "older", "1.0.0")).unwrap();
     install_path(&store, &package_directory(root, "broken", "1.0.0")).unwrap();
-    fs::remove_file(store.directory().join("broken/tick-package.json")).unwrap();
+    fs::write(
+        store.get("broken").unwrap().root.join("tick-package.json"),
+        "not json",
+    )
+    .unwrap();
     let marketplace = marketplace(&[
         ("older", "2.0.0", "https://example.com/older.tar.gz", true),
         ("new", "1.0.0", "https://example.com/new.tar.gz", false),
@@ -112,8 +115,16 @@ fn offers_pair_each_package_with_what_is_installed_of_it() {
 async fn installing_checks_the_installed_version_platform_and_address_before_downloading() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let store = PackageStore::in_config_root(&root.join("config"));
-    install_path(&store, &package_directory(root, "current", "1.0.0")).unwrap();
+    let store = PluginStore::in_config_root(&root.join("config"));
+    let earlier = tick_packages::PackageStore::in_config_root(&root.join("config"));
+    earlier
+        .install_path(&package_directory(root, "current", "1.0.0"))
+        .unwrap();
+    let registry = earlier.directory().join("installed.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+    document["packages"]["current"]["source"] = json!("https://example.com/current.tar.gz");
+    fs::write(registry, document.to_string()).unwrap();
     let remote = MarketplaceSource::Url("https://example.com/marketplace.json".parse().unwrap());
     let marketplace = marketplace(&[
         // Nothing listens there: a download would fail.
@@ -136,7 +147,7 @@ async fn installing_checks_the_installed_version_platform_and_address_before_dow
     .await
     .unwrap();
     assert_eq!(installation.outcome, InstallOutcome::AlreadyInstalled);
-    assert_eq!(installation.package.manifest.version, "1.0.0");
+    assert_eq!(installation.plugin.version, "1.0.0");
     assert_eq!(
         install(
             &http_client,
@@ -172,7 +183,7 @@ async fn installing_checks_the_installed_version_platform_and_address_before_dow
 fn uninstalling_says_where_the_credentials_stay() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let store = PackageStore::in_config_root(&root.join("config"));
+    let store = PluginStore::in_config_root(&root.join("config"));
     install_path(&store, &package_directory(root, "sample", "1.0.0")).unwrap();
     let credentials = store.credentials("sample").unwrap();
     credentials
@@ -192,7 +203,7 @@ fn uninstalling_says_where_the_credentials_stay() {
     assert!(credentials.api_key_path().exists());
     assert_eq!(
         uninstall(&store, "sample").unwrap_err(),
-        "Tick package sample is not installed"
+        "plugin sample is not installed"
     );
 }
 

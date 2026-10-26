@@ -184,12 +184,33 @@ impl Fixture {
         path_text(&path)
     }
 
+    pub(crate) fn install_official(&self, directory: &Path) {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(directory.join("tick-package.json")).unwrap())
+                .unwrap();
+        let (bytes, sha256) = archive_of(directory);
+        let archive = self.root.join("fixture.tar.gz");
+        fs::write(&archive, bytes).unwrap();
+        tick_plugins::PluginStore::in_config_root(&self.root.join("config"))
+            .install_archive(
+                &archive,
+                tick_plugins::ExpectedArchive {
+                    marketplace: "tickloop",
+                    name: manifest["name"].as_str().unwrap(),
+                    version: manifest["version"].as_str().unwrap(),
+                    sha256: &sha256,
+                    url: "https://example.test/fixture.tar.gz",
+                },
+            )
+            .unwrap();
+    }
+
     fn installed_root(&self) -> PathBuf {
-        self.root.join("config/ticks/sample")
+        self.root.join("config/plugins/cache/local/sample/local")
     }
 
     fn packages_directory(&self) -> PathBuf {
-        self.root.join("config/ticks")
+        self.root.join("config/plugins")
     }
 
     /// Every file and directory under the packages directory, with each file's contents.
@@ -440,52 +461,58 @@ pub(crate) fn path_text(path: &Path) -> String {
 fn a_package_installs_lists_updates_and_uninstalls_through_the_cli() {
     let fixture = Fixture::new();
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "No Tick packages are installed.\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "No plugins are installed.\n"
     );
     let first = fixture.package("1.0.0");
     let first_path = path_text(&first);
     let installed_root = path_text(&fixture.installed_root());
 
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "install", "--path", &first_path])),
-        format!("Installed Tick package sample 1.0.0 in {installed_root}.\n")
+        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &first_path])),
+        format!(
+            "Installed plugin sample@local 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
     );
     let program = Command::new(fixture.installed_root().join("bin/tick-sample"))
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(program.stdout).unwrap(), "sample 1.0.0\n");
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "install", "--path", &first_path])),
-        format!("Reinstalled Tick package sample 1.0.0 in {installed_root}.\n")
+        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &first_path])),
+        format!(
+            "Reinstalled plugin sample@local 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  1.0.0  no login needed  The sample package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@local  1.0.0  enabled  no login needed\n"
     );
 
     let second = path_text(&fixture.package("2.0.0"));
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "install", "--path", &second])),
-        format!("Replaced Tick package sample 1.0.0 with 2.0.0 in {installed_root}.\n")
+        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &second])),
+        format!(
+            "Replaced plugin sample@local 1.0.0 with 2.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  2.0.0  no login needed  The sample package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@local  2.0.0  enabled  no login needed\n"
     );
 
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "uninstall", "sample"])),
-        "Uninstalled Tick package sample 2.0.0.\n"
+        succeeded(&fixture.tickloop(&["plugin", "uninstall", "sample"])),
+        "Uninstalled plugin sample@local 2.0.0.\n"
     );
     assert!(!fixture.installed_root().exists());
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "uninstall", "sample"])),
-        "Error: Tick package sample is not installed\n"
+        failed(&fixture.tickloop(&["plugin", "uninstall", "sample"])),
+        "Error: plugin sample is not installed\n"
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "No Tick packages are installed.\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "No plugins are installed.\n"
     );
 }
 
@@ -493,7 +520,7 @@ fn a_package_installs_lists_updates_and_uninstalls_through_the_cli() {
 fn a_failed_install_says_why_and_keeps_the_installed_package() {
     let fixture = Fixture::new();
     succeeded(&fixture.tickloop(&[
-        "tick",
+        "plugin",
         "install",
         "--path",
         &path_text(&fixture.package("1.0.0")),
@@ -505,7 +532,7 @@ fn a_failed_install_says_why_and_keeps_the_installed_package() {
     )
     .unwrap();
 
-    let error = failed(&fixture.tickloop(&["tick", "install", "--path", &path_text(&broken)]));
+    let error = failed(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&broken)]));
 
     assert_eq!(
         error,
@@ -515,11 +542,11 @@ fn a_failed_install_says_why_and_keeps_the_installed_package() {
         )
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  1.0.0  no login needed  The sample package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@local  1.0.0  enabled  no login needed\n"
     );
     let missing = fixture.root.join("missing");
-    let error = failed(&fixture.tickloop(&["tick", "install", "--path", &path_text(&missing)]));
+    let error = failed(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&missing)]));
     assert!(
         error.starts_with(&format!(
             "Error: cannot install {}: cannot open",
@@ -530,14 +557,14 @@ fn a_failed_install_says_why_and_keeps_the_installed_package() {
 
     fs::remove_file(fixture.installed_root().join("bin/tick-sample")).unwrap();
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  1.0.0  login unknown  unusable: executable bin/tick-sample does not exist in the \
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@local  1.0.0  enabled  login unknown  unusable: executable bin/tick-sample does not exist in the \
          package; install it again\n"
     );
 
-    let registry = fixture.root.join("config/ticks/installed.json");
+    let registry = fixture.root.join("config/plugins/installed.json");
     fs::write(&registry, "{").unwrap();
-    let error = failed(&fixture.tickloop(&["tick", "list"]));
+    let error = failed(&fixture.tickloop(&["plugin", "list"]));
     assert!(
         error.starts_with(&format!("Error: {} is damaged", registry.display())),
         "{error}"
@@ -549,61 +576,61 @@ fn a_failed_install_says_why_and_keeps_the_installed_package() {
 fn the_tick_command_explains_its_usage_and_leaves_the_console_arguments_alone() {
     let fixture = Fixture::new();
     for arguments in [
-        &["tick"][..],
-        &["tick", "install"],
-        &["tick", "install", "--path"],
-        &["tick", "install", "-p", "sample"],
-        &["tick", "install", "--force"],
-        &["tick", "list", "--all"],
-        &["tick", "uninstall"],
-        &["tick", "login"],
-        &["tick", "logout", "--all"],
-        &["tick", "login", "sample", "now"],
-        &["tick", "login", "sample", "--issuer"],
-        &["tick", "login", "--issuer", "global"],
-        &["tick", "login", "sample", "--region", "global"],
-        &["tick", "remove", "sample"],
+        &["plugin"][..],
+        &["plugin", "install"],
+        &["plugin", "install", "--path"],
+        &["plugin", "install", "-p", "sample"],
+        &["plugin", "install", "--force"],
+        &["plugin", "list", "--all"],
+        &["plugin", "uninstall"],
+        &["plugin", "login"],
+        &["plugin", "logout", "--all"],
+        &["plugin", "login", "sample", "now"],
+        &["plugin", "login", "sample", "--issuer"],
+        &["plugin", "login", "--issuer", "global"],
+        &["plugin", "login", "sample", "--region", "global"],
+        &["plugin", "remove", "sample"],
     ] {
         let error = failed(&fixture.tickloop(arguments));
         assert!(
-            error.starts_with("Error: Unknown tick command. Usage: tickloop tick install PACKAGE"),
+            error.starts_with(
+                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN"
+            ),
             "{arguments:?}: {error}"
         );
     }
     for arguments in [
-        &["tick", "--help"][..],
-        &["tick", "-h"],
-        &["tick", "install", "--help"],
-        &["tick", "login", "--help"],
-        &["tick", "list", "-h"],
+        &["plugin", "--help"][..],
+        &["plugin", "-h"],
+        &["plugin", "install", "--help"],
+        &["plugin", "login", "--help"],
+        &["plugin", "list", "-h"],
     ] {
         let help = succeeded(&fixture.tickloop(arguments));
         assert!(
             help.starts_with(
-                "Usage: tickloop tick install PACKAGE\n       tickloop tick install --path PATH\n"
+                "Usage: tickloop plugin install PLUGIN\n       tickloop plugin install --path PATH\n"
             ),
             "{help}"
         );
         assert!(help.contains("TICKLOOP_CONFIG_DIR"), "{help}");
         assert!(help.contains("TICKLOOP_TICK_MARKETPLACE"), "{help}");
         assert!(
-            help.contains("tickloop tick login PACKAGE [--issuer LABEL]"),
+            help.contains("tickloop plugin login PLUGIN [--issuer LABEL]"),
             "{help}"
         );
         assert!(
-            help.contains("The Agent's /ticks logs packages in too"),
+            help.contains("login and logout manage the plugin's data source credentials"),
             "{help}"
         );
         assert!(
-            help.contains("grants no market data, account or trading access"),
+            help.contains("Installing runs nothing in the plugin"),
             "{help}"
         );
     }
     let console_help = succeeded(&fixture.tickloop(&["--help"]));
     assert!(
-        console_help.contains(
-            "tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]"
-        ),
+        console_help.contains("tickloop tick ... (deprecated alias for tickloop plugin)"),
         "{console_help}"
     );
     assert!(!fixture.root.join("config").exists());
@@ -623,38 +650,63 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
             &[(CURRENT_TARGET, &first_url, &first_sha256)],
         )])),
     );
-    let installed_root = path_text(&fixture.installed_root());
+    let installed_root = path_text(
+        &fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample/1.0.0"),
+    );
 
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["tick", "install", "sample"])),
-        format!("Installed Tick package sample 1.0.0 in {installed_root}.\n")
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        format!(
+            "Installed plugin sample@tickloop 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
     );
-    let program = Command::new(fixture.installed_root().join("bin/tick-sample"))
-        .output()
-        .unwrap();
+    let program = Command::new(
+        fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample/1.0.0")
+            .join("bin/tick-sample"),
+    )
+    .output()
+    .unwrap();
     assert_eq!(String::from_utf8(program.stdout).unwrap(), "sample 1.0.0\n");
     let registry: Value = serde_json::from_slice(
         &fs::read(fixture.packages_directory().join("installed.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(registry["packages"]["sample"]["source"], first_url);
-    assert_eq!(registry["packages"]["sample"]["sha256"], first_sha256);
+    assert_eq!(registry["plugins"]["sample"]["source"]["url"], first_url);
+    assert_eq!(registry["plugins"]["sample"]["sha256"], first_sha256);
 
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["tick", "install", "sample"])),
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
         format!(
-            "Tick package sample 1.0.0 is already installed in {installed_root}; nothing changed.\n"
+            "Plugin sample@tickloop 1.0.0 is already installed in {installed_root}; nothing changed.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
         )
     );
     assert_eq!(server.requests_of("/tick-sample-1.0.0.tar.gz"), 1);
 
-    fs::remove_file(fixture.installed_root().join("bin/tick-sample")).unwrap();
+    fs::remove_file(
+        fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample/1.0.0")
+            .join("bin/tick-sample"),
+    )
+    .unwrap();
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["tick", "install", "sample"])),
-        format!("Reinstalled Tick package sample 1.0.0 in {installed_root}.\n")
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        format!(
+            "Reinstalled plugin sample@tickloop 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
     );
     assert_eq!(server.requests_of("/tick-sample-1.0.0.tar.gz"), 2);
-    assert!(fixture.installed_root().join("bin/tick-sample").is_file());
+    assert!(
+        fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample/1.0.0")
+            .join("bin/tick-sample")
+            .is_file()
+    );
 
     let (second, second_sha256) = fixture.archive("2.0.0");
     let second_url = server.serve("/tick-sample-2.0.0.tar.gz", Reply::Body(second));
@@ -666,13 +718,20 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
             &[(CURRENT_TARGET, &second_url, &second_sha256)],
         )])),
     );
-    assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["tick", "install", "sample"])),
-        format!("Replaced Tick package sample 1.0.0 with 2.0.0 in {installed_root}.\n")
+    let installed_root = path_text(
+        &fixture
+            .root
+            .join("config/plugins/cache/tickloop/sample/2.0.0"),
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  2.0.0  no login needed  The sample package\n"
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        format!(
+            "Replaced plugin sample@tickloop 1.0.0 with 2.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
+        )
+    );
+    assert_eq!(
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@tickloop  2.0.0  enabled  no login needed\n"
     );
     fixture.assert_no_leftovers();
 }
@@ -681,12 +740,7 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
 fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     let fixture = Fixture::new();
     let server = Server::start();
-    succeeded(&fixture.tickloop(&[
-        "tick",
-        "install",
-        "--path",
-        &path_text(&fixture.package("1.0.0")),
-    ]));
+    fixture.install_official(&fixture.package("1.0.0"));
     let before = fixture.packages_state();
     let (archive, sha256) = fixture.archive("2.0.0");
     let archive_url = server.serve("/tick-sample-2.0.0.tar.gz", Reply::Body(archive.clone()));
@@ -803,7 +857,7 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     ];
 
     for (marketplace, reason) in cases {
-        let error = failed(&fixture.tickloop_from(&marketplace, &["tick", "install", "sample"]));
+        let error = failed(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"]));
         assert!(
             error.starts_with(&format!("Error: {reason}")),
             "{marketplace}: {error}"
@@ -813,8 +867,8 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     }
     assert_eq!(server.requests_of("/interrupted.tar.gz"), 1);
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "sample  1.0.0  no login needed  The sample package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "sample@tickloop  1.0.0  enabled  no login needed\n"
     );
 
     let registry = fixture.packages_directory().join("installed.json");
@@ -822,7 +876,7 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     let unreached_url = server.serve("/unreached.tar.gz", Reply::Body(Vec::new()));
     let error = failed(&fixture.tickloop_from(
         &offering("unreached", CURRENT_TARGET, &unreached_url, &sha256),
-        &["tick", "install", "sample"],
+        &["plugin", "install", "sample"],
     ));
     assert!(
         error.starts_with(&format!("Error: {} is damaged", registry.display())),
@@ -841,7 +895,7 @@ fn the_available_packages_show_which_are_installed_and_which_this_platform_can_i
         fixture.package_with_login("current", "1.0.0"),
         fixture.package_named("outdated", "1.0.0"),
     ] {
-        succeeded(&fixture.tickloop(&["tick", "install", "--path", &path_text(&package)]));
+        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&package)]));
     }
     let sha256 = "a".repeat(64);
     let download = |name: &str| format!("https://example.com/tick-{name}.tar.gz");
@@ -876,7 +930,7 @@ fn the_available_packages_show_which_are_installed_and_which_this_platform_can_i
     );
 
     let listing =
-        succeeded(&fixture.tickloop_from(&marketplace_url, &["tick", "list", "--available"]));
+        succeeded(&fixture.tickloop_from(&marketplace_url, &["plugin", "list", "--available"]));
 
     let mut lines = listing.lines();
     assert_eq!(
@@ -922,13 +976,13 @@ fn the_available_packages_show_which_are_installed_and_which_this_platform_can_i
 
     let empty = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&empty, &["tick", "list", "--available"])),
+        succeeded(&fixture.tickloop_from(&empty, &["plugin", "list", "--available"])),
         format!(
             "Tick marketplace tickloop by Tickloop AI: {empty}\nIt offers no Tick packages yet.\n"
         )
     );
     assert_eq!(
-        failed(&fixture.tickloop_from(&empty, &["tick", "install", "fresh"])),
+        failed(&fixture.tickloop_from(&empty, &["plugin", "install", "fresh"])),
         format!("Error: Tick package fresh is not in the Tick marketplace at {empty}\n")
     );
 }
@@ -941,28 +995,28 @@ fn a_package_logs_in_with_oauth2_and_out_and_lists_its_login_state() {
         fixture.package_with_auth("sample", "1.0.0", oauth2(&[("Local", server.issuer())])),
         fixture.package_named("plain", "1.0.0"),
     ] {
-        succeeded(&fixture.tickloop(&["tick", "install", "--path", &path_text(&package)]));
+        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&package)]));
     }
-    let list = || succeeded(&fixture.tickloop(&["tick", "list"]));
-    let logged_out = "plain   1.0.0  no login needed  The plain package\n\
-                      sample  1.0.0  needs login      The sample package\n";
+    let list = || succeeded(&fixture.tickloop(&["plugin", "list"]));
+    let logged_out = "plain@local   1.0.0  enabled  no login needed\n\
+                      sample@local  1.0.0  enabled  needs login\n";
     assert_eq!(list(), logged_out);
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "plain"])),
+        failed(&fixture.tickloop(&["plugin", "login", "plain"])),
         "Error: Tick package plain needs no login\n"
     );
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "logout", "plain"])),
+        failed(&fixture.tickloop(&["plugin", "logout", "plain"])),
         "Error: Tick package plain needs no login\n"
     );
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "missing"])),
-        "Error: Tick package missing is not installed; install it with tickloop tick install missing\n"
+        failed(&fixture.tickloop(&["plugin", "login", "missing"])),
+        "Error: plugin missing is not installed; install it with tickloop plugin install missing\n"
     );
 
     // No terminal is needed: the link and code are printed and the login waits for approval.
     server.answer_polls([TokenReply::Pending, TokenReply::Approve]);
-    let shown = succeeded(&fixture.tickloop(&["tick", "login", "sample"]));
+    let shown = succeeded(&fixture.tickloop(&["plugin", "login", "sample"]));
     let issuer = server.issuer();
     assert_eq!(
         shown,
@@ -983,13 +1037,13 @@ fn a_package_logs_in_with_oauth2_and_out_and_lists_its_login_state() {
     );
     assert_eq!(
         list(),
-        "plain   1.0.0  no login needed  The plain package\n\
-         sample  1.0.0  logged in        The sample package\n"
+        "plain@local   1.0.0  enabled  no login needed\n\
+         sample@local  1.0.0  enabled  logged in\n"
     );
 
     server.answer_polls([TokenReply::Denied]);
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "sample"]))
+        failed(&fixture.tickloop(&["plugin", "login", "sample"]))
             .lines()
             .last(),
         Some("Error: cannot log in to sample (Local): the authorization was denied")
@@ -1001,13 +1055,13 @@ fn a_package_logs_in_with_oauth2_and_out_and_lists_its_login_state() {
     expired["expires_at"] = json!(now() - 60);
     expired.as_object_mut().unwrap().remove("refresh_token");
     fs::write(&token_path, expired.to_string()).unwrap();
-    assert!(list().contains("sample  1.0.0  login expired"));
+    assert!(list().contains("sample@local  1.0.0  enabled  login expired"));
     fs::write(&token_path, "{").unwrap();
-    assert!(list().contains("sample  1.0.0  login unknown"));
+    assert!(list().contains("sample@local  1.0.0  enabled  login unknown"));
     fs::write(&token_path, saved.to_string()).unwrap();
 
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "logout", "sample"])),
+        succeeded(&fixture.tickloop(&["plugin", "logout", "sample"])),
         "Logged out of sample.\n"
     );
     let revocation = &server.requests_to(REVOCATION_PATH)[0];
@@ -1015,16 +1069,16 @@ fn a_package_logs_in_with_oauth2_and_out_and_lists_its_login_state() {
     assert!(!token_path.exists());
     assert_eq!(list(), logged_out);
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "logout", "sample"])),
+        succeeded(&fixture.tickloop(&["plugin", "logout", "sample"])),
         "Tick package sample was not logged in.\n"
     );
 
     // A failed revocation is reported and the login deleted all the same.
     server.answer_polls([TokenReply::Approve]);
-    succeeded(&fixture.tickloop(&["tick", "login", "sample"]));
+    succeeded(&fixture.tickloop(&["plugin", "login", "sample"]));
     server.answer_revocations(503);
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "logout", "sample"])),
+        succeeded(&fixture.tickloop(&["plugin", "logout", "sample"])),
         format!(
             "The authorization server did not revoke the token ({issuer}{REVOCATION_PATH} \
              answered HTTP 503 Service Unavailable); it is deleted here all the same.\n\
@@ -1033,9 +1087,9 @@ fn a_package_logs_in_with_oauth2_and_out_and_lists_its_login_state() {
     );
     assert_eq!(list(), logged_out);
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "uninstall", "sample"])),
+        succeeded(&fixture.tickloop(&["plugin", "uninstall", "sample"])),
         format!(
-            "Uninstalled Tick package sample 1.0.0.\nIts data source login stays in {}.\n",
+            "Uninstalled plugin sample@local 1.0.0.\nIts data source login stays in {}.\n",
             path_text(&fixture.credentials("sample"))
         )
     );
@@ -1053,21 +1107,21 @@ fn a_package_with_several_issuers_logs_in_with_the_one_chosen() {
             ("Global", global.issuer()),
         ]),
     );
-    succeeded(&fixture.tickloop(&["tick", "install", "--path", &path_text(&package)]));
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&package)]));
 
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "sample"])),
+        failed(&fixture.tickloop(&["plugin", "login", "sample"])),
         "Error: Tick package sample logs in with one of: China mainland, Global; choose one with \
-         tickloop tick login sample --issuer LABEL\n"
+         tickloop plugin login sample --issuer LABEL\n"
     );
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "sample", "--issuer", "Mars"])),
+        failed(&fixture.tickloop(&["plugin", "login", "sample", "--issuer", "Mars"])),
         "Error: Tick package sample has no issuer called Mars; choose one of: China mainland, Global\n"
     );
     assert!(mainland.requests().is_empty() && global.requests().is_empty());
 
     global.answer_polls([TokenReply::Approve]);
-    let shown = succeeded(&fixture.tickloop(&["tick", "login", "sample", "--issuer", "global"]));
+    let shown = succeeded(&fixture.tickloop(&["plugin", "login", "sample", "--issuer", "global"]));
     assert!(
         shown.ends_with("Logged in to sample (Global).\n"),
         "{shown}"
@@ -1079,7 +1133,7 @@ fn a_package_with_several_issuers_logs_in_with_the_one_chosen() {
 
     // On a terminal the issuer is typed, until it names one.
     mainland.answer_polls([TokenReply::Approve]);
-    let mut terminal = fixture.tickloop_on_terminal(&["tick", "login", "sample"]);
+    let mut terminal = fixture.tickloop_on_terminal(&["plugin", "login", "sample"]);
     terminal.wait_for("Type the one to use: ");
     terminal.type_text("mars\r");
     terminal.wait_for("That is none of: China mainland, Global.");
@@ -1106,10 +1160,10 @@ fn an_api_key_is_read_without_showing_it() {
         "1.0.0",
         json!({"type": "api_key", "env": "KEYED_API_KEY", "label": "Keyed API key"}),
     );
-    succeeded(&fixture.tickloop(&["tick", "install", "--path", &path_text(&package)]));
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&package)]));
     let key_path = fixture.credentials("keyed").join("api_key");
 
-    let mut terminal = fixture.tickloop_on_terminal(&["tick", "login", "keyed"]);
+    let mut terminal = fixture.tickloop_on_terminal(&["plugin", "login", "keyed"]);
     terminal.wait_for("Keyed API key for keyed (hidden as you type): ");
     terminal.type_text("secret-key-123\r");
     let (code, shown) = terminal.finish();
@@ -1125,11 +1179,11 @@ fn an_api_key_is_read_without_showing_it() {
         0o600
     );
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "keyed  1.0.0  logged in  The keyed package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "keyed@local  1.0.0  enabled  logged in\n"
     );
 
-    let mut terminal = fixture.tickloop_on_terminal(&["tick", "login", "keyed"]);
+    let mut terminal = fixture.tickloop_on_terminal(&["plugin", "login", "keyed"]);
     terminal.wait_for("(hidden as you type): ");
     terminal.type_text("abandoned\x1b");
     let (code, shown) = terminal.finish();
@@ -1141,7 +1195,7 @@ fn an_api_key_is_read_without_showing_it() {
     assert_eq!(fs::read(&key_path).unwrap(), b"secret-key-123");
 
     let piped = fixture
-        .command(&["tick", "login", "keyed"])
+        .command(&["plugin", "login", "keyed"])
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -1154,21 +1208,21 @@ fn an_api_key_is_read_without_showing_it() {
     succeeded(&piped.wait_with_output().unwrap());
     assert_eq!(fs::read(&key_path).unwrap(), b"piped-key");
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "keyed"])),
+        failed(&fixture.tickloop(&["plugin", "login", "keyed"])),
         "Error: cannot log in to keyed: a key holds 1 to 4096 bytes\n"
     );
     assert_eq!(
-        failed(&fixture.tickloop(&["tick", "login", "keyed", "--issuer", "Global"])),
+        failed(&fixture.tickloop(&["plugin", "login", "keyed", "--issuer", "Global"])),
         "Error: Tick package keyed logs in with a key; --issuer is for OAuth logins\n"
     );
 
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "logout", "keyed"])),
+        succeeded(&fixture.tickloop(&["plugin", "logout", "keyed"])),
         "Logged out of keyed.\n"
     );
     assert!(!key_path.exists());
     assert_eq!(
-        succeeded(&fixture.tickloop(&["tick", "list"])),
-        "keyed  1.0.0  needs login  The keyed package\n"
+        succeeded(&fixture.tickloop(&["plugin", "list"])),
+        "keyed@local  1.0.0  enabled  needs login\n"
     );
 }

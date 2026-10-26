@@ -327,7 +327,7 @@ impl WorkerControl {
                 let owner_revision = registry.revision().await?;
                 let record = LaunchRecord::opening(operation, chat, adapter, command, cwd, title)?;
                 let environment =
-                    with_package_credentials(environment, &record.command, &config_root);
+                    with_plugin_environment(environment, &record.command, &config_root)?;
                 self.launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
                     .map(|opened| json!(opened))
@@ -422,14 +422,14 @@ impl WorkerControl {
                 let current = LaunchIdentity::of(&lost.command, &lost.cwd).map_err(|error| {
                     // A recorded program that went with its uninstalled Tick package names it.
                     let executable = Path::new(&lost.command[0]);
-                    let packages = tick_packages::PackageStore::in_config_root(&config_root);
-                    match program::uninstalled_package_of(executable, &packages) {
+                    let packages = tick_plugins::PluginStore::in_config_root(&config_root);
+                    match program::uninstalled_plugin_of(executable, &packages) {
                         Some(name)
                             if std::fs::symlink_metadata(executable).is_err_and(|error| {
                                 error.kind() == std::io::ErrorKind::NotFound
                             }) =>
                         {
-                            program::package_not_installed(
+                            program::plugin_not_installed(
                                 &executable.file_name().unwrap_or_default().to_string_lossy(),
                                 &name,
                             )
@@ -444,6 +444,8 @@ impl WorkerControl {
                     ));
                 }
                 let owner_revision = registry.revision().await?;
+                let environment =
+                    with_plugin_environment(environment, &lost.command, &config_root)?;
                 let lost_state = lost.state.clone();
                 let reopened = LaunchState::Reopened {
                     instance: instance.clone(),
@@ -478,8 +480,6 @@ impl WorkerControl {
                     lost.cwd.clone(),
                     lost.title.clone(),
                 )?;
-                let environment =
-                    with_package_credentials(environment, &record.command, &config_root);
                 match self
                     .launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
@@ -603,31 +603,51 @@ impl WorkerControl {
 /// `command` runs, read from `config_root` now: a reopen gets the current login, and no record
 /// ever holds a secret. Credentials come from Tickloop alone, so the inherited token file
 /// variable, and the variable a package names for its key, give way to them.
-fn with_package_credentials(
+fn with_plugin_environment(
     mut environment: Vec<(String, String)>,
     command: &[String],
     config_root: &Path,
-) -> Vec<(String, String)> {
-    let packages = tick_packages::PackageStore::in_config_root(config_root);
+) -> Result<Vec<(String, String)>, HostError> {
+    let packages = tick_plugins::PluginStore::in_config_root(config_root);
     // Only the exact canonical path of an installed package's program gets its credentials.
     let package = command
         .first()
-        .and_then(|program| program::installed_package_of(Path::new(program), &packages));
+        .and_then(|program| program::installed_plugin_of(Path::new(program), &packages));
     let key_variable = package
         .as_ref()
         .and_then(|package| match &package.manifest.auth {
             tick_packages::PackageAuth::ApiKey { env, .. } => Some(env.as_str()),
             _ => None,
         });
+    const ROOT_VARIABLES: [&str; 2] = ["TICKLOOP_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"];
+    const DATA_VARIABLES: [&str; 2] = ["TICKLOOP_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"];
     environment.retain(|(name, _)| {
-        name != tick_packages::OAUTH_TOKEN_FILE_VARIABLE && Some(name.as_str()) != key_variable
+        !ROOT_VARIABLES.contains(&name.as_str())
+            && !DATA_VARIABLES.contains(&name.as_str())
+            && name != tick_packages::OAUTH_TOKEN_FILE_VARIABLE
+            && Some(name.as_str()) != key_variable
     });
+    if let Some(package) = &package {
+        if !package.enabled {
+            return Err(program::plugin_disabled(package.name()));
+        }
+        let data = packages
+            .create_data_directory(package.name())
+            .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
+        environment.extend(
+            ROOT_VARIABLES
+                .map(|name| (name.to_owned(), package.root.to_string_lossy().into_owned())),
+        );
+        environment.extend(
+            DATA_VARIABLES.map(|name| (name.to_owned(), data.to_string_lossy().into_owned())),
+        );
+    }
     if let Some(package) = &package
         && let Ok(credentials) = packages.credentials(&package.manifest.name)
     {
         environment.extend(credentials.launch_environment(&package.manifest.auth));
     }
-    environment
+    Ok(environment)
 }
 
 impl WorkerControl {
@@ -778,7 +798,8 @@ async fn chat_snapshot(
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use tick_packages::{ApiKey, OAUTH_TOKEN_FILE_VARIABLE, PackageStore};
+    use tick_packages::{ApiKey, OAUTH_TOKEN_FILE_VARIABLE};
+    use tick_plugins::PluginStore;
 
     use super::*;
 
@@ -865,11 +886,12 @@ mod tests {
         let program = source.join("bin").join(format!("tick-{name}"));
         std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let installed = PackageStore::in_config_root(config_root)
+        let installed = PluginStore::in_config_root(config_root)
             .install_path(&source)
             .unwrap()
-            .package
-            .executable();
+            .plugin
+            .executable()
+            .unwrap();
         installed.canonicalize().unwrap()
     }
 
@@ -882,7 +904,7 @@ mod tests {
             ),
         ];
         let command = vec![program.to_string_lossy().into_owned(), "quote".to_owned()];
-        with_package_credentials(inherited, &command, config_root)
+        with_plugin_environment(inherited, &command, config_root).unwrap()
     }
 
     fn names(environment: &[(String, String)]) -> Vec<&str> {
@@ -908,7 +930,7 @@ mod tests {
             "signed",
             json!({"type":"oauth2","issuers":[{"label":"Sample","issuer":"https://auth.example.com"}]}),
         );
-        let packages = PackageStore::in_config_root(&config_root);
+        let packages = PluginStore::in_config_root(&config_root);
         packages
             .credentials("keyed")
             .unwrap()
@@ -925,6 +947,38 @@ mod tests {
             launched(&keyed, &config_root),
             [
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                (
+                    "TICKLOOP_PLUGIN_ROOT".into(),
+                    packages
+                        .get("keyed")
+                        .unwrap()
+                        .root
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "CLAUDE_PLUGIN_ROOT".into(),
+                    packages
+                        .get("keyed")
+                        .unwrap()
+                        .root
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "TICKLOOP_PLUGIN_DATA".into(),
+                    packages
+                        .data_directory("keyed")
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "CLAUDE_PLUGIN_DATA".into(),
+                    packages
+                        .data_directory("keyed")
+                        .to_string_lossy()
+                        .into_owned()
+                ),
                 ("SAMPLE_API_KEY".to_owned(), KEY.to_owned()),
             ]
         );
@@ -932,6 +986,38 @@ mod tests {
             launched(&signed, &config_root),
             [
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                (
+                    "TICKLOOP_PLUGIN_ROOT".into(),
+                    packages
+                        .get("signed")
+                        .unwrap()
+                        .root
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "CLAUDE_PLUGIN_ROOT".into(),
+                    packages
+                        .get("signed")
+                        .unwrap()
+                        .root
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "TICKLOOP_PLUGIN_DATA".into(),
+                    packages
+                        .data_directory("signed")
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                (
+                    "CLAUDE_PLUGIN_DATA".into(),
+                    packages
+                        .data_directory("signed")
+                        .to_string_lossy()
+                        .into_owned()
+                ),
                 (OAUTH_TOKEN_FILE_VARIABLE.to_owned(), token_file),
             ]
         );

@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tick_packages::{InstalledPackage, PackageError, PackageStore};
+use tick_plugins::{InstalledPlugin, PluginError, PluginStore};
 
 use crate::host_error::HostError;
 
@@ -23,7 +23,7 @@ pub struct ResolvedExecutable {
     /// The canonical path of the program.
     pub path: PathBuf,
     /// The installed Tick package whose program it is.
-    pub package: Option<InstalledPackage>,
+    pub plugin: Option<InstalledPlugin>,
 }
 
 /// Resolves a program the way an Agent open does, finding the programs of the Tick packages
@@ -31,7 +31,7 @@ pub struct ResolvedExecutable {
 pub fn resolve_executable(
     program: &str,
     cwd: &Path,
-    packages: Option<&PackageStore>,
+    packages: Option<&PluginStore>,
 ) -> Result<ResolvedExecutable, HostError> {
     resolve_executable_from(
         program,
@@ -58,55 +58,71 @@ fn resolve_executable_from(
     program: &str,
     cwd: &Path,
     search_path: &OsStr,
-    packages: Option<&PackageStore>,
+    packages: Option<&PluginStore>,
 ) -> Result<ResolvedExecutable, HostError> {
     if program.contains('/') {
         let path = executable_file(&cwd.join(program)).ok_or_else(|| not_found(program))?;
-        let package = packages.and_then(|packages| installed_package_of(&path, packages));
-        return Ok(ResolvedExecutable { path, package });
+        let package = packages.and_then(|packages| installed_plugin_of(&path, packages));
+        if let Some(plugin) = &package
+            && !plugin.enabled
+        {
+            return Err(plugin_disabled(plugin.name()));
+        }
+        return Ok(ResolvedExecutable {
+            path,
+            plugin: package,
+        });
     }
     let package_name = program.strip_prefix(PACKAGE_PROGRAM_PREFIX);
     if let (Some(name), Some(packages)) = (package_name, packages) {
         match packages.get(name) {
-            Ok(package) => {
+            Ok(package) if !package.enabled => return Err(plugin_disabled(name)),
+            Ok(package) if package.manifest.tick.is_some() => {
                 let path =
-                    executable_file(&package.executable()).ok_or_else(|| not_found(program))?;
+                    executable_file(&package.executable().expect("Tick component has a program"))
+                        .ok_or_else(|| not_found(program))?;
                 return Ok(ResolvedExecutable {
                     path,
-                    package: Some(package),
+                    plugin: Some(package),
                 });
             }
-            Err(PackageError::NotInstalled(_) | PackageError::Invalid(_)) => {}
+            Ok(_) | Err(PluginError::NotInstalled(_) | PluginError::Invalid(_)) => {}
             Err(error) => return Err(HostError::before(INVALID_ARGUMENTS, error.to_string())),
         }
     }
     std::env::split_paths(search_path)
         .find_map(|directory| executable_file(&cwd.join(directory).join(program)))
-        .map(|path| ResolvedExecutable {
-            path,
-            package: None,
-        })
+        .map(|path| ResolvedExecutable { path, plugin: None })
         .ok_or_else(|| {
             match package_name.filter(|name| tick_packages::validate_package_name(name).is_ok()) {
-                Some(name) => package_not_installed(program, name),
+                Some(name) => plugin_not_installed(program, name),
                 None => not_found(program),
             }
         })
 }
 
-/// The failure of a program that comes from the Tick package `name`, which is not installed.
-pub fn package_not_installed(program: &str, name: &str) -> HostError {
+pub fn plugin_disabled(name: &str) -> HostError {
     HostError::before(
         INVALID_ARGUMENTS,
         format!(
-            "executable not found: {program} comes from Tick package {name}, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install {name}` in a terminal)"
+            "plugin {name} is disabled; the user enables it with `tickloop plugin enable {name}`"
+        ),
+    )
+}
+
+/// The failure of a program that comes from the Tick package `name`, which is not installed.
+pub fn plugin_not_installed(program: &str, name: &str) -> HostError {
+    HostError::before(
+        INVALID_ARGUMENTS,
+        format!(
+            "executable not found: {program} comes from plugin {name}, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install {name}` in a terminal)"
         ),
     )
 }
 
 /// The package a program recorded at `path` came from, once that package is no longer installed
 /// in `packages`: the program lay in the package's directory there and was named after it.
-pub fn uninstalled_package_of(path: &Path, packages: &PackageStore) -> Option<String> {
+pub fn uninstalled_plugin_of(path: &Path, packages: &PluginStore) -> Option<String> {
     let name = path
         .file_name()?
         .to_str()?
@@ -115,18 +131,24 @@ pub fn uninstalled_package_of(path: &Path, packages: &PackageStore) -> Option<St
         .directory()
         .canonicalize()
         .unwrap_or_else(|_| packages.directory().to_path_buf());
-    path.strip_prefix(directory.join(name)).ok()?;
-    matches!(packages.get(name), Err(PackageError::NotInstalled(_))).then(|| name.to_owned())
+    let relative = path.strip_prefix(directory.join("cache")).ok()?;
+    let mut components = relative.components();
+    let marketplace = components.next()?.as_os_str().to_str()?;
+    tick_plugins::validate_plugin_name(marketplace).ok()?;
+    if components.next()?.as_os_str() != name {
+        return None;
+    }
+    matches!(packages.get(name), Err(PluginError::NotInstalled(_))).then(|| name.to_owned())
 }
 
 /// The installed package whose program `path` is.
-pub fn installed_package_of(path: &Path, packages: &PackageStore) -> Option<InstalledPackage> {
+pub fn installed_plugin_of(path: &Path, packages: &PluginStore) -> Option<InstalledPlugin> {
     let name = path
         .file_name()?
         .to_str()?
         .strip_prefix(PACKAGE_PROGRAM_PREFIX)?;
     let package = packages.get(name).ok()?;
-    (executable_file(&package.executable()).as_deref() == Some(path)).then_some(package)
+    (executable_file(&package.executable()?).as_deref() == Some(path)).then_some(package)
 }
 
 /// The canonical path of `path` when it is an executable file.
@@ -155,7 +177,7 @@ mod tests {
     }
 
     /// Installs a package `name` whose program speaks the Tick protocol into `packages`.
-    fn install_package(packages: &PackageStore, sources: &Path, name: &str) -> InstalledPackage {
+    fn install_package(packages: &PluginStore, sources: &Path, name: &str) -> InstalledPlugin {
         let source = sources.join(name);
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(
@@ -171,14 +193,14 @@ mod tests {
         )
         .unwrap();
         write_executable(&source.join("bin").join(format!("tick-{name}")));
-        packages.install_path(&source).unwrap().package
+        packages.install_path(&source).unwrap().plugin
     }
 
     #[test]
     fn an_installed_package_program_comes_before_path() {
         let directory = tempfile::tempdir().unwrap();
         let path_bin = directory.path().join("path-bin");
-        let packages = PackageStore::in_config_root(&directory.path().join("config"));
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
         let sources = directory.path().join("sources");
         let sample = install_package(&packages, &sources, "sample");
         for executable in [path_bin.join("tick-sample"), path_bin.join("tick-other")] {
@@ -194,16 +216,16 @@ mod tests {
         };
 
         let resolved = resolve("tick-sample").unwrap();
-        assert_eq!(resolved.path, sample.executable());
-        assert_eq!(resolved.package.unwrap().manifest.name, "sample");
-        let by_path = resolve(sample.executable().to_str().unwrap()).unwrap();
+        assert_eq!(resolved.path, sample.executable().unwrap());
+        assert_eq!(resolved.plugin.unwrap().manifest.name, "sample");
+        let by_path = resolve(sample.executable().unwrap().to_str().unwrap()).unwrap();
         assert_eq!(
-            by_path.package.map(|package| package.manifest.name),
+            by_path.plugin.map(|package| package.manifest.name),
             Some("sample".to_owned()),
             "a path naming an installed program is that package's"
         );
         assert_eq!(
-            resolve("path-bin/tick-sample").unwrap().package,
+            resolve("path-bin/tick-sample").unwrap().plugin,
             None,
             "another program of the same name belongs to no package"
         );
@@ -211,23 +233,23 @@ mod tests {
             resolve("tick-other").unwrap(),
             ResolvedExecutable {
                 path: path_bin.join("tick-other").canonicalize().unwrap(),
-                package: None,
+                plugin: None,
             }
         );
 
-        packages.uninstall("sample").unwrap();
+        packages.uninstall("sample", false).unwrap();
         assert_eq!(
             resolve("tick-sample").unwrap(),
             ResolvedExecutable {
                 path: path_bin.join("tick-sample").canonicalize().unwrap(),
-                package: None,
+                plugin: None,
             }
         );
         std::fs::remove_file(path_bin.join("tick-sample")).unwrap();
         let error = resolve("tick-sample").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "InvalidArguments: executable not found: tick-sample comes from Tick package sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install sample` in a terminal)"
+            "InvalidArguments: executable not found: tick-sample comes from plugin sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install sample` in a terminal)"
         );
         assert!(!error.dispatched);
         assert_eq!(
@@ -240,23 +262,23 @@ mod tests {
     #[test]
     fn a_recorded_program_names_its_package_only_once_that_is_uninstalled() {
         let directory = tempfile::tempdir().unwrap();
-        let packages = PackageStore::in_config_root(&directory.path().join("config"));
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
         let sources = directory.path().join("sources");
         let sample = install_package(&packages, &sources, "sample");
         let other = install_package(&packages, &sources, "other");
-        let recorded = sample.executable();
+        let recorded = sample.executable().unwrap();
 
-        assert_eq!(uninstalled_package_of(&recorded, &packages), None);
-        packages.uninstall("sample").unwrap();
+        assert_eq!(uninstalled_plugin_of(&recorded, &packages), None);
+        packages.uninstall("sample", false).unwrap();
         assert_eq!(
-            uninstalled_package_of(&recorded, &packages).as_deref(),
+            uninstalled_plugin_of(&recorded, &packages).as_deref(),
             Some("sample")
         );
         for elsewhere in [
             directory.path().join("bin/tick-sample"),
             other.root.join("bin/tick-sample"),
         ] {
-            assert_eq!(uninstalled_package_of(&elsewhere, &packages), None);
+            assert_eq!(uninstalled_plugin_of(&elsewhere, &packages), None);
         }
     }
 
@@ -265,10 +287,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path_bin = directory.path().join("path-bin");
         write_executable(&path_bin.join("tick-sample"));
-        let packages = PackageStore::in_config_root(&directory.path().join("config"));
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
         std::fs::create_dir_all(packages.directory()).unwrap();
         std::fs::write(
-            packages.directory().join(tick_packages::REGISTRY_FILE_NAME),
+            packages.directory().join(tick_plugins::REGISTRY_FILE_NAME),
             "not json",
         )
         .unwrap();
@@ -281,5 +303,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("is damaged"), "{error}");
+    }
+    #[test]
+    fn a_disabled_plugin_cannot_open_by_name_even_when_path_has_the_same_program() {
+        let directory = tempfile::tempdir().unwrap();
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
+        install_package(&packages, &directory.path().join("sources"), "sample");
+        packages.set_enabled("sample", false).unwrap();
+        let path_bin = directory.path().join("path-bin");
+        write_executable(&path_bin.join("tick-sample"));
+        let error = resolve_executable_from(
+            "tick-sample",
+            directory.path(),
+            path_bin.as_os_str(),
+            Some(&packages),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("tickloop plugin enable sample"),
+            "{error}"
+        );
+        assert!(!error.dispatched);
     }
 }

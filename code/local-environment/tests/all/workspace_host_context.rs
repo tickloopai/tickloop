@@ -350,7 +350,7 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             "{case}: the bundled tickhost is no program to open"
         );
         assert_eq!(
-            state["workspace_host"]["tick_packages"],
+            state["workspace_host"]["plugins"],
             json!([]),
             "{case}: no Tick package is installed"
         );

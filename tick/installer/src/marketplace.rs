@@ -14,9 +14,9 @@ use std::{
 
 use crate::{HttpClient, HttpRequest};
 use reqwest::{Url, header::USER_AGENT};
-use tick_packages::{
-    DEFAULT_MARKETPLACE_URL, DownloadFile, MARKETPLACE_ENVIRONMENT_VARIABLE, Marketplace,
-};
+use tick_packages::{DEFAULT_MARKETPLACE_URL, MARKETPLACE_ENVIRONMENT_VARIABLE, Marketplace};
+
+use tick_plugins::DownloadFile;
 
 const MEBIBYTE: u64 = 1024 * 1024;
 const MARKETPLACE_SIZE_LIMIT: u64 = MEBIBYTE;

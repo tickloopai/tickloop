@@ -263,24 +263,27 @@ pub struct WorkspaceHostContext {
     pub integration: WorkspaceIntegration,
     /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
-    /// The installed Tick packages whose programs this Agent can open.
-    pub tick_packages: Vec<WorkspaceTickPackage>,
+    /// The installed plugins, including disabled plugins.
+    pub plugins: Vec<WorkspacePlugin>,
 }
 
-/// An installed Tick package, as the Agent sees it.
+/// An installed plugin, as the Agent sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct WorkspaceTickPackage {
+pub struct WorkspacePlugin {
+    pub id: String,
+    pub enabled: bool,
+    pub has_tick: bool,
     pub name: String,
     pub version: String,
-    pub description: String,
-    pub executable: PathBuf,
+    pub description: Option<String>,
+    pub executable: Option<PathBuf>,
     /// Its login state, from the credentials Tickloop saved for it.
-    pub login: WorkspacePackageLogin,
+    pub login: WorkspacePluginLogin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspacePackageLogin {
+pub enum WorkspacePluginLogin {
     LoggedIn,
     LoggedOut,
     Expired,
@@ -325,7 +328,7 @@ impl WorkspaceHostContext {
             name,
             integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
-            tick_packages: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 

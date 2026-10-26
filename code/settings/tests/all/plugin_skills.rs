@@ -294,3 +294,25 @@ fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
         registry.warnings()
     );
 }
+
+#[test]
+fn an_earlier_package_skill_migrates_as_a_plugin_and_obeys_disabling() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config");
+    install_tick_package(directory.path(), &config_root, "sample");
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+    let definition = registry
+        .definitions()
+        .find(|skill| skill.name.starts_with("sample:"))
+        .unwrap();
+    assert!(matches!(definition.source, SkillSource::Plugin { .. }));
+    PluginStore::in_config_root(&config_root)
+        .set_enabled("sample", false)
+        .unwrap();
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+    assert!(
+        !registry
+            .definitions()
+            .any(|skill| skill.name.starts_with("sample:"))
+    );
+}

@@ -773,9 +773,8 @@ for line in sys.stdin:
                     // As the production worker does, an open finds the programs of the Tick
                     // packages installed in the config root.
                     if let Some(config_root) = &launch.config_root {
-                        tools = tools.with_tick_packages(
-                            tick_packages::PackageStore::in_config_root(config_root),
-                        );
+                        tools = tools
+                            .with_plugins(tick_plugins::PluginStore::in_config_root(config_root));
                     }
                     let tools = Arc::new(tools);
                     let environment = LocalEnvironment::with(
@@ -1569,7 +1568,7 @@ for line in sys.stdin:
         let chat = daemon.chats[0];
         let packages =
             super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
-        let tools = daemon.tools().with_tick_packages(packages.clone());
+        let tools = daemon.tools().with_plugins(packages.clone());
         let open = json!({"action":"open","command":["tick-counter"],"cwd":daemon.root});
 
         let opened = run_tool(&tools, chat, "TickManage", open.clone()).await;
@@ -1612,13 +1611,13 @@ for line in sys.stdin:
         )
         .await;
 
-        packages.uninstall("counter").unwrap();
+        packages.uninstall("counter", false).unwrap();
         let refused = tools
             .prepare_call(chat.into(), "TickManage", &open, CancellationToken::new())
             .await
             .unwrap_err();
         assert!(
-            refused.contains("`tickloop tick install counter`"),
+            refused.contains("`tickloop plugin install counter`"),
             "{refused}"
         );
     }
@@ -1631,7 +1630,7 @@ for line in sys.stdin:
         let chat = daemon.chats[0];
         let packages =
             super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
-        let tools = daemon.tools().with_tick_packages(packages.clone());
+        let tools = daemon.tools().with_plugins(packages.clone());
         let opened = run_tool(
             &tools,
             chat,
@@ -1644,7 +1643,7 @@ for line in sys.stdin:
         let host = tickhost::process::sample(launcher).unwrap().parent;
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
         assert!(super::gone(business_pid).await);
-        packages.uninstall("counter").unwrap();
+        packages.uninstall("counter", false).unwrap();
         let reopen = json!({"action":"reopen","tick_instance_id":opened["tick_instance_id"]});
 
         let HostCallResult::NotDispatched(uninstalled) =
@@ -1654,7 +1653,7 @@ for line in sys.stdin:
         };
         assert!(
             uninstalled.contains(
-                "executable not found: tick-counter comes from Tick package counter, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install counter` in a terminal)"
+                "executable not found: tick-counter comes from plugin counter, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install counter` in a terminal)"
             ),
             "{uninstalled}"
         );
@@ -1731,6 +1730,21 @@ for line in sys.stdin:
                 .unwrap()
         );
         assert!(!signed_environment.contains_key("SAMPLE_API_KEY"));
+        for (name, environment) in [
+            ("keyed", &keyed_environment),
+            ("signed", &signed_environment),
+        ] {
+            let plugin = packages.get(name).unwrap();
+            for variable in ["TICKLOOP_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"] {
+                assert_eq!(environment[variable], plugin.root.to_str().unwrap());
+            }
+            let data = packages.data_directory(name);
+            for variable in ["TICKLOOP_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"] {
+                assert_eq!(environment[variable], data.to_str().unwrap());
+            }
+            assert!(data.is_dir());
+        }
+
         let shown = [
             serde_json::to_string(&results).unwrap(),
             format!("{:?}", reviewer.requests.lock().unwrap()),
@@ -1756,7 +1770,7 @@ for line in sys.stdin:
         ));
         inherited.push(("SAMPLE_API_KEY".into(), "inherited".into()));
         let tools = HostedTickTools::new(DaemonControl::new(daemon.grants[0].clone()), inherited)
-            .with_tick_packages(packages);
+            .with_plugins(packages);
         let opened = run_tool(&tools, chat, "TickManage", open("tick-keyed")).await;
         assert_eq!(opened["status"], "opened", "{opened}");
         let keyed_environment = super::support::hosted::recorded_environment(&sources, "keyed");

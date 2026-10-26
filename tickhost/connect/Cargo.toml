@@ -19,6 +19,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tickloop-ids = { path = "../../tick/ids" }
+tickloop-tick-plugins = { path = "../../tick/plugins" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tokio = { version = "1", features = ["full", "test-util"] }

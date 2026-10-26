@@ -11,23 +11,29 @@ use tick_plugins::{
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::login_label;
 
-const PLUGIN_USAGE: &str = "Usage: tickloop plugin install --path PATH
+const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN
+       tickloop plugin install --path PATH
        tickloop plugin uninstall PLUGIN [--keep-data]
        tickloop plugin enable PLUGIN
        tickloop plugin disable PLUGIN
-       tickloop plugin list
+       tickloop plugin login PLUGIN [--issuer LABEL]
+       tickloop plugin logout PLUGIN
+       tickloop plugin list [--available]
        tickloop plugin validate DIRECTORY";
 const PLUGIN_GUIDE: &str = "Manage the plugins in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set. A plugin is a directory with a .tickloop-plugin/plugin.json, a .claude-plugin/plugin.json or a tick-package.json manifest, or none, when it is named after its directory.
-install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet. A plugin cannot take the name of an installed plugin from another marketplace or of an installed Tick package.
+install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet. A plugin cannot take the name of an installed plugin from another marketplace.
 uninstall removes a plugin and its data directory; --keep-data keeps the data. Its saved login stays.
 enable and disable turn a plugin on and off without uninstalling it; a disabled plugin stays disabled when it is installed again. Its Skills, named PLUGIN:SKILL, load or stop loading from the Agent's next request.
 list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet.
 validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores.
-Tick packages are still managed with tickloop tick in this version.
+install PLUGIN downloads from the tickloop marketplace (TICKLOOP_TICK_MARKETPLACE overrides its URL or file). login and logout manage the plugin's data source credentials. list --available shows the tickloop marketplace.
+tickloop tick is a deprecated alias for tickloop plugin.
 Installing runs nothing in the plugin, and a plugin's Skills grant no tools; tools still ask as usual.
   -h, --help  Show this help.";
-const SUBCOMMANDS: [&str; 6] = [
+const SUBCOMMANDS: [&str; 8] = [
     "install",
+    "login",
+    "logout",
     "uninstall",
     "enable",
     "disable",
@@ -38,16 +44,35 @@ const KEEP_DATA_OPTION: &str = "--keep-data";
 
 enum PluginCommand<'a> {
     Help,
+    Install(String),
+    Login {
+        name: String,
+        issuer: Option<String>,
+    },
+    Logout(String),
+    ListAvailable,
     InstallPath(&'a Path),
-    Uninstall { name: String, keep_data: bool },
-    SetEnabled { name: String, enabled: bool },
+    Uninstall {
+        name: String,
+        keep_data: bool,
+    },
+    SetEnabled {
+        name: String,
+        enabled: bool,
+    },
     List,
     Validate(&'a Path),
 }
 
-pub fn run(arguments: &[OsString]) -> Result<(), String> {
+pub async fn run(arguments: &[OsString]) -> Result<(), String> {
     match parse(arguments)? {
         PluginCommand::Help => println!("{PLUGIN_USAGE}\n\n{PLUGIN_GUIDE}"),
+        PluginCommand::Install(name) => super::plugin_tick::install(&store()?, &name).await?,
+        PluginCommand::Login { name, issuer } => {
+            super::plugin_tick::login(&store()?, &name, issuer.as_deref()).await?
+        }
+        PluginCommand::Logout(name) => super::plugin_tick::logout(&store()?, &name).await?,
+        PluginCommand::ListAvailable => super::plugin_tick::list_available(&store()?).await?,
         PluginCommand::InstallPath(path) => install_path(&store()?, path)?,
         PluginCommand::Uninstall { name, keep_data } => uninstall(&store()?, &name, keep_data)?,
         PluginCommand::SetEnabled { name, enabled } => set_enabled(&store()?, &name, enabled)?,
@@ -68,6 +93,27 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
         }
         [command, option, path] if command == "install" && option == "--path" => {
             PluginCommand::InstallPath(Path::new(path))
+        }
+        [command, plugin] if command == "install" && !is_option(plugin) => {
+            PluginCommand::Install(name(plugin))
+        }
+        [command, plugin] if command == "login" && !is_option(plugin) => PluginCommand::Login {
+            name: name(plugin),
+            issuer: None,
+        },
+        [command, plugin, option, issuer]
+            if command == "login" && !is_option(plugin) && option == "--issuer" =>
+        {
+            PluginCommand::Login {
+                name: name(plugin),
+                issuer: Some(name(issuer)),
+            }
+        }
+        [command, plugin] if command == "logout" && !is_option(plugin) => {
+            PluginCommand::Logout(name(plugin))
+        }
+        [command, option] if command == "list" && option == "--available" => {
+            PluginCommand::ListAvailable
         }
         [command, plugin] if command == "uninstall" && !is_option(plugin) => {
             PluginCommand::Uninstall {
@@ -117,7 +163,7 @@ fn install_path(store: &PluginStore, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn report(installation: &Installation) {
+pub(super) fn report(installation: &Installation) {
     let plugin = &installation.plugin;
     let id = plugin.id();
     let version = &plugin.version;
@@ -137,6 +183,9 @@ fn report(installation: &Installation) {
             "It stays disabled; tickloop plugin enable {} turns it on.",
             plugin.name()
         );
+    }
+    if plugin.manifest.tick.is_some() {
+        println!("When opened, this plugin's program runs as your user. Installing runs nothing.");
     }
     report_manifest_notes(&plugin.manifest);
 }
@@ -314,7 +363,7 @@ fn validate(path: &Path) -> Result<(), String> {
 }
 
 /// Prints `rows` with every column but the last padded to its widest cell.
-fn print_table<const COLUMNS: usize>(rows: &[[String; COLUMNS]]) {
+pub(super) fn print_table<const COLUMNS: usize>(rows: &[[String; COLUMNS]]) {
     let widths: [usize; COLUMNS] =
         std::array::from_fn(|column| rows.iter().map(|row| row[column].len()).max().unwrap_or(0));
     for row in rows {

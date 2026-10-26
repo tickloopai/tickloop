@@ -1,21 +1,22 @@
 //! A TickManage open of an installed Tick package's program, prepared as an Agent's call is; the
 //! running Tick is covered by `code/cli`'s hosted tests.
 
-use tickloop_harness::runtime::host_tools::WorkspacePackageLogin;
+use tickloop_harness::runtime::host_tools::WorkspacePluginLogin;
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use serde_json::json;
-use tick_packages::{InstalledPackage, MANIFEST_FILE_NAME, PackageStore};
+use tick_packages::MANIFEST_FILE_NAME;
+use tick_plugins::{InstalledPlugin, PluginStore};
 use tickloop_code_local_environment::hosted::{
     tools::HostedTickTools,
     worker_control::{DaemonControl, WorkerControlGrant},
 };
-use tickloop_harness::runtime::host_tools::{HostToolProvider, WorkspaceTickPackage};
+use tickloop_harness::runtime::host_tools::{HostToolProvider, WorkspacePlugin};
 use tokio_util::sync::CancellationToken;
 
 /// Hosted Tick tools whose daemon is never reached: preparing an open asks nothing of it.
-fn tools(directory: &Path, packages: PackageStore) -> HostedTickTools {
+fn tools(directory: &Path, packages: PluginStore) -> HostedTickTools {
     HostedTickTools::new(
         DaemonControl::new(WorkerControlGrant {
             endpoint: directory.join("unused-daemon.sock"),
@@ -26,17 +27,17 @@ fn tools(directory: &Path, packages: PackageStore) -> HostedTickTools {
         }),
         Vec::new(),
     )
-    .with_tick_packages(packages)
+    .with_plugins(packages)
 }
 
 /// Installs the package `name`, whose program runs the example counter Tick and whose manifest
 /// says whether it speaks the Tick protocol.
 fn install(
     directory: &Path,
-    packages: &PackageStore,
+    packages: &PluginStore,
     name: &str,
     protocol: bool,
-) -> InstalledPackage {
+) -> InstalledPlugin {
     let counter = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tick/examples/counter.py")
         .canonicalize()
@@ -65,7 +66,7 @@ fn install(
     )
     .unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-    packages.install_path(&source).unwrap().package
+    packages.install_path(&source).unwrap().plugin
 }
 
 async fn prepare_open(
@@ -87,7 +88,7 @@ async fn prepare_open(
 async fn a_package_program_that_declares_the_protocol_opens_as_a_protocol_tick_unasked() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
-    let packages = PackageStore::in_config_root(&cwd.join("config"));
+    let packages = PluginStore::in_config_root(&cwd.join("config"));
     let counter = install(&cwd, &packages, "counter", true);
     install(&cwd, &packages, "plain", false);
     let tools = tools(&cwd, packages);
@@ -97,20 +98,24 @@ async fn a_package_program_that_declares_the_protocol_opens_as_a_protocol_tick_u
     assert_eq!(
         prepared.approval_summary(),
         format!(
-            "Open `tick-counter` from Tick package counter 1.0.0 in the Tickhost as an extension Tick (cwd {})",
+            "Open `tick-counter` from plugin counter@local 1.0.0 in the Tickhost as an extension Tick (cwd {})",
             cwd.display()
         )
     );
-    let by_path = prepare_open(&tools, &[counter.executable().to_str().unwrap()], &cwd)
-        .await
-        .unwrap();
+    let by_path = prepare_open(
+        &tools,
+        &[counter.executable().unwrap().to_str().unwrap()],
+        &cwd,
+    )
+    .await
+    .unwrap();
     assert_eq!(by_path.input()["protocol"], true);
 
     let plain = prepare_open(&tools, &["tick-plain"], &cwd).await.unwrap();
     assert_eq!(plain.input()["protocol"], false);
     assert!(
         plain.approval_summary().ends_with(&format!(
-            "from Tick package plain 1.0.0 in the Tickhost as a terminal Tick (cwd {})",
+            "from plugin plain@local 1.0.0 in the Tickhost as a terminal Tick (cwd {})",
             cwd.display()
         )),
         "{}",
@@ -119,21 +124,27 @@ async fn a_package_program_that_declares_the_protocol_opens_as_a_protocol_tick_u
 
     let context = tools.workspace_host_context().unwrap();
     assert_eq!(
-        context.tick_packages,
+        context.plugins,
         [
-            WorkspaceTickPackage {
+            WorkspacePlugin {
+                enabled: true,
+                has_tick: true,
+                id: "counter@local".into(),
                 name: "counter".into(),
                 version: "1.0.0".into(),
-                description: "The example counter".into(),
+                description: Some("The example counter".into()),
                 executable: counter.executable(),
-                login: WorkspacePackageLogin::NotRequired,
+                login: WorkspacePluginLogin::NotRequired,
             },
-            WorkspaceTickPackage {
+            WorkspacePlugin {
+                enabled: true,
+                has_tick: true,
+                id: "plain@local".into(),
                 name: "plain".into(),
                 version: "1.0.0".into(),
-                description: "The example counter".into(),
-                executable: cwd.join("config/ticks/plain/bin/tick-plain"),
-                login: WorkspacePackageLogin::NotRequired,
+                description: Some("The example counter".into()),
+                executable: Some(cwd.join("config/plugins/cache/local/plain/local/bin/tick-plain")),
+                login: WorkspacePluginLogin::NotRequired,
             },
         ]
     );
@@ -143,9 +154,9 @@ async fn a_package_program_that_declares_the_protocol_opens_as_a_protocol_tick_u
 async fn opening_the_program_of_a_package_that_is_not_installed_names_the_install_command() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
-    let packages = PackageStore::in_config_root(&cwd.join("config"));
+    let packages = PluginStore::in_config_root(&cwd.join("config"));
     install(&cwd, &packages, "counter-sample", true);
-    packages.uninstall("counter-sample").unwrap();
+    packages.uninstall("counter-sample", false).unwrap();
     let tools = tools(&cwd, packages);
 
     let error = prepare_open(&tools, &["tick-counter-sample", "--start", "1"], &cwd)
@@ -153,13 +164,7 @@ async fn opening_the_program_of_a_package_that_is_not_installed_names_the_instal
         .unwrap_err();
     assert_eq!(
         error,
-        "InvalidArguments: executable not found: tick-counter-sample comes from Tick package counter-sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install counter-sample` in a terminal)"
+        "InvalidArguments: executable not found: tick-counter-sample comes from plugin counter-sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install counter-sample` in a terminal)"
     );
-    assert!(
-        tools
-            .workspace_host_context()
-            .unwrap()
-            .tick_packages
-            .is_empty()
-    );
+    assert!(tools.workspace_host_context().unwrap().plugins.is_empty());
 }

@@ -1,14 +1,15 @@
 //! The login state of each installed Tick package, as every model request sees it in
-//! `workspace_host.tick_packages`; reading it from the saved credentials is covered by
+//! `workspace_host.plugins`; reading it from the saved credentials is covered by
 //! `tick/packages`.
 
-use tickloop_harness::runtime::host_tools::WorkspacePackageLogin;
+use tickloop_harness::runtime::host_tools::WorkspacePluginLogin;
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tickloop_code_settings::local_agent::LocalAgent;
 
 use serde_json::{Value, json};
-use tick_packages::{ApiKey, MANIFEST_FILE_NAME, OAuthToken, PackageStore};
+use tick_packages::{ApiKey, MANIFEST_FILE_NAME, OAuthToken};
+use tick_plugins::PluginStore;
 use tickloop_code_local_environment::hosted::{
     tools::HostedTickTools,
     worker_control::{DaemonControl, WorkerControlGrant},
@@ -19,7 +20,7 @@ use tickloop_harness::runtime::{Agent, host_tools::HostToolProvider};
 use tickloop_harness::test_support::{ScriptedModel, config, next_event, text};
 
 /// Hosted Tick tools whose daemon is never reached: reading login states asks nothing of it.
-fn tools(directory: &Path, packages: PackageStore) -> HostedTickTools {
+fn tools(directory: &Path, packages: PluginStore) -> HostedTickTools {
     HostedTickTools::new(
         DaemonControl::new(WorkerControlGrant {
             endpoint: directory.join("unused-daemon.sock"),
@@ -30,12 +31,12 @@ fn tools(directory: &Path, packages: PackageStore) -> HostedTickTools {
         }),
         Vec::new(),
     )
-    .with_tick_packages(packages)
+    .with_plugins(packages)
 }
 
 /// Installs the package `name` that authenticates by `auth`, whose program records each run in
 /// `runs` beside the sources.
-fn install(directory: &Path, packages: &PackageStore, name: &str, auth: Value) {
+fn install(directory: &Path, packages: &PluginStore, name: &str, auth: Value) {
     let source = directory.join("sources").join(name);
     fs::create_dir_all(source.join("bin")).unwrap();
     let manifest = json!({
@@ -82,11 +83,11 @@ fn token(expires_in: i64, refresh_token: Option<&str>) -> OAuthToken {
     }
 }
 
-fn login_of(tools: &HostedTickTools, name: &str) -> WorkspacePackageLogin {
+fn login_of(tools: &HostedTickTools, name: &str) -> WorkspacePluginLogin {
     tools
         .workspace_host_context()
         .unwrap()
-        .tick_packages
+        .plugins
         .into_iter()
         .find(|package| package.name == name)
         .unwrap()
@@ -97,7 +98,7 @@ fn login_of(tools: &HostedTickTools, name: &str) -> WorkspacePackageLogin {
 fn a_package_login_state_follows_its_saved_credentials_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
-    let packages = PackageStore::in_config_root(&cwd.join("config"));
+    let packages = PluginStore::in_config_root(&cwd.join("config"));
     install(&cwd, &packages, "sample", oauth2());
     install(
         &cwd,
@@ -109,34 +110,28 @@ fn a_package_login_state_follows_its_saved_credentials_at_once() {
     let tools = tools(&cwd, packages.clone());
     let sample = packages.credentials("sample").unwrap();
 
-    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::LoggedOut);
-    assert_eq!(login_of(&tools, "keyed"), WorkspacePackageLogin::LoggedOut);
-    assert_eq!(
-        login_of(&tools, "plain"),
-        WorkspacePackageLogin::NotRequired
-    );
+    assert_eq!(login_of(&tools, "sample"), WorkspacePluginLogin::LoggedOut);
+    assert_eq!(login_of(&tools, "keyed"), WorkspacePluginLogin::LoggedOut);
+    assert_eq!(login_of(&tools, "plain"), WorkspacePluginLogin::NotRequired);
     for (saved, state) in [
-        (token(600, None), WorkspacePackageLogin::LoggedIn),
-        (
-            token(-600, Some("refresh")),
-            WorkspacePackageLogin::LoggedIn,
-        ),
-        (token(-600, None), WorkspacePackageLogin::Expired),
+        (token(600, None), WorkspacePluginLogin::LoggedIn),
+        (token(-600, Some("refresh")), WorkspacePluginLogin::LoggedIn),
+        (token(-600, None), WorkspacePluginLogin::Expired),
     ] {
         sample.lock_oauth().unwrap().save_token(&saved).unwrap();
         assert_eq!(login_of(&tools, "sample"), state, "{saved:?}");
     }
     fs::write(sample.oauth_token_path(), "{").unwrap();
-    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::Unknown);
+    assert_eq!(login_of(&tools, "sample"), WorkspacePluginLogin::Unknown);
     sample.lock_oauth().unwrap().remove_token().unwrap();
-    assert_eq!(login_of(&tools, "sample"), WorkspacePackageLogin::LoggedOut);
+    assert_eq!(login_of(&tools, "sample"), WorkspacePluginLogin::LoggedOut);
 
     packages
         .credentials("keyed")
         .unwrap()
         .save_api_key(&ApiKey::new("key").unwrap())
         .unwrap();
-    assert_eq!(login_of(&tools, "keyed"), WorkspacePackageLogin::LoggedIn);
+    assert_eq!(login_of(&tools, "keyed"), WorkspacePluginLogin::LoggedIn);
     assert!(
         !cwd.join("runs").exists(),
         "reading login states runs no package program"
@@ -147,7 +142,7 @@ fn a_package_login_state_follows_its_saved_credentials_at_once() {
 async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_skill_names() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
-    let packages = PackageStore::in_config_root(&cwd.join("config"));
+    let packages = PluginStore::in_config_root(&cwd.join("config"));
     install(&cwd, &packages, "sample", oauth2());
     packages
         .credentials("sample")
@@ -184,7 +179,7 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
     };
     let state: Value =
         serde_json::from_str(text.rsplit_once("Current host state: ").unwrap().1).unwrap();
-    let listed = &state["workspace_host"]["tick_packages"];
+    let listed = &state["workspace_host"]["plugins"];
     assert_eq!(
         listed
             .as_array()
@@ -204,11 +199,11 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
         );
     }
     for login in [
-        WorkspacePackageLogin::LoggedIn,
-        WorkspacePackageLogin::LoggedOut,
-        WorkspacePackageLogin::Expired,
-        WorkspacePackageLogin::NotRequired,
-        WorkspacePackageLogin::Unknown,
+        WorkspacePluginLogin::LoggedIn,
+        WorkspacePluginLogin::LoggedOut,
+        WorkspacePluginLogin::Expired,
+        WorkspacePluginLogin::NotRequired,
+        WorkspacePluginLogin::Unknown,
     ] {
         let login = serde_json::to_value(login).unwrap();
         assert!(
@@ -216,4 +211,32 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
             "the tickloop Skill names the login state {login}"
         );
     }
+}
+
+#[test]
+fn the_model_sees_disabled_and_skill_only_plugins_without_running_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let store = PluginStore::in_config_root(&root.join("config"));
+    install(root, &store, "sample", json!({"type":"none"}));
+    store.set_enabled("sample", false).unwrap();
+    let notes = root.join("notes");
+    fs::create_dir_all(notes.join(".claude-plugin")).unwrap();
+    fs::write(
+        notes.join(".claude-plugin/plugin.json"),
+        r#"{"name":"notes","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    store.install_path(&notes).unwrap();
+    let context = tools(root, store).workspace_host_context().unwrap();
+    assert_eq!(
+        context
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.id.as_str(), plugin.enabled, plugin.has_tick))
+            .collect::<Vec<_>>(),
+        [("notes@local", true, false), ("sample@local", false, true)]
+    );
+    assert!(context.plugins[0].executable.is_none());
+    assert!(!root.join("runs").exists());
 }

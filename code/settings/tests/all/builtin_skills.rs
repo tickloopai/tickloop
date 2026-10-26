@@ -19,7 +19,7 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`view.status`",
         "Esc hides the view",
         "An artifact takes no Tick Subscription",
-        "`tick_packages`",
+        "`plugins`",
         "`<package>:usage`",
         "`<package>:<skill>`",
         "`tick-<package>`",

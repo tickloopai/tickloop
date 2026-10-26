@@ -6,7 +6,8 @@ use tickloop_code_settings::local_agent::LocalAgent;
 use tickloop_code_settings::skills::SkillDiscovery;
 
 use serde_json::json;
-use tick_packages::{MANIFEST_FILE_NAME, PackageStore};
+use tick_packages::MANIFEST_FILE_NAME;
+use tick_plugins::PluginStore;
 use tickloop_harness::model::ModelRequest;
 use tickloop_harness::policy::skills::{SkillCaller, SkillError, SkillRegistry};
 use tickloop_harness::protocol::{
@@ -623,7 +624,7 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
 /// `tickloop tick` would from another process, with a `usage` Skill described as `description`.
 fn install_package(
     directory: &Path,
-    packages: &PackageStore,
+    packages: &PluginStore,
     name: &str,
     version: &str,
     description: &str,
@@ -684,7 +685,7 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let config_root = root.join("config");
-    let packages = PackageStore::in_config_root(&config_root);
+    let packages = PluginStore::in_config_root(&config_root);
     let workdir = root.join("work");
     fs::create_dir(&workdir).unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
@@ -710,7 +711,7 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     let receipt = agent.submit(chat, "Quotes now?".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(
-        skill_listing(&model, 1).contains("- quotes:usage [Tick package · quotes]: Read quotes"),
+        skill_listing(&model, 1).contains("- quotes:usage [Plugin · quotes]: Read quotes"),
         "{}",
         skill_listing(&model, 1)
     );
@@ -723,7 +724,7 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     let invoked = serde_json::to_string(&model.requests.lock().unwrap()[3].messages).unwrap();
     assert!(invoked.contains("/quotes:usage"), "{invoked}");
 
-    packages.uninstall("quotes").unwrap();
+    packages.uninstall("quotes", false).unwrap();
     assert!(!agent.has_skill(chat, "quotes:usage").await.unwrap());
     assert!(agent.invoke_skill(chat, "/quotes:usage", "").await.is_err());
     let receipt = agent.submit(chat, "And now?".into()).await.unwrap();
@@ -836,7 +837,7 @@ async fn unchanged_skills_send_the_same_skill_tool_definition_so_the_prompt_cach
     fs::create_dir(&workdir).unwrap();
     install_package(
         &root,
-        &PackageStore::in_config_root(&config_root),
+        &PluginStore::in_config_root(&config_root),
         "quotes",
         "1.0.0",
         "Read quotes",
@@ -921,7 +922,7 @@ async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request(
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let config_root = root.join("config");
-    let packages = PackageStore::in_config_root(&config_root);
+    let packages = PluginStore::in_config_root(&config_root);
     let workdir = root.join("work");
     fs::create_dir(&workdir).unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
@@ -1002,7 +1003,7 @@ async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request(
     assert!(loaded.contains("Launching skill: quotes:usage"), "{loaded}");
     assert!(loaded.contains("Run tick-quotes 1.0.0."), "{loaded}");
 
-    packages.uninstall("quotes").unwrap();
+    packages.uninstall("quotes", false).unwrap();
     let receipt = agent.submit(child, "Again".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(!lists_skill(

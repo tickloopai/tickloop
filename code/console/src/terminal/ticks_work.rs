@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, future::Future, path::Path};
 
-use tick_packages::PackageStore;
+use tick_plugins::PluginStore;
 use tickloop_tick_installer::{
     DeviceLogin, LoggedOut, LoginError, MarketplaceSource, needs_no_login, start_login,
 };
@@ -74,7 +74,7 @@ impl TickPackageTasks {
         self.installed_reads
     }
 
-    fn read_installed(&mut self, store: PackageStore, panel: Uuid) {
+    fn read_installed(&mut self, store: PluginStore, panel: Uuid) {
         let read = self.next_installed_read();
         self.spawn(async move {
             let listing = blocking(move || read_installed_now(&store)).await;
@@ -105,7 +105,7 @@ pub(super) fn open(
 }
 
 pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageTasks) {
-    let store = PackageStore::in_config_root(root);
+    let store = PluginStore::in_config_root(root);
     let panel = work.panel;
     match work.request {
         TickPackageRequest::Load => {
@@ -159,7 +159,9 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.logins.insert(panel, (attempt, cancel.clone()));
             tasks.running.spawn(async move {
                 let started = async {
-                    let credentials = store.credentials(&name).map_err(LoginError::from)?;
+                    let credentials = store
+                        .credentials(&name)
+                        .map_err(|error| LoginError::Failed(error.to_string()))?;
                     start_login(
                         &tickloop_code_settings::package_http::client,
                         &credentials,
@@ -200,7 +202,7 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                     move || {
                         store
                             .credentials(&name)
-                            .and_then(|credentials| credentials.save_api_key(&key))
+                            .and_then(|credentials| Ok(credentials.save_api_key(&key)?))
                             .map_err(|error| error.to_string())
                     }
                 })
@@ -286,7 +288,7 @@ pub(super) fn finish(
         }
     }
     if changed_packages {
-        tasks.read_installed(PackageStore::in_config_root(root), panel);
+        tasks.read_installed(PluginStore::in_config_root(root), panel);
     }
     if let Some(name) = changed_login {
         start(
@@ -344,10 +346,10 @@ fn wait_for_approval(
 }
 
 /// The installed packages with the login states their saved credentials give.
-fn read_installed_now(store: &PackageStore) -> Result<InstalledList, String> {
+fn read_installed_now(store: &PluginStore) -> Result<InstalledList, String> {
     let packages = store.installed().map_err(|error| error.to_string())?;
     let logins = packages
-        .packages
+        .plugins
         .iter()
         .map(|package| store.login_state(package))
         .collect();
@@ -363,7 +365,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// Deletes the package's saved login, revoking an OAuth token where its server allows.
-async fn log_out(store: &PackageStore, name: &str) -> Result<LoggedOut, String> {
+async fn log_out(store: &PluginStore, name: &str) -> Result<LoggedOut, String> {
     let package = store.get(name).map_err(|error| error.to_string())?;
     let credentials = store.credentials(name).map_err(|error| error.to_string())?;
     match package.manifest.auth {

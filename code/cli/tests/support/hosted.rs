@@ -51,7 +51,7 @@ pub fn counter_program() -> Vec<String> {
 /// Installs the Tick package `counter` under `config_root` from a package directory it writes in
 /// `sources`: its program `tick-counter` runs the example counter Tick, and its manifest declares
 /// the Tick protocol.
-pub fn install_counter_package(config_root: &Path, sources: &Path) -> tick_packages::PackageStore {
+pub fn install_counter_package(config_root: &Path, sources: &Path) -> tick_plugins::PluginStore {
     use std::os::unix::fs::PermissionsExt;
     let source = sources.join("counter-package");
     std::fs::create_dir_all(source.join("bin")).unwrap();
@@ -77,7 +77,7 @@ pub fn install_counter_package(config_root: &Path, sources: &Path) -> tick_packa
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let packages = tick_packages::PackageStore::in_config_root(config_root);
+    let packages = tick_plugins::PluginStore::in_config_root(config_root);
     packages.install_path(&source).unwrap();
     packages
 }
@@ -90,7 +90,7 @@ pub fn install_environment_recording_package(
     sources: &Path,
     name: &str,
     auth: serde_json::Value,
-) -> tick_packages::PackageStore {
+) -> tick_plugins::PluginStore {
     use std::os::unix::fs::PermissionsExt;
     let source = sources.join(format!("{name}-package"));
     std::fs::create_dir_all(source.join("bin")).unwrap();
@@ -118,7 +118,7 @@ pub fn install_environment_recording_package(
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let packages = tick_packages::PackageStore::in_config_root(config_root);
+    let packages = tick_plugins::PluginStore::in_config_root(config_root);
     packages.install_path(&source).unwrap();
     packages
 }

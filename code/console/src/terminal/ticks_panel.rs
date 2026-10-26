@@ -7,9 +7,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tick_packages::{
-    ApiKey, BrokenPackage, CURRENT_TARGET, InstallOutcome, Installation, InstalledPackage,
-    InstalledPackages, LoginState, Marketplace, MarketplacePackage, OAuthIssuer, PackageAuth,
-    Uninstalled,
+    ApiKey, CURRENT_TARGET, LoginState, Marketplace, MarketplacePackage, OAuthIssuer, PackageAuth,
+};
+use tick_plugins::{
+    BrokenPlugin, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins, Uninstalled,
 };
 use tickloop_tick_installer::{
     InstalledVersion, LoggedOut, LoginError, Offer, login_label, offers,
@@ -73,7 +74,7 @@ pub(super) struct TickPackageWork {
 /// The installed packages, with the login state of each usable one in the same order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct InstalledList {
-    pub(super) packages: InstalledPackages,
+    pub(super) packages: InstalledPlugins,
     pub(super) logins: Vec<LoginState>,
 }
 
@@ -192,8 +193,8 @@ impl TickPackageResult {
                 result: Ok(installation),
                 ..
             } => {
-                let manifest = &installation.package.manifest;
-                let (name, version) = (&manifest.name, &manifest.version);
+                let manifest = &installation.plugin.manifest;
+                let (name, version) = (&manifest.name, &installation.plugin.version);
                 Notice::success(match &installation.outcome {
                     InstallOutcome::Installed => format!("Installed {name} {version}"),
                     InstallOutcome::Replaced { previous_version }
@@ -318,10 +319,10 @@ enum LoginAction {
 /// A row of the Installed page.
 enum InstalledEntry<'a> {
     Usable {
-        package: &'a InstalledPackage,
+        package: &'a InstalledPlugin,
         login: LoginState,
     },
-    Unusable(&'a BrokenPackage),
+    Unusable(&'a BrokenPlugin),
 }
 
 impl InstalledEntry<'_> {
@@ -409,7 +410,7 @@ impl TicksPanel {
                 if let Listing::Loaded(list) = &mut self.installed
                     && let Some(index) = list
                         .packages
-                        .packages
+                        .plugins
                         .iter()
                         .position(|package| package.manifest.name == name)
                     && let Some(login) = list.logins.get_mut(index)
@@ -790,7 +791,7 @@ impl TicksPanel {
                     offered.filter(|offer| offer.installed != InstalledVersion::Offered)
                 {
                     let offered_version = &offer.package.version;
-                    let label = if is_later(offered_version, &manifest.version) {
+                    let label = if is_later(offered_version, &package.version) {
                         format!("Update to {offered_version}")
                     } else {
                         format!("Replace with {offered_version}")
@@ -804,14 +805,14 @@ impl TicksPanel {
                     "Uninstall".to_owned(),
                     Choice::ConfirmUninstall {
                         name: name.clone(),
-                        version: manifest.version.clone(),
+                        version: package.version.clone(),
                     },
                 ));
                 (
-                    format!("{name} {}", manifest.version),
+                    format!("{name} {}", package.version),
                     vec![
                         login_label(*login).to_owned(),
-                        safe_line(&manifest.description),
+                        safe_line(manifest.description.as_deref().unwrap_or_default()),
                     ],
                 )
             }
@@ -848,10 +849,10 @@ impl TicksPanel {
             return None;
         };
         list.packages
-            .packages
+            .plugins
             .iter()
             .find(|package| package.manifest.name == name)
-            .map(|package| package.manifest.version.as_str())
+            .map(|package| package.version.as_str())
             .or_else(|| {
                 list.packages
                     .broken
@@ -867,7 +868,7 @@ impl TicksPanel {
         };
         let mut entries = list
             .packages
-            .packages
+            .plugins
             .iter()
             .zip(list.logins.iter().copied())
             .map(|(package, login)| InstalledEntry::Usable { package, login })
@@ -881,7 +882,7 @@ impl TicksPanel {
         let Listing::Loaded(marketplace) = &self.marketplace else {
             return Vec::new();
         };
-        let empty = InstalledPackages::default();
+        let empty = InstalledPlugins::default();
         let installed = match &self.installed {
             Listing::Loaded(list) => &list.packages,
             _ => &empty,
@@ -922,7 +923,7 @@ impl TicksPanel {
                 .map(|(index, entry)| {
                     let (details, glyph_role) = match entry {
                         InstalledEntry::Usable { package, login } => (
-                            format!("{} · {}", package.manifest.version, login_label(*login)),
+                            format!("{} · {}", package.version, login_label(*login)),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
@@ -1285,14 +1286,14 @@ fn step(selected: usize, count: usize, down: bool) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use tick_packages::PackageManifest;
+    use tick_plugins::{Component, ManifestFormat, PluginManifest, PluginSource, TickProgram};
 
     use super::*;
 
     const WIDTH: usize = 90;
     const HEIGHT: usize = 14;
 
-    fn installed(name: &str, version: &str, declares_login: bool) -> InstalledPackage {
+    fn installed(name: &str, version: &str, declares_login: bool) -> InstalledPlugin {
         let auth = if declares_login {
             PackageAuth::OAuth2 {
                 issuers: vec![server("Server")],
@@ -1301,17 +1302,29 @@ mod tests {
         } else {
             PackageAuth::None
         };
-        InstalledPackage {
-            manifest: PackageManifest {
+        InstalledPlugin {
+            manifest: PluginManifest {
                 name: name.into(),
-                version: version.into(),
-                description: format!("The {name} package"),
-                executable: PathBuf::from(format!("bin/tick-{name}")),
-                protocol: true,
+                version: Some(version.into()),
+                description: Some(format!("The {name} package")),
+                format: ManifestFormat::TickPackage,
+                tick: Some(TickProgram {
+                    executable: PathBuf::from(format!("bin/tick-{name}")),
+                    protocol: true,
+                }),
+                skill_paths: Vec::new(),
+                components: [Component::Tick].into_iter().collect(),
+                warnings: Vec::new(),
                 auth,
             },
             root: PathBuf::from("/packages").join(name),
-            source: String::new(),
+            source: PluginSource::Download {
+                url: "https://example.test/package.tar.gz".into(),
+            },
+            version: version.into(),
+            revision: version.into(),
+            marketplace: "tickloop".into(),
+            enabled: true,
             sha256: None,
             installed_at: "2026-10-15T00:00:00Z".into(),
         }
@@ -1320,14 +1333,14 @@ mod tests {
     /// The installed packages as the read numbered `read` found them, each with its login state.
     fn installed_list(
         read: u64,
-        packages: Vec<(InstalledPackage, LoginState)>,
+        packages: Vec<(InstalledPlugin, LoginState)>,
     ) -> TickPackageResult {
         let (packages, logins) = packages.into_iter().unzip();
         TickPackageResult::Installed {
             read,
             listing: Ok(InstalledList {
-                packages: InstalledPackages {
-                    packages,
+                packages: InstalledPlugins {
+                    plugins: packages,
                     broken: Vec::new(),
                 },
                 logins,
@@ -1592,6 +1605,8 @@ mod tests {
                 name: "beta".into(),
                 version: "1.0.0".into(),
                 credentials: Some("/config/credentials/beta".into()),
+                marketplace: "tickloop".into(),
+                data: None,
             }),
         });
         let notice = frame(&mut panel)
@@ -1621,7 +1636,7 @@ mod tests {
         }
     }
 
-    fn with_auth(mut package: InstalledPackage, auth: PackageAuth) -> InstalledPackage {
+    fn with_auth(mut package: InstalledPlugin, auth: PackageAuth) -> InstalledPlugin {
         package.manifest.auth = auth;
         package
     }
@@ -2057,11 +2072,13 @@ mod tests {
         );
         assert!(text(&mut panel).contains("Updating alpha to 2.0.0…"));
         let mut updated = installed("alpha", "2.0.0", true);
-        updated.source = "https://example.com/tick-alpha-2.0.0.tar.gz".into();
+        updated.source = PluginSource::Download {
+            url: "https://example.com/tick-alpha-2.0.0.tar.gz".into(),
+        };
         panel.apply(TickPackageResult::Installation {
             name: "alpha".into(),
             result: Ok(Box::new(Installation {
-                package: updated,
+                plugin: updated,
                 outcome: InstallOutcome::Replaced {
                     previous_version: "1.0.0".into(),
                 },
@@ -2209,7 +2226,7 @@ mod tests {
         panel.apply(TickPackageResult::Installation {
             name: "alpha".into(),
             result: Ok(Box::new(Installation {
-                package: installed("alpha", "0.2.0", true),
+                plugin: installed("alpha", "0.2.0", true),
                 outcome: InstallOutcome::Replaced {
                     previous_version: "0.3.0".into(),
                 },

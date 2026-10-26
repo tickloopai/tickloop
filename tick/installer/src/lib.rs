@@ -8,9 +8,10 @@ mod marketplace;
 
 use std::path::Path;
 
-use tick_packages::{
-    CURRENT_TARGET, ExpectedArchive, InstallOutcome, Installation, InstalledPackages, LoginState,
-    Marketplace, MarketplacePackage, PackageError, PackageStore, Uninstalled,
+use tick_packages::{CURRENT_TARGET, LoginState, Marketplace, MarketplacePackage};
+use tick_plugins::{
+    ExpectedArchive, InstallOutcome, Installation, InstalledPlugins, PluginError, PluginStore,
+    TICKLOOP_MARKETPLACE, Uninstalled,
 };
 
 pub use login::{LoggedOut, log_out, start_login};
@@ -21,19 +22,26 @@ pub use tick_oauth::{DeviceLogin, LoginError};
 /// version stays as it is and is not downloaded again; any other version is replaced.
 pub async fn install(
     http: &HttpClient,
-    store: &PackageStore,
+    store: &PluginStore,
     source: &MarketplaceSource,
     package: &MarketplacePackage,
 ) -> Result<Installation, String> {
     let MarketplacePackage { name, version, .. } = package;
     match store.get(name) {
-        Ok(installed) if &installed.manifest.version == version => {
+        Ok(installed) if installed.marketplace != TICKLOOP_MARKETPLACE => {
+            return Err(PluginError::NameTaken {
+                name: name.clone(),
+                marketplace: installed.marketplace,
+            }
+            .to_string());
+        }
+        Ok(installed) if &installed.version == version => {
             return Ok(Installation {
-                package: installed,
+                plugin: installed,
                 outcome: InstallOutcome::AlreadyInstalled,
             });
         }
-        Ok(_) | Err(PackageError::NotInstalled(_) | PackageError::Unusable { .. }) => {}
+        Ok(_) | Err(PluginError::NotInstalled(_) | PluginError::Unusable { .. }) => {}
         Err(error) => return Err(error.to_string()),
     }
     let download = package.current_download().ok_or_else(|| {
@@ -54,7 +62,8 @@ pub async fn install(
             name: &name,
             version: &version,
             sha256: &sha256,
-            source: url.as_str(),
+            marketplace: TICKLOOP_MARKETPLACE,
+            url: url.as_str(),
         };
         store
             .install_archive(file.path(), expected)
@@ -66,16 +75,16 @@ pub async fn install(
 
 /// Installs the package directory or `.tar.gz` archive at `path`, replacing the installed package
 /// of its name even at the same version.
-pub fn install_path(store: &PackageStore, path: &Path) -> Result<Installation, String> {
+pub fn install_path(store: &PluginStore, path: &Path) -> Result<Installation, String> {
     store
         .install_path(path)
         .map_err(|error| format!("cannot install {}: {error}", path.display()))
 }
 
 /// Removes the package's program and Skills; its data source credentials stay.
-pub fn uninstall(store: &PackageStore, name: &str) -> Result<Uninstalled, String> {
-    store.uninstall(name).map_err(|error| match error {
-        PackageError::NotInstalled(_) => error.to_string(),
+pub fn uninstall(store: &PluginStore, name: &str) -> Result<Uninstalled, String> {
+    store.uninstall(name, false).map_err(|error| match error {
+        PluginError::NotInstalled(_) => error.to_string(),
         _ => format!("cannot uninstall {name}: {error}"),
     })
 }
@@ -102,13 +111,13 @@ pub struct Offer {
 }
 
 /// The marketplace's packages by name, each with what is installed of it.
-pub fn offers(marketplace: &Marketplace, installed: &InstalledPackages) -> Vec<Offer> {
+pub fn offers(marketplace: &Marketplace, installed: &InstalledPlugins) -> Vec<Offer> {
     let mut offers = marketplace
         .packages
         .iter()
         .map(|package| {
             let usable = installed
-                .packages
+                .plugins
                 .iter()
                 .find(|installed| installed.manifest.name == package.name);
             let unusable = installed
@@ -116,10 +125,8 @@ pub fn offers(marketplace: &Marketplace, installed: &InstalledPackages) -> Vec<O
                 .iter()
                 .find(|broken| broken.name == package.name);
             let installed = match (usable, unusable) {
-                (Some(usable), _) if usable.manifest.version == package.version => {
-                    InstalledVersion::Offered
-                }
-                (Some(usable), _) => InstalledVersion::Other(usable.manifest.version.clone()),
+                (Some(usable), _) if usable.version == package.version => InstalledVersion::Offered,
+                (Some(usable), _) => InstalledVersion::Other(usable.version.clone()),
                 (None, Some(broken)) => InstalledVersion::Unusable(broken.version.clone()),
                 (None, None) => InstalledVersion::NotInstalled,
             };
