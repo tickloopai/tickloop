@@ -8,16 +8,14 @@ use tickloop_code_console::terminal::safe_line;
 use tickloop_code_settings::{
     UserSettings,
     mcp::{
-        McpLayer, configured_servers, configured_statuses, validate_entry,
-        validate_user_server_name,
+        DIRECTORY_SOURCE, McpLayer, PLUGIN_SERVER_PREFIX, PLUGIN_SOURCE_PREFIX, configured_servers,
+        configured_statuses, validate_entry, validate_user_server_name,
     },
 };
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
 
 const USAGE: &str = "Usage: tickloop mcp list\n       tickloop mcp add <name> <url> [--header 'Name: value']... [--dir]\n       tickloop mcp add <name> [--env NAME=value]... [--dir] -- <command> [arguments...]\n       tickloop mcp remove <name> [--dir]\n       tickloop mcp login <name> | logout <name>";
 const DIRECTORY_FLAG: &str = "--dir";
-const PLUGIN_ALIAS_PREFIX: &str = "plugin:";
-const PLUGIN_SERVER_PREFIX: &str = "plugin_";
 
 pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
     let words = arguments
@@ -61,7 +59,7 @@ fn layer(directory: bool) -> Result<McpLayer, String> {
 }
 
 fn refuse_plugin_server(name: &str) -> Result<(), String> {
-    if name.starts_with(PLUGIN_ALIAS_PREFIX) || name.starts_with(PLUGIN_SERVER_PREFIX) {
+    if name.starts_with(PLUGIN_SOURCE_PREFIX) || name.starts_with(PLUGIN_SERVER_PREFIX) {
         return Err(format!(
             "MCP server {} comes from its plugin; turn it off in /mcp or disable the plugin with tickloop plugin disable.",
             safe_line(name)
@@ -83,9 +81,9 @@ async fn list() -> Result<(), String> {
     }
     let mut groups = BTreeMap::<(u8, String), Vec<&McpServerStatus>>::new();
     for status in &statuses {
-        let key = match status.source.strip_prefix(PLUGIN_ALIAS_PREFIX) {
+        let key = match status.source.strip_prefix(PLUGIN_SOURCE_PREFIX) {
             Some(plugin) => (2, format!("Plugin {plugin}")),
-            None if status.source == "directory" => (1, "This directory".into()),
+            None if status.source == DIRECTORY_SOURCE => (1, "This directory".into()),
             None => (0, "Global".into()),
         };
         groups.entry(key).or_default().push(status);
@@ -115,15 +113,9 @@ fn list_line(status: &McpServerStatus) -> String {
         ),
         _ => "enabled".into(),
     });
-    if status.oauth {
-        parts.push(
-            if status.logged_in {
-                "logged in"
-            } else {
-                "not logged in"
-            }
-            .into(),
-        );
+    // Whether a server without a saved login needs one shows only once it answers.
+    if status.logged_in {
+        parts.push("logged in".into());
     }
     safe_line(&parts.join(" · "))
 }
@@ -192,7 +184,8 @@ fn add(arguments: &[&str]) -> Result<(), String> {
     validate_user_server_name(name)?;
     let layer = layer(directory)?;
     validate_entry(&entry, &working_directory()?)?;
-    let added = UserSettings::in_root(&config_root()?)
+    let settings = UserSettings::in_root(&config_root()?);
+    let added = settings
         .add_mcp_server(&layer, name, entry)
         .map_err(|error| error.to_string())?;
     if !added {
@@ -210,6 +203,14 @@ fn add(arguments: &[&str]) -> Result<(), String> {
             McpLayer::Directory(_) => "this directory",
         }
     );
+    if matches!(layer, McpLayer::Directory(_))
+        && settings.load().has_mcp_server(&McpLayer::Global, name)
+    {
+        println!(
+            "Here it takes the place of the global server {}.",
+            safe_line(name)
+        );
+    }
     Ok(())
 }
 

@@ -85,7 +85,7 @@ fn add_writes_the_global_or_directory_layer_and_list_starts_nothing() {
     .unwrap();
     assert_eq!(
         succeeded(&mcp(&fixture, &["list"])),
-        "Global\n  notes · http · direct · enabled · not logged in\n\
+        "Global\n  notes · http · direct · enabled\n\
          This directory\n  local · stdio · direct · enabled\n\
          Plugin docs\n  plugin_docs_search · stdio · direct · disabled in this directory\n"
     );

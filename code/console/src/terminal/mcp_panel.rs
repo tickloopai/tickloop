@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tickloop_code_settings::mcp::{DIRECTORY_SOURCE, GLOBAL_SOURCE, PLUGIN_SOURCE_PREFIX};
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -28,7 +29,6 @@ const TITLE: &str = "MCP";
 /// The title and the key hints.
 const CHROME_ROWS: usize = 2;
 const INDENT: &str = "  ";
-const PLUGIN_SOURCE_PREFIX: &str = "plugin:";
 
 /// Work the panel asks the Console to do; its result comes back as an [`McpResult`].
 #[derive(Clone, PartialEq, Eq)]
@@ -312,10 +312,31 @@ impl McpPanel {
                         ))
                     });
                 }
+                let shown = self
+                    .servers()
+                    .get(self.selected)
+                    .map(|server| server.name.clone());
                 self.read = read;
                 self.listing = listing.map_or_else(Listing::Failed, Listing::Loaded);
-                self.selected = self.selected.min(self.servers().len().saturating_sub(1));
-                self.menu = None;
+                self.selected = shown
+                    .and_then(|name| self.servers().iter().position(|server| server.name == name))
+                    .unwrap_or(self.selected)
+                    .min(self.servers().len().saturating_sub(1));
+                // An open menu follows the new states of its server, on the option it was on.
+                if let Some(menu) = self.menu.take() {
+                    let option = menu.options[menu.selected].0.clone();
+                    self.menu = self
+                        .actions_menu()
+                        .filter(|next| next.title == menu.title)
+                        .map(|mut next| {
+                            next.selected = next
+                                .options
+                                .iter()
+                                .position(|(label, _)| *label == option)
+                                .unwrap_or(0);
+                            next
+                        });
+                }
             }
             McpResult::LoginWaiting { link, opened, .. } => {
                 if let Some(login) = &mut self.login {
@@ -523,7 +544,6 @@ impl McpPanel {
                 McpPanelEffect::None
             }
             Choice::Tools(server) => {
-                self.menu = None;
                 self.tools = Some(ToolsView {
                     server,
                     selected: 0,
@@ -725,7 +745,7 @@ impl McpPanel {
     fn body(&self, width: usize, display: DisplayProfile) -> Body {
         let mut body = Body::default();
         if let Some(login) = &self.login {
-            login_lines(login, width, &mut body);
+            login_lines(login, width, display, &mut body);
             return body;
         }
         if let Some(view) = &self.tools {
@@ -789,7 +809,11 @@ impl McpPanel {
                     RoleLine::role(format!("{INDENT}{label}"), Role::Text)
                 });
             }
-            body.hint = "enter confirm · esc back".into();
+            body.hint = fit_hint(
+                &[("enter confirm".into(), 10), ("esc back".into(), 9)],
+                width,
+                display,
+            );
             return body;
         }
         for (index, rows) in self.list_rows(width, display) {
@@ -897,7 +921,7 @@ struct Body {
     hint: String,
 }
 
-fn login_lines(login: &LoginView, width: usize, body: &mut Body) {
+fn login_lines(login: &LoginView, width: usize, display: DisplayProfile, body: &mut Body) {
     let context_width = width.saturating_sub(INDENT.len()).max(1);
     let context = |body: &mut Body, text: &str, role: Role| {
         body.lines.extend(
@@ -914,7 +938,7 @@ fn login_lines(login: &LoginView, width: usize, body: &mut Body) {
         LoginStage::Starting => {
             context(body, "Finding the server's authorization…", Role::MutedText);
             body.focus = 0..body.lines.len();
-            body.hint = "esc cancel".into();
+            body.hint = fit_hint(&[("esc cancel".into(), 9)], width, display);
         }
         LoginStage::Waiting {
             link,
@@ -955,7 +979,15 @@ fn login_lines(login: &LoginView, width: usize, body: &mut Body) {
                 (2 + before_cursor.width()).min(width.saturating_sub(1)),
             ));
             body.focus = row..row + 1;
-            body.hint = "enter submit · ctrl+g editor · esc cancel".into();
+            body.hint = fit_hint(
+                &[
+                    ("enter submit".into(), 10),
+                    ("ctrl+g editor".into(), 3),
+                    ("esc cancel".into(), 9),
+                ],
+                width,
+                display,
+            );
         }
     }
 }
@@ -963,8 +995,8 @@ fn login_lines(login: &LoginView, width: usize, body: &mut Body) {
 /// Global servers first, then this directory's, then each plugin's.
 fn source_rank(source: &str) -> u8 {
     match source {
-        "global" => 0,
-        "directory" => 1,
+        GLOBAL_SOURCE => 0,
+        DIRECTORY_SOURCE => 1,
         _ => 2,
     }
 }
@@ -972,7 +1004,7 @@ fn source_rank(source: &str) -> u8 {
 fn source_heading(source: &str) -> String {
     match source.strip_prefix(PLUGIN_SOURCE_PREFIX) {
         Some(plugin) => format!("Plugin {plugin}"),
-        None if source == "directory" => "This directory".into(),
+        None if source == DIRECTORY_SOURCE => "This directory".into(),
         None => "Global".into(),
     }
 }
@@ -1194,7 +1226,20 @@ mod tests {
         press(&mut panel, KeyCode::Char('j'));
         assert_eq!(selected(&mut panel), ["mcp__notes__tool1 · Tool 1"]);
         press(&mut panel, KeyCode::Esc);
-        press(&mut panel, KeyCode::Enter);
+        assert_eq!(selected(&mut panel), ["❯ View tools"]);
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(McpListing {
+                servers: vec![server("notes", "global", McpServerState::Connected, 2)],
+                live: true,
+                directory: "/work".into(),
+            }),
+        });
+        assert_eq!(
+            selected(&mut panel),
+            ["❯ View tools"],
+            "a new read keeps the menu open"
+        );
         for _ in 0..2 {
             press(&mut panel, KeyCode::Char('j'));
         }

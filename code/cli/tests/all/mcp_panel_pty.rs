@@ -130,10 +130,7 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     terminal.press(b"\r", "the tools of notes", |frame| {
         frame.contains("mcp__notes__search · Find notes")
     });
-    terminal.press(ESCAPE, "the list again", |frame| {
-        frame.contains("enter actions · r refresh · esc close")
-    });
-    terminal.press(b"\r", "the actions again", |frame| {
+    terminal.press(ESCAPE, "the actions again", |frame| {
         frame.contains("❯ View tools")
     });
     terminal.press(DOWN, "Log in", |frame| frame.contains("❯ Log in"));

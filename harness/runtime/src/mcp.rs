@@ -39,6 +39,7 @@ use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, TokenErr
 pub use tickloop_harness_connector::{
     ConnectorCredential, ConnectorCredentials, InMemoryCredentials,
 };
+use tickloop_harness_protocol::mcp::DIRECT_EXPOSURE;
 pub use tickloop_harness_protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerSnapshot {
@@ -55,8 +56,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
-/// Until servers choose how their tools reach the model, every tool is listed directly.
-const DIRECT_EXPOSURE: &str = "direct";
 struct Handler {
     revision: Arc<AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
@@ -145,6 +144,21 @@ impl Entry {
             true
         });
         originals.retain(|name, _| tools.values().any(|tool| tool.original == *name));
+    }
+
+    /// Whether a login for the server's current address is saved.
+    fn has_saved_token(&self) -> bool {
+        let McpTransport::Http { url, .. } = &self.config.transport else {
+            return false;
+        };
+        self.credential
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|saved| {
+                saved.token.is_some()
+                    && reqwest::Url::parse(url).is_ok_and(|url| saved.server_url == url.as_str())
+            })
     }
 
     fn remember_credential(&self, credential: Option<ConnectorCredential>) {
@@ -397,7 +411,7 @@ impl McpConnections {
             let authenticating = AtomicBool::new(false);
             let connect = async {
                 let _permit = slots.acquire().await.map_err(|_| "MCP connection cancelled")?;
-                let has_token = entry.credential.read().unwrap().as_ref().is_some_and(|saved| matches!(&entry.config.transport, McpTransport::Http {url, ..} if reqwest::Url::parse(url).is_ok_and(|url| saved.server_url == url.as_str())) && saved.token.is_some());
+                let has_token = entry.has_saved_token();
                 if has_token && let Some(connector) = &entry.connector {
                     authenticating.store(true, Ordering::SeqCst);
                     let token = connector.access_token(&entry.cancel).await;
@@ -550,12 +564,7 @@ impl McpConnections {
                 let state = entry.state.read().unwrap().clone();
                 let (transport, oauth) = match &entry.config.transport {
                     McpTransport::Stdio { .. } => ("stdio".to_owned(), false),
-                    McpTransport::Http { headers, .. } => (
-                        "http".to_owned(),
-                        !headers
-                            .keys()
-                            .any(|key| key.eq_ignore_ascii_case("authorization")),
-                    ),
+                    McpTransport::Http { .. } => ("http".to_owned(), entry.connector.is_some()),
                     McpTransport::Unsupported { kind } => (kind.clone(), false),
                     McpTransport::NeedsConfiguration | McpTransport::Failed { .. } => {
                         (String::new(), false)
@@ -582,13 +591,7 @@ impl McpConnections {
                         .collect(),
                     failure,
                     oauth,
-                    logged_in: oauth
-                        && entry
-                            .credential
-                            .read()
-                            .unwrap()
-                            .as_ref()
-                            .is_some_and(|saved| saved.token.is_some()),
+                    logged_in: oauth && entry.has_saved_token(),
                     state,
                 }
             })

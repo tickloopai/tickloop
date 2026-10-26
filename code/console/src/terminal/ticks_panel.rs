@@ -1144,7 +1144,10 @@ impl TicksPanel {
     fn mcp_login_needed(&self, plugin: &str) -> bool {
         self.mcp_states.iter().any(|server| {
             server.state == McpServerState::NeedsLogin
-                && server.source.strip_prefix("plugin:") == Some(plugin)
+                && server
+                    .source
+                    .strip_prefix(tickloop_code_settings::mcp::PLUGIN_SOURCE_PREFIX)
+                    == Some(plugin)
         })
     }
 

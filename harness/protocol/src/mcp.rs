@@ -18,6 +18,9 @@ pub struct McpServerConfig {
     pub disabled: bool,
 }
 
+/// Until servers choose how their tools reach the model, every tool is listed directly.
+pub const DIRECT_EXPOSURE: &str = "direct";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerState {

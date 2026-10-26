@@ -10,10 +10,13 @@ const PROJECTS_KEY: &str = "projects";
 const SERVERS_KEY: &str = "mcpServers";
 /// Servers turned off in one directory, user and plugin servers alike, by their resolved name.
 const DISABLED_SERVERS_KEY: &str = "disabledMcpServers";
-const PLUGIN_SERVER_PREFIX: &str = "plugin_";
+/// The names of plugin servers start with this; user servers cannot.
+pub const PLUGIN_SERVER_PREFIX: &str = "plugin_";
 pub const ARTIFACTS_SERVER_NAME: &str = "tickloop-artifacts";
-/// Until servers choose how their tools reach the model, every tool is listed directly.
-const DIRECT_EXPOSURE: &str = "direct";
+/// The sources of servers: the user's global and directory settings, and `plugin:<plugin>`.
+pub const GLOBAL_SOURCE: &str = "global";
+pub const DIRECTORY_SOURCE: &str = "directory";
+pub const PLUGIN_SOURCE_PREFIX: &str = "plugin:";
 
 /// An enabled plugin's raw entries and host-owned locations.
 pub struct PluginServers {
@@ -288,7 +291,7 @@ pub async fn configured_statuses(
             } else {
                 state
             },
-            exposure: DIRECT_EXPOSURE.into(),
+            exposure: tickloop_harness::protocol::mcp::DIRECT_EXPOSURE.into(),
             tools: Vec::new(),
             failure: match &server.transport {
                 McpTransport::Failed { reason } => Some(reason.clone()),
@@ -321,7 +324,7 @@ pub fn resolve_servers_with_plugins(
     };
     let mut entries = BTreeMap::new();
     let project = &settings[PROJECTS_KEY][directory.to_string_lossy().as_ref()];
-    for (source, layer) in [("global", settings), ("directory", project)] {
+    for (source, layer) in [(GLOBAL_SOURCE, settings), (DIRECTORY_SOURCE, project)] {
         match layer.get(SERVERS_KEY) {
             Some(Value::Object(servers)) => {
                 for (name, entry) in servers {
@@ -363,7 +366,7 @@ pub fn resolve_servers_with_plugins(
             let name = format!("{PLUGIN_SERVER_PREFIX}{}_{name}", plugin.name);
             resolved.push(
                 name.clone(),
-                format!("plugin:{}", plugin.name),
+                format!("{PLUGIN_SOURCE_PREFIX}{}", plugin.name),
                 entry,
                 directory,
                 &environment,
@@ -431,7 +434,7 @@ impl ResolvedServers {
         directory: &Path,
         environment: &BTreeMap<String, String>,
     ) {
-        let plugin = source.starts_with("plugin:");
+        let plugin = source.starts_with(PLUGIN_SOURCE_PREFIX);
         if plugin && let Some(fields) = entry.as_object() {
             for field in fields.keys().filter(|field| is_approval_field(field)) {
                 self.warnings

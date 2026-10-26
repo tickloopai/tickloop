@@ -174,6 +174,19 @@ async fn configured(
     .map_err(|error| error.to_string())
 }
 
+async fn configured_server(
+    root: &Path,
+    directory: &Path,
+    name: &str,
+) -> Result<tickloop_harness::protocol::mcp::McpServerConfig, String> {
+    configured(root, directory)
+        .await?
+        .servers
+        .into_iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| format!("{name} is not configured or enabled in this directory"))
+}
+
 pub(super) fn start(
     console: &Console,
     root: &Path,
@@ -238,14 +251,7 @@ pub(super) fn start(
             let root = root.to_owned();
             tasks.running.spawn(async move {
                 let started = async {
-                    let server = configured(&root, &directory)
-                        .await?
-                        .servers
-                        .into_iter()
-                        .find(|server| server.name == name)
-                        .ok_or_else(|| {
-                            format!("{name} is not configured or enabled in this directory")
-                        })?;
+                    let server = configured_server(&root, &directory, &name).await?;
                     let login = login_connector(&root, &server)?
                         .start_login(None, &cancel)
                         .await
@@ -301,14 +307,7 @@ pub(super) fn start(
             let root = root.to_owned();
             tasks.spawn(async move {
                 let result = async {
-                    let server = configured(&root, &directory)
-                        .await?
-                        .servers
-                        .into_iter()
-                        .find(|server| server.name == name)
-                        .ok_or_else(|| {
-                            format!("{name} is not configured or enabled in this directory")
-                        })?;
+                    let server = configured_server(&root, &directory, &name).await?;
                     let outcome = login_connector(&root, &server)?
                         .logout(&CancellationToken::new())
                         .await
