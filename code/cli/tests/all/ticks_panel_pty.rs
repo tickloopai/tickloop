@@ -895,3 +895,73 @@ fn plugin_updates_refresh_git_revisions_even_when_the_display_version_does_not_c
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
 }
+
+#[test]
+fn available_status_distinguishes_marketplace_ownership_and_broken_plugins() {
+    use crate::marketplace_commands::{marketplace_directory, write_json};
+    let fixture = Fixture::new();
+    for market in ["first", "second"] {
+        let source = marketplace_directory(
+            &fixture,
+            market,
+            market,
+            json!([
+                {"name":"notes", "source":"./notes", "version":"1.0.0"},
+                {"name":"unsupported", "source":{"source":"npm", "package":"unsupported"}}
+            ]),
+        );
+        write_json(
+            &source.join("notes/.claude-plugin/plugin.json"),
+            &json!({"name":"notes", "version":"1.0.0"}),
+        );
+        succeeded(&fixture.tickloop(&["plugin", "marketplace", "add", &path_text(&source)]));
+    }
+    succeeded(&fixture.tickloop(&["plugin", "install", "notes@first"]));
+    succeeded(&fixture.tickloop(&["plugin", "disable", "notes"]));
+    let cached = fixture.root.join("config/plugins/cache/first/notes/local");
+    assert!(cached.exists());
+    fs::remove_dir_all(cached).unwrap();
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "unusable plugin metadata", |frame| {
+        row_shows(
+            frame,
+            "notes",
+            "first · disabled · 1.0.0 · unusable; reinstall",
+        )
+    });
+    terminal.press(TAB, "available ownership states", |frame| {
+        frame.contains("installed 1.0.0 but unusable")
+            && frame.contains("not installed; notes@first is installed")
+    });
+    terminal.press(
+        b"/second\r",
+        "cross-marketplace replacement refused",
+        |frame| {
+            dialog_text(frame).contains(
+                "plugin notes is already installed from marketplace first; uninstall it first",
+            )
+        },
+    );
+    terminal.press(b"\x15unsupported", "unsupported source", |frame| {
+        frame.contains("npm sources are not supported yet")
+    });
+    terminal.press(b"\r", "unsupported install refused", |frame| {
+        dialog_text(frame)
+            .contains("cannot install unsupported@first: npm sources are not supported yet")
+    });
+    terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter"));
+    terminal.press(TAB, "installed owner", |frame| {
+        frame.contains("[Installed]")
+    });
+    terminal.press(b"\r", "repair action", |frame| frame.contains("❯ Update"));
+    terminal.press(b"\r", "repaired original marketplace", |frame| {
+        row_shows(frame, "notes", "first · disabled · 1.0.0 · no login needed")
+    });
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(
+        succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@first  1.0.0  disabled")
+    );
+}

@@ -1172,8 +1172,14 @@ impl TicksPanel {
                         ),
                         InstalledEntry::Unusable(package) => (
                             format!(
-                                "{} · {} · unusable; reinstall",
-                                package.marketplace, package.version
+                                "{} · {} · {} · unusable; reinstall",
+                                package.marketplace,
+                                if package.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
+                                package.version
                             ),
                             Role::Error,
                         ),
