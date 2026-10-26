@@ -151,3 +151,78 @@ fn enabled_plugin_skills_are_named_after_their_plugin_beside_tick_package_skills
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
     assert!(registry.contains("notes:write"));
 }
+
+#[test]
+fn plugin_skill_bodies_name_the_plugin_its_data_and_the_skill_in_either_naming() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config");
+    let user_guide = config_root.join("skills/guide");
+    fs::create_dir_all(&user_guide).unwrap();
+    fs::write(
+        user_guide.join("SKILL.md"),
+        skill("guide", "The user's guide", "User ${CLAUDE_PLUGIN_ROOT}"),
+    )
+    .unwrap();
+    let body = "Package ${TICK_PACKAGE_ROOT}\n\
+                Root ${TICKLOOP_PLUGIN_ROOT} ${CLAUDE_PLUGIN_ROOT}\n\
+                Data ${TICKLOOP_PLUGIN_DATA} ${CLAUDE_PLUGIN_DATA}\n\
+                Skill ${TICKLOOP_SKILL_DIR} ${CLAUDE_SKILL_DIR}";
+    let notes = install(
+        &config_root,
+        &claude_plugin(
+            directory.path(),
+            "notes",
+            serde_json::json!({"name": "notes"}),
+            &[("skills/write", &skill("write", "Write notes", body))],
+        ),
+    );
+    install(
+        &config_root,
+        &claude_plugin(
+            directory.path(),
+            "plain",
+            serde_json::json!({"name": "plain"}),
+            &[(
+                "skills/read",
+                &skill("read", "Read", "Root ${CLAUDE_PLUGIN_ROOT}"),
+            )],
+        ),
+    );
+    let store = PluginStore::in_config_root(&config_root);
+    let data = store.data_directory("notes");
+    assert!(!data.exists());
+
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+
+    let expansion = registry
+        .expand("notes:write", "", SkillCaller::Model)
+        .unwrap();
+    let root = notes.root.display();
+    let skill_directory = notes.root.join("skills/write");
+    let skill_directory = skill_directory.display();
+    let data_shown = data.display();
+    assert!(
+        expansion.content.ends_with(&format!(
+            "Package {root}\nRoot {root} {root}\nData {data_shown} {data_shown}\n\
+             Skill {skill_directory} {skill_directory}"
+        )),
+        "{}",
+        expansion.content
+    );
+    assert!(
+        data.is_dir(),
+        "the data directory is created once a Skill uses it"
+    );
+    assert!(
+        !store.data_directory("plain").exists(),
+        "a plugin whose Skills never use its data directory gets none"
+    );
+    assert!(
+        registry
+            .expand("guide", "", SkillCaller::Model)
+            .unwrap()
+            .content
+            .ends_with("User ${CLAUDE_PLUGIN_ROOT}"),
+        "only a plugin's own Skills see its directories"
+    );
+}

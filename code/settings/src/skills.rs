@@ -59,7 +59,7 @@ enum SkillOrigin<'a> {
     User,
     Project,
     TickPackage(&'a InstalledPackage),
-    Plugin(&'a InstalledPlugin),
+    Plugin(&'a PluginStore, &'a InstalledPlugin),
 }
 
 fn load_tick_packages(
@@ -98,7 +98,8 @@ fn load_plugins(
     config_root: &Path,
     seen_files: &mut HashSet<PathBuf>,
 ) {
-    let installed = match PluginStore::in_config_root(config_root).installed() {
+    let store = PluginStore::in_config_root(config_root);
+    let installed = match store.installed() {
         Ok(installed) => installed,
         Err(error) => {
             registry.warn(format!(
@@ -122,7 +123,7 @@ fn load_plugins(
         load_files(
             registry,
             skill_files,
-            &SkillOrigin::Plugin(plugin),
+            &SkillOrigin::Plugin(&store, plugin),
             seen_files,
         );
     }
@@ -197,16 +198,50 @@ fn load_files(
                 },
                 &[(PACKAGE_ROOT_VARIABLE, &package.root)],
             ),
-            SkillOrigin::Plugin(plugin) => registry.register_markdown(
-                &markdown,
-                SkillSource::Plugin {
-                    plugin: plugin.name().to_owned(),
-                    path,
-                },
-                &[(PACKAGE_ROOT_VARIABLE, &plugin.root)],
-            ),
+            SkillOrigin::Plugin(store, plugin) => {
+                let data = plugin_data_directory(registry, store, plugin, &markdown);
+                let skill_directory = path.parent().unwrap_or(&path).to_path_buf();
+                let mut variables = vec![(PACKAGE_ROOT_VARIABLE, plugin.root.as_path())];
+                variables.extend(PLUGIN_ROOT_VARIABLES.map(|name| (name, plugin.root.as_path())));
+                variables.extend(PLUGIN_DATA_VARIABLES.map(|name| (name, data.as_path())));
+                variables.extend(
+                    SKILL_DIRECTORY_VARIABLES.map(|name| (name, skill_directory.as_path())),
+                );
+                registry.register_markdown(
+                    &markdown,
+                    SkillSource::Plugin {
+                        plugin: plugin.name().to_owned(),
+                        path,
+                    },
+                    &variables,
+                );
+            }
         }
     }
+}
+
+/// The plugin's data directory, created when the Skill in `markdown` names it.
+fn plugin_data_directory(
+    registry: &mut SkillRegistry,
+    store: &PluginStore,
+    plugin: &InstalledPlugin,
+    markdown: &str,
+) -> PathBuf {
+    if !PLUGIN_DATA_VARIABLES
+        .iter()
+        .any(|variable| markdown.contains(variable))
+    {
+        return store.data_directory(plugin.name());
+    }
+    store
+        .create_data_directory(plugin.name())
+        .unwrap_or_else(|error| {
+            registry.warn(format!(
+                "the data directory of plugin {} cannot be created: {error}",
+                plugin.name()
+            ));
+            store.data_directory(plugin.name())
+        })
 }
 
 fn project_skill_directories(folder: &Path) -> Vec<PathBuf> {
