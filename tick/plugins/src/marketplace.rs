@@ -1,20 +1,27 @@
 //! Marketplace registrations and cached catalogs, separate from installed plugins.
 
-use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     GitSource, MarketplaceCatalog, MarketplaceSource, PluginError, PluginStore,
-    TICKLOOP_MARKETPLACE,
+    TICKLOOP_MARKETPLACE, http::MARKETPLACE_SIZE_LIMIT,
 };
+
+const MARKETPLACES_DIRECTORY: &str = "marketplaces";
+const MARKETPLACE_REGISTRY_FILE: &str = "marketplaces.json";
+const MARKETPLACE_FILE: &str = "marketplace.json";
+const MARKETPLACE_CACHE_PREFIX: &str = "catalog-";
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 pub const CLAUDE_OFFICIAL_MARKETPLACE: &str = "claude-plugins-official";
 
@@ -86,7 +93,11 @@ impl PluginStore {
             .remove(name)
             .ok_or_else(|| PluginError::Invalid(format!("marketplace {name} is not registered")))?;
         self.write_marketplace_registry(&registry)?;
-        let _ = fs::remove_dir_all(self.directory.join("marketplaces").join(removed.cache));
+        let _ = fs::remove_dir_all(
+            self.directory
+                .join(MARKETPLACES_DIRECTORY)
+                .join(removed.cache),
+        );
         Ok(())
     }
 }
@@ -109,9 +120,8 @@ struct CachedMarketplace {
 const MARKETPLACE_LOCATIONS: [&str; 3] = [
     ".tickloop-plugin/marketplace.json",
     ".claude-plugin/marketplace.json",
-    "marketplace.json",
+    MARKETPLACE_FILE,
 ];
-use crate::http::MARKETPLACE_SIZE_LIMIT;
 
 impl PluginStore {
     pub async fn add_marketplace(
@@ -155,9 +165,9 @@ impl PluginStore {
                 {
                     let path = self
                         .directory
-                        .join("marketplaces")
+                        .join(MARKETPLACES_DIRECTORY)
                         .join(&cached.cache)
-                        .join("marketplace.json");
+                        .join(MARKETPLACE_FILE);
                     return MarketplaceCatalog::parse(
                         cached.registration.clone(),
                         &read_document(&path)?,
@@ -176,30 +186,14 @@ impl PluginStore {
     ) -> Result<MarketplaceCatalog, PluginError> {
         let mut commit = None;
         let document = match source {
-            MarketplaceSource::Directory(root) => {
-                let path = MARKETPLACE_LOCATIONS
-                    .iter()
-                    .map(|relative| root.join(relative))
-                    .find(|path| path.is_file())
-                    .ok_or_else(|| {
-                        PluginError::Invalid(format!("no marketplace file in {}", root.display()))
-                    })?;
-                read_document(&path)?
-            }
+            MarketplaceSource::Directory(root) => read_directory_document(root)?,
             MarketplaceSource::File(path) => read_document(path)?,
             MarketplaceSource::Git(source) => {
                 crate::store::create_private_directories(&self.directory)?;
                 let checkout = crate::GitClient::default()
                     .checkout(source, &self.directory)
                     .await?;
-                let path = MARKETPLACE_LOCATIONS
-                    .iter()
-                    .map(|relative| checkout.root().join(relative))
-                    .find(|path| path.is_file())
-                    .ok_or_else(|| {
-                        PluginError::Invalid("Git repository has no marketplace file".into())
-                    })?;
-                let document = read_document(&path)?;
+                let document = read_directory_document(checkout.root())?;
                 commit = Some(checkout.commit().to_owned());
                 document
             }
@@ -226,6 +220,11 @@ impl PluginStore {
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| PluginError::Invalid("marketplace must have a name".into()))?;
+        let name = previous
+            .filter(|registration| {
+                registration.builtin && registration.name == TICKLOOP_MARKETPLACE
+            })
+            .map_or(name, |registration| registration.name.as_str());
         crate::validate_plugin_name(name)?;
         if previous.is_none()
             && matches!(
@@ -261,20 +260,31 @@ impl PluginStore {
                 "marketplace {name} is already registered"
             )));
         }
-        let cache_root = self.directory.join("marketplaces");
+        if let Some(previous) = previous {
+            let current = registry.get(name).map(|cached| &cached.registration);
+            let changed = if previous.refreshed_at.is_some() {
+                current != Some(previous)
+            } else {
+                current.is_some_and(|current| current.source == previous.source)
+            };
+            if changed {
+                return Err(PluginError::Invalid(format!(
+                    "marketplace {name} changed while refreshing; retry the operation"
+                )));
+            }
+        }
+        let cache_root = self.directory.join(MARKETPLACES_DIRECTORY);
         crate::store::create_private_directories(&cache_root)?;
         let cache = tempfile::Builder::new()
-            .prefix("catalog-")
+            .prefix(MARKETPLACE_CACHE_PREFIX)
             .tempdir_in(&cache_root)
             .map_err(PluginError::io("cannot stage marketplace"))?;
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(cache.path().join("marketplace.json"))
+            .mode(PRIVATE_FILE_MODE)
+            .open(cache.path().join(MARKETPLACE_FILE))
             .map_err(PluginError::io("cannot cache marketplace"))?;
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(PluginError::io("cannot protect marketplace"))?;
         serde_json::to_writer(&file, &document)
             .map_err(|error| PluginError::Invalid(error.to_string()))?;
         file.sync_all()
@@ -420,7 +430,7 @@ impl PluginStore {
     fn read_marketplace_registry(
         &self,
     ) -> Result<BTreeMap<String, CachedMarketplace>, PluginError> {
-        let path = self.directory.join("marketplaces.json");
+        let path = self.directory.join(MARKETPLACE_REGISTRY_FILE);
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| PluginError::Registry {
                 path,
@@ -445,7 +455,7 @@ impl PluginStore {
         file.as_file()
             .sync_all()
             .map_err(PluginError::io("cannot sync marketplace registrations"))?;
-        file.persist(self.directory.join("marketplaces.json"))
+        file.persist(self.directory.join(MARKETPLACE_REGISTRY_FILE))
             .map_err(|error| {
                 PluginError::io("cannot save marketplace registrations")(error.error)
             })?;
@@ -466,4 +476,15 @@ fn read_document(path: &Path) -> Result<Value, PluginError> {
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| PluginError::Invalid(format!("invalid marketplace JSON: {error}")))
+}
+
+fn read_directory_document(root: &Path) -> Result<Value, PluginError> {
+    let path = MARKETPLACE_LOCATIONS
+        .iter()
+        .map(|relative| root.join(relative))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            PluginError::Invalid(format!("no marketplace file in {}", root.display()))
+        })?;
+    read_document(&path)
 }

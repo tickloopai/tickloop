@@ -355,7 +355,7 @@ impl PluginStore {
                 source: checkout.source.clone(),
                 commit: checkout.commit.clone(),
             },
-            revision: checkout.commit[..12].to_owned(),
+            revision: checkout.commit[..crate::git::COMMIT_REVISION_LENGTH].to_owned(),
             sha256: None,
             default_name: name.to_owned(),
             entry,
@@ -363,15 +363,7 @@ impl PluginStore {
             same_revision: SameRevision::Keep,
         };
         self.install(request, |staged| {
-            staging::copy_directory(checkout.root(), staged)?;
-            let manifest = PluginManifest::load(staged, name, entry)?;
-            if manifest.name != name {
-                return Err(PluginError::Invalid(format!(
-                    "the plugin is named {}, not {name}",
-                    manifest.name
-                )));
-            }
-            Ok(())
+            copy_named_plugin(checkout.root(), staged, name, entry)
         })
     }
 
@@ -402,15 +394,7 @@ impl PluginStore {
                     "plugin source contains the plugins directory".into(),
                 ));
             }
-            staging::copy_directory(root, staged)?;
-            let manifest = PluginManifest::load(staged, name, Some(entry))?;
-            if manifest.name != name {
-                return Err(PluginError::Invalid(format!(
-                    "the plugin is named {}, not {name}",
-                    manifest.name
-                )));
-            }
-            Ok(())
+            copy_named_plugin(root, staged, name, Some(entry))
         })
     }
 
@@ -824,4 +808,21 @@ fn move_aside(path: &Path, aside: &Path) -> Result<bool, PluginError> {
             error,
         )),
     }
+}
+
+fn copy_named_plugin(
+    source: &Path,
+    staged: &Path,
+    name: &str,
+    entry: Option<&Map<String, Value>>,
+) -> Result<(), PluginError> {
+    staging::copy_directory(source, staged)?;
+    let manifest = PluginManifest::load(staged, name, entry)?;
+    if manifest.name != name {
+        return Err(PluginError::Invalid(format!(
+            "the plugin is named {}, not {name}",
+            manifest.name
+        )));
+    }
+    Ok(())
 }

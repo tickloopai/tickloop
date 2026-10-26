@@ -45,7 +45,10 @@ impl MarketplaceSource {
             .map_or((text, None), |(url, reference)| {
                 (url, Some(reference.to_owned()))
             });
-        if location.starts_with("https://") && location.ends_with(".json") && reference.is_none() {
+        if location.starts_with("https://")
+            && reqwest::Url::parse(location).is_ok_and(|url| url.path().ends_with(".json"))
+            && reference.is_none()
+        {
             return Ok(Self::Url(location.to_owned()));
         }
         let url = if location.starts_with("https://")

@@ -740,3 +740,114 @@ async fn installed_names_cannot_be_taken_by_another_git_marketplace() {
     ));
     assert_eq!(fixture.registry(), before);
 }
+
+#[test]
+fn signed_https_marketplace_urls_keep_their_query_in_the_http_source() {
+    let url = "https://example.test/marketplace.json?token=example";
+    assert_eq!(
+        MarketplaceSource::parse(url).unwrap(),
+        MarketplaceSource::Url(url.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_cannot_resurrect_a_removed_marketplace_or_overwrite_its_replacement() {
+    let fixture = Fixture::new();
+    let root = fixture.source("race");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name": "race", "plugins": []}),
+    );
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "first"]);
+    let source = MarketplaceSource::parse(&format!("file://{}", root.display())).unwrap();
+    fixture
+        .store
+        .add_marketplace(&source, &no_http)
+        .await
+        .unwrap();
+    let (refresh, ()) = tokio::join!(biased;
+        fixture.store.refresh_marketplace("race", &no_http),
+        async { fixture.store.remove_marketplace("race").unwrap(); }
+    );
+    assert!(
+        refresh
+            .unwrap_err()
+            .to_string()
+            .contains("changed while refreshing")
+    );
+    assert_eq!(fixture.store.marketplaces().unwrap().len(), 2);
+    fixture
+        .store
+        .add_marketplace(&source, &no_http)
+        .await
+        .unwrap();
+    let replacement = fixture.source("replacement");
+    write_json(
+        &replacement.join("marketplace.json"),
+        &json!({"name": "race", "plugins": [{"name": "new", "source": {"source":"npm"}}]}),
+    );
+    let replacement = MarketplaceSource::Directory(replacement);
+    let (refresh, added) = tokio::join!(biased;
+        fixture.store.refresh_marketplace("race", &no_http),
+        async {
+            fixture.store.remove_marketplace("race").unwrap();
+            fixture.store.add_marketplace(&replacement, &no_http).await.unwrap()
+        }
+    );
+    assert!(refresh.is_err());
+    assert_eq!(
+        fixture.store.marketplace("race", &no_http).await.unwrap(),
+        added
+    );
+}
+
+#[test]
+fn the_builtin_tick_override_keeps_its_identity_with_a_differently_named_catalog() {
+    const OVERRIDE_FILE: &str = "builtin-override-04.json";
+    if std::env::var_os(tick_packages::MARKETPLACE_ENVIRONMENT_VARIABLE).is_some_and(|value| {
+        std::path::Path::new(&value)
+            .file_name()
+            .is_some_and(|name| name == OVERRIDE_FILE)
+    }) {
+        let fixture = Fixture::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let catalog = fixture
+                .store
+                .marketplace("tickloop", &no_http)
+                .await
+                .unwrap();
+            assert_eq!(catalog.registration.name, "tickloop");
+            assert!(catalog.registration.builtin);
+            assert_eq!(fixture.store.marketplaces().unwrap().len(), 2);
+            assert_eq!(
+                fixture
+                    .store
+                    .marketplace("tickloop", &no_http)
+                    .await
+                    .unwrap(),
+                catalog
+            );
+        });
+        return;
+    }
+    // A child test process isolates the existing override variable from other tests.
+    let fixture = Fixture::new();
+    let file = fixture.root().join(OVERRIDE_FILE);
+    write_json(
+        &file,
+        &json!({"name": "Alternate Tick packages", "owner": {"name":"Test"}, "packages": []}),
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "marketplace::the_builtin_tick_override_keeps_its_identity_with_a_differently_named_catalog"])
+        .env(tick_packages::MARKETPLACE_ENVIRONMENT_VARIABLE, file)
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

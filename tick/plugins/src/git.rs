@@ -10,6 +10,7 @@ use tokio::process::Command;
 
 use crate::{GitSource, PluginError};
 
+pub(crate) const COMMIT_REVISION_LENGTH: usize = 12;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
