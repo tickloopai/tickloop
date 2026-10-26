@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-code"
-description = "The tickloop executable: the Console, the daemon and worker entries, the Tick package commands, and their end-to-end tests"
+description = "The tickloop executable: the Console, the daemon and worker entries, the Tick package and plugin commands, and their end-to-end tests"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -38,6 +38,7 @@ tickloop-code-daemon = { path = "../daemon" }
 tickloop-tick-installer = { path = "../../tick/installer" }
 tickloop-code-updater = { path = "../updater" }
 tickloop-tick-packages = { path = "../../tick/packages" }
+tickloop-tick-plugins = { path = "../../tick/plugins" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

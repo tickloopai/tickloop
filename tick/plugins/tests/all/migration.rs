@@ -1,5 +1,7 @@
 use std::fs;
 
+use serde_json::json;
+
 use tick_packages::{ApiKey, ExpectedArchive, LoginState, PackageStore};
 use tick_plugins::{PluginSource, PluginStore};
 
@@ -36,11 +38,43 @@ fn earlier_packages(fixture: &Fixture) -> PackageStore {
 }
 
 #[test]
-fn the_first_use_moves_earlier_tick_packages_into_the_plugin_store() {
+fn using_the_store_leaves_earlier_tick_packages_where_they_are() {
+    let fixture = Fixture::new();
+    earlier_packages(&fixture);
+    let plugin = fixture.claude_plugin("notes", &json!({"name": "notes"}), &["write"]);
+
+    assert!(fixture.store.installed().unwrap().plugins.is_empty());
+    fixture.store.install_path(&plugin).unwrap();
+    fixture.store.set_enabled("notes", false).unwrap();
+
+    let ids = fixture
+        .store
+        .installed()
+        .unwrap()
+        .plugins
+        .iter()
+        .map(|plugin| plugin.id())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["notes@local"]);
+    let earlier = PackageStore::in_config_root(&fixture.config_root())
+        .installed()
+        .unwrap();
+    assert_eq!(earlier.packages.len(), 2);
+    assert!(fixture.config_root().join("ticks").is_dir());
+}
+
+#[test]
+fn an_explicit_migration_moves_earlier_tick_packages_into_the_plugin_store() {
     let fixture = Fixture::new();
     earlier_packages(&fixture);
 
+    let migration = fixture.store.migrate().unwrap().unwrap();
     let installed = fixture.store.installed().unwrap();
+
+    assert_eq!(
+        migration.migrated,
+        vec!["local-tool@local", "quotes@tickloop"]
+    );
 
     let ids = installed
         .plugins
@@ -105,7 +139,7 @@ fn a_migration_that_fails_leaves_the_earlier_packages_as_they_were() {
     fs::create_dir_all(plugins.join("cache")).unwrap();
     fs::write(plugins.join("cache/tickloop"), "in the way").unwrap();
 
-    let error = fixture.store.installed().unwrap_err();
+    let error = fixture.store.migrate().unwrap_err();
 
     assert!(error.to_string().contains("cannot create"), "{error}");
     assert!(!plugins.join("installed.json").exists());
@@ -117,6 +151,7 @@ fn a_migration_that_fails_leaves_the_earlier_packages_as_they_were() {
 
     fs::remove_file(plugins.join("cache/tickloop")).unwrap();
     let store = PluginStore::in_config_root(&fixture.config_root());
+    assert!(store.migrate().unwrap().is_some());
     assert_eq!(store.installed().unwrap().plugins.len(), 2);
 }
 

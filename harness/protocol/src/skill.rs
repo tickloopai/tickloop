@@ -26,6 +26,11 @@ pub enum SkillSource {
         package: String,
         path: PathBuf,
     },
+    /// A Skill an installed, enabled plugin brings, named `<plugin>:<skill>`.
+    Plugin {
+        plugin: String,
+        path: PathBuf,
+    },
     Remote {
         server_id: String,
         account_id: String,
@@ -41,6 +46,7 @@ impl SkillSource {
             Self::User { .. } => "User".into(),
             Self::Project { .. } => "Project".into(),
             Self::TickPackage { package, .. } => format!("Tick package · {package}"),
+            Self::Plugin { plugin, .. } => format!("Plugin · {plugin}"),
             Self::Remote { .. } => "Remote".into(),
         }
     }

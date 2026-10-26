@@ -12,6 +12,8 @@ mod loop_skill;
 mod model_configuration;
 #[path = "all/monitor_settings.rs"]
 mod monitor_settings;
+#[path = "all/plugin_skills.rs"]
+mod plugin_skills;
 #[path = "all/settings_store.rs"]
 mod settings_store;
 #[path = "all/skill_catalog.rs"]

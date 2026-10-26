@@ -1,6 +1,7 @@
 //! The process entries the `tickloop` executable dispatches before it starts the Console.
 
 mod package_command;
+mod plugin_command;
 
 use std::ffi::OsString;
 
@@ -9,6 +10,7 @@ use tickloop_code_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_work
 
 const MONITOR_COMMAND: &str = "monitor";
 const TICK_COMMAND: &str = "tick";
+const PLUGIN_COMMAND: &str = "plugin";
 
 /// Names this build, from its sources, for the comparison between a View and the running daemon.
 pub fn name_this_build() {
@@ -28,6 +30,7 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
             Some(tickloop_code_console::terminal::monitor_command::run(&arguments[1..]).await)
         }
         (TICK_COMMAND, _) => Some(package_command::run(&arguments[1..]).await),
+        (PLUGIN_COMMAND, _) => Some(plugin_command::run(&arguments[1..])),
         _ => None,
     }
 }

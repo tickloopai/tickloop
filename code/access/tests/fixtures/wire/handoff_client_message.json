@@ -2,7 +2,7 @@
   {
     "Hello": {
       "major": 28,
-      "minor": 3,
+      "minor": 4,
       "handoff": {
         "version": 1
       }
@@ -11,7 +11,7 @@
   {
     "Hello": {
       "major": 28,
-      "minor": 3,
+      "minor": 4,
       "handoff": {
         "version": 1,
         "resume": {

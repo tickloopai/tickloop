@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use tick_packages::{LoginState, PackageCredentials};
+use tick_packages::{LoginState, PackageCredentials, PackageStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -164,7 +164,8 @@ pub struct Uninstalled {
 }
 
 /// The plugins installed under one Tickloop config root, and the credentials kept for them
-/// there. Its first use moves the Tick packages an earlier Tickloop installed into it.
+/// there. The Tick packages an earlier Tickloop installed move into it only through
+/// [`PluginStore::migrate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginStore {
     pub(crate) config_root: PathBuf,
@@ -217,7 +218,6 @@ impl PluginStore {
     /// form a valid plugin. One that looks broken while an install or uninstall is under way is
     /// read again once that has finished.
     pub fn installed(&self) -> Result<InstalledPlugins, PluginError> {
-        self.migrate()?;
         let installed = self.read_installed()?;
         if installed.broken.is_empty() {
             return Ok(installed);
@@ -230,7 +230,6 @@ impl PluginStore {
     /// uninstall is under way is read again once that has finished.
     pub fn get(&self, name: &str) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
-        self.migrate()?;
         let read = || {
             let registry = Registry::read(&self.registry_path())?;
             let entry = registry
@@ -434,7 +433,8 @@ impl PluginStore {
     }
 
     /// Enables or disables the plugin `name`; a disabled plugin stays installed, but its Skills
-    /// are not loaded and its Tick program is not found by name.
+    /// are not loaded and its Tick program is not found by name. A plugin that can no longer be
+    /// used stays as it is.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
         let _lock = self.lock()?;
@@ -444,16 +444,18 @@ impl PluginStore {
             .plugins
             .get_mut(name)
             .ok_or_else(|| PluginError::NotInstalled(name.to_owned()))?;
+        let mut plugin =
+            self.load_installed(name, entry)
+                .map_err(|reason| PluginError::Unusable {
+                    name: name.to_owned(),
+                    reason,
+                })?;
         if entry.enabled != enabled {
             entry.enabled = enabled;
             registry.write(&registry_path)?;
+            plugin.enabled = enabled;
         }
-        let entry = &registry.plugins[name];
-        self.load_installed(name, entry)
-            .map_err(|reason| PluginError::Unusable {
-                name: name.to_owned(),
-                reason,
-            })
+        Ok(plugin)
     }
 
     /// Builds the plugin in a staging directory with `fill`, checks it, and installs it in the
@@ -495,6 +497,9 @@ impl PluginStore {
         }
 
         let name = manifest.name.clone();
+        if self.is_tick_package(&name)? {
+            return Err(PluginError::TickPackageNameTaken(name));
+        }
         let registry_path = self.registry_path();
         let mut registry = Registry::read(&registry_path)?;
         let previous = registry.plugins.get(&name).cloned();
@@ -586,6 +591,16 @@ impl PluginStore {
         })
     }
 
+    /// Whether a Tick package an earlier Tickloop installed, usable or not, is named `name`.
+    fn is_tick_package(&self, name: &str) -> Result<bool, PluginError> {
+        let packages = PackageStore::in_config_root(&self.config_root).installed()?;
+        Ok(packages
+            .packages
+            .iter()
+            .any(|package| package.manifest.name == name)
+            || packages.broken.iter().any(|package| package.name == name))
+    }
+
     fn read_installed(&self) -> Result<InstalledPlugins, PluginError> {
         let registry = Registry::read(&self.registry_path())?;
         let mut installed = InstalledPlugins::default();
@@ -639,16 +654,9 @@ impl PluginStore {
             .join(name)
     }
 
-    /// Takes the directory's lock, creating the directory when needed, removes what an install,
-    /// uninstall or download that never finished left behind, and moves in the Tick packages
-    /// an earlier Tickloop installed.
-    fn lock(&self) -> Result<File, PluginError> {
-        let lock = self.lock_directory()?;
-        self.migrate_locked()?;
-        Ok(lock)
-    }
-
-    pub(crate) fn lock_directory(&self) -> Result<File, PluginError> {
+    /// Takes the directory's lock, creating the directory when needed, and removes what an
+    /// install, uninstall or download that never finished left behind.
+    pub(crate) fn lock(&self) -> Result<File, PluginError> {
         create_private_directories(&self.directory)?;
         let path = self.directory.join(LOCK_FILE_NAME);
         let lock = OpenOptions::new()

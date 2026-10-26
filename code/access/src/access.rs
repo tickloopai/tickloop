@@ -71,8 +71,9 @@ use tickloop_harness::protocol::{
 /// 28.2 adds Goal display history, continuation times, and the Goal and scheduled tasks on the
 /// lightweight Chat status.
 /// 28.3 adds user-controlled pauses of individual scheduled tasks and periodic subscriptions.
+/// 28.4 adds the plugin source of an invoked Skill.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

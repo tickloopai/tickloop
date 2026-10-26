@@ -59,7 +59,7 @@ test: test-workspace
 ## these and the release workflow verifies the launcher. NEXTEST_PROFILE=ci retries flaky PTY tests.
 test-workspace:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
-	node --test scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs
+	node --test scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs scripts/plugin-compat-report.test.mjs
 	@mkdir -p /tmp/tickloop-test
 	TICKLOOP_CONFIG_DIR=$$(mktemp -d /tmp/tickloop-test/config.XXXXXX) \
 	TICKLOOP_TMPDIR=$$(mktemp -d /tmp/tickloop-test/tmp.XXXXXX) \

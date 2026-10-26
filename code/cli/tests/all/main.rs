@@ -19,6 +19,7 @@ mod hosted_ticks;
 mod monitor_attach;
 mod monitor_popup;
 mod monitor_pty;
+mod plugin_commands;
 mod provider_picker;
 mod runtime_source;
 mod terminal;

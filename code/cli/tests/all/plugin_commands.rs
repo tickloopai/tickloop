@@ -1,0 +1,298 @@
+//! `tickloop plugin` as a user runs it, against a private config root, with plugins from local
+//! directories.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use serde_json::{Value, json};
+
+use crate::tick_package_commands::{Fixture, failed, path_text, succeeded};
+
+/// A Claude Code plugin directory `label` with `manifest`, a Skill per name in `skills/`, and the
+/// commands and MCP servers Tickloop does not use yet.
+fn claude_plugin(fixture: &Fixture, label: &str, manifest: Value, skills: &[&str]) -> PathBuf {
+    let directory = fixture.root.join("sources").join(label);
+    fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
+    fs::write(
+        directory.join(".claude-plugin/plugin.json"),
+        manifest.to_string(),
+    )
+    .unwrap();
+    for skill in skills {
+        let skill_directory = directory.join("skills").join(skill);
+        fs::create_dir_all(&skill_directory).unwrap();
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: Uses {skill}\n---\nBody\n"),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(directory.join("commands")).unwrap();
+    fs::write(directory.join("commands/tidy.md"), "Tidy up\n").unwrap();
+    fs::write(directory.join(".mcp.json"), "{}").unwrap();
+    directory
+}
+
+fn installed_root(fixture: &Fixture, name: &str) -> String {
+    path_text(
+        &fixture
+            .root
+            .join("config/plugins/cache/local")
+            .join(name)
+            .join("local"),
+    )
+}
+
+fn plugin(fixture: &Fixture, arguments: &[&str]) -> std::process::Output {
+    let arguments = [&["plugin"][..], arguments].concat();
+    fixture.tickloop(&arguments)
+}
+
+#[test]
+fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "No plugins are installed.\n"
+    );
+    let source = claude_plugin(
+        &fixture,
+        "notes",
+        json!({"name": "notes", "version": "1.0.0", "skills": ["./skills", "./missing"]}),
+        &["write"],
+    );
+    let source_path = path_text(&source);
+    let root = installed_root(&fixture, "notes");
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "--path", &source_path])),
+        format!(
+            "Installed plugin notes@local 1.0.0 in {root}.\n\
+             Not supported yet, so not used: commands, MCP servers.\n\
+             Warning: skills path \"./missing\" is ignored: it does not exist\n"
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "notes@local  1.0.0  enabled  no login needed  not supported yet: commands, MCP servers\n"
+    );
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["disable", "notes"])),
+        "Disabled plugin notes@local; its Skills stop loading from the next request.\n"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["disable", "notes"])),
+        "Plugin notes@local is already disabled.\n"
+    );
+    let reinstalled = succeeded(&plugin(&fixture, &["install", "--path", &source_path]));
+    assert!(
+        reinstalled.starts_with(&format!(
+            "Reinstalled plugin notes@local 1.0.0 in {root}.\n\
+             It stays disabled; tickloop plugin enable notes turns it on.\n"
+        )),
+        "{reinstalled}"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "notes@local  1.0.0  disabled  no login needed  not supported yet: commands, MCP servers\n"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["enable", "notes"])),
+        "Enabled plugin notes@local; its Skills load from the next request.\n"
+    );
+
+    fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        json!({"name": "notes", "version": "1.1.0"}).to_string(),
+    )
+    .unwrap();
+    fs::remove_dir_all(source.join("commands")).unwrap();
+    fs::remove_file(source.join(".mcp.json")).unwrap();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "--path", &source_path])),
+        format!("Replaced plugin notes@local 1.0.0 with 1.1.0 in {root}.\n")
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "notes@local  1.1.0  enabled  no login needed\n"
+    );
+
+    let data = fixture.root.join("config/plugins/data/notes");
+    fs::create_dir_all(&data).unwrap();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["uninstall", "notes", "--keep-data"])),
+        format!(
+            "Uninstalled plugin notes@local 1.1.0.\nIts data stays in {}.\n",
+            path_text(&data)
+        )
+    );
+    assert!(data.is_dir());
+    assert!(!Path::new(&root).exists());
+    assert_eq!(
+        failed(&plugin(&fixture, &["uninstall", "notes"])),
+        "Error: plugin notes is not installed\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["enable", "notes"])),
+        "Error: plugin notes is not installed\n"
+    );
+
+    succeeded(&plugin(&fixture, &["install", "--path", &source_path]));
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["uninstall", "notes"])),
+        "Uninstalled plugin notes@local 1.1.0.\n"
+    );
+    assert!(!data.exists());
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "No plugins are installed.\n"
+    );
+}
+
+#[test]
+fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "notes",
+        json!({"name": "notes", "version": "1.0.0", "skills": ["./skills", "../outside"]}),
+        &["read", "write"],
+    );
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
+        "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.\n\
+         Skills: skills/read, skills/write\n\
+         Not supported yet, so not used: commands, MCP servers.\n\
+         Warning: skills path \"../outside\" is ignored: it must start with ./\n"
+    );
+
+    let bare = fixture.root.join("sources/bare-plugin");
+    fs::create_dir_all(&bare).unwrap();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&bare)])),
+        "Plugin bare-plugin, read from its directory.\nSkills: none\n"
+    );
+
+    fs::write(source.join(".claude-plugin/plugin.json"), r#"{"name": 7}"#).unwrap();
+    assert_eq!(
+        failed(&plugin(&fixture, &["validate", &path_text(&source)])),
+        format!(
+            "Error: {} is not a valid plugin: name in .claude-plugin/plugin.json must be a string\n",
+            source.display()
+        )
+    );
+    let missing = fixture.root.join("missing");
+    assert_eq!(
+        failed(&plugin(&fixture, &["validate", &path_text(&missing)])),
+        format!("Error: {} is not a plugin directory\n", missing.display())
+    );
+    assert!(
+        !fixture.root.join("config").exists(),
+        "validate installs nothing"
+    );
+}
+
+#[test]
+fn a_plugin_cannot_take_a_tick_package_name_and_an_unusable_one_is_listed() {
+    let fixture = Fixture::new();
+    succeeded(&fixture.tickloop(&[
+        "tick",
+        "install",
+        "--path",
+        &path_text(&fixture.package_named("sample", "1.0.0")),
+    ]));
+    let clash = claude_plugin(&fixture, "sample", json!({"name": "sample"}), &[]);
+
+    assert_eq!(
+        failed(&plugin(
+            &fixture,
+            &["install", "--path", &path_text(&clash)]
+        )),
+        format!(
+            "Error: cannot install {}: sample is already installed as a Tick package; uninstall \
+             it first\n",
+            clash.display()
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "No plugins are installed.\n"
+    );
+
+    let notes = claude_plugin(&fixture, "notes", json!({"name": "notes"}), &["write"]);
+    succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&notes)],
+    ));
+    fs::remove_dir_all(installed_root(&fixture, "notes")).unwrap();
+    let listed = succeeded(&plugin(&fixture, &["list"]));
+    assert!(
+        listed.starts_with(
+            "notes@local  local  enabled  login unknown  unusable: its directory cannot be opened"
+        ),
+        "{listed}"
+    );
+    assert!(listed.ends_with("; install it again\n"), "{listed}");
+    let error = failed(&plugin(&fixture, &["disable", "notes"]));
+    assert!(
+        error.starts_with("Error: cannot disable notes: plugin notes cannot be used"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_plugin_command_explains_its_usage() {
+    let fixture = Fixture::new();
+    for arguments in [
+        &["plugin"][..],
+        &["plugin", "install"],
+        &["plugin", "install", "notes"],
+        &["plugin", "install", "--path"],
+        &["plugin", "uninstall"],
+        &["plugin", "uninstall", "notes", "--all"],
+        &["plugin", "enable"],
+        &["plugin", "disable", "--all"],
+        &["plugin", "list", "--available"],
+        &["plugin", "validate"],
+        &["plugin", "login", "notes"],
+        &["plugin", "update"],
+    ] {
+        let error = failed(&fixture.tickloop(arguments));
+        assert!(
+            error.starts_with(
+                "Error: Unknown plugin command. Usage: tickloop plugin install --path PATH"
+            ),
+            "{arguments:?}: {error}"
+        );
+    }
+    for arguments in [
+        &["plugin", "--help"][..],
+        &["plugin", "-h"],
+        &["plugin", "install", "--help"],
+        &["plugin", "validate", "-h"],
+    ] {
+        let help = succeeded(&fixture.tickloop(arguments));
+        assert!(
+            help.starts_with(
+                "Usage: tickloop plugin install --path PATH\n       \
+                 tickloop plugin uninstall PLUGIN [--keep-data]\n"
+            ),
+            "{help}"
+        );
+        assert!(help.contains("TICKLOOP_CONFIG_DIR"), "{help}");
+        assert!(help.contains("named PLUGIN:SKILL"), "{help}");
+        assert!(help.contains("grant no tools"), "{help}");
+    }
+    let console_help = succeeded(&fixture.tickloop(&["--help"]));
+    assert!(
+        console_help.contains(
+            "tickloop plugin install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list | validate DIRECTORY"
+        ),
+        "{console_help}"
+    );
+    assert!(!fixture.root.join("config").exists());
+}

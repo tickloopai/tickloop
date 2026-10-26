@@ -19,6 +19,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tickloop-tick-packages = { path = "../../tick/packages" }
+tickloop-tick-plugins = { path = "../../tick/plugins" }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

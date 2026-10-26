@@ -2546,7 +2546,7 @@ mod tests {
                     .path()
                     .join(".tickloop/skills/catalog-workflow/SKILL.md"),
             },
-            None,
+            &[],
         );
         chat.skills = Arc::new(skills);
         let catalog = |chat: &Chat| {
