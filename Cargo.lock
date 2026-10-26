@@ -4125,6 +4125,7 @@ dependencies = [
  "tickloop-harness",
  "tickloop-tick-installer",
  "tickloop-tick-packages",
+ "tickloop-tick-plugins",
  "time",
  "uuid",
 ]

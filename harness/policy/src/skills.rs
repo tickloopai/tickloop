@@ -16,6 +16,13 @@ pub const BUILTIN_SKILLS: [&str; 3] = [TICKLOOP_SKILL, SLIDES_SKILL, LOOP_SKILL]
 pub const SKILL_TOOL_NAME: &str = "Skill";
 /// In the body of a Tick package's Skill, the directory the package is installed in.
 pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
+/// In the body of a plugin's Skill, the directory the plugin is installed in, in Tickloop's and
+/// Claude Code's naming.
+pub const PLUGIN_ROOT_VARIABLES: [&str; 2] = ["${TICKLOOP_PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}"];
+/// In the body of a plugin's Skill, the directory the plugin keeps its data in.
+pub const PLUGIN_DATA_VARIABLES: [&str; 2] = ["${TICKLOOP_PLUGIN_DATA}", "${CLAUDE_PLUGIN_DATA}"];
+/// In the body of a plugin's Skill, the directory of the Skill itself.
+pub const SKILL_DIRECTORY_VARIABLES: [&str; 2] = ["${TICKLOOP_SKILL_DIR}", "${CLAUDE_SKILL_DIR}"];
 
 const MAX_NAME_BYTES: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1536;
@@ -143,25 +150,35 @@ impl SkillRegistry {
         self.warnings.push(warning);
     }
 
+    /// Registers the Skill in `markdown`. A Tick package's or a plugin's Skill is named
+    /// `<package>:<skill>` and has each placeholder of `variables` in its body replaced by its
+    /// path; a plugin's Skill gets no tools from its `allowed-tools`.
     pub fn register_markdown(
         &mut self,
         markdown: &str,
         source: SkillSource,
-        package_root: Option<&Path>,
+        variables: &[(&str, &Path)],
     ) {
         let path = match &source {
             SkillSource::User { path }
             | SkillSource::Project { path }
-            | SkillSource::TickPackage { path, .. } => Some(path.clone()),
+            | SkillSource::TickPackage { path, .. }
+            | SkillSource::Plugin { path, .. } => Some(path.clone()),
             _ => None,
         };
         let parsed = parse_skill(markdown, source).map(|mut skill| {
-            if let SkillSource::TickPackage { package, .. } = &skill.source {
-                skill.name = format!("{package}:{}", skill.name);
-                if let Some(root) = package_root {
-                    skill.body = skill
-                        .body
-                        .replace(PACKAGE_ROOT_VARIABLE, &root.to_string_lossy());
+            let namespace = match &skill.source {
+                SkillSource::TickPackage { package, .. } => Some(package.clone()),
+                SkillSource::Plugin { plugin, .. } => {
+                    skill.allowed_tools.clear();
+                    Some(plugin.clone())
+                }
+                _ => None,
+            };
+            if let Some(namespace) = namespace {
+                skill.name = format!("{namespace}:{}", skill.name);
+                for (placeholder, value) in variables {
+                    skill.body = skill.body.replace(placeholder, &value.to_string_lossy());
                 }
             }
             skill
@@ -387,7 +404,8 @@ Available Skills:
         let content = match &skill.source {
             SkillSource::User { path }
             | SkillSource::Project { path }
-            | SkillSource::TickPackage { path, .. } => format!(
+            | SkillSource::TickPackage { path, .. }
+            | SkillSource::Plugin { path, .. } => format!(
                 "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
                 path.parent().unwrap_or(path).display()
             ),

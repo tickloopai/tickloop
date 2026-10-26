@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 use tick_packages::{InstalledPackage, PackageStore};
+use tick_plugins::{InstalledPlugin, PluginStore};
 pub use tickloop_harness::policy::skills::*;
 use tickloop_harness::protocol::SkillSource;
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -40,6 +41,7 @@ impl SkillDiscovery for SkillRegistry {
                 &mut seen_files,
             );
             load_tick_packages(&mut registry, root, &mut seen_files);
+            load_plugins(&mut registry, root, &mut seen_files);
         }
         for directory in project_skill_directories(folder) {
             load_directory(
@@ -57,7 +59,9 @@ enum SkillOrigin<'a> {
     User,
     Project,
     TickPackage(&'a InstalledPackage),
+    Plugin(&'a InstalledPlugin),
 }
+
 fn load_tick_packages(
     registry: &mut SkillRegistry,
     config_root: &Path,
@@ -88,6 +92,42 @@ fn load_tick_packages(
     }
 }
 
+/// Loads the Skills of every enabled plugin; a disabled one stays installed but unloaded.
+fn load_plugins(
+    registry: &mut SkillRegistry,
+    config_root: &Path,
+    seen_files: &mut HashSet<PathBuf>,
+) {
+    let installed = match PluginStore::in_config_root(config_root).installed() {
+        Ok(installed) => installed,
+        Err(error) => {
+            registry.warn(format!(
+                "the Skills of installed plugins are not loaded: {error}"
+            ));
+            return;
+        }
+    };
+    for broken in installed.broken.iter().filter(|broken| broken.enabled) {
+        registry.warn(format!(
+            "the Skills of plugin {} are not loaded: it cannot be used ({}); install it again",
+            broken.name, broken.reason
+        ));
+    }
+    for plugin in installed.plugins.iter().filter(|plugin| plugin.enabled) {
+        let skill_files = plugin
+            .skill_directories()
+            .into_iter()
+            .map(|directory| directory.join(SKILL_FILE_NAME))
+            .collect();
+        load_files(
+            registry,
+            skill_files,
+            &SkillOrigin::Plugin(plugin),
+            seen_files,
+        );
+    }
+}
+
 fn load_directory(
     registry: &mut SkillRegistry,
     directory: &Path,
@@ -111,6 +151,15 @@ fn load_directory(
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     paths.sort();
+    load_files(registry, paths, &origin, seen_files);
+}
+
+fn load_files(
+    registry: &mut SkillRegistry,
+    paths: Vec<PathBuf>,
+    origin: &SkillOrigin<'_>,
+    seen_files: &mut HashSet<PathBuf>,
+) {
     for path in paths {
         let canonical = match path.canonicalize() {
             Ok(path) => path,
@@ -133,18 +182,30 @@ fn load_directory(
             }
         };
         let path = canonical.clone();
-        let (source, root) = match origin {
-            SkillOrigin::User => (SkillSource::User { path }, None),
-            SkillOrigin::Project => (SkillSource::Project { path }, None),
-            SkillOrigin::TickPackage(package) => (
+        match origin {
+            SkillOrigin::User => {
+                registry.register_markdown(&markdown, SkillSource::User { path }, &[])
+            }
+            SkillOrigin::Project => {
+                registry.register_markdown(&markdown, SkillSource::Project { path }, &[])
+            }
+            SkillOrigin::TickPackage(package) => registry.register_markdown(
+                &markdown,
                 SkillSource::TickPackage {
                     package: package.manifest.name.clone(),
                     path,
                 },
-                Some(package.root.as_path()),
+                &[(PACKAGE_ROOT_VARIABLE, &package.root)],
             ),
-        };
-        registry.register_markdown(&markdown, source, root);
+            SkillOrigin::Plugin(plugin) => registry.register_markdown(
+                &markdown,
+                SkillSource::Plugin {
+                    plugin: plugin.name().to_owned(),
+                    path,
+                },
+                &[(PACKAGE_ROOT_VARIABLE, &plugin.root)],
+            ),
+        }
     }
 }
 
