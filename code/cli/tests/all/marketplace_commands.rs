@@ -312,12 +312,19 @@ fn a_plugin_installs_by_name_from_a_git_marketplace_and_updates_when_its_commit_
         )
     );
 
+    succeeded(&plugin(&fixture, &["uninstall", "review"]));
     let notes = fixture.root.join("sources/notes");
     write_skill(&notes.join("skills/write"), "write", "Write");
     succeeded(&plugin(
         &fixture,
         &["install", "--path", &path_text(&notes)],
     ));
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update"])),
+        "Plugin notes@local was installed from a local path; tickloop plugin install --path updates it.\n",
+        "updating every plugin passes over a local one even when it is the only one"
+    );
+    succeeded(&plugin(&fixture, &["install", "review"]));
     assert_eq!(
         succeeded(&plugin(&fixture, &["update"])),
         format!(

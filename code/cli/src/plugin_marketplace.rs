@@ -3,10 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use tick_plugins::InstalledPlugins;
 use tick_plugins::{
-    InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, MarketplaceRegistration,
-    MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
+    InstallOutcome, Installation, InstalledPlugins, LOCAL_MARKETPLACE, MarketplacePlugin,
+    MarketplaceRegistration, MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
@@ -252,6 +251,7 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
         )
         .collect::<Vec<_>>();
     targets.sort();
+    let is_single = name.is_some();
     if let Some(name) = name {
         targets.retain(|(installed, _)| installed == name);
         if targets.is_empty() {
@@ -269,7 +269,7 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
                 "{name}@{marketplace} was installed from a local path; \
                  tickloop plugin install --path updates it"
             );
-            if targets.len() == 1 {
+            if is_single {
                 return Err(format!("plugin {installed_locally}"));
             }
             println!("Plugin {installed_locally}.");
@@ -295,7 +295,7 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
         };
         match result {
             Ok(installation) => report_update(&installation),
-            Err(message) if targets.len() == 1 => return Err(message),
+            Err(message) if is_single => return Err(message),
             Err(message) => {
                 failures += 1;
                 eprintln!("Error: {}", safe_line(&message));
