@@ -534,7 +534,6 @@ impl PluginStore {
         })
     }
 
-    /// Whether a Tick package an earlier Tickloop installed, usable or not, is named `name`.
     fn read_installed(&self) -> Result<InstalledPlugins, PluginError> {
         let registry = Registry::read(&self.registry_path())?;
         let mut installed = InstalledPlugins::default();

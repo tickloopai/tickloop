@@ -183,3 +183,24 @@ fn a_name_held_by_a_plugin_is_skipped_and_reported_without_overwriting_it() {
     assert!(!retained.enabled);
     assert_eq!(retained.manifest, installed.manifest);
 }
+
+#[test]
+fn a_background_first_use_keeps_the_migration_notice_for_the_next_cli_use() {
+    let fixture = Fixture::new();
+    let packages = earlier_packages(&fixture);
+    fs::remove_file(
+        packages
+            .get("local-tool")
+            .unwrap()
+            .root
+            .join("tick-package.json"),
+    )
+    .unwrap();
+    fixture.store.installed().unwrap();
+    let reopened = PluginStore::in_config_root(&fixture.config_root());
+    let notices = reopened.take_migration_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("quotes@tickloop"));
+    assert!(notices[0].contains("Skipped Tick package local-tool"));
+    assert!(reopened.take_migration_notices().unwrap().is_empty());
+}

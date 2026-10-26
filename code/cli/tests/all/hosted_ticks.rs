@@ -1779,6 +1779,43 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_credential_cannot_replace_a_plugin_directory_variable() {
+        let daemon = Daemon::start(1).await;
+        let sources = daemon.root.join("sources");
+        for (name, variable) in [
+            ("root-conflict", "CLAUDE_PLUGIN_ROOT"),
+            ("data-conflict", "CLAUDE_PLUGIN_DATA"),
+        ] {
+            let plugins = super::support::hosted::install_environment_recording_package(
+                &daemon.config_root,
+                &sources,
+                name,
+                json!({"type":"api_key","env":variable,"label":"Conflicting key"}),
+            );
+            plugins
+                .credentials(name)
+                .unwrap()
+                .save_api_key(&tick_packages::ApiKey::new("fixture-conflicting-key").unwrap())
+                .unwrap();
+            let result = call_tool(
+                &daemon.tools().with_plugins(plugins),
+                daemon.chats[0],
+                "TickManage",
+                json!({"action":"open","command":[format!("tick-{name}")],"cwd":daemon.root}),
+            )
+            .await;
+            let HostCallResult::NotDispatched(error) = result else {
+                panic!("a conflicting credential variable must prevent dispatch");
+            };
+            assert!(
+                error.contains(variable) && error.contains("plugin directory"),
+                "{error}"
+            );
+            assert!(!sources.join(format!("{name}.env")).exists());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn auto_cleanup_supplies_the_creation_exception_for_the_chats_own_tick() {
         use tickloop_harness::protocol::ExecutionMode;
         use tickloop_harness::test_support::{

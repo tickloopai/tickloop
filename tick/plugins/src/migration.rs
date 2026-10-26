@@ -5,6 +5,8 @@
 
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -17,6 +19,7 @@ use crate::{
     store::{LOCAL_REVISION, PluginStore, create_private_directories},
 };
 
+const MIGRATION_NOTICE: &str = ".plugin-migration-notice";
 const MIGRATED_PREFIX: &str = "ticks.migrated-";
 const DOWNLOAD_SCHEMES: [&str; 2] = ["https://", "http://"];
 
@@ -25,7 +28,7 @@ const DOWNLOAD_SCHEMES: [&str; 2] = ["https://", "http://"];
 pub struct Migration {
     /// The plugin ID of each package that moved.
     pub migrated: Vec<String>,
-    /// The packages whose files could no longer be used, which stay behind.
+    /// The damaged packages or names already held by plugins, which stay behind.
     pub skipped: Vec<BrokenPackage>,
     /// Where the earlier packages directory now is.
     pub kept_at: PathBuf,
@@ -121,35 +124,74 @@ impl PluginStore {
                 error,
             ));
         }
-        if let Err(error) = registry.write(&self.registry_path()) {
-            fs::rename(&kept_at, &old_directory)
+        let migration = Migration {
+            migrated,
+            skipped,
+            kept_at,
+        };
+        let notice_path = migration.kept_at.join(MIGRATION_NOTICE);
+        let publish = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&notice_path)
+            .and_then(|mut file| file.write_all(migration.notice().as_bytes()))
+            .map_err(PluginError::io(
+                "cannot save the Tick package migration notice",
+            ))
+            .and_then(|()| registry.write(&self.registry_path()));
+        if let Err(error) = publish {
+            let _ = fs::remove_file(&notice_path);
+            fs::rename(&migration.kept_at, &old_directory)
                 .map_err(PluginError::io("cannot restore earlier Tick packages"))?;
             restore(&moved);
             return Err(error);
         }
-        Ok(Some(Migration {
-            migrated,
-            skipped,
-            kept_at,
-        }))
+        Ok(Some(migration))
     }
 
     pub(crate) fn migrate_on_use(&self) -> Result<(), PluginError> {
-        if let Some(migration) = self.migrate()? {
-            eprintln!(
-                "Migrated Tick packages to plugins: {}. Earlier files kept in {}.",
-                migration.migrated.join(", "),
-                crate::printable(migration.kept_at)
-            );
-            for skipped in migration.skipped {
-                eprintln!(
-                    "Skipped Tick package {}: {}",
-                    crate::printable(skipped.name),
-                    crate::printable(skipped.reason)
-                );
+        self.migrate().map(|_| ())
+    }
+
+    /// Takes the unread migration notices for a foreground CLI, including migrations performed
+    /// earlier by a background worker. The earlier package directories and files stay in place.
+    pub fn take_migration_notices(&self) -> Result<Vec<String>, PluginError> {
+        self.migrate()?;
+        let entries = match fs::read_dir(&self.config_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(PluginError::io("cannot read migration notices")(error)),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(PluginError::io("cannot read migration notices"))?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(MIGRATED_PREFIX)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                paths.push(entry.path().join(MIGRATION_NOTICE));
             }
         }
-        Ok(())
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        paths.sort();
+        let _lock = self.lock()?;
+        let mut notices = Vec::new();
+        for path in paths {
+            let notice = match fs::read_to_string(&path) {
+                Ok(notice) => notice,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(PluginError::io("cannot read migration notice")(error)),
+            };
+            fs::remove_file(&path)
+                .map_err(PluginError::io("cannot acknowledge migration notice"))?;
+            notices.push(notice);
+        }
+        Ok(notices)
     }
 
     fn needs_migration(&self) -> bool {
@@ -158,6 +200,24 @@ impl PluginStore {
             .join(PACKAGES_DIRECTORY)
             .join(tick_packages::REGISTRY_FILE_NAME);
         old_registry.is_file()
+    }
+}
+
+impl Migration {
+    fn notice(&self) -> String {
+        let mut notice = format!(
+            "Migrated Tick packages to plugins: {}. Earlier files kept in {}.\n",
+            self.migrated.join(", "),
+            crate::printable(&self.kept_at)
+        );
+        for skipped in &self.skipped {
+            notice.push_str(&format!(
+                "Skipped Tick package {}: {}\n",
+                crate::printable(&skipped.name),
+                crate::printable(&skipped.reason)
+            ));
+        }
+        notice
     }
 }
 

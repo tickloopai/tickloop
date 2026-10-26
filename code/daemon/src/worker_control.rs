@@ -621,6 +621,16 @@ fn with_plugin_environment(
         });
     const ROOT_VARIABLES: [&str; 2] = ["TICKLOOP_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"];
     const DATA_VARIABLES: [&str; 2] = ["TICKLOOP_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"];
+    if let Some(variable) = key_variable
+        && (ROOT_VARIABLES.contains(&variable) || DATA_VARIABLES.contains(&variable))
+    {
+        return Err(HostError::before(
+            "InvalidArguments",
+            format!(
+                "plugin authentication variable {variable} is reserved for a plugin directory; the plugin author must choose another API-key variable"
+            ),
+        ));
+    }
     environment.retain(|(name, _)| {
         !ROOT_VARIABLES.contains(&name.as_str())
             && !DATA_VARIABLES.contains(&name.as_str())

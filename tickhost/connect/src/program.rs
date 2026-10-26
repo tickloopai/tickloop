@@ -73,7 +73,10 @@ fn resolve_executable_from(
             plugin: package,
         });
     }
-    let package_name = program.strip_prefix(PACKAGE_PROGRAM_PREFIX);
+    let package_name = program
+        .strip_prefix(PACKAGE_PROGRAM_PREFIX)
+        .filter(|name| tick_plugins::validate_plugin_name(name).is_ok());
+    let mut has_no_tick = false;
     if let (Some(name), Some(packages)) = (package_name, packages) {
         match packages.get(name) {
             Ok(package) if !package.enabled => return Err(plugin_disabled(name)),
@@ -86,18 +89,21 @@ fn resolve_executable_from(
                     plugin: Some(package),
                 });
             }
-            Ok(_) | Err(PluginError::NotInstalled(_) | PluginError::Invalid(_)) => {}
+            Ok(_) => has_no_tick = true,
+            Err(PluginError::NotInstalled(_)) => {}
             Err(error) => return Err(HostError::before(INVALID_ARGUMENTS, error.to_string())),
         }
     }
     std::env::split_paths(search_path)
         .find_map(|directory| executable_file(&cwd.join(directory).join(program)))
         .map(|path| ResolvedExecutable { path, plugin: None })
-        .ok_or_else(|| {
-            match package_name.filter(|name| tick_packages::validate_package_name(name).is_ok()) {
-                Some(name) => plugin_not_installed(program, name),
-                None => not_found(program),
-            }
+        .ok_or_else(|| match package_name {
+            Some(name) if has_no_tick => HostError::before(
+                INVALID_ARGUMENTS,
+                format!("plugin {name} has no Tick program; executable not found: {program}"),
+            ),
+            Some(name) => plugin_not_installed(program, name),
+            None => not_found(program),
         })
 }
 
@@ -324,5 +330,43 @@ mod tests {
             "{error}"
         );
         assert!(!error.dispatched);
+    }
+    #[test]
+    fn a_damaged_earlier_registry_refuses_path_fallback_during_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        std::fs::create_dir_all(config.join("ticks")).unwrap();
+        std::fs::write(config.join("ticks/installed.json"), "not json").unwrap();
+        let path_bin = directory.path().join("path-bin");
+        write_executable(&path_bin.join("tick-sample"));
+        let plugins = PluginStore::in_config_root(&config);
+        let error = resolve_executable_from(
+            "tick-sample",
+            directory.path(),
+            path_bin.as_os_str(),
+            Some(&plugins),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("is damaged"), "{error}");
+    }
+
+    #[test]
+    fn a_skill_only_plugin_is_not_reported_as_uninstalled() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("notes");
+        std::fs::create_dir(&source).unwrap();
+        let plugins = PluginStore::in_config_root(&directory.path().join("config"));
+        plugins.install_path(&source).unwrap();
+        let error = resolve_executable_from(
+            "tick-notes",
+            directory.path(),
+            OsStr::new(""),
+            Some(&plugins),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("plugin notes has no Tick program"),
+            "{error}"
+        );
     }
 }

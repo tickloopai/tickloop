@@ -152,7 +152,16 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
 fn store() -> Result<PluginStore, String> {
     let config_root = tickloop_code_settings::config_root_directory()
         .ok_or("cannot find the Tickloop config directory; set HOME or TICKLOOP_CONFIG_DIR")?;
-    Ok(PluginStore::in_config_root(&config_root))
+    let store = PluginStore::in_config_root(&config_root);
+    for notice in store
+        .take_migration_notices()
+        .map_err(|error| error.to_string())?
+    {
+        for line in notice.lines() {
+            eprintln!("{}", safe_line(line));
+        }
+    }
+    Ok(store)
 }
 
 fn install_path(store: &PluginStore, path: &Path) -> Result<(), String> {
