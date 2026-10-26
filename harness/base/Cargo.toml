@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-harness-base"
-description = "Leaf utilities of the Agent: private files, HTTP policy, images and output styles"
+description = "Leaf utilities of the Agent: private files, HTTP policy, the loopback OAuth callback, images and output styles"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -21,7 +21,8 @@ thiserror = "2"
 tickloop-harness-protocol = { path = "../protocol" }
 tickloop-ids = { path = "../../tick/ids" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

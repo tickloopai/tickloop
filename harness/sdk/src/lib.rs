@@ -1,7 +1,8 @@
 //! The shared Harness API. Hosts select capabilities with Cargo features; these module paths
 //! remain stable when the implementation crates move. This crate contains only re-exports.
 //! `protocol` and `ids` are always available. `base` is opt-in, also enabled by `tools`,
-//! `model`, `artifacts`, `policy`, `engine` and `test-support`; `cron` and `transcript` stay lightweight.
+//! `model`, `artifacts`, `connector`, `policy`, `engine` and `test-support`; `cron` and `transcript`
+//! stay lightweight.
 
 #[cfg(feature = "base")]
 pub use tickloop_harness_base as base;
@@ -10,6 +11,8 @@ pub use tickloop_ids as ids;
 
 #[cfg(feature = "artifacts")]
 pub use tickloop_harness_artifacts as artifacts;
+#[cfg(feature = "connector")]
+pub use tickloop_harness_connector as connector;
 #[cfg(feature = "cron")]
 pub use tickloop_harness_cron as cron;
 #[cfg(feature = "model")]
