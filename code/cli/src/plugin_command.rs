@@ -20,7 +20,7 @@ const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]
        tickloop plugin login PLUGIN [--issuer LABEL]
        tickloop plugin logout PLUGIN
        tickloop plugin list [--available]
-       tickloop plugin validate DIRECTORY
+       tickloop plugin validate DIRECTORY [--name NAME]
        tickloop plugin marketplace add SOURCE
        tickloop plugin marketplace list
        tickloop plugin marketplace update [MARKETPLACE]
@@ -32,7 +32,7 @@ update reads the plugin's marketplace again and installs what it offers now, unl
 uninstall removes a plugin and its data directory; --keep-data keeps the data. Its saved login stays.
 enable and disable turn a plugin on and off without uninstalling it; a disabled plugin stays disabled when it is installed again. Its Skills, named PLUGIN:SKILL, load or stop loading from the Agent's next request.
 list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet. list --available shows what every marketplace offers: its latest version, what is installed and why a plugin cannot be installed. A marketplace that cannot be read is reported and the others are shown.
-validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores.
+validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores. --name uses a marketplace entry name as the installation identity and keeps the declared name for display.
 login and logout manage the plugin's data source credentials.
 marketplace add registers a marketplace from a GitHub OWNER/REPO[#REF], a Git URL (https, ssh or file), a local directory, or an https URL of a marketplace.json; it takes the name its marketplace file gives. marketplace list shows them, marketplace update reads one or every one again, and marketplace remove unregisters one and keeps the plugins installed from it. The built-in marketplaces cannot be removed: tickloop, read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file), and claude-plugins-official, fetched with git the first time it is used.
 tickloop tick is a deprecated alias for tickloop plugin.
@@ -71,7 +71,10 @@ enum PluginCommand<'a> {
         enabled: bool,
     },
     List,
-    Validate(&'a Path),
+    Validate {
+        path: &'a Path,
+        marketplace_name: Option<String>,
+    },
     Update(Option<String>),
     MarketplaceAdd(String),
     MarketplaceList,
@@ -99,7 +102,10 @@ pub async fn run(arguments: &[OsString]) -> Result<(), String> {
         PluginCommand::Uninstall { name, keep_data } => uninstall(&store()?, &name, keep_data)?,
         PluginCommand::SetEnabled { name, enabled } => set_enabled(&store()?, &name, enabled)?,
         PluginCommand::List => list(&store()?)?,
-        PluginCommand::Validate(path) => validate(path)?,
+        PluginCommand::Validate {
+            path,
+            marketplace_name,
+        } => validate(path, marketplace_name.as_deref())?,
         PluginCommand::MarketplaceAdd(source) => {
             super::plugin_marketplace::add_marketplace(&store()?, &source).await?
         }
@@ -200,8 +206,17 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
         {
             PluginCommand::MarketplaceRemove(name(marketplace))
         }
-        [command, path] if command == "validate" && !is_option(path) => {
-            PluginCommand::Validate(Path::new(path))
+        [command, path] if command == "validate" && !is_option(path) => PluginCommand::Validate {
+            path: Path::new(path),
+            marketplace_name: None,
+        },
+        [command, path, option, identity]
+            if command == "validate" && !is_option(path) && option == "--name" =>
+        {
+            PluginCommand::Validate {
+                path: Path::new(path),
+                marketplace_name: Some(name(identity)),
+            }
         }
         _ => return Err(format!("Unknown plugin command. {PLUGIN_USAGE}")),
     })
@@ -386,7 +401,7 @@ fn list(store: &PluginStore) -> Result<(), String> {
 }
 
 /// Shows what Tickloop reads from the plugin directory at `path`, or why it cannot use it.
-fn validate(path: &Path) -> Result<(), String> {
+fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
     let shown = path.display();
     if !path.is_dir() {
         return Err(format!("{shown} is not a plugin directory"));
@@ -399,8 +414,11 @@ fn validate(path: &Path) -> Result<(), String> {
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_default();
-    let manifest = PluginManifest::load(path, &directory_name, None)
-        .map_err(|error| format!("{shown} is not a valid plugin: {error}"))?;
+    let manifest = match marketplace_name {
+        Some(name) => PluginManifest::load_from_marketplace(path, name, None),
+        None => PluginManifest::load(path, &directory_name, None),
+    }
+    .map_err(|error| format!("{shown} is not a valid plugin: {error}"))?;
     let version = manifest
         .version
         .as_deref()
@@ -411,6 +429,9 @@ fn validate(path: &Path) -> Result<(), String> {
         manifest.name,
         manifest.format.label()
     );
+    if let Some(display_name) = &manifest.display_name {
+        println!("Its manifest calls it {}.", safe_line(display_name));
+    }
     let root = path.canonicalize().map_err(|error| error.to_string())?;
     let skills = tick_plugins::skill_directories(&root, &manifest.skill_paths)
         .iter()

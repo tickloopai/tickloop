@@ -349,3 +349,28 @@ fn first_cli_use_migrates_an_earlier_package_and_reports_it_only_once() {
     assert_eq!(succeeded(&plugin(&fixture, &["list"])), listed);
     assert!(!fixture.root.join("config/ticks").exists());
 }
+
+#[test]
+fn validate_uses_marketplace_identity_only_when_explicitly_supplied() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(&fixture, "notion", json!({"name": "Notion"}), &["read"]);
+    let path = path_text(&source);
+    let manifest_before = fs::read(source.join(".claude-plugin/plugin.json")).unwrap();
+    assert!(failed(&plugin(&fixture, &["validate", &path])).contains("is not a plugin name"));
+    let output = succeeded(&plugin(&fixture, &["validate", &path, "--name", "notion"]));
+    assert!(
+        output.contains("Plugin notion, read from .claude-plugin/plugin.json."),
+        "{output}"
+    );
+    assert!(output.contains("Its manifest calls it Notion."), "{output}");
+    assert!(output.contains("Skills: skills/read"), "{output}");
+    assert!(
+        failed(&plugin(&fixture, &["validate", &path, "--name", "Invalid"]))
+            .contains("is not a plugin name")
+    );
+    assert_eq!(
+        fs::read(source.join(".claude-plugin/plugin.json")).unwrap(),
+        manifest_before
+    );
+    assert!(!fixture.root.join("config").exists());
+}

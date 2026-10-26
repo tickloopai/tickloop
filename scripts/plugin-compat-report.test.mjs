@@ -51,11 +51,17 @@ if (process.argv[2] === "--version") { console.log("tickloop 0.0.0-fake"); proce
 const directory = process.argv[4];
 const found = [".tickloop-plugin/plugin.json", ".claude-plugin/plugin.json", "tick-package.json"].find(file => existsSync(join(directory, file)));
 const manifest = found ? JSON.parse(readFileSync(join(directory, found), "utf8")) : { name: basename(directory) };
-if (!/^[a-z0-9][a-z0-9-]*$/.test(manifest.name)) {
+if (typeof manifest.name !== "string") {
+  console.error(\`Error: \${directory} is not a valid plugin: name in \${found} must be a string\`);
+  process.exit(1);
+}
+const identity = process.argv[5] === "--name" ? process.argv[6] : manifest.name;
+if (!/^[a-z0-9][a-z0-9-]*$/.test(identity)) {
   console.error(\`Error: \${directory} is not a valid plugin: "\${manifest.name}" is not a plugin name\`);
   process.exit(1);
 }
-console.log(\`Plugin \${manifest.name}\${manifest.version ? " " + manifest.version : ""}, read from \${found ?? "its directory"}.\`);
+console.log(\`Plugin \${identity}\${manifest.version ? " " + manifest.version : ""}, read from \${found ?? "its directory"}.\`);
+if (identity !== manifest.name) console.log(\`Its manifest calls it \${manifest.name}.\`);
 const skills = existsSync(join(directory, "skills")) ? readdirSync(join(directory, "skills")).sort().map(name => "skills/" + name) : [];
 console.log(\`Skills: \${skills.length ? skills.join(", ") : "none"}\`);
 if (manifest.executable) console.log(\`Tick program: \${manifest.executable} (speaks the Tick protocol)\`);
@@ -96,7 +102,7 @@ function claudeMarketplace() {
     "plugins/notes/.claude-plugin/plugin.json": { name: "notes", version: "1.0.0" },
     "plugins/notes/skills/read/SKILL.md": skill("read"),
     "plugins/notes/commands/summarize.md": "Summarize\n",
-    "plugins/broken/.claude-plugin/plugin.json": { name: "Broken_Name" },
+    "plugins/broken/.claude-plugin/plugin.json": { name: 7 },
   });
   return { marketplace, marketplaceCommit, external, externalCommit, monorepo, monorepoCommit, firstMonorepoCommit };
 }
@@ -141,6 +147,7 @@ test("the output of tickloop plugin validate is read line by line", () => {
     "",
   ].join("\n")), {
     name: "notes",
+    displayName: null,
     version: "1.0.0",
     format: ".claude-plugin/plugin.json",
     skills: ["skills/read", "skills/write"],
@@ -149,7 +156,7 @@ test("the output of tickloop plugin validate is read line by line", () => {
     warnings: ["skills path \"../outside\" is ignored: it must start with ./"],
   });
   assert.deepEqual(parseValidateOutput("Plugin bare-plugin, read from its directory.\nSkills: none\n"), {
-    name: "bare-plugin", version: null, format: "its directory", skills: [], tick: null, unsupported: [], warnings: [],
+    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, unsupported: [], warnings: [],
   });
 });
 
@@ -193,7 +200,7 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
   assert.match(plugins["wrong-pin"].errors[0], /0000000000000000000000000000000000000000/);
   assert.equal(plugins.gone.errors.length, 1);
   assert.deepEqual(plugins["from-npm"].errors, ["npm sources cannot be installed"]);
-  assert.deepEqual(plugins.broken.errors, ["\"Broken_Name\" is not a plugin name"]);
+  assert.deepEqual(plugins.broken.errors, ["name in .claude-plugin/plugin.json must be a string"]);
   assert.deepEqual(plugins.escape.errors, ["../outside leaves the marketplace"]);
 
   assert.deepEqual(report.totals, {
@@ -296,7 +303,7 @@ test("the built tickloop reads the fixture marketplace the same way", { skip: !e
   assert.deepEqual(plugins.notes.unsupportedComponents, ["commands"]);
   assert.deepEqual(plugins.remote.unsupportedComponents, ["MCP servers"]);
   assert.deepEqual({ format: plugins.sub.manifestFormat, skills: plugins.sub.skills }, { format: "marketplace entry", skills: ["skills/draft"] });
-  assert.match(plugins.broken.errors[0], /Broken_Name/);
+  assert.match(plugins.broken.errors[0], /name .* must be a string/);
 });
 
 
@@ -315,4 +322,22 @@ test("validation staging rejects escaping and dangling links before writing a fa
     assert.equal(report.plugins[0].status, STATUS.notFetchable);
     assert.match(report.plugins[0].errors[0], /symbolic link/);
   }
+});
+
+
+test("marketplace compatibility uses entry identity and retains the manifest display name", async () => {
+  const marketplace = join(scratch, "identity-market");
+  const manifest = { name: "Notion", version: "1.0.0" };
+  writeFiles(marketplace, {
+    "marketplace.json": { name: "identity", plugins: [{ name: "notion", source: "./notion" }] },
+    "notion/.claude-plugin/plugin.json": manifest,
+    "notion/skills/read/SKILL.md": skill("read"),
+  });
+  const report = await createReport({ marketplace, tickloop: fakeTickloop(), workDirectory: join(scratch, "identity-work"), target: "aarch64-apple-darwin" });
+  assert.equal(report.plugins[0].status, STATUS.installable);
+  assert.equal(report.plugins[0].name, "notion");
+  assert.equal(report.plugins[0].displayName, "Notion");
+  assert.deepEqual(report.plugins[0].skills, ["skills/read"]);
+  assert.equal(report.totals.installableWithSkillsOrTick, 1);
+  assert.deepEqual(JSON.parse(readFileSync(join(marketplace, "notion/.claude-plugin/plugin.json"))), manifest);
 });

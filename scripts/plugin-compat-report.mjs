@@ -81,11 +81,13 @@ export function describeSource(entry, format, pluginRoot) {
 
 /** What `tickloop plugin validate` printed for a plugin it could read. */
 export function parseValidateOutput(stdout) {
-  const result = { name: null, version: null, format: null, skills: [], tick: null, unsupported: [], warnings: [] };
+  const result = { name: null, displayName: null, version: null, format: null, skills: [], tick: null, unsupported: [], warnings: [] };
   for (const line of stdout.split("\n")) {
     let match;
     if ((match = /^Plugin (\S+)(?: (\S+))?, read from (.+)\.$/.exec(line))) {
       [, result.name, result.version = null, result.format] = match;
+    } else if ((match = /^Its manifest calls it (.+)\.$/.exec(line))) {
+      result.displayName = match[1];
     } else if ((match = /^Skills: (.+)$/.exec(line))) {
       result.skills = match[1] === "none" ? [] : match[1].split(", ");
     } else if ((match = /^Tick program: (.+) \((.+)\)$/.exec(line))) {
@@ -315,9 +317,9 @@ async function stageForValidation(plugin, fetched, destination) {
   return true;
 }
 
-async function validate(tickloop, directory) {
+async function validate(tickloop, directory, name) {
   try {
-    const { stdout } = await run(tickloop, ["plugin", "validate", directory], { timeout: VALIDATE_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES });
+    const { stdout } = await run(tickloop, ["plugin", "validate", directory, "--name", name], { timeout: VALIDATE_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES });
     return { ok: true, ...parseValidateOutput(stdout) };
   } catch (error) {
     if (error.code === "ENOENT") throw new Error(`cannot run ${tickloop}; build it with cargo build -p tickloop-code`);
@@ -329,6 +331,7 @@ async function validate(tickloop, directory) {
 async function examinePlugin(plugin, context) {
   const result = {
     name: plugin.name,
+    displayName: null,
     sourceType: plugin.source.type,
     source: plugin.entry.source ?? null,
     status: null,
@@ -363,7 +366,7 @@ async function examinePlugin(plugin, context) {
     result.errors.push(error.message);
     return result;
   }
-  const validated = await validate(context.tickloop, destination);
+  const validated = await validate(context.tickloop, destination, plugin.name);
   if (!validated.ok) {
     result.status = STATUS.invalid;
     result.manifestFormat = wroteEntryManifest ? ENTRY_MANIFEST_FORMAT : null;
@@ -372,13 +375,14 @@ async function examinePlugin(plugin, context) {
   }
   result.status = STATUS.installable;
   result.manifestFormat = wroteEntryManifest ? ENTRY_MANIFEST_FORMAT : validated.format;
+  result.displayName = validated.displayName;
   result.version = validated.version;
   result.skills = validated.skills;
   result.tick = validated.tick;
   result.supportedComponents = [...(validated.tick ? ["tick"] : []), ...(validated.skills.length ? ["skills"] : [])];
   result.unsupportedComponents = validated.unsupported;
   result.warnings = validated.warnings;
-  if (validated.name !== plugin.name) result.warnings.push(`the manifest names it ${validated.name}, the marketplace ${plugin.name}`);
+  if (validated.displayName) result.warnings.push(`the manifest names it ${validated.displayName}, the marketplace ${plugin.name}`);
   return result;
 }
 

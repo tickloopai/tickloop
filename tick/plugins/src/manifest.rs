@@ -151,7 +151,9 @@ impl PluginManifest {
         Self::load_with_identity(root, default_name, entry, None)
     }
 
-    pub(crate) fn load_from_marketplace(
+    /// Reads a marketplace plugin using its entry name as identity, retaining the declared
+    /// manifest name as display metadata. The source files are never changed.
+    pub fn load_from_marketplace(
         root: &Path,
         name: &str,
         entry: Option<&Map<String, Value>>,
