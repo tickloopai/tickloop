@@ -696,3 +696,117 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     assert!(!visible.contains("worker-secret-refresh"));
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn agent_access_reports_servers_takes_up_disabling_and_reconnects_one() {
+    use tickloop_code_access::{
+        AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandResult,
+        ObservationRequest, ObservationValue,
+    };
+    use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let model = tickloop_harness::test_support::config();
+    let (agent, _local, _remote) = configured_agent(
+        &root,
+        model,
+        ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
+    )
+    .await;
+    let access = tickloop_code_daemon::EmbeddedAgentAccess::new(agent.clone());
+    let mut launch = LaunchSpec::embedded(root.clone());
+    launch.session_persistence = false;
+    let created = access
+        .execute(CommandEnvelope {
+            daemon_epoch: access.daemon_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch,
+                initial: None,
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let Some(CommandResult::Created { execution, .. }) = created.result else {
+        panic!("Create returns the execution: {created:?}");
+    };
+    let statuses = || async {
+        match access
+            .observe(ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::McpServers,
+                after: None,
+            })
+            .await
+            .unwrap()
+            .initial
+        {
+            ObservationValue::McpServers(statuses) => statuses,
+            other => panic!("an McpServers query answers with servers: {other:?}"),
+        }
+    };
+    let state = |statuses: &[McpServerStatus], name: &str| {
+        statuses
+            .iter()
+            .find(|status| status.name == name)
+            .map(|status| status.state.clone())
+    };
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("settings.json")).unwrap()).unwrap();
+    settings["projects"][root.to_string_lossy().as_ref()]["disabledMcpServers"] = json!(["remote"]);
+    std::fs::write(
+        root.join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let listed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let listed = statuses().await;
+            if state(&listed, "local") == Some(McpServerState::Connected) {
+                break listed;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stdio server connects");
+    assert_eq!(state(&listed, "remote"), Some(McpServerState::Disabled));
+    let local = listed.iter().find(|status| status.name == "local").unwrap();
+    assert_eq!(
+        (local.transport.as_str(), local.tools[0].name.as_str()),
+        ("stdio", "mcp__local__probe")
+    );
+    let disabled = listed
+        .iter()
+        .find(|status| status.name == "remote")
+        .unwrap();
+    assert!(disabled.tools.is_empty());
+    let reconnect = |name: &str| AgentCommand::ReconnectMcpServer {
+        execution,
+        name: name.into(),
+    };
+    let receipt = access
+        .execute(CommandEnvelope {
+            daemon_epoch: access.daemon_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: reconnect("local"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(receipt.result, Some(CommandResult::Done)),
+        "{receipt:?}"
+    );
+    assert_ne!(state(&statuses().await, "local"), None);
+    let refused = access
+        .execute(CommandEnvelope {
+            daemon_epoch: access.daemon_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: reconnect("absent"),
+        })
+        .await
+        .unwrap();
+    assert!(refused.error.is_some(), "{refused:?}");
+    agent.shutdown().await;
+}

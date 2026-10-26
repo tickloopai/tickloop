@@ -6,6 +6,15 @@ use std::{
 };
 use tickloop_harness::protocol::mcp::{McpOAuthConfig, McpServerConfig, McpTransport};
 
+const PROJECTS_KEY: &str = "projects";
+const SERVERS_KEY: &str = "mcpServers";
+/// Servers turned off in one directory, user and plugin servers alike, by their resolved name.
+const DISABLED_SERVERS_KEY: &str = "disabledMcpServers";
+const PLUGIN_SERVER_PREFIX: &str = "plugin_";
+pub const ARTIFACTS_SERVER_NAME: &str = "tickloop-artifacts";
+/// Until servers choose how their tools reach the model, every tool is listed directly.
+const DIRECT_EXPOSURE: &str = "direct";
+
 /// An enabled plugin's raw entries and host-owned locations.
 pub struct PluginServers {
     pub name: String,
@@ -21,6 +30,19 @@ pub struct ResolvedServers {
 }
 
 impl crate::LoadedSettings {
+    /// Whether `layer` configures a server called `name`.
+    pub fn has_mcp_server(&self, layer: &McpLayer, name: &str) -> bool {
+        let servers = match layer {
+            McpLayer::Global => self.settings.get(SERVERS_KEY),
+            McpLayer::Directory(directory) => self
+                .settings
+                .get(PROJECTS_KEY)
+                .and_then(|projects| projects.get(crate::project_key(directory)))
+                .and_then(|project| project.get(SERVERS_KEY)),
+        };
+        servers.is_some_and(|servers| servers.get(name).is_some())
+    }
+
     pub fn mcp_servers(
         &self,
         directory: &Path,
@@ -44,6 +66,241 @@ impl crate::LoadedSettings {
     }
 }
 
+/// Where a user server is configured: for every directory, or for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpLayer {
+    Global,
+    Directory(PathBuf),
+}
+
+impl McpLayer {
+    /// The settings `servers` of this layer, created when missing.
+    fn servers<'a>(
+        &self,
+        settings: &'a mut serde_json::Map<String, Value>,
+    ) -> Result<&'a mut serde_json::Map<String, Value>, crate::InvalidEntry> {
+        match self {
+            Self::Global => crate::object_entry(settings, SERVERS_KEY, SERVERS_KEY.into()),
+            Self::Directory(directory) => {
+                let key = crate::project_key(directory);
+                let projects = crate::object_entry(settings, PROJECTS_KEY, PROJECTS_KEY.into())?;
+                let project =
+                    crate::object_entry(projects, &key, format!("{PROJECTS_KEY}[{key:?}]"))?;
+                crate::object_entry(
+                    project,
+                    SERVERS_KEY,
+                    format!("{PROJECTS_KEY}[{key:?}].{SERVERS_KEY}"),
+                )
+            }
+        }
+    }
+}
+
+impl crate::UserSettings {
+    /// Adds the server `name` to `layer`; false, changing nothing, when the layer has one already.
+    pub fn add_mcp_server(
+        &self,
+        layer: &McpLayer,
+        name: &str,
+        entry: Value,
+    ) -> Result<bool, crate::SettingsError> {
+        let mut added = false;
+        self.update(|settings| {
+            let servers = layer.servers(settings)?;
+            if !servers.contains_key(name) {
+                servers.insert(name.to_owned(), entry);
+                added = true;
+            }
+            Ok(())
+        })?;
+        Ok(added)
+    }
+
+    /// Removes the server `name` from `layer`; false when the layer has no such server.
+    pub fn remove_mcp_server(
+        &self,
+        layer: &McpLayer,
+        name: &str,
+    ) -> Result<bool, crate::SettingsError> {
+        let mut removed = false;
+        self.update(|settings| {
+            removed = layer.servers(settings)?.remove(name).is_some();
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Turns the server `name`, a user or plugin server, off or on again in `directory` only.
+    pub fn set_mcp_server_disabled(
+        &self,
+        directory: &Path,
+        name: &str,
+        disabled: bool,
+    ) -> Result<(), crate::SettingsError> {
+        self.update(|settings| {
+            let key = crate::project_key(directory);
+            let location = format!("{PROJECTS_KEY}[{key:?}].{DISABLED_SERVERS_KEY}");
+            let projects = crate::object_entry(settings, PROJECTS_KEY, PROJECTS_KEY.into())?;
+            let project = crate::object_entry(projects, &key, format!("{PROJECTS_KEY}[{key:?}]"))?;
+            let names = project
+                .entry(DISABLED_SERVERS_KEY)
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or(crate::InvalidEntry {
+                    key: location,
+                    expected: "an array".into(),
+                })?;
+            names.retain(|listed| listed.as_str() != Some(name));
+            if disabled {
+                names.push(Value::String(name.to_owned()));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Checks an entry the user is adding: its transport and, unless it names variables to expand
+/// later, its address.
+pub fn validate_entry(entry: &Value, directory: &Path) -> Result<(), String> {
+    if needs_expansion(entry) {
+        return Ok(());
+    }
+    parse_transport(entry, directory).map(|_| ())
+}
+
+fn needs_expansion(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("${"),
+        Value::Array(items) => items.iter().any(needs_expansion),
+        Value::Object(fields) => fields.values().any(needs_expansion),
+        _ => false,
+    }
+}
+
+/// The MCP servers of the enabled plugins in `store`, without preparing their data directories.
+pub fn enabled_plugin_servers(
+    store: &tick_plugins::PluginStore,
+) -> (Vec<PluginServers>, Vec<String>) {
+    let installed = match store.installed() {
+        Ok(installed) => installed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("Cannot load plugin MCP servers: {error}")],
+            );
+        }
+    };
+    let plugins = installed
+        .plugins
+        .into_iter()
+        .filter(|plugin| plugin.enabled && !plugin.manifest.mcp_servers.is_empty())
+        .map(|plugin| PluginServers {
+            user_config: crate::plugin_config::PluginUserConfig::load(
+                store.config_root(),
+                &plugin.manifest,
+            )
+            .unwrap_or_default(),
+            data_directory: store.data_directory(plugin.name()),
+            name: plugin.name().to_owned(),
+            root: plugin.root,
+            entries: plugin.manifest.mcp_servers,
+        })
+        .collect();
+    (plugins, Vec::new())
+}
+
+/// Every server an Agent working in `directory` would have, from the settings and enabled plugins
+/// in the config root `root`, with variables taken from `environment`.
+pub fn configured_servers(
+    root: &Path,
+    directory: &Path,
+    environment: &BTreeMap<String, String>,
+) -> ResolvedServers {
+    let (plugins, mut warnings) =
+        enabled_plugin_servers(&tick_plugins::PluginStore::in_config_root(root));
+    let mut resolved = crate::UserSettings::in_root(root)
+        .load()
+        .mcp_servers_with_plugins(directory, environment, &plugins);
+    warnings.append(&mut resolved.warnings);
+    resolved.warnings = warnings;
+    resolved
+}
+
+/// What the configuration alone says of each server, before any Agent connects to it: a server
+/// that can run is `Connecting`, as it is when an Agent starts.
+pub async fn configured_statuses(
+    root: &Path,
+    servers: &[McpServerConfig],
+) -> Vec<tickloop_harness::protocol::mcp::McpServerStatus> {
+    use tickloop_harness::{
+        connector::ConnectorCredentials,
+        protocol::mcp::{McpServerState, McpServerStatus},
+    };
+    let mut statuses = Vec::new();
+    for server in servers {
+        let (transport, state, oauth) = match &server.transport {
+            McpTransport::Stdio { .. } => ("stdio".to_owned(), McpServerState::Connecting, false),
+            McpTransport::Http { headers, .. } => (
+                "http".to_owned(),
+                McpServerState::Connecting,
+                !headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization")),
+            ),
+            McpTransport::Unsupported { kind } => {
+                (kind.clone(), McpServerState::Unsupported, false)
+            }
+            McpTransport::NeedsConfiguration => {
+                (String::new(), McpServerState::NeedsConfiguration, false)
+            }
+            McpTransport::Failed { .. } => (String::new(), McpServerState::Failed, false),
+        };
+        let logged_in = match (&server.transport, oauth) {
+            (McpTransport::Http { url, .. }, true) => {
+                match crate::mcp_credentials::FileCredentials::new(
+                    root,
+                    &server.source,
+                    &server.name,
+                ) {
+                    Ok(credentials) => {
+                        credentials
+                            .load()
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|saved| {
+                                saved.token.is_some()
+                                    && reqwest::Url::parse(url)
+                                        .is_ok_and(|url| saved.server_url == url.as_str())
+                            })
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+        statuses.push(McpServerStatus {
+            name: server.name.clone(),
+            source: server.source.clone(),
+            transport,
+            state: if server.disabled {
+                McpServerState::Disabled
+            } else {
+                state
+            },
+            exposure: DIRECT_EXPOSURE.into(),
+            tools: Vec::new(),
+            failure: match &server.transport {
+                McpTransport::Failed { reason } => Some(reason.clone()),
+                _ => None,
+            },
+            oauth,
+            logged_in,
+        });
+    }
+    statuses
+}
+
 pub fn resolve_servers(
     settings: &Value,
     directory: &Path,
@@ -63,9 +320,9 @@ pub fn resolve_servers_with_plugins(
         warnings: Vec::new(),
     };
     let mut entries = BTreeMap::new();
-    let project = &settings["projects"][directory.to_string_lossy().as_ref()];
+    let project = &settings[PROJECTS_KEY][directory.to_string_lossy().as_ref()];
     for (source, layer) in [("global", settings), ("directory", project)] {
-        match layer.get("mcpServers") {
+        match layer.get(SERVERS_KEY) {
             Some(Value::Object(servers)) => {
                 for (name, entry) in servers {
                     entries.insert(name, (source, entry));
@@ -79,16 +336,8 @@ pub fn resolve_servers_with_plugins(
     }
     let mut signatures = BTreeMap::new();
     for (name, (source, entry)) in entries {
-        let valid_name = !name.is_empty()
-            && !name.starts_with("plugin_")
-            && name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
-        if !valid_name {
-            resolved.warnings.push(
-                "invalid user MCP server name (letters, digits, _ and - only; plugin_ is reserved)"
-                    .into(),
-            );
+        if let Err(problem) = validate_user_server_name(name) {
+            resolved.warnings.push(problem);
             continue;
         }
         resolved.push(name.clone(), source.into(), entry, directory, environment);
@@ -111,7 +360,7 @@ pub fn resolve_servers_with_plugins(
         }
         environment.extend(plugin.user_config.variables());
         for (name, entry) in &plugin.entries {
-            let name = format!("plugin_{}_{name}", plugin.name);
+            let name = format!("{PLUGIN_SERVER_PREFIX}{}_{name}", plugin.name);
             resolved.push(
                 name.clone(),
                 format!("plugin:{}", plugin.name),
@@ -134,7 +383,43 @@ pub fn resolve_servers_with_plugins(
             }
         }
     }
+    let disabled = disabled_servers(settings, directory);
+    for server in &mut resolved.servers {
+        server.disabled = disabled.contains(&server.name);
+    }
     resolved
+}
+
+/// The names of user servers: letters, digits, `_` and `-`, without the prefix of plugin servers
+/// or the name of the Artifacts server, whose resources are read under that name.
+pub fn validate_user_server_name(name: &str) -> Result<(), String> {
+    if name == ARTIFACTS_SERVER_NAME {
+        return Err(format!(
+            "MCP server name {ARTIFACTS_SERVER_NAME} is reserved for Tickloop Artifacts"
+        ));
+    }
+    let valid = !name.is_empty()
+        && !name.starts_with(PLUGIN_SERVER_PREFIX)
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "invalid user MCP server name (letters, digits, _ and - only; plugin_ is reserved)"
+                .into(),
+        )
+    }
+}
+
+fn disabled_servers(settings: &Value, directory: &Path) -> Vec<String> {
+    settings[PROJECTS_KEY][directory.to_string_lossy().as_ref()][DISABLED_SERVERS_KEY]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect()
 }
 
 impl ResolvedServers {
@@ -205,6 +490,7 @@ impl ResolvedServers {
             source,
             transport,
             sensitive_values: Vec::new(),
+            disabled: false,
             oauth,
             timeout_ms: expanded_entry["timeout"]
                 .as_u64()

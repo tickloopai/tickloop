@@ -20,6 +20,7 @@ use tickloop_code_access::{
     PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits, ReceiptState,
     RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput, ViewRef,
 };
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
     Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content, Decision,
     Event, EventKind, ExecutionMode, HostedMember, HostedMemberState, HostedProgramExit,
@@ -632,6 +633,10 @@ fn agent_commands_keep_their_recorded_wire() {
                     ..request
                 },
             },
+            AgentCommand::ReconnectMcpServer {
+                execution: execution(),
+                name: "plugin_notes_search".into(),
+            },
         ],
     );
 }
@@ -704,6 +709,11 @@ fn observation_requests_keep_their_recorded_wire() {
                 detail: AgentDetailQuery::Events { after: 9 },
                 after: None,
             },
+            ObservationRequest::Agent {
+                execution: execution(),
+                detail: AgentDetailQuery::McpServers,
+                after: None,
+            },
             ObservationRequest::OtherTickhost,
             ObservationRequest::RuntimeVersion,
         ],
@@ -756,6 +766,33 @@ fn observation_values_keep_their_recorded_wire() {
                 warnings: vec![],
             },
             ObservationValue::RewindFiles(None),
+            ObservationValue::McpServers(vec![
+                McpServerStatus {
+                    name: "plugin_notes_search".into(),
+                    source: "plugin:notes".into(),
+                    transport: "http".into(),
+                    state: McpServerState::NeedsLogin,
+                    exposure: "direct".into(),
+                    tools: vec![],
+                    failure: None,
+                    oauth: true,
+                    logged_in: false,
+                },
+                McpServerStatus {
+                    name: "local".into(),
+                    source: "global".into(),
+                    transport: "stdio".into(),
+                    state: McpServerState::Failed,
+                    exposure: "direct".into(),
+                    tools: vec![McpToolSummary {
+                        name: "mcp__local__probe".into(),
+                        description: "Report readiness".into(),
+                    }],
+                    failure: Some("MCP connection closed".into()),
+                    oauth: false,
+                    logged_in: false,
+                },
+            ]),
             ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
                 paused: false,
                 id: id(0x31),

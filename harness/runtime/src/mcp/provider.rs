@@ -89,15 +89,29 @@ impl HostToolProvider for McpToolProvider {
         *self.warnings.write().unwrap() = configuration.warnings;
         Ok(())
     }
+    async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
+        // A refused refresh leaves the servers as the last one found them.
+        let _ = self.refresh(cancel).await;
+        self.connections.statuses()
+    }
+    async fn reconnect_mcp_server(&self, name: &str) -> bool {
+        let configuration = (self.configuration)();
+        let reconnected = self
+            .connections
+            .reconnect(configuration.servers, name)
+            .await;
+        *self.warnings.write().unwrap() = configuration.warnings;
+        reconnected
+    }
     fn service_connections(&self) -> Value {
         serde_json::json!({"mcp": {"warnings": *self.warnings.read().unwrap()}})
     }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
-        self.connections.snapshot().into_iter().filter_map(|snapshot| {
+        self.connections.snapshot().into_iter().filter(|snapshot| snapshot.state != McpServerState::Disabled).filter_map(|snapshot| {
             let entries = self.connections.inner.entries.read().unwrap();
             let entry = entries.get(&snapshot.name)?;
             let login_hint = if snapshot.state == McpServerState::NeedsLogin {
-                " Ask the user to run tickloop mcp login <server>. Only the user can log in."
+                " Ask the user to log in from /mcp or with tickloop mcp login <server>. Only the user can log in."
             } else { "" };
             Some(McpServerInstructions {
                 server: McpResourceServer { name: snapshot.name.clone(), authority: Self::authority(entry), third_party: true },

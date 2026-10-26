@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 fn http_server(name: &str, server: &McpService) -> McpServerConfig {
     McpServerConfig {
         sensitive_values: Vec::new(),
+        disabled: false,
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Http {

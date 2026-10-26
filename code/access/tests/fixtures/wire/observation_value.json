@@ -598,6 +598,36 @@
     "RewindFiles": null
   },
   {
+    "McpServers": [
+      {
+        "name": "plugin_notes_search",
+        "source": "plugin:notes",
+        "transport": "http",
+        "state": "needs_login",
+        "exposure": "direct",
+        "tools": [],
+        "oauth": true,
+        "logged_in": false
+      },
+      {
+        "name": "local",
+        "source": "global",
+        "transport": "stdio",
+        "state": "failed",
+        "exposure": "direct",
+        "tools": [
+          {
+            "name": "mcp__local__probe",
+            "description": "Report readiness"
+          }
+        ],
+        "failure": "MCP connection closed",
+        "oauth": false,
+        "logged_in": false
+      }
+    ]
+  },
+  {
     "Subscriptions": [
       {
         "id": "00000000-0000-0000-0000-000000000031",

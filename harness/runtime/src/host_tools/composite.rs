@@ -135,6 +135,28 @@ impl HostToolProvider for CompositeHostTools {
             .flat_map(|s| s.mcp_instructions())
             .collect()
     }
+    async fn mcp_server_statuses(
+        &self,
+        cancel: CancellationToken,
+    ) -> Vec<tickloop_harness_protocol::mcp::McpServerStatus> {
+        futures_util::future::join_all(
+            self.sources
+                .iter()
+                .map(|s| s.mcp_server_statuses(cancel.clone())),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+    async fn reconnect_mcp_server(&self, name: &str) -> bool {
+        for source in &self.sources {
+            if source.reconnect_mcp_server(name).await {
+                return true;
+            }
+        }
+        false
+    }
     async fn list_mcp_resources_for(
         &self,
         server: &str,

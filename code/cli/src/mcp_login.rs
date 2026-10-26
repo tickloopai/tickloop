@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 use tickloop_code_console::terminal::safe_line;
-use tickloop_code_settings::{UserSettings, mcp::PluginServers, mcp_credentials::FileCredentials};
+use tickloop_code_settings::mcp_credentials::FileCredentials;
 use tickloop_harness::{
     connector::{Connector, Logout, OAuthSettings},
     protocol::mcp::{McpServerConfig, McpTransport},
@@ -84,30 +84,10 @@ fn resolve(root: &Path, name: &str) -> Result<McpServerConfig, String> {
     } else {
         name.to_owned()
     };
-    let store = tick_plugins::PluginStore::in_config_root(root);
-    let plugins = store
-        .installed()
-        .map_err(|error| error.to_string())?
-        .plugins
-        .into_iter()
-        .filter(|plugin| plugin.enabled)
-        .map(|plugin| PluginServers {
-            user_config: tickloop_code_settings::plugin_config::PluginUserConfig::load(
-                root,
-                &plugin.manifest,
-            )
-            .unwrap_or_default(),
-            data_directory: store.data_directory(plugin.name()),
-            name: plugin.name().to_owned(),
-            root: plugin.root,
-            entries: plugin.manifest.mcp_servers,
-        })
-        .collect::<Vec<_>>();
-    let settings = UserSettings::in_root(root).load();
-    let resolved = settings.mcp_servers_with_plugins(
-        &std::env::current_dir().map_err(|error| error.to_string())?,
+    let resolved = tickloop_code_settings::mcp::configured_servers(
+        root,
+        &super::mcp_command::working_directory()?,
         &std::env::vars().collect(),
-        &plugins,
     );
     resolved
         .servers

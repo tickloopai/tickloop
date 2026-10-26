@@ -484,6 +484,20 @@ pub trait HostToolProvider: Send + Sync {
         Vec::new()
     }
 
+    /// The configured MCP servers of this provider, after taking up the current configuration.
+    async fn mcp_server_statuses(
+        &self,
+        _cancel: CancellationToken,
+    ) -> Vec<tickloop_harness_protocol::mcp::McpServerStatus> {
+        Vec::new()
+    }
+
+    /// Connects the MCP server `name` again at the user's request; false when this provider has
+    /// no server of that name.
+    async fn reconnect_mcp_server(&self, _name: &str) -> bool {
+        false
+    }
+
     async fn list_mcp_resources(
         &self,
         _cursor: Option<&str>,
