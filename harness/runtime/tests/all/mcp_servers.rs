@@ -1393,3 +1393,55 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
         "a closed connection retained its host credential adapter"
     );
 }
+
+#[tokio::test]
+async fn http_private_configuration_preserves_protocol_flags_and_original_schema_validation() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271,"default":839271},"flag":{"type":"boolean","default":false}}}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+            sensitive_values: vec![json!(true), json!(false), json!(839271)],
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    let shown = &connections.snapshot()[0].tools[0].input_schema;
+    assert!(shown["properties"]["pin"].get("minimum").is_none());
+    assert!(shown["properties"]["flag"].get("default").is_none());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":0}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::NotDispatched(_)
+    ));
+    assert!(server.calls().is_empty());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":839272}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(server.calls().len(), 1);
+    connections.shutdown().await;
+}

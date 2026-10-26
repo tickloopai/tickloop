@@ -106,7 +106,7 @@ fn plugin_mcp_login_accepts_aliases_and_a_browser_callback_with_configured_oauth
         .port();
     let source = fixture.root.join("source");
     fs::create_dir_all(source.join(".claude-plugin")).unwrap();
-    fs::write(source.join(".claude-plugin/plugin.json"), json!({"name":"notes","mcpServers":{"remote":{"url":server.resource(),"oauth":{"clientId":"configured-client","callbackPort":port},"authServerMetadataUrl":format!("{}{METADATA_PATH}",server.issuer())}}}).to_string()).unwrap();
+    fs::write(source.join(".claude-plugin/plugin.json"), json!({"name":"notes", "userConfig":{"address":{"type":"string","default":server.resource()},"client":{"type":"string","default":"configured-${LITERAL}"},"callback_port":{"type":"number","default":port},"metadata":{"type":"string","default":format!("{}{METADATA_PATH}",server.issuer())}},"mcpServers":{"remote":{"url":"${user_config.address}","oauth":{"clientId":"${user_config.client}","callbackPort":"${user_config.callback_port}"},"authServerMetadataUrl":"${user_config.metadata}"}}}).to_string()).unwrap();
     succeeded(&fixture.tickloop(&["plugin", "install", "--path", source.to_str().unwrap()]));
     let hint = fixture.tickloop(&["plugin", "login", "notes"]);
     assert!(String::from_utf8_lossy(&hint.stderr).contains("tickloop mcp login"));
@@ -131,7 +131,7 @@ fn plugin_mcp_login_accepts_aliases_and_a_browser_callback_with_configured_oauth
         .root
         .join("config/credentials/notes/mcp/remote.json");
     let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(saved["registration"]["client_id"], "configured-client");
+    assert_eq!(saved["registration"]["client_id"], "configured-${LITERAL}");
     assert_eq!(
         saved["registration"]["redirect_uri"],
         format!("http://localhost:{port}/callback")

@@ -447,10 +447,16 @@ pub(crate) fn missing_user_config(value: &Value, variables: &BTreeMap<String, St
 }
 
 fn parse_oauth(entry: &Value) -> Result<McpOAuthConfig, String> {
-    let value = entry
+    let mut value = entry
         .get("oauth")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(port) = value.get("callbackPort").and_then(Value::as_str) {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| "invalid MCP OAuth callback port")?;
+        value["callbackPort"] = Value::from(port);
+    }
     let mut oauth: McpOAuthConfig =
         serde_json::from_value(value).map_err(|_| "invalid MCP OAuth settings")?;
     if let Some(metadata) = entry.get("authServerMetadataUrl") {

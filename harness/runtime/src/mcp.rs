@@ -117,11 +117,31 @@ struct Entry {
     connector: Option<Connector>,
     environment_secrets: Vec<String>,
     credential_secrets: RwLock<Vec<String>>,
+    tool_schemas: RwLock<BTreeMap<String, Value>>,
     state: RwLock<McpServerState>,
     connection: RwLock<Option<Arc<Connection>>>,
     cancel: CancellationToken,
 }
 impl Entry {
+    fn restore_tool_schemas(
+        &self,
+        tools: &mut BTreeMap<String, catalog::Tool>,
+        warnings: &mut Vec<String>,
+    ) {
+        let mut originals = self.tool_schemas.write().unwrap();
+        tools.retain(|name, tool| {
+            if let Some(schema) = originals.get(&tool.original) {
+                if jsonschema::validator_for(schema).is_err() {
+                    warnings.push(format!("{name}: invalid input schema; tool omitted"));
+                    return false;
+                }
+                tool.schema = schema.clone();
+            }
+            true
+        });
+        originals.retain(|name, _| tools.values().any(|tool| tool.original == *name));
+    }
+
     fn remember_credential(&self, credential: Option<ConnectorCredential>) {
         if let Some(token) = credential
             .as_ref()
@@ -293,6 +313,7 @@ impl McpConnections {
                     token: RwLock::new(None),
                     credential: RwLock::new(None),
                     credential_secrets: RwLock::new(Vec::new()),
+                    tool_schemas: RwLock::new(BTreeMap::new()),
                     credentials,
                     connector,
                     environment_secrets,
@@ -394,7 +415,8 @@ impl McpConnections {
                                     state_changed.notify_waiters();
                                 }
                                 if let Ok(Ok(tools)) = tools {
-                                    let (tools, warnings) = catalog::directory(&entry.config.name, tools);
+                                    let (mut tools, mut warnings) = catalog::directory(&entry.config.name, tools);
+                                    entry.restore_tool_schemas(&mut tools, &mut warnings);
                                     *connection.tools.write().unwrap() = tools;
                                     *connection.warnings.write().unwrap() = warnings;
                                     connection.catalog_revision.store(revision, Ordering::SeqCst);
@@ -872,9 +894,9 @@ async fn open(
                 Duration::from_millis(config.timeout_ms),
             )?;
             let redact_entry = Arc::downgrade(entry);
-            let http = http.with_redactor(Arc::new(move |value| {
+            let http = http.with_redactor(Arc::new(move |value, part| {
                 if let Some(entry) = redact_entry.upgrade() {
-                    redact_value(&entry, value);
+                    redact_wire_value(&entry, value, part);
                 } else {
                     *value = Value::Null;
                 }
@@ -991,7 +1013,8 @@ async fn open(
         }
         None => None,
     };
-    let (tools, warnings) = catalog::directory(&config.name, tools);
+    let (mut tools, mut warnings) = catalog::directory(&config.name, tools);
+    entry.restore_tool_schemas(&mut tools, &mut warnings);
     let instructions = service
         .peer()
         .peer_info()
@@ -1029,6 +1052,45 @@ fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {
     }
     resources
 }
+fn redact_wire_value(entry: &Entry, value: &mut Value, part: crate::mcp_http::ResponsePart) {
+    if matches!(part, crate::mcp_http::ResponsePart::ToolDirectory)
+        && let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut)
+    {
+        let mut originals = entry.tool_schemas.write().unwrap();
+        for tool in tools {
+            if let (Some(name), Some(schema)) = (
+                tool.get("name").and_then(Value::as_str),
+                tool.get("inputSchema"),
+            ) {
+                originals.insert(name.to_owned(), schema.clone());
+            }
+            redact_schema(entry, tool);
+        }
+    }
+    let capabilities = value
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .and_then(|_| value.get("capabilities"))
+        .and_then(|value| {
+            serde_json::from_value::<rmcp::model::ServerCapabilities>(value.clone()).ok()
+        })
+        .and_then(|value| serde_json::to_value(value).ok())
+        .map(|mut capabilities| {
+            for field in ["experimental", "extensions", "logging", "completions"] {
+                if let Some(value) = capabilities.get_mut(field) {
+                    redact_value(entry, value);
+                }
+            }
+            capabilities
+        });
+    redact_value(entry, value);
+    if let Some(capabilities) = capabilities
+        && let Some(fields) = value.as_object_mut()
+    {
+        fields.insert("capabilities".into(), capabilities);
+    }
+}
+
 fn redact_schema(entry: &Entry, schema: &mut Value) {
     fn remove_sensitive_constraints(entry: &Entry, value: &mut Value) {
         match value {

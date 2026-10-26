@@ -134,7 +134,12 @@ fn is_invisible_format(character: char) -> bool {
     )
 }
 
-type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value) + Send + Sync>;
+#[derive(Clone, Copy)]
+pub(crate) enum ResponsePart {
+    Data,
+    ToolDirectory,
+}
+type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePart) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
@@ -359,6 +364,7 @@ fn sse_stream(
     response: reqwest::Response,
     max_event_bytes: usize,
     redactor: Option<ResponseRedactor>,
+    directory_request: Option<rmcp::model::RequestId>,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let mut event_bytes = 0_usize;
     let mut line_bytes = 0_usize;
@@ -385,13 +391,19 @@ fn sse_stream(
             event.and_then(|mut event| {
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
-                        event.data = Some(redact_message(&data, redact).map_err(|_| {
-                            SseError::Body(Box::new(io::Error::other("invalid MCP event response")))
-                        })?);
+                        event.data = Some(
+                            redact_message(&data, redact, directory_request.as_ref()).map_err(
+                                |_| {
+                                    SseError::Body(Box::new(io::Error::other(
+                                        "invalid MCP event response",
+                                    )))
+                                },
+                            )?,
+                        );
                     }
                     for value in [&mut event.id, &mut event.event].into_iter().flatten() {
                         let mut text = serde_json::Value::String(std::mem::take(value));
-                        redact(&mut text);
+                        redact(&mut text, ResponsePart::Data);
                         *value = text.as_str().unwrap_or_default().to_owned();
                     }
                 }
@@ -401,10 +413,17 @@ fn sse_stream(
         .boxed()
 }
 
-fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde_json::Error> {
+fn redact_message(
+    text: &str,
+    redact: &ResponseRedactor,
+    directory_request: Option<&rmcp::model::RequestId>,
+) -> Result<String, serde_json::Error> {
     let mut message: serde_json::Value = serde_json::from_str(text)?;
+    let directory_response = message.get("method").is_none()
+        && directory_request
+            .is_some_and(|id| serde_json::to_value(id).ok().as_ref() == message.get("id"));
     if let Some(id) = message.get_mut("id").filter(|id| id.is_string()) {
-        redact(id);
+        redact(id, ResponsePart::Data);
     }
     for field in ["params", "result", "error"] {
         if let Some(payload) = message.get_mut(field) {
@@ -418,7 +437,7 @@ fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde
                         return true;
                     };
                     let mut display = name.clone();
-                    redact(&mut display);
+                    redact(&mut display, ResponsePart::Data);
                     display == *name
                 });
             }
@@ -427,7 +446,12 @@ fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde
                 .then(|| payload.get("protocolVersion").cloned())
                 .flatten()
                 .filter(|version| matches!(version.as_str(), Some("2026-07-28" | "2025-11-25")));
-            redact(payload);
+            let part = if field == "result" && directory_response {
+                ResponsePart::ToolDirectory
+            } else {
+                ResponsePart::Data
+            };
+            redact(payload, part);
             if let Some(version) = protocol_version
                 && let Some(fields) = payload.as_object_mut()
             {
@@ -449,7 +473,7 @@ fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde
         _ => false,
     };
     if custom_method && let Some(method) = message.get_mut("method") {
-        redact(method);
+        redact(method, ResponsePart::Data);
     }
     serde_json::to_string(&message)
 }
@@ -485,6 +509,14 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let directory_request = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
         let preserve_custom_result = matches!(
             &message,
             ClientJsonRpcMessage::Request(request)
@@ -509,7 +541,7 @@ impl StreamableHttpClient for McpHttpClient {
             .map(str::to_owned);
         if let (Some(id), Some(redact)) = (&session_id, &self.redactor) {
             let mut redacted = serde_json::Value::String(id.clone());
-            redact(&mut redacted);
+            redact(&mut redacted, ResponsePart::Data);
             if redacted.as_str() != Some(id.as_str()) {
                 return Err(unexpected("MCP session identifier contains a credential"));
             }
@@ -521,7 +553,12 @@ impl StreamableHttpClient for McpHttpClient {
             .unwrap_or("");
         if content_type.starts_with("text/event-stream") {
             return Ok(StreamableHttpPostResponse::Sse(
-                sse_stream(response, max_sse_event_size, self.redactor.clone()),
+                sse_stream(
+                    response,
+                    max_sse_event_size,
+                    self.redactor.clone(),
+                    directory_request,
+                ),
                 session_id,
             ));
         }
@@ -532,7 +569,7 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(redact) = &self.redactor {
             let text =
                 String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
-            body = redact_message(&text, redact)
+            body = redact_message(&text, redact, directory_request.as_ref())
                 .map_err(|_| unexpected("invalid MCP JSON response"))?
                 .into_bytes();
         }
@@ -608,6 +645,7 @@ impl StreamableHttpClient for McpHttpClient {
             response,
             max_sse_event_size,
             self.redactor.clone(),
+            None,
         ))
     }
 
