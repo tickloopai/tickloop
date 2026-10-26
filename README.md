@@ -55,7 +55,8 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 | `/rewind`, `/diff` | Undo back to an earlier message; review file changes |
 | `/resume`, `/clear` | Reopen a past conversation; start a new one |
 | `/permissions`, `/settings` | Choose how much the agent may do on its own; other preferences |
-| `/plugins`, `/artifacts` | Manage plugins; sign in to Artifacts |
+| `/ticks`, `/plugins` | Install and log in to Ticks; manage other plugins |
+| `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
 Keys:
@@ -68,26 +69,52 @@ Keys:
 - In the Monitor, `enter` opens a Tick and `esc` hides it again; the program keeps running.
 - To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
-## Plugins and data sources
+## Ticks
 
-Plugins add Skills and Tick programs. Open `/plugins` to browse installed and available plugins, or use the command line:
+A Tick is a live program the agent can open, watch and act on, such as a market data feed or a document reader. Ticks are installed like plugins and share their marketplaces and storage, but you manage them on their own: open `/ticks` to find, install and log in to them, or use the command line:
+
+```sh
+tickloop tick list --available
+tickloop tick install NAME                # or NAME@MARKETPLACE
+tickloop tick list
+tickloop tick login NAME                  # when the data source requires login
+tickloop tick logout NAME
+tickloop tick update NAME                 # omit NAME to update all Ticks
+tickloop tick disable NAME
+tickloop tick enable NAME
+tickloop tick uninstall NAME              # deletes its data; keeps saved login
+tickloop tick uninstall NAME --keep-data  # keeps its data too
+tickloop tick install --path ./my-tick    # a local Tick directory or .tar.gz archive
+```
+
+Official Ticks come from the built-in `tickloop` marketplace; their sources live in [tickloopai/ticks](https://github.com/tickloopai/ticks). A plugin that carries a Tick program is a Tick, even when it also brings Skills: it appears only in `/ticks` and `tickloop tick`, never in `/plugins`. `tickloop plugin` refuses it and names the `tickloop tick` command to use instead, and the other way round.
+
+In `/ticks`, `Tab` or left/right switches between **Installed** and **Available**. Use `j`/`k` or `Ctrl+N`/`Ctrl+P` to select. On Installed, `Enter` opens a Tick's actions: log in or out, update, enable or disable. Installed rows show the marketplace, enabled state, version and login state. Login happens in the panel: an OAuth Tick shows a link and code to approve in a browser on any device, and a key is typed masked. On Available, `Enter` installs or updates the selected Tick, and `/` starts a case-insensitive filter across names, descriptions and marketplaces: `j`/`k` enter text, `Ctrl+N`/`Ctrl+P` select, and `Ctrl+G` opens an editor. `Esc` leaves filtering and keeps the query; another `Esc` closes the panel.
+
+To uninstall in the panel, press `x` twice on the same Installed row within three seconds. This deletes the Tick's data, keeps saved login, and leaves running Ticks running. Moving selection, another key, leaving the panel or waiting cancels confirmation. Saved logins remain under `credentials/NAME/` in your configuration directory; log out before uninstalling to remove one.
+
+Once a Tick is installed (and logged in, if it needs a login), ask the agent to open it by name, for example "open the NAME Tick and watch it". Installation runs nothing: a Tick's program runs as you only when opened under your permission settings. A disabled Tick cannot be opened by name. Installing, updating, removing and logging in are your actions; the agent only asks you to do them.
+
+Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py).
+
+## Plugins
+
+Plugins add Skills to the agent. Open `/plugins` to browse the installed and available plugins without a Tick program, or use the command line:
 
 ```sh
 tickloop plugin list --available
 tickloop plugin install NAME@MARKETPLACE
 tickloop plugin list
-tickloop plugin login NAME                  # when the plugin requires login
-tickloop plugin logout NAME
 tickloop plugin update NAME                 # omit NAME to update all marketplace plugins
 tickloop plugin disable NAME
 tickloop plugin enable NAME
-tickloop plugin uninstall NAME              # deletes plugin data; keeps saved login
+tickloop plugin uninstall NAME              # deletes plugin data
 tickloop plugin uninstall NAME --keep-data  # keeps plugin data too
 ```
 
-The built-in marketplaces are `tickloop` and `claude-plugins-official`. They cannot be removed; the Git marketplace downloads on first use. Official Tick packages live in [tickloopai/ticks](https://github.com/tickloopai/ticks). Install with just `NAME` when its source is unambiguous; if several marketplaces offer it, the command lists candidates (or uses the source of an existing installation). To switch an installed name to another marketplace, uninstall it first.
+The built-in marketplaces are `tickloop` and `claude-plugins-official`. They cannot be removed; the Git marketplace downloads on first use. Install with just `NAME` when its source is unambiguous; if several marketplaces offer it, the command lists candidates (or uses the source of an existing installation). To switch an installed name to another marketplace, uninstall it first. A plugin from a Git marketplace whose Tick program shows only once installed is installed by `tickloop plugin`, then reported and managed as a Tick.
 
-Register other sources from the command line:
+Register other sources from the command line; `/ticks` and `/plugins` both read them:
 
 ```sh
 tickloop plugin marketplace add OWNER/REPO
@@ -105,19 +132,15 @@ tickloop plugin validate ./my-plugin
 tickloop plugin install --path ./my-plugin
 ```
 
-Local-path installations are updated only by running `install --path` again, even at the same version; `update` and the panel do not update them. `validate` reports the manifest, components and path warnings; installation additionally checks the file tree. A failed installation leaves the previous installation intact. If a plugin is marked unusable, reinstall it from its original source.
+Local-path installations are updated only by running `install --path` again, even at the same version; `update` and the panels do not update them. `validate` reports the manifest, components and path warnings; installation additionally checks the file tree. A failed installation leaves the previous installation intact. If a plugin is marked unusable, reinstall it from its original source; an unusable plugin whose kind cannot be read is listed in both `/ticks` and `/plugins`.
 
-In `/plugins`, `Tab` or left/right switches between **Installed** and **Available**. Use `j`/`k` or `Ctrl+N`/`Ctrl+P` to select and `Enter` to install or open actions. Installed rows show source, version, enabled state, login and unsupported components; actions include enable/disable, update and login/logout. On Available, `/` starts a case-insensitive filter across names, descriptions and marketplaces: `j`/`k` enter text, `Ctrl+N`/`Ctrl+P` select, and `Ctrl+G` opens an editor. `Esc` leaves filtering and keeps the query; another `Esc` closes the panel. A failed marketplace has its own error row, summarized in at most three lines; other sources and Installed remain usable.
+`/plugins` works like `/ticks`: Installed and Available pages, `Enter` for actions (enable/disable, update) or to install, `/` to filter, and `x` twice to uninstall. Installed rows also show unsupported components. A failed marketplace has its own error row, summarized in at most three lines; other sources and Installed remain usable.
 
-To uninstall in the panel, press `x` twice on the same Installed row within three seconds. This deletes plugin data, keeps saved login, and leaves running Ticks running. Moving selection, another key, leaving the panel or waiting cancels confirmation. Use the CLI's `--keep-data` to preserve data. Saved logins remain under `credentials/NAME/` in your configuration directory; use `logout` before uninstalling if you want to remove the saved login.
+Type `/` to discover user-invocable Skills for the current folder, including built-in, user, project and enabled plugin and Tick Skills. The Skills group shows each name, description and source; use `Ctrl+N` / `Ctrl+P` to select, then `Enter` or `Tab` to complete. Completion refreshes when Skills or plugins change. Invoke `/plugin:skill [ARGUMENTS]`, or `/skill [ARGUMENTS]` when that short name is unique. Ambiguous short names list the full names to use; exact names win, and built-in commands always take precedence. Each invocation displays a `Skill · name · source` row, preserved when reopening history.
 
-Type `/` to discover user-invocable Skills for the current folder, including built-in, user, project and enabled plugin Skills. The Skills group shows each name, description and source; use `Ctrl+N` / `Ctrl+P` to select, then `Enter` or `Tab` to complete. Completion refreshes when Skills or plugins change. Invoke `/plugin:skill [ARGUMENTS]`, or `/skill [ARGUMENTS]` when that short name is unique. Ambiguous short names list the full names to use; exact names win, and built-in commands always take precedence. Each invocation displays a `Skill · name · source` row, preserved when reopening history.
+Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills; reinstalling or updating preserves the disabled state. Installation runs nothing and grants no permissions; plugin Skill tool calls still require the usual approval. Only Skills and Tick components work in this release; other components are listed as unsupported. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
 
-Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills and prevents opening its Tick by name; reinstalling or updating preserves the disabled state. Installation runs nothing and grants no permissions. Tick programs run as you only when opened under your permission settings; plugin Skill tool calls still require the usual approval. Only Skills and Tick components work in this release; other components are listed as unsupported. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
-
-Existing Tick packages migrate automatically on first use, keeping saved login. Broken packages are reported for reinstallation; the old directory is preserved. `tickloop tick …` and `/ticks` remain aliases in this release and show a rename hint.
-
-Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py).
+Existing Tick packages migrate automatically on first use, keeping saved login. Broken packages are reported for reinstallation; the old directory is preserved.
 
 ## Requirements
 
