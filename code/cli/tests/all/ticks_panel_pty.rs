@@ -36,6 +36,8 @@ struct Terminal {
     _master: Box<dyn portable_pty::MasterPty + Send>,
     fixture_home: std::path::PathBuf,
     config_root: std::path::PathBuf,
+    columns: u16,
+    rows: u16,
 }
 
 impl Terminal {
@@ -93,7 +95,22 @@ impl Terminal {
             _master: pty.master,
             fixture_home: root.join("home"),
             config_root: root.join("config"),
+            columns: COLUMNS,
+            rows: ROWS,
         }
+    }
+
+    fn resize(&mut self, columns: u16, rows: u16) {
+        self.columns = columns;
+        self.rows = rows;
+        self._master
+            .resize(PtySize {
+                rows,
+                cols: columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
     }
 
     fn send(&mut self, input: &[u8]) {
@@ -108,8 +125,8 @@ impl Terminal {
     fn frame(&self) -> String {
         screen::visible_screen_with_selection(
             &self.output.lock().unwrap(),
-            usize::from(COLUMNS),
-            usize::from(ROWS),
+            usize::from(self.columns),
+            usize::from(self.rows),
         )
     }
 
@@ -717,6 +734,38 @@ fn uninstall_requires_two_control_x_presses_on_the_same_plugin() {
         "beta",
         "1.0.0 · no login needed"
     ));
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+}
+
+#[test]
+fn a_short_terminal_cannot_confirm_a_hidden_plugin_uninstall() {
+    let fixture = Fixture::new();
+    install_path(&fixture, &fixture.package_named("alpha", "1.0.0"));
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "installed", |frame| {
+        row_shows(frame, "alpha", "1.0.0 · no login needed")
+    });
+    terminal.press(b"\x18", "uninstall armed", |frame| {
+        frame.contains("Press ctrl+x again to uninstall alpha")
+    });
+    let mark = terminal.mark();
+    terminal.resize(30, 6);
+    terminal.wait_for_frame(mark, "resize instead of hidden confirmation", |frame| {
+        frame.contains("Resize · esc back")
+    });
+    terminal.send(b"\x18");
+    terminal.press(ESCAPE, "closed small panel", |frame| {
+        !panel_is_open(frame) && !frame.contains("Resize")
+    });
+    let mark = terminal.mark();
+    terminal.resize(COLUMNS, ROWS);
+    terminal.wait_for_frame(mark, "full terminal", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "plugin preserved", |frame| {
+        row_shows(frame, "alpha", "1.0.0 · no login needed")
+    });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
 }

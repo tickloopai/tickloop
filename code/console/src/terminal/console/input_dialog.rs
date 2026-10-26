@@ -661,7 +661,7 @@ impl State {
         } else if let Some(picker) = &self.artifacts_picker {
             picker.minimum_frame_rows()
         } else if let Some(panel) = &self.ticks_panel {
-            panel.minimum_frame_rows()
+            panel.minimum_frame_rows(self.width)
         } else if self.conversation_picker.is_some() {
             4
         } else if let Some(surface) = &self.permissions_surface {
@@ -679,7 +679,7 @@ impl State {
                 if self.artifacts_picker.is_some() {
                     "Artifacts"
                 } else if self.ticks_panel.is_some() {
-                    "Tick packages"
+                    "Plugins"
                 } else if let Some(picker) = &self.conversation_picker {
                     picker.title()
                 } else if self.permissions_surface.is_some() {

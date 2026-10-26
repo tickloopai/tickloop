@@ -12,7 +12,8 @@ use tick_packages::{
     ApiKey, CURRENT_TARGET, LoginState, Marketplace, MarketplacePackage, OAuthIssuer, PackageAuth,
 };
 use tick_plugins::{
-    BrokenPlugin, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins, Uninstalled,
+    BrokenPlugin, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins, PluginManifest,
+    Uninstalled,
 };
 use tickloop_tick_installer::{
     InstalledVersion, LoggedOut, LoginError, Offer, login_label, offers,
@@ -240,16 +241,8 @@ impl TickPackageResult {
                 if manifest.tick.is_some() {
                     text.push_str("; Its Tick program runs as you when opened");
                 }
-                let unsupported = manifest.unsupported();
-                if !unsupported.is_empty() {
-                    text.push_str(&format!(
-                        "; Not supported yet: {}",
-                        unsupported
-                            .iter()
-                            .map(|component| component.label())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
+                if let Some(warning) = unsupported_summary(manifest) {
+                    text.push_str(&format!("; {warning}"));
                 }
                 Notice::success(text)
             }
@@ -504,6 +497,7 @@ impl TicksPanel {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
+        self.cancel_uninstall();
         if self.filtering
             && self.page == MARKETPLACE_PAGE
             && self.menus.is_empty()
@@ -1049,17 +1043,30 @@ impl TicksPanel {
         let glyph = display.glyph(Glyph::ProtocolTick);
         let selected = self.selected[self.page];
         let row = |index: usize, name: &str, details: String, glyph_role: Role| {
-            ListRow {
+            let separate_details = glyph.width() + name.width() + details.width() + 3 > width;
+            let mut lines = ListRow {
                 selected: index == selected && self.menus.is_empty(),
                 glyph,
                 glyph_role,
                 name,
-                details,
+                details: if separate_details {
+                    String::new()
+                } else {
+                    details.clone()
+                },
                 fill: None,
                 subscription: None,
                 bar_columns: None,
             }
-            .lines(width)
+            .lines(width);
+            if separate_details {
+                lines.extend(
+                    wrap_text(&details, width.saturating_sub(2).max(1))
+                        .into_iter()
+                        .map(|line| RoleLine::role(format!("  {line}"), Role::MutedText)),
+                );
+            }
+            lines
         };
         if self.page == INSTALLED_PAGE {
             return self
@@ -1096,19 +1103,8 @@ impl TicksPanel {
                     };
                     let mut lines = row(index, entry.name(), details, glyph_role);
                     if let InstalledEntry::Usable { package, .. } = entry {
-                        let unsupported = package.manifest.unsupported();
-                        if !unsupported.is_empty() {
-                            lines.push(RoleLine::role(
-                                format!(
-                                    "  Not supported yet: {}",
-                                    unsupported
-                                        .iter()
-                                        .map(|component| component.label())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ),
-                                Role::Warning,
-                            ));
+                        if let Some(warning) = unsupported_summary(&package.manifest) {
+                            lines.push(RoleLine::role(format!("  {warning}"), Role::Warning));
                         }
                     }
                     (index, lines)
@@ -1197,8 +1193,16 @@ impl TicksPanel {
     }
 
     /// The header, one row of the list or menu, and the key hints.
-    pub(super) fn minimum_frame_rows(&self) -> usize {
-        CHROME_ROWS + 1
+    pub(super) fn minimum_frame_rows(&self, width: usize) -> usize {
+        let selected_rows = if self.menus.is_empty() && self.login.is_none() {
+            self.list_rows(width, DisplayProfile::default())
+                .into_iter()
+                .find(|(index, _)| *index == self.selected[self.page])
+                .map_or(1, |(_, lines)| lines.len())
+        } else {
+            1
+        };
+        CHROME_ROWS + selected_rows + self.status_lines(width).len()
     }
 
     pub(super) fn content_rows(&self, width: usize) -> usize {
@@ -1401,6 +1405,20 @@ impl TicksPanel {
     }
 }
 
+fn unsupported_summary(manifest: &PluginManifest) -> Option<String> {
+    let unsupported = manifest.unsupported();
+    (!unsupported.is_empty()).then(|| {
+        format!(
+            "Not supported yet: {}",
+            unsupported
+                .iter()
+                .map(|component| component.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Whether `offered` is a later version than `installed`, both read as dot-separated numbers; a
 /// version that is not one is never later, so replacing it is not called an update.
 fn is_later(offered: &str, installed: &str) -> bool {
@@ -1526,7 +1544,7 @@ fn step(selected: usize, count: usize, down: bool) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use tick_plugins::{Component, ManifestFormat, PluginManifest, PluginSource, TickProgram};
+    use tick_plugins::{Component, ManifestFormat, PluginSource, TickProgram};
 
     use super::*;
 
