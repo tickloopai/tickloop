@@ -398,6 +398,14 @@ fn a_plugin_whose_files_are_gone_is_listed_as_broken() {
     );
     let error = fixture.store.get("review").unwrap_err();
     assert!(matches!(error, PluginError::Unusable { .. }), "{error}");
+    let registry = fixture.registry();
+    let error = fixture.store.set_enabled("review", false).unwrap_err();
+    assert!(matches!(error, PluginError::Unusable { .. }), "{error}");
+    assert_eq!(
+        fixture.registry(),
+        registry,
+        "a failed change changes nothing"
+    );
 }
 
 #[test]

@@ -374,7 +374,8 @@ impl PluginStore {
     }
 
     /// Enables or disables the plugin `name`; a disabled plugin stays installed, but its Skills
-    /// are not loaded and its Tick program is not found by name.
+    /// are not loaded and its Tick program is not found by name. A plugin that can no longer be
+    /// used stays as it is.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
         let _lock = self.lock()?;
@@ -384,16 +385,18 @@ impl PluginStore {
             .plugins
             .get_mut(name)
             .ok_or_else(|| PluginError::NotInstalled(name.to_owned()))?;
+        let mut plugin =
+            self.load_installed(name, entry)
+                .map_err(|reason| PluginError::Unusable {
+                    name: name.to_owned(),
+                    reason,
+                })?;
         if entry.enabled != enabled {
             entry.enabled = enabled;
             registry.write(&registry_path)?;
+            plugin.enabled = enabled;
         }
-        let entry = &registry.plugins[name];
-        self.load_installed(name, entry)
-            .map_err(|reason| PluginError::Unusable {
-                name: name.to_owned(),
-                reason,
-            })
+        Ok(plugin)
     }
 
     /// Builds the plugin in a staging directory with `fill`, checks it, and installs it in the

@@ -7,7 +7,7 @@ use std::{
 use tick_packages::PackageStore;
 use tick_plugins::{InstalledPlugin, PluginStore};
 use tickloop_code_settings::skills::{SkillCaller, SkillDiscovery, SkillRegistry};
-use tickloop_harness::protocol::SkillSource;
+use tickloop_harness::protocol::{InvokedSkill, SkillSource};
 
 fn skill(name: &str, description: &str, body: &str) -> String {
     format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n")
@@ -224,5 +224,73 @@ fn plugin_skill_bodies_name_the_plugin_its_data_and_the_skill_in_either_naming()
             .content
             .ends_with("User ${CLAUDE_PLUGIN_ROOT}"),
         "only a plugin's own Skills see its directories"
+    );
+}
+
+#[test]
+fn a_plugin_skill_gets_no_tools_from_its_allowed_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config");
+    install(
+        &config_root,
+        &claude_plugin(
+            directory.path(),
+            "notes",
+            serde_json::json!({"name": "notes"}),
+            &[(
+                "skills/tools",
+                "---\nname: tools\ndescription: Asks for tools\nallowed-tools: [Bash, Write]\n---\nTools body\n",
+            )],
+        ),
+    );
+
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+
+    let expansion = registry
+        .expand("notes:tools", "", SkillCaller::Model)
+        .unwrap();
+    assert!(expansion.allowed_tools.is_empty());
+    let invoked = InvokedSkill::try_from(expansion).unwrap();
+    assert!(invoked.content.ends_with("Tools body"));
+}
+
+#[test]
+fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "notes",
+        serde_json::json!({"name": "notes"}),
+        &[("skills/write", &skill("write", "Write", "Write body"))],
+    );
+    let notes = install(&config_root, &source);
+    fs::remove_dir_all(&notes.root).unwrap();
+
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+    assert!(registry.contains("tickloop"));
+    assert!(!registry.contains("notes:write"));
+    assert_eq!(registry.warnings().len(), 1, "{:?}", registry.warnings());
+    assert!(
+        registry.warnings()[0].starts_with("the Skills of plugin notes are not loaded"),
+        "{:?}",
+        registry.warnings()
+    );
+
+    let store = PluginStore::in_config_root(&config_root);
+    install(&config_root, &source);
+    store.set_enabled("notes", false).unwrap();
+    fs::remove_dir_all(store.get("notes").unwrap().root).unwrap();
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+    assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
+
+    fs::write(store.directory().join("installed.json"), "not json").unwrap();
+    let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
+    assert!(registry.contains("tickloop"));
+    assert_eq!(registry.warnings().len(), 1);
+    assert!(
+        registry.warnings()[0].starts_with("the Skills of installed plugins are not loaded"),
+        "{:?}",
+        registry.warnings()
     );
 }
