@@ -185,7 +185,7 @@ fn send_now_pty_ctrl_enter_reaches_the_model_without_waiting_for_the_running_too
         30,
         "terminal::console::send_now_pty::send_now_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("fixture"));
+    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("fixture"));
     assert!(
         fixture.raw_output().contains("\x1b[>1u"),
         "the View asks the terminal to tell ctrl+enter from enter"

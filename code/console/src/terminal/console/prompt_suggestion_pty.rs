@@ -196,7 +196,7 @@ async fn prompt_suggestion_pty_generates_ghost_without_submitting_until_accepted
         24,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("fixture"));
+    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("fixture"));
     fixture.send("修好了检查一下\r".as_bytes());
     let frame = fixture.wait(|frame| frame.contains("进度怎么样了"));
     // At 80 columns Monitor sits beside the conversation, so the status line wraps within the
@@ -266,7 +266,7 @@ async fn prompt_suggestion_pty_chinese_bash_kimi_with_completed_child_shows_and_
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
+    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     let frame = fixture.wait(|frame| frame.contains("查看 README.md"));
     assert!(
@@ -326,7 +326,7 @@ async fn prompt_suggestion_pty_delegated_chinese_bash_explains_suppression_witho
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
+    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     let frame = fixture
         .wait(|frame| super::super::shows_turn_summary(frame) && frame.contains("当前目录包含"));
@@ -362,7 +362,7 @@ async fn prompt_suggestion_pty_provider_failure_is_quiet_and_status_has_no_priva
         32,
         "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("Kimi"));
+    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("Kimi"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
     requests.recv().await.unwrap();
     let editor = || {
@@ -408,7 +408,7 @@ async fn prompt_suggestion_pty_off_plan_and_failed_turns_make_no_model_request()
             24,
             "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
         );
-        fixture.wait(|frame| frame.contains("Chat:") && frame.contains("fixture"));
+        fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("fixture"));
         fixture.send(b"check the fixture\r");
         fixture.wait(|frame| {
             if suppression == "failed" {

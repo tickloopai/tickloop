@@ -5671,27 +5671,28 @@ impl State {
         self.reset_chat_surfaces(chat, preserve_editor_context);
     }
 
+    /// Shows the Agent's build in the banner's title of `chat`, or the title alone.
     fn apply_agent_runtime_banner(&mut self, chat: Uuid) -> bool {
-        let Some(prefix) = self.creation_prefixes.get(&Some(chat)) else {
-            return false;
-        };
-        let mut at = 0;
-        for entry in prefix {
-            let CreationPrefixEntry::Output(ConversationPiece::Styled(text, _)) = entry else {
-                break;
-            };
-            at += text.bytes().filter(|byte| *byte == b'\n').count();
-        }
-        if at == 0 {
+        if !self.creation_prefixes.contains_key(&Some(chat)) {
             return false;
         }
-        let text = self.agent_runtime_banners.get(&chat).map(String::as_str);
+        let (line, plain) = super::banner_title_line(None);
+        let title = plain
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>();
+        let (_, shown) =
+            super::banner_title_line(self.agent_runtime_banners.get(&chat).map(String::as_str));
+        let spans = shown
+            .iter()
+            .map(|(text, role)| (text.as_str(), *role))
+            .collect::<Vec<_>>();
         if self.chat == Some(chat) {
-            self.scrollback.set_agent_runtime_banner(at, text)
+            self.scrollback.set_banner_title(line, &title, &spans)
         } else {
             self.view_cache
                 .get_mut(&Some(chat))
-                .is_some_and(|view| view.scrollback.set_agent_runtime_banner(at, text))
+                .is_some_and(|view| view.scrollback.set_banner_title(line, &title, &spans))
         }
     }
 
