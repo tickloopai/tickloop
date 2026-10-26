@@ -511,11 +511,8 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     .unwrap();
     assert!(approved);
     assert_eq!(server.calls().len(), 1);
-    let visible = format!(
-        "{:?} {:?}",
-        scripted.requests.lock().unwrap(),
-        agent.snapshot(chat).await.unwrap()
-    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let visible = format!("{:?} {snapshot:?}", scripted.requests.lock().unwrap());
     assert!(!visible.contains("worker-secret-access"));
     assert!(!visible.contains("worker-secret-refresh"));
     agent.shutdown().await;
