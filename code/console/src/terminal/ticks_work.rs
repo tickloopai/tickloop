@@ -54,8 +54,8 @@ pub(super) struct TickPackageTasks {
     marketplace_reads: u64,
     /// The login under way in each panel: its attempt and what cancels it.
     logins: HashMap<Uuid, (u64, CancellationToken)>,
-    /// The command that opened each panel, which names its results once the panel is closed.
-    commands: HashMap<Uuid, &'static str>,
+    /// The kind of each panel opened, whose command names its results once it is closed.
+    kinds: HashMap<Uuid, PluginKind>,
 }
 
 impl TickPackageTasks {
@@ -119,7 +119,7 @@ pub(super) fn open(
     let panel = TicksPanel::new(chat, kind);
     let id = panel.id();
     console.show_ticks_panel(panel)?;
-    tasks.commands.insert(id, panel_command(kind));
+    tasks.kinds.insert(id, kind);
     start(
         root,
         TickPackageWork {
@@ -343,12 +343,16 @@ pub(super) fn finish(
         Applied::Ignored => return Ok(()),
         Applied::NoPanel => {
             if let Some(notice) = notice {
-                let command = tasks
-                    .commands
+                let kind = tasks
+                    .kinds
                     .get(&panel)
                     .copied()
-                    .unwrap_or(panel_command(PluginKind::Plugin));
-                console.write_line(&format!("{command}: {}", safe_line(&notice.text)))?;
+                    .unwrap_or(PluginKind::Plugin);
+                console.write_line(&format!(
+                    "{}: {}",
+                    panel_command(kind),
+                    safe_line(&notice.text)
+                ))?;
             }
             return Ok(());
         }

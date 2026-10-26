@@ -1295,10 +1295,13 @@ impl TicksPanel {
             );
         }
         if self.uninstall_confirmation.is_some() {
-            add(
-                "Uninstall removes its files and data. Saved login and running Ticks stay.",
-                Role::MutedText,
-            );
+            let warning = match self.kind {
+                PluginKind::Plugin => "Uninstall removes its files and data.",
+                PluginKind::Tick => {
+                    "Uninstall removes its files and data. Saved login and running Ticks stay."
+                }
+            };
+            add(warning, Role::MutedText);
         }
         // A login under way shows itself in place of the list.
         if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
@@ -2643,6 +2646,25 @@ mod tests {
         assert!(
             shown.contains("docs · The docs plugin")
                 && shown.contains("team · 1.0.0 · not installed"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_uninstall_warning_names_only_what_the_kind_keeps() {
+        let mut ticks = mixed_panel(PluginKind::Tick);
+        press(&mut ticks, KeyCode::Char('x'));
+        assert!(
+            text(&mut ticks).contains(
+                "Uninstall removes its files and data. Saved login and running Ticks stay."
+            )
+        );
+        let mut plugins = mixed_panel(PluginKind::Plugin);
+        press(&mut plugins, KeyCode::Char('x'));
+        let shown = text(&mut plugins);
+        assert!(
+            shown.contains("Uninstall removes its files and data.")
+                && !shown.contains("Saved login"),
             "{shown}"
         );
     }

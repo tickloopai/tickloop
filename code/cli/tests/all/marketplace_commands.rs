@@ -565,6 +565,19 @@ fn the_available_plugins_merge_every_marketplace_and_one_that_cannot_be_read_sto
     succeeded(&plugin(&fixture, &["marketplace", "add", &path_text(&lab)]));
     succeeded(&plugin(&fixture, &["install", "review@team-tools"]));
     succeeded(&plugin(&fixture, &["install", "lint@lab"]));
+    for (arguments, error) in [
+        (
+            &["install", "lint@lab"][..],
+            "Error: lint is not offered as a Tick; use tickloop plugin install lint@lab\n",
+        ),
+        (
+            &["install", "lint"],
+            "Error: lint is not offered as a Tick; use tickloop plugin install lint\n",
+        ),
+    ] {
+        let refused = failed(&tick(&fixture, arguments));
+        assert!(refused.ends_with(error), "{arguments:?}: {refused}");
+    }
 
     let available = plugin(&fixture, &["list", "--available"]);
     assert!(available.status.success(), "{}", stderr(&available));

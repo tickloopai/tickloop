@@ -194,7 +194,7 @@ pub(super) async fn install(
                 })?;
             let offered = PluginKind::of_offer(plugin);
             if offered != kind {
-                return Err(other_kind(name, offered, typed));
+                return Err(other_kind_offer(name, offered, typed));
             }
             install_from(HTTP, store, marketplace, plugin).await?
         }
@@ -205,6 +205,18 @@ pub(super) async fn install(
     };
     report(&installation, kind);
     Ok(())
+}
+
+/// Why the offer `name` belongs to the other command: a Tick marketplace package is known to carry
+/// a Tick program, while any other offer is only not known to until it is fetched.
+fn other_kind_offer(name: &str, offered: PluginKind, typed: &str) -> String {
+    match offered {
+        PluginKind::Tick => other_kind(name, offered, typed),
+        PluginKind::Plugin => format!(
+            "{name} is not offered as a Tick; use {} {typed}",
+            offered.command()
+        ),
+    }
 }
 
 /// The marketplace that offers `name` as `kind`: the only one, or the one it is installed from.
@@ -244,7 +256,7 @@ async fn choose_offer(
     if offers.is_empty()
         && let Some((_, other)) = others.first()
     {
-        return Err(other_kind(name, PluginKind::of_offer(other), typed));
+        return Err(other_kind_offer(name, PluginKind::of_offer(other), typed));
     }
     let installed = store.installed().map_err(|error| error.to_string())?;
     let installed_from = installed
