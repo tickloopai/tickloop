@@ -393,3 +393,17 @@ pub fn register_runtime_directory(path: &std::path::Path) {
     record.push(b'\n');
     file.write_all(&record).unwrap();
 }
+
+/// Runs real external I/O against wall time, then restores a test's paused clock.
+pub struct ExternalIoGuard;
+impl ExternalIoGuard {
+    pub fn start() -> Self {
+        tokio::time::resume();
+        Self
+    }
+}
+impl Drop for ExternalIoGuard {
+    fn drop(&mut self) {
+        tokio::time::pause();
+    }
+}

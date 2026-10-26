@@ -927,7 +927,7 @@ async fn pattern_file_arguments_require_the_same_read_permission_as_search_input
 
 #[tokio::test]
 async fn tilde_directory_operands_use_the_same_normalized_path_checks() {
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = tempfile::tempdir_in(std::env::home_dir().unwrap()).unwrap();
     let project = directory.path().canonicalize().unwrap();
     let home = std::env::home_dir().unwrap();
     let a = project.join("a");

@@ -576,9 +576,9 @@ fn own_tickhost_cleans_its_runtime_after_the_callers_runtime_is_gone() {
         .unwrap()
         .to_path_buf();
     drop(runtime);
-    drop(host);
     let leaked = directory.exists();
-    if leaked {
+    drop(host);
+    if directory.exists() {
         std::fs::remove_dir_all(&directory).unwrap();
     }
     assert!(!leaked, "OwnTickhost left {}", directory.display());

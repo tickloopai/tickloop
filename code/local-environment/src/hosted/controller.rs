@@ -193,6 +193,13 @@ impl HostController {
         }
     }
 
+    pub(super) fn stop_in_process(&self) {
+        if let HostProgram::InProcess(server) = &self.program {
+            let server = server.lock().unwrap().take();
+            drop(server);
+        }
+    }
+
     pub fn daemon_epoch(&self) -> Uuid {
         self.daemon_epoch
     }

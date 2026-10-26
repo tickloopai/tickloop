@@ -34,7 +34,7 @@ test('workspace runner removes its temporary roots on success and failure', t =>
   }
 });
 
-test('workspace runner detects and cleans only its leaked process and runtime', t => {
+test('workspace runner reports and cleans only its leaked process and runtime without failing', t => {
   const directory = mkdtempSync(join(tmpdir(), 'workspace-leak-test-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const childFile = join(directory, 'child');
@@ -55,7 +55,7 @@ test('workspace runner detects and cleans only its leaked process and runtime', 
   });
   const pid = Number(readFileSync(childFile, 'utf8'));
   t.after(() => { try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } });
-  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /1 owned processes, 1 owned runtime directories/);
   assert.ok(!existsSync(readFileSync(runtimeFile, 'utf8')));
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });

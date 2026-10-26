@@ -184,6 +184,7 @@ async fn flush(client: &LocalAgentClient) -> Result<(), String> {
 
 impl Drop for PrivateDaemon {
     fn drop(&mut self) {
+        let config_was_removed = !self.config_root.exists();
         let directory = self.runtime.clone();
         if directory.join(DAEMON_SOCKET).exists() {
             stop_gracefully(&directory);
@@ -204,6 +205,9 @@ impl Drop for PrivateDaemon {
         }
         let _ = std::fs::remove_dir_all(&self.runtime);
         let _ = std::fs::remove_dir_all(&self.tickhost);
+        if config_was_removed {
+            let _ = std::fs::remove_dir_all(&self.config_root);
+        }
     }
 }
 

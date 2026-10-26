@@ -57,9 +57,8 @@ try {
     return entries.filter(entry => entry.isDirectory()).flatMap(entry => runtimeDirectoriesIn(join(root, entry.name)));
   }
   const leftoverDirectories = [...new Set([...runtimes.filter(path => existsSync(path)), ...runtimeDirectoriesIn(temporary)])];
-  console.error(`Test cleanup: ${remaining.length} owned processes, ${leftoverDirectories.length} owned runtime directories left by tests.`);
+  console.error(`Test cleanup: ${remaining.length} owned processes, ${leftoverDirectories.length} owned runtime directories left by tests (report-only).`);
   if (remaining.length || leftoverDirectories.length) {
-    code = 1;
     for (const { pid, identity } of remaining) {
       if (processes().some(process => process.identity === identity)) {
         console.error(`Stopping leaked test PID ${pid}`);

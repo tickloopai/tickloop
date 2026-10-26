@@ -26,6 +26,7 @@ use tickloop_harness::tools::{
     ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError, ToolError,
 };
 use tokio::sync::{Mutex, OnceCell, watch};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -124,7 +125,8 @@ pub struct OwnTickhost {
     directory: tickloop_harness::base::private_fs::PrivateDirectory,
     worker: Uuid,
     idle_timeout: Duration,
-    controller: OnceCell<HostController>,
+    controller: OnceCell<Arc<HostController>>,
+    stop: CancellationToken,
 }
 
 impl OwnTickhost {
@@ -139,14 +141,29 @@ impl OwnTickhost {
             worker: tickloop_ids::generate(),
             idle_timeout,
             controller: OnceCell::new(),
+            stop: CancellationToken::new(),
         }
     }
 }
 
 impl Drop for OwnTickhost {
     fn drop(&mut self) {
-        drop(self.controller.take());
+        if let Some(controller) = self.controller.get() {
+            controller.stop_in_process();
+        }
+        self.stop.cancel();
         let _ = std::fs::remove_dir_all(self.directory.path());
+    }
+}
+
+struct OwnHostCleanup {
+    controller: Arc<HostController>,
+    directory: std::path::PathBuf,
+}
+impl Drop for OwnHostCleanup {
+    fn drop(&mut self) {
+        self.controller.stop_in_process();
+        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -163,7 +180,7 @@ impl OwnTickhost {
                 self.directory
                     .create()
                     .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
-                Ok::<_, HostError>(HostController::in_process(
+                let controller = Arc::new(HostController::in_process(
                     self.directory.path(),
                     HostPaths {
                         runtime: self
@@ -173,9 +190,20 @@ impl OwnTickhost {
                     },
                     tickloop_ids::generate(),
                     self.idle_timeout,
-                ))
+                ));
+                let cleanup = OwnHostCleanup {
+                    controller: controller.clone(),
+                    directory: self.directory.path().to_path_buf(),
+                };
+                let stop = self.stop.clone();
+                tokio::spawn(async move {
+                    let _cleanup = cleanup;
+                    stop.cancelled().await;
+                });
+                Ok::<_, HostError>(controller)
             })
             .await
+            .map(Arc::as_ref)
     }
 
     fn identity(&self, controller: &HostController, chat: Uuid) -> ShellIdentity {

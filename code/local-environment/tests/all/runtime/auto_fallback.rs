@@ -355,7 +355,23 @@ async fn completed(
     events: &mut broadcast::Receiver<Event>,
     run_id: uuid::Uuid,
 ) -> ApprovalAssessmentDetails {
+    completed_with_clock(events, run_id, false).await
+}
+
+async fn completed_paused(
+    events: &mut broadcast::Receiver<Event>,
+    run_id: uuid::Uuid,
+) -> ApprovalAssessmentDetails {
+    completed_with_clock(events, run_id, true).await
+}
+
+async fn completed_with_clock(
+    events: &mut broadcast::Receiver<Event>,
+    run_id: uuid::Uuid,
+    paused: bool,
+) -> ApprovalAssessmentDetails {
     let mut assessment = None;
+    let mut external_io = None;
     let mut observed = Vec::new();
     loop {
         let event = events.recv().await.unwrap();
@@ -365,6 +381,12 @@ async fn completed(
         observed.push(format!("{:?}", event.kind));
         match event.kind {
             EventKind::ApprovalAssessed { assessment: value } => assessment = Some(*value),
+            EventKind::ToolStarted { name, .. } if paused && name == "Bash" => {
+                external_io = Some(tickloop_harness::test_support::ExternalIoGuard::start());
+            }
+            EventKind::ToolCompleted { .. } => {
+                drop(external_io.take());
+            }
             EventKind::Completed { .. } => {
                 return assessment.unwrap_or_else(|| panic!("no assessment: {observed:?}"));
             }
@@ -388,7 +410,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
         )
         .await
         .unwrap();
-    let first = completed(&mut events, run.run_id.uuid()).await;
+    let first = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(first.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(first.fallback_from, Some(ApprovalReviewerKind::Jev));
     assert_eq!(
@@ -415,7 +437,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
         )
         .await
         .unwrap();
-    let second = completed(&mut events, run.run_id.uuid()).await;
+    let second = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(second.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         second.fallback_reason,
@@ -431,7 +453,7 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
         )
         .await
         .unwrap();
-    let _ = completed(&mut events, run.run_id.uuid()).await;
+    let _ = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 3);
     assert!(root.path().join("link-4").symlink_metadata().is_ok());
@@ -472,7 +494,7 @@ async fn jev_wait_uses_one_shared_twenty_second_budget_before_llm_fallback() {
         .await
         .unwrap();
     tokio::time::advance(Duration::from_secs(20)).await;
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         assessment.fallback_failure,
@@ -496,7 +518,7 @@ async fn transient_jev_failure_retries_once_within_budget_and_keeps_valid_refusa
         .await
         .unwrap();
     tokio::time::advance(Duration::from_millis(500)).await;
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(assessment.attempts.len(), 3);
@@ -609,7 +631,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
     });
     agent.set_judgment_client(replacement.clone()).await;
     tokio::time::advance(Duration::from_secs(20)).await;
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         agent.auto_reviewer_health().await,
@@ -623,7 +645,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
         )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(replacement.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
@@ -741,7 +763,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
         )
         .await
         .unwrap();
-    completed(&mut events, first_run.run_id.uuid()).await;
+    completed_paused(&mut events, first_run.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
 
     let other_model = Arc::new(ConversationModel {
@@ -782,7 +804,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     assert_eq!(probe.chat_id, first_chat);
     assert_eq!(concurrent.chat_id, other_chat);
     assert_ne!(probe.run_id, concurrent.run_id);
-    let concurrent_assessment = completed(&mut events, concurrent.run_id.uuid()).await;
+    let concurrent_assessment = completed_paused(&mut events, concurrent.run_id.uuid()).await;
     assert_eq!(
         concurrent_assessment.reviewer.unwrap().kind,
         ApprovalReviewerKind::Llm
@@ -799,7 +821,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
 
     tokio::time::advance(Duration::from_secs(20)).await;
-    let probe_assessment = completed(&mut probe_events, probe.run_id.uuid()).await;
+    let probe_assessment = completed_paused(&mut probe_events, probe.run_id.uuid()).await;
     assert_eq!(
         probe_assessment.fallback_failure,
         Some(ApprovalFailureKind::Timeout)
@@ -822,7 +844,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
         )
         .await
         .unwrap();
-    let first_assessment = completed(&mut events, first.run_id.uuid()).await;
+    let first_assessment = completed_paused(&mut events, first.run_id.uuid()).await;
     assert_eq!(
         first_assessment.fallback_from,
         Some(ApprovalReviewerKind::Jev)
@@ -836,7 +858,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
         )
         .await
         .unwrap();
-    let assessment = completed(&mut events, second.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, second.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert_eq!(
@@ -851,7 +873,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
         )
         .await
         .unwrap();
-    let _ = completed(&mut events, third.run_id.uuid()).await;
+    let _ = completed_paused(&mut events, third.run_id.uuid()).await;
     assert_eq!(jev.calls.load(Ordering::SeqCst), 5);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
@@ -1145,7 +1167,7 @@ async fn jev_stages_share_one_twenty_second_budget() {
         )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(
         assessment.fallback_failure,
         Some(ApprovalFailureKind::Timeout)
@@ -1184,7 +1206,7 @@ async fn jev_can_complete_two_six_second_stages_without_premature_fallback() {
         )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert!(assessment.fallback_failure.is_none());
@@ -1214,7 +1236,7 @@ async fn both_jev_stages_share_one_retry_allowance() {
         )
         .await
         .unwrap();
-    let assessment = completed(&mut events, run.run_id.uuid()).await;
+    let assessment = completed_paused(&mut events, run.run_id.uuid()).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
     assert_eq!(
         assessment.fallback_failure,
