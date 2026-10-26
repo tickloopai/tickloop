@@ -781,6 +781,8 @@ pub(super) struct State {
     /// Agent Colors of every Agent this View has learned of, shared by all its conversations.
     agent_colors: AgentColors,
     pub(super) chat: Option<Uuid>,
+    /// Whether this View's Chats are saved, so leaving it can name the command that resumes one.
+    saves_chats: bool,
     activity_interruptible: bool,
     idle_loop_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
@@ -1940,6 +1942,14 @@ impl Console {
             compact_message,
             necessary,
         })
+    }
+
+    pub(super) fn set_saves_chats(&self, saves_chats: bool) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .saves_chats = saves_chats;
+        Ok(())
     }
 
     pub(super) fn set_status_lines(&self, lines: Option<Vec<String>>) -> Result<(), String> {
@@ -5148,10 +5158,7 @@ impl Drop for Lifetime {
             let mut reopen_hint = None;
             if let Ok(mut state) = self.state.lock() {
                 let mut output = io::stdout().lock();
-                reopen_hint = state.chat.map(|chat| {
-                    let chat = tickloop_ids::base62::encode(chat);
-                    format!("Chat {chat} · reopen it with /resume {chat}")
-                });
+                reopen_hint = state.chat.filter(|_| state.saves_chats).map(resume_hint);
                 state.transcript = None;
                 let _ = state.draw(&mut output);
                 if !renderer.uses_alternate_screen() {
@@ -5179,6 +5186,13 @@ impl Drop for Lifetime {
             }
         }
     }
+}
+
+/// Like Claude Code's exit hint, the command that resumes the Chat the View showed, dimmed.
+fn resume_hint(chat: Uuid) -> String {
+    let command = format!("tickloop -r {}", tickloop_ids::base62::encode(chat));
+    let hint = format!("Resume this Chat with:\n{command}");
+    format!("\n{}", crossterm::style::Stylize::dim(hint.as_str()))
 }
 
 struct ConsoleFrame {
@@ -5901,6 +5915,7 @@ impl State {
             awaiting_input_echoes: HashSet::new(),
             agent_colors: AgentColors::default(),
             chat: None,
+            saves_chats: false,
             activity_interruptible: false,
             idle_loop_interruptible: false,
             back_to_bottom_target: None,
@@ -13926,6 +13941,16 @@ fn draft_keeps_context(draft: &str, context: &InputContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exit_hint_names_the_command_that_resumes_the_chat() {
+        let chat = Uuid::from_u128(1);
+        let encoded = tickloop_ids::base62::encode(chat);
+        assert_eq!(
+            resume_hint(chat),
+            format!("\n\u{1b}[2mResume this Chat with:\ntickloop -r {encoded}\u{1b}[0m")
+        );
+    }
     use tickloop_harness::protocol::{Decision, ExecutionMode, PermissionRule};
     use tickloop_harness::protocol::{
         EventKind, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,

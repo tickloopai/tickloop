@@ -38,8 +38,12 @@ use tickloop_harness::base::private_fs::{
 pub use source::{Installation, Source};
 
 pub const PROGRAMS: [&str; 2] = ["tickloop", "tickhost"];
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Like Codex, an update is looked for at most once in this long after a successful check,
+/// whether the Console just started or has been running.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(20 * 60 * 60);
+/// How soon a failed check is tried again, and how often a running Console asks whether a check
+/// is due.
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -47,6 +51,7 @@ const RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_GROUP_KILL_GRACE: Duration = Duration::from_millis(50);
 const PROCESS_GROUP_KILL_POLL: Duration = Duration::from_millis(1);
 const HOMEBREW_FORMULA: &str = "tickloopai/tap/tickloop";
+const BACKGROUND_FLAG: &str = "--background";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Build {
@@ -206,14 +211,9 @@ fn prepare_runtime(
     Ok(Some(destination.join("tickloop")))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundCheck {
-    Startup,
-    Periodic,
-}
-
-/// Starts a detached update check only for an ordinary interactive Console.
-pub fn start_background(arguments: &[OsString], trigger: BackgroundCheck) -> Result<()> {
+/// Starts a detached update check only for an ordinary interactive Console, and only when one is
+/// due.
+pub fn start_background(arguments: &[OsString]) -> Result<()> {
     if !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
         || arguments
@@ -237,7 +237,7 @@ pub fn start_background(arguments: &[OsString], trigger: BackgroundCheck) -> Res
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if !is_due(&state, now(), trigger) {
+    if !is_due(&state, now()) {
         return Ok(());
     }
     let log = OpenOptions::new()
@@ -249,13 +249,7 @@ pub fn start_background(arguments: &[OsString], trigger: BackgroundCheck) -> Res
         .open(state_path.with_file_name("update.log"))?;
     let mut command = std::process::Command::new(executable);
     command
-        .args([
-            "update",
-            match trigger {
-                BackgroundCheck::Startup => "--background-startup",
-                BackgroundCheck::Periodic => "--background",
-            },
-        ])
+        .args(["update", BACKGROUND_FLAG])
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -281,10 +275,11 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn is_due(state: &UpdateState, at: u64, trigger: BackgroundCheck) -> bool {
-    trigger == BackgroundCheck::Startup
-        || (at.saturating_sub(state.checked_at) >= CHECK_INTERVAL.as_secs()
-            && at.saturating_sub(state.attempted_at) >= RETRY_INTERVAL.as_secs())
+/// A check is due a full interval after the last success and an hour after the last attempt, so
+/// a failure is retried sooner.
+fn is_due(state: &UpdateState, at: u64) -> bool {
+    at.saturating_sub(state.checked_at) >= CHECK_INTERVAL.as_secs()
+        && at.saturating_sub(state.attempted_at) >= RETRY_INTERVAL.as_secs()
 }
 
 fn check_age(timestamp: u64, at: u64) -> String {
@@ -322,14 +317,10 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     if let ["--install-cargo", launcher] = args.as_slice() {
         return bundle::install_registry(build, Path::new(launcher));
     }
-    let background = match args.as_slice() {
-        ["--background-startup"] => Some(BackgroundCheck::Startup),
-        ["--background"] => Some(BackgroundCheck::Periodic),
-        _ => None,
-    };
+    let background = args == [BACKGROUND_FLAG];
     let check = args == ["--check"];
     let status = args == ["--status"];
-    if !args.is_empty() && background.is_none() && !check && !status {
+    if !args.is_empty() && !background && !check && !status {
         bail!("Usage: tickloop update [--check | --status]");
     }
     let executable = std::env::current_exe()?.canonicalize()?;
@@ -359,7 +350,7 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     let _lock = match Lock::acquire(&directory.join("update.lock")) {
         Ok(lock) => lock,
         Err(error)
-            if background.is_some()
+            if background
                 && error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
@@ -372,8 +363,8 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if let Some(trigger) = background {
-        if !is_due(&state, now(), trigger) {
+    if background {
+        if !is_due(&state, now()) {
             return Ok(());
         }
         OpenOptions::new()

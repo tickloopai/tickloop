@@ -1344,6 +1344,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         None => Console::start_with_display(interactive_terminal, display_preferences)?,
     };
     let console = &console;
+    console.set_saves_chats(agent.saves_chats())?;
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_popup(monitor_popup)?;

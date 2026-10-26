@@ -143,18 +143,12 @@ fn main() {
                 tickloop_code_updater::cleanup_unused_runtimes,
             ));
             // Automatic checks must never prevent opening a Console.
-            let _ = tickloop_code_updater::start_background(
-                &arguments,
-                tickloop_code_updater::BackgroundCheck::Startup,
-            );
+            let _ = tickloop_code_updater::start_background(&arguments);
             let background_arguments = arguments.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(tickloop_code_updater::CHECK_INTERVAL).await;
-                    let _ = tickloop_code_updater::start_background(
-                        &background_arguments,
-                        tickloop_code_updater::BackgroundCheck::Periodic,
-                    );
+                    tokio::time::sleep(tickloop_code_updater::RETRY_INTERVAL).await;
+                    let _ = tickloop_code_updater::start_background(&background_arguments);
                 }
             });
         }
