@@ -16,3 +16,6 @@ mod marketplace;
 mod program_credentials;
 #[path = "all/support.rs"]
 mod support;
+
+#[path = "all/oauth/mod.rs"]
+mod oauth;

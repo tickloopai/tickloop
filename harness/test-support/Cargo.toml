@@ -11,6 +11,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+sha2 = "0.10"
+tickloop-harness-artifacts = { path = "../artifacts" }
 async-trait = "0.1"
 futures-util = "0.3"
 regex = "1"
@@ -29,5 +31,4 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tickloop-harness-artifacts = { path = "../artifacts" }
 tickloop-harness-base = { path = "../base" }

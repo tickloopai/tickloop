@@ -10,5 +10,28 @@
     "tickloop-tick-packages",
     "tickloop-tick-oauth",
     "tickloop-ui"
+  ],
+  "groups": [
+    {
+      "packages": [
+        "tickloop-tick-packages",
+        "tickloop-tick-oauth"
+      ],
+      "aliases": {
+        "tick_packages::credentials::OAuthToken": "tick_oauth::OAuthToken",
+        "tick_packages::OAuthToken": "tick_oauth::OAuthToken",
+        "tick_oauth::token_data::OAuthToken": "tick_oauth::OAuthToken",
+        "tick_packages::credentials::PackageCredentials": "tick_packages::PackageCredentials",
+        "tick_oauth::credentials::CredentialStore": "tick_oauth::CredentialStore"
+      },
+      "exports": {
+        "tickloop-tick-packages": [
+          "tick_packages::OAuthToken"
+        ],
+        "tickloop-tick-oauth": [
+          "tick_oauth::OAuthToken"
+        ]
+      }
+    }
   ]
 }

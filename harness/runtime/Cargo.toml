@@ -46,8 +46,6 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 [dev-dependencies]
-tickloop-code-local-environment = { path = "../../code/local-environment" }
-tickloop-code-settings = { path = "../../code/settings", features = ["test-support"] }
 base64 = "0.22"
 percent-encoding = "2"
 serde_yaml_ng = "0.10"
@@ -58,6 +56,5 @@ tokio-tungstenite = { version = "0.27", default-features = false, features = ["c
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [features]
-# Exposes test-only seams (a stand-in Trigger source) to the tests of the Agent crates; never
-# enabled by a build.
+# Exposes test-only Trigger controls and the in-memory Execution Environment to host tests.
 test-support = []

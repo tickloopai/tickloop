@@ -20,6 +20,30 @@ const policy = {
   exceptions: [],
 };
 
+test("the workspace permits portable OAuth without migration exceptions", () => {
+  const actual = JSON.parse(readFileSync(new URL("./dependency-boundaries.json", import.meta.url), "utf8"));
+  assert.deepEqual(actual.exceptions, []);
+  assert.deepEqual(checkBoundaries(metadata([
+    ["tickloop-harness-artifacts", "tickloop-tick-oauth"],
+    ["tickloop-harness-artifacts", "tickloop-tick-oauth-test-server", "dev"],
+    ["tickloop-tick-packages", "tickloop-tick-oauth"],
+  ]), actual), []);
+});
+
+test("OAuth is a leaf, test servers stay dev-only, and Harness cannot compose Code tests", () => {
+  const actual = JSON.parse(readFileSync(new URL("./dependency-boundaries.json", import.meta.url), "utf8"));
+  for (const [from, to, kinds] of [
+    ["tickloop-tick-oauth", "tickloop-tick-packages", ["normal", "build", "dev"]],
+    ["tickloop-harness-runtime", "tickloop-code-settings", ["normal", "build", "dev"]],
+    ["tickloop-harness-runtime", "tickloop-code-local-environment", ["normal", "build", "dev"]],
+    ["tickloop-harness-artifacts", "tickloop-tick-oauth-test-server", ["normal", "build"]],
+  ]) {
+    for (const kind of kinds) {
+      assert.equal(checkBoundaries(metadata([[from, to, kind, 'cfg(unix)']]), actual).length, 1, `${from} -> ${to} (${kind})`);
+    }
+  }
+});
+
 test("a Harness dependency on Code fails with the offending edge", () => {
   assert.deepEqual(checkBoundaries(metadata([["engine", "cli"]]), policy), [
     "engine -> cli (normal): harness may not depend on code",

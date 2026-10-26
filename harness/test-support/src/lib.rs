@@ -374,3 +374,6 @@ pub fn model_ids_as_uuids(text: &str) -> String {
     rewritten.push_str(rest);
     rewritten
 }
+
+pub mod artifact_service;
+pub mod judgment;

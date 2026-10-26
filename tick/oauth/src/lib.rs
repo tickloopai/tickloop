@@ -9,13 +9,14 @@ mod credentials;
 mod device;
 mod server;
 mod token;
+mod token_data;
 
 use std::fmt;
 
 pub use credentials::CredentialStore;
 pub use device::{ClientRegistration, DeviceLogin, Progress};
-pub use tick_packages::OAuthToken;
 pub use token::{RefreshError, UserInfo, refresh, refresh_for_resource, revoke, user_info};
+pub use token_data::OAuthToken;
 
 /// Why a login ended without saving a token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,9 +50,3 @@ impl fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
-
-impl From<tick_packages::PackageError> for LoginError {
-    fn from(error: tick_packages::PackageError) -> Self {
-        Self::Failed(error.to_string())
-    }
-}

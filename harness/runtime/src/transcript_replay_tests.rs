@@ -10,7 +10,6 @@ use std::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tickloop_code_settings::UserSettings;
 use tickloop_harness_artifacts::ArtifactClient;
 use tickloop_harness_model::{ModelClients, judgment::JevClient};
 use tickloop_harness_protocol::{Content, ExecutionMode, OperationRecord, OperationState, Receipt};
@@ -28,6 +27,12 @@ struct ReplayConfig {
     transcript: PathBuf,
     credential_root: PathBuf,
     operations: Vec<PathBuf>,
+    auto_schema_version: u64,
+    auto_reviewer: tickloop_harness_protocol::AutoReviewerPreference,
+    auto_rules: tickloop_harness_protocol::AutoRuleSettings,
+    auto_revision: tickloop_harness_protocol::AutoSettingsRevision,
+    jev: tickloop_harness_model::judgment::JevConfig,
+    model: tickloop_harness_protocol::ModelConfig,
     #[serde(default)]
     llm_fallback: bool,
 }
@@ -57,10 +62,14 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
         .unwrap()
         .lines()
         .collect::<Vec<_>>();
-    let settings = UserSettings::in_root(&request.credential_root);
-    let (auto, revision) = settings.auto_settings_with_revision().unwrap();
-    let jev_config = settings.load().jev_config().unwrap();
-    let llm_config = settings.load().configured_model().unwrap().unwrap();
+    let auto = tickloop_harness_policy::AutoSettings {
+        schema_version: request.auto_schema_version,
+        reviewer: request.auto_reviewer.clone(),
+        rules: request.auto_rules.clone(),
+    };
+    let revision = request.auto_revision.clone();
+    let jev_config = request.jev.clone();
+    let llm_config = request.model.clone();
 
     let credentials = tempfile::tempdir().unwrap();
     let credential_root = credentials.path().canonicalize().unwrap();

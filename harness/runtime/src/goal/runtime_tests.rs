@@ -272,11 +272,24 @@ async fn usage_counted_but_unwritten_stays_unwritten_after_a_take_over() {
 async fn usage_reported_while_another_process_changes_the_goal_charges_the_goal_it_left() {
     let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
+    let settings = Arc::new(tickloop_harness_policy::settings::MemorySettingsStore::default());
     let open = || {
-        Agent::open(
-            root.path().into(),
-            config(),
-            Arc::new(ScriptedModel::new(Vec::new())),
+        Agent::with_seams(
+            crate::HarnessSeams {
+                transcripts: Some(Arc::new(
+                    crate::transcript::JsonlTranscriptStore::open(root.path().into()).unwrap(),
+                )),
+                environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
+                models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(
+                    ScriptedModel::new(Vec::new()),
+                )),
+            },
+            crate::HarnessOptions {
+                settings: Some(settings.clone()),
+                local_state_root: Some(root.path().into()),
+                host: tickloop_harness_protocol::AgentHostOptions::default(),
+                ..crate::HarnessOptions::local(config())
+            },
         )
         .unwrap()
     };

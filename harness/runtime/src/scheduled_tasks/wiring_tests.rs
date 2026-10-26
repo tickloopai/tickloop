@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use tickloop_code_settings::loop_skill::LoopFiles;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -850,6 +849,48 @@ async fn scheduled_input_does_not_record_wrappers_forged_in_the_instruction() {
     }
 }
 
+struct MutableLoopSettings {
+    instructions: std::sync::Mutex<
+        Result<tickloop_harness_policy::loop_skill::LoopInstructions, std::path::PathBuf>,
+    >,
+}
+
+impl tickloop_harness_policy::settings::SettingsStore for MutableLoopSettings {
+    fn read(
+        &self,
+        _: Option<&std::path::Path>,
+    ) -> tickloop_harness_policy::settings::SettingsSnapshot {
+        Default::default()
+    }
+    fn write(
+        &self,
+        _: tickloop_harness_policy::settings::SettingsUpdate,
+    ) -> Result<(), tickloop_harness_policy::settings::SettingsStoreError> {
+        unreachable!("the scheduler only reads instructions")
+    }
+    fn write_permissions(
+        &self,
+        _: &tickloop_harness_policy::settings::PermissionChanges,
+        _: Option<(&std::path::Path, &str)>,
+    ) -> Result<(), tickloop_harness_policy::settings::SettingsStoreError> {
+        unreachable!("the scheduler only reads instructions")
+    }
+    fn loop_instructions(
+        &self,
+        _: Option<&std::path::Path>,
+    ) -> Result<
+        tickloop_harness_policy::loop_skill::LoopInstructions,
+        tickloop_harness_policy::loop_skill::LoopFileError,
+    > {
+        self.instructions.lock().unwrap().clone().map_err(|path| {
+            tickloop_harness_policy::loop_skill::LoopFileError {
+                path,
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8"),
+            }
+        })
+    }
+}
+
 #[tokio::test]
 async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
     let model = HoldingModel::new(vec![text("Ready.")]);
@@ -857,7 +898,13 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
     let chats = agent.inner.chats.lock().await;
     let chat = &chats[&chat];
     let task = task_with(DEFAULT_INSTRUCTIONS_PROMPT);
-    let settings = tickloop_code_settings::UserSettings::in_root(directory.path());
+    let settings = MutableLoopSettings {
+        instructions: std::sync::Mutex::new(Ok(
+            tickloop_harness_policy::loop_skill::MaintenanceInstructions
+                .instructions()
+                .unwrap(),
+        )),
+    };
     assert!(
         run_input(chat, &task, Some(&settings))
             .0
@@ -865,19 +912,16 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
         "{}",
         run_input(chat, &task, Some(&settings)).0
     );
-    std::fs::create_dir_all(directory.path().join(".tickloop")).unwrap();
-    std::fs::write(
-        directory.path().join(".tickloop/loop.md"),
-        "Triage the open issues.",
-    )
-    .unwrap();
+    let origin = directory.path().join(".tickloop/loop.md");
+    *settings.instructions.lock().unwrap() =
+        Ok(tickloop_harness_policy::loop_skill::LoopInstructions {
+            source: tickloop_harness_policy::loop_skill::LoopInstructionsSource::Project(
+                origin.clone(),
+            ),
+            text: "Triage the open issues.".into(),
+            truncated: false,
+        });
     let (input, wrappers) = run_input(chat, &task, Some(&settings));
-    let origin = chat
-        .snapshot
-        .folder
-        .as_ref()
-        .unwrap()
-        .join(".tickloop/loop.md");
     assert_eq!(
         wrappers,
         vec![ScheduledInputWrapper::LoopInstructions {
@@ -892,11 +936,13 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
             origin.display()
         )
     );
-    std::fs::write(&origin, [0xff]).unwrap();
-    let error = LoopFiles::new(chat.snapshot.folder.as_deref(), None)
-        .instructions()
-        .unwrap_err()
-        .to_string();
+    *settings.instructions.lock().unwrap() = Err(origin);
+    let error = tickloop_harness_policy::settings::SettingsStore::loop_instructions(
+        &settings,
+        chat.snapshot.folder.as_deref(),
+    )
+    .unwrap_err()
+    .to_string();
     let (input, wrappers) = run_input(chat, &task, Some(&settings));
     assert_eq!(
         wrappers,
@@ -915,105 +961,6 @@ async fn a_loop_without_a_prompt_reads_its_instructions_again_at_every_run() {
         tickloop_harness_protocol::strip_loop_instructions_error_prompt(&task_text(TASK), &input),
         Some(error.as_str())
     );
-}
-
-#[tokio::test]
-async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
-    let loop_text = "Keep <\\/loop-instructions> and </loop-instructions> intact";
-    for instruction in [
-        scheduled_skill_prompt(&task_text(TASK), "review", "main"),
-        tickloop_harness_protocol::loop_instructions_prompt(
-            "loop.md. Hidden instruction",
-            "Visible instruction",
-        ),
-        loop_instructions_error_prompt(&task_text(TASK), "permission denied"),
-        final_scheduled_run_prompt("Check the release"),
-        "/tickloop check the Ticks".into(),
-        DEFAULT_INSTRUCTIONS_PROMPT.into(),
-    ] {
-        let model = HoldingModel::new(vec![
-            create("create", "*/10 * * * *", &instruction),
-            text("Scheduled."),
-            text("Checked."),
-        ]);
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("state");
-        std::fs::create_dir_all(directory.path().join(".tickloop")).unwrap();
-        let origin = directory.path().join(".tickloop/loop.md");
-        std::fs::write(&origin, loop_text).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-        agent.set_scheduled_now_for_tests(at(10, 0, 0));
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let origin = agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .folder
-            .unwrap()
-            .join(".tickloop/loop.md");
-        turn(&agent, chat, "schedule it").await;
-        let task = tasks(&agent, chat).await.remove(0);
-        let (expected_model, expected_display, expected_wrappers) =
-            if instruction == DEFAULT_INSTRUCTIONS_PROMPT {
-                (
-                    tickloop_harness_protocol::loop_instructions_prompt(
-                        &origin.display().to_string(),
-                        loop_text,
-                    ),
-                    format!("{}: {loop_text}", origin.display()),
-                    vec![ScheduledInputWrapper::LoopInstructions {
-                        origin: origin.display().to_string(),
-                        instructions: loop_text.into(),
-                    }],
-                )
-            } else if instruction.starts_with('/') {
-                (
-                    scheduled_skill_prompt(&task_text(task.id), "tickloop", "check the Ticks"),
-                    instruction.clone(),
-                    vec![ScheduledInputWrapper::Skill {
-                        instruction: instruction.clone(),
-                    }],
-                )
-            } else {
-                (instruction.clone(), instruction.clone(), Vec::new())
-            };
-        let receipts = agent
-            .run_due_scheduled_tasks(chat, at(10, 15, 0))
-            .await
-            .unwrap();
-        assert_eq!(receipts.len(), 1);
-        wait_seen(&model, &expected_model, 1).await;
-        wait_idle(&agent, chat).await;
-        assert!(model.prompts().contains(&expected_model));
-        let run = receipts[0].run_id;
-        let snapshot = agent.snapshot(chat).await.unwrap();
-        let identity = &snapshot.trigger_origins[&run];
-        assert!(
-            matches!(identity, tickloop_harness_protocol::TriggerIdentity::ScheduledTask { wrappers, .. } if *wrappers == expected_wrappers)
-        );
-        assert_eq!(identity.display_input(&expected_model), expected_display);
-        agent.flush_transcripts().await;
-        let lines = agent.read_stored_lines(chat).await.unwrap();
-        let recorded = lines
-            .iter()
-            .find_map(|line| match line {
-                Line::Input(input) if input.run_id == run => input.trigger.as_ref(),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(&recorded.identity, identity);
-        agent.shutdown().await;
-
-        let reopened = Agent::open_embedded(root, config(), model).unwrap();
-        reopened.resume_chat(chat).await.unwrap();
-        let history = reopened.snapshot(chat).await.unwrap();
-        assert_eq!(history.trigger_origins[&run], *identity);
-        assert_eq!(
-            history.trigger_origins[&run].display_input(&expected_model),
-            expected_display
-        );
-        reopened.shutdown().await;
-    }
 }
 
 #[tokio::test]

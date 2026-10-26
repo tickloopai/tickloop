@@ -12,6 +12,9 @@ name = "tick_packages"
 doctest = false
 
 [dependencies]
+async-trait = "0.1"
+tickloop-tick-oauth = { path = "../oauth" }
+tokio = { version = "1", features = ["rt"] }
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,4 +26,8 @@ time = { version = "0.3", features = ["formatting"] }
 url = "2"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tickloop-tick-oauth-test-server = { path = "../oauth-test-server" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-util = "0.7"
 time = { version = "0.3", features = ["parsing"] }

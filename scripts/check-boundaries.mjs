@@ -20,6 +20,7 @@ export function checkBoundaries(metadata, policy) {
       const destination = policy.layers[dependency.name];
       if (policy.allowed[layer]?.includes(destination)) continue;
       const kind = dependency.kind ?? "normal";
+      if (kind === "dev" && policy.allowedDev?.[layer]?.includes(destination)) continue;
       const target = dependency.target ?? null;
       const exception = policy.exceptions.find(edge => edge.from === pkg.name
         && edge.to === dependency.name && edge.kind === kind && edge.target === target);

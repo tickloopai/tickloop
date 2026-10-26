@@ -37,6 +37,29 @@ fn token(expires_at: u64, refresh_token: Option<&str>) -> OAuthToken {
     }
 }
 
+#[tokio::test]
+async fn both_token_paths_use_the_same_credential_store_and_saved_format() {
+    let directory = tempfile::tempdir().unwrap();
+    let credentials = PackageCredentials::in_config_root(directory.path(), "sample").unwrap();
+    let portable: tick_oauth::OAuthToken = token(123, Some("refresh-secret"));
+    tick_oauth::CredentialStore::save_token(&credentials, &portable)
+        .await
+        .unwrap();
+    let saved: OAuthToken = credentials.oauth_token().unwrap().unwrap();
+    let roundtrip: tick_oauth::OAuthToken = saved;
+    assert_eq!(
+        serde_json::to_value(roundtrip).unwrap(),
+        json!({
+            "access_token": "secret-access", "token_type": "Bearer",
+            "refresh_token": "refresh-secret", "issuer": "https://auth.example.com",
+            "client_id": "client-1", "token_endpoint": "https://auth.example.com/token",
+            "expires_at": 123
+        })
+    );
+    let error: tick_oauth::LoginError = PackageError::Invalid("invalid package".into()).into();
+    assert_eq!(error.to_string(), "invalid package");
+}
+
 fn oauth2() -> PackageAuth {
     PackageAuth::OAuth2 {
         issuers: vec![OAuthIssuer {

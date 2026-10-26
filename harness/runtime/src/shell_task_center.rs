@@ -581,7 +581,6 @@ mod tests {
 
     use super::*;
     use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-    use tickloop_harness_protocol::{InputModality, ModelConfig, Protocol};
 
     struct UnusedModel;
 
@@ -617,27 +616,27 @@ mod tests {
     }
 
     fn agent() -> Agent {
-        let agent = Agent::new_embedded(
-            ModelConfig {
-                provider: tickloop_harness_protocol::ModelProvider::Api,
-                auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
-                name: "test".into(),
-                protocol: Protocol::Messages,
-                base_url: "http://127.0.0.1".into(),
-                model: "test".into(),
-                api_key_env: String::new(),
-                max_output_tokens: 1024,
-                provider_id: String::new(),
-                provider_name: String::new(),
-                model_id: String::new(),
-                connection: None,
-                card: None,
-                input_modalities: vec![InputModality::Text],
+        let environment = Arc::new(crate::environment::memory::MemoryEnvironment::new());
+        for (command, output) in [
+            ("printf finished", "finished"),
+            ("printf lag-output", "lag-output"),
+            ("printf 'abcdef'", "abcdef"),
+            ("printf first", "first"),
+        ] {
+            environment.define_shell(command, Duration::ZERO, output.as_bytes().to_vec(), 0);
+        }
+        environment.define_shell("sleep 5", Duration::from_secs(5), Vec::new(), 0);
+        Agent::with_seams(
+            crate::HarnessSeams {
+                transcripts: None,
+                environment: Some(environment),
+                models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(
+                    UnusedModel,
+                )),
             },
-            Arc::new(UnusedModel),
-        );
-        agent.install_own_tickhost();
-        agent
+            crate::HarnessOptions::local(tickloop_harness_test_support::config()),
+        )
+        .unwrap()
     }
 
     async fn create_chat(agent: &Agent, workdir: &Path) -> ChatId {

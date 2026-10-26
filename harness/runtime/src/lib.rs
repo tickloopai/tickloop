@@ -61,8 +61,6 @@ mod chat_reads;
 mod chat_settings;
 mod chat_title;
 mod citations;
-#[cfg(test)]
-mod codex_tests;
 mod compaction;
 mod context;
 mod delegation;
@@ -898,14 +896,11 @@ fn host_provider_is_confirmed(
 #[cfg(test)]
 fn local_options(
     model: ModelConfig,
-    settings: Option<tickloop_code_settings::UserSettings>,
+    settings: Option<Arc<dyn SettingsStore>>,
     host: AgentHostOptions,
 ) -> HarnessOptions {
     HarnessOptions {
-        local_state_root: settings
-            .as_ref()
-            .and_then(|settings| settings.root().map(Path::to_path_buf)),
-        settings: settings.map(|settings| Arc::new(settings) as Arc<dyn SettingsStore>),
+        settings,
         host,
         ..HarnessOptions::local(model)
     }
@@ -1790,9 +1785,7 @@ impl Agent {
     /// Opens a persistent Agent rooted at `root`. No Chat is loaded on open; use
     /// [`Agent::resume_chat`] to resume one by id and [`Agent::saved_chats`] to list saved Chats.
     ///
-    /// Following Claude Code's `shouldSkipPersistence`: when the user setting `cleanupPeriodDays`
-    /// is 0, Chats are not saved, same as [`Agent::new_with_user_settings_embedded`], while user
-    /// settings are still read and written. Settings are read only once, on open.
+    /// Uses an in-memory Settings Store; file-backed composition is tested by Code.
     #[cfg(test)]
     pub fn open(
         root: PathBuf,
@@ -1820,11 +1813,17 @@ impl Agent {
     ) -> Result<Self, AgentError> {
         let store = transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
-        let settings = tickloop_code_settings::UserSettings::in_root(store.root());
-        let recorder = (!settings.skips_transcripts())
-            .then(|| persistence::ChatRecorder::new(Arc::new(store)));
+        let mut options = local_options(
+            model,
+            Some(Arc::new(
+                tickloop_harness_policy::settings::MemorySettingsStore::default(),
+            )),
+            host_options,
+        );
+        options.local_state_root = Some(store.root().to_owned());
+        let recorder = Some(persistence::ChatRecorder::new(Arc::new(store)));
         Ok(Self::build(
-            local_options(model, Some(settings), host_options),
+            options,
             Arc::new(harness::OneClient(client.clone())),
             client,
             recorder,
@@ -1865,22 +1864,6 @@ impl Agent {
         host_options: AgentHostOptions,
     ) -> Self {
         Self::new_local(model, client, None, host_options)
-    }
-
-    /// An Agent that does not save Chats but reads and writes user settings as usual.
-    #[cfg(test)]
-    pub fn new_with_user_settings_embedded(
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_code_settings::UserSettings,
-    ) -> Self {
-        Self::build(
-            local_options(model, Some(settings), AgentHostOptions::embedded_defaults()),
-            Arc::new(harness::OneClient(client.clone())),
-            client,
-            None,
-            Some(Arc::new(environment::FolderEnvironment::bare())),
-        )
     }
 
     /// An Agent on this computer's files that keeps no Transcript.
@@ -5452,23 +5435,6 @@ impl tickloop_harness_tools::ShellRetention for WeakAgent {
             Some(agent) => agent.monitor_may_list_shell(chat.into(), task).await,
             None => false,
         }
-    }
-}
-
-#[cfg(test)]
-impl Agent {
-    fn install_shell_grants(
-        &self,
-        grants: Arc<dyn tickloop_code_local_environment::hosted::shells::ShellGrants>,
-    ) -> Arc<tickloop_code_local_environment::hosted::shells::ShellTasks> {
-        let tasks = tickloop_code_local_environment::hosted::shells::ShellTasks::new(grants);
-        self.install_shell_runtime(tasks.clone());
-        tasks
-    }
-    fn install_own_tickhost(&self) {
-        self.install_shell_grants(Arc::new(
-            tickloop_code_local_environment::hosted::shells::OwnTickhost::new(),
-        ));
     }
 }
 

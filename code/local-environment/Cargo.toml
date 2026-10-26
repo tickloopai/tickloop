@@ -28,6 +28,16 @@ tickloop-tickhost = { path = "../../tickhost/host" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 
 [dev-dependencies]
+icu_normalizer = "2"
+tracing = "0.1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tickloop-harness = { path = "../../harness/sdk", features = ["test-support"] }
 tempfile = "3"
 

@@ -5,9 +5,9 @@
     "tickloop-harness-protocol": "harness",
     "tickloop-ids": "foundation",
     "tickloop-tick-protocol": "foundation",
-    "tickloop-tick-oauth": "tick",
+    "tickloop-tick-oauth": "leaf",
     "tickloop-tick-packages": "tick",
-    "tickloop-tick-oauth-test-server": "tick",
+    "tickloop-tick-oauth-test-server": "test-support",
     "tickloop-code-client": "code",
     "tickloop-harness-cron": "harness",
     "tickloop-harness-model": "harness",
@@ -33,11 +33,13 @@
   "allowed": {
     "harness": [
       "harness",
-      "foundation"
+      "foundation",
+      "leaf"
     ],
     "facade": [
       "harness",
-      "foundation"
+      "foundation",
+      "leaf"
     ],
     "code": [
       "code",
@@ -45,55 +47,49 @@
       "foundation",
       "tick",
       "tickhost",
-      "ui"
+      "ui",
+      "leaf"
     ],
     "foundation": [
       "foundation"
     ],
     "tick": [
       "foundation",
-      "tick"
+      "tick",
+      "leaf"
     ],
     "tickhost": [
       "foundation",
       "tick",
       "tickhost",
-      "ui"
+      "ui",
+      "leaf"
     ],
     "ui": [
       "foundation",
       "tick",
-      "ui"
-    ]
+      "ui",
+      "leaf"
+    ],
+    "leaf": [],
+    "test-support": []
   },
-  "exceptions": [
-    {
-      "from": "tickloop-harness-artifacts",
-      "to": "tickloop-tick-oauth",
-      "kind": "normal",
-      "target": null,
-      "reason": "Existing OAuth/package integration; tighten when its portable contract is separated."
-    },
-    {
-      "from": "tickloop-harness-artifacts",
-      "to": "tickloop-tick-oauth-test-server",
-      "kind": "dev",
-      "target": null,
-      "reason": "Existing OAuth/package integration; tighten when its portable contract is separated."
-    },
-    {
-      "from": "tickloop-harness-runtime",
-      "to": "tickloop-code-settings",
-      "kind": "dev",
-      "target": null,
-      "reason": "File-backed Settings Store and Skill discovery adapters are exercised only by runtime tests."
-    },
-    {
-      "from": "tickloop-harness-runtime",
-      "to": "tickloop-code-local-environment",
-      "kind": "dev",
-      "target": null,
-      "reason": "Existing runtime behavior tests compose the isolated Local Environment; production Harness remains independent."
-    }
-  ]
+  "exceptions": [],
+  "allowedDev": {
+    "harness": [
+      "test-support"
+    ],
+    "facade": [
+      "test-support"
+    ],
+    "code": [
+      "test-support"
+    ],
+    "tick": [
+      "test-support"
+    ],
+    "leaf": [
+      "test-support"
+    ]
+  }
 }

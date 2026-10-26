@@ -31,7 +31,7 @@ use tickloop_harness_transcript::{Line, SettledOutcome};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::mcp_tools::artifact_service::{ArtifactService, CREATED_ARTIFACT};
+use tickloop_harness_test_support::artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(20);
 const ROOT_PROMPT: &str = "Use every tool you have once.";

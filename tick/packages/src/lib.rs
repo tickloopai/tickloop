@@ -9,6 +9,7 @@
 mod credentials;
 mod manifest;
 mod marketplace;
+mod oauth;
 mod registry;
 mod staging;
 
@@ -23,7 +24,7 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use credentials::{
-    ApiKey, LockedOAuth, LoginState, OAUTH_TOKEN_FILE_VARIABLE, OAuthToken, PackageCredentials,
+    ApiKey, LockedOAuth, LoginState, OAUTH_TOKEN_FILE_VARIABLE, PackageCredentials,
     config_root_runtime_key, default_config_root,
 };
 pub use manifest::{
@@ -35,6 +36,7 @@ pub use marketplace::{
 };
 pub use registry::REGISTRY_FILE_NAME;
 use registry::{Registry, RegistryEntry};
+pub use tick_oauth::OAuthToken;
 
 /// The directory under the config root that holds the installed packages and their registry.
 pub const PACKAGES_DIRECTORY: &str = "ticks";

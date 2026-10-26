@@ -5,6 +5,8 @@ use std::sync::Arc;
 use crate::host_tools::{HostCallResult, HostEffect, PreparedHostCall};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod memory;
 mod port;
 pub mod shell_host;
 pub mod tools;

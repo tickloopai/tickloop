@@ -212,7 +212,7 @@ async fn both_reviewers_receive_complete_artifact_edits_in_both_stages() {
     use tickloop_harness_protocol::{Content, ExecutionMode};
     use tickloop_harness_test_support::{auto_classification, next_event};
 
-    struct ScreenedJudgment(super::trusted_approval_context::RecordingJudgment);
+    struct ScreenedJudgment(tickloop_harness_test_support::judgment::RecordingJudgment);
 
     #[async_trait::async_trait]
     impl JudgmentClient for ScreenedJudgment {
@@ -278,7 +278,7 @@ async fn both_reviewers_receive_complete_artifact_edits_in_both_stages() {
                 text(&auto_classification(false).to_string()),
             ]));
             let jev = Arc::new(ScreenedJudgment(
-                super::trusted_approval_context::RecordingJudgment {
+                tickloop_harness_test_support::judgment::RecordingJudgment {
                     requests: Mutex::new(Vec::new()),
                 },
             ));
@@ -388,7 +388,7 @@ async fn three_large_artifact_edits_do_not_exhaust_the_following_bash_review() {
         let llm = Arc::new(ScriptedModel::new(vec![text(
             &auto_classification(false).to_string(),
         )]));
-        let jev = Arc::new(super::trusted_approval_context::RecordingJudgment {
+        let jev = Arc::new(tickloop_harness_test_support::judgment::RecordingJudgment {
             requests: Mutex::new(Vec::new()),
         });
         if use_jev {

@@ -1,8 +1,8 @@
 //! Using a saved token with its server: renewing it (RFC 6749 section 6) and revoking it
 //! (RFC 7009).
 
+use crate::OAuthToken;
 use reqwest::{Client, RequestBuilder};
-use tick_packages::OAuthToken;
 
 use crate::{
     LoginError,

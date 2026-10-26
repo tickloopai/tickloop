@@ -707,8 +707,12 @@ fn estimate_tokens_for_request(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::{fs::OpenOptions, time::Duration};
+    use std::time::Duration;
     use tickloop_harness_model::{LocalModelClients, cards::ModelCatalog};
+    use tickloop_harness_policy::settings::{
+        MemorySettingsStore, PermissionChanges, SettingsSnapshot, SettingsStore,
+        SettingsStoreError, SettingsUpdate,
+    };
 
     #[tokio::test]
     async fn ordinary_source_lookup_failure_finishes_requests_and_reports_failure_after_cancellation()
@@ -857,6 +861,28 @@ mod tests {
         }
     }
 
+    struct GatedSettings {
+        memory: MemorySettingsStore,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SettingsStore for GatedSettings {
+        fn read(&self, folder: Option<&std::path::Path>) -> SettingsSnapshot {
+            self.memory.read(folder)
+        }
+        fn write(&self, update: SettingsUpdate) -> Result<(), SettingsStoreError> {
+            self.resume.lock().unwrap().recv().unwrap();
+            self.memory.write(update)
+        }
+        fn write_permissions(
+            &self,
+            changes: &PermissionChanges,
+            expected: Option<(&std::path::Path, &str)>,
+        ) -> Result<(), SettingsStoreError> {
+            self.memory.write_permissions(changes, expected)
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn model_selection_keeps_chat_locked_while_settings_write_waits() {
         let directory = tempfile::tempdir().unwrap();
@@ -865,7 +891,11 @@ mod tests {
         let original = catalog.get("deepseek-api", "deepseek-flash").unwrap();
         let replacement = catalog.get("openai-api", "gpt-6-luna").unwrap();
         let store = crate::transcript::JsonlTranscriptStore::open(root.clone()).unwrap();
-        let settings = tickloop_code_settings::UserSettings::in_root(store.root());
+        let (release_settings, resume) = std::sync::mpsc::channel();
+        let settings = GatedSettings {
+            memory: MemorySettingsStore::default(),
+            resume: std::sync::Mutex::new(resume),
+        };
         let agent = Agent::with_seams(
             crate::HarnessSeams {
                 transcripts: Some(Arc::new(store)),
@@ -875,7 +905,7 @@ mod tests {
             crate::HarnessOptions {
                 search: Default::default(),
                 model: original,
-                local_state_root: settings.root().map(ToOwned::to_owned),
+                local_state_root: Some(root),
                 settings: Some(std::sync::Arc::new(settings)),
                 host: tickloop_harness_protocol::AgentHostOptions::embedded_defaults(),
                 tools: crate::ToolPolicy::local(),
@@ -893,16 +923,6 @@ mod tests {
         )
         .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-
-        let lock_path = root.join("settings.json.lock");
-        let held_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .unwrap();
-        held_lock.lock().unwrap();
 
         let selecting_agent = agent.clone();
         let selecting_replacement = replacement.clone();
@@ -927,7 +947,7 @@ mod tests {
                 .is_err(),
             "the old request could complete while model settings were being written"
         );
-        drop(held_lock);
+        release_settings.send(()).unwrap();
         assert_eq!(selection.await.unwrap().unwrap(), ModelChange::Applied);
         assert_eq!(agent.snapshot(chat).await.unwrap().model, replacement);
         agent.shutdown().await;

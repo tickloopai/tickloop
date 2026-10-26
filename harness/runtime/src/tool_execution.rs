@@ -1,6 +1,4 @@
 use std::sync::Arc;
-#[cfg(test)]
-use tickloop_code_settings::skills::SkillDiscovery;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -2533,25 +2531,24 @@ mod tests {
             .repeat(30)
             .trim_end()
             .to_owned();
-        let path = directory.path().join(".tickloop/skills/catalog-workflow");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(
-            path.join("SKILL.md"),
-            format!("---\nname: catalog-workflow\ndescription: {description}\n---\nPrivate body"),
-        )
-        .unwrap();
-        let agent = Agent::new_with_user_settings_embedded(
+        let agent = Agent::new_embedded(
             tickloop_harness_test_support::config_with_window(8_192),
             Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
-            tickloop_code_settings::UserSettings::in_root(&directory.path().join("config")),
         );
-        agent
-            .trust_working_directory(directory.path().into())
-            .await
-            .unwrap();
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         let mut chats = agent.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).unwrap();
+        let mut skills = tickloop_harness_policy::skills::SkillRegistry::builtin();
+        skills.register_markdown(
+            &format!("---\nname: catalog-workflow\ndescription: {description}\n---\nPrivate body"),
+            tickloop_harness_protocol::SkillSource::Project {
+                path: directory
+                    .path()
+                    .join(".tickloop/skills/catalog-workflow/SKILL.md"),
+            },
+            None,
+        );
+        chat.skills = Arc::new(skills);
         let catalog = |chat: &Chat| {
             ToolRegistry::for_chat(
                 chat,
@@ -2600,9 +2597,7 @@ mod tests {
 
     /// Every tool this Agent defines itself, in each of its forms.
     fn built_in_definitions() -> Vec<ToolDefinition> {
-        let directory = tempfile::tempdir().unwrap();
-        let skills =
-            tickloop_harness_policy::skills::SkillRegistry::discover(directory.path(), None);
+        let skills = tickloop_harness_policy::skills::SkillRegistry::builtin();
         tickloop_harness_tools::Tools::definitions()
             .into_iter()
             .chain([false, true].into_iter().flat_map(plan::definitions))

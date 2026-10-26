@@ -2,9 +2,9 @@
 
 use reqwest::header::HeaderValue;
 use serde_json::json;
+use tick_oauth::OAuthToken;
 use tick_oauth::{RefreshError, refresh, revoke};
 use tick_oauth_test_server::{AuthorizationServer, REVOCATION_PATH, TOKEN_PATH, TokenReply};
-use tick_packages::OAuthToken;
 
 use crate::support::{http, now};
 
