@@ -89,6 +89,9 @@ impl PreparedResourceCall {
         if sources.is_empty() {
             return Err("unknown or unavailable MCP resource server".into());
         }
+        if server.is_some() && sources.len() > 1 {
+            return Err("MCP resource server name is ambiguous".into());
+        }
         let skill = if let Some(target) = &uri {
             let definition = provider.remote_skills().into_iter().find(|definition| {
                 matches!(&definition.source, SkillSource::Remote {server_id, account_id, resources, ..} if sources.iter().any(|source| source.authority == tickloop_harness_protocol::HostToolAuthority::Mcp {server_id:server_id.clone(),account_id:account_id.clone()}) && resources.iter().any(|resource| &resource.uri == target))

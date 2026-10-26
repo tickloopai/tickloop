@@ -88,7 +88,7 @@ impl HostToolProvider for McpToolProvider {
                         .read()
                         .unwrap()
                         .as_ref()
-                        .is_some_and(|connection| connection.provides_resources)
+                        .is_some_and(|connection| connection.resources.is_some())
             })
             .map(|entry| McpResourceServer {
                 name: entry.config.name.clone(),
