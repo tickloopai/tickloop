@@ -506,7 +506,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
     let first = McpService::start().await;
     let second = McpService::start().await;
     first.set_tools(json!([{"name":"b__c","inputSchema":{"type":"object"}}]));
-    second.set_tools(json!([{"name":"c","inputSchema":{"type":"object"}}]));
+    second.set_tools(json!([{"name":"b_c","inputSchema":{"type":"object"}}]));
     let connections = McpConnections::new(
         HostCapabilities::default(),
         BTreeMap::new(),
@@ -529,7 +529,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
             McpServerConfig {
                 sensitive_values: Vec::new(),
                 disabled: false,
-                name: "a__b".into(),
+                name: "a_".into(),
                 source: "global".into(),
                 transport: McpTransport::Http {
                     url: second.url(),
@@ -562,7 +562,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
         ));
     }
     assert_eq!(first.calls()[0]["params"]["name"], "b__c");
-    assert_eq!(second.calls()[0]["params"]["name"], "c");
+    assert_eq!(second.calls()[0]["params"]["name"], "b_c");
     connections.shutdown().await;
 }
 

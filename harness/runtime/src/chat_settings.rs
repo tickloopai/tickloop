@@ -481,6 +481,18 @@ impl Agent {
                     "permission was already answered".into(),
                 ));
             }
+            let mcp_rule = match (&request.mcp_server, &specifier) {
+                (Some(server), Some(target)) => {
+                    if target != &request.name && target != &format!("mcp__{server}") {
+                        return Err(AgentError::Invalid(
+                            "MCP permission rule must name this tool or its server".into(),
+                        ));
+                    }
+                    Some(target.clone())
+                }
+                _ => None,
+            };
+            let specifier = if mcp_rule.is_some() { None } else { specifier };
             // A tool whose rules name one aspect of the call, such as the WebFetch domain, never
             // saves an exact-input rule.
             let specifier = specifier.or_else(|| {
@@ -503,7 +515,7 @@ impl Agent {
                     ));
                 }
             }
-            let input = specifier.is_none().then_some(request.input);
+            let input = (specifier.is_none() && mcp_rule.is_none()).then_some(request.input);
             let rule = PermissionRule {
                 id: tickloop_ids::generate(),
                 decision: if allow {
@@ -511,7 +523,7 @@ impl Agent {
                 } else {
                     Decision::Deny
                 },
-                tool: request.name,
+                tool: mcp_rule.unwrap_or(request.name),
                 specifier,
                 input,
                 loop_id: None,

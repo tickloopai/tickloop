@@ -9887,6 +9887,7 @@ mod tests {
     async fn direct_shell_permission_tracks_its_owner_without_a_pending_model_run() {
         let chat = Uuid::new_v4();
         let request = tickloop_harness::protocol::PermissionRequest {
+            mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
             execution: tickloop_harness::protocol::PermissionExecution::UserShell {

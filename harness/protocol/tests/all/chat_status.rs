@@ -60,6 +60,7 @@ fn busy_chat() -> ChatSnapshot {
     }))
     .unwrap();
     let permission = PermissionRequest {
+        mcp_server: None,
         id: id(0x70),
         loop_id: tickloop_ids::Id::from(id(0x10)),
         execution: PermissionExecution::ToolCall {

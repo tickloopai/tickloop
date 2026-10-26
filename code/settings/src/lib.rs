@@ -601,7 +601,14 @@ fn saved_project_rules(
         .filter_map(
             |(index, rule)| match serde_json::from_value::<SavedRule>(rule.clone()) {
                 Ok(rule) if !rule.tool.is_empty() && rule.decision != Decision::Check => {
-                    Some(PermissionRule::from(rule))
+                    let rule = PermissionRule::from(rule);
+                    if rule.tool.starts_with("mcp__")
+                        && let Err(error) = tickloop_harness::tools::permissions::validate_rule(&rule)
+                    {
+                        problems.push(format!("`{location}[{index}]` is ignored: {error}"));
+                        return None;
+                    }
+                    Some(rule)
                 }
                 Ok(_) => {
                     problems.push(format!(

@@ -349,3 +349,47 @@ fn servers_disabled_in_a_directory_stay_listed_as_disabled_there_only() {
     );
     assert!(disabled("/elsewhere").values().all(|disabled| !disabled));
 }
+
+#[test]
+fn user_server_names_cannot_contain_the_tool_separator() {
+    let result = resolve_servers(
+        &json!({"mcpServers": {
+        "team":{"command":"valid"}, "team__read":{"command":"must-not-run"}
+    }, "projects":{"/work":{"mcpServers":{"other__read":{"url":"https://example.com"}}}}}),
+        Path::new("/work"),
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        result
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["team"]
+    );
+    assert_eq!(result.warnings.len(), 2);
+    assert!(result.warnings.iter().all(|warning| warning.contains("__")));
+}
+
+#[test]
+fn plugin_service_names_collapse_underscore_runs_without_silently_replacing_a_service() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    let plugins = [PluginServers {
+        name: "demo".into(), root: "/plugins/demo".into(), data_directory: "/data/demo".into(), user_config: Default::default(),
+        entries: serde_json::from_value(json!({"read__notes":{"command":"first"},"read_notes":{"command":"second"},"read..all":{"command":"third"}})).unwrap(),
+    }];
+    let result =
+        resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &plugins);
+    let names = result
+        .servers
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["plugin_demo_read_all", "plugin_demo_read_notes"]);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("name") && warning.contains("plugin_demo_read_notes"))
+    );
+}

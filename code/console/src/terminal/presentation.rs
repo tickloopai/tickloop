@@ -3140,6 +3140,7 @@ mod tests {
             run,
             EventKind::PermissionRequested {
                 request: PermissionRequest {
+                    mcp_server: None,
                     id: Uuid::new_v4(),
                     loop_id: Uuid::nil().into(),
                     execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
@@ -3643,6 +3644,7 @@ mod tests {
         }))
         .unwrap();
         snapshot.permissions.push(PermissionRequest {
+            mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: loop_id.into(),
             execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
@@ -3728,6 +3730,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("note.txt");
         let request = PermissionRequest {
+            mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
             execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
@@ -4614,6 +4617,7 @@ mod tests {
             "\n● Read · /work/notes.md\n"
         );
         let request = PermissionRequest {
+            mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
             execution: tickloop_harness::protocol::PermissionExecution::ToolCall {
@@ -4635,6 +4639,7 @@ mod tests {
     fn permission_context_keeps_full_command_and_edit_content() {
         let command = format!("printf {} ; rm important.txt", "long".repeat(2000));
         let mut request = PermissionRequest {
+            mcp_server: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),
             execution: tickloop_harness::protocol::PermissionExecution::ToolCall {

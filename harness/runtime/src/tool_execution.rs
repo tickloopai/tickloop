@@ -1288,6 +1288,9 @@ impl Agent {
                     &operation,
                     permission_input,
                     delegation::HostCallPermission {
+                        mcp_server: prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.mcp_server()),
                         permission: host_permission,
                         local_read: prepared_host_call
                             .as_ref()
@@ -1425,8 +1428,14 @@ impl Agent {
                             receipt,
                             &operation,
                             session_operation.clone(),
-                            approval_source,
-                            approval_reason,
+                            super::PermissionPrompt {
+                                source: approval_source,
+                                reason: approval_reason,
+                                mcp_server: prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.mcp_server())
+                                    .map(str::to_owned),
+                            },
                             cancel.clone(),
                         )
                         .await?;
@@ -1481,6 +1490,9 @@ impl Agent {
                             .then_some(approval_source),
                         &policy,
                         assessment_details.as_ref(),
+                        prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.mcp_server()),
                     )
                     .finish(receipt.chat_id, &operation),
                 );
@@ -1565,6 +1577,9 @@ impl Agent {
                                     final_approval_source,
                                     &policy,
                                     assessment_details.as_ref(),
+                                    prepared_host_call
+                                        .as_ref()
+                                        .and_then(|call| call.mcp_server()),
                                 )
                                 .finish(receipt.chat_id, &operation),
                             );
@@ -1589,6 +1604,9 @@ impl Agent {
                                 final_approval_source,
                                 &policy,
                                 assessment_details.as_ref(),
+                                prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.mcp_server()),
                             )
                             .project_rules_unavailable()
                             .finish(receipt.chat_id, &operation);
@@ -1600,6 +1618,9 @@ impl Agent {
                                 &operation,
                                 permission_input,
                                 HostAdmission {
+                                    mcp_server: prepared_host_call
+                                        .as_ref()
+                                        .and_then(|call| call.mcp_server()),
                                     tool_name: &name,
                                     expected_task_binding: task_binding,
                                     session_evaluation: &session_evaluation,
@@ -1661,6 +1682,9 @@ impl Agent {
                                 final_approval_source,
                                 &current_policy,
                                 assessment_details.as_ref(),
+                                prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.mcp_server()),
                             )
                             .finish(receipt.chat_id, &operation);
                             return Err(ToolCallError::denied(error, record));
@@ -1990,6 +2014,7 @@ impl Agent {
                                         Some(PermissionApprovalSource::AutoReviewer),
                                         &policy,
                                         assessment_details.as_ref(),
+                                        None,
                                     )
                                     .finish(receipt.chat_id, &operation);
                                     return Err(ToolCallError::denied(reason, record));
@@ -2021,8 +2046,11 @@ impl Agent {
                                     receipt,
                                     &operation,
                                     session_operation.clone(),
-                                    approval_source,
-                                    approval_reason,
+                                    super::PermissionPrompt {
+                                        source: approval_source,
+                                        reason: approval_reason,
+                                        mcp_server: None,
+                                    },
                                     cancel.clone(),
                                 )
                                 .await?;
@@ -2076,6 +2104,7 @@ impl Agent {
                                 Some(approval_source),
                                 &policy,
                                 assessment_details.as_ref(),
+                                None,
                             )
                             .finish(receipt.chat_id, &operation),
                         );
@@ -2119,6 +2148,7 @@ impl Agent {
                                     Some(PermissionApprovalSource::AutoReviewer),
                                     &current_policy,
                                     assessment_details.as_ref(),
+                                    None,
                                 )
                                 .finish(receipt.chat_id, &operation);
                                 return Err(ToolCallError::denied(reason, record));
@@ -2141,6 +2171,7 @@ impl Agent {
                                 final_approval_source,
                                 &policy,
                                 assessment_details.as_ref(),
+                                None,
                             )
                             .project_rules_unavailable()
                             .finish(receipt.chat_id, &operation);
@@ -2172,6 +2203,7 @@ impl Agent {
                                 final_approval_source,
                                 &chat.snapshot.policy,
                                 assessment_details.as_ref(),
+                                None,
                             )
                             .finish(receipt.chat_id, &operation);
                             return Err(ToolCallError::denied(reason, record));
@@ -2192,6 +2224,7 @@ impl Agent {
                                 final_approval_source,
                                 &chat.snapshot.policy,
                                 assessment_details.as_ref(),
+                                None,
                             )
                             .finish(receipt.chat_id, &operation);
                             ToolCallError::denied(reason, record)
@@ -2228,6 +2261,7 @@ impl Agent {
                                 final_approval_source,
                                 &chat.snapshot.policy,
                                 assessment_details.as_ref(),
+                                None,
                             )
                             .finish(receipt.chat_id, &operation);
                             return Err(ToolCallError::denied(reason, record));
@@ -2256,6 +2290,7 @@ impl Agent {
                             &operation.input,
                             &chat.snapshot.policy,
                             super::denials::AllowedDecision {
+                                mcp_server: None,
                                 path: approval_path,
                                 direct_basis: if prepared.is_read_only {
                                     super::denials::DirectApprovalBasis::ReadOnly
@@ -2408,6 +2443,7 @@ impl Agent {
                         Some(PermissionApprovalSource::AutoReviewer),
                         policy,
                         Some(&assessment.details),
+                        None,
                     )
                     .finish(receipt.chat_id, operation);
                     return Err(ToolCallError::denied(reason, record));
@@ -2462,6 +2498,7 @@ impl Agent {
                             Some(PermissionApprovalSource::AutoReviewer),
                             policy,
                             Some(&assessment.details),
+                            None,
                         )
                         .finish(receipt.chat_id, operation);
                         return Err(ToolCallError::denied(reason, record));

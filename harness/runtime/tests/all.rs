@@ -79,3 +79,6 @@ mod native_task_auto;
 
 #[path = "all/mcp_servers.rs"]
 mod mcp_servers;
+
+#[path = "all/third_party_approval.rs"]
+mod third_party_approval;

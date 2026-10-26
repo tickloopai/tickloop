@@ -275,7 +275,13 @@ impl McpConnections {
             .into_iter()
             .map(|config| (config.name.clone(), config))
             .collect();
-        for config in configs.into_values() {
+        for mut config in configs.into_values() {
+            if !tickloop_harness_protocol::mcp::is_valid_mcp_server_name(&config.name) {
+                config.transport = McpTransport::Failed {
+                    reason: "invalid MCP server name: use letters, digits, _ and - without __"
+                        .into(),
+                };
+            }
             let (connector, credentials, credential, credential_failure) = match &config.transport {
                 McpTransport::Http { url, headers }
                     if !headers
@@ -544,10 +550,7 @@ impl McpConnections {
         }
         for (entry, _, tool) in &mut tools {
             if counts[&tool.definition.name] > 1 {
-                tool.definition.name = catalog::hashed_name(
-                    &tool.definition.name,
-                    &format!("{}\0{}", entry.config.name, tool.original),
-                );
+                tool.definition.name = catalog::hashed_name(&entry.config.name, &tool.original);
             }
         }
         tools

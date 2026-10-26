@@ -89,3 +89,33 @@ pub struct McpOAuthConfig {
     #[serde(rename = "authServerMetadataUrl")]
     pub authorization_server_metadata_url: Option<String>,
 }
+
+/// A resolved service name cannot contain the separator used in model tool names.
+pub fn is_valid_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("__")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Normalizes one name component, preserving the separators added by the tool naming layer.
+pub fn normalize_mcp_name_component(name: &str) -> String {
+    let mut normalized = String::new();
+    for character in name.chars() {
+        let character = if character.is_ascii_alphanumeric() || character == '-' {
+            character
+        } else {
+            '_'
+        };
+        if character != '_' || !normalized.ends_with('_') {
+            normalized.push(character);
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        "unnamed".into()
+    } else {
+        normalized.into()
+    }
+}

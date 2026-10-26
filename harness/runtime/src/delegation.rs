@@ -98,6 +98,7 @@ mod ancestry_authority_tests {
                 &operation,
                 &input,
                 HostCallPermission {
+                    mcp_server: None,
                     permission: Some(crate::host_tools::HostToolPermission::Classified {
                         allow_rule_bypasses_review: false,
                     }),
@@ -475,6 +476,7 @@ pub(super) fn effective_policy(
 /// local file it sends, whose `Read` approval the call also needs.
 #[derive(Clone, Copy)]
 pub(super) struct HostCallPermission<'a> {
+    pub(super) mcp_server: Option<&'a str>,
     pub(super) permission: Option<crate::host_tools::HostToolPermission>,
     pub(super) local_read: Option<&'a PreparedTool>,
 }
@@ -497,11 +499,20 @@ pub(super) fn host_authority(
     let HostCallPermission {
         permission,
         local_read,
+        mcp_server,
     } = host_call;
     let policy = effective_policy(chats, receipt)?;
     let decide = |policy: &tickloop_harness_protocol::PermissionPolicy, loop_id, session, human| {
-        let explicit =
-            policy.explicit_rule_match(&operation.name, permission_input, loop_id, session);
+        let explicit = match mcp_server {
+            Some(server) => policy.explicit_mcp_rule_match(
+                &operation.name,
+                server,
+                permission_input,
+                loop_id,
+                session,
+            ),
+            None => policy.explicit_rule_match(&operation.name, permission_input, loop_id, session),
+        };
         (
             host_tool_decision(explicit, permission, policy.mode, human),
             explicit.is_some_and(|matched| {

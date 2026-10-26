@@ -51,6 +51,7 @@ pub struct PreparedHostCall {
     payload: Option<Box<dyn Any + Send + Sync>>,
     artifact_account: Option<ArtifactAccountContext>,
     policy_identity: Option<HostPolicyIdentity>,
+    mcp_server: Option<String>,
     approval_facts: tickloop_harness_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_harness_tools::PreparedTool, bool)>,
 }
@@ -88,8 +89,18 @@ impl PreparedHostCall {
             payload: None,
             artifact_account: None,
             policy_identity: None,
+            mcp_server: None,
             local_read: None,
         }
+    }
+
+    pub(crate) fn with_mcp_server(mut self, server: String) -> Self {
+        self.mcp_server = Some(server);
+        self
+    }
+
+    pub(crate) fn mcp_server(&self) -> Option<&str> {
+        self.mcp_server.as_deref()
     }
 
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {

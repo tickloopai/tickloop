@@ -56,7 +56,7 @@ fn resolve(root: &Path, name: &str) -> Result<McpServerConfig, String> {
         let (plugin, server) = plugin
             .split_once(':')
             .ok_or("use plugin:<plugin>:<server>")?;
-        format!("plugin_{plugin}_{server}")
+        tickloop_code_settings::mcp::plugin_server_name(plugin, server)
     } else {
         name.to_owned()
     };

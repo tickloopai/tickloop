@@ -1006,8 +1006,11 @@ impl Agent {
                 receipt,
                 &request_operation,
                 session_operation,
-                PermissionApprovalSource::ExplicitAsk,
-                Some("Approve the reviewed plan and choose an execution mode".into()),
+                super::PermissionPrompt {
+                    source: PermissionApprovalSource::ExplicitAsk,
+                    reason: Some("Approve the reviewed plan and choose an execution mode".into()),
+                    mcp_server: None,
+                },
                 cancel.clone(),
             )
             .await?;
