@@ -575,3 +575,27 @@ fn plugins_command_and_ticks_alias_open_the_plugins_panel() {
     terminal.press(ESCAPE, "closed alias", |frame| !frame.contains("Plugins ·"));
     terminal.exit();
 }
+
+#[test]
+fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("notes");
+    fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
+    fs::write(directory.join(".claude-plugin/plugin.json"),
+        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}}}"#).unwrap();
+    install_path(&fixture, &directory);
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
+        row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
+            && frame.contains("Not supported yet: MCP")
+    });
+    terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
+    terminal.press(b"\r", "disabled", |frame| row_shows(frame, "notes", "local · disabled · 1.0.0 · no login needed"));
+    terminal.press(b"\r", "enable action", |frame| frame.contains("❯ Enable"));
+    terminal.press(b"\r", "enabled", |frame| row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed"));
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@local  1.0.0  enabled"));
+}

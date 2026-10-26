@@ -45,6 +45,7 @@ pub(super) enum TickPackageRequest {
     /// Installs or updates to the version the marketplace offers.
     Install(MarketplacePackage),
     Uninstall(String),
+    SetEnabled { name: String, enabled: bool },
     /// Logs the package in at `issuer` with an OAuth device authorization the user approves;
     /// the panel numbers each `attempt` as it starts, and its results carry the number.
     LogIn {
@@ -98,6 +99,11 @@ pub(super) enum TickPackageResult {
     Uninstallation {
         name: String,
         result: Result<Uninstalled, String>,
+    },
+    Enabled {
+        name: String,
+        enabled: bool,
+        result: Result<(), String>,
     },
     Logout {
         name: String,
@@ -177,6 +183,10 @@ impl TickPackageResult {
                 result: Err(error),
                 ..
             } => Notice::failure(format!("Cannot log in to {name}: {error}")),
+            Self::Enabled { name, enabled, result } => match result {
+                Ok(()) => Notice::success(format!("{} {name}", if *enabled { "Enabled" } else { "Disabled" })),
+                Err(error) => Notice::failure(format!("Cannot {} {name}: {error}", if *enabled { "enable" } else { "disable" })),
+            },
             Self::KeySaved {
                 name,
                 result: Ok(()),
@@ -432,7 +442,8 @@ impl TicksPanel {
             TickPackageResult::Installation { .. }
             | TickPackageResult::Uninstallation { .. }
             | TickPackageResult::Logout { .. }
-            | TickPackageResult::KeySaved { .. } => self.busy = None,
+            | TickPackageResult::KeySaved { .. }
+            | TickPackageResult::Enabled { .. } => self.busy = None,
         }
         for page in [INSTALLED_PAGE, MARKETPLACE_PAGE] {
             let count = self.entry_count(page);
@@ -678,6 +689,7 @@ impl TicksPanel {
                 Some(_) => format!("Replacing {} with {}…", package.name, package.version),
                 None => format!("Installing {} {}…", package.name, package.version),
             },
+            TickPackageRequest::SetEnabled { name, enabled } => format!("{} {name}…", if *enabled { "Enabling" } else { "Disabling" }),
             TickPackageRequest::Uninstall(name) => format!("Uninstalling {name}…"),
             TickPackageRequest::LogIn { name, .. } => format!("Logging in to {name}…"),
             TickPackageRequest::SaveKey { name, .. } => format!("Saving the key for {name}…"),
@@ -802,6 +814,10 @@ impl TicksPanel {
                     ));
                 }
                 options.push((
+                    if package.enabled { "Disable" } else { "Enable" }.to_owned(),
+                    Choice::Run(TickPackageRequest::SetEnabled { name: name.clone(), enabled: !package.enabled }),
+                ));
+                options.push((
                     "Uninstall".to_owned(),
                     Choice::ConfirmUninstall {
                         name: name.clone(),
@@ -923,7 +939,7 @@ impl TicksPanel {
                 .map(|(index, entry)| {
                     let (details, glyph_role) = match entry {
                         InstalledEntry::Usable { package, login } => (
-                            format!("{} · {}", package.version, login_label(*login)),
+                            format!("{} · {} · {} · {}", package.marketplace, if package.enabled { "enabled" } else { "disabled" }, package.version, login_label(*login)),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
@@ -931,10 +947,17 @@ impl TicksPanel {
                             },
                         ),
                         InstalledEntry::Unusable(package) => {
-                            (format!("{} · unusable", package.version), Role::Error)
+                            (format!("{} · {} · unusable; reinstall", package.marketplace, package.version), Role::Error)
                         }
                     };
-                    (index, row(index, entry.name(), details, glyph_role))
+                    let mut lines = row(index, entry.name(), details, glyph_role);
+                    if let InstalledEntry::Usable { package, .. } = entry {
+                        let unsupported = package.manifest.unsupported();
+                        if !unsupported.is_empty() {
+                            lines.push(RoleLine::role(format!("  Not supported yet: {}", unsupported.iter().map(|component| component.label()).collect::<Vec<_>>().join(", ")), Role::Warning));
+                        }
+                    }
+                    (index, lines)
                 })
                 .collect();
         }
@@ -1142,7 +1165,7 @@ impl TicksPanel {
             (INSTALLED_PAGE, Listing::Loading, _) => ("Loading…".to_owned(), Role::MutedText),
             (INSTALLED_PAGE, Listing::Failed(error), _) => (safe_line(error), Role::Error),
             (INSTALLED_PAGE, Listing::Loaded(_), _) => (
-                "No Tick packages are installed; the Marketplace page offers them.".to_owned(),
+                "No plugins are installed; the Available page offers them.".to_owned(),
                 Role::MutedText,
             ),
             (_, _, Listing::Loading) => {

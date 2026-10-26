@@ -139,6 +139,15 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                 (panel, TickPackageResult::Installation { name, result })
             });
         }
+        TickPackageRequest::SetEnabled { name, enabled } => {
+            tasks.spawn(async move {
+                let result = blocking({
+                    let name = name.clone();
+                    move || store.set_enabled(&name, enabled).map(|_| ()).map_err(|error| error.to_string())
+                }).await;
+                (panel, TickPackageResult::Enabled { name, enabled, result })
+            });
+        }
         TickPackageRequest::Uninstall(name) => {
             tasks.spawn(async move {
                 let result = blocking({
@@ -269,6 +278,7 @@ pub(super) fn finish(
         &result,
         TickPackageResult::Installation { result: Ok(_), .. }
             | TickPackageResult::Uninstallation { result: Ok(_), .. }
+            | TickPackageResult::Enabled { result: Ok(_), .. }
     );
     let changed_login = match &result {
         TickPackageResult::Logout { name, .. }
