@@ -11,7 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-tickloop-harness = { path = "../../harness/sdk" }
+tickloop-harness = { path = "../../harness/sdk", features = ["base"] }
 anyhow = "1"
 flate2 = "1"
 libc = "0.2"

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { checkBoundaries } from "./check-boundaries.mjs";
+
+test("the real workspace keeps the cron and transcript facade free of base and image dependencies", () => {
+  assert.match(execFileSync(process.execPath, [fileURLToPath(new URL("./check-boundaries.mjs", import.meta.url))], { encoding: "utf8" }), /Workspace dependency boundaries passed/);
+});
 
 function metadata(edges) {
   const names = [...new Set(edges.flatMap(([from, to]) => [from, to]))];

@@ -39,6 +39,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const policy = JSON.parse(readFileSync(new URL("./dependency-boundaries.json", import.meta.url), "utf8"));
   const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--locked", "--no-deps", "--format-version", "1"], { cwd: root, encoding: "utf8" }));
   const failures = checkBoundaries(metadata, policy);
+  const lightweightTree = execFileSync("cargo", ["tree", "--locked", "-p", "tickloop-harness", "--no-default-features", "-F", "cron,transcript", "-e", "normal", "--prefix", "none", "--format", "{p}"], { cwd: root, encoding: "utf8" });
+  const lightweightPackages = new Set(lightweightTree.trim().split("\n").map(line => line.split(" ")[0]));
+  for (const name of ["tickloop-harness-base", "image", "system-configuration"]) {
+    if (lightweightPackages.has(name)) failures.push(`Lightweight Harness (cron,transcript) must not depend on ${name}`);
+  }
   if (failures.length) {
     console.error(failures.join("\n"));
     process.exitCode = 1;

@@ -12,18 +12,19 @@ doctest = false
 
 [features]
 default = []
-engine = ["policy", "dep:tickloop-harness-runtime", "tools", "model", "transcript", "cron", "artifacts"]
-tools = ["dep:tickloop-harness-tools"]
-policy = ["dep:tickloop-harness-policy"]
-model = ["dep:tickloop-harness-model"]
+base = ["dep:tickloop-harness-base"]
+engine = ["base", "policy", "dep:tickloop-harness-runtime", "tools", "model", "transcript", "cron", "artifacts"]
+tools = ["base", "dep:tickloop-harness-tools"]
+policy = ["base", "dep:tickloop-harness-policy"]
+model = ["base", "dep:tickloop-harness-model"]
 transcript = ["dep:tickloop-harness-transcript"]
 cron = ["dep:tickloop-harness-cron"]
-artifacts = ["dep:tickloop-harness-artifacts"]
+artifacts = ["base", "dep:tickloop-harness-artifacts"]
 test-support = ["engine", "dep:tickloop-harness-test-support"]
 
 [dependencies]
 tickloop-harness-policy = { path = "../policy", optional = true }
-tickloop-harness-base = { path = "../base" }
+tickloop-harness-base = { path = "../base", optional = true }
 tickloop-harness-protocol = { path = "../protocol" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-harness-runtime = { path = "../runtime", optional = true }
