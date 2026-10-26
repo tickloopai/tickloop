@@ -223,8 +223,6 @@ pub fn needs_user_config(value: &Value) -> bool {
 
 #[derive(Deserialize)]
 struct Entry {
-    #[serde(rename = "type")]
-    kind: Option<String>,
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
@@ -236,6 +234,19 @@ struct Entry {
     headers: BTreeMap<String, String>,
 }
 
+/// The declared transport, including the same inference used when connecting.
+pub fn transport_kind(entry: &Value) -> Result<&str, &'static str> {
+    match entry.get("type") {
+        Some(Value::String(kind)) => Ok(kind),
+        None | Some(Value::Null) => Ok(if entry["command"].is_string() {
+            "stdio"
+        } else {
+            "http"
+        }),
+        Some(_) => Err("invalid MCP transport type"),
+    }
+}
+
 fn parse_transport(
     value: &Value,
     directory: &Path,
@@ -244,11 +255,7 @@ fn parse_transport(
     let entry: Entry = serde_json::from_value(value.clone())
         .map_err(|_| "invalid MCP server fields".to_owned())?;
     let expand = |text: &str| expand_variables(text, environment);
-    let kind = entry.kind.as_deref().unwrap_or(if entry.command.is_some() {
-        "stdio"
-    } else {
-        "http"
-    });
+    let kind = transport_kind(value)?;
     match kind {
         "stdio" => {
             let command = expand(

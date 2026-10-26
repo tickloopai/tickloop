@@ -224,6 +224,15 @@ async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_req
                 .any(|t| t.name.contains("duplicate") || t.name.contains("_config__"))
         );
     }
+    {
+        let requests = scripted.requests.lock().unwrap();
+        let context = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(
+            context.contains("plugin_alpha_duplicate skipped"),
+            "deduplication must be visible to the model"
+        );
+        assert!(context.contains("autoApprove ignored"));
+    }
     scripted.enqueue(call("alpha", "mcp__plugin_alpha_shared__probe", json!({})));
     scripted.enqueue(text("done"));
     agent
@@ -261,6 +270,28 @@ async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_req
     .await
     .unwrap();
     assert_eq!(alpha.calls().len(), 1);
+    let settings_path = canonical.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    settings["mcpServers"]["mine"] = json!({"url":alpha.url()});
+    std::fs::write(settings_path, settings.to_string()).unwrap();
+    scripted.enqueue(text("configuration changed"));
+    complete(&agent, chat, "Report the updated services").await;
+    {
+        let requests = scripted.requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert!(
+            !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__plugin_alpha_shared__probe")
+        );
+        assert!(
+            serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains("plugin_alpha_shared skipped: same command or URL as mine")
+        );
+    }
     store.set_enabled("alpha", false).unwrap();
     store.uninstall("beta", true).unwrap();
     scripted.enqueue(text("disabled"));

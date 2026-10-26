@@ -443,7 +443,7 @@ fn mcp_validation_install_and_enable_disclose_services_without_running_them() {
         "mcp",
         json!({"name":"mcp", "mcpServers":{
             "local":{"command":"example-server", "args":["--serve"]},
-            "remote":{"url":"https://example.com/mcp"},
+            "remote":{"command":null,"url":"https://example.com/mcp"},
             "config":{"command":"example", "args":["${user_config.key}"]},
             "legacy":{"type":"sse", "url":"https://example.com/sse"}
         }}),
@@ -481,4 +481,55 @@ fn mcp_validation_install_and_enable_disclose_services_without_running_them() {
         "{output}"
     );
     assert!(output.contains("run as your user"), "{output}");
+}
+
+#[test]
+fn mcp_install_and_enable_report_duplicates_against_all_enabled_sources() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join("config")).unwrap();
+    fs::write(fixture.root.join("config/settings.json"), json!({
+        "mcpServers":{"mine":{"url":"https://old.example/mcp"}},
+        "projects":{path_text(&fixture.root):{"mcpServers":{"mine":{"url":"https://example.com/mcp"}}}}
+    }).to_string()).unwrap();
+    let alpha = claude_plugin(
+        &fixture,
+        "alpha",
+        json!({"name":"alpha", "mcpServers":{"local":{"command":"shared-server"}}}),
+        &[],
+    );
+    succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&alpha)],
+    ));
+    let zeta = claude_plugin(
+        &fixture,
+        "zeta",
+        json!({"name":"zeta", "mcpServers":{
+            "local":{"command":"shared-server"}, "remote":{"url":"https://example.com/mcp"}
+        }}),
+        &[],
+    );
+    let installed = succeeded(&plugin(&fixture, &["install", "--path", &path_text(&zeta)]));
+    for text in [
+        "plugin_zeta_local skipped: same command or URL as plugin_alpha_local",
+        "plugin_zeta_remote skipped: same command or URL as mine",
+    ] {
+        assert!(installed.contains(text), "{installed}");
+    }
+    assert_eq!(
+        installed.matches("status: skipped duplicate").count(),
+        2,
+        "{installed}"
+    );
+    succeeded(&plugin(&fixture, &["disable", "alpha"]));
+    succeeded(&plugin(&fixture, &["disable", "zeta"]));
+    let enabled = succeeded(&plugin(&fixture, &["enable", "zeta"]));
+    assert_eq!(
+        enabled.matches("status: skipped duplicate").count(),
+        1,
+        "{enabled}"
+    );
+    assert!(enabled.contains("plugin_zeta_local | transport: stdio | command: [\"shared-server\"] | OAuth: none | userConfig: none | status: ready"));
+    let validated = succeeded(&plugin(&fixture, &["validate", &path_text(&zeta)]));
+    assert!(!validated.contains("skipped duplicate"), "{validated}");
 }

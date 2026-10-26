@@ -4,7 +4,7 @@ mod process;
 mod provider;
 use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
-pub use provider::McpToolProvider;
+pub use provider::{McpConfiguration, McpToolProvider};
 use rmcp::{
     ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
