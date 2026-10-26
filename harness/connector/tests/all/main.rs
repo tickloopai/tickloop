@@ -1,3 +1,4 @@
+mod addresses;
 mod clients;
 mod login;
 mod login_ending;

@@ -34,7 +34,6 @@ use tickloop_harness_protocol::{ModelAuthSource, ModelConfig};
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language.retriever";
 const REFRESH_SKEW_MS: u64 = 60_000;
-const BROWSER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct GoogleAuth {
@@ -210,7 +209,11 @@ impl GoogleAuth {
                 authorization_url: url.into(),
                 callback_uri,
                 verifier,
-                callback: listener.receive(state, super::BROWSER_CALLBACK_PAGES, BROWSER_TIMEOUT),
+                callback: listener.receive(
+                    state,
+                    super::BROWSER_CALLBACK_PAGES,
+                    super::BROWSER_TIMEOUT,
+                ),
             },
         })
     }

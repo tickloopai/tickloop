@@ -12,9 +12,12 @@ mod login;
 mod tokens;
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use reqwest::Url;
+use tickloop_harness_base::network::is_loopback;
+use tokio_util::sync::CancellationToken;
 
 pub use credentials::{
     ClientRegistration, ConnectorCredential, ConnectorCredentials, CredentialError, CredentialLock,
@@ -40,7 +43,7 @@ pub struct OAuthSettings {
 pub enum ConfigurationError {
     #[error("the MCP server address must use https, or http on this machine")]
     ServerAddress,
-    #[error("the authorization server metadata address must use https")]
+    #[error("the authorization server metadata address must use https, or http on this machine")]
     MetadataAddress,
     #[error("the OAuth client id must not be empty")]
     ClientId,
@@ -100,13 +103,31 @@ impl Connector {
         {
             return Err(ConfigurationError::ClientId);
         }
+        let configured_on_this_machine =
+            is_loopback(&server_url) || metadata_url.as_ref().is_some_and(is_loopback);
         Ok(Self {
             server_url,
             settings,
             metadata_url,
             credentials,
-            http: http::PolicyClient::new(),
+            http: http::PolicyClient::new(configured_on_this_machine),
         })
+    }
+}
+
+/// The operation stopped because its cancellation token fired.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cancelled;
+
+/// Runs `future` unless `cancellation` fires first.
+pub(crate) async fn cancellable<T>(
+    cancellation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, Cancelled> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(Cancelled),
+        value = future => Ok(value),
     }
 }
 

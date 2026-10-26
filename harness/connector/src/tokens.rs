@@ -8,10 +8,11 @@ use tick_oauth::{OAuthToken, RefreshError};
 use tokio_util::sync::CancellationToken;
 
 use crate::credentials::{ConnectorCredential, CredentialError};
-use crate::login::{LoginError, cancellable};
-use crate::{AccessToken, Connector};
+use crate::{AccessToken, Cancelled, Connector, cancellable};
 
 const RENEWAL_MARGIN: Duration = Duration::from_secs(30);
+/// The refusal that ends a login (RFC 6749 section 5.2); other refusals may pass later.
+const INVALID_GRANT: &str = "invalid_grant";
 
 /// Why no access token is available. The texts never include server responses or tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -40,24 +41,29 @@ pub enum Logout {
     NotLoggedIn,
 }
 
-impl From<LoginError> for TokenError {
-    fn from(error: LoginError) -> Self {
-        match error {
-            LoginError::Credentials(error) => Self::Credentials(error),
-            _ => Self::Cancelled,
-        }
+impl From<Cancelled> for TokenError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
     }
 }
 
 impl Connector {
-    /// The token to send, renewed first when it expires within 30 seconds.
+    /// The token to send, renewed first when it expires within 30 seconds. An expired token
+    /// that cannot be renewed needs a new login.
     pub async fn access_token(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<AccessToken, TokenError> {
         let token = self.saved_token(cancellation).await?;
-        if !expires_soon(&token) || token.refresh_token().is_none() {
+        if !expires_soon(&token) {
             return Ok(AccessToken(token.access_token));
+        }
+        if token.refresh_token().is_none() {
+            return if now_seconds() < token.expires_at {
+                Ok(AccessToken(token.access_token))
+            } else {
+                Err(TokenError::NeedsLogin)
+            };
         }
         self.renew(&token.access_token, cancellation).await
     }
@@ -83,17 +89,18 @@ impl Connector {
         let Some(token) = credential.token.take() else {
             return Ok(Logout::NotLoggedIn);
         };
-        let outcome = if token.revocation_endpoint.is_none() {
-            Logout::NotRevocable
-        } else {
-            match cancellable(
-                cancellation,
-                tick_oauth::revoke(self.token_client(&token), &token),
-            )
-            .await?
-            {
-                Ok(()) => Logout::Revoked,
-                Err(_) => Logout::RevocationFailed,
+        let revocation_client = token
+            .revocation_endpoint
+            .as_deref()
+            .map(|endpoint| self.http.client_for(endpoint));
+        let outcome = match revocation_client {
+            None => Logout::NotRevocable,
+            Some(None) => Logout::RevocationFailed,
+            Some(Some(client)) => {
+                match cancellable(cancellation, tick_oauth::revoke(client, &token)).await? {
+                    Ok(()) => Logout::Revoked,
+                    Err(_) => Logout::RevocationFailed,
+                }
             }
         };
         self.credentials.save(&credential).await?;
@@ -135,8 +142,12 @@ impl Connector {
             self.forget_token(credential).await?;
             return Err(TokenError::NeedsLogin);
         };
+        let client = self
+            .http
+            .client_for(&token.token_endpoint)
+            .ok_or(TokenError::RenewalFailed)?;
         let renewal = tick_oauth::refresh_for_resource(
-            self.token_client(&token),
+            client,
             &token,
             &refresh_token,
             resource.as_deref(),
@@ -150,7 +161,7 @@ impl Connector {
                 self.credentials.save(&credential).await?;
                 Ok(AccessToken(access_token))
             }
-            Err(RefreshError::Refused(_)) => {
+            Err(RefreshError::Refused(code)) if code == INVALID_GRANT => {
                 let reread = self.credentials.load().await?;
                 if let Some(current) = self.token_of(reread.clone())
                     && current.refresh_token() != Some(refresh_token.as_str())
@@ -160,7 +171,9 @@ impl Connector {
                 self.forget_token(reread).await?;
                 Err(TokenError::NeedsLogin)
             }
-            Err(RefreshError::Failed(_)) => Err(TokenError::RenewalFailed),
+            Err(RefreshError::Refused(_) | RefreshError::Failed(_)) => {
+                Err(TokenError::RenewalFailed)
+            }
         }
     }
 
@@ -175,11 +188,6 @@ impl Connector {
             }
             _ => Ok(()),
         }
-    }
-
-    fn token_client(&self, token: &OAuthToken) -> &reqwest::Client {
-        let address = reqwest::Url::parse(&token.token_endpoint).unwrap_or(self.server_url.clone());
-        self.http.for_address(&address)
     }
 }
 

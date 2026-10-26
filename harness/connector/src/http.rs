@@ -1,5 +1,7 @@
 //! The HTTP client every OAuth request of a Connector goes through: the Harness HTTP policy
-//! (TLS, proxies, no redirects), https only except on this machine, and bounded responses.
+//! (TLS, proxies, no redirects), bounded responses, and https only. This machine is reachable
+//! only when the configuration itself points there, so a remote server's metadata cannot send
+//! requests to local services.
 
 use futures_util::StreamExt;
 use reqwest::{Client, Url, redirect::Policy};
@@ -12,16 +14,20 @@ use tickloop_harness_base::network::{HttpPolicy, build_http_client, is_loopback}
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+/// Sample targets that choose each client's proxy route: remote addresses may use proxies,
+/// this machine never does.
+const REMOTE_ROUTE: &str = "https://mcp.invalid/";
+const THIS_MACHINE_ROUTE: &str = "http://127.0.0.1/";
 
 #[derive(Debug, thiserror::Error)]
 enum RefusedRequest {
-    #[error("only https addresses, or http on this machine, are accepted")]
-    Insecure,
+    #[error("the address is not allowed for this server's login")]
+    Address,
     #[error("the response is larger than allowed")]
     TooLarge,
 }
 
-/// `url` may be requested: https, or http to this machine, without user information.
+/// `url` may be configured: https, or http to this machine, without user information.
 pub(crate) fn is_allowed_address(url: &Url) -> bool {
     let secure = url.scheme() == "https" || url.scheme() == "http" && is_loopback(url);
     secure && url.username().is_empty() && url.password().is_none() && url.host_str().is_some()
@@ -31,10 +37,13 @@ pub(crate) fn is_allowed_address(url: &Url) -> bool {
 pub(crate) struct PolicyClient {
     remote: Client,
     loopback: Client,
+    reaches_this_machine: bool,
 }
 
 impl PolicyClient {
-    pub(crate) fn new() -> Self {
+    /// `reaches_this_machine` when a configured address is on this machine; otherwise every
+    /// request must go to a remote https address.
+    pub(crate) fn new(reaches_this_machine: bool) -> Self {
         let build = |target: &str| {
             let mut policy = HttpPolicy::new(Policy::none());
             policy.timeout = Some(HTTP_TIMEOUT);
@@ -44,28 +53,46 @@ impl PolicyClient {
                 .0
         };
         Self {
-            remote: build("https://mcp.invalid/"),
-            loopback: build("http://127.0.0.1/"),
+            remote: build(REMOTE_ROUTE),
+            loopback: build(THIS_MACHINE_ROUTE),
+            reaches_this_machine,
         }
     }
 
-    /// The client for requests to `url`, which bypasses proxies only on this machine.
-    pub(crate) fn for_address(&self, url: &Url) -> &Client {
+    fn permits(&self, url: &Url) -> bool {
+        if !is_allowed_address(url) {
+            return false;
+        }
         if is_loopback(url) {
+            self.reaches_this_machine
+        } else {
+            url.scheme() == "https"
+        }
+    }
+
+    /// The client for requests to `endpoint`, when the policy permits them; it bypasses proxies
+    /// only on this machine.
+    pub(crate) fn client_for(&self, endpoint: &str) -> Option<&Client> {
+        let url = Url::parse(endpoint).ok()?;
+        self.permitted_client(&url).ok()
+    }
+
+    fn permitted_client(&self, url: &Url) -> Result<&Client, OAuthHttpClientError> {
+        if !self.permits(url) {
+            return Err(Box::new(RefusedRequest::Address));
+        }
+        Ok(if is_loopback(url) {
             &self.loopback
         } else {
             &self.remote
-        }
+        })
     }
 
     pub(crate) async fn get_bounded(
         &self,
         url: &Url,
     ) -> Result<(u16, Vec<u8>), OAuthHttpClientError> {
-        if !is_allowed_address(url) {
-            return Err(Box::new(RefusedRequest::Insecure));
-        }
-        let response = self.for_address(url).get(url.clone()).send().await?;
+        let response = self.permitted_client(url)?.get(url.clone()).send().await?;
         let status = response.status().as_u16();
         Ok((status, read_bounded(response).await?))
     }
@@ -89,11 +116,9 @@ impl OAuthHttpClient for PolicyClient {
         let request = request.request;
         Box::pin(async move {
             let url = Url::parse(&request.uri().to_string())?;
-            if !is_allowed_address(&url) {
-                return Err(Box::new(RefusedRequest::Insecure) as OAuthHttpClientError);
-            }
+            let client = self.permitted_client(&url)?;
             let request = reqwest::Request::try_from(request)?;
-            let response = self.for_address(&url).execute(request).await?;
+            let response = client.execute(request).await?;
             let mut builder = http::Response::builder()
                 .status(response.status())
                 .version(response.version());
@@ -103,5 +128,40 @@ impl OAuthHttpClient for PolicyClient {
             let body = read_bounded(response).await?;
             Ok(builder.body(body)?)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH};
+
+    use super::*;
+
+    /// Every request, including the OAuth requests of discovery, registration and the code
+    /// exchange, goes through the same check as these.
+    #[tokio::test]
+    async fn a_remote_servers_login_never_requests_this_machine() {
+        let local = AuthorizationServer::start();
+        let metadata = Url::parse(&format!("{}{METADATA_PATH}", local.issuer())).unwrap();
+        let remote_login = PolicyClient::new(false);
+
+        assert!(remote_login.get_bounded(&metadata).await.is_err());
+        assert!(remote_login.client_for(metadata.as_str()).is_none());
+        assert!(remote_login.client_for("https://localhost/token").is_none());
+        assert!(
+            remote_login
+                .client_for("http://auth.example.test/token")
+                .is_none()
+        );
+        assert!(
+            remote_login
+                .client_for("https://auth.example.test/token")
+                .is_some()
+        );
+        assert!(local.requests().is_empty());
+
+        let local_login = PolicyClient::new(true);
+        let (status, _) = local_login.get_bounded(&metadata).await.unwrap();
+        assert_eq!(status, 200);
     }
 }

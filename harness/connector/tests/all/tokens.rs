@@ -168,6 +168,29 @@ async fn logout_revokes_the_refresh_token_and_forgets_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_other_than_invalid_grant_keeps_the_login() {
+    let fixture = Fixture::new();
+    fixture.log_in().await;
+    let rejected = fixture
+        .connector
+        .access_token(&fixture.cancellation)
+        .await
+        .unwrap();
+    fixture
+        .server
+        .answer_polls([TokenReply::Error(400, "invalid_request".into())]);
+
+    assert_eq!(
+        fixture
+            .connector
+            .renew_rejected(&rejected, &fixture.cancellation)
+            .await,
+        Err(TokenError::RenewalFailed)
+    );
+    assert!(fixture.credentials.current().unwrap().token.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_revocation_still_logs_out() {
     let fixture = Fixture::new();
     fixture.log_in().await;

@@ -3,7 +3,6 @@
 //! comes back through the loopback callback or a pasted redirect address.
 
 use std::fmt;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,9 +18,9 @@ use tickloop_harness_base::oauth_callback::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::Connector;
 use crate::credentials::{ClientRegistration, ConnectorCredential, CredentialError};
 use crate::tokens::now_seconds;
+use crate::{Cancelled, Connector, cancellable};
 
 const CLIENT_NAME: &str = "Tickloop";
 const CALLBACK_PATH: &str = "/callback";
@@ -43,11 +42,10 @@ const CALLBACK_PAGES: CallbackPages = CallbackPages {
 pub enum LoginError {
     #[error("the login was cancelled")]
     Cancelled,
-    #[error("the login timed out after 5 minutes")]
+    #[error("the login timed out after {} minutes", LOGIN_TIMEOUT.as_secs() / 60)]
     TimedOut,
-    #[error(
-        "the callback port {0} on 127.0.0.1 is already in use; free it or set another oauth.callbackPort"
-    )]
+    /// The port given, or 0 when no free port was found.
+    #[error("{}", unavailable_port(*.0))]
     CallbackPortUnavailable(u16),
     #[error("the authorization was denied")]
     Denied,
@@ -67,6 +65,22 @@ pub enum LoginError {
     TokenExchange,
     #[error(transparent)]
     Credentials(#[from] CredentialError),
+}
+
+impl From<Cancelled> for LoginError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+fn unavailable_port(port: u16) -> String {
+    if port == 0 {
+        "no free callback port on 127.0.0.1 is available".to_owned()
+    } else {
+        format!(
+            "the callback port {port} on 127.0.0.1 is already in use; free it or set another oauth.callbackPort"
+        )
+    }
 }
 
 /// A login waiting for the user to approve it in a browser. Dropping it cancels the login and
@@ -104,8 +118,8 @@ impl PendingLogin {
         self.callback.paste()
     }
 
-    /// Waits up to 5 minutes from the start for the callback or the pasted address, exchanges
-    /// the code, and saves the token.
+    /// Waits for the callback or the pasted address until the login timeout, counted from when
+    /// the authorization URL was ready, then exchanges the code and saves the token.
     pub async fn finish(mut self, cancellation: &CancellationToken) -> Result<(), LoginError> {
         let response = self
             .callback
@@ -190,11 +204,14 @@ impl Connector {
         challenge: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<PendingLogin, LoginError> {
-        let mut manager = AuthorizationManager::new_with_oauth_http_client(
-            self.server_url.clone(),
-            Arc::new(self.http.clone()),
+        let mut manager = cancellable(
+            cancellation,
+            AuthorizationManager::new_with_oauth_http_client(
+                self.server_url.clone(),
+                Arc::new(self.http.clone()),
+            ),
         )
-        .await
+        .await?
         .map_err(|_| LoginError::Discovery)?;
         let metadata = cancellable(
             cancellation,
@@ -215,9 +232,8 @@ impl Connector {
         let session = cancellable(cancellation, AuthorizationSession::new(manager, request))
             .await?
             .map_err(|(_, error)| authorization_error(&error))?;
-        let (client_id, _) = session
-            .get_credentials()
-            .await
+        let (client_id, _) = cancellable(cancellation, session.get_credentials())
+            .await?
             .map_err(|_| LoginError::Registration)?;
         let authorization_url = session.get_authorization_url().to_owned();
         let query = |name: &str| {
@@ -326,17 +342,6 @@ async fn bind(port: u16) -> Result<CallbackListener, LoginError> {
     CallbackListener::bind(port, CALLBACK_PATH)
         .await
         .map_err(callback_error)
-}
-
-/// Runs `future` unless the login is cancelled first.
-pub(crate) async fn cancellable<T>(
-    cancellation: &CancellationToken,
-    future: impl Future<Output = T>,
-) -> Result<T, LoginError> {
-    tokio::select! {
-        () = cancellation.cancelled() => Err(LoginError::Cancelled),
-        value = future => Ok(value),
-    }
 }
 
 fn callback_error(error: CallbackError) -> LoginError {

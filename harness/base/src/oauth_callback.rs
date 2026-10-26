@@ -107,8 +107,8 @@ impl CallbackListener {
         let (sender, responses) = mpsc::unbounded_channel();
         let stop = CancellationToken::new();
         let completed = Arc::new(AtomicBool::new(false));
-        let expected = Expected {
-            redirect_uri: self.redirect_uri.clone(),
+        let expected = ExpectedCallback {
+            redirect: Url::parse(&self.redirect_uri).expect("bound redirect URI"),
             state,
         };
         let task = tokio::spawn(serve_callbacks(
@@ -142,9 +142,10 @@ impl fmt::Debug for CallbackListener {
     }
 }
 
+/// Where the authorization response must arrive and the `state` it must carry.
 #[derive(Clone)]
-struct Expected {
-    redirect_uri: String,
+struct ExpectedCallback {
+    redirect: Url,
     state: String,
 }
 
@@ -161,7 +162,7 @@ pub struct PendingCallback {
 
 impl PendingCallback {
     pub fn redirect_uri(&self) -> &str {
-        &self.paste.expected.redirect_uri
+        self.paste.expected.redirect.as_str()
     }
 
     pub fn state(&self) -> &str {
@@ -178,9 +179,10 @@ impl PendingCallback {
         cancellation: &CancellationToken,
     ) -> Result<AuthorizationResponse, CallbackError> {
         tokio::select! {
+            biased;
+            received = self.responses.recv() => received.ok_or(CallbackError::Ended)?,
             () = cancellation.cancelled() => Err(CallbackError::Cancelled),
             () = tokio::time::sleep_until(self.deadline) => Err(CallbackError::TimedOut),
-            received = self.responses.recv() => received.ok_or(CallbackError::Ended)?,
         }
     }
 }
@@ -196,14 +198,14 @@ impl fmt::Debug for PendingCallback {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PendingCallback")
-            .field("redirect_uri", &self.paste.expected.redirect_uri)
+            .field("redirect_uri", &self.paste.expected.redirect.as_str())
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone)]
 pub struct CallbackPaste {
-    expected: Expected,
+    expected: ExpectedCallback,
     sender: mpsc::UnboundedSender<Completion>,
     completed: Arc<AtomicBool>,
 }
@@ -238,10 +240,10 @@ impl fmt::Debug for CallbackPaste {
     }
 }
 
-fn parse_callback(pasted_redirect_url: &str, expected: &Expected) -> Completion {
+fn parse_callback(pasted_redirect_url: &str, expected: &ExpectedCallback) -> Completion {
     let callback =
         Url::parse(pasted_redirect_url.trim()).map_err(|_| CallbackError::InvalidCallback)?;
-    let redirect = Url::parse(&expected.redirect_uri).expect("bound redirect URI");
+    let redirect = &expected.redirect;
     if callback.scheme() != redirect.scheme()
         || callback.host_str() != redirect.host_str()
         || callback.port() != redirect.port()
@@ -286,7 +288,7 @@ fn parse_callback(pasted_redirect_url: &str, expected: &Expected) -> Completion 
 
 async fn serve_callbacks(
     listener: TcpListener,
-    expected: Expected,
+    expected: ExpectedCallback,
     pages: CallbackPages,
     sender: mpsc::UnboundedSender<Completion>,
     completed: Arc<AtomicBool>,
@@ -306,7 +308,7 @@ async fn serve_callbacks(
 
 async fn answer_callback(
     mut stream: TcpStream,
-    expected: &Expected,
+    expected: &ExpectedCallback,
     pages: &CallbackPages,
     sender: &mpsc::UnboundedSender<Completion>,
     completed: &AtomicBool,
@@ -322,10 +324,7 @@ async fn answer_callback(
             } else {
                 target
             };
-            let redirect_path = Url::parse(&expected.redirect_uri)
-                .map(|redirect| redirect.path().to_owned())
-                .unwrap_or_default();
-            if Url::parse(&url).is_ok_and(|parsed| parsed.path() != redirect_path) {
+            if Url::parse(&url).is_ok_and(|parsed| parsed.path() != expected.redirect.path()) {
                 (404, ROUTE_NOT_FOUND, None)
             } else {
                 match parse_callback(&url, expected) {
