@@ -359,11 +359,16 @@ impl McpConnections {
                             _ = entry.cancel.cancelled() => { stop.cancel(); let _ = waiting.await; break; }
                             _ = &mut waiting => { if *entry.state.read().unwrap() != McpServerState::NeedsLogin { *entry.state.write().unwrap() = McpServerState::Failed; } state_changed.notify_waiters(); break; }
                             _ = connection.changed.notified() => {
+                                if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
                                 let revision = connection.revision.load(Ordering::SeqCst);
                                 let tools = tokio::select! {
                                     _ = entry.cancel.cancelled() => continue,
                                     tools = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.list_all_tools()) => tools,
                                 };
+                                if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
+                                    authentication_rejected(&entry, http, &entry.cancel).await;
+                                    state_changed.notify_waiters();
+                                }
                                 if let Ok(Ok(tools)) = tools {
                                     let (tools, warnings) = catalog::directory(&entry.config.name, tools);
                                     *connection.tools.write().unwrap() = tools;
@@ -375,12 +380,17 @@ impl McpConnections {
                                 }
                             }
                             _ = async { resources_changed.as_ref().unwrap().notified().await }, if resources_changed.is_some() => {
+                                if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
                                 let directory = connection.resources.as_ref().unwrap();
                                 let revision = directory.revision.load(Ordering::SeqCst);
                                 let resources = tokio::select! {
                                     _ = entry.cancel.cancelled() => continue,
                                     resources = tokio::time::timeout(REQUEST_TIMEOUT, resource_directory(&connection.peer)) => resources,
                                 };
+                                if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
+                                    authentication_rejected(&entry, http, &entry.cancel).await;
+                                    state_changed.notify_waiters();
+                                }
                                 let mut warnings = connection.warnings.write().unwrap();
                                 warnings.retain(|warning| warning != RESOURCES_UNAVAILABLE);
                                 if let Ok(Ok(resources)) = resources {
@@ -685,6 +695,16 @@ impl McpConnections {
         cursor: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Value, String> {
+        if self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .get(server)
+            .is_some_and(|entry| *entry.state.read().unwrap() != McpServerState::Connected)
+        {
+            return Err("MCP connection unavailable".into());
+        }
         if cursor.is_none()
             && let Some(entry) = self.inner.entries.read().unwrap().get(server)
             && let Some(resources) = entry
@@ -729,6 +749,9 @@ impl McpConnections {
             .get(server)
             .cloned()
             .ok_or("MCP resource server unavailable")?;
+        if *entry.state.read().unwrap() != McpServerState::Connected {
+            return Err("MCP connection unavailable".into());
+        }
         let connection = entry
             .connection
             .read()
@@ -743,7 +766,14 @@ impl McpConnections {
             _ = cancel.cancelled() => return Err("MCP resource request cancelled".into()),
             _ = entry.cancel.cancelled() => return Err("MCP resource server changed".into()),
             result = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.send_request(request)) => result,
-        }.map_err(|_| "MCP resource request timed out")?.map_err(|_| "MCP resource request failed")?;
+        };
+        if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
+            authentication_rejected(&entry, http, &cancel).await;
+            self.inner.state_changed.notify_waiters();
+        }
+        let response = response
+            .map_err(|_| "MCP resource request timed out")?
+            .map_err(|_| "MCP resource request failed")?;
         let mut value =
             serde_json::to_value(&response).map_err(|_| "invalid MCP resource result")?;
         redact_value(&entry, &mut value);

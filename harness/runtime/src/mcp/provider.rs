@@ -96,9 +96,16 @@ impl HostToolProvider for McpToolProvider {
         self.connections.snapshot().into_iter().filter_map(|snapshot| {
             let entries = self.connections.inner.entries.read().unwrap();
             let entry = entries.get(&snapshot.name)?;
-            Some(McpServerInstructions {server:McpResourceServer {name:snapshot.name.clone(), authority:Self::authority(entry), third_party:true}, text:format!("MCP server: {}; source: {}; status: {:?}. Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, redact(entry, snapshot.instructions))})
+            let login_hint = if snapshot.state == McpServerState::NeedsLogin {
+                " Ask the user to run tickloop mcp login <server>. Only the user can log in."
+            } else { "" };
+            Some(McpServerInstructions {
+                server: McpResourceServer { name: snapshot.name.clone(), authority: Self::authority(entry), third_party: true },
+                text: format!("MCP server: {}; source: {}; status: {:?}.{} Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, login_hint, redact(entry, snapshot.instructions)),
+            })
         }).collect()
     }
+
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
         self.connections
             .inner

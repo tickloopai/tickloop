@@ -156,7 +156,8 @@ impl ResolvedServers {
         {
             transport = McpTransport::NeedsConfiguration;
         }
-        let oauth = if matches!(transport, McpTransport::Http { .. }) {
+        let oauth = if matches!(&transport, McpTransport::Http { headers, .. } if !headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")))
+        {
             match parse_oauth(entry, environment) {
                 Ok(oauth) => oauth,
                 Err(reason) => {

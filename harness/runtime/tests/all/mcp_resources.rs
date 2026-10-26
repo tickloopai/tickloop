@@ -27,6 +27,7 @@ fn http_server(name: &str, server: &McpService) -> McpServerConfig {
             url: server.url(),
             headers: BTreeMap::new(),
         },
+        oauth: Default::default(),
         timeout_ms: 5000,
     }
 }

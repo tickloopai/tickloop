@@ -428,6 +428,7 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     })
     .await
     .expect("the Worker did not report that login is needed");
+    assert!(format!("{:?}", scripted.requests.lock().unwrap()).contains("tickloop mcp login"));
     let credentials = FileCredentials::new(&root, "global", "remote").unwrap();
     let held = credentials.lock().await.unwrap();
     credentials
@@ -475,9 +476,40 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     })
     .await
     .expect("the Worker did not observe the saved login");
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
     scripted.enqueue(call("probe", "mcp__remote__probe", json!({})));
     scripted.enqueue(text("done"));
-    complete(&agent, chat, "Call the remote probe").await;
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, "Call the remote probe".into())
+        .await
+        .unwrap();
+    let mut approved = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => {
+                    let evidence = format!("{request:?}");
+                    assert!(!evidence.contains("worker-secret-access"));
+                    assert!(!evidence.contains("worker-secret-refresh"));
+                    approved = true;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(approved);
     assert_eq!(server.calls().len(), 1);
     let visible = format!(
         "{:?} {:?}",

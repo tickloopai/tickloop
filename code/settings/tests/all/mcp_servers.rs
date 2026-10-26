@@ -177,3 +177,16 @@ fn remote_oauth_settings_survive_resolution() {
         Some("https://example.com/metadata")
     );
 }
+
+#[test]
+fn a_fixed_authorization_header_does_not_require_valid_oauth_configuration() {
+    let resolved = tickloop_code_settings::mcp::resolve_servers(
+        &serde_json::json!({"mcpServers":{"fixed":{"url":"https://example.com/mcp","headers":{"authorization":"Bearer fixed"},"oauth":{"clientId":3}}}}),
+        std::path::Path::new("/workspace"),
+        &Default::default(),
+    );
+    assert!(matches!(
+        resolved.servers[0].transport,
+        tickloop_harness::protocol::mcp::McpTransport::Http { .. }
+    ));
+}

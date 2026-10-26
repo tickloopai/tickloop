@@ -1099,3 +1099,51 @@ async fn settled(connections: &McpConnections) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn resource_authentication_failure_requires_login_before_more_requests() {
+    let server = McpService::start().await;
+    let configs = vec![McpServerConfig {
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    server.set_status(401);
+    assert!(
+        connections
+            .read_resource("remote", "fixture://text", CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    let requests = server.request_count();
+    assert!(
+        connections
+            .read_resource("remote", "fixture://text", CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(
+        connections
+            .list_resources("remote", None, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.request_count(), requests);
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    connections.shutdown().await;
+}
