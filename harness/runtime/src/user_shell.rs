@@ -514,6 +514,7 @@ impl Agent {
             }
             if decision != Decision::Allow {
                 let request = PermissionRequest {
+                    mcp_server: None,
                     id: tickloop_ids::generate(),
                     loop_id,
                     execution: PermissionExecution::UserShell {

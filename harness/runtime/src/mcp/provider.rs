@@ -127,6 +127,7 @@ impl HostToolProvider for McpToolProvider {
             HostToolPermission::ThirdParty,
             format!("Call third-party MCP tool {name}"),
         )
+        .with_mcp_server(call.entry.config.name.clone())
         .with_payload(call))
     }
     async fn revalidate_call(

@@ -1288,6 +1288,9 @@ impl Agent {
                     &operation,
                     permission_input,
                     delegation::HostCallPermission {
+                        mcp_server: prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.mcp_server()),
                         permission: host_permission,
                         local_read: prepared_host_call
                             .as_ref()
@@ -1425,8 +1428,14 @@ impl Agent {
                             receipt,
                             &operation,
                             session_operation.clone(),
-                            approval_source,
-                            approval_reason,
+                            super::PermissionPrompt {
+                                source: approval_source,
+                                reason: approval_reason,
+                                mcp_server: prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.mcp_server())
+                                    .map(str::to_owned),
+                            },
                             cancel.clone(),
                         )
                         .await?;
@@ -1600,6 +1609,9 @@ impl Agent {
                                 &operation,
                                 permission_input,
                                 HostAdmission {
+                                    mcp_server: prepared_host_call
+                                        .as_ref()
+                                        .and_then(|call| call.mcp_server()),
                                     tool_name: &name,
                                     expected_task_binding: task_binding,
                                     session_evaluation: &session_evaluation,
@@ -2021,8 +2033,11 @@ impl Agent {
                                     receipt,
                                     &operation,
                                     session_operation.clone(),
-                                    approval_source,
-                                    approval_reason,
+                                    super::PermissionPrompt {
+                                        source: approval_source,
+                                        reason: approval_reason,
+                                        mcp_server: None,
+                                    },
                                     cancel.clone(),
                                 )
                                 .await?;

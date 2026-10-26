@@ -107,3 +107,41 @@ fn file_and_memory_stores_preserve_thinking_choices_across_effort_changes() {
         );
     }
 }
+
+#[test]
+fn mcp_permission_rules_round_trip_and_invalid_rules_are_reported() {
+    use serde_json::json;
+    use tickloop_harness::tools::permissions::PermissionPolicyExt;
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    std::fs::write(directory.path().join("settings.json"), serde_json::to_vec(&json!({"projects":{project.to_str().unwrap():{"permissions":{"rules":[
+        {"id":"00000000-0000-0000-0000-000000000001","tool":"mcp__review__*","decision":"allow"},
+        {"id":"00000000-0000-0000-0000-000000000002","tool":"mcp__review*","decision":"allow"}
+    ]}}}})).unwrap()).unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    let saved = settings.read(Some(&project)).project;
+    assert_eq!(saved.rules.len(), 1);
+    assert_eq!(saved.warnings.len(), 1);
+    let policy = tickloop_harness::protocol::PermissionPolicy {
+        mode: ExecutionMode::Auto,
+        rules: saved.rules,
+        ..Default::default()
+    };
+    let matched = policy
+        .explicit_mcp_rule_match(
+            "mcp__review__read",
+            "review",
+            &json!({}),
+            uuid::Uuid::nil(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(Decision::from(matched.decision), Decision::Allow);
+    assert!(
+        settings
+            .read(Some(&project.join("other")))
+            .project
+            .rules
+            .is_empty()
+    );
+}

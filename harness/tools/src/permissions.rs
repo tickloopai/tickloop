@@ -91,6 +91,16 @@ pub trait PermissionPolicyExt {
         session: Option<SessionPermissionDecision>,
     ) -> Option<ExplicitRuleMatch>;
 
+    /// Match MCP rules against the resolved server, including hashed model tool names.
+    fn explicit_mcp_rule_match(
+        &self,
+        name: &str,
+        server: &str,
+        input: &Value,
+        loop_id: Uuid,
+        session: Option<SessionPermissionDecision>,
+    ) -> Option<ExplicitRuleMatch>;
+
     fn decide(&self, operation: &PreparedTool, workspace: &Workspace, loop_id: Uuid) -> Decision;
 
     /// [`Self::decide_with_session`] with Claude Code's allowance for the current Loop's plan
@@ -211,6 +221,37 @@ impl PermissionPolicyExt for PermissionPolicy {
             decision: ExplicitPermissionDecision::Allow,
             source,
         })
+    }
+
+    fn explicit_mcp_rule_match(
+        &self,
+        name: &str,
+        server: &str,
+        input: &Value,
+        loop_id: Uuid,
+        session: Option<SessionPermissionDecision>,
+    ) -> Option<ExplicitRuleMatch> {
+        let mut policy = self.clone();
+        let server_rule = format!("mcp__{server}");
+        let wildcard_rule = format!("{server_rule}__*");
+        // Resolve service rules before generic matching: display names may be hashed, and
+        // underscores in service names must not grant a different service's authority.
+        for rules in [
+            &mut policy.rules,
+            &mut policy.host_rules,
+            &mut policy.project_constraints,
+            &mut policy.managed_constraints,
+        ] {
+            rules.retain_mut(|rule| {
+                if rule.tool == server_rule || rule.tool == wildcard_rule {
+                    rule.tool = name.to_owned();
+                    true
+                } else {
+                    !rule.tool.starts_with("mcp__") || rule.tool == name
+                }
+            });
+        }
+        policy.explicit_rule_match(name, input, loop_id, session)
     }
 
     fn decide(&self, operation: &PreparedTool, workspace: &Workspace, loop_id: Uuid) -> Decision {
@@ -385,6 +426,18 @@ pub fn is_supported_rule_content(tool: &str, specifier: &str) -> bool {
 pub fn validate_rule(rule: &PermissionRule) -> Result<(), &'static str> {
     if rule.tool.is_empty() || rule.decision == Decision::Check {
         return Err("rules require a tool and allow, ask or deny decision");
+    }
+    if let Some(target) = rule.tool.strip_prefix("mcp__") {
+        let target = target.strip_suffix("__*").unwrap_or(target);
+        if target.is_empty()
+            || !target
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(
+                "MCP rules require a server or tool name, with only a trailing __* server wildcard",
+            );
+        }
     }
     if rule.persistent && rule.loop_id.is_some() {
         return Err("project rules cannot name a Loop");

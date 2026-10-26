@@ -490,6 +490,7 @@ async fn host_admission_rechecks_task_binding_after_waiting_for_the_commit_lock(
         &operation,
         &operation.input,
         HostAdmission {
+            mcp_server: None,
             tool_name: &operation.name,
             expected_task_binding: Some(expected),
             session_evaluation: &evaluation,

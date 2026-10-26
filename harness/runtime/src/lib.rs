@@ -667,6 +667,7 @@ struct PermissionAnswer {
 }
 
 struct HostAdmission<'a> {
+    mcp_server: Option<&'a str>,
     tool_name: &'a str,
     expected_task_binding: Option<Option<tickloop_harness_protocol::TaskExecutionBinding>>,
     session_evaluation: &'a session_permissions::SessionPermissionEvaluation,
@@ -678,6 +679,12 @@ struct HostAdmission<'a> {
     direct_basis: denials::DirectApprovalBasis,
     approval_source: Option<PermissionApprovalSource>,
     assessment: Option<&'a ApprovalAssessmentDetails>,
+}
+
+struct PermissionPrompt {
+    source: PermissionApprovalSource,
+    reason: Option<String>,
+    mcp_server: Option<String>,
 }
 
 struct PendingApproval {
@@ -3393,6 +3400,7 @@ impl Agent {
             permission_input,
             delegation::HostCallPermission {
                 permission: admission.host_permission,
+                mcp_server: admission.mcp_server,
                 local_read: admission.local_read,
             },
             admission.session_evaluation.decision,
@@ -4435,11 +4443,11 @@ impl Agent {
         receipt: &Receipt,
         operation: &OperationRecord,
         session_operation: SessionPermissionOperation,
-        approval_source: PermissionApprovalSource,
-        approval_reason: Option<String>,
+        prompt: PermissionPrompt,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
         let request = PermissionRequest {
+            mcp_server: prompt.mcp_server,
             id: tickloop_ids::generate(),
             loop_id: receipt.loop_id,
             execution: PermissionExecution::ToolCall {
@@ -4449,8 +4457,8 @@ impl Agent {
             name: operation.name.clone(),
             input: operation.input.clone(),
             file_change: operation.file_change.clone().map(Box::new),
-            approval_reason,
-            approval_source,
+            approval_reason: prompt.reason,
+            approval_source: prompt.source,
         };
         self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
             .await
@@ -4633,6 +4641,10 @@ impl Agent {
             return Err(AgentError::Invalid(
                 "rules require a tool and allow, ask or deny decision".into(),
             ));
+        }
+        for rule in rules.iter().filter(|rule| rule.tool.starts_with("mcp__")) {
+            tickloop_harness_tools::permissions::validate_rule(rule)
+                .map_err(|error| AgentError::Invalid(error.into()))?;
         }
         let _settings_gate = self.inner.settings_writes.lock().await;
         let changes = {

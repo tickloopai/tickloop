@@ -3,6 +3,8 @@ mod goal;
 mod judgment;
 pub(super) mod providers;
 pub(super) use providers::ProviderUpdate;
+#[cfg(test)]
+mod mcp_approval_tests;
 mod search;
 #[cfg(test)]
 mod settings_ux_pty;
@@ -2350,6 +2352,13 @@ impl Menus {
                 "Yes, once".into(),
                 "No, and tell the Agent what to do differently (esc)".into(),
             ]
+        } else if persistent && request.mcp_server.is_some() {
+            vec![
+                "Yes, once".into(),
+                "Always allow this tool in this directory".into(),
+                "Always allow this server in this directory".into(),
+                "No, and tell the Agent what to do differently (esc)".into(),
+            ]
         } else if persistent {
             vec![
                 "Yes".into(),
@@ -2580,6 +2589,17 @@ impl Menus {
                 } => {
                     let explicit_ask =
                         request.approval_source == PermissionApprovalSource::ExplicitAsk;
+                    if !explicit_ask && persistent && let Some(server) = &request.mcp_server {
+                        let target = match index {
+                            Some(1) => Some(request.name.clone()),
+                            Some(2) => Some(format!("mcp__{server}")),
+                            _ => None,
+                        };
+                        if let Some(target) = target {
+                            agent.answer_permission_with_rule(chat, request.id, target).await.map_err(|error| error.to_string())?;
+                            return Ok(MenuOutcome { permission: Some(request.id), ..Default::default() });
+                        }
+                    }
                     if !explicit_ask
                         && persistent
                         && index == Some(2)
@@ -3789,6 +3809,7 @@ mod tests {
         snapshot
             .permissions
             .push(tickloop_harness::protocol::PermissionRequest {
+                mcp_server: None,
                 id: permission,
                 loop_id: receipt.loop_id,
                 execution: tickloop_harness::protocol::PermissionExecution::ToolCall {

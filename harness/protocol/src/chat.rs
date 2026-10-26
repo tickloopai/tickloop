@@ -466,6 +466,9 @@ impl PermissionExecution {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PermissionRequest {
+    /// The resolved MCP service, captured when the call was prepared, never inferred from its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<String>,
     pub id: Uuid,
     pub loop_id: LoopId,
     pub execution: PermissionExecution,
