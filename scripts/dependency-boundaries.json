@@ -2,6 +2,7 @@
   "layers": {
     "tickloop-harness-artifacts": "harness",
     "tickloop-harness-base": "harness",
+    "tickloop-harness-connector": "harness",
     "tickloop-harness-protocol": "harness",
     "tickloop-ids": "foundation",
     "tickloop-tick-protocol": "foundation",

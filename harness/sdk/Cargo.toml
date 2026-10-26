@@ -20,11 +20,13 @@ model = ["base", "dep:tickloop-harness-model"]
 transcript = ["dep:tickloop-harness-transcript"]
 cron = ["dep:tickloop-harness-cron"]
 artifacts = ["base", "dep:tickloop-harness-artifacts"]
+connector = ["base", "dep:tickloop-harness-connector"]
 test-support = ["engine", "dep:tickloop-harness-test-support"]
 
 [dependencies]
 tickloop-harness-policy = { path = "../policy", optional = true }
 tickloop-harness-base = { path = "../base", optional = true }
+tickloop-harness-connector = { path = "../connector", optional = true }
 tickloop-harness-protocol = { path = "../protocol" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-harness-runtime = { path = "../runtime", optional = true }
