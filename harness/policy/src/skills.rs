@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::{Deserialize, Deserializer, de};
+use serde_json::Value;
+
 use tickloop_harness_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
 use crate::loop_skill::{self, LoopInstructionSource, MaintenanceInstructions};
@@ -30,7 +33,8 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 const ESTIMATED_LISTING_BYTES_PER_TOKEN: usize = 4;
 const LISTING_CONTEXT_PERCENT: usize = 1;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 enum SkillContext {
     #[default]
     Inline,
@@ -116,12 +120,23 @@ pub enum SkillError {
     InvalidLoopInterval(tickloop_harness_cron::IntervalError),
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
 struct Frontmatter {
+    #[serde(deserialize_with = "deserialize_text")]
     name: String,
+    #[serde(deserialize_with = "deserialize_text")]
     description: String,
-    allowed_tools: Vec<String>,
+    #[serde(default)]
+    allowed_tools: RawAllowedTools,
+    #[serde(
+        default = "default_user_invocable",
+        deserialize_with = "deserialize_bool"
+    )]
     user_invocable: bool,
+    #[serde(default, deserialize_with = "deserialize_bool")]
     disable_model_invocation: bool,
+    #[serde(default)]
     context: SkillContext,
 }
 
@@ -169,10 +184,7 @@ impl SkillRegistry {
         let parsed = parse_skill(markdown, source).map(|mut skill| {
             let namespace = match &skill.source {
                 SkillSource::TickPackage { package, .. } => Some(package.clone()),
-                SkillSource::Plugin { plugin, .. } => {
-                    skill.allowed_tools.clear();
-                    Some(plugin.clone())
-                }
+                SkillSource::Plugin { plugin, .. } => Some(plugin.clone()),
                 _ => None,
             };
             if let Some(namespace) = namespace {
@@ -494,15 +506,24 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
     let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
     let rest = markdown
         .strip_prefix("---\n")
+        .or_else(|| markdown.strip_prefix("---\r\n"))
         .ok_or_else(|| SkillError::Invalid("missing YAML frontmatter".into()))?;
-    let (frontmatter, body) = rest
-        .split_once("\n---\n")
+    let (frontmatter, body) = ["\n---\n", "\n---\r\n"]
+        .into_iter()
+        .filter_map(|delimiter| rest.find(delimiter).map(|index| (index, delimiter.len())))
+        .min_by_key(|(index, _)| *index)
+        .map(|(index, length)| (&rest[..index], &rest[index + length..]))
         .ok_or_else(|| SkillError::Invalid("unterminated YAML frontmatter".into()))?;
     let frontmatter = parse_frontmatter(frontmatter)?;
     validate_name(&frontmatter.name)?;
     if frontmatter.description.trim().is_empty() {
         return Err(SkillError::Invalid("description cannot be empty".into()));
     }
+    let allowed_tools = if matches!(source, SkillSource::Plugin { .. }) {
+        Vec::new()
+    } else {
+        parse_allowed_tools(frontmatter.allowed_tools)?
+    };
     let body = body.trim().to_owned();
     if body.is_empty() {
         return Err(SkillError::Invalid("body cannot be empty".into()));
@@ -512,7 +533,7 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
         description: frontmatter.description,
         source,
         body,
-        allowed_tools: frontmatter.allowed_tools,
+        allowed_tools,
         user_invocable: frontmatter.user_invocable,
         disable_model_invocation: frontmatter.disable_model_invocation,
         context: frontmatter.context,
@@ -520,125 +541,68 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
 }
 
 fn parse_frontmatter(source: &str) -> Result<Frontmatter, SkillError> {
-    let mut name = None;
-    let mut description = None;
-    let mut allowed_tools = Vec::new();
-    let mut user_invocable = true;
-    let mut disable_model_invocation = false;
-    let mut context = SkillContext::Inline;
-    let mut list_key = None;
-
-    for raw_line in source.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("- ") {
-            if list_key != Some("allowed-tools") {
-                return Err(SkillError::Invalid(
-                    "only allowed-tools accepts a YAML list".into(),
-                ));
-            }
-            allowed_tools.push(parse_scalar(value)?);
-            continue;
-        }
-        let (key, value) = line
-            .split_once(':')
-            .ok_or_else(|| SkillError::Invalid(format!("invalid frontmatter line `{line}`")))?;
-        let key = key.trim();
-        let value = value.trim();
-        list_key = None;
-        match key {
-            "name" => set_once(&mut name, parse_scalar(value)?, key)?,
-            "description" => set_once(&mut description, parse_scalar(value)?, key)?,
-            "allowed-tools" if value.is_empty() => list_key = Some("allowed-tools"),
-            "allowed-tools" => allowed_tools.extend(parse_string_list(value)?),
-            "user-invocable" => user_invocable = parse_bool(value, key)?,
-            "disable-model-invocation" => {
-                disable_model_invocation = parse_bool(value, key)?;
-            }
-            "context" => {
-                context = match parse_scalar(value)?.as_str() {
-                    "inline" => SkillContext::Inline,
-                    "fork" => SkillContext::Fork,
-                    _ => {
-                        return Err(SkillError::Invalid("context must be inline or fork".into()));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(Frontmatter {
-        name: name.ok_or_else(|| SkillError::Invalid("name is required".into()))?,
-        description: description
-            .ok_or_else(|| SkillError::Invalid("description is required".into()))?,
-        allowed_tools,
-        user_invocable,
-        disable_model_invocation,
-        context,
-    })
+    let options = serde_saphyr::options! { strict_booleans: true };
+    serde_saphyr::from_str_with_options(source, options)
+        .map_err(|error| SkillError::Invalid(format!("invalid YAML frontmatter: {error}")))
 }
 
-fn set_once(target: &mut Option<String>, value: String, key: &str) -> Result<(), SkillError> {
-    if target.replace(value).is_some() {
-        return Err(SkillError::Invalid(format!("duplicate `{key}` field")));
+fn deserialize_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => Ok(value.split_whitespace().collect::<Vec<_>>().join(" ")),
+        _ => Err(de::Error::custom("expected a string")),
     }
-    Ok(())
 }
 
-fn parse_bool(value: &str, key: &str) -> Result<bool, SkillError> {
+fn default_user_invocable() -> bool {
+    true
+}
+
+fn deserialize_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::Bool(value) => Ok(value),
+        _ => Err(de::Error::custom("expected true or false")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawAllowedTools {
+    Value(Value),
+    Unsupported(de::IgnoredAny),
+}
+
+impl Default for RawAllowedTools {
+    fn default() -> Self {
+        Self::Value(Value::Array(Vec::new()))
+    }
+}
+
+fn parse_allowed_tools(value: RawAllowedTools) -> Result<Vec<String>, SkillError> {
+    let RawAllowedTools::Value(value) = value else {
+        return Err(SkillError::Invalid(
+            "allowed-tools must be a string or list of strings".into(),
+        ));
+    };
     match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(SkillError::Invalid(format!(
-            "`{key}` must be true or false"
-        ))),
-    }
-}
-
-fn parse_string_list(value: &str) -> Result<Vec<String>, SkillError> {
-    if let Some(value) = value
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-    {
-        return value
+        Value::String(value) if !value.is_empty() => Ok(value
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(parse_scalar)
-            .collect();
+            .map(str::to_owned)
+            .collect()),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) if !value.is_empty() => Ok(value),
+                _ => Err(SkillError::Invalid(
+                    "allowed-tools entries must be strings".into(),
+                )),
+            })
+            .collect(),
+        _ => Err(SkillError::Invalid(
+            "allowed-tools must be a string or list of strings".into(),
+        )),
     }
-    Ok(parse_scalar(value)?
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
-fn parse_scalar(value: &str) -> Result<String, SkillError> {
-    if value.is_empty() || matches!(value, "|" | ">") {
-        return Err(SkillError::Invalid(
-            "frontmatter values must be non-empty single-line scalars".into(),
-        ));
-    }
-    if value.starts_with('"') {
-        return serde_json::from_str(value)
-            .map_err(|_| SkillError::Invalid(format!("invalid quoted scalar `{value}`")));
-    }
-    if let Some(value) = value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-    {
-        return Ok(value.replace("''", "'"));
-    }
-    if value.starts_with('\'') || value.ends_with('\'') {
-        return Err(SkillError::Invalid(format!(
-            "invalid quoted scalar `{value}`"
-        )));
-    }
-    Ok(value.to_owned())
 }
 
 fn validate_name(name: &str) -> Result<(), SkillError> {

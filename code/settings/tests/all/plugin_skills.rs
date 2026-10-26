@@ -316,3 +316,47 @@ fn an_earlier_package_skill_migrates_as_a_plugin_and_obeys_disabling() {
             .any(|skill| skill.name.starts_with("sample:"))
     );
 }
+
+#[test]
+fn plugin_skills_ignore_non_string_tool_permission_metadata() {
+    for value in [
+        "null",
+        "false",
+        "42",
+        "[Bash, 42, {command: Write}]",
+        "{Bash: true}",
+        "{[Bash, Write]: true}",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let config_root = directory.path().join("config");
+        let markdown = format!(
+            "---\nname: guide\ndescription: >-\n  Read the guide.\nallowed-tools: {value}\n---\nBody"
+        );
+        install(
+            &config_root,
+            &claude_plugin(
+                directory.path(),
+                "notes",
+                serde_json::json!({"name": "notes"}),
+                &[("skills/guide", &markdown)],
+            ),
+        );
+        let registry =
+            SkillRegistry::discover_with_builtins(directory.path(), Some(&config_root), []);
+        assert!(
+            registry.warnings().is_empty(),
+            "{value}: {:?}",
+            registry.warnings()
+        );
+        let expansion = registry
+            .expand("notes:guide", "", SkillCaller::Model)
+            .unwrap();
+        assert!(expansion.allowed_tools.is_empty());
+        assert!(
+            InvokedSkill::try_from(expansion)
+                .unwrap()
+                .content
+                .ends_with("Body")
+        );
+    }
+}
