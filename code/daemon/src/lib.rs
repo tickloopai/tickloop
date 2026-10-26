@@ -734,6 +734,7 @@ pub async fn build_runtime_with_models(
     };
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts,
             environment: Some(Arc::new(environment.clone())),
             models,

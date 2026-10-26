@@ -497,6 +497,7 @@ pub struct Tools {
     /// What this Chat's fetches saw that may give provenance to later URLs.
     observed_urls: web_provenance::Observations,
     search_credential_root: Option<PathBuf>,
+    search_provider_factory: Option<std::sync::Arc<dyn web_search::SearchProviderFactory>>,
     file_reads: FileReadState,
     /// The addresses `WebFetch` may reach.
     reach: Reach,
@@ -545,6 +546,7 @@ impl Tools {
             fetched_pages: web::FetchCache::default(),
             observed_urls: web_provenance::Observations::default(),
             search_credential_root: None,
+            search_provider_factory: None,
             file_reads: FileReadState::default(),
             reach,
         }
@@ -593,6 +595,14 @@ impl Tools {
             _ => {}
         }
         Ok(prepared)
+    }
+
+    pub fn with_search_provider_factory(
+        mut self,
+        factory: Option<std::sync::Arc<dyn web_search::SearchProviderFactory>>,
+    ) -> Self {
+        self.search_provider_factory = factory;
+        self
     }
 
     pub async fn prepare(
@@ -678,12 +688,26 @@ impl Tools {
                 .await
                 .clone()
                 .ok_or_else(|| ToolError::Network(web_search::DISABLED_MESSAGE.into()))?;
-            let plan = web_search::prepare(
-                &config,
-                &search.request(),
-                self.search_credential_root.as_deref(),
-            )
+            let request = search.request();
+            web_search::validate_request(&config, &request)
+                .map_err(|error| ToolError::Network(error.to_string()))?;
+            let plan = match &self.search_provider_factory {
+                Some(factory) => tokio::time::timeout(
+                    web_search::SEARCH_TIMEOUT,
+                    factory.prepare(&config, &request),
+                )
+                .await
+                .unwrap_or(Err(web_search::SearchError::Timeout)),
+                None => {
+                    web_search::prepare(&config, &request, self.search_credential_root.as_deref())
+                }
+            }
             .map_err(|error| ToolError::Network(error.to_string()))?;
+            if plan.kind != config.provider {
+                return Err(ToolError::Network(
+                    "search provider does not match configuration".into(),
+                ));
+            }
             prepared.input["provider"] = json!(config.provider);
             prepared.input["endpoint"] = json!(plan.endpoints.first());
             prepared.input["endpoints"] = json!(plan.endpoints);

@@ -86,6 +86,7 @@ fn harness(
 ) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: local.then(|| Arc::new(FolderEnvironment::bare()) as _),
             models: ChosenModels::new(model),

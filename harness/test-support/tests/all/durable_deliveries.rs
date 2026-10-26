@@ -31,6 +31,7 @@ const HEADING: &str = "@tickloop feedback request-1 on artifact doc";
 fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

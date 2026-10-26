@@ -24,7 +24,7 @@ use tickloop_harness_protocol::{
 };
 use tokio_util::sync::CancellationToken;
 
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const PERPLEXITY_MAX_DOMAIN_BYTES: usize = 253;
@@ -90,6 +90,18 @@ impl DomainFilter {
 pub struct SearchRequest {
     pub query: String,
     pub domains: DomainFilter,
+}
+
+impl SearchRequest {
+    /// Parses the same query and domain fields as the WebSearch tool, including normalization.
+    pub fn from_tool_input(input: &Value) -> Result<Self, SearchError> {
+        let (_, operation, _) = crate::web::prepare_search(input)
+            .map_err(|_| SearchError::InvalidQuery("invalid search arguments"))?;
+        let crate::Operation::WebSearch(search) = operation else {
+            unreachable!("search preparation returns a search operation");
+        };
+        Ok(search.request())
+    }
 }
 
 pub struct SearchContext {
@@ -175,6 +187,17 @@ pub trait SearchProvider: Send + Sync {
     ) -> Result<SearchResponse, SearchError>;
 }
 
+/// Resolves one search's provider before approval. Each call may resolve fresh credentials,
+/// but the returned provider must retain that binding throughout execution.
+#[async_trait]
+pub trait SearchProviderFactory: Send + Sync {
+    async fn prepare(
+        &self,
+        config: &SearchConfig,
+        request: &SearchRequest,
+    ) -> Result<Arc<PreparedSearch>, SearchError>;
+}
+
 pub struct PreparedSearch {
     provider: Arc<dyn SearchProvider>,
     pub endpoints: Vec<String>,
@@ -190,6 +213,31 @@ impl std::fmt::Debug for PreparedSearch {
 }
 
 impl PreparedSearch {
+    /// Binds a host-owned transport to a validated logical search destination. The host owns
+    /// transport authorization; credentials and transport tokens must not appear in metadata.
+    pub fn from_provider(
+        config: &SearchConfig,
+        request: &SearchRequest,
+        provider: Arc<dyn SearchProvider>,
+    ) -> Result<Arc<Self>, SearchError> {
+        validate_request(config, request)?;
+        if provider.descriptor().kind != config.provider {
+            return Err(SearchError::InvalidQuery(
+                "provider does not match configuration",
+            ));
+        }
+        let address = if config.provider == SearchProviderKind::Free {
+            DUCKDUCKGO_ENDPOINT.to_owned()
+        } else {
+            endpoint(config)?.to_string()
+        };
+        Ok(Arc::new(Self {
+            provider,
+            endpoints: vec![address],
+            kind: config.provider,
+        }))
+    }
+
     pub async fn execute(
         &self,
         request: &SearchRequest,
@@ -343,103 +391,102 @@ pub fn prepare(
     request: &SearchRequest,
     credential_root: Option<&Path>,
 ) -> Result<Arc<PreparedSearch>, SearchError> {
+    validate_request(config, request)?;
+    let name = config
+        .api_key_env
+        .as_deref()
+        .or(config.provider.credential_env());
+    let key = name
+        .map(|name| {
+            let saved = credential_root
+                .map(|root| credentials::load_api_key(root, name))
+                .transpose()
+                .map_err(|_| SearchError::Credential)?
+                .flatten();
+            saved
+                .or_else(|| std::env::var(name).ok())
+                .filter(|key| !key.trim().is_empty())
+                .ok_or(SearchError::MissingCredential)
+        })
+        .transpose()?;
+    prepare_with_api_key(config, request, key)
+}
+
+/// Uses only the supplied credential, without reading settings or environment variables.
+pub fn prepare_with_api_key(
+    config: &SearchConfig,
+    request: &SearchRequest,
+    key: Option<String>,
+) -> Result<Arc<PreparedSearch>, SearchError> {
+    validate_request(config, request)?;
+    let kind = config.provider;
+    if kind.credential_env().is_some() && key.as_ref().is_none_or(|key| key.trim().is_empty()) {
+        return Err(SearchError::MissingCredential);
+    }
+    let provider: Arc<dyn SearchProvider> = if kind == SearchProviderKind::Free {
+        Arc::new(DuckDuckGoSearch {
+            endpoint: Url::parse(DUCKDUCKGO_ENDPOINT).expect("valid engine"),
+        })
+    } else {
+        let connection = Connection {
+            url: endpoint(config)?,
+            key,
+        };
+        match kind {
+            SearchProviderKind::Brave => Arc::new(Brave(connection)),
+            SearchProviderKind::Tavily => Arc::new(Tavily(connection)),
+            SearchProviderKind::Exa => Arc::new(Exa(connection)),
+            SearchProviderKind::SerpApi => Arc::new(SerpApi(connection)),
+            SearchProviderKind::Serper => Arc::new(Serper(connection)),
+            SearchProviderKind::Perplexity => Arc::new(Perplexity(connection)),
+            SearchProviderKind::Searxng => Arc::new(Searxng(connection)),
+            SearchProviderKind::Free => unreachable!(),
+        }
+    };
+    PreparedSearch::from_provider(config, request, provider)
+}
+
+pub(crate) fn validate_request(
+    config: &SearchConfig,
+    request: &SearchRequest,
+) -> Result<(), SearchError> {
     validate_config(config)
         .map_err(|_| SearchError::InvalidQuery("invalid provider configuration"))?;
     if request.query.len() > MAX_QUERY_BYTES {
         return Err(SearchError::InvalidQuery("query is too long"));
     }
-    let kind = config.provider;
-    let (provider, endpoints): (Arc<dyn SearchProvider>, Vec<String>) = if kind
-        == SearchProviderKind::Free
-    {
-        let queries = request.domains.operator_queries(&request.query, "-");
-        validate_queries(&queries, MAX_QUERY_BYTES, None)?;
-        (
-            Arc::new(DuckDuckGoSearch {
-                endpoint: Url::parse(DUCKDUCKGO_ENDPOINT).expect("valid engine"),
-            }),
-            vec![DUCKDUCKGO_ENDPOINT.to_owned()],
-        )
-    } else {
-        let url = endpoint(config)?;
-        let name = config.api_key_env.as_deref().or(kind.credential_env());
-        let key = name
-            .map(|name| {
-                let saved = credential_root
-                    .map(|root| credentials::load_api_key(root, name))
-                    .transpose()
-                    .map_err(|_| SearchError::Credential)?
-                    .flatten();
-                saved
-                    .or_else(|| std::env::var(name).ok())
-                    .filter(|key| !key.trim().is_empty())
-                    .ok_or(SearchError::MissingCredential)
-            })
-            .transpose()?;
-        let connection = Connection {
-            url: url.clone(),
-            key,
-        };
-        let provider: Arc<dyn SearchProvider> = match kind {
-            SearchProviderKind::Brave => {
-                validate_queries(
-                    &request.domains.operator_queries(&request.query, "NOT "),
-                    600,
-                    Some(75),
-                )?;
-                Arc::new(Brave(connection))
+    match config.provider {
+        SearchProviderKind::Brave => validate_queries(
+            &request.domains.operator_queries(&request.query, "NOT "),
+            600,
+            Some(75),
+        ),
+        SearchProviderKind::Free
+        | SearchProviderKind::SerpApi
+        | SearchProviderKind::Serper
+        | SearchProviderKind::Searxng => validate_queries(
+            &request.domains.operator_queries(&request.query, "-"),
+            MAX_QUERY_BYTES,
+            None,
+        ),
+        SearchProviderKind::Perplexity => {
+            let (domains, prefix_length): (&[String], usize) = match &request.domains {
+                DomainFilter::Any => (&[], 0),
+                DomainFilter::Allowed(domains) => (domains, 0),
+                DomainFilter::Blocked(domains) => (domains, 1),
+            };
+            if domains
+                .iter()
+                .any(|domain| domain.len() + prefix_length > PERPLEXITY_MAX_DOMAIN_BYTES)
+            {
+                return Err(SearchError::InvalidQuery(
+                    "Perplexity domains including exclusion prefixes must not exceed 253 bytes",
+                ));
             }
-            SearchProviderKind::Tavily => Arc::new(Tavily(connection)),
-            SearchProviderKind::Exa => Arc::new(Exa(connection)),
-            SearchProviderKind::SerpApi => {
-                validate_queries(
-                    &request.domains.operator_queries(&request.query, "-"),
-                    MAX_QUERY_BYTES,
-                    None,
-                )?;
-                Arc::new(SerpApi(connection))
-            }
-            SearchProviderKind::Serper => {
-                validate_queries(
-                    &request.domains.operator_queries(&request.query, "-"),
-                    MAX_QUERY_BYTES,
-                    None,
-                )?;
-                Arc::new(Serper(connection))
-            }
-            SearchProviderKind::Perplexity => {
-                let (domains, prefix_length): (&[String], usize) = match &request.domains {
-                    DomainFilter::Any => (&[], 0),
-                    DomainFilter::Allowed(domains) => (domains, 0),
-                    DomainFilter::Blocked(domains) => (domains, 1),
-                };
-                if domains
-                    .iter()
-                    .any(|domain| domain.len() + prefix_length > PERPLEXITY_MAX_DOMAIN_BYTES)
-                {
-                    return Err(SearchError::InvalidQuery(
-                        "Perplexity domains including exclusion prefixes must not exceed 253 bytes",
-                    ));
-                }
-                Arc::new(Perplexity(connection))
-            }
-            SearchProviderKind::Searxng => {
-                validate_queries(
-                    &request.domains.operator_queries(&request.query, "-"),
-                    MAX_QUERY_BYTES,
-                    None,
-                )?;
-                Arc::new(Searxng(connection))
-            }
-            SearchProviderKind::Free => unreachable!(),
-        };
-        (provider, vec![url.to_string()])
-    };
-    Ok(Arc::new(PreparedSearch {
-        provider,
-        endpoints,
-        kind,
-    }))
+            Ok(())
+        }
+        SearchProviderKind::Tavily | SearchProviderKind::Exa => Ok(()),
+    }
 }
 
 fn validate_queries(

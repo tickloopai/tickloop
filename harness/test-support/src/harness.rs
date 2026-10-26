@@ -36,6 +36,7 @@ impl ModelClients for ChosenModels {
 pub fn embedded_agent(model: ModelConfig, models: Arc<dyn ModelClients>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(Arc::new(FolderEnvironment::bare())),
             models,

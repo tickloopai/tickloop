@@ -77,6 +77,7 @@ fn family_harness_with_tasks(
 ) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

@@ -70,7 +70,8 @@ impl Agent {
                     .with_search_configuration(
                         snapshot.search_config.clone(),
                         self.inner.config_root.clone(),
-                    ),
+                    )
+                    .with_search_provider_factory(self.inner.search_provider_factory.clone()),
             );
         }
         let chat_id = snapshot.id;
@@ -134,7 +135,8 @@ impl Agent {
             .with_search_configuration(
                 snapshot.search_config.clone(),
                 self.inner.config_root.clone(),
-            ),
+            )
+            .with_search_provider_factory(self.inner.search_provider_factory.clone()),
         )
     }
 

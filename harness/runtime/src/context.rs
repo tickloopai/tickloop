@@ -722,6 +722,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let agent = Agent::with_seams(
                 crate::HarnessSeams {
+                    search: None,
                     transcripts: None,
                     environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
                     models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![
@@ -898,6 +899,7 @@ mod tests {
         };
         let agent = Agent::with_seams(
             crate::HarnessSeams {
+                search: None,
                 transcripts: Some(Arc::new(store)),
                 environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
                 models: Arc::new(LocalModelClients::new(None)),

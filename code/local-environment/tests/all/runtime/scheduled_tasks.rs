@@ -24,6 +24,7 @@ fn at(hour: u32, minute: u32) -> DateTime<Utc> {
 fn stateless_host(store: Arc<dyn TranscriptStore>, model: Arc<ContractModel>) -> Agent {
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),
@@ -158,6 +159,7 @@ fn stateless_host_with_a_folder(
 ) -> Agent {
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: Some(Arc::new(
                 tickloop_harness::runtime::environment::FolderEnvironment::bare(),

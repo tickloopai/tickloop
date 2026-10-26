@@ -862,6 +862,7 @@ const DURABLE_ORIGIN: &str = "https://tickloop.ai/artifact";
 fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ContractModel>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),

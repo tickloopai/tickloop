@@ -217,6 +217,7 @@ fn shell_agent() -> Agent {
     );
     Agent::with_seams(
         crate::HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(environment),
             models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(

@@ -317,6 +317,8 @@ struct Inner {
     /// Host-provided preferences and project permissions; absent when the host keeps none.
     settings: Option<Arc<dyn SettingsStore>>,
     search: SearchDefaults,
+    search_provider_factory:
+        Option<Arc<dyn tickloop_harness_tools::web_search::SearchProviderFactory>>,
     host_options: AgentHostOptions,
     waits: WaitHosting,
     /// Local credential and tool-output storage, supplied independently of preferences.
@@ -1828,6 +1830,7 @@ impl Agent {
             client,
             recorder,
             Some(Arc::new(environment::FolderEnvironment::bare())),
+            None,
         ))
     }
 
@@ -1883,6 +1886,7 @@ impl Agent {
             client,
             None,
             Some(Arc::new(environment::FolderEnvironment::bare())),
+            None,
         )
     }
 
@@ -1893,6 +1897,9 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         recorder: Option<persistence::ChatRecorder>,
         environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+        search_provider_factory: Option<
+            Arc<dyn tickloop_harness_tools::web_search::SearchProviderFactory>,
+        >,
     ) -> Self {
         let HarnessOptions {
             model,
@@ -1928,6 +1935,7 @@ impl Agent {
                 models,
                 settings,
                 search,
+                search_provider_factory,
                 host_options,
                 waits,
                 config_root,

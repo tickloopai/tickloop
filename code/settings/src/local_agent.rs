@@ -65,6 +65,7 @@ impl LocalAgent for Agent {
         let root = store.root().to_owned();
         Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: Some(Arc::new(store)),
                 environment: Some(Arc::new(FolderEnvironment::bare())),
                 models: Arc::new(OneClient(client)),
@@ -84,6 +85,7 @@ impl LocalAgent for Agent {
     ) -> Agent {
         Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: Some(Arc::new(FolderEnvironment::bare())),
                 models: Arc::new(OneClient(client)),
@@ -104,6 +106,7 @@ pub fn opened_agent(root: PathBuf, model: ModelConfig, models: Arc<dyn ModelClie
     let settings = crate::UserSettings::in_root(store.root());
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(Arc::new(store)),
             environment: Some(Arc::new(FolderEnvironment::bare())),
             models,

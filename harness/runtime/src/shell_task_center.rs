@@ -628,6 +628,7 @@ mod tests {
         environment.define_shell("sleep 5", Duration::from_secs(5), Vec::new(), 0);
         Agent::with_seams(
             crate::HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: Some(environment),
                 models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(

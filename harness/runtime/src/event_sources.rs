@@ -1219,6 +1219,7 @@ mod feedback_admission_tests {
     async fn folderless_loop() -> (Agent, Receipt) {
         let agent = Agent::with_seams(
             crate::HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: None,
                 models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(

@@ -3575,6 +3575,7 @@ async fn all_loop_forms_invoke_the_skill_in_chats_with_and_without_a_folder() {
         }
         let core = tickloop_harness::runtime::Agent::with_seams(
             tickloop_harness::runtime::HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: folder.then(|| {
                     Arc::new(tickloop_harness::runtime::environment::FolderEnvironment::bare())

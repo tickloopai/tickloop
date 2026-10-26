@@ -151,6 +151,7 @@ fn fixture() -> Fixture {
 fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent {
     Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: Some(store),
             environment: Some(Arc::new(FolderEnvironment::bare())),
             models: tickloop_harness_test_support::harness::ChosenModels::new(model),

@@ -660,6 +660,7 @@ for line in sys.stdin:
         };
         let agent = Agent::with_seams(
             HarnessSeams {
+                search: None,
                 transcripts: None,
                 environment: Some(environment.clone()),
                 models: ChosenModels::new(model.clone()),
@@ -783,6 +784,7 @@ for line in sys.stdin:
                     );
                     let runtime = Agent::with_seams(
                         HarnessSeams {
+                            search: None,
                             transcripts: None,
                             environment: Some(Arc::new(environment.clone())),
                             models: ChosenModels::new(self.model.clone()),

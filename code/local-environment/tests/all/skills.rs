@@ -1208,6 +1208,7 @@ fn agent_with_project_skills(
 ) -> Agent {
     Agent::with_seams(
         tickloop_harness::runtime::HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(Arc::new(
                 tickloop_harness::runtime::environment::FolderEnvironment::bare(),

@@ -596,3 +596,251 @@ async fn live_duckduckgo_palace_museum_query() {
         Err(error) => println!("LIVE Palace Museum query: unavailable={error}"),
     }
 }
+
+#[tokio::test]
+async fn explicit_key_uses_native_adapter_and_has_no_ambient_fallback() {
+    let (url, received) = server(
+        200,
+        "application/json",
+        r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":"Reference"}]}"#,
+    )
+    .await;
+    let config = SearchConfig {
+        provider: SearchProviderKind::Tavily,
+        endpoint: url.to_string(),
+        api_key_env: Some("PATH".into()),
+    };
+    let request = request(DomainFilter::Any);
+    assert!(matches!(
+        prepare_with_api_key(&config, &request, None),
+        Err(SearchError::MissingCredential)
+    ));
+    let prepared =
+        prepare_with_api_key(&config, &request, Some("explicit-fixture-key".into())).unwrap();
+    assert!(!format!("{prepared:?}").contains("explicit-fixture-key"));
+    let response = prepared
+        .execute(&request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(response.results.len(), 1);
+    assert!(
+        received
+            .await
+            .unwrap()
+            .contains("authorization: Bearer explicit-fixture-key")
+    );
+}
+
+struct RevisionProvider {
+    kind: SearchProviderKind,
+    revision: usize,
+}
+
+#[async_trait]
+impl SearchProvider for RevisionProvider {
+    fn descriptor(&self) -> SearchProviderDescriptor {
+        descriptor(self.kind)
+    }
+    async fn search(
+        &self,
+        request: &SearchRequest,
+        _: &SearchContext,
+    ) -> Result<SearchResponse, SearchError> {
+        Ok(SearchResponse {
+            query: request.query.clone(),
+            provider: self.kind,
+            engine: None,
+            results: vec![SearchHit {
+                title: format!("Revision {}", self.revision),
+                url: "https://rust-lang.org/".into(),
+                snippet: None,
+                published_at: None,
+            }],
+            searched_at: SystemTime::now(),
+            truncated: false,
+        })
+    }
+}
+
+#[derive(Default)]
+struct RevisionFactory(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl SearchProviderFactory for RevisionFactory {
+    async fn prepare(
+        &self,
+        config: &SearchConfig,
+        request: &SearchRequest,
+    ) -> Result<Arc<PreparedSearch>, SearchError> {
+        let revision = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PreparedSearch::from_provider(
+            config,
+            request,
+            Arc::new(RevisionProvider {
+                kind: config.provider,
+                revision,
+            }),
+        )
+    }
+}
+
+#[tokio::test]
+async fn injected_factory_refreshes_between_preparations_but_keeps_approved_binding() {
+    let factory = Arc::new(RevisionFactory::default());
+    let config = SearchConfig {
+        provider: SearchProviderKind::Tavily,
+        endpoint: String::new(),
+        api_key_env: None,
+    };
+    let tools = crate::Tools::folderless(tickloop_harness_base::network::Reach::PublicAddresses)
+        .with_search_configuration(Some(config.clone()), None)
+        .with_search_provider_factory(Some(factory.clone()));
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let ids = tickloop_ids::IdContext::new();
+    let input = json!({"query": "rust documentation"});
+    let first = tools
+        .prepare(&ids, &workspace, crate::WEB_SEARCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    let second = tools
+        .prepare(&ids, &workspace, crate::WEB_SEARCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    assert!(first.requires_permission);
+    assert_eq!(first.input["endpoint"], config.provider.default_endpoint());
+    tools.set_search(None).await.unwrap();
+    assert!(
+        tools
+            .prepare(&ids, &workspace, crate::WEB_SEARCH_TOOL_NAME, &input)
+            .await
+            .is_err()
+    );
+    assert_eq!(factory.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        tools
+            .execute(first, CancellationToken::new())
+            .await
+            .unwrap()
+            .content
+            .contains("Revision 0")
+    );
+    assert!(
+        tools
+            .execute(second, CancellationToken::new())
+            .await
+            .unwrap()
+            .content
+            .contains("Revision 1")
+    );
+    tools.set_search(Some(config)).await.unwrap();
+    let third = tools
+        .prepare(&ids, &workspace, crate::WEB_SEARCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    assert!(
+        tools
+            .execute(third, CancellationToken::new())
+            .await
+            .unwrap()
+            .content
+            .contains("Revision 2")
+    );
+}
+
+#[test]
+fn injected_provider_preserves_native_validation() {
+    let config = SearchConfig {
+        provider: SearchProviderKind::Brave,
+        endpoint: String::new(),
+        api_key_env: None,
+    };
+    let provider = || {
+        Arc::new(RevisionProvider {
+            kind: SearchProviderKind::Tavily,
+            revision: 0,
+        }) as Arc<dyn SearchProvider>
+    };
+    assert!(
+        PreparedSearch::from_provider(&config, &request(DomainFilter::Any), provider()).is_err()
+    );
+    let oversized = SearchRequest {
+        query: "a".repeat(601),
+        domains: DomainFilter::Any,
+    };
+    let matching = Arc::new(RevisionProvider {
+        kind: SearchProviderKind::Brave,
+        revision: 0,
+    });
+    assert!(PreparedSearch::from_provider(&config, &oversized, matching).is_err());
+    let unsafe_config = SearchConfig {
+        endpoint: "https://secret@example.com/".into(),
+        ..config
+    };
+    assert!(
+        PreparedSearch::from_provider(&unsafe_config, &request(DomainFilter::Any), provider())
+            .is_err()
+    );
+}
+
+#[test]
+fn public_search_request_parser_preserves_native_domain_validation() {
+    let parsed = SearchRequest::from_tool_input(
+        &json!({"query":"Rust documentation", "allowed_domains":["*.RUST-LANG.ORG"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.domains,
+        DomainFilter::Allowed(vec!["rust-lang.org".into()])
+    );
+    for input in [
+        json!({"query":""}),
+        json!({"query":"Rust documentation", "allowed_domains":["rust-lang.org"], "blocked_domains":["example.org"]}),
+        json!({"query":"Rust documentation", "api_key":"not-accepted"}),
+    ] {
+        assert!(SearchRequest::from_tool_input(&input).is_err());
+    }
+}
+
+struct PendingFactory;
+#[async_trait]
+impl SearchProviderFactory for PendingFactory {
+    async fn prepare(
+        &self,
+        _: &SearchConfig,
+        _: &SearchRequest,
+    ) -> Result<Arc<PreparedSearch>, SearchError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn factory_preparation_is_bounded_by_the_native_search_timeout() {
+    let tools = crate::Tools::folderless(tickloop_harness_base::network::Reach::PublicAddresses)
+        .with_search_configuration(
+            Some(SearchConfig {
+                provider: SearchProviderKind::Tavily,
+                endpoint: String::new(),
+                api_key_env: None,
+            }),
+            None,
+        )
+        .with_search_provider_factory(Some(Arc::new(PendingFactory)));
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let result = tools
+        .prepare(
+            &tickloop_ids::IdContext::new(),
+            &workspace,
+            crate::WEB_SEARCH_TOOL_NAME,
+            &json!({"query":"Rust documentation"}),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(crate::ToolError::Network(message)) if message == SearchError::Timeout.to_string())
+    );
+}

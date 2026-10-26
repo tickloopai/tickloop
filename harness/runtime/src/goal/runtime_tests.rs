@@ -276,6 +276,7 @@ async fn usage_reported_while_another_process_changes_the_goal_charges_the_goal_
     let open = || {
         Agent::with_seams(
             crate::HarnessSeams {
+                search: None,
                 transcripts: Some(Arc::new(
                     crate::transcript::JsonlTranscriptStore::open(root.path().into()).unwrap(),
                 )),

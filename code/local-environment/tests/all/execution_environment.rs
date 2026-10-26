@@ -73,6 +73,7 @@ async fn shell_approval_is_bound_to_the_definition_prepared_before_the_question(
     ]));
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(environment.clone()),
             models: ChosenModels::new(model),
@@ -154,6 +155,7 @@ async fn native_environment_shell_output_and_state_have_one_owner() {
     ]));
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(environment.clone()),
             models: ChosenModels::new(model),
@@ -477,6 +479,7 @@ async fn a_harness_uses_its_injected_environment_for_bash() {
     ]));
     let agent = Agent::with_seams(
         HarnessSeams {
+            search: None,
             transcripts: None,
             environment: Some(environment),
             models: ChosenModels::new(model),
