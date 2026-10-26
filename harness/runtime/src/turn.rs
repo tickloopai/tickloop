@@ -160,7 +160,7 @@ pub enum TurnOutcome {
 
 #[derive(Clone, Debug)]
 pub enum TurnWait {
-    Permission(PermissionRequest),
+    Permission(Box<PermissionRequest>),
     Question(QuestionRequest),
     /// The answer waits for the member `chat` of its family, as a foreground `Subagent` call or
     /// a member waiting for its children does, and that member waits for a person.
@@ -1343,7 +1343,16 @@ fn uncertain_operations(chat: &Chat, run: RunId) -> Vec<OperationRecord> {
 /// What the Run waits for when it is parked on a person.
 fn waiting_for_person(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Option<TurnWait> {
     if chat.active_run == Some(run) {
-        return waiting_member(chats, chat, run);
+        return chat
+            .snapshot
+            .permissions
+            .iter()
+            .find(|request| {
+                request.execution.run_id() == Some(run) && request.parent_call.is_some()
+            })
+            .cloned()
+            .map(|request| TurnWait::Permission(Box::new(request)))
+            .or_else(|| waiting_member(chats, chat, run));
     }
     if !chat.parked.contains_key(&run) {
         return None;
@@ -1354,7 +1363,7 @@ fn waiting_for_person(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) ->
         .iter()
         .find(|request| request.execution.run_id() == Some(run))
         .cloned()
-        .map(TurnWait::Permission)
+        .map(|request| TurnWait::Permission(Box::new(request)))
         .or_else(|| {
             snapshot
                 .questions

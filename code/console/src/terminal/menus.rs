@@ -2338,7 +2338,7 @@ impl Menus {
                 })
         });
         let mut context = vec![requester.clone()];
-        if review.is_none() {
+        if review.is_none() || request.parent_call.is_some() {
             context.extend(permission_context(request));
         }
         let explicit_ask = request.approval_source == PermissionApprovalSource::ExplicitAsk;

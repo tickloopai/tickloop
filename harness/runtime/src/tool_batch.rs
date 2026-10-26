@@ -548,7 +548,9 @@ impl Agent {
         }
         self.apply_completed_host_effect(chat, receipt, call_id, completion.host_effect);
         self.save(&chat.snapshot);
-        Ok(completion.result.tool)
+        let mut result = completion.result.tool;
+        result.content = completion.result.content.text().into_owned();
+        Ok(result)
     }
 
     fn apply_completed_host_effect(

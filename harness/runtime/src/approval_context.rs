@@ -831,6 +831,22 @@ impl crate::Agent {
     }
 }
 
+pub(super) fn append_nested_evidence(context: &mut ApprovalSnapshot, text: String) {
+    use reply_history::{ReplyContext, ReplySource, ReplyTurn};
+    let Some(input) = context.original_user_inputs.last() else {
+        return;
+    };
+    context.reply_history.contexts.push(ReplyContext {
+        chat_id: input.chat_id,
+        user_message_id: input.message_id,
+        preceding: vec![ReplyTurn {
+            message_id: tickloop_ids::generate(),
+            source: ReplySource::Assistant,
+            text,
+        }],
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,20 +1065,4 @@ mod tests {
             "unrelated repeated call IDs are not compaction rewrites"
         );
     }
-}
-
-pub(super) fn append_nested_evidence(context: &mut ApprovalSnapshot, text: String) {
-    use reply_history::{ReplyContext, ReplySource, ReplyTurn};
-    let Some(input) = context.original_user_inputs.last() else {
-        return;
-    };
-    context.reply_history.contexts.push(ReplyContext {
-        chat_id: input.chat_id,
-        user_message_id: input.message_id,
-        preceding: vec![ReplyTurn {
-            message_id: tickloop_ids::generate(),
-            source: ReplySource::Assistant,
-            text,
-        }],
-    });
 }

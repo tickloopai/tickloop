@@ -518,7 +518,7 @@ struct Chat {
 
 enum RunAdmission {
     Idle,
-    Ready(Receipt, ModelRequest, CancellationToken),
+    Ready(Receipt, Box<ModelRequest>, CancellationToken),
     /// The first takeable input is a Trigger's whose source proves it again outside the lock.
     ValidateTrigger(Box<PendingInput>),
 }
@@ -3971,7 +3971,7 @@ impl Agent {
             match admission {
                 RunAdmission::Idle => return Ok(None),
                 RunAdmission::Ready(receipt, request, cancel) => {
-                    return Ok(Some((receipt, request, cancel)));
+                    return Ok(Some((receipt, *request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
                     match self.take_trigger_input(chat_id, *pending).await? {
@@ -4127,7 +4127,7 @@ impl Agent {
                     return Ok(TriggerTake::Waits);
                 }
                 drop(boundary);
-                self.run_task((receipt, request, cancel));
+                self.run_task((receipt, *request, cancel));
                 Ok(TriggerTake::Started)
             }
         }
@@ -4453,7 +4453,7 @@ impl Agent {
                 reasoning_effort: candidate.snapshot.effective_reasoning_effort(),
             };
             *chat = candidate;
-            return Ok(RunAdmission::Ready(receipt, request, cancel));
+            return Ok(RunAdmission::Ready(receipt, Box::new(request), cancel));
         }
         if preceding_model_runs.is_some()
             && command_barrier.is_none_or(|command_sequence| {

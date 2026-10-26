@@ -64,7 +64,7 @@ impl HostToolProvider for McpToolProvider {
             .collect()
     }
     fn has_tool_search(&self) -> bool {
-        !self.connections.snapshot().is_empty()
+        true
     }
     fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
         self.connections

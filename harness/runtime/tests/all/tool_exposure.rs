@@ -86,7 +86,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         oauth: Default::default(),
         sensitive_values: vec![],
         disabled: false,
-        exposure: ToolExposure::Search,
+        exposure: ToolExposure::Codemode,
         tool_exposure: vec![("secret".into(), ToolExposure::Hidden)],
         description: "Office tools".into(),
     }];
@@ -123,10 +123,26 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         ),
         text("done"),
     ]));
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::with_seams(
+        tickloop_harness_runtime::HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: None,
+            models: tickloop_harness_test_support::harness::ChosenModels::new(model.clone()),
+        },
+        tickloop_harness_runtime::HarnessOptions {
+            tools: tickloop_harness_runtime::ToolPolicy::durable_chat(),
+            waits: tickloop_harness_runtime::WaitHosting::Durable,
+            host: tickloop_harness_protocol::AgentHostOptions {
+                prompt_policy: tickloop_harness_protocol::PromptPolicy::DenyOnPrompt,
+                ..tickloop_harness_protocol::AgentHostOptions::product_defaults()
+            },
+            ..tickloop_harness_runtime::HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
     agent.install_host_tools(provider).unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let chat = agent.create_chat_without_folder().await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
@@ -141,7 +157,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         }
     }
     assert_eq!(server.calls().len(), 1);
-    configs.write().unwrap()[0].disabled = true;
+    configs.write().unwrap().clear();
     model.enqueue(text("updated"));
     agent
         .submit(chat, "Report changed availability".into())
@@ -154,41 +170,45 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
             _ => {}
         }
     }
-    let requests = model.requests.lock().unwrap();
-    assert!(
-        !requests[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name.starts_with("mcp__"))
-    );
-    let first = serde_json::to_vec(&requests[0].tools).unwrap();
-    for request in requests.iter() {
-        assert_eq!(serde_json::to_vec(&request.tools).unwrap(), first);
-    }
-    let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
-    assert!(last.contains("MAIL_OK"));
-    assert!(last.contains("anyOf"));
-    assert!(last.contains("not_executed"));
-    assert!(last.contains("have disconnected"));
-    let original = requests[0]
-        .messages
-        .iter()
-        .find(|message| {
-            serde_json::to_string(message)
-                .unwrap()
-                .contains("MCP server: office")
-        })
-        .unwrap();
-    assert!(
-        requests
-            .last()
-            .unwrap()
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            !requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name.starts_with("mcp__"))
+        );
+        let first = serde_json::to_vec(&requests[0].tools).unwrap();
+        for request in requests.iter() {
+            assert!(
+                serde_json::to_vec(&request.tools).unwrap() == first,
+                "tool definitions changed across requests"
+            );
+        }
+        let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(last.contains("MAIL_OK"));
+        assert!(last.contains("anyOf"));
+        assert!(last.contains("not_executed"));
+        assert!(last.contains("have disconnected"));
+        let original = requests[0]
             .messages
             .iter()
-            .any(|message| serde_json::to_value(message).unwrap()
-                == serde_json::to_value(original).unwrap())
-    );
-    drop(requests);
+            .find(|message| {
+                serde_json::to_string(message)
+                    .unwrap()
+                    .contains("MCP server: office")
+            })
+            .unwrap();
+        assert!(
+            requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| serde_json::to_value(message).unwrap()
+                    == serde_json::to_value(original).unwrap())
+        );
+    }
     agent.shutdown().await;
 }
 
@@ -245,7 +265,7 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
         ),
         text("done"),
     ]));
-    let agent = Agent::new_embedded(config(), model);
+    let agent = Agent::new_embedded(config(), model.clone());
     agent
         .install_host_tools(Arc::new(McpToolProvider::new(
             connections,
@@ -282,14 +302,20 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
         );
     }
     agent
-        .answer_permission(chat, requests[1].id, true)
+        .answer_permission_with_comment(
+            chat,
+            requests[1].id,
+            true,
+            tickloop_harness_protocol::PermissionScope::Once,
+            Some("Keep the audit note".into()),
+        )
         .await
         .unwrap();
     loop {
-        if let EventKind::ToolCompleted { result, .. } = next_event(&mut events).await.kind {
-            if result.content == "MAIL_OK" {
-                break;
-            }
+        if let EventKind::ToolCompleted { result, .. } = next_event(&mut events).await.kind
+            && result.content.contains("MAIL_OK")
+        {
+            break;
         }
     }
     assert_eq!(server.calls().len(), 1);
@@ -306,6 +332,11 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
         }
     }
     assert_eq!(server.calls().len(), 2);
+    assert!(
+        serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages)
+            .unwrap()
+            .contains("Keep the audit note")
+    );
     agent.shutdown().await;
 }
 
@@ -313,7 +344,7 @@ struct ReviewableTools(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl tickloop_harness_runtime::host_tools::HostToolProvider for ReviewableTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        ["Review", "Pending"]
+        ["Observe", "Review", "Pending"]
             .into_iter()
             .map(|name| ToolDefinition {
                 name: name.into(),
@@ -331,7 +362,9 @@ impl tickloop_harness_runtime::host_tools::HostToolProvider for ReviewableTools 
         name: &str,
         _: &serde_json::Value,
     ) -> tickloop_harness_runtime::host_tools::HostToolPermission {
-        if name == "Pending" {
+        if name == "Observe" {
+            tickloop_harness_runtime::host_tools::HostToolPermission::ReadOnly
+        } else if name == "Pending" {
             tickloop_harness_runtime::host_tools::HostToolPermission::ThirdParty
         } else {
             tickloop_harness_runtime::host_tools::HostToolPermission::Reviewable
@@ -365,7 +398,7 @@ async fn auto_rejection_stops_pending_calls_and_sees_the_model_authored_batch() 
         call(
             "batch",
             "ExecuteTools",
-            json!({"calls":[{"name":"Review","arguments":{}},{"name":"Pending","arguments":{}}]}),
+            json!({"calls":[{"name":"Observe","arguments":{}},{"name":"Review","arguments":{}},{"name":"Pending","arguments":{}}]}),
         ),
         text("done"),
     ]));
@@ -411,12 +444,14 @@ async fn auto_rejection_stops_pending_calls_and_sees_the_model_authored_batch() 
     )
     .unwrap();
     assert!(snapshots.contains("Pending"));
+    assert!(snapshots.contains("EXECUTED"));
     assert!(snapshots.contains("Model-authored nested calls"));
-    let requests = model.requests.lock().unwrap();
-    let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
-    assert!(last.contains("denied"));
-    assert!(last.contains("not_executed"));
-    drop(requests);
+    {
+        let requests = model.requests.lock().unwrap();
+        let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(last.contains("denied"));
+        assert!(last.contains("not_executed"));
+    }
     assert!(agent.snapshot(chat).await.unwrap().permissions.is_empty());
     agent.shutdown().await;
 }
@@ -584,4 +619,223 @@ async fn nested_results_survive_reload_with_parent_links_and_no_reexecution() {
     ));
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn rewind_drops_nested_calls_whose_parent_was_removed_from_the_same_run() {
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use tickloop_harness_protocol::{
+        Decision, EventKind, ExecutionMode, PermissionRule, RewindMode,
+    };
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, harness::ChosenModels, next_event, text,
+        transcripts::InMemoryTranscriptStore,
+    };
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "before",
+            "ExecuteTools",
+            json!({"calls":[{"name":"Pending","arguments":{}}]}),
+        ),
+        call(
+            "after",
+            "ExecuteTools",
+            json!({"calls":[{"name":"Review","arguments":{}}]}),
+        ),
+        text("done"),
+    ]));
+    let make_agent = |model: Arc<ScriptedModel>| {
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store.clone()),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
+                models: ChosenModels::new(model),
+            },
+            HarnessOptions::local(config()),
+        )
+        .unwrap()
+    };
+    let agent = make_agent(model.clone());
+    agent
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0))))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: tickloop_ids::generate(),
+                decision: Decision::Ask,
+                tool: "Pending".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Initial request".into()).await.unwrap();
+    let request = loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => break request,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    agent.submit(chat, "Later request".into()).await.unwrap();
+    agent
+        .answer_permission(chat, request.id, true)
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let before = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.call_id == "before")
+        .unwrap();
+    let after = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.call_id == "after")
+        .unwrap();
+    assert_eq!(before.run_id, after.run_id);
+    let point = snapshot.rewind_points()[1].message_id;
+    agent
+        .rewind(chat, point, RewindMode::Conversation)
+        .await
+        .unwrap();
+    assert!(
+        !agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .iter()
+            .any(|operation| operation.parent_call_id.as_deref() == Some("after"))
+    );
+    model.enqueue(text("new branch"));
+    agent
+        .submit(chat, "Continue the rewound branch".into())
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.sync().await.unwrap();
+    agent.shutdown().await;
+    let restored = make_agent(Arc::new(ScriptedModel::new(vec![])));
+    let snapshot = restored.resume_chat(chat).await.unwrap();
+    assert!(
+        snapshot
+            .operations
+            .iter()
+            .any(|operation| operation.parent_call_id.as_deref() == Some("before"))
+    );
+    assert!(
+        !snapshot
+            .operations
+            .iter()
+            .any(|operation| operation.parent_call_id.as_deref() == Some("after"))
+    );
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn hosts_observe_nested_confirmation_through_the_turn_interface() {
+    use std::{
+        sync::{Arc, atomic::AtomicUsize},
+        time::Duration,
+    };
+    use tickloop_harness_runtime::{
+        Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, TurnOp, TurnOutcome,
+        TurnRequest, TurnWait, UserMessage,
+    };
+    use tickloop_harness_test_support::{ScriptedModel, call, config, harness::ChosenModels, text};
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "batch",
+            "ExecuteTools",
+            json!({"calls":[{"name":"Pending","arguments":{}}]}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(
+                tickloop_harness_runtime::environment::FolderEnvironment::bare(),
+            )),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions::local(config()),
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0))))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let turn = agent
+        .advance(
+            chat,
+            TurnRequest {
+                input_id: tickloop_ids::generate().into(),
+                op: TurnOp::Continue {
+                    after: ParentSelection::CurrentLeaf,
+                    message: UserMessage {
+                        text: "Call the service".into(),
+                        ..Default::default()
+                    },
+                },
+                delivery: Delivery::Queue,
+                host_context: None,
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), turn.outcome())
+        .await
+        .expect("nested permission did not reach host")
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(request.parent_call.as_ref().unwrap().call_id, "batch");
+    agent
+        .answer_permission(chat, request.id, true)
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), turn.outcome())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, TurnOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    agent.shutdown().await;
 }

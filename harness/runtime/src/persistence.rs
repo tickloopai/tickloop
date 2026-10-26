@@ -2375,10 +2375,7 @@ fn recover_transcript(
     for line in &loaded.lifecycle {
         if let Line::NestedCall(entry) = line
             && entry.chat_id == source_chat_id
-            && snapshot
-                .message_runs
-                .values()
-                .any(|run| *run == entry.operation.run_id)
+            && super::nested_calls::parent_on_chain(&snapshot, &entry.operation)
         {
             let mut operation = entry.operation.clone();
             if matches!(

@@ -97,6 +97,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
         )],
     });
     snapshot.operations.push(OperationRecord {
+        parent_call_id: None,
         id: Uuid::new_v4(),
         loop_id: receipt.loop_id,
         run_id: receipt.run_id,

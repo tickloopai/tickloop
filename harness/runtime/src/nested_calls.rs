@@ -425,3 +425,14 @@ impl Agent {
         })
     }
 }
+
+pub(crate) fn parent_on_chain(
+    snapshot: &tickloop_harness_protocol::ChatSnapshot,
+    operation: &OperationRecord,
+) -> bool {
+    snapshot.messages.iter().enumerate().any(|(index, message)| {
+        snapshot.message_runs.get(&index) == Some(&operation.run_id)
+            && message.content.iter().any(|content| matches!(content,
+                tickloop_harness_protocol::Content::ToolUse { id, .. } if Some(id) == operation.parent_call_id.as_ref()))
+    })
+}

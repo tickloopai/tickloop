@@ -533,8 +533,15 @@ impl State {
             height: self.height.saturating_sub(2).max(1),
         };
         let frame = match &review.review {
-            Ok(source) => render_diff(source, &review.navigation, viewport),
-            Err(error) => render_error("Review unavailable", error, &review.navigation, viewport),
+            Ok(source) => {
+                render_diff_with_context(source, &review.context, &review.navigation, viewport)
+            }
+            Err(error) => render_error(
+                "Review unavailable",
+                &review.error_text(error),
+                &review.navigation,
+                viewport,
+            ),
         };
         review.navigation = frame.navigation;
         review.viewport = viewport;
@@ -574,10 +581,18 @@ impl State {
                 height: limit,
             };
             match &review.review {
-                Ok(source) => render_diff(source, &review.navigation, viewport).total_rows,
-                Err(error) => {
-                    render_error("Review unavailable", error, &review.navigation, viewport)
+                Ok(source) => {
+                    render_diff_with_context(source, &review.context, &review.navigation, viewport)
                         .total_rows
+                }
+                Err(error) => {
+                    render_error(
+                        "Review unavailable",
+                        &review.error_text(error),
+                        &review.navigation,
+                        viewport,
+                    )
+                    .total_rows
                 }
             }
         } else {
