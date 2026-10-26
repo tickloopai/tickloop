@@ -428,12 +428,77 @@ fn a_name_several_marketplaces_offer_lists_them_and_an_unreadable_marketplace_is
     assert_eq!(absent.status.code(), Some(1));
     assert!(
         stderr(&absent).ends_with(
-            "Error: no marketplace offers plugin absent; \
+            "Error: no marketplace that could be read offers plugin absent; \
              tickloop plugin list --available shows what they offer\n"
         ),
         "{}",
         stderr(&absent)
     );
+
+    fs::remove_dir_all(cached_root(&fixture, "lab", "review", "local")).unwrap();
+    let repaired = plugin(&fixture, &["install", "review"]);
+    assert!(
+        stdout(&repaired).contains("plugin review@lab local in"),
+        "an unusable plugin is installed again from its own marketplace: {}{}",
+        stdout(&repaired),
+        stderr(&repaired)
+    );
+}
+
+#[test]
+fn plugins_of_a_removed_marketplace_stay_and_are_passed_over_when_updating_every_plugin() {
+    let fixture = Fixture::new();
+    official_marketplace(&fixture, json!([]));
+    let root = marketplace_directory(
+        &fixture,
+        "team",
+        "team-tools",
+        json!([{"name": "review", "source": "./plugins/review"}]),
+    );
+    write_skill(&root.join("plugins/review/skills/check"), "check", "Check");
+    commit_all(&root, "first");
+    succeeded(&plugin(&fixture, &["marketplace", "add", &file_url(&root)]));
+    succeeded(&plugin(&fixture, &["install", "review"]));
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["marketplace", "remove", "team-tools"])),
+        "Removed marketplace team-tools.\n\
+         Its plugins stay installed: review@team-tools; tickloop plugin uninstall removes one.\n"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update"])),
+        "Plugin review@team-tools is not updated: marketplace team-tools is not registered; \
+         tickloop plugin marketplace add registers it again.\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["update", "review"])),
+        "Error: cannot update review@team-tools: marketplace team-tools is not registered\n"
+    );
+}
+
+#[test]
+fn listing_or_installing_by_name_fails_when_no_marketplace_can_be_read() {
+    let fixture = Fixture::new();
+    let missing = path_text(&fixture.root.join("missing.json"));
+    for arguments in [
+        &["plugin", "list", "--available"][..],
+        &["plugin", "install", "review"],
+    ] {
+        let output = fixture.tickloop_from(&missing, arguments);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        let errors = stderr(&output);
+        let lines = errors.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{errors}");
+        assert!(
+            lines[0].starts_with("Warning: cannot read marketplace tickloop: "),
+            "{errors}"
+        );
+        assert!(
+            lines[1].starts_with("Warning: cannot read marketplace claude-plugins-official: "),
+            "{errors}"
+        );
+        assert_eq!(lines[2], "Error: no marketplace could be read");
+    }
 }
 
 #[test]

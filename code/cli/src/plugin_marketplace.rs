@@ -16,6 +16,7 @@ use tickloop_tick_installer::{
 use super::plugin_command::{print_table, report, report_notes};
 
 const SHORT_COMMIT_LENGTH: usize = 12;
+const NO_MARKETPLACE_READ: &str = "no marketplace could be read";
 const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::package_http::client;
 
 pub(super) async fn add_marketplace(store: &PluginStore, text: &str) -> Result<(), String> {
@@ -198,14 +199,18 @@ async fn choose_offer(
     name: &str,
 ) -> Result<(String, MarketplacePlugin), String> {
     let mut offers = Vec::new();
+    let mut is_any_readable = false;
     for offer in read_marketplaces(HTTP, store, false).await? {
         match offer.plugins {
-            Ok(plugins) => offers.extend(
-                plugins
-                    .into_iter()
-                    .filter(|plugin| plugin.name == name)
-                    .map(|plugin| (offer.registration.name.clone(), plugin)),
-            ),
+            Ok(plugins) => {
+                is_any_readable = true;
+                offers.extend(
+                    plugins
+                        .into_iter()
+                        .filter(|plugin| plugin.name == name)
+                        .map(|plugin| (offer.registration.name.clone(), plugin)),
+                )
+            }
             Err(reason) => eprintln!(
                 "Warning: cannot read marketplace {}: {}",
                 offer.registration.name,
@@ -213,16 +218,32 @@ async fn choose_offer(
             ),
         }
     }
-    let installed_from = store.get(name).ok().map(|plugin| plugin.marketplace);
+    if !is_any_readable {
+        return Err(NO_MARKETPLACE_READ.to_owned());
+    }
+    let installed = store.installed().map_err(|error| error.to_string())?;
+    let installed_from = installed
+        .plugins
+        .iter()
+        .find(|plugin| plugin.name() == name)
+        .map(|plugin| &plugin.marketplace)
+        .or_else(|| {
+            installed
+                .broken
+                .iter()
+                .find(|plugin| plugin.name == name)
+                .map(|plugin| &plugin.marketplace)
+        });
     if let Some(position) = offers
         .iter()
-        .position(|(marketplace, _)| Some(marketplace) == installed_from.as_ref())
+        .position(|(marketplace, _)| Some(marketplace) == installed_from)
     {
         return Ok(offers.swap_remove(position));
     }
     match offers.len() {
         0 => Err(format!(
-            "no marketplace offers plugin {name}; tickloop plugin list --available shows what they offer"
+            "no marketplace that could be read offers plugin {name}; \
+             tickloop plugin list --available shows what they offer"
         )),
         1 => Ok(offers.remove(0)),
         _ => Err(format!(
@@ -280,7 +301,16 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
                 Ok(registration) => read_marketplace(HTTP, store, &registration, true)
                     .await
                     .map_err(|reason| format!("cannot read marketplace {marketplace}: {reason}")),
-                Err(reason) => Err(reason),
+                Err(reason) if is_single => {
+                    return Err(format!("cannot update {name}@{marketplace}: {reason}"));
+                }
+                Err(reason) => {
+                    println!(
+                        "Plugin {name}@{marketplace} is not updated: {reason}; \
+                         tickloop plugin marketplace add registers it again."
+                    );
+                    continue;
+                }
             };
             marketplaces.insert(marketplace.clone(), plugins);
         }
@@ -336,30 +366,37 @@ pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
     let offers = read_marketplaces(HTTP, store, false).await?;
     let installed = store.installed().map_err(|error| error.to_string())?;
     let mut rows = Vec::new();
+    let mut is_any_readable = false;
     for offer in offers {
         let marketplace = &offer.registration.name;
         match offer.plugins {
-            Ok(plugins) => rows.extend(plugins.iter().map(|plugin| {
-                let mut status = installed_status(&installed, marketplace, plugin);
-                if let Some(reason) = unavailable_reason(plugin) {
-                    status.push_str(&format!("; {reason}"));
-                }
-                [
-                    format!("{}@{marketplace}", plugin.name),
-                    plugin.version.as_deref().map_or("-".to_owned(), safe_line),
-                    status,
-                    plugin
-                        .description
-                        .as_deref()
-                        .map(safe_line)
-                        .unwrap_or_default(),
-                ]
-            })),
+            Ok(plugins) => {
+                is_any_readable = true;
+                rows.extend(plugins.iter().map(|plugin| {
+                    let mut status = installed_status(&installed, marketplace, plugin);
+                    if let Some(reason) = unavailable_reason(plugin) {
+                        status.push_str(&format!("; {reason}"));
+                    }
+                    [
+                        format!("{}@{marketplace}", plugin.name),
+                        plugin.version.as_deref().map_or("-".to_owned(), safe_line),
+                        status,
+                        plugin
+                            .description
+                            .as_deref()
+                            .map(safe_line)
+                            .unwrap_or_default(),
+                    ]
+                }))
+            }
             Err(reason) => eprintln!(
                 "Warning: cannot read marketplace {marketplace}: {}",
                 safe_line(&reason)
             ),
         }
+    }
+    if !is_any_readable {
+        return Err(NO_MARKETPLACE_READ.to_owned());
     }
     if rows.is_empty() {
         println!("No marketplace offers plugins yet.");
