@@ -808,8 +808,15 @@ pub async fn build_runtime_with_models(
         )
         .with_stderr_directory(log_directory);
         let folder = launch.folder.clone();
+        let plugins =
+            tick_plugins::PluginStore::in_config_root(settings.root().expect("settings root"));
         let configuration = Arc::new(move || {
-            let resolved = settings.load().mcp_servers(&folder, &startup_environment);
+            let plugin_servers = enabled_plugin_mcp_servers(&plugins);
+            let resolved = settings.load().mcp_servers_with_plugins(
+                &folder,
+                &startup_environment,
+                &plugin_servers,
+            );
             for warning in resolved.warnings {
                 eprintln!("{warning}");
             }
@@ -822,6 +829,47 @@ pub async fn build_runtime_with_models(
         .install_host_tools(sources)
         .map_err(|error| format!("cannot install host tools: {error}"))?;
     Ok((agent, environment))
+}
+
+fn enabled_plugin_mcp_servers(
+    store: &tick_plugins::PluginStore,
+) -> Vec<tickloop_code_settings::mcp::PluginServers> {
+    let installed = match store.installed() {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("Cannot load plugin MCP servers: {error}");
+            return Vec::new();
+        }
+    };
+    for broken in installed.broken.iter().filter(|plugin| plugin.enabled) {
+        eprintln!(
+            "Cannot load MCP servers for plugin {}: {}",
+            broken.name, broken.reason
+        );
+    }
+    installed
+        .plugins
+        .into_iter()
+        .filter(|plugin| plugin.enabled && !plugin.manifest.mcp_servers.is_empty())
+        .filter_map(|plugin| {
+            let data_directory = match store.create_data_directory(plugin.name()) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    eprintln!("Cannot prepare plugin MCP data directory: {error}");
+                    return None;
+                }
+            };
+            for warning in &plugin.manifest.warnings {
+                eprintln!("Plugin {}: {warning}", plugin.name());
+            }
+            Some(tickloop_code_settings::mcp::PluginServers {
+                name: plugin.name().to_owned(),
+                root: plugin.root,
+                data_directory,
+                entries: plugin.manifest.mcp_servers,
+            })
+        })
+        .collect()
 }
 
 fn validate_daemon_lock_path(lock: &File, path: &Path) -> Result<(), String> {

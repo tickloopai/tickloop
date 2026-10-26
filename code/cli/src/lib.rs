@@ -2,6 +2,7 @@
 
 mod plugin_command;
 mod plugin_marketplace;
+mod plugin_mcp;
 mod plugin_tick;
 
 use std::ffi::OsString;

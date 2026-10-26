@@ -428,6 +428,7 @@ pub(super) fn report_notes(plugin: &InstalledPlugin) {
         println!("When opened, its Tick program runs as your user. Installing runs nothing.");
     }
     report_manifest_notes(&plugin.manifest);
+    super::plugin_mcp::report(&plugin.manifest, &plugin.root, plugin.enabled);
 }
 
 /// Prints the components Tickloop does not use yet and what it ignored in the manifest.
@@ -502,6 +503,11 @@ fn set_enabled(store: &PluginStore, name: &str, enabled: bool) -> Result<(), Str
         (false, false) => {
             println!("Disabled {noun} {id}; its Skills stop loading from the next request.")
         }
+    }
+    if enabled {
+        super::plugin_mcp::report(&plugin.manifest, &plugin.root, true);
+    } else if !plugin.manifest.mcp_servers.is_empty() {
+        println!("Its MCP servers stop from the next Agent request.");
     }
     Ok(())
 }
@@ -627,6 +633,7 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
         );
     }
     report_manifest_notes(&manifest);
+    super::plugin_mcp::report(&manifest, &root, true);
     Ok(())
 }
 

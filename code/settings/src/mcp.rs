@@ -1,7 +1,18 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use tickloop_harness::protocol::mcp::{McpServerConfig, McpTransport};
+
+/// An enabled plugin's raw entries and host-owned locations.
+pub struct PluginServers {
+    pub name: String,
+    pub root: PathBuf,
+    pub data_directory: PathBuf,
+    pub entries: BTreeMap<String, Value>,
+}
 
 pub struct ResolvedServers {
     pub servers: Vec<McpServerConfig>,
@@ -14,10 +25,20 @@ impl crate::LoadedSettings {
         directory: &Path,
         environment: &BTreeMap<String, String>,
     ) -> ResolvedServers {
-        resolve_servers(
+        self.mcp_servers_with_plugins(directory, environment, &[])
+    }
+
+    pub fn mcp_servers_with_plugins(
+        &self,
+        directory: &Path,
+        environment: &BTreeMap<String, String>,
+        plugins: &[PluginServers],
+    ) -> ResolvedServers {
+        resolve_servers_with_plugins(
             &Value::Object(self.settings.clone()),
             directory,
             environment,
+            plugins,
         )
     }
 }
@@ -26,6 +47,15 @@ pub fn resolve_servers(
     settings: &Value,
     directory: &Path,
     environment: &BTreeMap<String, String>,
+) -> ResolvedServers {
+    resolve_servers_with_plugins(settings, directory, environment, &[])
+}
+
+pub fn resolve_servers_with_plugins(
+    settings: &Value,
+    directory: &Path,
+    environment: &BTreeMap<String, String>,
+    plugins: &[PluginServers],
 ) -> ResolvedServers {
     let mut resolved = ResolvedServers {
         servers: Vec::new(),
@@ -46,6 +76,7 @@ pub fn resolve_servers(
             None => {}
         }
     }
+    let mut signatures = BTreeMap::new();
     for (name, (source, entry)) in entries {
         let valid_name = !name.is_empty()
             && !name.starts_with("plugin_")
@@ -59,20 +90,85 @@ pub fn resolve_servers(
             );
             continue;
         }
-        let transport = parse_transport(entry, directory, environment)
-            .unwrap_or_else(|reason| McpTransport::Failed { reason });
-        match &transport {
-            McpTransport::Failed { reason } => {
-                resolved.warnings.push(format!("MCP {name}: {reason}"))
+        resolved.push(name.clone(), source.into(), entry, directory, environment);
+        if let Some(signature) = signature(entry, directory, environment) {
+            signatures.entry(signature).or_insert_with(|| name.clone());
+        }
+    }
+    let mut plugins = plugins.iter().collect::<Vec<_>>();
+    plugins.sort_by(|left, right| left.name.cmp(&right.name));
+    for plugin in plugins {
+        let mut environment = environment.clone();
+        for key in ["CLAUDE_PLUGIN_ROOT", "TICKLOOP_PLUGIN_ROOT"] {
+            environment.insert(key.into(), plugin.root.to_string_lossy().into_owned());
+        }
+        for key in ["CLAUDE_PLUGIN_DATA", "TICKLOOP_PLUGIN_DATA"] {
+            environment.insert(
+                key.into(),
+                plugin.data_directory.to_string_lossy().into_owned(),
+            );
+        }
+        for (name, entry) in &plugin.entries {
+            let name = format!("plugin_{}_{name}", plugin.name);
+            resolved.push(
+                name.clone(),
+                format!("plugin:{}", plugin.name),
+                entry,
+                directory,
+                &environment,
+            );
+            if let Some(signature) = signature(entry, directory, &environment) {
+                if let Some(preferred) = signatures.get(&signature) {
+                    resolved.warnings.push(format!(
+                        "MCP {name} skipped: same command or URL as {preferred}"
+                    ));
+                    resolved.servers.pop();
+                } else {
+                    signatures.insert(signature, name);
+                }
             }
-            McpTransport::Unsupported { .. } => resolved
+        }
+    }
+    resolved
+}
+
+impl ResolvedServers {
+    fn push(
+        &mut self,
+        name: String,
+        source: String,
+        entry: &Value,
+        directory: &Path,
+        environment: &BTreeMap<String, String>,
+    ) {
+        let plugin = source.starts_with("plugin:");
+        if plugin && let Some(fields) = entry.as_object() {
+            for field in fields.keys().filter(|field| is_approval_field(field)) {
+                self.warnings
+                    .push(format!("MCP {name}: approval field {field} ignored"));
+            }
+        }
+        let mut transport = parse_transport(entry, directory, environment)
+            .unwrap_or_else(|reason| McpTransport::Failed { reason });
+        if plugin
+            && needs_user_config(entry)
+            && !matches!(transport, McpTransport::Unsupported { .. })
+        {
+            transport = McpTransport::NeedsConfiguration;
+        }
+        match &transport {
+            McpTransport::Failed { reason } => self.warnings.push(format!("MCP {name}: {reason}")),
+            McpTransport::NeedsConfiguration => self.warnings.push(format!(
+                "MCP {name}: needs userConfig; configure the plugin before connecting"
+            )),
+            McpTransport::Unsupported { .. } => self
                 .warnings
                 .push(format!("MCP {name}: transport is not supported yet")),
             _ => {}
         }
-        resolved.servers.push(McpServerConfig {
-            name: name.clone(),
-            source: source.into(),
+        self.servers.push(McpServerConfig {
+            name,
+            source,
             transport,
             timeout_ms: entry["timeout"]
                 .as_u64()
@@ -80,7 +176,49 @@ pub fn resolve_servers(
                 .unwrap_or(300_000),
         });
     }
-    resolved
+}
+
+fn is_approval_field(field: &str) -> bool {
+    let normalized = field
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("approv")
+        || normalized.contains("permission")
+        || matches!(
+            normalized.as_str(),
+            "alwaysallow" | "allowedtools" | "trust" | "trusted"
+        )
+}
+
+fn signature(
+    entry: &Value,
+    directory: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    let identity = serde_json::json!({
+        "type": entry["type"], "command": entry["command"],
+        "args": entry.get("args").cloned().unwrap_or_else(|| serde_json::json!([])), "url": entry["url"]
+    });
+    match parse_transport(&identity, directory, environment).ok()? {
+        McpTransport::Stdio { command, args, .. } => {
+            Some(serde_json::to_string(&("stdio", command, args)).expect("strings serialize"))
+        }
+        McpTransport::Http { url, .. } => {
+            Some(serde_json::to_string(&("http", url)).expect("strings serialize"))
+        }
+        _ => None,
+    }
+}
+
+pub fn needs_user_config(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("${user_config."),
+        Value::Array(items) => items.iter().any(needs_user_config),
+        Value::Object(fields) => fields.values().any(needs_user_config),
+        _ => false,
+    }
 }
 
 #[derive(Deserialize)]

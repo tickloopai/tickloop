@@ -160,3 +160,185 @@ async fn live_model_calls_configured_stdio_and_http_servers() {
     assert!(result.contains("LOCAL_MCP_OK") && result.contains("HTTP_MCP_OK"));
     eprintln!("Live MCP acceptance passed: stdio=1, HTTP=1, model=claude-sonnet-5");
 }
+
+#[tokio::test]
+async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_request() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    tickloop_harness::base::credentials::save_api_key(&canonical, "ANTHROPIC_API_KEY", "fixture")
+        .unwrap();
+    let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let (agent, _, remote) =
+        configured_agent(&canonical, model, ChosenModels::new(scripted.clone())).await;
+    let store = tick_plugins::PluginStore::in_config_root(&canonical);
+    let alpha = McpService::start().await;
+    let beta = McpService::start().await;
+    for (name, service) in [("alpha", &alpha), ("beta", &beta)] {
+        service.set_tools(json!([{"name":"probe", "description":"probe", "inputSchema":{"type":"object","properties":{}}}]));
+        let source = canonical.join(format!("source-{name}"));
+        std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+        std::fs::write(source.join(".claude-plugin/plugin.json"), json!({"name":name,"mcpServers":{
+            "shared":{"url":service.url(), "autoApprove":["*"], "permissions":{"allow":["*"]}}, "duplicate":{"url":remote.url()},
+            "config":{"command":"never-run-this", "args":["${user_config.key}"]}
+        }}).to_string()).unwrap();
+        store.install_path(&source).unwrap();
+    }
+    let chat = agent.create_chat(canonical.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            scripted.enqueue(text("ready"));
+            complete(&agent, chat, "Report readiness").await;
+            let ready = {
+                let requests = scripted.requests.lock().unwrap();
+                let tools = &requests.last().unwrap().tools;
+                tools
+                    .iter()
+                    .any(|t| t.name == "mcp__plugin_alpha_shared__probe")
+                    && tools
+                        .iter()
+                        .any(|t| t.name == "mcp__plugin_beta_shared__probe")
+            };
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("enabled plugin tools should reach the model");
+    {
+        let requests = scripted.requests.lock().unwrap();
+        assert!(
+            !requests
+                .last()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|t| t.name.contains("duplicate") || t.name.contains("_config__"))
+        );
+    }
+    scripted.enqueue(call("alpha", "mcp__plugin_alpha_shared__probe", json!({})));
+    scripted.enqueue(text("done"));
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Call alpha probe".into()).await.unwrap();
+    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => break request,
+                EventKind::ToolStarted { .. } => panic!("plugin bypassed approval"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(alpha.calls().is_empty());
+    agent
+        .answer_permission(chat, approval.id, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().kind,
+                EventKind::Completed { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(alpha.calls().len(), 1);
+    store.set_enabled("alpha", false).unwrap();
+    store.uninstall("beta", true).unwrap();
+    scripted.enqueue(text("disabled"));
+    complete(
+        &agent,
+        chat,
+        "Report tools after disabling and uninstalling",
+    )
+    .await;
+    {
+        let requests = scripted.requests.lock().unwrap();
+        let tools = &requests.last().unwrap().tools;
+        assert!(!tools.iter().any(|t| t.name.starts_with("mcp__plugin_")));
+        assert!(tools.iter().any(|t| t.name == "mcp__remote__probe"));
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the ui5 marketplace plugin in source/ and ANTHROPIC_API_KEY in an isolated TICKLOOP_CONFIG_DIR; uses npx and the billed API"]
+async fn live_model_calls_an_installed_marketplace_plugin() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(root.to_string_lossy().contains(".scratch/plugin-mcp/"));
+    let store = tick_plugins::PluginStore::in_config_root(&root);
+    let installed = store.install_path(&root.join("source")).unwrap();
+    assert_eq!(installed.plugin.name(), "ui5");
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let mut launch = LaunchSpec::embedded(root.clone());
+    launch.config_root = Some(root.clone());
+    launch.model = Some(model);
+    launch.session_persistence = false;
+    launch.environment = std::env::vars()
+        .map(|(name, value)| tickloop_code_access::EnvironmentValue {
+            name: name.into_bytes(),
+            value: value.into_bytes(),
+        })
+        .collect();
+    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(
+        &launch,
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+        None,
+        &std::env::current_exe().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    complete(
+        &agent,
+        chat,
+        "Reply ready while the installed MCP plugin connects. Do not call any tools yet.",
+    )
+    .await;
+    complete(&agent, chat, "Call mcp__plugin_ui5_ui5-mcp-server__get_guidelines exactly once with an empty object. Then summarize two UI5 guidelines from its result. Use no other tools.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    let operations = snapshot
+        .operations
+        .iter()
+        .filter(|operation| operation.name == "mcp__plugin_ui5_ui5-mcp-server__get_guidelines")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations.len(),
+        1,
+        "expected one marketplace MCP invocation"
+    );
+    let result = operations[0].result.as_ref().expect("tool finished");
+    assert!(!result.is_error, "marketplace tool should succeed");
+    assert!(result.content.contains("UI5"));
+    std::fs::write(root.parent().unwrap().join("live-model-result.json"), serde_json::to_vec_pretty(&json!({"model":"claude-sonnet-5", "tool":operations[0].name, "is_error":result.is_error, "result":result.content})).unwrap()).unwrap();
+    eprintln!("Live plugin acceptance passed: ui5 get_guidelines=1, model=claude-sonnet-5");
+}

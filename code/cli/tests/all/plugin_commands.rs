@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::tick_package_commands::{Fixture, failed, path_text, succeeded};
 
 /// A Claude Code plugin directory `label` with `manifest`, a Skill per name in `skills/`, and the
-/// commands and MCP servers Tickloop does not use yet.
+/// commands Tickloop does not use yet.
 fn claude_plugin(fixture: &Fixture, label: &str, manifest: Value, skills: &[&str]) -> PathBuf {
     let directory = fixture.root.join("sources").join(label);
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
@@ -70,13 +70,13 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
         succeeded(&plugin(&fixture, &["install", "--path", &source_path])),
         format!(
             "Installed plugin notes@local 1.0.0 in {root}.\n\
-             Not supported yet, so not used: commands, MCP servers.\n\
+             Not supported yet, so not used: commands.\n\
              Warning: skills path \"./missing\" is ignored: it does not exist\n"
         )
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  enabled  no login needed  not supported yet: commands, MCP servers\n"
+        "notes@local  1.0.0  enabled  no login needed  not supported yet: commands\n"
     );
 
     assert_eq!(
@@ -97,7 +97,7 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  disabled  no login needed  not supported yet: commands, MCP servers\n"
+        "notes@local  1.0.0  disabled  no login needed  not supported yet: commands\n"
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["enable", "notes"])),
@@ -166,7 +166,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
         succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
         "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.\n\
          Skills: skills/read, skills/write\n\
-         Not supported yet, so not used: commands, MCP servers.\n\
+         Not supported yet, so not used: commands.\n\
          Warning: skills path \"../outside\" is ignored: it must start with ./\n"
     );
 
@@ -433,4 +433,52 @@ fn validate_uses_marketplace_identity_only_when_explicitly_supplied() {
         manifest_before
     );
     assert!(!fixture.root.join("config").exists());
+}
+
+#[test]
+fn mcp_validation_install_and_enable_disclose_services_without_running_them() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "mcp",
+        json!({"name":"mcp", "mcpServers":{
+            "local":{"command":"example-server", "args":["--serve"]},
+            "remote":{"url":"https://example.com/mcp"},
+            "config":{"command":"example", "args":["${user_config.key}"]},
+            "legacy":{"type":"sse", "url":"https://example.com/sse"}
+        }}),
+        &[],
+    );
+    let path = path_text(&source);
+    for output in [
+        succeeded(&plugin(&fixture, &["validate", &path])),
+        succeeded(&plugin(&fixture, &["install", "--path", &path])),
+    ] {
+        assert!(
+            output.contains("plugin_mcp_local")
+                && output.contains("example-server")
+                && output.contains("--serve"),
+            "{output}"
+        );
+        assert!(
+            output.contains("https://example.com/mcp")
+                && output.contains("OAuth: discover on connect"),
+            "{output}"
+        );
+        assert!(
+            output.contains("userConfig: required") && output.contains("unsupported"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("not used: commands, MCP servers"),
+            "{output}"
+        );
+    }
+    succeeded(&plugin(&fixture, &["disable", "mcp"]));
+    let output = succeeded(&plugin(&fixture, &["enable", "mcp"]));
+    assert!(
+        output.contains("example-server") && output.contains("https://example.com/mcp"),
+        "{output}"
+    );
+    assert!(output.contains("run as your user"), "{output}");
 }

@@ -47,6 +47,7 @@ pub enum McpServerState {
     Failed,
     Unsupported,
     NeedsLogin,
+    NeedsConfiguration,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerSnapshot {
@@ -210,6 +211,7 @@ impl McpConnections {
                 let state = credential_failure.unwrap_or_else(|| match &config.transport {
                     McpTransport::Unsupported { .. } => McpServerState::Unsupported,
                     McpTransport::Failed { .. } => McpServerState::Failed,
+                    McpTransport::NeedsConfiguration => McpServerState::NeedsConfiguration,
                     McpTransport::Stdio { .. } if !self.inner.capabilities.local_processes => {
                         McpServerState::Unsupported
                     }

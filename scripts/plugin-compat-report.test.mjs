@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { checkGitArguments, checkout, cloneUrl, createReport, describeSource, parseValidateOutput, renderMarkdown, STATUS } from "./plugin-compat-report.mjs";
+import { checkGitArguments, checkout, cloneUrl, createReport, describeSource, parseValidateOutput, renderMarkdown, summarize, STATUS } from "./plugin-compat-report.mjs";
 
 const script = fileURLToPath(new URL("./plugin-compat-report.mjs", import.meta.url));
 const builtTickloop = fileURLToPath(new URL("../target/debug/tickloop", import.meta.url));
@@ -152,11 +152,12 @@ test("the output of tickloop plugin validate is read line by line", () => {
     format: ".claude-plugin/plugin.json",
     skills: ["skills/read", "skills/write"],
     tick: { executable: "bin/tick-notes", kind: "speaks the Tick protocol" },
+    mcp: [],
     unsupported: ["commands", "MCP servers"],
     warnings: ["skills path \"../outside\" is ignored: it must start with ./"],
   });
   assert.deepEqual(parseValidateOutput("Plugin bare-plugin, read from its directory.\nSkills: none\n"), {
-    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, unsupported: [], warnings: [],
+    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, mcp: [], unsupported: [], warnings: [],
   });
 });
 
@@ -207,6 +208,7 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
     plugins: 9,
     installable: 4,
     installableWithSkillsOrTick: 4,
+    mcp: { servers: 0, byTransport: {}, oauthConfigured: 0, oauthDiscovery: 0, needsUserConfig: 0, unsupported: 0 },
     invalid: 1,
     notFetchable: 3,
     unsupportedSource: 1,
@@ -301,7 +303,7 @@ test("the built tickloop reads the fixture marketplace the same way", { skip: !e
     { installable: 4, invalid: 1, notFetchable: 3, unsupportedSource: 1 },
   );
   assert.deepEqual(plugins.notes.unsupportedComponents, ["commands"]);
-  assert.deepEqual(plugins.remote.unsupportedComponents, ["MCP servers"]);
+  assert.deepEqual(plugins.remote.unsupportedComponents, []);
   assert.deepEqual({ format: plugins.sub.manifestFormat, skills: plugins.sub.skills }, { format: "marketplace entry", skills: ["skills/draft"] });
   assert.match(plugins.broken.errors[0], /name .* must be a string/);
 });
@@ -353,4 +355,17 @@ test("validation staging rejects a linked plugin root without modifying its targ
   assert.deepEqual(readdirSync(outside), ["skills"]);
   assert.equal(report.plugins[0].status, STATUS.notFetchable);
   assert.match(report.plugins[0].errors[0], /real directory/);
+});
+
+test("MCP validation contributes transports, OAuth discovery and configuration to the report", () => {
+  const parsed = parseValidateOutput([
+    'MCP server: plugin_demo_local | transport: stdio | command: ["npx","server"] | OAuth: none | userConfig: none | status: ready',
+    'MCP server: plugin_demo_remote | transport: http | address: https://example.com/mcp | OAuth: discover on connect | userConfig: required | status: needs configuration',
+    'MCP server: plugin_demo_legacy | transport: sse | address: https://example.com/sse | OAuth: none | userConfig: none | status: unsupported',
+  ].join("\n"));
+  assert.equal(parsed.mcp.length, 3);
+  assert.deepEqual(parsed.mcp[0], { name: "plugin_demo_local", transport: "stdio", targetKind: "command", target: '["npx","server"]', oauth: "none", userConfig: "none", status: "ready" });
+  const totals = summarize([{ status: STATUS.installable, sourceType: "path", supportedComponents: ["MCP servers"], unsupportedComponents: [], warnings: [], manifestFormat: "directory", mcp: parsed.mcp }]);
+  assert.deepEqual(totals.mcp, { servers: 3, byTransport: { http: 1, sse: 1, stdio: 1 }, oauthConfigured: 0, oauthDiscovery: 1, needsUserConfig: 1, unsupported: 1 });
+  assert.equal(totals.installableWithSkillsOrTick, 0);
 });
