@@ -857,14 +857,14 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
        tickloop tick ... (deprecated alias for tickloop plugin)
-       tickloop plugin install PLUGIN | install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY
+       tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
 monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, logs one in or out of its data source, or lists those installed or in the marketplace; tickloop tick --help explains them.
-plugin installs a plugin from its directory or archive, enables, disables or uninstalls one, lists those installed, or checks a plugin directory; tickloop plugin --help explains them.
+plugin installs a plugin by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, lists those installed or available, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.

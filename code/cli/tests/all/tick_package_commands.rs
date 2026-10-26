@@ -607,7 +607,7 @@ fn the_tick_command_explains_its_usage_and_leaves_the_console_arguments_alone() 
         let error = failed(&fixture.tickloop(arguments));
         assert!(
             error.starts_with(
-                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN"
+                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN[@MARKETPLACE]"
             ),
             "{arguments:?}: {error}"
         );
@@ -622,7 +622,7 @@ fn the_tick_command_explains_its_usage_and_leaves_the_console_arguments_alone() 
         let help = succeeded(&fixture.tickloop(arguments));
         assert!(
             help.starts_with(
-                "Usage: tickloop plugin install PLUGIN\n       tickloop plugin install --path PATH\n"
+                "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]\n       tickloop plugin install --path PATH\n"
             ),
             "{help}"
         );
@@ -670,7 +670,7 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
     );
 
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample@tickloop"])),
         format!(
             "Installed plugin sample@tickloop 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
         )
@@ -692,7 +692,7 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
     assert_eq!(registry["plugins"]["sample"]["sha256"], first_sha256);
 
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample@tickloop"])),
         format!(
             "Plugin sample@tickloop 1.0.0 is already installed in {installed_root}; nothing changed.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
         )
@@ -707,7 +707,7 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
     )
     .unwrap();
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample@tickloop"])),
         format!(
             "Reinstalled plugin sample@tickloop 1.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
         )
@@ -737,7 +737,7 @@ fn a_package_installs_from_the_marketplace_and_updates_to_the_version_it_offers(
             .join("config/plugins/cache/tickloop/sample/2.0.0"),
     );
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"])),
+        succeeded(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample@tickloop"])),
         format!(
             "Replaced plugin sample@tickloop 1.0.0 with 2.0.0 in {installed_root}.\nWhen opened, this plugin's program runs as your user. Installing runs nothing.\n"
         )
@@ -870,7 +870,8 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     ];
 
     for (marketplace, reason) in cases {
-        let error = failed(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample"]));
+        let error =
+            failed(&fixture.tickloop_from(&marketplace, &["plugin", "install", "sample@tickloop"]));
         assert!(
             error.starts_with(&format!("Error: {reason}")),
             "{marketplace}: {error}"
@@ -889,7 +890,7 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
     let unreached_url = server.serve("/unreached.tar.gz", Reply::Body(Vec::new()));
     let error = failed(&fixture.tickloop_from(
         &offering("unreached", CURRENT_TARGET, &unreached_url, &sha256),
-        &["plugin", "install", "sample"],
+        &["plugin", "install", "sample@tickloop"],
     ));
     assert!(
         error.starts_with(&format!("Error: {} is damaged", registry.display())),
@@ -904,12 +905,14 @@ fn a_failed_marketplace_install_says_why_and_changes_nothing() {
 fn the_available_packages_show_which_are_installed_and_which_this_platform_can_install() {
     let fixture = Fixture::new();
     let server = Server::start();
-    for package in [
-        fixture.package_with_login("current", "1.0.0"),
-        fixture.package_named("outdated", "1.0.0"),
-    ] {
-        succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&package)]));
-    }
+    fixture.install_official(&fixture.package_with_login("current", "1.0.0"));
+    fixture.install_official(&fixture.package_named("outdated", "1.0.0"));
+    succeeded(&fixture.tickloop(&[
+        "plugin",
+        "install",
+        "--path",
+        &path_text(&fixture.package_named("fresh", "0.1.0")),
+    ]));
     let sha256 = "a".repeat(64);
     let download = |name: &str| format!("https://example.com/tick-{name}.tar.gz");
     let marketplace_url = server.serve(
@@ -942,19 +945,22 @@ fn the_available_packages_show_which_are_installed_and_which_this_platform_can_i
         ),
     );
 
-    let listing =
-        succeeded(&fixture.tickloop_from(&marketplace_url, &["plugin", "list", "--available"]));
+    let listing = fixture.tickloop_from(&marketplace_url, &["plugin", "list", "--available"]);
 
-    let mut lines = listing.lines();
-    assert_eq!(
-        lines.next().unwrap(),
-        format!("Tick marketplace tickloop by Tickloop AI: {marketplace_url}")
+    assert!(listing.status.success());
+    assert!(
+        String::from_utf8_lossy(&listing.stderr)
+            .starts_with("Warning: cannot read marketplace claude-plugins-official: "),
+        "the built-in Git marketplace stands in as an unreadable local repository"
     );
-    let rows = lines
+    let rows = String::from_utf8(listing.stdout)
+        .unwrap()
+        .lines()
         .map(|line| {
             line.split("  ")
                 .map(str::trim)
                 .filter(|column| !column.is_empty())
+                .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -963,39 +969,41 @@ fn the_available_packages_show_which_are_installed_and_which_this_platform_can_i
         rows,
         [
             vec![
-                "current",
+                "current@tickloop",
                 "1.0.0",
                 "installed",
-                "needs login",
                 "The current package"
             ],
             vec![
-                "elsewhere",
+                "elsewhere@tickloop",
                 "0.1.0",
                 &unavailable,
-                "-",
                 "The elsewhere package"
             ],
-            vec!["fresh", "0.3.0", "not installed", "-", "The fresh package"],
             vec![
-                "outdated",
+                "fresh@tickloop",
+                "0.3.0",
+                "not installed; fresh@local is installed",
+                "The fresh package"
+            ],
+            vec![
+                "outdated@tickloop",
                 "2.0.0",
                 "installed 1.0.0",
-                "no login needed",
                 "The outdated package"
             ],
         ]
     );
 
     let empty = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let listing = fixture.tickloop_from(&empty, &["plugin", "list", "--available"]);
+    assert!(listing.status.success());
     assert_eq!(
-        succeeded(&fixture.tickloop_from(&empty, &["plugin", "list", "--available"])),
-        format!(
-            "Tick marketplace tickloop by Tickloop AI: {empty}\nIt offers no Tick packages yet.\n"
-        )
+        String::from_utf8(listing.stdout).unwrap(),
+        "No marketplace offers plugins yet.\n"
     );
     assert_eq!(
-        failed(&fixture.tickloop_from(&empty, &["plugin", "install", "fresh"])),
+        failed(&fixture.tickloop_from(&empty, &["plugin", "install", "fresh@tickloop"])),
         format!("Error: Tick package fresh is not in the Tick marketplace at {empty}\n")
     );
 }

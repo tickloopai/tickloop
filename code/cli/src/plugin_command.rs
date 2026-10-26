@@ -11,27 +11,36 @@ use tick_plugins::{
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::login_label;
 
-const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN
+const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]
        tickloop plugin install --path PATH
+       tickloop plugin update [PLUGIN]
        tickloop plugin uninstall PLUGIN [--keep-data]
        tickloop plugin enable PLUGIN
        tickloop plugin disable PLUGIN
        tickloop plugin login PLUGIN [--issuer LABEL]
        tickloop plugin logout PLUGIN
        tickloop plugin list [--available]
-       tickloop plugin validate DIRECTORY";
+       tickloop plugin validate DIRECTORY
+       tickloop plugin marketplace add SOURCE
+       tickloop plugin marketplace list
+       tickloop plugin marketplace update [MARKETPLACE]
+       tickloop plugin marketplace remove MARKETPLACE";
 const PLUGIN_GUIDE: &str = "Manage the plugins in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set. A plugin is a directory with a .tickloop-plugin/plugin.json, a .claude-plugin/plugin.json or a tick-package.json manifest, or none, when it is named after its directory.
-install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet. A plugin cannot take the name of an installed plugin from another marketplace.
+install PLUGIN installs the plugin of that name from the one marketplace that offers it, or from the one it is installed from; when several offer it, it lists them, and PLUGIN@MARKETPLACE chooses. A marketplace is read as last fetched; marketplace update reads it again. A plugin cannot take the name of an installed plugin from another marketplace.
+install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet.
+update reads the plugin's marketplace again and installs what it offers now, unless that is installed already: the same version, or for Git sources the same commit. Without PLUGIN it updates every plugin except those installed with --path.
 uninstall removes a plugin and its data directory; --keep-data keeps the data. Its saved login stays.
 enable and disable turn a plugin on and off without uninstalling it; a disabled plugin stays disabled when it is installed again. Its Skills, named PLUGIN:SKILL, load or stop loading from the Agent's next request.
-list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet.
+list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet. list --available shows what every marketplace offers: its latest version, what is installed and why a plugin cannot be installed. A marketplace that cannot be read is reported and the others are shown.
 validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores.
-install PLUGIN downloads from the tickloop marketplace (TICKLOOP_TICK_MARKETPLACE overrides its URL or file). login and logout manage the plugin's data source credentials. list --available shows the tickloop marketplace.
+login and logout manage the plugin's data source credentials.
+marketplace add registers a marketplace from a GitHub OWNER/REPO[#REF], a Git URL (https, ssh or file), a local directory, or an https URL of a marketplace.json; it takes the name its marketplace file gives. marketplace list shows them, marketplace update reads one or every one again, and marketplace remove unregisters one and keeps the plugins installed from it. The built-in marketplaces cannot be removed: tickloop, read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file), and claude-plugins-official, fetched with git the first time it is used.
 tickloop tick is a deprecated alias for tickloop plugin.
 Installing runs nothing in the plugin, and a plugin's Skills grant no tools; tools still ask as usual.
   -h, --help  Show this help.";
-const SUBCOMMANDS: [&str; 8] = [
+const SUBCOMMANDS: [&str; 10] = [
     "install",
+    "update",
     "login",
     "logout",
     "uninstall",
@@ -39,6 +48,7 @@ const SUBCOMMANDS: [&str; 8] = [
     "disable",
     "list",
     "validate",
+    "marketplace",
 ];
 const KEEP_DATA_OPTION: &str = "--keep-data";
 
@@ -113,6 +123,7 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
         [command, help] if is_help(help) && SUBCOMMANDS.iter().any(|name| command == name) => {
             PluginCommand::Help
         }
+        [command, _, help] if command == "marketplace" && is_help(help) => PluginCommand::Help,
         [command, option, path] if command == "install" && option == "--path" => {
             PluginCommand::InstallPath(Path::new(path))
         }

@@ -251,12 +251,16 @@ fn the_plugin_command_explains_its_usage() {
         &["plugin", "enable"],
         &["plugin", "disable", "--all"],
         &["plugin", "validate"],
-        &["plugin", "update"],
+        &["plugin", "update", "--all"],
+        &["plugin", "marketplace"],
+        &["plugin", "marketplace", "add"],
+        &["plugin", "marketplace", "remove"],
+        &["plugin", "marketplace", "list", "extra"],
     ] {
         let error = failed(&fixture.tickloop(arguments));
         assert!(
             error.starts_with(
-                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN"
+                "Error: Unknown plugin command. Usage: tickloop plugin install PLUGIN[@MARKETPLACE]"
             ),
             "{arguments:?}: {error}"
         );
@@ -266,14 +270,22 @@ fn the_plugin_command_explains_its_usage() {
         &["plugin", "-h"],
         &["plugin", "install", "--help"],
         &["plugin", "validate", "-h"],
+        &["plugin", "update", "--help"],
+        &["plugin", "marketplace", "--help"],
+        &["plugin", "marketplace", "add", "--help"],
     ] {
         let help = succeeded(&fixture.tickloop(arguments));
         assert!(
             help.starts_with(
-                "Usage: tickloop plugin install PLUGIN\n       tickloop plugin install --path PATH\n"
+                "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]\n       tickloop plugin install --path PATH\n"
             ),
             "{help}"
         );
+        assert!(
+            help.contains("       tickloop plugin marketplace add SOURCE\n"),
+            "{help}"
+        );
+        assert!(help.contains("claude-plugins-official"), "{help}");
         assert!(help.contains("TICKLOOP_CONFIG_DIR"), "{help}");
         assert!(help.contains("named PLUGIN:SKILL"), "{help}");
         assert!(help.contains("grant no tools"), "{help}");
@@ -281,7 +293,7 @@ fn the_plugin_command_explains_its_usage() {
     let console_help = succeeded(&fixture.tickloop(&["--help"]));
     assert!(
         console_help.contains(
-            "tickloop plugin install PLUGIN | install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY"
+            "tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE"
         ),
         "{console_help}"
     );

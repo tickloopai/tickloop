@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use tick_packages::CURRENT_TARGET;
 
 use crate::tick_package_commands::{
-    Fixture, OFFICIAL_MARKETPLACE_REPOSITORY, failed, marketplace_json, offered, path_text,
-    succeeded,
+    Fixture, OFFICIAL_MARKETPLACE_REPOSITORY, Reply, Server, archive_of, failed, marketplace_json,
+    offered, path_text, succeeded,
 };
 
 const DEFAULT_TICK_MARKETPLACE: &str = "tick-marketplace";
@@ -703,5 +703,49 @@ fn the_built_in_git_marketplace_is_fetched_on_first_use_and_installs_each_kind_o
                 "manifest name: Notion".to_owned(),
             ],
         ]
+    );
+}
+
+#[test]
+fn a_tick_package_installs_and_updates_by_name_from_the_tickloop_marketplace() {
+    let fixture = Fixture::new();
+    official_marketplace(&fixture, json!([]));
+    let server = Server::start();
+    let offer = |version: &str| {
+        let (archive, sha256) = archive_of(&fixture.package_named("sample", version));
+        let url = server.serve(
+            &format!("/tick-sample-{version}.tar.gz"),
+            Reply::Body(archive),
+        );
+        fixture.marketplace_file(
+            DEFAULT_TICK_MARKETPLACE,
+            &marketplace_json(json!([offered(
+                "sample",
+                version,
+                &[(CURRENT_TARGET, &url, &sha256)]
+            )])),
+        );
+    };
+    offer("1.0.0");
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "sample"])),
+        format!(
+            "Installed plugin sample@tickloop 1.0.0 in {}.\n\
+             When opened, this plugin's program runs as your user. Installing runs nothing.\n",
+            cached_root(&fixture, "tickloop", "sample", "1.0.0")
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update", "sample"])),
+        "Plugin sample@tickloop 1.0.0 is up to date.\n"
+    );
+    offer("2.0.0");
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update"])),
+        format!(
+            "Updated plugin sample@tickloop from 1.0.0 to 2.0.0 in {}.\n\
+             When opened, this plugin's program runs as your user. Installing runs nothing.\n",
+            cached_root(&fixture, "tickloop", "sample", "2.0.0")
+        )
     );
 }
