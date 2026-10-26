@@ -1,7 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use base64::{
@@ -15,12 +14,11 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    BrowserLogin, BrowserSession,
+    BrowserLogin,
     provider_store::{ProviderStore, read_private_json},
 };
 use crate::{
@@ -28,6 +26,7 @@ use crate::{
 };
 use tickloop_harness_base::{
     network::{HttpPolicy, build_http_client},
+    oauth_callback::{CallbackError, CallbackListener},
     private_fs::unix_time_milliseconds,
 };
 use tickloop_harness_protocol::{ModelAuthSource, ModelConfig};
@@ -35,6 +34,7 @@ use tickloop_harness_protocol::{ModelAuthSource, ModelConfig};
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language.retriever";
 const REFRESH_SKEW_MS: u64 = 60_000;
+const BROWSER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct GoogleAuth {
@@ -173,15 +173,9 @@ impl GoogleAuth {
         let listener = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
-            result = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) => result.map_err(|_| configuration("Google OAuth callback port is unavailable"))?,
+            result = CallbackListener::bind(0, super::CALLBACK_PATH) => result.map_err(|_| configuration("Google OAuth callback port is unavailable"))?,
         };
-        let callback_uri = format!(
-            "http://localhost:{}/auth/callback",
-            listener
-                .local_addr()
-                .map_err(|_| configuration("Google OAuth callback unavailable"))?
-                .port()
-        );
+        let callback_uri = listener.redirect_uri().to_owned();
         let verifier = super::new_pkce_verifier();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = tickloop_ids::random_token();
@@ -206,17 +200,6 @@ impl GoogleAuth {
             credentials,
         })?;
         drop(lock);
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let stop = CancellationToken::new();
-        let completed = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(super::serve_browser_callbacks(
-            listener,
-            callback_uri.clone(),
-            state.clone(),
-            sender.clone(),
-            completed.clone(),
-            stop.clone(),
-        ));
         Ok(GoogleLogin {
             generation,
             client_id,
@@ -226,16 +209,8 @@ impl GoogleAuth {
                 generation,
                 authorization_url: url.into(),
                 callback_uri,
-                session: BrowserSession {
-                    verifier,
-                    started_at: Instant::now(),
-                    callback_codes: receiver,
-                    callback_sender: sender,
-                    callback_task: task,
-                    stop,
-                    completed,
-                    state,
-                },
+                verifier,
+                callback: listener.receive(state, super::BROWSER_CALLBACK_PAGES, BROWSER_TIMEOUT),
             },
         })
     }
@@ -245,11 +220,18 @@ impl GoogleAuth {
         mut login: GoogleLogin,
         cancel: &CancellationToken,
     ) -> Result<String, ModelError> {
-        let code = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ModelError::Cancelled),
-            () = tokio::time::sleep(Duration::from_secs(15 * 60)) => return Err(configuration("Google OAuth authorization expired")),
-            code = login.browser.session.callback_codes.recv() => code.ok_or_else(|| configuration("Google OAuth callback ended"))?.map_err(|_| configuration("Google OAuth authorization denied or invalid callback"))?,
+        let code = match login.browser.callback.wait(cancel).await {
+            Ok(response) => response.code,
+            Err(CallbackError::Cancelled) => return Err(ModelError::Cancelled),
+            Err(CallbackError::TimedOut) => {
+                return Err(configuration("Google OAuth authorization expired"));
+            }
+            Err(CallbackError::Ended) => return Err(configuration("Google OAuth callback ended")),
+            Err(_) => {
+                return Err(configuration(
+                    "Google OAuth authorization denied or invalid callback",
+                ));
+            }
         };
         let value = token_request(
             &self.token_url,
@@ -259,7 +241,7 @@ impl GoogleAuth {
                 ("client_id", &login.client_id),
                 ("client_secret", &login.client_secret),
                 ("redirect_uri", &login.browser.callback_uri),
-                ("code_verifier", &login.browser.session.verifier),
+                ("code_verifier", &login.browser.verifier),
             ],
             cancel,
         )
@@ -788,11 +770,20 @@ mod tests {
             .unwrap();
         let cancel = CancellationToken::new();
         let login = auth.start_browser_login(&cancel).await.unwrap();
+        let state = reqwest::Url::parse(&login.browser.authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
         login
             .browser
-            .session
-            .callback_sender
-            .send(Ok("code".into()))
+            .manual_callback()
+            .submit(&format!(
+                "{}?code=code&state={state}",
+                login.browser.callback_uri
+            ))
             .unwrap();
         auth.logout(&cancel).await.unwrap();
         assert!(auth.finish_browser_login(login, &cancel).await.is_err());
