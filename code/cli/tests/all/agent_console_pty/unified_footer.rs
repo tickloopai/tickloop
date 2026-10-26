@@ -391,12 +391,12 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     shell_view_closed(&pty, "printf 'shell-second\\n'; while").await;
     pty.wait_for(
         "Esc returns to the second Shell's row, which can stop it",
-        |frame| frame.contains("Shells (2)") && frame.contains("ctrl+x stop"),
+        |frame| frame.contains("Shells (2)") && frame.contains("x stop"),
     )
     .await;
-    pty.send(b"\x18");
+    pty.send(b"x");
     pty.wait_for("Tick Shell stop needs confirmation", |frame| {
-        frame.contains("Press ctrl+x again to stop this Shell")
+        frame.contains("Press x again to stop this Shell")
     })
     .await;
     assert!(
@@ -405,7 +405,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
             .iter()
             .any(|task| task.id == second && !task.state.is_terminal())
     );
-    pty.send(b"\x18");
+    pty.send(b"x");
     let stopped = wait_shell_tasks(
         &client,
         execution,

@@ -66,6 +66,7 @@ Keys:
 - `ctrl+j` inserts a new line; `ctrl+g` edits your message in an external editor.
 - In lists and menus, use `j`/`k` or the arrow keys, `enter` to choose and `esc` to go back.
 - In the Monitor, `enter` opens a Tick and `esc` hides it again; the program keeps running.
+- To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
 ## Plugins and data sources
 
@@ -108,7 +109,7 @@ Local-path installations are updated only by running `install --path` again, eve
 
 In `/plugins`, `Tab` or left/right switches between **Installed** and **Available**. Use `j`/`k` or `Ctrl+N`/`Ctrl+P` to select and `Enter` to install or open actions. Installed rows show source, version, enabled state, login and unsupported components; actions include enable/disable, update and login/logout. On Available, `/` starts a case-insensitive filter across names, descriptions and marketplaces: `j`/`k` enter text, `Ctrl+N`/`Ctrl+P` select, and `Ctrl+G` opens an editor. `Esc` leaves filtering and keeps the query; another `Esc` closes the panel. A failed marketplace has its own error row, summarized in at most three lines; other sources and Installed remain usable.
 
-To uninstall in the panel, press `Ctrl+X` twice on the same Installed row within three seconds. This deletes plugin data, keeps saved login, and leaves running Ticks running. Moving selection, another key, leaving the panel or waiting cancels confirmation. Use the CLI's `--keep-data` to preserve data. Saved logins remain under `credentials/NAME/` in your configuration directory; use `logout` before uninstalling if you want to remove the saved login.
+To uninstall in the panel, press `x` twice on the same Installed row within three seconds. This deletes plugin data, keeps saved login, and leaves running Ticks running. Moving selection, another key, leaving the panel or waiting cancels confirmation. Use the CLI's `--keep-data` to preserve data. Saved logins remain under `credentials/NAME/` in your configuration directory; use `logout` before uninstalling if you want to remove the saved login.
 
 Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills and prevents opening its Tick by name; reinstalling or updating preserves the disabled state. Installation runs nothing and grants no permissions. Tick programs run as you only when opened under your permission settings; plugin Skill tool calls still require the usual approval. Only Skills and Tick components work in this release; other components are listed as unsupported. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
 

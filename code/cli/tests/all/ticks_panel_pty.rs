@@ -400,10 +400,10 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     });
     assert!(!frame.contains("Log in"), "{frame}");
     terminal.press(ESCAPE, "the list", |frame| !frame.contains("❯ Update"));
-    terminal.press(b"\x18", "uninstall confirmation", |frame| {
-        frame.contains("Press ctrl+x again to uninstall sample")
+    terminal.press(b"x", "uninstall confirmation", |frame| {
+        frame.contains("Press x again to uninstall sample")
     });
-    terminal.press(b"\x18", "the uninstall", |frame| {
+    terminal.press(b"x", "the uninstall", |frame| {
         frame.contains("Uninstalled sample 1.0.0; its running Ticks keep running until closed")
             && !frame.contains("◉ sample")
     });
@@ -663,10 +663,10 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
     terminal.press(CONTROL_P, "previous filtered row", |frame| {
         is_selected(frame, "jk-340")
     });
-    terminal.press(b"z", "no matching plugins", |frame| {
-        frame.contains("No plugins match")
+    terminal.press(b"xx", "x stays text in the filter", |frame| {
+        frame.contains("Filter: jk-34xx") && frame.contains("No plugins match")
     });
-    terminal.press(b"\x7f", "backspace restores matches", |frame| {
+    terminal.press(b"\x7f\x7f", "backspace restores matches", |frame| {
         is_selected(frame, "jk-340")
     });
     terminal.press(ESCAPE, "leave filter", |frame| {
@@ -696,7 +696,7 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
 }
 
 #[test]
-fn uninstall_requires_two_control_x_presses_on_the_same_plugin() {
+fn uninstall_requires_two_plain_x_presses_on_the_same_plugin() {
     let fixture = Fixture::new();
     install_path(&fixture, &fixture.package_named("alpha", "1.0.0"));
     install_path(&fixture, &fixture.package_named("beta", "1.0.0"));
@@ -707,26 +707,34 @@ fn uninstall_requires_two_control_x_presses_on_the_same_plugin() {
     terminal.press(b"/plugins\r", "installed plugins", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
-    terminal.press(b"\x18", "uninstall armed", |frame| {
-        frame.contains("Press ctrl+x again to uninstall alpha")
+    terminal.press(b"x", "uninstall armed", |frame| {
+        frame.contains("Press x again to uninstall alpha")
+    });
+    terminal.press(
+        b"\x18\x18",
+        "control x cancels without uninstalling",
+        |frame| !frame.contains("Press x again") && is_selected(frame, "alpha"),
+    );
+    terminal.press(b"x", "plain x arms again", |frame| {
+        frame.contains("Press x again to uninstall alpha")
     });
     terminal.press(b"j", "selection cancels uninstall", |frame| {
-        is_selected(frame, "beta") && !frame.contains("Press ctrl+x again")
+        is_selected(frame, "beta") && !frame.contains("Press x again")
     });
-    terminal.press(b"\x18", "beta armed", |frame| {
-        frame.contains("Press ctrl+x again to uninstall beta")
+    terminal.press(b"x", "beta armed", |frame| {
+        frame.contains("Press x again to uninstall beta")
     });
     terminal.press(b"k", "alpha selected", |frame| is_selected(frame, "alpha"));
-    terminal.press(b"\x18", "confirmation will expire", |frame| {
-        frame.contains("Press ctrl+x again to uninstall alpha")
+    terminal.press(b"x", "confirmation will expire", |frame| {
+        frame.contains("Press x again to uninstall alpha")
     });
     terminal.wait_for_frame(terminal.mark(), "confirmation expired", |frame| {
-        !frame.contains("Press ctrl+x again") && frame.contains("ctrl+x uninstall")
+        !frame.contains("Press x again") && frame.contains("x uninstall")
     });
-    terminal.press(b"\x18", "alpha armed again", |frame| {
-        frame.contains("Press ctrl+x again to uninstall alpha")
+    terminal.press(b"x", "alpha armed again", |frame| {
+        frame.contains("Press x again to uninstall alpha")
     });
-    terminal.press(b"\x18", "alpha uninstalled", |frame| {
+    terminal.press(b"x", "alpha uninstalled", |frame| {
         frame.contains("Uninstalled alpha") && !frame.contains("◉ alpha")
     });
     assert!(
@@ -754,15 +762,15 @@ fn a_short_terminal_cannot_confirm_a_hidden_plugin_uninstall() {
     terminal.press(b"/plugins\r", "installed", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
-    terminal.press(b"\x18", "uninstall armed", |frame| {
-        frame.contains("Press ctrl+x again to uninstall alpha")
+    terminal.press(b"x", "uninstall armed", |frame| {
+        frame.contains("Press x again to uninstall alpha")
     });
     let mark = terminal.mark();
     terminal.resize(30, 6);
     terminal.wait_for_frame(mark, "resize instead of hidden confirmation", |frame| {
         frame.contains("Resize · esc back")
     });
-    terminal.send(b"\x18");
+    terminal.send(b"x");
     terminal.press(ESCAPE, "closed small panel", |frame| {
         !panel_is_open(frame) && !frame.contains("Resize")
     });

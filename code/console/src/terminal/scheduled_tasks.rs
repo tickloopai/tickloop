@@ -256,7 +256,7 @@ impl TickDetailView for TaskDetail {
         self
     }
     fn hint(&self) -> String {
-        "j/k scroll · ctrl+x remove · esc back".into()
+        "j/k scroll · x remove · esc back".into()
     }
     fn lines(&mut self, width: usize, height: usize, _now: u64) -> Vec<TickDetailLine> {
         let view = view(&self.task, false, None, false);

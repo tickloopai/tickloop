@@ -249,10 +249,10 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     // A clean exit adds no words or time to the row; its unread end colours its glyph.
     session.wait_for_unread_shell();
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
-    session.send(b"\x1b[C\x18");
-    session.wait("Press ctrl+x again to remove");
+    session.send(b"\x1b[Cx");
+    session.wait("Press x again to remove");
     assert!(session.frame().contains("Shells (1)"));
-    session.send(b"\x18");
+    session.send(b"x");
     session.wait_without("Shells (1)");
     // The emptied column stays, so the conversation keeps its width; /monitor hides it.
     session.wait("Nothing to monitor");
@@ -403,11 +403,11 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             std::fs::read_to_string(log).unwrap().trim(),
             "https://docs.example/a/test"
         );
-        session.wait("ctrl+x unlink");
-        session.send(b"\x18");
-        session.wait("Press ctrl+x again to unlink");
+        session.wait("x unlink");
+        session.send(b"x");
+        session.wait("Press x again to unlink");
         assert!(session.frame().contains("PTY Research"));
-        session.send(b"\x18");
+        session.send(b"x");
         session.wait("Nothing to monitor");
         assert!(!session.frame().contains("Artifact unlinked"));
         session.exit();
@@ -453,36 +453,40 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.keep_history_paused();
     session.wait("Monitor 1");
     session.wait("calendar:pty-member");
-    session.send(b"jk");
-    session.wait("❯\u{a0}jk");
+    session.send(b"xxjk");
+    session.wait("❯\u{a0}xxjk");
     assert!(
         session.frame().contains("calendar:pty-member"),
-        "typing j/k edits the input while Monitor is not focused"
+        "typing x/j/k edits the input while Monitor is not focused"
     );
-    session.send(b"\x7f\x7f");
-    session.wait_without("❯\u{a0}jk");
+    session.send(b"\x7f\x7f\x7f\x7f");
+    session.wait_without("❯\u{a0}xxjk");
     session.send(b"\x1b[C");
-    session.wait("enter details · ctrl+x remove · s subscriptions · esc input");
+    session.wait("enter details · x remove · s subscriptions · esc input");
     session.send(b"\r");
     session.wait("Owner     this Chat");
     session.wait("Resources unavailable");
     session.send(b"\x1b");
     session.wait_without("Owner     this Chat");
-    session.send(b"\x18");
-    session.wait("Press ctrl+x again to remove");
+    session.send(b"x");
+    session.wait("Press x again to remove");
+    session.send(b"\x18\x18");
+    session.wait_without("Press x again");
     assert!(session.frame().contains("calendar:pty-member"));
+    session.send(b"x");
+    session.wait("Press x again to remove");
     session.send(b"\x1b[B");
-    session.wait_without("Press ctrl+x again");
-    session.send(b"\x18");
-    session.wait("Press ctrl+x again to remove");
-    session.wait_without("Press ctrl+x again");
+    session.wait_without("Press x again");
+    session.send(b"x");
+    session.wait("Press x again to remove");
+    session.wait_without("Press x again");
     assert!(
         session.frame().contains("calendar:pty-member"),
         "expiry keeps the row"
     );
-    session.send(b"\x18");
-    session.wait("Press ctrl+x again to remove");
-    session.send(b"\x18");
+    session.send(b"x");
+    session.wait("Press x again to remove");
+    session.send(b"x");
     session.wait_without("calendar:pty-member");
     session.wait_without("Monitor 1");
     session.exit();
@@ -500,7 +504,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
 }
 
 #[test]
-fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_in_a_real_pty() {
+fn scheduled_task_deletion_from_details_and_list_requires_two_plain_x_presses_in_a_real_pty() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let chat = tokio::runtime::Builder::new_current_thread()
@@ -549,16 +553,16 @@ fn scheduled_task_deletion_from_details_and_list_requires_two_control_x_presses_
     session.wait("Scheduled (2)");
     session.send(b"\x1b[C\r");
     session.wait("Cron: * * * * *");
-    session.send(b"\x18");
-    session.wait("Press ctrl+x again to delete this scheduled task");
+    session.send(b"x");
+    session.wait("Press x again to delete this scheduled task");
     assert!(session.frame().contains("Cron: * * * * *"));
-    session.send(b"\x18");
+    session.send(b"x");
     session.wait("Scheduled (1)");
     assert!(!session.frame().contains("Scheduled task removed"));
-    session.send(b"\x18");
-    session.wait("Press ctrl+x again to delete this scheduled task");
+    session.send(b"x");
+    session.wait("Press x again to delete this scheduled task");
     assert!(session.frame().contains("Scheduled (1)"));
-    session.send(b"\x18");
+    session.send(b"x");
     session.wait_without("Scheduled (1)");
     session.wait("Nothing to monitor");
     session.exit();

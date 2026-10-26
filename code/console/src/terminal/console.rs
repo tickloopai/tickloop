@@ -11513,7 +11513,7 @@ impl State {
             target,
             detail,
             intent,
-            hint: format!("Press ctrl+x again to {consequence}"),
+            hint: format!("Press x again to {consequence}"),
         })
     }
 
@@ -11920,7 +11920,7 @@ impl State {
             return None;
         }
         if key.code != KeyCode::Char('x')
-            || key.modifiers != KeyModifiers::CONTROL
+            || key.modifiers != KeyModifiers::NONE
             || !self.monitor_owns_keys()
         {
             self.monitor_confirmation = None;
@@ -12064,7 +12064,7 @@ impl State {
         {
             self.monitor.action_error = None;
             self.shell_background_chord_started_at = None;
-            if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
+            if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::NONE {
                 return self.request_monitor_removal();
             }
             let (width, height) = self.detail_area();

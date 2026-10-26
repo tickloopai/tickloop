@@ -1219,9 +1219,9 @@ impl Monitor {
             return format!(
                 "{pause}{}",
                 if self.expanded_tasks {
-                    "enter details · ctrl+x remove · j/k select · esc back"
+                    "enter details · x remove · j/k select · esc back"
                 } else {
-                    "enter details · ctrl+x remove · esc input"
+                    "enter details · x remove · esc input"
                 }
             );
         }
@@ -1236,8 +1236,6 @@ impl Monitor {
                             "{} {}",
                             if action.key == crate::monitor_rows::MONITOR_ENTER_KEY {
                                 "enter".into()
-                            } else if action.key == crate::monitor_rows::REMOVE_KEY {
-                                "ctrl+x".into()
                             } else {
                                 action.key.to_string()
                             },

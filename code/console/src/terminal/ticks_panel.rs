@@ -548,8 +548,7 @@ impl TicksPanel {
     }
 
     pub(super) fn key(&mut self, key: KeyEvent) -> TicksPanelEffect {
-        let uninstall_key =
-            key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL;
+        let uninstall_key = key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::NONE;
         if !uninstall_key {
             self.cancel_uninstall();
         }
@@ -1398,7 +1397,7 @@ impl TicksPanel {
                     0,
                     (
                         if self.page == INSTALLED_PAGE {
-                            "ctrl+x uninstall"
+                            "x uninstall"
                         } else {
                             "/ filter"
                         }
@@ -1444,10 +1443,9 @@ impl TicksPanel {
         lines.resize(height.saturating_sub(1 + status.len()), RoleLine::default());
         lines.extend(status);
         lines.push(match &self.uninstall_confirmation {
-            Some((name, _)) => RoleLine::role(
-                format!("Press ctrl+x again to uninstall {name}"),
-                Role::Error,
-            ),
+            Some((name, _)) => {
+                RoleLine::role(format!("Press x again to uninstall {name}"), Role::Error)
+            }
             None => RoleLine::role(hint, Role::MutedText),
         });
         lines.truncate(height);
@@ -1898,10 +1896,10 @@ mod tests {
         );
         assert!(!shown.contains("Log in"), "{shown}");
         press(&mut panel, KeyCode::Esc);
-        control(&mut panel, 'x');
-        assert!(text(&mut panel).contains("Press ctrl+x again to uninstall beta"));
+        press(&mut panel, KeyCode::Char('x'));
+        assert!(text(&mut panel).contains("Press x again to uninstall beta"));
         assert_eq!(
-            work(control(&mut panel, 'x')),
+            work(press(&mut panel, KeyCode::Char('x'))),
             TickPackageRequest::Uninstall("beta".into())
         );
         let shown = text(&mut panel);

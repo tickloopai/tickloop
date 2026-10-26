@@ -891,7 +891,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. Press ctrl+x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press ctrl+x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -944,13 +944,13 @@ j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
 /plan enters Plan mode, or opens this Chat's saved plan.
-Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; p pauses/resumes a periodic subscription or scheduled task; ctrl+x twice confirms removal.
+Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; p pauses/resumes a periodic subscription or scheduled task; x twice confirms removal.
 The first new Goal, scheduled task or Tick in each Chat during this console session opens Monitor once without moving input focus, even when hidden. Closing it prevents further automatic opens. Existing content on opening a Chat does not trigger this; narrow terminals flash the Monitor entry instead of covering the conversation.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
 Background Shell completions are added to their Chat as task notifications.
 A completion continues the Loop once it has worked, unless its last turn was interrupted or failed; otherwise it is only recorded.
 /compact [INSTRUCTIONS] summarizes context behind a compaction boundary.
-/loop [INTERVAL] [INSTRUCTION] repeats work: a fixed interval runs once immediately, then on schedule; without an interval the Agent picks each next wakeup. Without instructions it reads .tickloop/loop.md, then the config root's loop.md, else maintenance guidance. Chats without a Folder only read the config root's loop.md. Monitor shows each scheduled task; p pauses/resumes it (pending tasks cannot pause), enter opens details, ctrl+x twice confirms deletion. Esc cancels a self-paced pending wakeup; fixed schedules keep running. /stop pauses receiving; send a message to resume.
+/loop [INTERVAL] [INSTRUCTION] repeats work: a fixed interval runs once immediately, then on schedule; without an interval the Agent picks each next wakeup. Without instructions it reads .tickloop/loop.md, then the config root's loop.md, else maintenance guidance. Chats without a Folder only read the config root's loop.md. Monitor shows each scheduled task; p pauses/resumes it (pending tasks cannot pause), enter opens details, x twice confirms deletion. Esc cancels a self-paced pending wakeup; fixed schedules keep running. /stop pauses receiving; send a message to resume.
 
 /help advanced lists advanced commands; /exit closes this View; Agent work continues."#;
     format!(
@@ -9956,9 +9956,9 @@ mod status_agents_help_tests {
         assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
         assert!(help.contains("tickloop monitor attach"));
         for expected in [
-            "Press ctrl+x twice within 3 seconds",
+            "Press x twice within 3 seconds",
             "restoring its subscriptions at their frequencies",
-            "Press ctrl+x twice to remove a scheduled task or unlink an Artifact",
+            "Press x twice to remove a scheduled task or unlink an Artifact",
             "h includes earlier feedback",
         ] {
             assert!(help.contains(expected), "missing: {expected}");
