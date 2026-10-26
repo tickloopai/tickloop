@@ -2,6 +2,8 @@
 
 #[path = "all/manifest.rs"]
 mod manifest;
+#[path = "all/marketplace.rs"]
+mod marketplace;
 #[path = "all/migration.rs"]
 mod migration;
 #[path = "all/store.rs"]

@@ -5,20 +5,31 @@
 //! Installing only places files: nothing in a plugin runs, no Tick opens and no access is
 //! granted.
 
+mod catalog;
+mod git;
+mod http;
 mod manifest;
+mod marketplace;
 mod migration;
 mod registry;
+mod source;
 mod staging;
 mod store;
 
 use std::{ffi::OsStr, io, path::PathBuf};
 
+pub use catalog::{MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource};
+pub use git::{GitCheckout, GitClient};
 pub use manifest::{
     CLAUDE_MANIFEST, Component, ManifestFormat, PluginManifest, TICKLOOP_MANIFEST, TickProgram,
     skill_directories, validate_plugin_name,
 };
+pub use marketplace::{
+    CLAUDE_OFFICIAL_MARKETPLACE, HttpClient, HttpRequest, MarketplaceRegistration,
+};
 pub use migration::Migration;
 pub use registry::{PluginSource, REGISTRY_FILE_NAME};
+pub use source::{GitSource, MarketplaceSource};
 pub use store::{
     BrokenPlugin, DownloadFile, ExpectedArchive, InstallOutcome, Installation, InstalledPlugin,
     InstalledPlugins, PluginStore, Uninstalled,

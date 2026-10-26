@@ -340,6 +340,65 @@ impl PluginStore {
         Ok(DownloadFile(file))
     }
 
+    /// Installs a checked-out plugin, keeping an intact installation at the same commit.
+    pub fn install_checkout(
+        &self,
+        checkout: &crate::GitCheckout,
+        marketplace: &str,
+        name: &str,
+        entry: Option<&Map<String, Value>>,
+    ) -> Result<Installation, PluginError> {
+        validate_plugin_name(marketplace)?;
+        validate_plugin_name(name)?;
+        let request = Request {
+            marketplace,
+            source: PluginSource::Git {
+                source: checkout.source.clone(),
+                commit: checkout.commit.clone(),
+            },
+            revision: checkout.commit[..crate::git::COMMIT_REVISION_LENGTH].to_owned(),
+            sha256: None,
+            default_name: name.to_owned(),
+            entry,
+            expected: None,
+            same_revision: SameRevision::Keep,
+        };
+        self.install(request, |staged| {
+            staging::copy_directory(checkout.root(), staged)
+        })
+    }
+
+    pub(crate) fn install_marketplace_directory(
+        &self,
+        root: &Path,
+        marketplace: &str,
+        name: &str,
+        entry: &Map<String, Value>,
+    ) -> Result<Installation, PluginError> {
+        validate_plugin_name(marketplace)?;
+        validate_plugin_name(name)?;
+        let request = Request {
+            marketplace,
+            source: PluginSource::Path {
+                path: root.to_string_lossy().into_owned(),
+            },
+            revision: LOCAL_REVISION.to_owned(),
+            sha256: None,
+            default_name: name.to_owned(),
+            entry: Some(entry),
+            expected: None,
+            same_revision: SameRevision::Replace,
+        };
+        self.install(request, |staged| {
+            if canonical(&self.directory)?.starts_with(root) {
+                return Err(PluginError::Invalid(
+                    "plugin source contains the plugins directory".into(),
+                ));
+            }
+            staging::copy_directory(root, staged)
+        })
+    }
+
     /// Removes the plugin and its registration, and its data unless `keep_data`. Its data source
     /// credentials stay.
     pub fn uninstall(&self, name: &str, keep_data: bool) -> Result<Uninstalled, PluginError> {
@@ -421,7 +480,11 @@ impl PluginStore {
         )))?;
         fill(&staged)?;
         staging::check_tree(&staged)?;
-        let manifest = PluginManifest::load(&staged, &request.default_name, request.entry)?;
+        let manifest = if request.marketplace == LOCAL_MARKETPLACE {
+            PluginManifest::load(&staged, &request.default_name, request.entry)?
+        } else {
+            PluginManifest::load_from_marketplace(&staged, &request.default_name, request.entry)?
+        };
         if let Some(document) = manifest.written_manifest(request.entry) {
             write_manifest(&staged, &document)?;
         }
@@ -558,8 +621,12 @@ impl PluginStore {
             .join(&entry.revision)
             .canonicalize()
             .map_err(|error| format!("its directory cannot be opened: {error}"))?;
-        let manifest =
-            PluginManifest::load(&root, name, None).map_err(|error| error.to_string())?;
+        let manifest = if entry.marketplace == LOCAL_MARKETPLACE {
+            PluginManifest::load(&root, name, None)
+        } else {
+            PluginManifest::load_from_marketplace(&root, name, None)
+        }
+        .map_err(|error| error.to_string())?;
         if manifest.name != name {
             return Err(format!("its manifest names the plugin {}", manifest.name));
         }

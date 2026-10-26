@@ -206,16 +206,6 @@ fn an_archive_that_does_not_match_its_listing_changes_nothing() {
         .unwrap_err();
     assert!(error.to_string().contains("SHA-256"), "{error}");
 
-    let wrong_name = ExpectedArchive {
-        name: "other",
-        ..expected("1.0.0", &sha256)
-    };
-    let error = fixture
-        .store
-        .install_archive(&archive, wrong_name)
-        .unwrap_err();
-    assert_eq!(error.to_string(), "the plugin is named quotes, not other");
-
     let error = fixture
         .store
         .install_archive(&archive, expected("9.9.9", &sha256))
