@@ -246,6 +246,13 @@ pub(super) fn transcript_document(
                         }
                         let text = safe_text(text);
                         writer.prompt(&text, &image_links.in_text(snapshot.id.into(), &text));
+                        if let Some(skill) = block
+                            .metadata
+                            .run_id
+                            .and_then(|run| snapshot.user_skill_invocations.get(&run.into()))
+                        {
+                            writer.runs((user_skill_runs(skill, display), Vec::new()));
+                        }
                     }
                 }
             }
@@ -1012,6 +1019,24 @@ fn twelve_hour_time(hour: u32, minute: u32) -> String {
         _ => (hour - 12, "PM"),
     };
     format!("{hour:02}:{minute:02} {period}")
+}
+
+pub(super) fn user_skill_runs(
+    skill: &tickloop_harness::protocol::UserSkillInvocation,
+    display: DisplayProfile,
+) -> RoleRuns {
+    vec![
+        (
+            format!("\n{} ", display.glyph(Glyph::ToolCall)),
+            Some(Role::MutedText),
+        ),
+        ("Skill".into(), Some(Role::ToolName)),
+        (format!(" · {}", super::safe_line(&skill.name)), None),
+        (
+            format!(" · {}\n", super::safe_line(&skill.source.display_label())),
+            Some(Role::MutedText),
+        ),
+    ]
 }
 
 pub(super) struct ToolPresentation {

@@ -1,3 +1,5 @@
+use tickloop_code_settings::skills::SkillRegistry;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CommandGroup {
     Conversation,
@@ -424,10 +426,29 @@ pub(super) enum CompletionAction {
     ReplaceDraft { draft: String, cursor: usize },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CompletionCandidate {
+    pub command: String,
+    pub arguments: String,
+    pub description: String,
+    pub menu_group: Option<CommandGroup>,
+}
+
+impl CompletionCandidate {
+    fn syntax(&self) -> String {
+        if self.arguments.is_empty() {
+            self.command.clone()
+        } else {
+            format!("{} {}", self.command, self.arguments)
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Completion {
     scope: CommandScope,
-    matches: Vec<usize>,
+    matches: Vec<CompletionCandidate>,
+    skills: Vec<CompletionCandidate>,
     selected: Option<usize>,
     draft: String,
     token_start: usize,
@@ -435,6 +456,18 @@ pub(super) struct Completion {
 }
 
 impl Completion {
+    pub(super) fn set_skills(&mut self, registry: &SkillRegistry) {
+        self.skills = registry
+            .user_definitions()
+            .map(|skill| CompletionCandidate {
+                command: format!("/{}", skill.name),
+                arguments: "[ARGUMENTS]".into(),
+                description: format!("{} · {}", skill.source.display_label(), skill.description),
+                menu_group: Some(CommandGroup::Skills),
+            })
+            .collect();
+    }
+
     #[cfg(test)]
     fn update(&mut self, draft: &str) {
         self.update_at(draft, draft.len(), CommandScope::Root);
@@ -453,19 +486,44 @@ impl Completion {
         self.matches.extend(
             COMMANDS
                 .iter()
-                .enumerate()
-                .filter(|(_, spec)| {
+                .filter(|spec| {
                     spec.menu_group != Some(CommandGroup::Advanced)
                         && spec.command[1..].starts_with(query)
                         && spec.unavailable_in(scope).is_none()
                 })
-                .map(|(index, _)| index),
+                .map(|spec| {
+                    let discovered = self
+                        .skills
+                        .iter()
+                        .find(|skill| skill.command == spec.command);
+                    CompletionCandidate {
+                        command: spec.command.into(),
+                        arguments: spec.arguments.into(),
+                        description: discovered
+                            .filter(|_| spec.menu_group == Some(CommandGroup::Skills))
+                            .map_or_else(
+                                || spec.description_in(scope),
+                                |skill| skill.description.clone(),
+                            ),
+                        menu_group: spec.menu_group,
+                    }
+                }),
         );
-        self.matches.sort_by(|left, right| {
-            let left = &COMMANDS[*left];
-            let right = &COMMANDS[*right];
-            left.command.cmp(right.command)
-        });
+        self.matches.extend(
+            self.skills
+                .iter()
+                .filter(|skill| {
+                    !COMMANDS.iter().any(|spec| spec.command == skill.command)
+                        && (skill.command[1..].starts_with(query)
+                            || skill
+                                .command
+                                .split_once(':')
+                                .is_some_and(|(_, bare)| bare.starts_with(query)))
+                })
+                .cloned(),
+        );
+        self.matches
+            .sort_by(|left, right| left.command.cmp(&right.command));
         if !self.matches.is_empty() {
             self.draft.push_str(draft);
             self.token_start = token_start;
@@ -485,14 +543,14 @@ impl Completion {
         !self.matches.is_empty()
     }
 
-    pub(super) fn candidates(&self) -> impl ExactSizeIterator<Item = &'static CommandSpec> + '_ {
-        self.matches.iter().map(|index| &COMMANDS[*index])
+    pub(super) fn candidates(&self) -> impl ExactSizeIterator<Item = &CompletionCandidate> + '_ {
+        self.matches.iter()
     }
 
     /// Candidate syntax with the description that holds where the command would act.
     pub(super) fn described_candidates(&self) -> Vec<(String, String)> {
         self.candidates()
-            .map(|spec| (spec.syntax(), spec.description_in(self.scope)))
+            .map(|spec| (spec.syntax(), spec.description.clone()))
             .collect()
     }
 
@@ -519,7 +577,7 @@ impl Completion {
             }
             CompletionKey::Complete => {
                 let index = self.selected.unwrap_or(0);
-                let replacement = self.completed_draft(COMMANDS[self.matches[index]]);
+                let replacement = self.completed_draft(&self.matches[index]);
                 self.dismiss();
                 replacement
             }
@@ -527,7 +585,7 @@ impl Completion {
                 let Some(index) = self.selected else {
                     return CompletionAction::Ignored;
                 };
-                let replacement = self.completed_draft(COMMANDS[self.matches[index]]);
+                let replacement = self.completed_draft(&self.matches[index]);
                 self.dismiss();
                 replacement
             }
@@ -538,7 +596,7 @@ impl Completion {
         }
     }
 
-    fn completed_draft(&self, command: CommandSpec) -> CompletionAction {
+    fn completed_draft(&self, command: &CompletionCandidate) -> CompletionAction {
         let prefix = &self.draft[..self.token_start];
         let suffix = &self.draft[self.token_end..];
         let mut draft = String::with_capacity(
@@ -548,7 +606,7 @@ impl Completion {
                 + suffix.len(),
         );
         draft.push_str(prefix);
-        draft.push_str(command.command);
+        draft.push_str(&command.command);
         let mut cursor = draft.len();
 
         if !command.arguments.is_empty() {
@@ -598,10 +656,10 @@ fn command_token(draft: &str, cursor: usize) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
-    fn command_names(completion: &Completion) -> Vec<&'static str> {
+    fn command_names(completion: &Completion) -> Vec<&str> {
         completion
             .candidates()
-            .map(|candidate| candidate.command)
+            .map(|candidate| candidate.command.as_str())
             .collect()
     }
 

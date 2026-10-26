@@ -283,6 +283,8 @@ pub struct ChainEntry {
     pub message: Message,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoked_skills: Vec<tickloop_harness_protocol::InvokedSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_skill_invocation: Option<tickloop_harness_protocol::UserSkillInvocation>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_meta: bool,
     /// Tickloop extension: marks a host note, the host tool names announced as available once

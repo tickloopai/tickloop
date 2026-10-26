@@ -104,6 +104,8 @@ pub struct SkillCatalog {
 pub enum SkillError {
     #[error("unknown skill: {0}")]
     Unknown(String),
+    #[error("ambiguous skill `{name}`; use one of: {candidates}")]
+    Ambiguous { name: String, candidates: String },
     #[error("skill `{0}` cannot be invoked by the model")]
     ModelInvocationDisabled(String),
     #[error("skill `{0}` cannot be invoked directly by the user")]
@@ -209,6 +211,41 @@ impl SkillRegistry {
     pub fn contains(&self, name: &str) -> bool {
         self.skills
             .contains_key(name.trim().trim_start_matches('/'))
+    }
+
+    /// Resolves a slash invocation without widening the model tool's exact-name contract.
+    pub fn resolve_user_name(&self, name: &str) -> Result<&str, SkillError> {
+        let name = name.trim().trim_start_matches('/');
+        if let Some(skill) = self.skills.get(name) {
+            return Ok(&skill.name);
+        }
+        let matches = self
+            .skills
+            .values()
+            .filter(|skill| {
+                skill.user_invocable
+                    && skill
+                        .name
+                        .split_once(':')
+                        .is_some_and(|(_, bare)| bare == name)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [skill] => Ok(&skill.name),
+            [] => Err(SkillError::Unknown(name.to_owned())),
+            _ => Err(SkillError::Ambiguous {
+                name: name.to_owned(),
+                candidates: matches
+                    .iter()
+                    .map(|skill| format!("/{}", skill.name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+
+    pub fn user_definitions(&self) -> impl Iterator<Item = &SkillDefinition> {
+        self.skills.values().filter(|skill| skill.user_invocable)
     }
 
     /// Whether the Skill named `name` disables model invocation, so only the user invokes it.
@@ -386,7 +423,10 @@ Available Skills:
         arguments: &str,
         caller: SkillCaller,
     ) -> Result<SkillExpansion, SkillError> {
-        let name = name.trim().trim_start_matches('/');
+        let name = match caller {
+            SkillCaller::User => self.resolve_user_name(name)?,
+            SkillCaller::Model => name.trim().trim_start_matches('/'),
+        };
         let skill = self
             .skills
             .get(name)

@@ -84,6 +84,8 @@ pub struct ChatSnapshot {
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoked_skills: Vec<InvokedSkill>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_skill_invocations: BTreeMap<RunId, crate::UserSkillInvocation>,
     #[serde(default)]
     pub message_runs: BTreeMap<usize, RunId>,
     /// Recorded Trigger sources for display only; raw messages remain the model's input.

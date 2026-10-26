@@ -136,6 +136,7 @@ impl Agent {
             thinking_enabled: source.snapshot.thinking_enabled,
             messages: model_seed.clone(),
             invoked_skills: source.snapshot.invoked_skills.clone(),
+            user_skill_invocations: source.snapshot.user_skill_invocations.clone(),
             message_runs: BTreeMap::new(),
             trigger_origins: BTreeMap::new(),
             message_contexts: BTreeMap::new(),

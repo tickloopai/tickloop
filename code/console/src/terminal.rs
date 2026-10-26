@@ -905,7 +905,9 @@ Monitor keeps Goal at the bottom, outside its member list; select it and press e
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
 Chats you switch away from keep running in this process.
-/tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
+/NAME [ARGUMENTS] loads a Skill; slash completion shows descriptions and sources (ctrl+n/p selects).
+Use /plugin:skill, or /skill when unique; full names and built-in commands take precedence.
+Each user invocation shows a Skill row with its source, also in reopened history.
 /slides [TOPIC] makes new Slides in Tickloop Artifacts; without a topic the Agent asks for one.
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
 /plugins manages plugins: Installed shows versions and login states; Available installs or updates. /ticks is a renamed alias. Tab or left/right switches pages.
@@ -1359,6 +1361,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         agent.clone(),
     )))?;
     console.configure_input_history(config_root.as_deref(), &workdir)?;
+    console.configure_skill_completion(config_root.clone())?;
     // The image cache expires with Transcripts, so a session that saves no Chats caches nothing.
     let image_cache_root = config_root
         .as_ref()
@@ -4043,19 +4046,14 @@ async fn interact_with_herdr(
                                 .split_once(char::is_whitespace)
                                 .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
                             let directory=global.projection().dispatch_directory;
-                            if selected_chat.is_none() && agent.check_new_agent_skill(&directory,name,arguments).is_err() {
-                                outln!(console, "Unknown command; use /help.");
-                                console.restore_rejected_prompt(restored_contexts,"Unknown command; use /help")?;
+                            if selected_chat.is_none() && let Err(error) = agent.check_new_agent_skill(&directory,name,arguments) {
+                                console.restore_rejected_prompt(restored_contexts,&safe_line(&error))?;
                                 continue;
                             }
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {
                                 Ok(chat)=>chat,
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);status_dirty=true;continue;},
                             };
-                            if !agent.has_skill(chat_id, name).await.map_err(|error|error.to_string())? {
-                                outln!(console, "Unknown command; use /help.");
-                                continue;
-                            }
                             let sent=send_input(agent,chat_id.into(),retry_of,agent.invoke_skill(chat_id, name, arguments),submitted_receipt).await;
                             match sent {
                                 InputSend::Accepted { value: receipt, adopted } => {
@@ -6733,16 +6731,19 @@ async fn track_accepted_echo(
     let _frame_hold = console.hold_frames()?;
     if let Some(snapshot) = &snapshot {
         console.set_queued_inputs(receipt.chat_id.into(), snapshot.queued_inputs())?;
-        if let Some(input) = consumed_input_text(snapshot, receipt.run_id.into()) {
+        if consumed_input_text(snapshot, receipt.run_id.into()).is_some() {
             if echo.is_some() {
                 console.mark_input_echoes(receipt.chat_id.into(), [receipt.run_id.uuid()])?;
+                if let Some(skill) = snapshot.user_skill_invocations.get(&receipt.run_id) {
+                    console.record_skill_invocation(
+                        receipt.chat_id.into(),
+                        receipt.run_id.into(),
+                        skill,
+                    )?;
+                }
                 return Ok(echo);
             }
-            return console.record_consumed_input(
-                receipt.chat_id.into(),
-                receipt.run_id.into(),
-                &safe_text(&input),
-            );
+            return consume_input_echo_from_snapshot(console, snapshot, receipt.run_id.into());
         }
     }
     if let Some(echo) = echo {
@@ -6830,7 +6831,12 @@ fn consume_input_echo_from_snapshot(
             let _frame_hold = console.hold_frames()?;
             console.set_queued_inputs(snapshot.id.into(), snapshot.queued_inputs())?;
             console.flash_trigger_input(snapshot, input)?;
-            console.record_consumed_input(snapshot.id.into(), input, &safe_text(&text))
+            let echo =
+                console.record_consumed_input(snapshot.id.into(), input, &safe_text(&text))?;
+            if let Some(skill) = snapshot.user_skill_invocations.get(&input.into()) {
+                console.record_skill_invocation(snapshot.id.into(), input, skill)?;
+            }
+            Ok(echo)
         }
         None => {
             let mut has_unshown_agent_message = false;

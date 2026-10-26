@@ -1,0 +1,223 @@
+use super::*;
+
+fn install_design_plugin(fixture: &PrivateFixture, name: &str) {
+    let source = fixture.path(&format!("{name}-source"));
+    std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(source.join("skills/design")).unwrap();
+    std::fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        format!(r#"{{"name":"{name}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(source.join("skills/design/SKILL.md"), "---\nname: frontend-design\ndescription: Design a polished page\n---\nSKILL_DESIGN_GUIDANCE $ARGUMENTS").unwrap();
+    tick_plugins::PluginStore::in_config_root(&fixture.path("config"))
+        .install_path(&source)
+        .unwrap();
+}
+
+async fn run_skill_completion(fixture: &PrivateFixture) {
+    install_design_plugin(fixture, "canvas");
+    for (path, name, invocable) in [
+        ("config/skills/personal", "f-personal", true),
+        ("work/.tickloop/skills/project", "f-project", true),
+        ("work/.tickloop/skills/hidden", "f-hidden", false),
+    ] {
+        let directory = fixture.path(path);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("SKILL.md"), format!("---\nname: {name}\ndescription: Local guidance\nuser-invocable: {invocable}\n---\nBody")).unwrap();
+    }
+    let mut view = PtyView::start(fixture);
+    view.wait_for("new input ready", new_input_is_visible).await;
+    view.send(b"/f");
+    let frame = view
+        .wait_for("all user-invocable sources appear in Skills", |frame| {
+            frame.contains("/canvas:frontend-design")
+                && frame.contains("Design a polished page")
+                && frame.contains("Plugin")
+                && frame.contains("/f-personal")
+                && frame.contains("User")
+                && frame.contains("/f-project")
+                && frame.contains("Project")
+                && frame.contains("Skills")
+        })
+        .await;
+    assert!(!frame.contains("/f-hidden"));
+    view.send(b"ront");
+    view.wait_for("bare-name prefix filters the namespaced Skill", |frame| {
+        frame.contains("/canvas:frontend-design") && !frame.contains("/f-personal")
+    })
+    .await;
+    view.send(b"\x0e\x10\r");
+    view.wait_for_editor(
+        "ctrl+n and ctrl+p select the full Skill name",
+        Some("/canvas:frontend-design"),
+    )
+    .await;
+    view.send(b"\x03/front");
+    view.wait_for("completion is open before disable", |frame| {
+        frame.contains("/canvas:frontend-design")
+    })
+    .await;
+    let store = tick_plugins::PluginStore::in_config_root(&fixture.path("config"));
+    store.set_enabled("canvas", false).unwrap();
+    view.wait_for("disable refreshes an already open completion", |frame| {
+        !frame.contains("/canvas:frontend-design") && !frame.contains("Skills")
+    })
+    .await;
+    store.set_enabled("canvas", true).unwrap();
+    view.wait_for("enable restores completion without restarting", |frame| {
+        frame.contains("/canvas:frontend-design") && frame.contains("Skills")
+    })
+    .await;
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_completes_discovered_plugin_skills() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(run_skill_completion(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn run_skill_rows(fixture: &PrivateFixture) {
+    install_design_plugin(fixture, "frontend-design");
+    let (base_url, mut requests) = model_http_support::serve_responses(vec![
+        (200, chat_reply(None, "First design ready")),
+        (200, chat_reply(None, "Second design ready")),
+    ])
+    .await;
+    fixture.set_chat_model(&base_url);
+    let mut view = PtyView::launch(fixture, &[], &[], true);
+    view.wait_for("new input ready", new_input_is_visible).await;
+    view.send(b"/frontend-design first\r");
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request["messages"]
+            .to_string()
+            .contains("SKILL_DESIGN_GUIDANCE first")
+    );
+    view.wait_for("first Skill load is visible", |frame| {
+        frame.contains("Skill · frontend-design:frontend-design")
+            && frame.contains("Plugin · frontend-design")
+            && frame.contains("First design ready")
+    })
+    .await;
+    view.send(b"/frontend-design second\r");
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request["messages"]
+            .to_string()
+            .contains("SKILL_DESIGN_GUIDANCE second")
+    );
+    view.wait_for("second Skill load is visible", |frame| {
+        frame
+            .matches("Skill · frontend-design:frontend-design")
+            .count()
+            == 2
+            && frame.contains("Second design ready")
+    })
+    .await;
+    let client = fixture.client().await;
+    let chat = catalog(&client).await[0].chat_id;
+    view.close().await;
+    drop(client);
+    fixture.shutdown().await;
+    tick_plugins::PluginStore::in_config_root(&fixture.path("config"))
+        .set_enabled("frontend-design", false)
+        .unwrap();
+    let mut reopened = PtyView::launch(fixture, &["--resume", &chat.to_string()], &[], true);
+    reopened
+        .wait_for("Skill rows survive reopening", |frame| {
+            frame
+                .matches("Skill · frontend-design:frontend-design")
+                .count()
+                == 2
+                && frame.contains("Plugin · frontend-design")
+        })
+        .await;
+    reopened.send(b"\x1b");
+    reopened
+        .wait_for_editor("continue prompt dismissed before closing", Some(""))
+        .await;
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_short_skill_invocations_show_source_and_restore_history_rows() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(run_skill_rows(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn run_ambiguous_skills(fixture: &PrivateFixture) {
+    install_design_plugin(fixture, "alpha");
+    install_design_plugin(fixture, "beta");
+    let (base_url, mut requests) = model_http_support::serve_responses(vec![(
+        200,
+        chat_reply(None, "Qualified design ready"),
+    )])
+    .await;
+    fixture.set_chat_model(&base_url);
+    let mut view = PtyView::start(fixture);
+    view.wait_for("new input ready", new_input_is_visible).await;
+    view.send(b"/frontend-design first\r");
+    view.wait_for("new Agent rejects ambiguous short name", |frame| {
+        frame.contains("ambiguous skill")
+            && frame.contains("/alpha:frontend-design")
+            && frame.contains("/beta:frontend-design")
+    })
+    .await;
+    let client = fixture.client().await;
+    assert!(catalog(&client).await.is_empty());
+    view.send(b"\x03/alpha:frontend-design first\r");
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request["messages"]
+            .to_string()
+            .contains("SKILL_DESIGN_GUIDANCE first")
+    );
+    view.wait_for("full name runs despite the short-name collision", |frame| {
+        frame.contains("Qualified design ready")
+    })
+    .await;
+    view.send(b"/frontend-design again\r");
+    view.wait_for("existing Chat rejects ambiguous short name", |frame| {
+        frame.contains("ambiguous skill")
+            && frame.contains("/alpha:frontend-design")
+            && frame.contains("/beta:frontend-design")
+    })
+    .await;
+    assert_eq!(catalog(&client).await.len(), 1);
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_short_skill_collisions_are_refused_before_creation_and_in_chat() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(run_ambiguous_skills(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

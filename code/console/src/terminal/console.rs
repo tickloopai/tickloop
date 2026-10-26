@@ -31,6 +31,7 @@ mod image_preparation_tests;
 mod upgrade;
 pub(super) use upgrade::ConsoleUpgrade;
 mod file_index_worker;
+mod skill_discovery;
 use file_index_worker::{FileIndexWorker, IndexRequest};
 #[cfg(test)]
 #[path = "console/connection_tests.rs"]
@@ -796,6 +797,7 @@ pub(super) struct State {
     completion: Completion,
     file_mentions: FileMentionState,
     file_index_worker: Option<Arc<FileIndexWorker>>,
+    completion_skills: Option<(PathBuf, tickloop_code_settings::skills::SkillRegistry)>,
     file_index_focused: bool,
     input_owner: Uuid,
     editor: Editor,
@@ -3974,6 +3976,30 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn record_skill_invocation(
+        &self,
+        chat: Uuid,
+        run: Uuid,
+        skill: &tickloop_harness::protocol::UserSkillInvocation,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let runs = super::presentation::user_skill_runs(skill, state.display);
+        let key = format!("user-skill:{run}");
+        if state.chat == Some(chat) {
+            state
+                .scrollback
+                .set_tool_call(run, &key, &runs, ToolCallState::Finished, None);
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat)) {
+            cached
+                .scrollback
+                .set_tool_call(run, &key, &runs, ToolCallState::Finished, None);
+        }
+        Ok(())
+    }
+
     pub(super) fn record_consumed_input(
         &self,
         chat: Uuid,
@@ -5914,6 +5940,7 @@ impl State {
             completion: Completion::default(),
             file_mentions: FileMentionState::default(),
             file_index_worker: None,
+            completion_skills: None,
             file_index_focused: true,
             input_owner: tickloop_ids::generate(),
             editor: Editor::new(),
@@ -8907,6 +8934,12 @@ impl State {
                     }
                 } else if self.candidate_rows(1).is_empty() && self.clipboard_hint.is_visible() {
                     CLIPBOARD_IMAGE_HINT
+                } else if self.completion.is_open() && !self.file_mentions.is_open() {
+                    if self.completion.selected_index().is_some() {
+                        "ctrl+n/p select · enter complete · tab complete · esc close"
+                    } else {
+                        "ctrl+n/p select · tab complete · enter send · esc close"
+                    }
                 } else if overview {
                     if !self.overview.input_focused {
                         overview_list_hint = format!(
@@ -9170,14 +9203,24 @@ impl State {
         } else {
             return Vec::new();
         };
-        if self.file_mentions.is_open() && self.shell_input.active_completion().is_none() {
+        if (self.file_mentions.is_open() || self.completion.is_open())
+            && self.shell_input.active_completion().is_none()
+        {
             let mut lines = Vec::new();
             let mut group = None;
             let mut selected_row = None;
             for (index, (text, description)) in candidates.into_iter().enumerate() {
-                let current_group = match self.file_mentions.candidates()[index].target {
-                    MentionTarget::Agent(_) => "Agents",
-                    MentionTarget::File { .. } => "Files",
+                let current_group = if self.file_mentions.is_open() {
+                    match self.file_mentions.candidates()[index].target {
+                        MentionTarget::Agent(_) => "Agents",
+                        MentionTarget::File { .. } => "Files",
+                    }
+                } else {
+                    self.completion
+                        .candidates()
+                        .nth(index)
+                        .and_then(|candidate| candidate.menu_group)
+                        .map_or("Commands", |group| group.title())
                 };
                 if group != Some(current_group) {
                     lines.push(RoleLine::role(current_group, Role::MutedText));
@@ -9912,6 +9955,7 @@ impl State {
         self.shell_history_cache = None;
         if self.prompt_enabled && self.menu.is_none() && self.transcript.is_none() {
             let scope = self.command_scope();
+            self.refresh_skill_candidates();
             self.completion
                 .update_at(self.editor.draft(), self.editor.cursor(), scope);
             self.file_mentions

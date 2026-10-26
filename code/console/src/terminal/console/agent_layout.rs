@@ -1720,7 +1720,7 @@ pub(super) fn help_lines(
             "A/Q approval/question",
             "↓ Subagents list (input end)",
             "Click Subagents N fold list",
-            "ctrl+n/p list/completion",
+            "ctrl+n/p command/Skill completion",
             "enter open Agent (list)",
             "space fold descendants (list)",
             "x dismiss finished (list)",

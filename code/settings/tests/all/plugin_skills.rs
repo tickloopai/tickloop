@@ -360,3 +360,98 @@ fn plugin_skills_ignore_non_string_tool_permission_metadata() {
         );
     }
 }
+
+#[test]
+fn cached_discovery_notices_a_skill_added_to_an_existing_plugin_directory() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "design",
+        serde_json::json!({"name":"design"}),
+        &[],
+    );
+    fs::create_dir_all(source.join("skills/empty")).unwrap();
+    let plugin = install(&config, &source);
+    let mut cache = SkillDiscoveryCache::default();
+    assert!(cache.refresh(directory.path(), Some(&config)).is_some());
+    assert!(cache.refresh(directory.path(), Some(&config)).is_none());
+    fs::write(
+        plugin.root.join("skills/empty/SKILL.md"),
+        skill("added", "Added guidance", "New body"),
+    )
+    .unwrap();
+    let changed = cache
+        .refresh(directory.path(), Some(&config))
+        .expect("new Skill must invalidate cached discovery");
+    assert!(changed.contains("design:added"));
+}
+
+#[test]
+fn cached_discovery_refreshes_plugin_enablement_and_project_edits() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "design",
+        serde_json::json!({"name":"design"}),
+        &[("skills/design", &skill("design", "Design", "body"))],
+    );
+    let store = PluginStore::in_config_root(&config);
+    let mut cache = SkillDiscoveryCache::default();
+    cache.refresh(directory.path(), Some(&config)).unwrap();
+    install(&config, &source);
+    assert!(
+        cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("design:design")
+    );
+    store.set_enabled("design", false).unwrap();
+    assert!(
+        !cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("design:design")
+    );
+    store.set_enabled("design", true).unwrap();
+    assert!(
+        cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("design:design")
+    );
+    let project = directory.path().join(".tickloop/skills/local");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("SKILL.md"), skill("local", "Initial", "body")).unwrap();
+    assert!(
+        cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("local")
+    );
+    fs::write(
+        project.join("SKILL.md"),
+        skill("local", "Changed description", "body"),
+    )
+    .unwrap();
+    let changed = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert_eq!(
+        changed
+            .user_definitions()
+            .find(|skill| skill.name == "local")
+            .unwrap()
+            .description,
+        "Changed description"
+    );
+    fs::remove_file(project.join("SKILL.md")).unwrap();
+    assert!(
+        !cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("local")
+    );
+    assert!(cache.refresh(directory.path(), Some(&config)).is_none());
+}

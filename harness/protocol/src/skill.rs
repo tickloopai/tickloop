@@ -67,3 +67,10 @@ pub struct InvokedSkill {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
 }
+
+/// Display metadata captured when the user loads a Skill; it grants no active guidance.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct UserSkillInvocation {
+    pub name: String,
+    pub source: SkillSource,
+}

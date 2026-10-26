@@ -1008,6 +1008,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         thinking_enabled: true,
         messages: Vec::new(),
         invoked_skills: Vec::new(),
+        user_skill_invocations: BTreeMap::new(),
         message_runs: BTreeMap::new(),
         trigger_origins: BTreeMap::new(),
         message_contexts: BTreeMap::new(),
@@ -2420,15 +2421,13 @@ impl Agent {
 
     pub async fn has_skill(&self, chat_id: ChatId, name: &str) -> Result<bool, AgentError> {
         self.rediscover_skills(chat_id).await;
-        Ok(self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .skills
-            .contains(name))
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+        match chat.skills.resolve_user_name(name) {
+            Ok(_) => Ok(true),
+            Err(tickloop_harness_policy::skills::SkillError::Unknown(_)) => Ok(false),
+            Err(error) => Err(AgentError::Invalid(error.to_string())),
+        }
     }
 
     pub async fn submit_with_file_references(
@@ -2725,6 +2724,13 @@ impl Agent {
             chat.user_loops.insert(run_id.into(), user_loop);
         }
         if let Some(mut invoked_skill) = invoked_skill {
+            chat.snapshot.user_skill_invocations.insert(
+                run_id.into(),
+                tickloop_harness_protocol::UserSkillInvocation {
+                    name: invoked_skill.name.clone(),
+                    source: invoked_skill.source.clone(),
+                },
+            );
             if invoked_skill.source == tickloop_harness_protocol::SkillSource::BuiltIn
                 && chat.skills.is_user_only(&invoked_skill.name)
             {

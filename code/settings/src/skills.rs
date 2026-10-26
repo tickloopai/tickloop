@@ -29,28 +29,75 @@ impl SkillDiscovery for SkillRegistry {
         config_root: Option<&Path>,
         builtins: impl IntoIterator<Item = &'a str>,
     ) -> Self {
-        let mut registry = Self::with_builtins(builtins);
-        registry.set_loop_instructions(Arc::new(LoopFiles::new(Some(folder), config_root)));
-        let mut seen_files = HashSet::new();
-        if let Some(root) = config_root {
-            load_directory(
-                &mut registry,
-                &root.join(SKILLS_DIRECTORY),
-                SkillOrigin::User,
-                &mut seen_files,
-            );
-            load_plugins(&mut registry, root, &mut seen_files);
-        }
-        for directory in project_skill_directories(folder) {
-            load_directory(
-                &mut registry,
-                &directory,
-                SkillOrigin::Project,
-                &mut seen_files,
-            );
-        }
-        registry
+        discover_tracked(folder, config_root, builtins).0
     }
+}
+
+/// Cached disk discovery. Call from a background worker: unchanged sources require only metadata.
+#[derive(Default)]
+pub struct SkillDiscoveryCache {
+    context: Option<(PathBuf, Option<PathBuf>)>,
+    watched: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+}
+
+impl SkillDiscoveryCache {
+    pub fn refresh(&mut self, folder: &Path, config_root: Option<&Path>) -> Option<SkillRegistry> {
+        let context = (folder.to_path_buf(), config_root.map(Path::to_path_buf));
+        if self.context.as_ref() == Some(&context)
+            && self
+                .watched
+                .iter()
+                .all(|(path, previous)| &file_stamp(path) == previous)
+        {
+            return None;
+        }
+        let (registry, paths) = discover_tracked(folder, config_root, BUILTIN_SKILLS);
+        self.watched = paths
+            .into_iter()
+            .map(|path| {
+                let stamp = file_stamp(&path);
+                (path, stamp)
+            })
+            .collect();
+        self.context = Some(context);
+        Some(registry)
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+fn discover_tracked<'a>(
+    folder: &Path,
+    config_root: Option<&Path>,
+    builtins: impl IntoIterator<Item = &'a str>,
+) -> (SkillRegistry, Vec<PathBuf>) {
+    let mut registry = SkillRegistry::with_builtins(builtins);
+    registry.set_loop_instructions(Arc::new(LoopFiles::new(Some(folder), config_root)));
+    let mut seen_files = HashSet::new();
+    let mut watched = Vec::new();
+    if let Some(root) = config_root {
+        load_directory(
+            &mut registry,
+            &root.join(SKILLS_DIRECTORY),
+            SkillOrigin::User,
+            &mut seen_files,
+            &mut watched,
+        );
+        load_plugins(&mut registry, root, &mut seen_files, &mut watched);
+    }
+    for directory in project_skill_directories(folder) {
+        load_directory(
+            &mut registry,
+            &directory,
+            SkillOrigin::Project,
+            &mut seen_files,
+            &mut watched,
+        );
+    }
+    (registry, watched)
 }
 
 enum SkillOrigin<'a> {
@@ -64,7 +111,10 @@ fn load_plugins(
     registry: &mut SkillRegistry,
     config_root: &Path,
     seen_files: &mut HashSet<PathBuf>,
+    watched: &mut Vec<PathBuf>,
 ) {
+    watched.push(config_root.join("plugins/installed.json"));
+    watched.push(config_root.join("ticks/installed.json"));
     let store = PluginStore::in_config_root(config_root);
     let installed = match store.installed() {
         Ok(installed) => installed,
@@ -82,6 +132,26 @@ fn load_plugins(
         ));
     }
     for plugin in installed.plugins.iter().filter(|plugin| plugin.enabled) {
+        for manifest in [
+            ".tickloop-plugin/plugin.json",
+            ".claude-plugin/plugin.json",
+            "tick-package.json",
+        ] {
+            watched.push(plugin.root.join(manifest));
+        }
+        for path in &plugin.manifest.skill_paths {
+            let directory = plugin.root.join(path);
+            watched.push(directory.join(SKILL_FILE_NAME));
+            if let Ok(entries) = fs::read_dir(&directory) {
+                watched.extend(
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path().join(SKILL_FILE_NAME)),
+                );
+            }
+            watched.push(directory);
+        }
+        watched.push(plugin.root.join("skills"));
         let skill_files = plugin
             .skill_directories()
             .into_iter()
@@ -92,6 +162,7 @@ fn load_plugins(
             skill_files,
             &SkillOrigin::Plugin(&store, plugin),
             seen_files,
+            watched,
         );
     }
 }
@@ -101,7 +172,9 @@ fn load_directory(
     directory: &Path,
     origin: SkillOrigin<'_>,
     seen_files: &mut HashSet<PathBuf>,
+    watched: &mut Vec<PathBuf>,
 ) {
+    watched.push(directory.to_path_buf());
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -116,10 +189,11 @@ fn load_directory(
     let mut paths = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path().join(SKILL_FILE_NAME))
+        .inspect(|path| watched.push(path.clone()))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     paths.sort();
-    load_files(registry, paths, &origin, seen_files);
+    load_files(registry, paths, &origin, seen_files, watched);
 }
 
 fn load_files(
@@ -127,8 +201,10 @@ fn load_files(
     paths: Vec<PathBuf>,
     origin: &SkillOrigin<'_>,
     seen_files: &mut HashSet<PathBuf>,
+    watched: &mut Vec<PathBuf>,
 ) {
     for path in paths {
+        watched.push(path.clone());
         let canonical = match path.canonicalize() {
             Ok(path) => path,
             Err(error) => {
@@ -136,6 +212,7 @@ fn load_files(
                 continue;
             }
         };
+        watched.push(canonical.clone());
         if !seen_files.insert(canonical.clone()) {
             continue;
         }

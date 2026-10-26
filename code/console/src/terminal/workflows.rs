@@ -1219,6 +1219,12 @@ fn append_public_message(
                         display,
                         !source.is_agent_message,
                     );
+                    if source_chat_id == history.chat.id
+                        && let Some(skill) =
+                            run_id.and_then(|run| history.chat.user_skill_invocations.get(&run))
+                    {
+                        history.push_runs(&presentation::user_skill_runs(skill, display));
+                    }
                 }
                 Role::Assistant if folded => {
                     history.push_role(

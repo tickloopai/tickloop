@@ -630,6 +630,7 @@ mod tests {
             git_branch: None,
             message,
             invoked_skills: Vec::new(),
+            user_skill_invocation: None,
             is_meta: false,
             host_tools: None,
             plan_mode_exit: false,

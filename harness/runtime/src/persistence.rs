@@ -1489,6 +1489,9 @@ fn chain_entry(
         git_branch: None,
         message,
         invoked_skills: snapshot.invoked_skills.clone(),
+        user_skill_invocation: run_id
+            .and_then(|run| snapshot.user_skill_invocations.get(&run))
+            .cloned(),
         is_meta: snapshot.host_notes.contains_key(&index),
         host_tools: snapshot
             .host_notes
@@ -1648,6 +1651,9 @@ fn record_loop(
             content: Vec::new(),
         },
         invoked_skills: snapshot.invoked_skills.clone(),
+        user_skill_invocation: run_id
+            .and_then(|run| snapshot.user_skill_invocations.get(&run))
+            .cloned(),
         is_meta: false,
         host_tools: None,
         plan_mode_exit: false,
@@ -1784,6 +1790,7 @@ fn current_git_branch(folder: &Path) -> Option<String> {
 struct RestoredChain {
     messages: Vec<Message>,
     invoked_skills: Vec<tickloop_harness_protocol::InvokedSkill>,
+    user_skill_invocations: BTreeMap<RunId, tickloop_harness_protocol::UserSkillInvocation>,
     message_runs: BTreeMap<usize, RunId>,
     message_responses: BTreeMap<usize, ResponseId>,
     tool_call_recoveries: BTreeMap<usize, Vec<ToolCallRecovery>>,
@@ -1820,6 +1827,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
     let mut restored = RestoredChain {
         messages: Vec::new(),
         invoked_skills: Vec::new(),
+        user_skill_invocations: BTreeMap::new(),
         message_runs: BTreeMap::new(),
         message_responses: BTreeMap::new(),
         tool_call_recoveries: BTreeMap::new(),
@@ -1844,6 +1852,11 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
     };
     let mut execution_mode_warnings = Vec::new();
     for entry in chain {
+        if let (Some(run), Some(skill)) = (entry.run_id, &entry.user_skill_invocation) {
+            restored
+                .user_skill_invocations
+                .insert(run.into(), skill.clone());
+        }
         if !entry.invoked_skills.is_empty() {
             restored.invoked_skills = entry.invoked_skills.clone();
         }
@@ -2065,6 +2078,7 @@ impl RestoredChain {
         let mut kept = Self {
             messages: Vec::new(),
             invoked_skills: self.invoked_skills.clone(),
+            user_skill_invocations: self.user_skill_invocations.clone(),
             message_runs: BTreeMap::new(),
             message_responses: BTreeMap::new(),
             tool_call_recoveries: BTreeMap::new(),
@@ -2396,6 +2410,7 @@ impl RestoredChain {
     fn fill_conversation(&self, snapshot: &mut ChatSnapshot, bookkeeping: &mut ChatBookkeeping) {
         snapshot.messages = self.messages.clone();
         snapshot.invoked_skills = self.invoked_skills.clone();
+        snapshot.user_skill_invocations = self.user_skill_invocations.clone();
         snapshot.message_runs = self.message_runs.clone();
         bookkeeping.message_responses = self.message_responses.clone();
         snapshot.tool_call_recoveries = self
