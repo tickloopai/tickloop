@@ -917,7 +917,7 @@ fn marketplace_archives_also_use_the_entry_name_as_identity() {
         .unwrap()
         .plugin;
     assert_eq!(installed.name(), "alias");
-    assert_eq!(installed.manifest.display_name.as_deref(), Some("original"));
+    assert_eq!(installed.manifest.display_name.as_deref(), Some("Original Display Name"));
     assert_eq!(fixture.store.get("alias").unwrap().manifest.name, "alias");
     assert_eq!(
         installed.executable(),
