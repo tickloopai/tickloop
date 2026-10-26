@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -21,13 +21,15 @@ function makeWritable(directory) {
 }
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'tickloop-dev-launch-test-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'tickloop-dev-launch-test-')));
   t.after(() => {
     makeWritable(root);
     rmSync(root, { recursive: true, force: true });
   });
   const commands = join(root, 'commands');
   const caller = join(root, 'caller directory');
+  const home = join(root, 'home');
+  mkdirSync(home);
   mkdirSync(commands);
   mkdirSync(caller);
   const executable = (name, source) => writeFileSync(join(commands, name), `#!${process.execPath}\n${source}\n`, { mode: 0o755 });
@@ -48,6 +50,10 @@ function fixture(t) {
   const tickloop = `#!${process.execPath}
     const fs = require('node:fs'); const path = require('node:path');
     const args = process.argv.slice(2);
+    fs.appendFileSync(path.join(process.env.HOME, 'program-calls'), JSON.stringify({
+      program: path.basename(process.argv[1]), args, config: process.env.TICKLOOP_CONFIG_DIR,
+      runtime: process.env.TICKLOOP_TICK_RUNTIME_DIR }) + '\\n');
+    if (args.join(' ') === 'daemon stop' || args.join(' ') === 'stop') process.exit(0);
     if (args[0] === 'tick' && args[1] === 'list') { console.log('fixture-package'); process.exit(0); }
     if (args[0] !== '--development-root' || !args[1]) process.exit(91);
     const developmentRoot = args.splice(0, 2)[1];
@@ -88,10 +94,10 @@ function fixture(t) {
   }
 
   function environment(overrides) {
-    const env = { ...process.env, PATH: `${commands}:/usr/bin:/bin`,
+    const env = { ...process.env, HOME: home, PATH: `${commands}:/usr/bin:/bin`,
       TICKLOOP_CONFIG_DIR: join(root, 'global configuration') };
     // An enclosing `make test` passes its own variables and command line down to every sub-make.
-    for (const name of ['CARGO_TARGET_DIR', 'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
+    for (const name of ['TICKLOOP_DEV_CONFIG_DIR', 'TICKLOOP_TICK_RUNTIME_DIR', 'CARGO_TARGET_DIR', 'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
       delete env[name];
     return Object.assign(env, overrides);
   }
@@ -112,10 +118,10 @@ function fixture(t) {
       cwd: caller, env: environment(overrides), encoding: 'utf8', timeout: 15_000,
     }));
   }
-  return { root, caller, checkout, run, runMake };
+  return { root, home, caller, checkout, run, runMake };
 }
 
-test('actual launcher publishes a fresh immutable program bundle for the shared daemon', t => {
+test('actual launcher publishes a fresh immutable program bundle for the dev daemon', t => {
   const f = fixture(t);
   const checkout = f.checkout('worktree with spaces', { branch: 'feature/升级' });
   const first = f.run(checkout, {}, ['-c', '--cwd', f.caller]);
@@ -130,23 +136,23 @@ test('actual launcher publishes a fresh immutable program bundle for the shared 
   assert.deepEqual(JSON.parse(readFileSync(join(dirname(first.reported.executable), 'installation.json'), 'utf8')),
     { developmentRoot: realpathSync(checkout) });
   assert.deepEqual(first.reported.args, ['-c', '--cwd', f.caller]);
-  assert.equal(first.reported.config, join(f.root, 'global configuration'));
-  assert.equal(first.reported.home, process.env.HOME);
+  assert.equal(first.reported.config, join(f.home, '.tickloop-dev'));
+  assert.equal(first.reported.home, f.home);
   assert.equal(lstatSync(first.reported.executable).mode & 0o777, 0o500);
   assert.equal(lstatSync(dirname(first.reported.executable)).mode & 0o777, 0o500);
   assert.ok(existsSync(first.reported.executable));
   assert.ok(!existsSync(join(checkout, 'git-calls')));
 });
 
-test('every checkout and branch selects the daemon of the config root, as an installed tickloop does', t => {
+test('every checkout uses the dev root and discards inherited runtime overrides', t => {
   const f = fixture(t);
   const first = f.checkout('first', { branch: 'feature/a' });
   const second = f.checkout('second', { branch: 'feature/b' });
   for (const checkout of [first, second]) {
-    const result = f.run(checkout);
+    const result = f.run(checkout, { TICKLOOP_TICK_RUNTIME_DIR: '/must-not-use' });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(Object.keys(result.reported.environment), []);
-    assert.equal(result.reported.config, join(f.root, 'global configuration'));
+    assert.equal(result.reported.config, join(f.home, '.tickloop-dev'));
   }
 });
 
@@ -233,3 +239,92 @@ function fixtureWithStaleOrigin(t) {
   writeFileSync(join(directory, '.env'), `TICKLOOP_ARTIFACT_ORIGIN=${STALE_ORIGIN}\n`);
   return { ...f, directory };
 }
+
+ test('only the dedicated override selects a different dev root', t => {
+  const f = fixture(t);
+  const root = join(f.root, 'dedicated dev');
+  const result = f.runMake(f.checkout('override'), [], { TICKLOOP_DEV_CONFIG_DIR: root });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.reported.config, root);
+  assert.ok(result.stderr.includes(`Development configuration: ${root}`));
+});
+
+const loginFiles = ['openai-codex-credentials', 'github-copilot', 'minimax-cn', 'minimax-global',
+  'kimi-code-oauth', 'xai-oauth', 'google-oauth'].map(name => `auth/${name}.json`);
+
+test('first use seeds only settings and model credentials privately, once', t => {
+  const f = fixture(t);
+  const checkout = f.checkout('seed');
+  const source = join(f.home, '.tickloop');
+  const dev = join(f.home, '.tickloop-dev');
+  const allowed = ['settings.json', ...loginFiles];
+  const excluded = ['plugins/installed.json', 'packages/installed.json', 'auth/google-service-token.json',
+    'auth/plugin.json', 'auth/openai-codex.lock', 'chats/chat.json', 'history', 'file-history/a',
+    'scheduled-tasks.json', 'cache/item'];
+  for (const file of [...allowed, ...excluded]) {
+    mkdirSync(dirname(join(source, file)), { recursive: true });
+    writeFileSync(join(source, file), `fixture ${file}`);
+  }
+  writeFileSync(join(source, '.env'), 'OPENAI_API_KEY="fixture-key"\nGOOGLE_CLOUD_PROJECT="project"\nPLUGIN_SECRET="never-copy"\n');
+  const result = f.run(checkout);
+  assert.equal(result.status, 0, result.stderr);
+  for (const file of allowed) {
+    assert.equal(readFileSync(join(dev, file), 'utf8'), `fixture ${file}`);
+    assert.equal(lstatSync(join(dev, file)).mode & 0o777, 0o600);
+    assert.equal(readFileSync(join(source, file), 'utf8'), `fixture ${file}`);
+  }
+  assert.equal(readFileSync(join(dev, '.env'), 'utf8'), 'OPENAI_API_KEY="fixture-key"\nGOOGLE_CLOUD_PROJECT="project"\n');
+  for (const file of excluded) assert.ok(!existsSync(join(dev, file)), file);
+  for (const directory of [dev, join(dev, 'auth')]) assert.equal(lstatSync(directory).mode & 0o777, 0o700);
+  assert.match(result.stderr, /Seeded development configuration: .*settings.json/);
+  writeFileSync(join(dev, 'settings.json'), 'dev settings');
+  const again = f.run(checkout);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(readFileSync(join(dev, 'settings.json'), 'utf8'), 'dev settings');
+  assert.doesNotMatch(again.stderr, /Seeded development configuration/);
+});
+
+test('built programs stop only the dev daemon and Tickhost before launch', t => {
+  const f = fixture(t);
+  const result = f.run(f.checkout('stop'));
+  assert.equal(result.status, 0, result.stderr);
+  const calls = readFileSync(join(f.home, 'program-calls'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.slice(0, 2).map(({ program, args }) => ({ program, args })), [
+    { program: 'tickloop', args: ['daemon', 'stop'] }, { program: 'tickhost', args: ['stop'] },
+  ]);
+  for (const call of calls) {
+    assert.equal(call.config, join(f.home, '.tickloop-dev'));
+    assert.equal(call.runtime, undefined);
+  }
+});
+
+test('released root and aliases are rejected before building or changing files', t => {
+  const f = fixture(t);
+  const source = join(f.home, '.tickloop');
+  mkdirSync(source);
+  const alias = join(f.home, 'alias');
+  symlinkSync(source, alias);
+  const checkout = f.checkout('unsafe override');
+  for (const root of [source, alias, `${source}/.`, join(source, 'nested/dev')]) {
+    const result = f.run(checkout, { TICKLOOP_DEV_CONFIG_DIR: root });
+    assert.notEqual(result.status, 0, root);
+    assert.ok(!existsSync(join(checkout, 'cargo-calls')));
+    assert.deepEqual(readdirSync(source), []);
+  }
+});
+
+test('a failed seed removes its partial root so a retry can seed', t => {
+  const f = fixture(t);
+  const source = join(f.home, '.tickloop');
+  mkdirSync(source);
+  writeFileSync(join(source, 'settings.json'), 'settings');
+  writeFileSync(join(f.root, 'commands/cp'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const checkout = f.checkout('failed seed');
+  const failed = f.run(checkout);
+  assert.notEqual(failed.status, 0);
+  assert.ok(!existsSync(join(f.home, '.tickloop-dev')));
+  rmSync(join(f.root, 'commands/cp'));
+  const retry = f.run(checkout);
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(readFileSync(join(f.home, '.tickloop-dev/settings.json'), 'utf8'), 'settings');
+});

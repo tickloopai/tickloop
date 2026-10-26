@@ -26,8 +26,8 @@ PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
 .PHONY: dev build install package test test-workspace check check-workspace release release-publish
 
-## Start this checkout's build in the current directory, with the same config root, daemon and Tickhost
-## as an installed tickloop, against Tickloop Cloud ENV=prod (default), ENV=pre or ENV=dev.
+## Start this checkout's build with its own ~/.tickloop-dev config root, daemon and Tickhost
+## (override with TICKLOOP_DEV_CONFIG_DIR), against Tickloop Cloud ENV=prod (default), ENV=pre or ENV=dev.
 ## Example: make dev ENV=pre ARGS="-c"
 # ENV=dev needs TICKLOOP_DEV_ARTIFACT_ORIGIN=<your dev cloud origin> in .env. Every ENV replaces any
 # TICKLOOP_ARTIFACT_ORIGIN from .env or the environment.
