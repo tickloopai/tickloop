@@ -162,7 +162,7 @@ fn benchmark_has_two_balanced_independent_frozen_sets() {
     assert_eq!(cases.len(), 200);
     let frozen_dialogues: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_str(DIALOGUES).unwrap();
-    let acceptance = json!({
+    let mut acceptance = json!({
         "cases": cases.iter().filter(|case| case.split == "acceptance").map(|case| json!({
             "split":case.split, "expected":case.expected, "id":case.id, "user":case.user,
             "command":case.command, "rationale":case.rationale,
@@ -170,6 +170,7 @@ fn benchmark_has_two_balanced_independent_frozen_sets() {
         "dialogues": frozen_dialogues.into_iter().filter(|(key, _)| key.starts_with("acceptance/"))
             .collect::<std::collections::BTreeMap<_, _>>(),
     });
+    acceptance.sort_all_objects();
     assert_eq!(
         frozen["acceptance_sha256"],
         format!(

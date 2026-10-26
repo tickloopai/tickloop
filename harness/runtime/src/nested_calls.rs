@@ -6,10 +6,7 @@ use crate::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use tickloop_harness_protocol::{EventKind, OperationRecord, OperationState, Receipt, ToolResult};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +43,6 @@ pub(crate) struct NestedCalls {
     parent: String,
     is_batch: bool,
     registry: ToolRegistry,
-    stopped: AtomicBool,
     stop: CancellationToken,
     completed: Mutex<Vec<(Value, NestedOutcome)>>,
 }
@@ -80,14 +76,13 @@ pub(crate) fn is_nested() -> bool {
 }
 pub(crate) fn stop_after_denial() {
     let _ = CURRENT.try_with(|scope| {
-        scope.stopped.store(true, Ordering::SeqCst);
         scope.stop.cancel();
     });
 }
 
 pub(crate) fn check_dispatch() -> Result<(), String> {
     if CURRENT
-        .try_with(|scope| scope.stopped.load(Ordering::SeqCst))
+        .try_with(|scope| scope.stop_token().is_cancelled())
         .unwrap_or(false)
     {
         Err("Nested execution stopped after Auto rejection; call not dispatched".into())
@@ -104,6 +99,10 @@ pub(crate) async fn stopped() {
 }
 
 impl NestedCalls {
+    pub(crate) fn stop_token(&self) -> CancellationToken {
+        self.stop.clone()
+    }
+
     pub(crate) async fn execute(
         self: &Arc<Self>,
         name: String,
@@ -129,7 +128,7 @@ impl NestedCalls {
         let unavailable = (self.is_batch && self.registry.script_only(&name))
             || forbidden
             || registration.is_none()
-            || self.stopped.load(Ordering::SeqCst)
+            || self.stop_token().is_cancelled()
             || cancel.is_cancelled();
         let outcome = if unavailable {
             NestedOutcome { images:vec![],sources:vec![],call_id:call_id.clone(), name:name.clone(), status:NestedStatus::NotExecuted,
@@ -301,7 +300,6 @@ impl Agent {
             parent,
             is_batch,
             registry,
-            stopped: AtomicBool::new(false),
             stop: CancellationToken::new(),
             completed: Mutex::new(Vec::new()),
         }))

@@ -340,7 +340,10 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
     agent.shutdown().await;
 }
 
-struct ReviewableTools(std::sync::atomic::AtomicUsize);
+struct ReviewableTools(
+    std::sync::atomic::AtomicUsize,
+    Option<std::sync::Arc<tokio::sync::Notify>>,
+);
 #[async_trait::async_trait]
 impl tickloop_harness_runtime::host_tools::HostToolProvider for ReviewableTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
@@ -369,6 +372,20 @@ impl tickloop_harness_runtime::host_tools::HostToolProvider for ReviewableTools 
         } else {
             tickloop_harness_runtime::host_tools::HostToolPermission::Reviewable
         }
+    }
+    async fn prepare(
+        &self,
+        chat: tickloop_harness_protocol::ChatId,
+        name: &str,
+        input: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_harness_runtime::host_tools::HostToolPermission, String> {
+        if name == "Review"
+            && let Some(gate) = &self.1
+        {
+            tokio::select! {_ = cancel.cancelled() => return Err("cancelled".into()), _ = gate.notified()=>{}}
+        }
+        Ok(self.permission(chat, name, input))
     }
     async fn execute(
         &self,
@@ -410,7 +427,11 @@ async fn auto_rejection_stops_pending_calls_and_sees_the_model_authored_batch() 
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent.set_auto_reviewer(reviewer.clone()).await;
-    let provider = Arc::new(ReviewableTools(AtomicUsize::new(0)));
+    let review_gate = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(ReviewableTools(
+        AtomicUsize::new(0),
+        Some(review_gate.clone()),
+    ));
     agent.install_host_tools(provider.clone()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(dir.path().into()).await.unwrap();
@@ -427,12 +448,15 @@ async fn auto_rejection_stops_pending_calls_and_sees_the_model_authored_batch() 
         let event = next_event(&mut events).await;
 
         match event.kind {
+            EventKind::ToolCompleted { result, .. } if result.content == "EXECUTED" => {
+                review_gate.notify_one()
+            }
             EventKind::Completed { .. } => break,
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
-    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     let snapshots = serde_json::to_string(
         &reviewer
             .requests
@@ -582,7 +606,7 @@ async fn nested_results_survive_reload_with_parent_links_and_no_reexecution() {
         .unwrap()
     };
     let agent = make_agent(model);
-    let provider = Arc::new(ReviewableTools(AtomicUsize::new(0)));
+    let provider = Arc::new(ReviewableTools(AtomicUsize::new(0), None));
     agent.install_host_tools(provider.clone()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(dir.path().into()).await.unwrap();
@@ -662,7 +686,7 @@ async fn rewind_drops_nested_calls_whose_parent_was_removed_from_the_same_run() 
     };
     let agent = make_agent(model.clone());
     agent
-        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0))))
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0), None)))
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(dir.path().into()).await.unwrap();
@@ -795,7 +819,7 @@ async fn hosts_observe_nested_confirmation_through_the_turn_interface() {
     )
     .unwrap();
     agent
-        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0))))
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0), None)))
         .unwrap();
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -837,5 +861,213 @@ async fn hosts_observe_nested_confirmation_through_the_turn_interface() {
         matches!(outcome, TurnOutcome::Completed { .. }),
         "{outcome:?}"
     );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn compacted_parent_ids_do_not_remove_a_new_runs_pending_nested_records() {
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use tickloop_harness_protocol::{Decision, EventKind, ExecutionMode, PermissionRule};
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, harness::ChosenModels, next_event, text,
+        transcripts::InMemoryTranscriptStore,
+    };
+    use tickloop_harness_transcript::Line;
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "batch",
+            "ExecuteTools",
+            json!({"calls":[{"name":"Review","arguments":{}}]}),
+        ),
+        text("done"),
+        text("Earlier operation completed."),
+    ]));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(store.clone()),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
+            models: ChosenModels::new(model.clone()),
+        },
+        HarnessOptions::local(config()),
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0), None)))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let old = agent.submit(chat, "First request".into()).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.compact(chat).await.unwrap();
+    assert!(
+        !agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .message_compactions
+            .is_empty()
+    );
+    agent.sync().await.unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: tickloop_ids::generate(),
+                decision: Decision::Ask,
+                tool: "Pending".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    model.enqueue(call(
+        "batch",
+        "ExecuteTools",
+        json!({"calls":[{"name":"Pending","arguments":{"payload":"x".repeat(300_000)}}]}),
+    ));
+    let new = agent.submit(chat, "Second request".into()).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.sync().await.unwrap();
+    let lines = store.lines(chat);
+    let snapshot = lines
+        .iter()
+        .rev()
+        .find_map(|line| {
+            if let Line::RetainedSnapshot(snapshot) = line {
+                Some(snapshot)
+            } else {
+                None
+            }
+        })
+        .expect("large pending call should cause a retained snapshot");
+    assert!(
+        snapshot.lines.iter().any(
+            |line| matches!(line,Line::NestedCall(entry) if entry.operation.run_id==new.run_id)
+        ),
+        "pending child record was dropped because an older Run reused its parent ID"
+    );
+    assert!(
+        !snapshot.lines.iter().any(
+            |line| matches!(line,Line::NestedCall(entry) if entry.operation.run_id==old.run_id)
+        ),
+        "compacted old children must not be retained by a new Run's parent ID"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn partial_compaction_does_not_keep_old_children_with_reused_parent_ids() {
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use tickloop_harness_protocol::{
+        DirectedSummaryRequest, EventKind, ExecutionMode, SummaryDirection,
+    };
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, harness::ChosenModels, next_event, text,
+        transcripts::InMemoryTranscriptStore,
+    };
+    use tickloop_harness_transcript::Line;
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let batch = || {
+        call(
+            "batch",
+            "ExecuteTools",
+            json!({"calls":[{"name":"Review","arguments":{}}]}),
+        )
+    };
+    let model = Arc::new(ScriptedModel::new(vec![
+        batch(),
+        text("first done"),
+        batch(),
+        text("second done"),
+        text("First request completed."),
+    ]));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(store.clone()),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions::local(config()),
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(ReviewableTools(AtomicUsize::new(0), None)))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let mut receipts = Vec::new();
+    for prompt in ["First request", "Second request"] {
+        receipts.push(agent.submit(chat, prompt.into()).await.unwrap());
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+    let point = agent.snapshot(chat).await.unwrap().rewind_points()[1].message_id;
+    agent
+        .summarize_checkpoint(
+            chat,
+            DirectedSummaryRequest {
+                message_id: point,
+                direction: SummaryDirection::UpToHere,
+                guidance: None,
+            },
+        )
+        .await
+        .unwrap();
+    agent.sync().await.unwrap();
+    let lines = store.lines(chat);
+    let snapshot = lines
+        .iter()
+        .rev()
+        .find_map(|line| {
+            if let Line::RetainedSnapshot(snapshot) = line {
+                Some(snapshot)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(snapshot.lines.iter().any(
+        |line| matches!(line,Line::NestedCall(entry) if entry.operation.run_id==receipts[1].run_id)
+    ));
+    assert!(!snapshot.lines.iter().any(|line|matches!(line,Line::NestedCall(entry) if entry.operation.run_id==receipts[0].run_id)),"old Run's children retained due to new Run's matching parent ID");
     agent.shutdown().await;
 }
