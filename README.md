@@ -1,9 +1,4 @@
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/lockup-on-dark.svg">
-    <img src="assets/brand/lockup.svg" alt="Tickloop" width="265" height="50">
-  </picture>
-</h1>
+# Tickloop
 
 [Website](https://tickloop.ai) · English | [简体中文](README.zh-CN.md)
 
