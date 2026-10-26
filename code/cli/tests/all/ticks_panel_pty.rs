@@ -1006,3 +1006,116 @@ fn available_status_distinguishes_marketplace_ownership_and_broken_plugins() {
         succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@first  1.0.0  disabled")
     );
 }
+
+#[test]
+fn plugin_user_config_page_masks_secrets_and_reconfigures_saved_values() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("configured");
+    fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
+    fs::write(directory.join(".claude-plugin/plugin.json"), json!({
+        "name":"configured", "userConfig": {
+            "key":{"type":"string","title":"Private key","sensitive":true,"required":true},
+            "workspace":{"type":"directory","title":"Workspace","required":true}
+        },"mcpServers":{"service":{"url":"https://example.com/mcp","headers":{"Key":"${user_config.key}"}}}
+    }).to_string()).unwrap();
+    install_from_path(&fixture, "plugin", &directory);
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "configuration status", |frame| {
+        frame.contains("needs configuration")
+    });
+    terminal.press(b"\r", "configure action", |frame| {
+        frame.contains("Configure")
+    });
+    terminal.press(b"\r", "private field", |frame| {
+        frame.contains("Private key") && frame.contains("Configure configured")
+    });
+    let shown = terminal.press(b"panel-private-key", "masked input", |frame| {
+        frame.contains("*****************")
+    });
+    assert!(!shown.contains("panel-private-key"));
+    terminal.press(b"\r", "workspace field", |frame| {
+        frame.contains("Workspace")
+    });
+    terminal.press(b"/tmp/jk\r", "saved", |frame| {
+        frame.contains("configured") && !frame.contains("Configure configured")
+    });
+    let private = fixture
+        .root
+        .join("config/credentials/configured/user-config.json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(private).unwrap()).unwrap()["key"],
+        "panel-private-key"
+    );
+    let public = fs::read_to_string(fixture.root.join("config/settings.json")).unwrap();
+    assert!(public.contains("/tmp/jk"));
+    assert!(!public.contains("panel-private-key"));
+    terminal.press(b"\r", "configure action", |frame| {
+        frame.contains("Configure")
+    });
+    terminal.press(b"\r", "saved private field", |frame| {
+        frame.contains("Private key") && frame.contains("********")
+    });
+    terminal.press(ESCAPE, "cancel configuration", |frame| {
+        !frame.contains("Configure configured")
+    });
+    terminal.press(ESCAPE, "close panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(
+        !terminal
+            .output
+            .lock()
+            .unwrap()
+            .contains("panel-private-key")
+    );
+}
+
+#[test]
+fn installing_a_plugin_in_the_panel_opens_its_missing_configuration() {
+    use crate::marketplace_commands::{marketplace_directory, write_json};
+    let fixture = Fixture::new();
+    let team = marketplace_directory(
+        &fixture,
+        "team",
+        "team",
+        json!([{"name":"configured","source":"./configured"}]),
+    );
+    write_json(
+        &team.join("configured/.claude-plugin/plugin.json"),
+        &json!({
+            "name":"configured", "userConfig":{"key":{"type":"string","title":"Private key","sensitive":true,"required":true}}
+        }),
+    );
+    succeeded(&fixture.tickloop(&["plugin", "marketplace", "add", &path_text(&team)]));
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "installed page", panel_is_open);
+    terminal.press(TAB, "available page", |frame| {
+        frame.contains("[Available]") && frame.contains("configured")
+    });
+    terminal.press(
+        b"/configured\r",
+        "configuration after installation",
+        |frame| frame.contains("Configure configured") && frame.contains("Private key"),
+    );
+    terminal.press(b"cancelled-secret", "masked", |frame| {
+        frame.contains("****************")
+    });
+    terminal.press(ESCAPE, "cancel", |frame| {
+        !frame.contains("Configure configured")
+    });
+    assert!(
+        !fixture
+            .root
+            .join("config/credentials/configured/user-config.json")
+            .exists()
+    );
+    terminal.press(ESCAPE, "leave filter", |frame| {
+        !frame.contains("esc leave filter")
+    });
+    terminal.press(ESCAPE, "close panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(!terminal.output.lock().unwrap().contains("cancelled-secret"));
+}

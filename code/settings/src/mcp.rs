@@ -12,6 +12,7 @@ pub struct PluginServers {
     pub root: PathBuf,
     pub data_directory: PathBuf,
     pub entries: BTreeMap<String, Value>,
+    pub user_config: crate::plugin_config::PluginUserConfig,
 }
 
 pub struct ResolvedServers {
@@ -108,6 +109,7 @@ pub fn resolve_servers_with_plugins(
                 plugin.data_directory.to_string_lossy().into_owned(),
             );
         }
+        environment.extend(plugin.user_config.variables());
         for (name, entry) in &plugin.entries {
             let name = format!("plugin_{}_{name}", plugin.name);
             resolved.push(
@@ -117,6 +119,9 @@ pub fn resolve_servers_with_plugins(
                 directory,
                 &environment,
             );
+            if let Some(server) = resolved.servers.last_mut() {
+                server.sensitive_values = plugin.user_config.secrets();
+            }
             if let Some(signature) = signature(entry, directory, &environment) {
                 if let Some(preferred) = signatures.get(&signature) {
                     resolved.warnings.push(format!(
@@ -148,14 +153,30 @@ impl ResolvedServers {
                     .push(format!("MCP {name}: approval field {field} ignored"));
             }
         }
-        let mut transport = parse_transport(entry, directory, environment)
-            .unwrap_or_else(|reason| McpTransport::Failed { reason });
-        if plugin
-            && needs_user_config(entry)
-            && !matches!(transport, McpTransport::Unsupported { .. })
-        {
-            transport = McpTransport::NeedsConfiguration;
+        let mut entry = entry.clone();
+        if plugin && let Some(fields) = entry.as_object_mut() {
+            fields.retain(|field, _| !is_approval_field(field));
         }
+        let expanded = if transport_kind(&entry).is_ok_and(|kind| {
+            !matches!(kind, "stdio" | "http" | "streamable-http") && !kind.contains("${")
+        }) {
+            Ok(entry.clone())
+        } else if plugin && missing_user_config(&entry, environment) {
+            Err("missing userConfig; configure the plugin".into())
+        } else {
+            expand_value(&entry, environment)
+        };
+        let transport = match &expanded {
+            Ok(entry) => parse_transport(entry, directory)
+                .unwrap_or_else(|reason| McpTransport::Failed { reason }),
+            Err(reason) if plugin && reason.starts_with("missing userConfig") => {
+                McpTransport::NeedsConfiguration
+            }
+            Err(reason) => McpTransport::Failed {
+                reason: reason.clone(),
+            },
+        };
+        let expanded_entry = expanded.as_ref().unwrap_or(&entry);
         match &transport {
             McpTransport::Failed { reason } => self.warnings.push(format!("MCP {name}: {reason}")),
             McpTransport::NeedsConfiguration => self.warnings.push(format!(
@@ -170,8 +191,10 @@ impl ResolvedServers {
             name,
             source,
             transport,
-            timeout_ms: entry["timeout"]
+            sensitive_values: Vec::new(),
+            timeout_ms: expanded_entry["timeout"]
                 .as_u64()
+                .or_else(|| expanded_entry["timeout"].as_str()?.parse().ok())
                 .filter(|n| *n >= 1000)
                 .unwrap_or(300_000),
         });
@@ -201,7 +224,7 @@ fn signature(
         "type": entry["type"], "command": entry["command"],
         "args": entry.get("args").cloned().unwrap_or_else(|| serde_json::json!([])), "url": entry["url"]
     });
-    match parse_transport(&identity, directory, environment).ok()? {
+    match parse_transport(&expand_value(&identity, environment).ok()?, directory).ok()? {
         McpTransport::Stdio { command, args, .. } => {
             Some(serde_json::to_string(&("stdio", command, args)).expect("strings serialize"))
         }
@@ -247,52 +270,29 @@ pub fn transport_kind(entry: &Value) -> Result<&str, &'static str> {
     }
 }
 
-fn parse_transport(
-    value: &Value,
-    directory: &Path,
-    environment: &BTreeMap<String, String>,
-) -> Result<McpTransport, String> {
+fn parse_transport(value: &Value, directory: &Path) -> Result<McpTransport, String> {
     let entry: Entry = serde_json::from_value(value.clone())
         .map_err(|_| "invalid MCP server fields".to_owned())?;
-    let expand = |text: &str| expand_variables(text, environment);
     let kind = transport_kind(value)?;
     match kind {
         "stdio" => {
-            let command = expand(
-                entry
-                    .command
-                    .as_deref()
-                    .ok_or("stdio server needs command")?,
-            )?;
+            let command = entry.command.ok_or("stdio server needs command")?;
             if command.is_empty() {
                 return Err("stdio server needs command".into());
             }
-            let args = entry
-                .args
-                .iter()
-                .map(|arg| expand(arg))
-                .collect::<Result<_, _>>()?;
-            let env = entry
-                .env
-                .iter()
-                .map(|(key, value)| Ok((key.clone(), expand(value)?)))
-                .collect::<Result<_, String>>()?;
             let cwd = entry
                 .cwd
-                .as_deref()
-                .map(expand)
-                .transpose()?
                 .map(|cwd| directory.join(cwd))
                 .unwrap_or_else(|| directory.to_owned());
             Ok(McpTransport::Stdio {
                 command,
-                args,
-                env,
+                args: entry.args,
+                env: entry.env,
                 cwd,
             })
         }
         "http" | "streamable-http" => {
-            let url = expand(entry.url.as_deref().ok_or("HTTP server needs url")?)?;
+            let url = entry.url.ok_or("HTTP server needs url")?;
             let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid MCP URL")?;
             let local = parsed.host_str().is_some_and(|host| {
                 host == "localhost"
@@ -308,12 +308,10 @@ fn parse_transport(
             {
                 return Err("MCP URL requires HTTPS (HTTP is allowed only on loopback), without userinfo or fragment".into());
             }
-            let headers = entry
-                .headers
-                .iter()
-                .map(|(key, value)| Ok((key.clone(), expand(value)?)))
-                .collect::<Result<_, String>>()?;
-            Ok(McpTransport::Http { url, headers })
+            Ok(McpTransport::Http {
+                url,
+                headers: entry.headers,
+            })
         }
         _ => Ok(McpTransport::Unsupported { kind: kind.into() }),
     }
@@ -332,7 +330,10 @@ fn expand_variables(text: &str, environment: &BTreeMap<String, String>) -> Resul
         let (name, default) = expression
             .split_once(":-")
             .map_or((expression, None), |(name, default)| (name, Some(default)));
-        if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        if name.is_empty()
+            || (!name.starts_with("user_config.")
+                && !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+        {
             return Err("invalid MCP environment variable name".into());
         }
         let value = environment
@@ -340,10 +341,64 @@ fn expand_variables(text: &str, environment: &BTreeMap<String, String>) -> Resul
             .map(String::as_str)
             .filter(|value| !value.is_empty())
             .or(default)
-            .ok_or_else(|| format!("missing environment variable {name}"))?;
+            .ok_or_else(|| {
+                if name.starts_with("user_config.") {
+                    "missing userConfig; configure the plugin".into()
+                } else {
+                    format!("missing environment variable {name}")
+                }
+            })?;
         output.push_str(value);
         rest = &variable[end + 1..];
     }
     output.push_str(rest);
     Ok(output)
+}
+
+fn expand_value(value: &Value, environment: &BTreeMap<String, String>) -> Result<Value, String> {
+    match value {
+        Value::String(text) => expand_variables(text, environment).map(Value::String),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| expand_value(item, environment))
+            .collect(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    expand_variables(key, environment)?,
+                    expand_value(value, environment)?,
+                ))
+            })
+            .collect::<Result<serde_json::Map<_, _>, String>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+pub(crate) fn missing_user_config(value: &Value, variables: &BTreeMap<String, String>) -> bool {
+    let missing = |text: &str| {
+        text.match_indices("${user_config.").any(|(start, _)| {
+            let expression = &text[start + 2..];
+            let Some(end) = expression.find('}') else {
+                return true;
+            };
+            let expression = &expression[..end];
+            let (name, default) = expression
+                .split_once(":-")
+                .map_or((expression, None), |(name, default)| (name, Some(default)));
+            default.is_none() && !variables.contains_key(name)
+        })
+    };
+    match value {
+        Value::String(text) => missing(text),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| missing_user_config(item, variables)),
+        Value::Object(fields) => fields
+            .iter()
+            .filter(|(key, _)| !is_approval_field(key))
+            .any(|(key, value)| missing(key) || missing_user_config(value, variables)),
+        _ => false,
+    }
 }

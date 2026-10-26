@@ -123,6 +123,7 @@ fn load_plugins(
     watched: &mut Vec<PathBuf>,
 ) {
     watched.push(config_root.join("plugins/installed.json"));
+    watched.push(config_root.join("settings.json"));
     watched.push(config_root.join("ticks/installed.json"));
     let store = PluginStore::in_config_root(config_root);
     let installed = match store.installed() {
@@ -244,6 +245,24 @@ fn load_files(
                 registry.register_markdown(&markdown, SkillSource::Project { path }, &[])
             }
             SkillOrigin::Plugin(store, plugin) => {
+                watched.push(
+                    store
+                        .config_root()
+                        .join("credentials")
+                        .join(plugin.name())
+                        .join("user-config.json"),
+                );
+                let config = match crate::plugin_config::PluginUserConfig::load(
+                    store.config_root(),
+                    &plugin.manifest,
+                ) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        registry.warn(format!("Plugin {}: cannot read user config", plugin.name()));
+                        continue;
+                    }
+                };
+                let markdown = config.skill_text(&markdown);
                 let data = plugin_data_directory(registry, store, plugin, &markdown);
                 let skill_directory = path.parent().unwrap_or(&path).to_path_buf();
                 let mut variables = vec![(PACKAGE_ROOT_VARIABLE, plugin.root.as_path())];

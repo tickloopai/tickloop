@@ -738,7 +738,10 @@ async fn open(
                 .envs(environment)
                 .envs(env)
                 .current_dir(cwd);
-            let stderr = if let Some(directory) = stderr_directory {
+            // Arbitrary stderr bytes cannot be safely redacted across chunk boundaries.
+            let stderr = if !config.sensitive_values.is_empty() {
+                std::process::Stdio::null()
+            } else if let Some(directory) = stderr_directory {
                 use sha2::{Digest, Sha256};
                 use std::os::unix::fs::OpenOptionsExt;
                 directory
@@ -852,6 +855,7 @@ fn redact(entry: &Entry, content: String) -> String {
     let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
     let mut content = normalizer.normalize(&content).into_owned();
     let mut secrets = entry.environment_secrets.clone();
+    secrets.extend(entry.config.sensitive_values.iter().cloned());
     if let Some(token) = entry.token.read().unwrap().as_ref() {
         secrets.push(token.secret().to_owned());
     }

@@ -142,7 +142,9 @@ tickloop plugin install --path ./my-plugin
 
 已启用插件可在 `.mcp.json` 中声明 MCP 服务（服务映射或带 `mcpServers` 外层），也可在清单的 `mcpServers` 中使用对象、相对路径或数组。支持 stdio 与 streamable HTTP，工具名为 `mcp__plugin_<插件>_<服务>__<工具>`；过长或碰撞的名字补哈希。`validate`、安装与启用会列出命令、地址及缺少的配置。启用即同意从下一次 Agent 请求起以用户身份运行服务；禁用或卸载后从下一次请求起停止，工具调用仍按用户权限审批。
 
-命令和参数或 URL 相同时，优先保留用户自己配置的服务；插件之间按插件名排序，保留在前者，并提示跳过的重复项。连接时替换插件根和数据目录变量（`${TICKLOOP_PLUGIN_ROOT}`、`${TICKLOOP_PLUGIN_DATA}` 及其 `CLAUDE_` 别名），以及启动环境中的 `${VAR}`、`${VAR:-默认值}`。引用 `${user_config.*}` 的服务暂标为需要配置，不启动。HTTP 是否需要登录在连接时发现，静态验证不能确定。
+插件可声明 `userConfig`（字符串、数字、布尔、目录或文件）。安装、启用时在终端询问尚未填写的项；无终端时提示运行 `tickloop plugin configure NAME`。此命令与 `/plugins` 的 Configure 操作均可重新配置。敏感输入不回显或以 `*` 遮掩，保存到仅当前用户可读写的 `credentials/NAME/user-config.json`；其他值保存在 `settings.json` 的 `plugins.NAME.options`。卸载保留这两类配置。MCP 配置使用实际值；Skill 使用非敏感值，敏感值替换为占位文字。修改从下一次请求起生效。
+
+命令和参数或 URL 相同时，优先保留用户自己配置的服务；插件之间按插件名排序，保留在前者，并提示跳过的重复项。连接时替换插件根和数据目录变量（`${TICKLOOP_PLUGIN_ROOT}`、`${TICKLOOP_PLUGIN_DATA}` 及其 `CLAUDE_` 别名），以及启动环境中的 `${VAR}`、`${VAR:-默认值}`。引用了缺失的 `${user_config.*}` 值时，服务显示需要配置且不启动。HTTP 是否需要登录在连接时发现，静态验证不能确定。
 
 旧 Tick 包在首次使用时自动迁移，保留登录；损坏的包会提示重装，旧目录保留。
 

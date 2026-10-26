@@ -533,3 +533,66 @@ fn mcp_install_and_enable_report_duplicates_against_all_enabled_sources() {
     let validated = succeeded(&plugin(&fixture, &["validate", &path_text(&zeta)]));
     assert!(!validated.contains("skipped duplicate"), "{validated}");
 }
+
+#[test]
+fn user_config_install_without_terminal_succeeds_and_points_to_configure() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "configured",
+        json!({"name":"configured","userConfig":{"key":{"type":"string","required":true,"sensitive":true}},"mcpServers":{"remote":{"url":"https://example.com","headers":{"X-Key":"${user_config.key}"}}}}),
+        &[],
+    );
+    let shown = succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&source)],
+    ));
+    assert!(
+        shown.contains("tickloop plugin configure configured"),
+        "{shown}"
+    );
+    let enabled = succeeded(&plugin(&fixture, &["enable", "configured"]));
+    assert!(
+        enabled.contains("tickloop plugin configure configured"),
+        "{enabled}"
+    );
+    let configure = failed(&plugin(&fixture, &["configure", "configured"]));
+    assert!(configure.contains("terminal"), "{configure}");
+}
+
+#[test]
+fn user_config_terminal_prompts_only_for_missing_values_and_masks_reconfiguration() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "configured",
+        json!({"name":"configured","userConfig":{
+            "key":{"type":"string","title":"Private key","required":true,"sensitive":true},
+            "number":{"type":"number","default":4}
+        }}),
+        &[],
+    );
+    let mut terminal =
+        fixture.tickloop_on_terminal(&["plugin", "install", "--path", &path_text(&source)]);
+    terminal.wait_for("Private key (hidden as you type): ");
+    terminal.type_text("cli-private-key\r");
+    let (code, shown) = terminal.finish();
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("cli-private-key"));
+    assert!(!shown.contains("number:"));
+    let enabled = succeeded(&plugin(&fixture, &["enable", "configured"]));
+    assert!(!enabled.contains("Configuration needed"));
+    let mut terminal = fixture.tickloop_on_terminal(&["plugin", "configure", "configured"]);
+    terminal.wait_for("Private key [Enter keeps ********] (hidden as you type): ");
+    terminal.type_text("replaced-private-key\r");
+    terminal.wait_for("number [Enter keeps 4]: ");
+    terminal.type_text("7\r");
+    let (code, shown) = terminal.finish();
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("private-key"));
+    let public = fs::read_to_string(fixture.root.join("config/settings.json")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&public).unwrap()["plugins"]["configured"]["options"]["number"],
+        7
+    );
+}

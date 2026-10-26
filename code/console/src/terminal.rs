@@ -66,6 +66,7 @@ mod opener;
 mod paste_blocks;
 mod pasted_image_paths;
 mod permissions_surface;
+mod plugin_configuration;
 pub mod popup;
 mod presentation;
 mod process_registry;
