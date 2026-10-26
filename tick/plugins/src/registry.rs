@@ -18,6 +18,11 @@ const REGISTRY_VERSION: u32 = 1;
 pub enum PluginSource {
     /// A local plugin directory or archive.
     Path { path: String },
+    /// A Git repository at the verified commit, optionally restricted to a subdirectory.
+    Git {
+        source: crate::GitSource,
+        commit: String,
+    },
     /// An archive downloaded from a marketplace.
     Download { url: String },
 }
@@ -26,6 +31,7 @@ impl std::fmt::Display for PluginSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Path { path } => formatter.write_str(path),
+            Self::Git { source, .. } => formatter.write_str(&source.url),
             Self::Download { url } => formatter.write_str(url),
         }
     }

@@ -339,6 +339,42 @@ impl PluginStore {
         Ok(DownloadFile(file))
     }
 
+    /// Installs a checked-out plugin, keeping an intact installation at the same commit.
+    pub fn install_checkout(
+        &self,
+        checkout: &crate::GitCheckout,
+        marketplace: &str,
+        name: &str,
+        entry: Option<&Map<String, Value>>,
+    ) -> Result<Installation, PluginError> {
+        validate_plugin_name(marketplace)?;
+        validate_plugin_name(name)?;
+        let request = Request {
+            marketplace,
+            source: PluginSource::Git {
+                source: checkout.source.clone(),
+                commit: checkout.commit.clone(),
+            },
+            revision: checkout.commit[..12].to_owned(),
+            sha256: None,
+            default_name: name.to_owned(),
+            entry,
+            expected: None,
+            same_revision: SameRevision::Keep,
+        };
+        self.install(request, |staged| {
+            staging::copy_directory(checkout.root(), staged)?;
+            let manifest = PluginManifest::load(staged, name, entry)?;
+            if manifest.name != name {
+                return Err(PluginError::Invalid(format!(
+                    "the plugin is named {}, not {name}",
+                    manifest.name
+                )));
+            }
+            Ok(())
+        })
+    }
+
     /// Removes the plugin and its registration, and its data unless `keep_data`. Its data source
     /// credentials stay.
     pub fn uninstall(&self, name: &str, keep_data: bool) -> Result<Uninstalled, PluginError> {
