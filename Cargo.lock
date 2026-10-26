@@ -4461,6 +4461,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickloop-tick-plugins"
+version = "0.2.25"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tickloop-tick-packages",
+ "time",
+]
+
+[[package]]
 name = "tickloop-tick-protocol"
 version = "0.2.25"
 dependencies = [

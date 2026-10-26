@@ -1,0 +1,27 @@
+[package]
+name = "tickloop-tick-plugins"
+description = "Plugins: finding and reading their manifests, and installing, enabling and removing them under a Tickloop config root, where Tick packages are plugins too"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tick_plugins"
+doctest = false
+
+[dependencies]
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+thiserror = "2"
+tickloop-tick-packages = { path = "../packages" }
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+time = { version = "0.3", features = ["parsing"] }
+

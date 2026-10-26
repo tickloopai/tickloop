@@ -7,6 +7,7 @@
     "tickloop-tick-protocol": "foundation",
     "tickloop-tick-oauth": "leaf",
     "tickloop-tick-packages": "tick",
+    "tickloop-tick-plugins": "tick",
     "tickloop-tick-oauth-test-server": "test-support",
     "tickloop-code-client": "code",
     "tickloop-harness-cron": "harness",

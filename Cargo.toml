@@ -3,7 +3,7 @@ members = [
     "harness/*", "code/*",
     "tickhost/host", "tickhost/connect",
     "tick/ids", "tick/protocol", "tick/sdk", "tick/packages", "tick/oauth",
-    "tick/oauth-test-server", "tick/installer",
+    "tick/oauth-test-server", "tick/installer", "tick/plugins",
     "ui",
 ]
 resolver = "3"
