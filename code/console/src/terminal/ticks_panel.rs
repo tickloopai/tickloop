@@ -13,7 +13,8 @@ use tick_plugins::{
     LOCAL_MARKETPLACE, MarketplacePlugin, PluginManifest, Uninstalled,
 };
 use tickloop_tick_installer::{
-    LoggedOut, LoginError, MarketplaceOffer, PluginRequest, login_label, unavailable_reason,
+    LoggedOut, LoginError, MarketplaceOffer, PluginRequest, installed_status, login_label,
+    unavailable_reason,
 };
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -94,7 +95,10 @@ pub(super) enum TickPackageResult {
         read: u64,
         listing: Result<InstalledList, String>,
     },
-    Marketplace(Result<Vec<MarketplaceOffer>, String>),
+    Marketplace {
+        read: u64,
+        listing: Result<Vec<MarketplaceOffer>, String>,
+    },
     Login {
         name: String,
         state: LoginState,
@@ -172,7 +176,7 @@ impl TickPackageResult {
     pub(super) fn notice(&self) -> Option<Notice> {
         Some(match self {
             Self::Installed { .. }
-            | Self::Marketplace(_)
+            | Self::Marketplace { .. }
             | Self::Login { .. }
             | Self::LoginWaiting { .. } => return None,
             Self::LoginEnded {
@@ -397,6 +401,7 @@ pub(super) struct TicksPanel {
     /// The number of the read `installed` holds; a read that started before it is stale.
     installed_read: u64,
     marketplace: Listing<Vec<MarketplaceOffer>>,
+    marketplace_read: u64,
     selected: [usize; 2],
     top: [usize; 2],
     menus: Vec<PanelMenu>,
@@ -422,6 +427,7 @@ impl TicksPanel {
             installed: Listing::Loading,
             installed_read: 0,
             marketplace: Listing::Loading,
+            marketplace_read: 0,
             selected: [0; 2],
             top: [0; 2],
             menus: Vec::new(),
@@ -461,7 +467,9 @@ impl TicksPanel {
                 self.installed_read = read;
                 self.installed = listing.map_or_else(Listing::Failed, Listing::Loaded);
             }
-            TickPackageResult::Marketplace(listing) => {
+            TickPackageResult::Marketplace { read, .. } if read < self.marketplace_read => {}
+            TickPackageResult::Marketplace { read, listing } => {
+                self.marketplace_read = read;
                 self.marketplace = listing.map_or_else(Listing::Failed, Listing::Loaded);
             }
             TickPackageResult::Login { name, state } => {
@@ -1074,40 +1082,6 @@ impl TicksPanel {
             .collect()
     }
 
-    fn installed_status(&self, offer: &AvailablePlugin<'_>) -> String {
-        let Listing::Loaded(list) = &self.installed else {
-            return "not installed".into();
-        };
-        let usable = list
-            .packages
-            .plugins
-            .iter()
-            .find(|plugin| plugin.name() == offer.plugin.name);
-        let unusable = list
-            .packages
-            .broken
-            .iter()
-            .find(|plugin| plugin.name == offer.plugin.name);
-        match (usable, unusable) {
-            (Some(plugin), _) if plugin.marketplace == offer.marketplace => {
-                if offer.plugin.version.as_ref() == Some(&plugin.version) {
-                    "installed".into()
-                } else {
-                    format!("installed {}", plugin.version)
-                }
-            }
-            (None, Some(plugin)) if plugin.marketplace == offer.marketplace => {
-                format!("installed {} but unusable", plugin.version)
-            }
-            (Some(plugin), _) => format!("not installed; {} is installed", plugin.id()),
-            (None, Some(plugin)) => format!(
-                "not installed; {}@{} is installed",
-                plugin.name, plugin.marketplace
-            ),
-            (None, None) => "not installed".into(),
-        }
-    }
-
     fn entry_count(&self, page: usize) -> usize {
         if page == INSTALLED_PAGE {
             self.installed_entries().len()
@@ -1208,7 +1182,12 @@ impl TicksPanel {
             .iter()
             .enumerate()
             .map(|(index, offer)| {
-                let mut status = self.installed_status(offer);
+                let mut status = match &self.installed {
+                    Listing::Loaded(list) => {
+                        installed_status(&list.packages, offer.marketplace, offer.plugin)
+                    }
+                    _ => "not installed".to_owned(),
+                };
                 let reason = unavailable_reason(offer.plugin);
                 let role = if reason.is_some() {
                     Role::Warning
@@ -1705,6 +1684,10 @@ mod tests {
         }
     }
 
+    fn marketplace_result(listing: Result<Vec<MarketplaceOffer>, String>) -> TickPackageResult {
+        TickPackageResult::Marketplace { read: 1, listing }
+    }
+
     /// The marketplace offering each `(name, version, installable)`.
     fn marketplace(offered: &[(&str, &str, bool)]) -> Vec<MarketplaceOffer> {
         let packages = offered
@@ -1765,7 +1748,7 @@ mod tests {
                 (installed("beta", "1.0.0", false), LoginState::NotRequired),
             ],
         ));
-        panel.apply(TickPackageResult::Marketplace(Ok(marketplace(&[
+        panel.apply(marketplace_result(Ok(marketplace(&[
             ("alpha", "2.0.0", true),
             ("sample", "1.0.0", true),
         ]))));
@@ -2442,7 +2425,7 @@ mod tests {
             1,
             vec![(installed("alpha", "1.0.0", true), LoginState::LoggedIn)],
         ));
-        panel.apply(TickPackageResult::Marketplace(Ok(marketplace(&[
+        panel.apply(marketplace_result(Ok(marketplace(&[
             ("alpha", "1.0.0", true),
             ("other", "1.0.0", false),
         ]))));
@@ -2465,7 +2448,7 @@ mod tests {
     fn an_unavailable_marketplace_leaves_the_installed_page_as_it_is() {
         let mut panel = TicksPanel::new(None);
         assert!(text(&mut panel).contains("Loading…"));
-        panel.apply(TickPackageResult::Marketplace(Err(
+        panel.apply(marketplace_result(Err(
             "cannot read the Tick marketplace at /missing.json: No such file or directory".into(),
         )));
         panel.apply(installed_list(
@@ -2496,6 +2479,25 @@ mod tests {
             TickPackageRequest::Load
         );
         assert!(text(&mut panel).contains("Reading marketplaces…"));
+    }
+
+    #[test]
+    fn an_older_catalog_completion_does_not_replace_the_refreshed_marketplace() {
+        let mut panel = TicksPanel::new(None);
+        panel.apply(installed_list(1, Vec::new()));
+        panel.apply(TickPackageResult::Marketplace {
+            read: 2,
+            listing: Ok(marketplace(&[("alpha", "2.0.0", true)])),
+        });
+        press(&mut panel, KeyCode::Tab);
+        assert!(text(&mut panel).contains("tickloop · 2.0.0"));
+        panel.apply(TickPackageResult::Marketplace {
+            read: 1,
+            listing: Ok(marketplace(&[("alpha", "1.0.0", true)])),
+        });
+        let shown = text(&mut panel);
+        assert!(shown.contains("tickloop · 2.0.0"), "{shown}");
+        assert!(!shown.contains("tickloop · 1.0.0"), "{shown}");
     }
 
     #[test]
@@ -2534,7 +2536,7 @@ mod tests {
             1,
             vec![(installed("alpha", "0.3.0", true), LoginState::LoggedIn)],
         ));
-        panel.apply(TickPackageResult::Marketplace(Ok(marketplace(&[(
+        panel.apply(marketplace_result(Ok(marketplace(&[(
             "alpha", "0.2.0", true,
         )]))));
         press(&mut panel, KeyCode::Enter);

@@ -41,6 +41,7 @@ pub(super) enum Done {
 pub(super) struct TickPackageTasks {
     running: JoinSet<(Uuid, Done)>,
     installed_reads: u64,
+    marketplace_reads: u64,
     /// The login under way in each panel: its attempt and what cancels it.
     logins: HashMap<Uuid, (u64, CancellationToken)>,
 }
@@ -78,9 +79,11 @@ impl TickPackageTasks {
     }
 
     fn read_marketplaces(&mut self, store: PluginStore, panel: Uuid) {
+        self.marketplace_reads += 1;
+        let read = self.marketplace_reads;
         self.spawn(async move {
             let listing = read_marketplaces(HTTP, &store, false).await;
-            (panel, TickPackageResult::Marketplace(listing))
+            (panel, TickPackageResult::Marketplace { read, listing })
         });
     }
 

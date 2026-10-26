@@ -4,13 +4,13 @@
 use std::collections::BTreeMap;
 
 use tick_plugins::{
-    InstallOutcome, Installation, InstalledPlugins, LOCAL_MARKETPLACE, MarketplacePlugin,
-    MarketplaceRegistration, MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
+    InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, MarketplaceRegistration,
+    MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
-    PluginRequest, install_from, plugin_http, read_marketplace, read_marketplaces, source_label,
-    unavailable_reason,
+    PluginRequest, install_from, installed_status, plugin_http, read_marketplace,
+    read_marketplaces, source_label, unavailable_reason,
 };
 
 use super::plugin_command::{print_table, report, report_notes};
@@ -412,38 +412,4 @@ pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
     });
     print_table(&rows);
     Ok(())
-}
-
-/// What is installed of the plugin `offered` the marketplace `marketplace` lists.
-fn installed_status(
-    installed: &InstalledPlugins,
-    marketplace: &str,
-    offered: &MarketplacePlugin,
-) -> String {
-    let usable = installed
-        .plugins
-        .iter()
-        .find(|plugin| plugin.name() == offered.name);
-    let unusable = installed
-        .broken
-        .iter()
-        .find(|plugin| plugin.name == offered.name);
-    match (usable, unusable) {
-        (Some(plugin), _) if plugin.marketplace == marketplace => {
-            if offered.version.as_ref() == Some(&plugin.version) {
-                "installed".to_owned()
-            } else {
-                format!("installed {}", plugin.version)
-            }
-        }
-        (None, Some(plugin)) if plugin.marketplace == marketplace => {
-            format!("installed {} but unusable", plugin.version)
-        }
-        (Some(plugin), _) => format!("not installed; {} is installed", plugin.id()),
-        (None, Some(plugin)) => format!(
-            "not installed; {}@{} is installed",
-            plugin.name, plugin.marketplace
-        ),
-        (None, None) => "not installed".to_owned(),
-    }
 }

@@ -4,9 +4,9 @@
 
 use tick_packages::{CURRENT_TARGET, Marketplace, validate_package_name};
 use tick_plugins::{
-    Installation, MarketplacePlugin, MarketplacePluginSource, MarketplaceRegistration,
-    MarketplaceSource as PluginMarketplaceSource, PluginError, PluginStore, TICKLOOP_MARKETPLACE,
-    validate_plugin_name,
+    Installation, InstalledPlugins, MarketplacePlugin, MarketplacePluginSource,
+    MarketplaceRegistration, MarketplaceSource as PluginMarketplaceSource, PluginError,
+    PluginStore, TICKLOOP_MARKETPLACE, validate_plugin_name,
 };
 
 use crate::{HttpClient, HttpRequest, MarketplaceSource};
@@ -183,4 +183,38 @@ pub async fn install_from(
         .install_marketplace_plugin(marketplace, &plugin.name, &plugin_http(http))
         .await
         .map_err(|error| format!("cannot install {id}: {error}"))
+}
+
+/// What is installed of the plugin `offered` the marketplace `marketplace` lists.
+pub fn installed_status(
+    installed: &InstalledPlugins,
+    marketplace: &str,
+    offered: &MarketplacePlugin,
+) -> String {
+    let usable = installed
+        .plugins
+        .iter()
+        .find(|plugin| plugin.name() == offered.name);
+    let unusable = installed
+        .broken
+        .iter()
+        .find(|plugin| plugin.name == offered.name);
+    match (usable, unusable) {
+        (Some(plugin), _) if plugin.marketplace == marketplace => {
+            if offered.version.as_ref() == Some(&plugin.version) {
+                "installed".to_owned()
+            } else {
+                format!("installed {}", plugin.version)
+            }
+        }
+        (None, Some(plugin)) if plugin.marketplace == marketplace => {
+            format!("installed {} but unusable", plugin.version)
+        }
+        (Some(plugin), _) => format!("not installed; {} is installed", plugin.id()),
+        (None, Some(plugin)) => format!(
+            "not installed; {}@{} is installed",
+            plugin.name, plugin.marketplace
+        ),
+        (None, None) => "not installed".to_owned(),
+    }
 }
