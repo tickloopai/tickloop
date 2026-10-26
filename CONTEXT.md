@@ -107,7 +107,7 @@ _Avoid_: inbox, to-do queue
 
 **Send Now**:
 A way of submitting while the Agent is working that makes a message start a new turn immediately (`ctrl+enter`): it first interrupts the current turn, then runs this message. A normal submission only queues.
-_Avoid_: "jump the queue", Steer (Codex uses it for a normal submission merged into the current turn)
+_Avoid_: "jump the queue", Steer
 
 **Receiving**:
 The Loop's single switch for whether it accepts Triggers, with only two states: receiving and paused. `/stop`, ordinary history loading, and Trigger input that cannot be written to the Transcript for a long time pause it; Continue resumes it.
@@ -124,7 +124,7 @@ _Avoid_: event trigger, timer, clock rule
 The user, in the Monitor, hands the current content of an unsubscribed Extension Tick or Terminal Tick to the Agent once, without creating a subscription.
 
 **Scheduled Task**:
-Modeled on Claude Code's `/loop` and cron tools, makes the Loop run a user-authorized instruction repeatedly on a schedule or at a point in time; it is the time source of Triggers and belongs only to the root Agent. A schedule can be recurring (a `/loop` interval or a 5-field cron), one-time, or self-paced. A Scheduled Task is not a Tick.
+A schedule that makes the Loop run a user-authorized instruction repeatedly on a schedule or at a point in time; it is the time source of Triggers and belongs only to the root Agent. A schedule can be recurring (a `/loop` interval or a 5-field cron), one-time, or self-paced. A Scheduled Task is not a Tick.
 _Avoid_: clock rule, scheduled Tick
 
 **Self-paced `/loop`**:
