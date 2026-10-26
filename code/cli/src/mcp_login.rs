@@ -92,6 +92,11 @@ fn resolve(root: &Path, name: &str) -> Result<McpServerConfig, String> {
         .into_iter()
         .filter(|plugin| plugin.enabled)
         .map(|plugin| PluginServers {
+            user_config: tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                root,
+                &plugin.manifest,
+            )
+            .unwrap_or_default(),
             data_directory: store.data_directory(plugin.name()),
             name: plugin.name().to_owned(),
             root: plugin.root,

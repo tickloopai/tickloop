@@ -375,6 +375,185 @@ async fn live_model_calls_an_installed_marketplace_plugin() {
 }
 
 #[tokio::test]
+async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcript() {
+    use tickloop_code_settings::plugin_config::PluginUserConfig;
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    tickloop_harness::base::credentials::save_api_key(&canonical, "ANTHROPIC_API_KEY", "fixture")
+        .unwrap();
+    let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let (agent, _, _) =
+        configured_agent(&canonical, model, ChosenModels::new(scripted.clone())).await;
+    let service = McpService::start().await;
+    let secret = "sensitive-config-marker";
+    service.set_tools(json!([{"name":"probe","description":format!("Returns {secret}"),"inputSchema":{"type":"object","properties":{"note":{"type":"string","description":secret},"pin":{"type":"number","default":839271},"flag":{"type":"boolean","default":false}}}}]));
+    service.set_result(json!({"content":[{"type":"text","text":format!("result {secret}")}],"structuredContent":{"value":secret}}));
+    let source = canonical.join("source");
+    std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    let mut args = service.stdio_args();
+    args.push("prefix${user_config.key}suffix".into());
+    args.push("prefix${user_config.pin}suffix".into());
+    args.push("${user_config.flag}".into());
+    args[2] = format!(
+        "import sys\nsys.stderr.write('sensitive-config-marker\\n')\n{}",
+        args[2]
+    );
+    std::fs::write(source.join(".claude-plugin/plugin.json"), json!({
+        "name":"configured", "userConfig":{"key":{"type":"string","required":true,"sensitive":true},"pin":{"type":"number","sensitive":true},"flag":{"type":"boolean","sensitive":true}},
+        "mcpServers":{"probe":{"command":"python3","args":args}}
+    }).to_string()).unwrap();
+    let plugin = tick_plugins::PluginStore::in_config_root(&canonical)
+        .install_path(&source)
+        .unwrap()
+        .plugin;
+    let chat = agent.create_chat(canonical.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    scripted.enqueue(text("missing configuration"));
+    complete(&agent, chat, "Report services").await;
+    {
+        let requests = scripted.requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert!(
+            !request
+                .tools
+                .iter()
+                .any(|tool| tool.name.contains("plugin_configured"))
+        );
+        assert!(
+            serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains("NeedsConfiguration")
+        );
+    }
+    let mut config = PluginUserConfig::load(&canonical, &plugin.manifest).unwrap();
+    config
+        .save(
+            &canonical,
+            &plugin.manifest,
+            &serde_json::from_value(json!({"key":secret,"pin":839271,"flag":false})).unwrap(),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            scripted.enqueue(text("ready"));
+            complete(&agent, chat, "Report services").await;
+            if scripted
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__plugin_configured_probe__probe")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("configured plugin should connect on the next request");
+    scripted.enqueue(call(
+        "configured",
+        "mcp__plugin_configured_probe__probe",
+        json!({}),
+    ));
+    scripted.enqueue(text("done"));
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, "Call the configured tool".into())
+        .await
+        .unwrap();
+    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            assert!(!serde_json::to_string(&event).unwrap().contains(secret));
+            match event.kind {
+                EventKind::PermissionRequested { request } => break request,
+                EventKind::ToolStarted { .. } => panic!("configuration bypassed approval"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!serde_json::to_string(&approval).unwrap().contains(secret));
+    agent
+        .answer_permission(chat, approval.id, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            assert!(!serde_json::to_string(&event).unwrap().contains(secret));
+            if matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(service.calls().len(), 1);
+    {
+        let requests = scripted.requests.lock().unwrap();
+        for request in requests.iter() {
+            assert!(
+                !serde_json::to_string(&request.tools)
+                    .unwrap()
+                    .contains("839271")
+            );
+            if let Some(tool) = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == "mcp__plugin_configured_probe__probe")
+            {
+                assert!(
+                    tool.input_schema["properties"]["flag"]
+                        .get("default")
+                        .is_none()
+                );
+            }
+            assert!(
+                !serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains(secret)
+            );
+            assert!(
+                !serde_json::to_string(&request.tools)
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(!serde_json::to_string(&snapshot).unwrap().contains(secret));
+    agent.shutdown().await;
+    let logs = canonical
+        .join("logs/mcp")
+        .join(std::process::id().to_string());
+    if let Ok(files) = std::fs::read_dir(logs) {
+        for file in files {
+            assert!(
+                !std::fs::read_to_string(file.unwrap().path())
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn worker_picks_up_a_login_saved_after_startup() {
     use tickloop_code_settings::mcp_credentials::FileCredentials;
     use tickloop_harness::connector::{

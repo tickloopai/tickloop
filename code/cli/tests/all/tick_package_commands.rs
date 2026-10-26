@@ -61,7 +61,7 @@ impl Fixture {
     }
 
     /// Runs tickloop on a terminal of its own, which the test reads and types on.
-    fn tickloop_on_terminal(&self, arguments: &[&str]) -> Terminal {
+    pub(crate) fn tickloop_on_terminal(&self, arguments: &[&str]) -> Terminal {
         self.tickloop_on_terminal_with_env(arguments, &[])
     }
 

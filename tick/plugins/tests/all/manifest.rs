@@ -394,7 +394,6 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
             Component::Hooks,
             Component::LspServers,
             Component::OutputStyles,
-            Component::UserConfig,
             Component::Channels,
             Component::Settings,
             Component::Dependencies
@@ -490,4 +489,34 @@ fn mcp_entries_merge_default_file_and_manifest_objects_paths_and_arrays() {
         })
     );
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
+}
+
+#[test]
+fn user_config_declarations_keep_supported_types_and_ignore_unknown_types() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("configured", &json!({
+        "name":"configured", "userConfig": {
+            "key":{"type":"string","title":"API key","description":"Your key","sensitive":true,"required":true},
+            "count":{"type":"number","default":3},
+            "active":{"type":"boolean","default":false},
+            "folder":{"type":"directory"}, "document":{"type":"file"},
+            "unknown":{"type":"future","default":"do-not-print"}
+        }
+    }), &[]);
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(manifest.user_config.len(), 5);
+    let key = &manifest.user_config["key"];
+    assert!(key.sensitive && key.required);
+    assert_eq!(key.title.as_deref(), Some("API key"));
+    assert_eq!(key.description.as_deref(), Some("Your key"));
+    assert_eq!(manifest.user_config["count"].default, Some(json!(3)));
+    assert_eq!(manifest.user_config["active"].default, Some(json!(false)));
+    assert!(!manifest.unsupported().contains(&Component::UserConfig));
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown"))
+    );
+    assert!(!format!("{:?}", manifest.warnings).contains("do-not-print"));
 }

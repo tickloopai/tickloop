@@ -22,6 +22,7 @@ async fn http_connection_discovers_and_calls_the_original_tool() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "sample".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -77,6 +78,7 @@ async fn schema_unions_are_flattened_and_ambiguous_tools_are_withdrawn() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "schema".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -118,6 +120,7 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "local".into(),
             source: "global".into(),
             transport: McpTransport::Stdio {
@@ -175,6 +178,7 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"approved result"}]}));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "review".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -267,6 +271,7 @@ async fn resources_and_unknown_call_outcomes_remain_bound_to_the_server() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "resources".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -316,6 +321,7 @@ async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
         BTreeMap::new(),
     );
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "expiry".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -377,6 +383,7 @@ async fn text_embedded_resources_and_images_reach_the_host_result() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "mixed".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -416,6 +423,7 @@ async fn large_results_keep_both_ends_and_save_full_text_in_family_temporary_sto
     let full = format!("START{}END", "中".repeat(8000));
     server.set_result(json!({"content":[{"type":"text","text":full}]}));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "output".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -499,6 +507,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
     connections
         .reconcile(vec![
             McpServerConfig {
+                sensitive_values: Vec::new(),
                 name: "a".into(),
                 source: "global".into(),
                 transport: McpTransport::Http {
@@ -509,6 +518,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
                 timeout_ms: 1000,
             },
             McpServerConfig {
+                sensitive_values: Vec::new(),
                 name: "a__b".into(),
                 source: "global".into(),
                 transport: McpTransport::Http {
@@ -571,6 +581,7 @@ async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "secrets".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -612,6 +623,7 @@ async fn a_resource_404_cannot_reclassify_a_later_timed_out_mutation() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "outcome".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -673,6 +685,7 @@ async fn resource_uri_collisions_do_not_redirect_to_another_provider() {
     };
     let server = McpService::start().await;
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "other".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -768,6 +781,7 @@ for line in sys.stdin:
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "blocked".into(),
             source: "global".into(),
             transport: McpTransport::Stdio {
@@ -835,6 +849,7 @@ async fn bearer_scheme_spelling_and_stdio_arguments_do_not_expose_tokens() {
         );
         connections
             .reconcile(vec![McpServerConfig {
+                sensitive_values: Vec::new(),
                 name: "secret".into(),
                 source: "global".into(),
                 transport,
@@ -885,6 +900,7 @@ async fn credential_renewal_does_not_block_background_connection_startup() {
     let started = tokio::time::timeout(
         Duration::from_millis(500),
         connections.reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "renew".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -918,6 +934,7 @@ async fn list_change_withdraws_old_tools_while_the_new_directory_is_loading() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "revision".into(),
             source: "global".into(),
             transport: McpTransport::Http {
@@ -959,6 +976,7 @@ async fn insufficient_scope_withdraws_tools_and_stops_connection_retries() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "remote".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1022,6 +1040,7 @@ async fn oauth_login_renews_rejected_and_expiring_tokens_and_stops_after_invalid
     server.require_bearer("access-2");
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "remote".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1104,6 +1123,7 @@ async fn settled(connections: &McpConnections) {
 async fn resource_authentication_failure_requires_login_before_more_requests() {
     let server = McpService::start().await;
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "remote".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1204,6 +1224,7 @@ async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
         token.refresh_token.as_ref().unwrap()
     ));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "remote".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1283,6 +1304,7 @@ async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
         token:Some(serde_json::from_value(json!({"access_token":"expired-access","refresh_token":"expired-refresh","token_type":"Bearer","issuer":server.url(),"expires_at":0,"client_id":"client","token_endpoint":server.url()})).unwrap()),
     }));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
         name: "remote".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1336,6 +1358,7 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
             name: "remote".into(),
             source: "global".into(),
             transport: McpTransport::Http {

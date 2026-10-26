@@ -204,6 +204,7 @@ pub(super) async fn install(
         }
     };
     report(&installation, kind);
+    super::plugin_config::configure(store, &installation.plugin, false)?;
     Ok(())
 }
 

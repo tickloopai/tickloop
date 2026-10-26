@@ -2,6 +2,7 @@
 
 mod mcp_login;
 mod plugin_command;
+mod plugin_config;
 mod plugin_marketplace;
 mod plugin_mcp;
 mod plugin_tick;

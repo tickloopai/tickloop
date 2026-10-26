@@ -136,6 +136,27 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
     let panel = work.panel;
     let refresh = matches!(&work.request, TickPackageRequest::Update(_));
     match work.request {
+        TickPackageRequest::SaveConfiguration { name, input } => {
+            tasks.spawn(async move {
+                let result = blocking({
+                    let name = name.clone();
+                    move || {
+                        let plugin = store.get(&name).map_err(|error| error.to_string())?;
+                        let mut config =
+                            tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                                store.config_root(),
+                                &plugin.manifest,
+                            )?;
+                        config.save(store.config_root(), &plugin.manifest, &input.0)
+                    }
+                })
+                .await;
+                (
+                    panel,
+                    TickPackageResult::ConfigurationSaved { name, result },
+                )
+            });
+        }
         TickPackageRequest::Load => {
             tasks.read_installed(store.clone(), panel);
             tasks.read_marketplaces(store, panel);
@@ -330,6 +351,7 @@ pub(super) fn finish(
         TickPackageResult::Installation { result: Ok(_), .. }
             | TickPackageResult::Uninstallation { result: Ok(_), .. }
             | TickPackageResult::Enabled { result: Ok(_), .. }
+            | TickPackageResult::ConfigurationSaved { result: Ok(_), .. }
     );
     let changed_login = match &result {
         TickPackageResult::Logout { name, .. }
@@ -426,7 +448,23 @@ fn read_installed_now(store: &PluginStore) -> Result<InstalledList, String> {
         .iter()
         .map(|package| store.login_state(package))
         .collect();
-    Ok(InstalledList { packages, logins })
+    let configurations = packages
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let config = tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                store.config_root(),
+                &plugin.manifest,
+            )
+            .unwrap_or_default();
+            (plugin.name().to_owned(), config)
+        })
+        .collect();
+    Ok(InstalledList {
+        packages,
+        logins,
+        configurations,
+    })
 }
 
 async fn blocking<T: Send + 'static>(
