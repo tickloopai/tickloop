@@ -38,6 +38,10 @@ struct LegacyFixture {
 
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments == ["--cleanup-probe"] {
+        println!("{}", support::cli_runtime::config_root().display());
+        return ExitCode::SUCCESS;
+    }
     if arguments.first().and_then(|argument| argument.to_str()) == Some("--content-identity") {
         println!("{}", tickhost::host::BUILD_IDENTITY);
         return ExitCode::SUCCESS;

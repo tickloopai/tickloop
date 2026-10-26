@@ -1049,7 +1049,6 @@ const STEP_DOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// Long enough for a daemon to check its runtime directory at least twice.
 const TWO_RUNTIME_CHECKS: Duration = Duration::from_millis(2500);
 const DAEMON_HOLDER_REPORT: &str = "TICKLOOP_TEST_DAEMON_HOLDER_REPORT";
-const NEXT_TEST_PROCESS: &str = "TICKLOOP_TEST_NEXT_PROCESS";
 
 /// Starts a daemon in `runtime` with one idle worker, and returns a client of the daemon with the
 /// processes of the daemon and the worker.
@@ -1303,7 +1302,7 @@ async fn a_daemon_keeps_serving_without_its_lock_file_and_exits_once_the_lock_is
     .await;
 }
 
-/// Runs only as a child of `a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts`:
+/// Runs only as a child of `a_daemon_left_by_a_killed_test_process_is_cleaned_by_its_owner`:
 /// holds a private daemon with a worker and reports their processes until its stdin closes.
 #[tokio::test]
 async fn daemon_holder_child_process() {
@@ -1311,26 +1310,17 @@ async fn daemon_holder_child_process() {
         return;
     };
     let workdir = tempfile::tempdir().unwrap();
-    let runtime = support::runtime_dir();
-    let (_client, [daemon, worker]) =
-        start_daemon_with_worker(runtime.path(), workdir.path()).await;
+    let runtime = report.parent().unwrap().join("runtime");
+    let (_client, [daemon, worker]) = start_daemon_with_worker(&runtime, workdir.path()).await;
     let unpublished = report.with_extension("partial");
     std::fs::write(&unpublished, format!("{daemon} {worker}")).unwrap();
     std::fs::rename(unpublished, report).unwrap();
     let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0]);
 }
 
-/// Runs only as a child of the same test: a test process that starts, as the next one would.
-#[test]
-fn next_test_process_child_process() {
-    if std::env::var_os(NEXT_TEST_PROCESS).is_some() {
-        drop(support::runtime_dir());
-    }
-}
-
 #[tokio::test]
-async fn a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts() {
-    let scratch = tempfile::tempdir().unwrap();
+async fn a_daemon_left_by_a_killed_test_process_is_cleaned_by_its_owner() {
+    let scratch = support::runtime_dir();
     let report = scratch.path().join("processes");
     let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -1364,18 +1354,9 @@ async fn a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts() {
             .any(|process| support::has_exited(*process)),
         "a test process killed without cleanup leaves its daemon and worker running"
     );
-    let next_started = std::time::Instant::now();
-    let next = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            tickloop_harness::test_support::test_path!(next_test_process_child_process).as_str(),
-        ])
-        .env(NEXT_TEST_PROCESS, "1")
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(next.success());
-    assert_exit_before(next_started + STEP_DOWN_DEADLINE, &processes).await;
+    let cleanup_started = std::time::Instant::now();
+    std::fs::remove_dir_all(scratch.path().join("runtime")).unwrap();
+    assert_exit_before(cleanup_started + STEP_DOWN_DEADLINE, &processes).await;
 }
 
 async fn controlled_connections(

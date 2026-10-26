@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod host;
+pub mod in_process;
 pub mod paths;
 pub mod process;
 pub mod pty;

@@ -25,6 +25,7 @@ use tickhost_connect::hosted::{
 };
 
 struct Fixture {
+    server: tickhost::in_process::InProcessHost,
     directory: tempfile::TempDir,
     paths: HostPaths,
     key: String,
@@ -33,7 +34,6 @@ struct Fixture {
     daemon: Option<HostConnection>,
     /// Stops the host as `tickhost stop` does, once sent or dropped.
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl Fixture {
@@ -42,16 +42,13 @@ impl Fixture {
     }
 
     async fn start_with_idle_timeout(idle_timeout: Duration) -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("ths")
-            .tempdir_in(crate::SHORT_TEMP_ROOT)
-            .unwrap();
+        let directory = crate::runtime_directory("ths");
         let paths = HostPaths {
             runtime: directory.path().join("h"),
         };
         let key = host::random_token();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(host::serve_until(
+        let server = tickhost::in_process::InProcessHost::start_until(
             paths.clone(),
             host::HostConfig {
                 controller_key: key.clone(),
@@ -60,7 +57,8 @@ impl Fixture {
             async move {
                 let _ = stopped.await;
             },
-        ));
+        )
+        .unwrap();
         let mut fixture = Self {
             directory,
             paths,
@@ -1032,4 +1030,46 @@ async fn a_shell_view_is_granted_only_to_its_own_chat_until_the_task_is_forgotte
             .code,
         "TargetGone"
     );
+}
+
+#[test]
+fn fixture_drop_stops_shells_even_after_panic_and_runtime_shutdown() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut pid = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let fixture = Fixture::start().await;
+            let work = fixture.workdir("work");
+            let started = start(
+                &fixture,
+                &fixture.binding("echo $$; exec sleep 30", &work),
+                &[],
+            )
+            .await;
+            for _ in 0..100 {
+                if let Ok(contents) = std::fs::read_to_string(&started.output)
+                    && let Ok(process) = contents.trim().parse::<i32>()
+                {
+                    pid = process;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(pid > 0, "shell reported its PID");
+            panic!("fixture unwind probe");
+        });
+    }));
+    drop(runtime);
+    assert!(pid > 0, "shell did not start");
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(result.is_err());
+    assert!(!alive, "fixture left Shell PID {pid} alive");
 }

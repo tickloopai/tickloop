@@ -377,3 +377,33 @@ pub fn model_ids_as_uuids(text: &str) -> String {
 
 pub mod artifact_service;
 pub mod judgment;
+
+/// Records a newly owned runtime for the workspace runner's post-test leak check. Outside that
+/// runner there is no journal; individual fixture guards still perform their own cleanup.
+pub fn register_runtime_directory(path: &std::path::Path) {
+    use std::io::Write;
+    let Some(root) = std::env::var_os("TICKLOOP_TMPDIR") else {
+        return;
+    };
+    let journal = std::path::Path::new(&root).join("owned-runtimes.jsonl");
+    let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(journal) else {
+        return;
+    };
+    let mut record = serde_json::to_vec(path).unwrap();
+    record.push(b'\n');
+    file.write_all(&record).unwrap();
+}
+
+/// Runs real external I/O against wall time, then restores a test's paused clock.
+pub struct ExternalIoGuard;
+impl ExternalIoGuard {
+    pub fn start() -> Self {
+        tokio::time::resume();
+        Self
+    }
+}
+impl Drop for ExternalIoGuard {
+    fn drop(&mut self) {
+        tokio::time::pause();
+    }
+}

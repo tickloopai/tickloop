@@ -66,7 +66,7 @@ async fn spawn_tick(directory: &Path, name: &str, source: &str) -> TickSession {
 }
 
 async fn counter() -> (TickSession, tempfile::TempDir) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_tick(directory.path(), "counter", COUNTER).await;
     (session, directory)
 }
@@ -374,7 +374,7 @@ async fn shutdown_does_not_remove_a_replacement_at_the_endpoint_path() {
 
 #[tokio::test]
 async fn malformed_child_response_after_dispatch_is_unknown() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_tick(
         directory.path(),
         "broken",
@@ -457,7 +457,7 @@ for line in sys.stdin:
 /// eight answers all arrive.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ninth_call_in_flight_is_busy_before_dispatch_while_eight_fill_the_response_budget() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_tick(directory.path(), "holding", HOLDING_TICK).await;
     let mut held = tokio::task::JoinSet::new();
     for _ in 0..8 {
@@ -531,7 +531,7 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
 
 #[tokio::test]
 async fn oversized_child_response_is_never_reported_as_success() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_tick(
         directory.path(),
         "oversized",
@@ -559,7 +559,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn child_that_stops_reading_stdin_expires_and_exits_instead_of_hanging_session() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_tick(
         directory.path(),
         "nonreader",

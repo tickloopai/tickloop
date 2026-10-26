@@ -55,7 +55,7 @@ fn terminal() -> HostedTerminal {
 }
 
 async fn limits_tick(read_bytes: usize) -> (TickSession, SessionClient, tempfile::TempDir) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let script = directory.path().join("limits.py");
     std::fs::write(&script, LIMITS_TICK).unwrap();
     let session = TickSession::spawn(SessionLaunch {

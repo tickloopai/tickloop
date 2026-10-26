@@ -35,7 +35,7 @@ fn release_identity_and_host_content_identity_are_reported_separately() {
 /// A `tickhost run` started the way the Agent daemon starts it, and its controller.
 struct Service {
     config_root: ConfigRoot,
-    process: std::process::Child,
+    process: crate::OwnedChild,
     controller: Option<HostConnection>,
     daemon_epoch: uuid::Uuid,
 }
@@ -47,11 +47,9 @@ struct ConfigRoot {
 
 impl ConfigRoot {
     fn new() -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("thc")
-            .tempdir_in(crate::SHORT_TEMP_ROOT)
-            .unwrap();
+        let directory = crate::runtime_directory("thc");
         let paths = HostPaths::of_config_root(Some(directory.path()));
+        crate::register_runtime_directory(&paths.runtime);
         Self { directory, paths }
     }
 }
@@ -66,14 +64,16 @@ impl Service {
     async fn start() -> Self {
         let config_root = ConfigRoot::new();
         let key = host::random_token();
-        let mut process = tickhost()
-            .arg(tickhost::cli::RUN_COMMAND)
-            .env("TICKLOOP_CONFIG_DIR", config_root.directory.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut process = crate::OwnedChild(
+            tickhost()
+                .arg(tickhost::cli::RUN_COMMAND)
+                .env("TICKLOOP_CONFIG_DIR", config_root.directory.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let config = host::HostConfig {
             controller_key: key.clone(),
             idle_timeout: host::DEFAULT_IDLE_TIMEOUT,
@@ -116,13 +116,6 @@ impl Service {
             .env("TICKLOOP_CONFIG_DIR", self.config_root.directory.path())
             .output()
             .unwrap()
-    }
-}
-
-impl Drop for Service {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
     }
 }
 
@@ -469,7 +462,7 @@ fn stop_never_signals_a_process_the_host_lock_names_unless_it_is_the_live_tickho
     let config_root = ConfigRoot::new();
     let paths = &config_root.paths;
     paths.prepare().unwrap();
-    let mut unrelated = Command::new("/bin/sleep").arg("600").spawn().unwrap();
+    let mut unrelated = crate::OwnedChild(Command::new("/bin/sleep").arg("600").spawn().unwrap());
     std::fs::write(paths.lock(), unrelated.id().to_string()).unwrap();
     let stop = || {
         tickhost()

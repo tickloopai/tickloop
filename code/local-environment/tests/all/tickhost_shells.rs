@@ -548,3 +548,38 @@ async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
     }
     agent.shutdown().await;
 }
+
+#[test]
+fn own_tickhost_cleans_its_runtime_after_the_callers_runtime_is_gone() {
+    let host = OwnTickhost::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let issued = runtime
+        .block_on(host.allow_spawn(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            ShellApproval {
+                shell: "/bin/sh".into(),
+                command: "true".into(),
+                cwd: std::env::temp_dir(),
+                environment: tickhost::shell::environment_digest(&[]),
+            },
+        ))
+        .unwrap();
+    let directory = issued
+        .endpoint
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    drop(runtime);
+    let leaked = directory.exists();
+    drop(host);
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    assert!(!leaked, "OwnTickhost left {}", directory.display());
+}

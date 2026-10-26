@@ -117,7 +117,7 @@ enum HostProgram {
     Executable(PathBuf),
     /// The host library, served inside this process; it runs Shell tasks only, since a protocol
     /// Tick's launcher is the Tickhost executable.
-    InProcess,
+    InProcess(std::sync::Mutex<Option<tickhost::in_process::InProcessHost>>),
 }
 
 pub struct HostController {
@@ -168,7 +168,7 @@ impl HostController {
             agent_runtime,
             paths,
             daemon_epoch,
-            HostProgram::InProcess,
+            HostProgram::InProcess(std::sync::Mutex::new(None)),
             idle_timeout,
         )
     }
@@ -190,6 +190,13 @@ impl HostController {
             starting: Mutex::new(()),
             lifeline: Mutex::new(None),
             verified_epoch: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn stop_in_process(&self) {
+        if let HostProgram::InProcess(server) = &self.program {
+            let server = server.lock().unwrap().take();
+            drop(server);
         }
     }
 
@@ -926,10 +933,13 @@ impl HostController {
         };
         let executable = match &self.program {
             HostProgram::Executable(executable) => executable,
-            HostProgram::InProcess => {
+            HostProgram::InProcess(server) => {
                 // What would keep the host from serving fails this start at once.
                 self.paths.prepare()?;
-                tokio::spawn(tickhost::host::serve(self.paths.clone(), config));
+                *server.lock().unwrap() = Some(tickhost::in_process::InProcessHost::start(
+                    self.paths.clone(),
+                    config,
+                )?);
                 return Ok(());
             }
         };
