@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use tick_packages::{LoginState, PackageCredentials, PackageStore};
+use tick_packages::{LoginState, PackageCredentials};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -164,8 +164,7 @@ pub struct Uninstalled {
 }
 
 /// The plugins installed under one Tickloop config root, and the credentials kept for them
-/// there. The Tick packages an earlier Tickloop installed move into it only through
-/// [`PluginStore::migrate`].
+/// there. The Tick packages an earlier Tickloop installed migrate on first use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginStore {
     pub(crate) config_root: PathBuf,
@@ -218,6 +217,7 @@ impl PluginStore {
     /// form a valid plugin. One that looks broken while an install or uninstall is under way is
     /// read again once that has finished.
     pub fn installed(&self) -> Result<InstalledPlugins, PluginError> {
+        self.migrate_on_use()?;
         let installed = self.read_installed()?;
         if installed.broken.is_empty() {
             return Ok(installed);
@@ -230,6 +230,7 @@ impl PluginStore {
     /// uninstall is under way is read again once that has finished.
     pub fn get(&self, name: &str) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
+        self.migrate_on_use()?;
         let read = || {
             let registry = Registry::read(&self.registry_path())?;
             let entry = registry
@@ -323,6 +324,7 @@ impl PluginStore {
     pub fn download_file(&self) -> Result<DownloadFile, PluginError> {
         // Under the directory's lock, so no install or uninstall takes the new file for one left
         // behind before this process locks it.
+        self.migrate_on_use()?;
         let _lock = self.lock()?;
         let file = tempfile::Builder::new()
             .prefix(DOWNLOAD_PREFIX)
@@ -342,6 +344,7 @@ impl PluginStore {
     /// credentials stay.
     pub fn uninstall(&self, name: &str, keep_data: bool) -> Result<Uninstalled, PluginError> {
         validate_plugin_name(name)?;
+        self.migrate_on_use()?;
         let _lock = self.lock()?;
         let registry_path = self.registry_path();
         let mut registry = Registry::read(&registry_path)?;
@@ -378,6 +381,7 @@ impl PluginStore {
     /// used stays as it is.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
+        self.migrate_on_use()?;
         let _lock = self.lock()?;
         let registry_path = self.registry_path();
         let mut registry = Registry::read(&registry_path)?;
@@ -407,6 +411,7 @@ impl PluginStore {
         request: Request<'_>,
         fill: impl FnOnce(&Path) -> Result<(), PluginError>,
     ) -> Result<Installation, PluginError> {
+        self.migrate_on_use()?;
         let _lock = self.lock()?;
         let staging = self.staging()?;
         let staged = staging.path().join(STAGED_PLUGIN);
@@ -438,9 +443,6 @@ impl PluginStore {
         }
 
         let name = manifest.name.clone();
-        if self.is_tick_package(&name)? {
-            return Err(PluginError::TickPackageNameTaken(name));
-        }
         let registry_path = self.registry_path();
         let mut registry = Registry::read(&registry_path)?;
         let previous = registry.plugins.get(&name).cloned();
@@ -533,15 +535,6 @@ impl PluginStore {
     }
 
     /// Whether a Tick package an earlier Tickloop installed, usable or not, is named `name`.
-    fn is_tick_package(&self, name: &str) -> Result<bool, PluginError> {
-        let packages = PackageStore::in_config_root(&self.config_root).installed()?;
-        Ok(packages
-            .packages
-            .iter()
-            .any(|package| package.manifest.name == name)
-            || packages.broken.iter().any(|package| package.name == name))
-    }
-
     fn read_installed(&self) -> Result<InstalledPlugins, PluginError> {
         let registry = Registry::read(&self.registry_path())?;
         let mut installed = InstalledPlugins::default();

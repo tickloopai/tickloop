@@ -38,29 +38,30 @@ fn earlier_packages(fixture: &Fixture) -> PackageStore {
 }
 
 #[test]
-fn using_the_store_leaves_earlier_tick_packages_where_they_are() {
+fn first_use_merges_earlier_packages_into_an_existing_plugin_registry() {
     let fixture = Fixture::new();
-    earlier_packages(&fixture);
     let plugin = fixture.claude_plugin("notes", &json!({"name": "notes"}), &["write"]);
-
-    assert!(fixture.store.installed().unwrap().plugins.is_empty());
     fixture.store.install_path(&plugin).unwrap();
     fixture.store.set_enabled("notes", false).unwrap();
+    earlier_packages(&fixture);
 
-    let ids = fixture
-        .store
-        .installed()
-        .unwrap()
+    let installed = fixture.store.installed().unwrap();
+    let ids = installed
         .plugins
         .iter()
         .map(|plugin| plugin.id())
         .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["notes@local"]);
-    let earlier = PackageStore::in_config_root(&fixture.config_root())
-        .installed()
-        .unwrap();
-    assert_eq!(earlier.packages.len(), 2);
-    assert!(fixture.config_root().join("ticks").is_dir());
+    assert_eq!(
+        ids,
+        vec!["local-tool@local", "notes@local", "quotes@tickloop"]
+    );
+    assert!(!installed.plugins[1].enabled);
+    assert_eq!(
+        fixture.store.login_state(&installed.plugins[2]),
+        LoginState::LoggedIn
+    );
+    assert!(!fixture.config_root().join("ticks").exists());
+    assert_eq!(fixture.store.migrate().unwrap(), None);
 }
 
 #[test]
@@ -162,4 +163,23 @@ fn nothing_moves_without_earlier_packages() {
     assert_eq!(fixture.store.migrate().unwrap(), None);
     assert!(fixture.store.installed().unwrap().plugins.is_empty());
     assert!(!fixture.store.directory().exists());
+}
+
+#[test]
+fn a_name_held_by_a_plugin_is_skipped_and_reported_without_overwriting_it() {
+    let fixture = Fixture::new();
+    let plugin = fixture.claude_plugin("quotes", &json!({"name": "quotes"}), &["write"]);
+    let installed = fixture.store.install_path(&plugin).unwrap().plugin;
+    fixture.store.set_enabled("quotes", false).unwrap();
+    earlier_packages(&fixture);
+    let migration = fixture.store.migrate().unwrap().unwrap();
+    assert_eq!(migration.migrated, vec!["local-tool@local"]);
+    assert_eq!(migration.skipped.len(), 1);
+    assert_eq!(migration.skipped[0].name, "quotes");
+    assert!(migration.skipped[0].reason.contains("name already held"));
+    assert!(migration.kept_at.join("quotes").is_dir());
+    let retained = fixture.store.get("quotes").unwrap();
+    assert_eq!(retained.root, installed.root);
+    assert!(!retained.enabled);
+    assert_eq!(retained.manifest, installed.manifest);
 }

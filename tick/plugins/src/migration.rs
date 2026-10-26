@@ -32,8 +32,8 @@ pub struct Migration {
 }
 
 impl PluginStore {
-    /// Moves the Tick packages an earlier Tickloop installed into this store, unless the store
-    /// has a registry already; `None` when there was nothing to move. When a package cannot be
+    /// Moves the Tick packages an earlier Tickloop installed into this store, unless there
+    /// is no earlier registry; `None` when there was nothing to move. When a package cannot be
     /// moved, the ones moved already go back and the earlier directory stays as it was.
     pub fn migrate(&self) -> Result<Option<Migration>, PluginError> {
         if !self.needs_migration() {
@@ -45,7 +45,8 @@ impl PluginStore {
         }
         let old_directory = self.config_root.join(PACKAGES_DIRECTORY);
         let packages = PackageStore::in_config_root(&self.config_root).installed()?;
-        let mut registry = Registry::empty();
+        let mut registry = Registry::read(&self.registry_path())?;
+        let mut skipped = packages.broken;
         let mut moved = Vec::<(PathBuf, PathBuf)>::new();
         let restore = |moved: &[(PathBuf, PathBuf)]| {
             for (from, to) in moved.iter().rev() {
@@ -56,6 +57,17 @@ impl PluginStore {
         for package in packages.packages {
             let name = package.manifest.name.clone();
             let version = package.manifest.version.clone();
+            if let Some(existing) = registry.plugins.get(&name) {
+                skipped.push(BrokenPackage {
+                    name,
+                    version,
+                    reason: format!(
+                        "name already held by plugin from {}; left unchanged",
+                        existing.marketplace
+                    ),
+                });
+                continue;
+            }
             let is_download = DOWNLOAD_SCHEMES
                 .iter()
                 .any(|scheme| package.source.starts_with(scheme));
@@ -99,24 +111,45 @@ impl PluginStore {
                 },
             );
         }
+        let kept_at = self.config_root.join(format!(
+            "{MIGRATED_PREFIX}{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        if let Err(error) = fs::rename(&old_directory, &kept_at) {
+            restore(&moved);
+            return Err(PluginError::io("cannot preserve earlier Tick packages")(
+                error,
+            ));
+        }
         if let Err(error) = registry.write(&self.registry_path()) {
+            fs::rename(&kept_at, &old_directory)
+                .map_err(PluginError::io("cannot restore earlier Tick packages"))?;
             restore(&moved);
             return Err(error);
         }
-        let kept_at = self.config_root.join(format!(
-            "{MIGRATED_PREFIX}{}",
-            OffsetDateTime::now_utc().unix_timestamp()
-        ));
-        let kept_at = match fs::rename(&old_directory, &kept_at) {
-            Ok(()) => kept_at,
-            // The plugins are registered already, so the earlier registry is never read again.
-            Err(_) => old_directory,
-        };
         Ok(Some(Migration {
             migrated,
-            skipped: packages.broken,
+            skipped,
             kept_at,
         }))
+    }
+
+    pub(crate) fn migrate_on_use(&self) -> Result<(), PluginError> {
+        if let Some(migration) = self.migrate()? {
+            eprintln!(
+                "Migrated Tick packages to plugins: {}. Earlier files kept in {}.",
+                migration.migrated.join(", "),
+                crate::printable(migration.kept_at)
+            );
+            for skipped in migration.skipped {
+                eprintln!(
+                    "Skipped Tick package {}: {}",
+                    crate::printable(skipped.name),
+                    crate::printable(skipped.reason)
+                );
+            }
+        }
+        Ok(())
     }
 
     fn needs_migration(&self) -> bool {
@@ -124,7 +157,7 @@ impl PluginStore {
             .config_root
             .join(PACKAGES_DIRECTORY)
             .join(tick_packages::REGISTRY_FILE_NAME);
-        old_registry.is_file() && !self.registry_path().exists()
+        old_registry.is_file()
     }
 }
 
