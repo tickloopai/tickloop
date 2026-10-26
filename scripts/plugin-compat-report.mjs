@@ -46,7 +46,11 @@ const GIT_ENVIRONMENT = {
   SSH_ASKPASS: "",
   GCM_INTERACTIVE: "never",
   GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+  // Marketplaces are third-party input: no ext:: or other command-running transports.
+  GIT_ALLOW_PROTOCOL: "https:ssh:file",
 };
+const COMMIT_SHA = /^[0-9a-f]{7,40}$/i;
+const GIT_REF = /^(?!-)[A-Za-z0-9._\/-]+$/;
 
 export const STATUS = {
   installable: "installable",
@@ -110,24 +114,37 @@ async function git(args, options = {}) {
   }
 }
 
+/**
+ * Refuses a URL, ref, commit or path from a marketplace that git could read as an option, such
+ * as a ref of `--upload-pack=<command>`, which would run that command.
+ */
+export function checkGitArguments({ url, ref, sha, paths = [] }) {
+  if (typeof url !== "string" || url.startsWith("-")) throw new Error(`invalid repository URL ${JSON.stringify(url)}`);
+  if (sha !== undefined && !COMMIT_SHA.test(sha)) throw new Error(`invalid commit ${JSON.stringify(sha)}`);
+  if (ref !== undefined && !GIT_REF.test(ref)) throw new Error(`invalid ref ${JSON.stringify(ref)}`);
+  const badPath = paths.find(path => typeof path !== "string" || path.startsWith("-"));
+  if (badPath !== undefined) throw new Error(`invalid path ${JSON.stringify(badPath)}`);
+}
+
 /** Fetches one commit of `url` into `directory`, only `paths` of it when given. */
 export async function checkout({ url, ref, sha, paths }, directory) {
+  checkGitArguments({ url, ref, sha, paths });
   await mkdir(directory, { recursive: true });
   const inRepository = args => git(["-C", directory, ...args]);
   await inRepository(["init", "--quiet"]);
-  await inRepository(["remote", "add", "origin", url]);
+  await inRepository(["remote", "add", "--end-of-options", "origin", url]);
   const isSparse = paths?.length > 0 && !paths.includes("");
-  if (isSparse) await inRepository(["sparse-checkout", "set", "--cone", ...paths]);
+  if (isSparse) await inRepository(["sparse-checkout", "set", "--cone", "--end-of-options", ...paths]);
   const filter = isSparse ? ["--filter=blob:none"] : [];
   try {
-    await inRepository(["fetch", "--quiet", "--depth", "1", "--no-tags", ...filter, "origin", sha ?? ref ?? "HEAD"]);
+    await inRepository(["fetch", "--quiet", "--depth", "1", "--no-tags", ...filter, "--end-of-options", "origin", sha ?? ref ?? "HEAD"]);
   } catch (error) {
     if (!sha) throw error;
     // Servers that refuse a commit by SHA still send the history of the ref that contains it.
-    await inRepository(["fetch", "--quiet", "--no-tags", ...filter, "origin", ref ?? "HEAD"]);
+    await inRepository(["fetch", "--quiet", "--no-tags", ...filter, "--end-of-options", "origin", ref ?? "HEAD"]);
   }
   try {
-    await inRepository(["checkout", "--quiet", sha ?? "FETCH_HEAD"]);
+    await inRepository(["checkout", "--quiet", "--end-of-options", sha ?? "FETCH_HEAD"]);
   } catch (error) {
     throw sha ? new Error(`commit ${sha} is not in the repository`) : error;
   }

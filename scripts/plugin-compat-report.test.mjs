@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { cloneUrl, createReport, describeSource, parseValidateOutput, renderMarkdown, STATUS } from "./plugin-compat-report.mjs";
+import { checkGitArguments, checkout, cloneUrl, createReport, describeSource, parseValidateOutput, renderMarkdown, STATUS } from "./plugin-compat-report.mjs";
 
 const script = fileURLToPath(new URL("./plugin-compat-report.mjs", import.meta.url));
 const builtTickloop = fileURLToPath(new URL("../target/debug/tickloop", import.meta.url));
@@ -113,6 +113,22 @@ test("GitHub shorthands become clone URLs and unsupported sources are named", ()
   assert.deepEqual(describeSource({ source: "formatter" }, "claude", "./plugins"), { type: "path", path: "plugins/formatter" });
   assert.deepEqual(describeSource({ source: { source: "pip", package: "x" } }, "claude"), { type: "pip", unsupported: true });
   assert.deepEqual(describeSource({ name: "demo" }, "tick"), { type: "tick-archive" });
+});
+
+test("a marketplace cannot pass git an option through a URL, ref, commit or path", async () => {
+  const url = "https://example.test/plugin.git";
+  assert.doesNotThrow(() => checkGitArguments({ url, ref: "release/1.2", sha: "0123abcd", paths: ["plugins/one"] }));
+  assert.throws(() => checkGitArguments({ url, ref: "--upload-pack=touch /tmp/pwned" }), /invalid ref/);
+  assert.throws(() => checkGitArguments({ url, sha: "--output=/tmp/x" }), /invalid commit/);
+  assert.throws(() => checkGitArguments({ url: "--upload-pack=touch /tmp/pwned" }), /invalid repository URL/);
+  assert.throws(() => checkGitArguments({ url, paths: ["--no-cone"] }), /invalid path/);
+  const directory = mkdtempSync(join(tmpdir(), "compat-injection-"));
+  try {
+    await assert.rejects(checkout({ url, ref: "--upload-pack=touch /tmp/pwned" }, directory), /invalid ref/);
+    assert.equal(existsSync(join(directory, ".git")), false, "nothing ran before the check");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("the output of tickloop plugin validate is read line by line", () => {
