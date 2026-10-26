@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::{
     console::wrap_text,
-    conversation_picker::{ConversationPickerFrame, compact_line, fit_hint},
+    conversation_picker::{ConversationPickerFrame, compact_line, ellipsize, fit_hint},
     display::{DisplayProfile, Glyph},
     editor::{Editor, EditorCommand},
     list_row::ListRow,
@@ -36,6 +36,7 @@ const INSTALLED_PAGE: usize = 0;
 const MARKETPLACE_PAGE: usize = 1;
 /// The header and the key hints.
 const CHROME_ROWS: usize = 2;
+const MARKETPLACE_ERROR_ROWS: usize = 3;
 const EMPTY_INDENT: &str = "  ";
 const CONTEXT_INDENT: &str = "  ";
 
@@ -1239,13 +1240,25 @@ impl TicksPanel {
             .collect::<Vec<_>>();
         for (marketplace, error) in self.marketplace_errors() {
             let index = rows.len();
-            let lines = wrap_text(
+            let mut text = wrap_text(
                 &safe_line(&format!("cannot read marketplace {marketplace}: {error}")),
                 width.max(1),
-            )
-            .into_iter()
-            .map(|line| RoleLine::role(line, Role::Error))
-            .collect();
+            );
+            if text.len() > MARKETPLACE_ERROR_ROWS {
+                let tail = text.split_off(MARKETPLACE_ERROR_ROWS - 1).join(" ");
+                text.push(ellipsize(&tail, width));
+            }
+            let lines = text
+                .into_iter()
+                .map(|line| {
+                    let line = RoleLine::role(line, Role::Error);
+                    if index == selected {
+                        line.filled(Role::Selection)
+                    } else {
+                        line
+                    }
+                })
+                .collect();
             rows.push((index, lines));
         }
         rows
@@ -1390,51 +1403,38 @@ impl TicksPanel {
             if body.is_empty() {
                 body = self.empty_lines(width);
             }
-            let enter = if self.page == INSTALLED_PAGE {
-                "enter actions"
+            let mut hints = if self.filtering && self.page == MARKETPLACE_PAGE {
+                vec![
+                    ("ctrl+n/p select".into(), 8),
+                    ("ctrl+g editor".into(), 3),
+                    ("esc leave filter".into(), 9),
+                ]
             } else {
-                "enter install/update"
+                let mut hints = vec![
+                    ("tab/←/→ page".into(), 6),
+                    ("r refresh".into(), 4),
+                    ("esc close".into(), 9),
+                ];
+                hints.insert(
+                    0,
+                    (
+                        if self.page == INSTALLED_PAGE {
+                            "ctrl+x uninstall"
+                        } else {
+                            "/ filter"
+                        }
+                        .into(),
+                        5,
+                    ),
+                );
+                hints
             };
-            let hint = if self.filtering && self.page == MARKETPLACE_PAGE {
-                fit_hint(
-                    &[
-                        ("ctrl+n/p select".into(), 8),
-                        ("enter install/update".into(), 7),
-                        ("ctrl+g editor".into(), 3),
-                        ("esc leave filter".into(), 9),
-                    ],
-                    width,
-                    display,
-                )
-            } else {
-                fit_hint(
-                    &[
-                        (enter.to_owned(), 10),
-                        (
-                            if self.page == INSTALLED_PAGE {
-                                "ctrl+x uninstall"
-                            } else {
-                                "r refresh"
-                            }
-                            .to_owned(),
-                            5,
-                        ),
-                        ("tab/←/→ page".to_owned(), 6),
-                        (
-                            if self.page == MARKETPLACE_PAGE {
-                                "/ filter"
-                            } else {
-                                "r refresh"
-                            }
-                            .to_owned(),
-                            4,
-                        ),
-                        ("esc close".to_owned(), 9),
-                    ],
-                    width,
-                    display,
-                )
-            };
+            if self.page == INSTALLED_PAGE {
+                hints.insert(0, ("enter actions".into(), 10));
+            } else if self.selected[MARKETPLACE_PAGE] < self.offers().len() {
+                hints.insert(0, ("enter install/update".into(), 10));
+            }
+            let hint = fit_hint(&hints, width, display);
             (hint, selected_rows)
         };
         let top = &mut self.top[self.page];
@@ -2387,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn the_marketplace_installs_and_updates_and_says_a_new_chat_loads_the_skill() {
+    fn available_plugins_install_and_update_without_requiring_a_new_chat() {
         let mut panel = loaded_panel();
         press(&mut panel, KeyCode::Tab);
         let TickPackageRequest::Update(update) = work(press(&mut panel, KeyCode::Enter)) else {
@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_marketplace_version_older_than_the_installed_one_replaces_it_rather_than_updating() {
+    fn an_update_reports_actual_versions_even_when_the_offered_version_is_older() {
         let mut panel = TicksPanel::new(None);
         panel.apply(installed_list(
             1,

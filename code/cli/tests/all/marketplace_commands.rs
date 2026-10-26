@@ -85,7 +85,7 @@ pub(crate) fn marketplace_directory(
 }
 
 /// Makes the repository that stands in for the built-in `claude-plugins-official` list `plugins`.
-pub(crate) fn official_marketplace(fixture: &Fixture, plugins: Value) -> PathBuf {
+fn official_marketplace(fixture: &Fixture, plugins: Value) -> PathBuf {
     let root = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
     write_json(
         &root.join(".claude-plugin/marketplace.json"),

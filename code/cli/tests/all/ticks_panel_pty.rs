@@ -248,7 +248,11 @@ fn dialog(frame: &str) -> String {
 
 /// The dialog's text with its rows joined, so a wrapped message reads as one.
 fn dialog_text(frame: &str) -> String {
-    dialog(frame).lines().map(str::trim).collect()
+    dialog(frame)
+        .replace(screen::SELECTED_MARK, " ")
+        .lines()
+        .map(str::trim)
+        .collect()
 }
 
 fn panel_is_open(frame: &str) -> bool {
@@ -799,6 +803,15 @@ fn available_plugins_install_from_each_marketplace_despite_another_marketplace_e
         frame.contains("notes")
             && frame.contains("team · 1.0.0 · not installed")
             && frame.contains("cannot read marketplace claude-plugins-official")
+    });
+    terminal.press(b"jj", "marketplace error selection", |frame| {
+        frame.lines().any(|line| {
+            line.contains(screen::SELECTED_MARK)
+                && line
+                    .replace(screen::SELECTED_MARK, " ")
+                    .contains("cannot read marketplace claude-plugins-official")
+        }) && !frame.contains("Resize")
+            && !frame.contains("enter install/update")
     });
     terminal.press(b"/notes\r", "install explicit marketplace", |frame| {
         frame.contains("Installed plugin notes@team 1.0.0")
