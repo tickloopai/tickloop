@@ -168,9 +168,9 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
-        command: "/ticks",
+        command: "/plugins",
         arguments: "",
-        description: "Install, update, log in to and uninstall Tick packages.",
+        description: "Install, update, enable, disable and log in to plugins.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -628,7 +628,7 @@ mod tests {
             "/loop",
             "/slides",
             "/artifacts",
-            "/ticks",
+            "/plugins",
         ] {
             assert!(command_names(&completion).contains(&command));
         }

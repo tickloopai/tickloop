@@ -230,7 +230,7 @@ fn dialog_text(frame: &str) -> String {
 }
 
 fn panel_is_open(frame: &str) -> bool {
-    frame.contains("Tick packages · ")
+    frame.contains("Plugins · ")
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     assert!(
         frame
             .replace(screen::SELECTED_MARK, " ")
-            .contains("Tick packages · [Installed]  Marketplace"),
+            .contains("Plugins · [Installed]  Available"),
         "{frame}"
     );
     assert!(
@@ -295,7 +295,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     }
 
     let frame = terminal.press(TAB, "the Marketplace page", |frame| {
-        frame.contains("[Marketplace]") && row_shows(frame, "sample", "1.0.0 · not installed")
+        frame.contains("[Available]") && row_shows(frame, "sample", "1.0.0 · not installed")
     });
     assert!(
         row_shows(&frame, "alpha", "2.0.0 · installed 1.0.0"),
@@ -334,7 +334,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     );
     assert!(!frame.contains("Update to"), "{frame}");
     assert!(frame.contains("enter confirm · esc back"), "{frame}");
-    input_dialog::assert_frame(&frame, usize::from(ROWS), "Tick packages");
+    input_dialog::assert_frame(&frame, usize::from(ROWS), "Plugins");
 
     // A login saved elsewhere shows once the list is read again; logging out deletes it.
     terminal.press(ESCAPE, "the list again", |frame| {
@@ -425,7 +425,7 @@ fn the_installed_page_works_while_the_marketplace_cannot_be_read() {
         !frame.contains("❯ Log in")
     });
     let frame = terminal.press(TAB, "the Marketplace page", |frame| {
-        frame.contains("[Marketplace]") && frame.contains("cannot read the Tick marketplace at")
+        frame.contains("[Available]") && frame.contains("cannot read the Tick marketplace at")
     });
     assert!(
         dialog_text(&frame).contains("missing.json: No such file or directory"),
@@ -485,7 +485,7 @@ fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
             && shown.contains("❯ Cancel login"),
         "{frame}"
     );
-    input_dialog::assert_frame(&frame, usize::from(ROWS), "Tick packages");
+    input_dialog::assert_frame(&frame, usize::from(ROWS), "Plugins");
     terminal.wait_for_frame(terminal.mark(), "the refusal", |frame| {
         dialog_text(frame).contains("Cannot log in to alpha: the authorization was denied")
             && row_shows(frame, "alpha", "1.0.0 · needs login")
@@ -556,5 +556,22 @@ fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
         frame.contains("Logged out of keyed") && row_shows(frame, "keyed", "1.0.0 · needs login")
     });
     terminal.press(ESCAPE, "the closed panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+}
+
+#[test]
+fn plugins_command_and_ticks_alias_open_the_plugins_panel() {
+    let fixture = Fixture::new();
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "Plugins", |frame| {
+        frame.replace(screen::SELECTED_MARK, " ").contains("Plugins · [Installed]  Available")
+    });
+    terminal.press(ESCAPE, "closed plugins", |frame| !frame.contains("Plugins ·"));
+    terminal.press(b"/ticks\r", "renamed alias", |frame| {
+        frame.contains("Plugins ·") && frame.contains("/ticks has been renamed to /plugins")
+    });
+    terminal.press(ESCAPE, "closed alias", |frame| !frame.contains("Plugins ·"));
     terminal.exit();
 }

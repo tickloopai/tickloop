@@ -1,5 +1,5 @@
-//! Runs the work `/ticks` asks for, through the same installs, updates, uninstalls, logins and
-//! logouts as `tickloop tick`: each runs as a task, and an OAuth login in two, one that gets the
+//! Runs the work `/plugins` asks for, through the same installs, updates, uninstalls, logins and
+//! logouts as `tickloop plugin`: each runs as a task, and an OAuth login in two, one that gets the
 //! device code the panel shows and one that waits for the user to approve it.
 
 use std::{collections::HashMap, future::Future, path::Path};
@@ -20,7 +20,7 @@ use super::{
     },
 };
 
-/// What a `/ticks` task ends with.
+/// What a `/plugins` task ends with.
 pub(super) enum Done {
     Result(TickPackageResult),
     /// The device authorization of a login, which the panel shows while it waits for approval.
@@ -32,7 +32,7 @@ pub(super) enum Done {
     },
 }
 
-/// The `/ticks` work under way. Reads of the installed packages are numbered as they start, so a
+/// The `/plugins` work under way. Reads of the installed packages are numbered as they start, so a
 /// panel keeps the most recent one whatever order they finish in.
 #[derive(Default)]
 pub(super) struct TickPackageTasks {
@@ -83,7 +83,7 @@ impl TickPackageTasks {
     }
 }
 
-/// Opens `/ticks` and starts reading what it lists.
+/// Opens `/plugins` and starts reading what it lists.
 pub(super) fn open(
     console: &Console,
     root: &Path,
@@ -282,7 +282,7 @@ pub(super) fn finish(
         Applied::Ignored => return Ok(()),
         Applied::NoPanel => {
             if let Some(notice) = notice {
-                console.write_line(&format!("/ticks: {}", safe_line(&notice.text)))?;
+                console.write_line(&format!("/plugins: {}", safe_line(&notice.text)))?;
             }
             return Ok(());
         }

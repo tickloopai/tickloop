@@ -361,7 +361,7 @@ impl State {
         None
     }
 
-    /// The `/ticks` panel `id`, shown, suspended behind an Agent request, or kept with another
+    /// The `/plugins` panel `id`, shown, suspended behind an Agent request, or kept with another
     /// Chat's dialog.
     pub(super) fn ticks_panel_mut(
         &mut self,

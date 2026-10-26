@@ -1,4 +1,4 @@
-//! `/ticks`: the Tick packages panel of the input dialog. The Installed page lists the installed
+//! `/plugins`: the Tick packages panel of the input dialog. The Installed page lists the installed
 //! packages with their versions and login states, and enter opens a package's actions there; the
 //! Marketplace page lists what the Tick marketplace offers, and enter installs or updates it.
 //! Logging in happens in the panel: the link and code of an OAuth device authorization, or a
@@ -28,8 +28,8 @@ use super::{
     style::{Role, RoleLine},
 };
 
-const TITLE: &str = "Tick packages";
-const PAGES: [&str; 2] = ["Installed", "Marketplace"];
+const TITLE: &str = "Plugins";
+const PAGES: [&str; 2] = ["Installed", "Available"];
 const INSTALLED_PAGE: usize = 0;
 const MARKETPLACE_PAGE: usize = 1;
 /// The header and the key hints.
@@ -1441,7 +1441,7 @@ mod tests {
         let mut panel = loaded_panel();
         let shown = text(&mut panel);
         assert!(
-            shown.starts_with("Tick packages · [Installed]  Marketplace"),
+            shown.starts_with("Plugins · [Installed]  Available"),
             "{shown}"
         );
         assert!(
@@ -1486,9 +1486,9 @@ mod tests {
             );
         }
         for (code, page) in [
-            (KeyCode::Tab, "[Marketplace]"),
+            (KeyCode::Tab, "[Available]"),
             (KeyCode::BackTab, "[Installed]"),
-            (KeyCode::Right, "[Marketplace]"),
+            (KeyCode::Right, "[Available]"),
             (KeyCode::Left, "[Installed]"),
         ] {
             press(&mut panel, code);

@@ -413,6 +413,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/diff"
                 | "/status"
                 | "/artifacts"
+                | "/plugins"
                 | "/ticks"
                 | "/settings"
                 | "/permissions"
@@ -907,8 +908,8 @@ Chats you switch away from keep running in this process.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
 /slides [TOPIC] makes new Slides in Tickloop Artifacts; without a topic the Agent asks for one.
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
-/ticks manages Tick packages: Installed shows each version and login state, where enter logs in or out, updates or uninstalls; Marketplace installs or updates. Tab or left/right switches pages.
-A /ticks login hands this terminal to the package's login program until it ends; a new Chat loads an installed or updated package's Skill.
+/plugins manages plugins: Installed shows versions and login states; Available installs or updates. /ticks is a renamed alias. Tab or left/right switches pages.
+Plugin login runs in the panel; installed or updated Skills load on the next request.
 /model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
@@ -3645,11 +3646,12 @@ async fn interact_with_herdr(
                                 Err(error) => outln!(console, "Cannot configure Tickloop Artifacts: {}", safe_text(&error)),
                             }
                         },
-                        command if command == "/ticks" || command.starts_with("/ticks ") => {
-                            if command.trim() != "/ticks" { outln!(console, "Use /ticks"); continue; }
-                            let Some(root) = config_root.as_deref() else { outln!(console, "Tick packages need a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
-                            if !interactive { outln!(console, "/ticks needs an interactive terminal; run tickloop tick there instead."); continue; }
-                            if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), &mut tick_package_tasks) { outln!(console, "Cannot open /ticks: {}", safe_text(&error)); }
+                        command if matches!(command.split_whitespace().next(), Some("/plugins" | "/ticks")) => {
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use /plugins"); continue; }
+                            let Some(root) = config_root.as_deref() else { outln!(console, "Plugins need a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            if !interactive { outln!(console, "/plugins needs an interactive terminal; run tickloop plugin there instead."); continue; }
+                            if command.trim() == "/ticks" { outln!(console, "/ticks has been renamed to /plugins"); }
+                            if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), &mut tick_package_tasks) { outln!(console, "Cannot open /plugins: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)

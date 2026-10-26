@@ -331,7 +331,7 @@ pub(super) enum InputEvent {
     },
     ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
     ArtifactSignOut,
-    /// Work `/ticks` asks for, or the login state to read again once a login program ended.
+    /// Work `/plugins` asks for, or the login state to read again once a login program ended.
     TickPackages(super::ticks_panel::TickPackageWork),
     TickAction {
         chat: Uuid,
@@ -1819,7 +1819,7 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
-            return Err("/ticks needs an interactive terminal".into());
+            return Err("/plugins needs an interactive terminal".into());
         }
         state.install_ticks_panel(panel);
         state.rendered_region = None;
@@ -1828,7 +1828,7 @@ impl Console {
             .map_err(|error| error.to_string())
     }
 
-    /// Hands `result` to the `/ticks` panel `panel`, shown or waiting, and says what became of it.
+    /// Hands `result` to the `/plugins` panel `panel`, shown or waiting, and says what became of it.
     pub(super) fn apply_tick_package_result(
         &self,
         panel: Uuid,
