@@ -12,17 +12,64 @@ export function compareApi(baseline, current) {
   };
 }
 
-export function compareApiGroup(baseline, current, group) {
-  const aliases = Object.entries(group.aliases).sort(([left], [right]) => right.length - left.length);
-  const normalize = snapshots => Object.values(snapshots).flatMap(snapshot => snapshot.trim().split("\n")).map(line => {
-    for (const [alias, canonical] of aliases) {
-      const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      line = line.replace(new RegExp(`\\b${escaped}\\b`, "g"), canonical);
+function typeIdentity(documents, name) {
+  const [crate, ...segments] = name.split("::");
+  const document = Object.values(documents).find(doc => doc.index[doc.root]?.name === crate);
+  if (!document) return undefined;
+  let item = document.index[document.root];
+  for (const [position, segment] of segments.entries()) {
+    item = item?.inner.module?.items.map(id => document.index[id]).find(child =>
+      child?.visibility === "public" && (child.inner.use?.name ?? child.name) === segment);
+    if (item?.inner.use) {
+      const target = item.inner.use.id;
+      if (position === segments.length - 1) {
+        const path = document.paths[target];
+        return path && `${path.kind} ${path.path.join("::")}`;
+      }
+      item = document.index[target];
     }
-    const exported = Object.values(group.exports).flat().map(name => group.aliases[name] ?? name);
-    return exported.some(name => line === `pub use ${name}`) ? line.replace("pub use ", "pub struct ") : line;
-  }).join("\n");
-  const diff = compareApi(normalize(baseline), normalize(current));
+  }
+  const path = item ? document.paths[item.id] : Object.values(document.paths).find(path =>
+    path.crate_id === 0 && path.path.join("::") === name);
+  return path && `${path.kind} ${path.path.join("::")}`;
+}
+
+export function compareApiGroup(baseline, current, group, documents = {}) {
+  const aliases = Object.entries(group.aliases).sort(([left], [right]) => right.length - left.length);
+  for (const snapshots of [baseline, current]) {
+    const definitions = new Map();
+    for (const snapshot of Object.values(snapshots)) {
+      for (const line of snapshot.split("\n")) {
+        const name = /^pub (?:struct|enum|union|type|trait) ([\w:]+)(?:\b|$)/.exec(line)?.[1];
+        if (!name) continue;
+        const canonical = group.aliases[name] ?? name;
+        if (!definitions.has(canonical)) definitions.set(canonical, new Set());
+        definitions.get(canonical).add(name);
+      }
+    }
+    for (const [canonical, names] of definitions) {
+      if (names.size > 1) throw new Error(`Cannot normalize independent definitions of ${canonical}: ${[...names].join(", ")}`);
+    }
+  }
+  const normalize = (snapshots, label) => {
+    const snapshotText = Object.values(snapshots).join("\n");
+    const verifiedAliases = aliases.flatMap(([alias, canonical]) => {
+      const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(`(?<![\\w:])${escaped}\\b`, "g");
+      if (!pattern.test(snapshotText)) return [];
+      const identity = typeIdentity(documents[label] ?? {}, alias);
+      if (!identity || identity !== typeIdentity(documents[label] ?? {}, canonical)) {
+        throw new Error(`${label}: unverified equivalent paths ${alias} and ${canonical}`);
+      }
+      return [[pattern, canonical]];
+    });
+    return snapshotText.trim().split("\n").map(line => {
+      for (const [pattern, canonical] of verifiedAliases) line = line.replace(pattern, canonical);
+      const exported = Object.values(group.exports).flat().map(name => group.aliases[name] ?? name);
+      return exported.some(name => line === `pub use ${name}`) ? line.replace("pub use ", "pub struct ") : line;
+    }).join("\n");
+  };
+  const diff = compareApi(normalize(baseline, "baseline"), normalize(current, "current"));
   for (const [pkg, exports] of Object.entries(group.exports)) {
     for (const name of exports) {
       const exposes = snapshot => snapshot.split("\n").some(line => line === `pub use ${name}` || line === `pub struct ${name}`);
@@ -54,6 +101,7 @@ function checkPublicApi() {
   rmSync(archive);
   let changed = false;
   const collected = { baseline: {}, current: {} };
+  const documents = { baseline: {}, current: {} };
   try {
     for (const pkg of baseline.packages) {
       const snapshots = [];
@@ -63,6 +111,13 @@ function checkPublicApi() {
         });
         writeFileSync(join(run, `${pkg}.${label}.txt`), output);
         collected[label][pkg] = output;
+        if (baseline.groups?.some(group => group.packages.includes(pkg))) {
+          const crate = /^pub mod (\w+)$/m.exec(output)?.[1];
+          if (!crate) throw new Error(`Cannot find the crate root in ${pkg} ${label} API`);
+          const rustdoc = readFileSync(join(directory, "build", "doc", `${crate}.json`), "utf8");
+          writeFileSync(join(run, `${pkg}.${label}.json`), rustdoc);
+          documents[label][pkg] = JSON.parse(rustdoc);
+        }
         snapshots.push(output);
       }
       if (baseline.groups?.some(group => group.packages.includes(pkg))) continue;
@@ -76,7 +131,7 @@ function checkPublicApi() {
     }
     for (const group of baseline.groups ?? []) {
       const snapshots = label => Object.fromEntries(group.packages.map(pkg => [pkg, collected[label][pkg]]));
-      const diff = compareApiGroup(snapshots("baseline"), snapshots("current"), group);
+      const diff = compareApiGroup(snapshots("baseline"), snapshots("current"), group, documents);
       if (diff.removed.length || diff.added.length) {
         changed = true;
         console.error(`${group.packages.join(" + ")}: public API differs from ${baseline.release}\n${diff.removed.map(line => `- ${line}`).concat(diff.added.map(line => `+ ${line}`)).join("\n")}`);
