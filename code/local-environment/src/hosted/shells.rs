@@ -143,6 +143,13 @@ impl OwnTickhost {
     }
 }
 
+impl Drop for OwnTickhost {
+    fn drop(&mut self) {
+        drop(self.controller.take());
+        let _ = std::fs::remove_dir_all(self.directory.path());
+    }
+}
+
 impl Default for OwnTickhost {
     fn default() -> Self {
         Self::new()

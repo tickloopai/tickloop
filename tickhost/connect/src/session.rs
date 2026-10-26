@@ -1178,7 +1178,7 @@ mod tests {
     /// in-flight slots are free.
     #[tokio::test]
     async fn a_call_beyond_the_response_budget_is_busy_before_dispatch() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let counter = PathBuf::from(
             std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test package directory"),
         )
@@ -1246,7 +1246,7 @@ for line in sys.stdin:
     /// all reach no later request.
     #[tokio::test]
     async fn timed_out_calls_free_their_in_flight_slots() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let script = directory.path().join("late.py");
         std::fs::write(&script, LATE_ANSWERS_TICK).unwrap();
         let session = spawn_python(directory.path(), &script).await;

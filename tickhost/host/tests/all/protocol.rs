@@ -12,17 +12,14 @@ use tickhost_connect::hosted::{
 use tokio::{io::BufReader, net::UnixStream};
 
 struct Fixture {
+    server: tickhost::in_process::InProcessHost,
     _directory: tempfile::TempDir,
     paths: HostPaths,
     key: String,
-    server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 fn private_directory() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("th")
-        .tempdir_in(crate::SHORT_TEMP_ROOT)
-        .unwrap()
+    crate::runtime_directory("th")
 }
 
 fn host_paths(directory: &tempfile::TempDir) -> HostPaths {
@@ -38,13 +35,14 @@ async fn start() -> Fixture {
 async fn start_in(directory: tempfile::TempDir) -> Fixture {
     let paths = host_paths(&directory);
     let key = host::random_token();
-    let server = tokio::spawn(host::serve(
+    let server = tickhost::in_process::InProcessHost::start(
         paths.clone(),
         host::HostConfig {
             controller_key: key.clone(),
             idle_timeout: host::DEFAULT_IDLE_TIMEOUT,
         },
-    ));
+    )
+    .unwrap();
     wait_until_serving(&paths, &key).await;
     Fixture {
         _directory: directory,

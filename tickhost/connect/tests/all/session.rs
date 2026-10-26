@@ -35,7 +35,7 @@ async fn spawn_python(directory: &Path, source: &str) -> Result<TickSession, Ses
 
 #[tokio::test]
 async fn the_example_counter_is_described_read_called_and_updates_through_its_standard_streams() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let counter = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test package directory"),
     )
@@ -169,7 +169,7 @@ fn the_example_counter_drops_lines_it_cannot_answer() {
 /// A Tick may not answer under a null `id`, so one that does breaks the session.
 #[tokio::test]
 async fn a_response_with_a_null_id_breaks_the_session() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(
         directory.path(),
         r#"
@@ -243,7 +243,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn a_call_prepared_against_an_older_catalog_revision_is_refused_unrun() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(directory.path(), EVOLVING).await.unwrap();
     let client = session.client();
     let prepared = client.describe().await.unwrap();
@@ -306,7 +306,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn a_tick_error_says_whether_the_call_ran_and_only_a_garbled_answer_leaves_it_unknown() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(directory.path(), ANSWERS_WITH_ERRORS)
         .await
         .unwrap();
@@ -345,7 +345,7 @@ async fn a_tick_error_says_whether_the_call_ran_and_only_a_garbled_answer_leaves
 
 #[tokio::test]
 async fn a_protocol_2_tick_fails_to_start_with_a_version_error() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let refused = spawn_python(
         directory.path(),
         r#"
@@ -370,7 +370,7 @@ for line in sys.stdin:
 /// next to the session's socket rather than on the Tick's terminal.
 #[tokio::test]
 async fn an_unknown_notification_is_counted_and_logged_without_ending_the_tick() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(
         directory.path(),
         r#"
@@ -446,7 +446,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn a_read_answer_is_checked_before_the_update_that_arrived_after_it() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(directory.path(), UPDATES_RIGHT_AFTER_ITS_FIRST_READ)
         .await
         .expect("read(0) on the wire before update(1) is in order");
@@ -478,7 +478,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn an_update_may_follow_a_read_that_already_answered_its_seq() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let session = spawn_python(directory.path(), ANSWERS_A_READ_BEFORE_WRITING_ITS_UPDATE)
         .await
         .unwrap();
@@ -508,7 +508,7 @@ async fn an_update_may_follow_a_read_that_already_answered_its_seq() {
 #[tokio::test]
 async fn a_hosted_session_answers_only_its_own_terminal_binding() {
     use tickhost_connect::{hosted::HostedTerminal, session::SessionClient};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::session_directory();
     let script = directory.path().join("quiet.py");
     std::fs::write(&script, r#"
 import json, sys
@@ -564,4 +564,26 @@ for line in sys.stdin:
         "another terminal of the same host is another binding"
     );
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_runtime_stays_inside_the_fixture_cleanup_boundary() {
+    let directory = crate::session_directory();
+    let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
+    let session = spawn(
+        directory.path(),
+        vec!["python3".into(), counter.display().to_string()],
+    )
+    .await
+    .unwrap();
+    let runtime = session.endpoint().parent().unwrap().to_path_buf();
+    let owned = runtime.starts_with(directory.path().canonicalize().unwrap());
+    session.shutdown().await.unwrap();
+    // Keep even a failing regression run from leaving its newly created hashed directory.
+    if !owned {
+        std::fs::remove_dir(&runtime).unwrap();
+    }
+    assert!(owned, "session escaped the fixture: {}", runtime.display());
+    drop(directory);
+    assert!(!runtime.exists());
 }

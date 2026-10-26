@@ -22,17 +22,23 @@ thread_local! {
 /// runtime directories, which also ends a daemon that did not stop.
 struct PrivateDaemon {
     _config_root: Option<tempfile::TempDir>,
+    config_root: PathBuf,
     runtime: PathBuf,
     tickhost: PathBuf,
 }
 
 impl PrivateDaemon {
     fn of(config_root: &Path, owned: Option<tempfile::TempDir>) -> Self {
-        Self {
+        let daemon = Self {
+            config_root: config_root.to_path_buf(),
             runtime: daemon_directory_of(config_root),
             tickhost: tickhost::paths::HostPaths::of_config_root(Some(config_root)).runtime,
             _config_root: owned,
+        };
+        for path in [&daemon.config_root, &daemon.runtime, &daemon.tickhost] {
+            tickloop_harness::test_support::register_runtime_directory(path);
         }
+        daemon
     }
 }
 
@@ -182,6 +188,20 @@ impl Drop for PrivateDaemon {
         if directory.join(DAEMON_SOCKET).exists() {
             stop_gracefully(&directory);
         }
+        if self.tickhost.join("host.sock").exists() {
+            let stopped = std::process::Command::new(super::fixture_cli::tickhost())
+                .arg("stop")
+                .env("TICKLOOP_CONFIG_DIR", &self.config_root)
+                .env_remove("TICKLOOP_TICK_RUNTIME_DIR")
+                .output();
+            if !stopped.is_ok_and(|output| output.status.success()) {
+                eprintln!(
+                    "Private CLI Tickhost cleanup failed: {}",
+                    self.tickhost.display()
+                );
+                return;
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.runtime);
         let _ = std::fs::remove_dir_all(&self.tickhost);
     }
@@ -228,4 +248,91 @@ fn stop_gracefully(directory: &Path) {
             directory.display()
         );
     }
+}
+
+struct CleanupProbeHost {
+    child: std::process::Child,
+    runtime: PathBuf,
+}
+impl Drop for CleanupProbeHost {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.runtime);
+    }
+}
+
+#[test]
+fn adopted_config_cleanup_stops_tickhost_before_removing_its_runtime() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::Instant,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let paths = tickhost::paths::HostPaths::of_config_root(Some(root.path()));
+    let host = Command::new(super::fixture_cli::tickhost())
+        .arg("run")
+        .env("TICKLOOP_CONFIG_DIR", root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut host = CleanupProbeHost {
+        child: host,
+        runtime: paths.runtime.clone(),
+    };
+    writeln!(
+        host.child.stdin.take().unwrap(),
+        "{}",
+        serde_json::to_string(&tickhost::host::HostConfig {
+            controller_key: tickhost::host::random_token(),
+            idle_timeout: Duration::from_secs(600)
+        })
+        .unwrap()
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !paths.socket().exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = paths.socket().exists();
+    let root_path = root.path().to_path_buf();
+    std::thread::spawn(move || {
+        adopt(&root_path);
+    })
+    .join()
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while host.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let exited = host.child.try_wait().unwrap().is_some();
+    // The regression also cleans its own child when run against the broken fixture.
+    if !exited {
+        let _ = host.child.kill();
+    }
+    host.child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&paths.runtime);
+    assert!(started, "fixture Tickhost did not start");
+    assert!(
+        exited,
+        "fixture removed the runtime but left Tickhost running"
+    );
+}
+
+#[test]
+fn fixture_main_thread_releases_its_config_root_on_exit() {
+    let output = std::process::Command::new(super::fixture_cli::executable())
+        .arg("--cleanup-probe")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let root = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let leaked = root.exists();
+    if leaked {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    assert!(!leaked, "fixture main thread left {}", root.display());
 }

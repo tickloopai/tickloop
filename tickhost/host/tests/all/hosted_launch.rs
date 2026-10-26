@@ -71,12 +71,12 @@ for line in sys.stdin:
 "#;
 
 struct Fixture {
+    server: tickhost::in_process::InProcessHost,
     directory: tempfile::TempDir,
     paths: HostPaths,
     key: String,
     daemon_epoch: uuid::Uuid,
     owner: Value,
-    server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl Fixture {
@@ -85,21 +85,19 @@ impl Fixture {
     }
 
     async fn with_idle_timeout(idle_timeout: Duration) -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("th")
-            .tempdir_in(crate::SHORT_TEMP_ROOT)
-            .unwrap();
+        let directory = crate::runtime_directory("th");
         let paths = HostPaths {
             runtime: directory.path().join("h"),
         };
         let key = host::random_token();
-        let server = tokio::spawn(host::serve(
+        let server = tickhost::in_process::InProcessHost::start(
             paths.clone(),
             host::HostConfig {
                 controller_key: key.clone(),
                 idle_timeout,
             },
-        ));
+        )
+        .unwrap();
         let fixture = Self {
             directory,
             paths,
@@ -2114,10 +2112,7 @@ async fn a_launch_token_works_once_and_only_after_a_proven_foreground() {
 /// a Herdr Pane, and an unreadable binding are refused before the program starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_launcher_without_a_readable_tickhost_launch_never_starts_a_tick() {
-    let directory = tempfile::Builder::new()
-        .prefix("thctx")
-        .tempdir_in(crate::SHORT_TEMP_ROOT)
-        .unwrap();
+    let directory = crate::runtime_directory("thctx");
     let marker = directory.path().join("started");
     let cases: [(&[(&str, &str)], &str); 2] = [
         (
@@ -2297,10 +2292,7 @@ async fn shutdown(fixture: &Fixture) {
 /// No host is needed: the launcher proves its foreground before it contacts any endpoint.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_launcher_in_a_background_process_group_of_its_terminal_is_refused() {
-    let directory = tempfile::Builder::new()
-        .prefix("thbg")
-        .tempdir_in(crate::SHORT_TEMP_ROOT)
-        .unwrap();
+    let directory = crate::runtime_directory("thbg");
     let marker = directory.path().join("started");
     let status = directory.path().join("status");
     let binding = json!({
@@ -2323,7 +2315,7 @@ async fn a_launcher_in_a_background_process_group_of_its_terminal_is_refused() {
         .env("TICKLOOP_TICKHOST_LAUNCH", binding.to_string())
         .env_remove("HERDR_ENV");
     slave.attach(&mut shell).unwrap();
-    let mut child = shell.spawn().unwrap();
+    let mut child = shell.kill_on_drop(true).spawn().unwrap();
     drop(shell);
     let waited = tokio::time::timeout(Duration::from_secs(15), async {
         // Drain the terminal so the shell's job notices never block on a full PTY.
