@@ -3718,6 +3718,7 @@ impl Agent {
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
+                user_context: Default::default(),
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
                 branch_reservation: None,

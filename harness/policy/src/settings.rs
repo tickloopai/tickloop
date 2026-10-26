@@ -129,6 +129,13 @@ pub trait SettingsStore: Send + Sync {
             &crate::loop_skill::MaintenanceInstructions,
         )
     }
+    /// The instruction files a conversation in `folder` loads, lowest priority first.
+    fn instruction_files(
+        &self,
+        _folder: Option<&Path>,
+    ) -> Vec<crate::instructions::InstructionFile> {
+        Vec::new()
+    }
 
     fn write_permissions(
         &self,

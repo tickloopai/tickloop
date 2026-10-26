@@ -13,9 +13,11 @@ doctest = false
 [dependencies]
 tickloop-harness = { path = "../../harness/sdk", features = ["model", "policy", "tools"] }
 tickloop-tick-installer = { path = "../../tick/installer" }
+regex = "1"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tickloop-tick-packages = { path = "../../tick/packages" }

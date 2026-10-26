@@ -667,7 +667,7 @@ pub async fn build_runtime_with_models(
     let settings = launch
         .config_root
         .as_ref()
-        .map(|root| UserSettings::in_root(root));
+        .map(|root| UserSettings::in_root(root).with_home_directory(std::env::home_dir()));
     let transcripts = if launch.session_persistence {
         let root = launch
             .config_root

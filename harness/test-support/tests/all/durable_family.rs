@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tickloop_harness_model::ModelRequest;
 use tickloop_harness_protocol::{
-    AgentHostOptions, Content, ExecutionMode, PromptPolicy, QuestionAnswer, QuestionRequest, Role,
+    AgentHostOptions, Content, ExecutionMode, PromptPolicy, QuestionAnswer, QuestionRequest,
     SubagentNotificationDelivery,
 };
 use tickloop_harness_runtime::transcript::TranscriptStore;
@@ -42,7 +42,7 @@ pub(super) fn task_of(request: &ModelRequest) -> Option<String> {
     let first = request
         .messages
         .iter()
-        .find(|message| message.role != Role::System)?;
+        .find(|message| tickloop_harness_test_support::is_conversation(message))?;
     let Content::Text { text } = first.content.first()? else {
         return None;
     };

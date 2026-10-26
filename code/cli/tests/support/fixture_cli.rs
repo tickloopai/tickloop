@@ -184,12 +184,27 @@ fn reported_build_identity(executable: &Path) -> Option<String> {
 /// a test that needs it unset removes it.
 const FIXTURE_API_KEY: (&str, &str) = ("DEEPSEEK_API_KEY", "fixture-default-key");
 
+std::thread_local! {
+    static HOMES: std::cell::RefCell<Vec<tempfile::TempDir>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An empty home directory kept for the rest of the test, so a fixture never reads the
+/// developer's own instruction files; a test that sets `HOME` itself replaces it.
+fn isolated_home() -> PathBuf {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().to_path_buf();
+    HOMES.with(|homes| homes.borrow_mut().push(home));
+    path
+}
+
 /// The product CLI through the fixture; callers append CLI arguments.
 pub fn command() -> std::process::Command {
     let mut command = std::process::Command::new(executable());
     command
         .arg(CLI_MODE)
-        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
+        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1)
+        .env("HOME", isolated_home());
     command
 }
 
@@ -197,7 +212,8 @@ pub fn tokio_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(executable());
     command
         .arg(CLI_MODE)
-        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
+        .env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1)
+        .env("HOME", isolated_home());
     command
 }
 
@@ -205,6 +221,7 @@ pub fn pty_command() -> portable_pty::CommandBuilder {
     let mut command = portable_pty::CommandBuilder::new(executable());
     command.arg(CLI_MODE);
     command.env(FIXTURE_API_KEY.0, FIXTURE_API_KEY.1);
+    command.env("HOME", isolated_home());
     command
 }
 

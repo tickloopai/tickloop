@@ -6,6 +6,8 @@ mod builtin_catalog;
 mod builtin_skills;
 #[path = "all/goal_settings.rs"]
 mod goal_settings;
+#[path = "all/instruction_files.rs"]
+mod instruction_files;
 #[path = "all/loop_skill.rs"]
 mod loop_skill;
 #[path = "all/model_configuration.rs"]

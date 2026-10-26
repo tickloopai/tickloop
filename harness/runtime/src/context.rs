@@ -528,8 +528,10 @@ impl Agent {
                             .iter()
                             .map(|skill| skill.name.clone())
                             .collect();
-                        // Like Claude Code, compaction drops the file contents read so far.
+                        // Like Claude Code, compaction drops the file contents read so far and
+                        // reads the user context again.
                         chat.tools.file_reads().clear();
+                        chat.user_context = Default::default();
                         Ok(CompactionOutcome {
                             summary,
                             snapshot: chat.snapshot.clone(),

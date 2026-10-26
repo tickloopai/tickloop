@@ -4116,9 +4116,11 @@ dependencies = [
 name = "tickloop-code-settings"
 version = "0.2.25"
 dependencies = [
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -4341,6 +4343,7 @@ dependencies = [
  "tickloop-harness-artifacts",
  "tickloop-harness-base",
  "tickloop-harness-model",
+ "tickloop-harness-policy",
  "tickloop-harness-protocol",
  "tickloop-harness-runtime",
  "tickloop-harness-transcript",
