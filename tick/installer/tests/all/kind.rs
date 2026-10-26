@@ -11,6 +11,8 @@ use tickloop_tick_installer::PluginKind;
 
 fn manifest(tick: Option<TickProgram>) -> PluginManifest {
     PluginManifest {
+        mcp_servers: Default::default(),
+        user_config: Default::default(),
         name: "sample".into(),
         display_name: None,
         version: Some("1.0.0".into()),

@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -134,13 +134,24 @@ fn is_invisible_format(character: char) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ResponsePart {
+    Data,
+    ToolDirectory,
+}
+type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePart) + Send + Sync>;
+type DirectoryRequests = Arc<Mutex<HashMap<rmcp::model::RequestId, tokio::time::Instant>>>;
+
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
     client: Client,
     endpoint: Url,
     token: Arc<str>,
     unauthorized: Arc<AtomicBool>,
+    insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
+    redactor: Option<ResponseRedactor>,
+    directory_requests: DirectoryRequests,
     headers: HashMap<HeaderName, HeaderValue>,
 }
 
@@ -156,7 +167,10 @@ impl McpHttpClient {
             endpoint,
             token: token.into(),
             unauthorized: Arc::new(AtomicBool::new(false)),
+            insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
+            redactor: None,
+            directory_requests: Arc::default(),
             headers: HashMap::new(),
         })
     }
@@ -206,6 +220,11 @@ impl McpHttpClient {
             http.headers.insert(name, value);
         }
         Ok(http)
+    }
+
+    pub(crate) fn with_redactor(mut self, redactor: ResponseRedactor) -> Self {
+        self.redactor = Some(redactor);
+        self
     }
 
     pub(crate) fn with_artifact_credentials(
@@ -289,8 +308,31 @@ impl McpHttpClient {
         Ok(request)
     }
 
-    fn verify_status(&self, status: StatusCode) -> Result<(), StreamableHttpError<McpHttpError>> {
-        if status == StatusCode::UNAUTHORIZED {
+    pub(crate) fn insufficient_scope(&self) -> bool {
+        self.insufficient_scope.load(Ordering::SeqCst)
+    }
+
+    fn verify_status(
+        &self,
+        response: &reqwest::Response,
+    ) -> Result<(), StreamableHttpError<McpHttpError>> {
+        let status = response.status();
+        let insufficient_scope = status == StatusCode::FORBIDDEN
+            && response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
+                    rmcp::transport::auth::WWWAuthenticateParams::parse(value, &self.endpoint)
+                        .error
+                        .as_deref()
+                        == Some("insufficient_scope")
+                });
+        if insufficient_scope {
+            self.insufficient_scope.store(true, Ordering::SeqCst);
+        }
+        if status == StatusCode::UNAUTHORIZED || insufficient_scope {
             self.unauthorized.store(true, Ordering::SeqCst);
         }
         if !status.is_success() {
@@ -324,6 +366,8 @@ async fn json_bytes(
 fn sse_stream(
     response: reqwest::Response,
     max_event_bytes: usize,
+    redactor: Option<ResponseRedactor>,
+    directory_requests: DirectoryRequests,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let mut event_bytes = 0_usize;
     let mut line_bytes = 0_usize;
@@ -345,7 +389,113 @@ fn sse_stream(
         }
         Ok(chunk)
     });
-    SseStream::from_bytes_stream(stream).boxed()
+    SseStream::from_bytes_stream(stream)
+        .map(move |event| {
+            event.and_then(|mut event| {
+                if let Some(redact) = &redactor {
+                    if let Some(data) = event.data.take() {
+                        event.data = Some(
+                            redact_message(&data, redact, &directory_requests).map_err(|_| {
+                                SseError::Body(Box::new(io::Error::other(
+                                    "invalid MCP event response",
+                                )))
+                            })?,
+                        );
+                    }
+                    for value in [&mut event.id, &mut event.event].into_iter().flatten() {
+                        let mut text = serde_json::Value::String(std::mem::take(value));
+                        redact(&mut text, ResponsePart::Data);
+                        *value = text.as_str().unwrap_or_default().to_owned();
+                    }
+                }
+                Ok(event)
+            })
+        })
+        .boxed()
+}
+
+fn redact_message(
+    text: &str,
+    redact: &ResponseRedactor,
+    directory_requests: &DirectoryRequests,
+) -> Result<String, serde_json::Error> {
+    let mut message: serde_json::Value = serde_json::from_str(text)?;
+    let pending = if message.get("method").is_none() {
+        message
+            .get("id")
+            .and_then(|id| serde_json::from_value::<rmcp::model::RequestId>(id.clone()).ok())
+            .and_then(|id| {
+                let mut pending = directory_requests.lock().unwrap();
+                pending.remove_entry(&id).or_else(|| match id {
+                    rmcp::model::RequestId::String(id) => {
+                        id.parse::<i64>().ok().and_then(|number| {
+                            pending.remove_entry(&rmcp::model::RequestId::Number(number))
+                        })
+                    }
+                    _ => None,
+                })
+            })
+            .filter(|(_, started)| started.elapsed() <= REQUEST_TIMEOUT)
+    } else {
+        None
+    };
+    let directory_response = pending.is_some();
+    if let Some((id, _)) = pending {
+        message["id"] = serde_json::to_value(id)?;
+    } else if let Some(id) = message.get_mut("id").filter(|id| id.is_string()) {
+        redact(id, ResponsePart::Data);
+    }
+    for field in ["params", "result", "error"] {
+        if let Some(payload) = message.get_mut(field) {
+            if field == "result"
+                && let Some(tools) = payload
+                    .get_mut("tools")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| {
+                    let Some(name) = tool.get("name") else {
+                        return true;
+                    };
+                    let mut display = name.clone();
+                    redact(&mut display, ResponsePart::Data);
+                    display == *name
+                });
+            }
+            // The protocol version and envelope are routing facts, not server display text.
+            let protocol_version = (field == "result")
+                .then(|| payload.get("protocolVersion").cloned())
+                .flatten()
+                .filter(|version| matches!(version.as_str(), Some("2026-07-28" | "2025-11-25")));
+            let part = if field == "result" && directory_response {
+                ResponsePart::ToolDirectory
+            } else {
+                ResponsePart::Data
+            };
+            redact(payload, part);
+            if let Some(version) = protocol_version
+                && let Some(fields) = payload.as_object_mut()
+            {
+                fields.insert("protocolVersion".into(), version);
+            }
+        }
+    }
+    // Reject undecodable messages here so SDK diagnostics cannot echo their raw fields.
+    let decoded = serde_json::from_value::<ServerJsonRpcMessage>(message.clone())?;
+    let custom_method = match decoded {
+        ServerJsonRpcMessage::Notification(notification) => matches!(
+            notification.notification,
+            rmcp::model::ServerNotification::CustomNotification(_)
+        ),
+        ServerJsonRpcMessage::Request(request) => matches!(
+            request.request,
+            rmcp::model::ServerRequest::CustomRequest(_)
+        ),
+        _ => false,
+    };
+    if custom_method && let Some(method) = message.get_mut("method") {
+        redact(method, ResponsePart::Data);
+    }
+    serde_json::to_string(&message)
 }
 
 impl StreamableHttpClient for McpHttpClient {
@@ -379,6 +529,21 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let directory_request = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
+        if self.redactor.is_some()
+            && let Some(id) = &directory_request
+        {
+            let mut pending = self.directory_requests.lock().unwrap();
+            pending.retain(|_, started| started.elapsed() <= REQUEST_TIMEOUT);
+            pending.insert(id.clone(), tokio::time::Instant::now());
+        }
         let preserve_custom_result = matches!(
             &message,
             ClientJsonRpcMessage::Request(request)
@@ -389,7 +554,7 @@ impl StreamableHttpClient for McpHttpClient {
             request = request.header("Mcp-Session-Id", session_id.as_ref());
         }
         let response = self.send(request.json(&message)).await?;
-        self.verify_status(response.status())?;
+        self.verify_status(&response)?;
         if matches!(
             response.status(),
             StatusCode::ACCEPTED | StatusCode::NO_CONTENT
@@ -401,6 +566,13 @@ impl StreamableHttpClient for McpHttpClient {
             .get("Mcp-Session-Id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        if let (Some(id), Some(redact)) = (&session_id, &self.redactor) {
+            let mut redacted = serde_json::Value::String(id.clone());
+            redact(&mut redacted, ResponsePart::Data);
+            if redacted.as_str() != Some(id.as_str()) {
+                return Err(unexpected("MCP session identifier contains a credential"));
+            }
+        }
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -408,14 +580,26 @@ impl StreamableHttpClient for McpHttpClient {
             .unwrap_or("");
         if content_type.starts_with("text/event-stream") {
             return Ok(StreamableHttpPostResponse::Sse(
-                sse_stream(response, max_sse_event_size),
+                sse_stream(
+                    response,
+                    max_sse_event_size,
+                    self.redactor.clone(),
+                    self.directory_requests.clone(),
+                ),
                 session_id,
             ));
         }
         if !content_type.starts_with("application/json") {
             return Err(unexpected("invalid MCP content type"));
         }
-        let body = json_bytes(response).await?;
+        let mut body = json_bytes(response).await?;
+        if let Some(redact) = &self.redactor {
+            let text =
+                String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
+            body = redact_message(&text, redact, &self.directory_requests)
+                .map_err(|_| unexpected("invalid MCP JSON response"))?
+                .into_bytes();
+        }
         // The SDK's untagged result decoder mistakes extension metadata for a tool result.
         let decoded = if preserve_custom_result {
             serde_json::from_slice::<JsonRpcResponse<serde_json::Value>>(&body)
@@ -475,7 +659,7 @@ impl StreamableHttpClient for McpHttpClient {
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
-        self.verify_status(response.status())?;
+        self.verify_status(&response)?;
         if !response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -484,7 +668,12 @@ impl StreamableHttpClient for McpHttpClient {
         {
             return Err(unexpected("invalid MCP event stream content type"));
         }
-        Ok(sse_stream(response, max_sse_event_size))
+        Ok(sse_stream(
+            response,
+            max_sse_event_size,
+            self.redactor.clone(),
+            self.directory_requests.clone(),
+        ))
     }
 
     async fn delete_session(
@@ -503,7 +692,7 @@ impl StreamableHttpClient for McpHttpClient {
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
-        self.verify_status(response.status())
+        self.verify_status(&response)
     }
 }
 

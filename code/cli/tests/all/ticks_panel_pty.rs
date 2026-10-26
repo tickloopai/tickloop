@@ -27,9 +27,9 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_SETTLE: Duration = Duration::from_millis(40);
 const CONTROL_N: &[u8] = b"\x0e";
 const CONTROL_P: &[u8] = b"\x10";
-const ESCAPE: &[u8] = b"\x1b";
+pub(crate) const ESCAPE: &[u8] = b"\x1b";
 const TAB: &[u8] = b"\t";
-struct Terminal {
+pub(crate) struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<String>>,
@@ -41,7 +41,7 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn start(fixture: &Fixture, marketplace: &str) -> Self {
+    pub(crate) fn start(fixture: &Fixture, marketplace: &str) -> Self {
         let root = &fixture.root;
         fs::create_dir_all(root.join("tmp")).unwrap();
         let pty = native_pty_system()
@@ -113,16 +113,16 @@ impl Terminal {
             .unwrap();
     }
 
-    fn send(&mut self, input: &[u8]) {
+    pub(crate) fn send(&mut self, input: &[u8]) {
         self.writer.write_all(input).unwrap();
         self.writer.flush().unwrap();
     }
 
-    fn mark(&self) -> usize {
+    pub(crate) fn mark(&self) -> usize {
         self.output.lock().unwrap().len()
     }
 
-    fn frame(&self) -> String {
+    pub(crate) fn frame(&self) -> String {
         screen::visible_screen_with_selection(
             &self.output.lock().unwrap(),
             usize::from(self.columns),
@@ -131,7 +131,12 @@ impl Terminal {
     }
 
     /// Waits for a frame drawn after `mark` that `matches`.
-    fn wait_for_frame(&self, mark: usize, label: &str, matches: impl Fn(&str) -> bool) -> String {
+    pub(crate) fn wait_for_frame(
+        &self,
+        mark: usize,
+        label: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
             let drawn = self.output.lock().unwrap()[mark..].contains("\x1b[?2026l");
@@ -149,7 +154,12 @@ impl Terminal {
     }
 
     /// Sends `input` and waits for the frame it leads to.
-    fn press(&mut self, input: &[u8], label: &str, matches: impl Fn(&str) -> bool) -> String {
+    pub(crate) fn press(
+        &mut self,
+        input: &[u8],
+        label: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let mark = self.mark();
         self.send(input);
         self.wait_for_frame(mark, label, matches)
@@ -163,7 +173,7 @@ impl Terminal {
         );
     }
 
-    fn exit(&mut self) {
+    pub(crate) fn exit(&mut self) {
         self.send(b"/exit\r");
         let deadline = Instant::now() + TIMEOUT;
         while self.child.try_wait().unwrap().is_none() {
@@ -237,7 +247,7 @@ fn is_selected(frame: &str, name: &str) -> bool {
 }
 
 /// The input dialog's rows: those after its top rule.
-fn dialog(frame: &str) -> String {
+pub(crate) fn dialog(frame: &str) -> String {
     let lines = frame.lines().collect::<Vec<_>>();
     let top = lines
         .iter()
@@ -247,7 +257,7 @@ fn dialog(frame: &str) -> String {
 }
 
 /// The dialog's text with its rows joined, so a wrapped message reads as one.
-fn dialog_text(frame: &str) -> String {
+pub(crate) fn dialog_text(frame: &str) -> String {
     dialog(frame)
         .replace(screen::SELECTED_MARK, " ")
         .lines()
@@ -621,24 +631,36 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
     fs::write(
         directory.join(".claude-plugin/plugin.json"),
-        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}}}"#,
+        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"hooks":{}}}"#,
     )
     .unwrap();
     install_from_path(&fixture, "plugin", &directory);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
-        row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
-            && frame.contains("Not supported yet: MCP")
+    let frame = terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
+        row_shows(
+            frame,
+            "notes",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+        ) && frame.contains("Not supported yet: hooks")
     });
+    assert!(!frame.contains("Not supported yet: MCP"), "{frame}");
     terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
     terminal.press(b"\r", "disabled", |frame| {
-        row_shows(frame, "notes", "local · disabled · 1.0.0 · no login needed")
+        row_shows(
+            frame,
+            "notes",
+            "local · disabled · 1.0.0 · no login needed · 1 MCP server",
+        )
     });
     terminal.press(b"\r", "enable action", |frame| frame.contains("❯ Enable"));
     terminal.press(b"\r", "enabled", |frame| {
-        row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
+        row_shows(
+            frame,
+            "notes",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+        )
     });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
@@ -1004,4 +1026,123 @@ fn available_status_distinguishes_marketplace_ownership_and_broken_plugins() {
     assert!(
         succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@first  1.0.0  disabled")
     );
+}
+
+#[test]
+fn plugin_user_config_page_masks_secrets_and_reconfigures_saved_values() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("configured");
+    fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
+    fs::write(directory.join(".claude-plugin/plugin.json"), json!({
+        "name":"configured", "userConfig": {
+            "key":{"type":"string","title":"Private key","sensitive":true,"required":true},
+            "workspace":{"type":"directory","title":"Workspace","required":true}
+        },"mcpServers":{"service":{"url":"https://example.com/mcp","headers":{"Key":"${user_config.key}"}}}
+    }).to_string()).unwrap();
+    install_from_path(&fixture, "plugin", &directory);
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "configuration status", |frame| {
+        frame.contains("needs configuration")
+    });
+    terminal.press(b"\r", "configure action", |frame| {
+        frame.contains("Configure")
+    });
+    terminal.press(b"\r", "private field", |frame| {
+        frame.contains("Private key") && frame.contains("Configure configured")
+    });
+    let shown = terminal.press(b"panel-private-key", "masked input", |frame| {
+        frame.contains("*****************")
+    });
+    assert!(!shown.contains("panel-private-key"));
+    terminal.press(b"\x1b[D", "masked cursor moves left", |frame| {
+        frame.contains("****************▏*")
+    });
+    terminal.press(b"X", "insert at masked cursor", |frame| {
+        frame.contains("*****************▏*")
+    });
+    terminal.press(b"\r", "workspace field", |frame| {
+        frame.contains("Workspace")
+    });
+    terminal.press(b"/tmp/jk\r", "saved", |frame| {
+        frame.contains("configured") && !frame.contains("Configure configured")
+    });
+    let private = fixture
+        .root
+        .join("config/credentials/configured/user-config.json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(private).unwrap()).unwrap()["key"],
+        "panel-private-keXy"
+    );
+    let public = fs::read_to_string(fixture.root.join("config/settings.json")).unwrap();
+    assert!(public.contains("/tmp/jk"));
+    assert!(!public.contains("panel-private-key"));
+    terminal.press(b"\r", "configure action", |frame| {
+        frame.contains("Configure")
+    });
+    terminal.press(b"\r", "saved private field", |frame| {
+        frame.contains("Private key") && frame.contains("********")
+    });
+    terminal.press(ESCAPE, "cancel configuration", |frame| {
+        !frame.contains("Configure configured")
+    });
+    terminal.press(ESCAPE, "close panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(
+        !terminal
+            .output
+            .lock()
+            .unwrap()
+            .contains("panel-private-key")
+    );
+}
+
+#[test]
+fn installing_a_plugin_in_the_panel_opens_its_missing_configuration() {
+    use crate::marketplace_commands::{marketplace_directory, write_json};
+    let fixture = Fixture::new();
+    let team = marketplace_directory(
+        &fixture,
+        "team",
+        "team",
+        json!([{"name":"configured","source":"./configured"}]),
+    );
+    write_json(
+        &team.join("configured/.claude-plugin/plugin.json"),
+        &json!({
+            "name":"configured", "userConfig":{"key":{"type":"string","title":"Private key","sensitive":true,"required":true}}
+        }),
+    );
+    succeeded(&fixture.tickloop(&["plugin", "marketplace", "add", &path_text(&team)]));
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "installed page", panel_is_open);
+    terminal.press(TAB, "available page", |frame| {
+        frame.contains("[Available]") && frame.contains("configured")
+    });
+    terminal.press(
+        b"/configured\r",
+        "configuration after installation",
+        |frame| frame.contains("Configure configured") && frame.contains("Private key"),
+    );
+    terminal.press(b"cancelled-secret", "masked", |frame| {
+        frame.contains("****************")
+    });
+    terminal.press(ESCAPE, "cancel", |frame| {
+        !frame.contains("Configure configured")
+    });
+    assert!(
+        !fixture
+            .root
+            .join("config/credentials/configured/user-config.json")
+            .exists()
+    );
+    terminal.press(ESCAPE, "leave filter", |frame| {
+        !frame.contains("esc leave filter")
+    });
+    terminal.press(ESCAPE, "close panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(!terminal.output.lock().unwrap().contains("cancelled-secret"));
 }

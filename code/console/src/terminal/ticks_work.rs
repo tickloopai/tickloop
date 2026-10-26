@@ -18,6 +18,7 @@ const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::pack
 
 use super::{
     console::Console,
+    execution::ConsoleExecution,
     safe_line,
     ticks_panel::{
         Applied, InstalledList, PluginKind, TickPackageRequest, TickPackageResult, TickPackageWork,
@@ -56,9 +57,19 @@ pub(super) struct TickPackageTasks {
     logins: HashMap<Uuid, (u64, CancellationToken)>,
     /// The kind of each panel opened, whose command names its results once it is closed.
     kinds: HashMap<Uuid, PluginKind>,
+    /// What reads the MCP servers of the Chat each panel was opened for.
+    agent: Option<ConsoleExecution>,
+    chats: HashMap<Uuid, Uuid>,
 }
 
 impl TickPackageTasks {
+    pub(super) fn new(agent: ConsoleExecution) -> Self {
+        Self {
+            agent: Some(agent),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.running.is_empty()
     }
@@ -99,6 +110,19 @@ impl TickPackageTasks {
         });
     }
 
+    /// Reads the MCP servers of the panel's Chat, whose states tell which plugin servers need a
+    /// login; a panel without a running Agent has none to read.
+    fn read_mcp_states(&mut self, panel: Uuid) {
+        let (Some(agent), Some(chat)) = (self.agent.clone(), self.chats.get(&panel).copied())
+        else {
+            return;
+        };
+        self.spawn(async move {
+            let states = agent.mcp_servers(chat).await.unwrap_or_default();
+            (panel, TickPackageResult::McpStates(states))
+        });
+    }
+
     fn read_installed(&mut self, store: PluginStore, panel: Uuid) {
         let read = self.next_installed_read();
         self.spawn(async move {
@@ -118,8 +142,11 @@ pub(super) fn open(
 ) -> Result<(), String> {
     let panel = TicksPanel::new(chat, kind);
     let id = panel.id();
-    console.show_ticks_panel(panel)?;
+    console.show_user_panel(super::user_panel::UserPanel::Packages(panel))?;
     tasks.kinds.insert(id, kind);
+    if let Some(chat) = chat {
+        tasks.chats.insert(id, chat);
+    }
     start(
         root,
         TickPackageWork {
@@ -136,9 +163,31 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
     let panel = work.panel;
     let refresh = matches!(&work.request, TickPackageRequest::Update(_));
     match work.request {
+        TickPackageRequest::SaveConfiguration { name, input } => {
+            tasks.spawn(async move {
+                let result = blocking({
+                    let name = name.clone();
+                    move || {
+                        let plugin = store.get(&name).map_err(|error| error.to_string())?;
+                        let mut config =
+                            tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                                store.config_root(),
+                                &plugin.manifest,
+                            )?;
+                        config.save(store.config_root(), &plugin.manifest, &input.0)
+                    }
+                })
+                .await;
+                (
+                    panel,
+                    TickPackageResult::ConfigurationSaved { name, result },
+                )
+            });
+        }
         TickPackageRequest::Load => {
             tasks.read_installed(store.clone(), panel);
             tasks.read_marketplaces(store, panel);
+            tasks.read_mcp_states(panel);
         }
         TickPackageRequest::Install(request) | TickPackageRequest::Update(request) => {
             tasks.spawn(async move {
@@ -330,6 +379,7 @@ pub(super) fn finish(
         TickPackageResult::Installation { result: Ok(_), .. }
             | TickPackageResult::Uninstallation { result: Ok(_), .. }
             | TickPackageResult::Enabled { result: Ok(_), .. }
+            | TickPackageResult::ConfigurationSaved { result: Ok(_), .. }
     );
     let changed_login = match &result {
         TickPackageResult::Logout { name, .. }
@@ -359,6 +409,7 @@ pub(super) fn finish(
     }
     if changed_packages {
         tasks.read_installed(PluginStore::in_config_root(root), panel);
+        tasks.read_mcp_states(panel);
     }
     if changed_marketplace {
         tasks.read_marketplaces(PluginStore::in_config_root(root), panel);
@@ -426,7 +477,23 @@ fn read_installed_now(store: &PluginStore) -> Result<InstalledList, String> {
         .iter()
         .map(|package| store.login_state(package))
         .collect();
-    Ok(InstalledList { packages, logins })
+    let configurations = packages
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let config = tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                store.config_root(),
+                &plugin.manifest,
+            )
+            .unwrap_or_default();
+            (plugin.name().to_owned(), config)
+        })
+        .collect();
+    Ok(InstalledList {
+        packages,
+        logins,
+        configurations,
+    })
 }
 
 async fn blocking<T: Send + 'static>(

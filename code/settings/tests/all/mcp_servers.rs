@@ -61,3 +61,291 @@ fn invalid_entries_do_not_hide_valid_servers_or_leak_substituted_values() {
     ));
     assert!(!resolved.warnings.join(" ").contains("private-value"));
 }
+
+#[test]
+fn plugins_resolve_after_users_with_roots_and_deterministic_signature_priority() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    let entries: BTreeMap<String, serde_json::Value> = serde_json::from_value(json!({
+        "local":{"command":"${TICKLOOP_PLUGIN_ROOT}/server", "args":["${CLAUDE_PLUGIN_DATA}","${MODE:-test}"], "env":{"ROOT":"${CLAUDE_PLUGIN_ROOT}","DATA":"${TICKLOOP_PLUGIN_DATA}"}},
+        "remote":{"url":"https://example.com/mcp", "headers":{"X-Key":"ignored-for-signature"}},
+        "shared":{"command":"shared","args":["serve"],"autoApprove":["*"]},
+        "configure":{"command":"node", "args":["${user_config.key}"]}
+    })).unwrap();
+    let plugins = ["zeta", "alpha"].map(|name| PluginServers {
+        user_config: Default::default(),
+        name: name.into(),
+        root: format!("/plugins/{name}").into(),
+        data_directory: format!("/data/{name}").into(),
+        entries: entries.clone(),
+    });
+    let result = resolve_servers_with_plugins(
+        &json!({"mcpServers":{"mine":{"url":"https://example.com/mcp"}}}),
+        Path::new("/work"),
+        &BTreeMap::new(),
+        &plugins,
+    );
+    assert_eq!(
+        result
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "mine",
+            "plugin_alpha_configure",
+            "plugin_alpha_local",
+            "plugin_alpha_shared",
+            "plugin_zeta_configure",
+            "plugin_zeta_local"
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&result.servers[2].transport).unwrap(),
+        json!({"type":"stdio","command":"/plugins/alpha/server","args":["/data/alpha","test"],"env":{"ROOT":"/plugins/alpha","DATA":"/data/alpha"},"cwd":"/work"})
+    );
+    assert_eq!(
+        serde_json::to_value(&result.servers[1].transport).unwrap()["type"],
+        "needs_configuration"
+    );
+    let warnings = result.warnings.join("\n");
+    assert!(warnings.contains("plugin_alpha_remote") && warnings.contains("mine"));
+    assert!(warnings.contains("plugin_zeta_shared") && warnings.contains("plugin_alpha_shared"));
+    assert!(warnings.contains("autoApprove") && warnings.contains("ignored"));
+}
+
+#[test]
+fn signature_priority_does_not_depend_on_credentials_and_unsupported_stays_unsupported() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    let plugin = PluginServers {
+        user_config: Default::default(),
+        name: "demo".into(),
+        root: "/plugin".into(),
+        data_directory: "/data".into(),
+        entries: serde_json::from_value(json!({
+            "remote":{"url":"https://example.com/mcp"},
+            "local":{"command":"same", "args":["serve"]},
+            "legacy":{"type":"sse", "url":"${user_config.url}"},
+            "safe":{"command":"safe", "always_allow":true, "auto_approve":["*"]}
+        }))
+        .unwrap(),
+    };
+    let result = resolve_servers_with_plugins(
+        &json!({"mcpServers":{
+            "remote":{"url":"https://example.com/mcp", "headers":{"Authorization":"${MISSING}"}},
+            "local":{"command":"same", "args":["serve"], "env":{"KEY":"${MISSING}"}}
+        }}),
+        Path::new("/work"),
+        &BTreeMap::new(),
+        &[plugin],
+    );
+    assert_eq!(
+        result
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["local", "remote", "plugin_demo_legacy", "plugin_demo_safe"]
+    );
+    assert_eq!(
+        serde_json::to_value(&result.servers[2].transport).unwrap()["type"],
+        "unsupported"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("always_allow") && w.contains("ignored"))
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("auto_approve") && w.contains("ignored"))
+    );
+}
+
+#[test]
+fn plugin_user_config_is_typed_private_persistent_and_resolves_mcp_fields() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tick_plugins::{PluginManifest, PluginStore};
+    use tickloop_code_settings::{
+        mcp::{PluginServers, resolve_servers_with_plugins},
+        plugin_config::PluginUserConfig,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        json!({
+            "name":"configured", "userConfig": {
+                "key":{"type":"string","sensitive":true,"required":true},
+                "host":{"type":"string","default":"example.com"},
+                "timeout":{"type":"number","default":1234},
+                "active":{"type":"boolean","default":false},
+            "unused":{"type":"string","sensitive":true,"default":"unreferenced-secret"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let manifest = PluginManifest::load(&source, "unused", None).unwrap();
+    let root = temp.path().join("config");
+    let mut config = PluginUserConfig::load(&root, &manifest).unwrap();
+    assert!(!config.is_filled("key"));
+    assert!(config.is_filled("active"));
+    config
+        .save(
+            &root,
+            &manifest,
+            &serde_json::from_value(json!({"key":"private-${LITERAL}","host":"service.example"}))
+                .unwrap(),
+        )
+        .unwrap();
+    let public = fs::read_to_string(root.join("settings.json")).unwrap();
+    assert!(!public.contains("private-"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&public).unwrap()["plugins"]["configured"]["options"]
+            ["host"],
+        "service.example"
+    );
+    let private_path = root.join("credentials/configured/user-config.json");
+    assert_eq!(
+        fs::metadata(&private_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let store = PluginStore::in_config_root(&root);
+    store.install_path(&source).unwrap();
+    store.uninstall("configured", false).unwrap();
+    let config = PluginUserConfig::load(&root, &manifest).unwrap();
+    assert!(config.is_filled("key"));
+    let plugin = PluginServers {
+        name:"configured".into(),root:source,data_directory:root.join("data"),user_config:config,
+        entries:serde_json::from_value(json!({"remote":{
+            "type":"http","url":"https://${user_config.host}/mcp",
+            "headers":{"${user_config.host}":"${user_config.key}"},"timeout":"${user_config.timeout}"
+        }})).unwrap()
+    };
+    let resolved =
+        resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &[plugin]);
+    assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    assert_eq!(resolved.servers[0].timeout_ms, 1234);
+    assert_eq!(resolved.servers[0].sensitive_values.len(), 1);
+    let transport = serde_json::to_value(&resolved.servers[0].transport).unwrap();
+    assert_eq!(transport["url"], "https://service.example/mcp");
+    assert_eq!(
+        transport["headers"]["service.example"],
+        "private-${LITERAL}"
+    );
+}
+
+#[test]
+fn missing_plugin_config_takes_precedence_and_ignored_approval_fields_do_not_expand() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    use tickloop_harness::protocol::mcp::McpTransport;
+    let plugin = PluginServers {
+        name: "configured".into(),
+        root: "/plugin".into(),
+        data_directory: "/data".into(),
+        user_config: Default::default(),
+        entries: serde_json::from_value(json!({
+            "missing":{"command":"${ABSENT}","env":{"KEY":"${user_config.key}"}},
+            "ignored":{"command":"server","autoApprove":["${ABSENT}"]}
+        }))
+        .unwrap(),
+    };
+    let resolved =
+        resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &[plugin]);
+    assert!(matches!(
+        resolved.servers[0].transport,
+        McpTransport::Stdio { .. }
+    ));
+    assert!(matches!(
+        resolved.servers[1].transport,
+        McpTransport::NeedsConfiguration
+    ));
+}
+
+#[test]
+fn remote_oauth_settings_survive_resolution() {
+    let resolved = tickloop_code_settings::mcp::resolve_servers(
+        &serde_json::json!({"mcpServers":{"remote":{"url":"https://example.com/mcp", "oauth":{"clientId":"client", "callbackPort":9911}, "authServerMetadataUrl":"https://example.com/metadata"}}}),
+        std::path::Path::new("/workspace"),
+        &Default::default(),
+    );
+    let oauth = &resolved.servers[0].oauth;
+    assert_eq!(oauth.client_id.as_deref(), Some("client"));
+    assert_eq!(oauth.callback_port, Some(9911));
+    assert_eq!(
+        oauth.authorization_server_metadata_url.as_deref(),
+        Some("https://example.com/metadata")
+    );
+}
+
+#[test]
+fn a_fixed_authorization_header_does_not_require_valid_oauth_configuration() {
+    let resolved = tickloop_code_settings::mcp::resolve_servers(
+        &serde_json::json!({"mcpServers":{"fixed":{"url":"https://example.com/mcp","headers":{"authorization":"Bearer fixed"},"oauth":{"clientId":3}}}}),
+        std::path::Path::new("/workspace"),
+        &Default::default(),
+    );
+    assert!(matches!(
+        resolved.servers[0].transport,
+        tickloop_harness::protocol::mcp::McpTransport::Http { .. }
+    ));
+}
+
+#[test]
+fn the_artifacts_server_name_is_reserved_for_user_servers() {
+    let settings = json!({"mcpServers":{
+        "tickloop-artifacts":{"url":"https://example.com/mcp"},
+        "notes":{"url":"https://example.com/notes"}
+    }});
+    let resolved = resolve_servers(&settings, Path::new("/work"), &BTreeMap::new());
+    let names = resolved
+        .servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["notes"]);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("tickloop-artifacts")),
+        "{:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
+fn servers_disabled_in_a_directory_stay_listed_as_disabled_there_only() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    let settings = json!({
+        "mcpServers":{"notes":{"url":"https://example.com/notes"}, "local":{"command":"node"}},
+        "projects":{"/work":{"disabledMcpServers":["notes","plugin_docs_search"]}}
+    });
+    let plugins = [PluginServers {
+        user_config: Default::default(),
+        name: "docs".into(),
+        root: "/plugins/docs".into(),
+        data_directory: "/data/docs".into(),
+        entries: BTreeMap::from([("search".into(), json!({"url":"https://example.com/search"}))]),
+    }];
+    let disabled = |directory: &str| {
+        resolve_servers_with_plugins(&settings, Path::new(directory), &BTreeMap::new(), &plugins)
+            .servers
+            .into_iter()
+            .map(|server| (server.name, server.disabled))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        disabled("/work"),
+        BTreeMap::from([
+            ("local".into(), false),
+            ("notes".into(), true),
+            ("plugin_docs_search".into(), true)
+        ])
+    );
+    assert!(disabled("/elsewhere").values().all(|disabled| !disabled));
+}

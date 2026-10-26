@@ -426,5 +426,14 @@
       "kind": "Question",
       "version": 1
     }
+  },
+  {
+    "kind": "reconnect_mcp_server",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "name": "plugin_notes_search"
   }
 ]

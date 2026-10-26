@@ -49,6 +49,9 @@ mod interleaved_context;
 #[path = "all/mcp_approval.rs"]
 mod mcp_approval;
 
+#[path = "all/mcp_resources.rs"]
+mod mcp_resources;
+
 #[path = "all/model_image_capability.rs"]
 mod model_image_capability;
 #[path = "all/model_live.rs"]

@@ -1,7 +1,11 @@
 //! The process entries the `tickloop` executable dispatches before it starts the Console.
 
+mod mcp_command;
+mod mcp_login;
 mod plugin_command;
+mod plugin_config;
 mod plugin_marketplace;
+mod plugin_mcp;
 mod plugin_tick;
 
 use std::ffi::OsString;
@@ -32,6 +36,7 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
             Some(tickloop_code_console::terminal::monitor_command::run(&arguments[1..]).await)
         }
         (TICK_COMMAND, _) => Some(plugin_command::run(PluginKind::Tick, &arguments[1..]).await),
+        ("mcp", _) => Some(mcp_command::run(&arguments[1..]).await),
         (PLUGIN_COMMAND, _) => Some(plugin_command::run(PluginKind::Plugin, &arguments[1..]).await),
         _ => None,
     }

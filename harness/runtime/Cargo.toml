@@ -49,6 +49,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 [dev-dependencies]
+tickloop-tick-oauth-test-server = { path = "../../tick/oauth-test-server" }
 serde_yaml_ng = "0.10"
 tempfile = "3"
 tickloop-harness-test-support = { path = "../test-support" }

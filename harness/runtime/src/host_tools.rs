@@ -395,6 +395,9 @@ impl HostCallResult {
 pub struct McpResourceServer {
     pub name: String,
     pub authority: HostToolAuthority,
+    /// A server the host connects to for the user, as opposed to Tickloop Artifacts; its
+    /// resource results follow the same size rule as its `mcp__` tool results.
+    pub third_party: bool,
 }
 
 /// The instructions an MCP server gave when the host connected to it for an account.
@@ -490,6 +493,20 @@ pub trait HostToolProvider: Send + Sync {
     /// The instructions of the MCP servers whose tools this provider currently offers.
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
         Vec::new()
+    }
+
+    /// The configured MCP servers of this provider, after taking up the current configuration.
+    async fn mcp_server_statuses(
+        &self,
+        _cancel: CancellationToken,
+    ) -> Vec<tickloop_harness_protocol::mcp::McpServerStatus> {
+        Vec::new()
+    }
+
+    /// Connects the MCP server `name` again at the user's request; false when this provider has
+    /// no server of that name.
+    async fn reconnect_mcp_server(&self, _name: &str) -> bool {
+        false
     }
 
     async fn list_mcp_resources(

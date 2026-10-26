@@ -1142,6 +1142,15 @@ impl EmbeddedAgentAccess {
                 )
                 .await
             }
+            AgentCommand::ReconnectMcpServer { execution, name } => {
+                self.chat(execution).await?;
+                self.inner
+                    .agent
+                    .reconnect_mcp_server(&name)
+                    .await
+                    .map_err(agent_access_error)?;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::TrustWorkingDirectory { folder } => {
                 self.inner
                     .agent
@@ -1867,6 +1876,9 @@ impl EmbeddedAgentAccess {
             },
             AgentDetailQuery::Warnings => {
                 ObservationValue::Warnings(self.live_facts(execution, chat).await?.warnings)
+            }
+            AgentDetailQuery::McpServers => {
+                ObservationValue::McpServers(self.inner.agent.mcp_servers().await)
             }
         })
     }

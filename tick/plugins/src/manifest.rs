@@ -4,7 +4,7 @@
 //! carry is recognized, whether or not Tickloop supports it yet.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Component as PathComponent, Path, PathBuf},
@@ -91,7 +91,10 @@ pub enum Component {
 impl Component {
     /// Whether Tickloop uses this component of an installed plugin.
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Tick | Self::Skills)
+        matches!(
+            self,
+            Self::Tick | Self::Skills | Self::McpServers | Self::UserConfig
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -136,6 +139,9 @@ pub struct PluginManifest {
     /// The directories that hold Skills, relative to the plugin root.
     pub skill_paths: Vec<PathBuf>,
     pub components: BTreeSet<Component>,
+    /// Raw MCP entries; the host resolves variables and interprets transports.
+    pub mcp_servers: BTreeMap<String, Value>,
+    pub user_config: BTreeMap<String, UserConfigField>,
     /// What was ignored in the manifest, and why.
     pub warnings: Vec<String>,
 }
@@ -347,8 +353,19 @@ fn from_document(
         components.insert(Component::Skills);
     }
     for (field, component) in COMPONENT_FIELDS {
+        let mut ignored_warnings = Vec::new();
         if let Some(value) = document.get(field)
-            && declared_component(root, field, component, value, &mut warnings)
+            && declared_component(
+                root,
+                field,
+                component,
+                value,
+                if component == Component::McpServers {
+                    &mut ignored_warnings
+                } else {
+                    &mut warnings
+                },
+            )
         {
             components.insert(component);
         }
@@ -372,6 +389,8 @@ fn from_document(
     if tick.is_some() {
         components.insert(Component::Tick);
     }
+    let mcp_servers = read_mcp_servers(root, document.get("mcpServers"), &mut warnings);
+    let user_config = read_user_config(document.get("userConfig"), &mut warnings);
     Ok(PluginManifest {
         name,
         display_name,
@@ -382,6 +401,8 @@ fn from_document(
         auth,
         skill_paths,
         components,
+        mcp_servers,
+        user_config,
         warnings,
     })
 }
@@ -419,6 +440,7 @@ fn from_tick_package(
         components.insert(Component::Skills);
     }
     insert_default_components(root, &mut components, &mut warnings);
+    let mcp_servers = read_mcp_servers(root, None, &mut warnings);
     Ok(PluginManifest {
         name: marketplace_name.map_or(package.name, str::to_owned),
         display_name,
@@ -432,6 +454,8 @@ fn from_tick_package(
         auth: package.auth,
         skill_paths,
         components,
+        mcp_servers,
+        user_config: BTreeMap::new(),
         warnings,
     })
 }
@@ -651,4 +675,162 @@ fn is_showable(text: &str) -> bool {
         && !text
             .chars()
             .any(|character| character.is_control() && character != '\n')
+}
+
+fn read_mcp_servers(
+    root: &Path,
+    declaration: Option<&Value>,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Value> {
+    let mut servers = BTreeMap::new();
+    if root.join(".mcp.json").exists() {
+        read_mcp_declaration(
+            root,
+            &Value::String("./.mcp.json".into()),
+            &mut servers,
+            warnings,
+        );
+    }
+    if let Some(declaration) = declaration {
+        read_mcp_declaration(root, declaration, &mut servers, warnings);
+    }
+    servers
+}
+
+fn read_mcp_declaration(
+    root: &Path,
+    declaration: &Value,
+    servers: &mut BTreeMap<String, Value>,
+    warnings: &mut Vec<String>,
+) {
+    match declaration {
+        Value::Null => {}
+        Value::Array(items) => {
+            for item in items {
+                read_mcp_declaration(root, item, servers, warnings);
+            }
+        }
+        Value::Object(document) => {
+            let entries = match document.get("mcpServers") {
+                Some(Value::Object(entries)) => entries,
+                Some(_) => {
+                    warnings.push("MCP mcpServers must be an object".into());
+                    return;
+                }
+                None => document,
+            };
+            for (name, entry) in entries {
+                if servers
+                    .insert(name.clone(), entry.clone())
+                    .is_some_and(|previous| previous != *entry)
+                {
+                    warnings.push(format!(
+                        "MCP {}: later declaration replaces an earlier entry",
+                        printable(name)
+                    ));
+                }
+            }
+        }
+        Value::String(path) => {
+            let document = contained_path(root, path)
+                .map_err(str::to_owned)
+                .and_then(|relative| {
+                    read_document(&root.join(relative))
+                        .map_err(|_| "cannot read MCP JSON object".to_owned())
+                });
+            match document {
+                Ok(Some(document)) => {
+                    // Files contain entries, never more paths to follow.
+                    read_mcp_declaration(root, &Value::Object(document), servers, warnings);
+                }
+                Ok(None) => warnings.push("MCP configuration file is missing".into()),
+                Err(reason) => warnings.push(format!(
+                    "mcpServers path {:?} is ignored: {reason}",
+                    printable(path)
+                )),
+            }
+        }
+        _ => warnings.push("mcpServers must be an object, path or array".into()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserConfigType {
+    String,
+    Number,
+    Boolean,
+    Directory,
+    File,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct UserConfigField {
+    #[serde(rename = "type")]
+    pub kind: UserConfigType,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub sensitive: bool,
+    #[serde(default)]
+    pub required: bool,
+    pub default: Option<Value>,
+}
+
+impl std::fmt::Debug for UserConfigField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserConfigField")
+            .field("kind", &self.kind)
+            .field("sensitive", &self.sensitive)
+            .field("required", &self.required)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserConfigField {
+    pub fn accepts(&self, value: &Value) -> bool {
+        match self.kind {
+            UserConfigType::String | UserConfigType::Directory | UserConfigType::File => {
+                value.as_str().is_some_and(|text| !text.trim().is_empty())
+            }
+            UserConfigType::Number => value.is_number(),
+            UserConfigType::Boolean => value.is_boolean(),
+        }
+    }
+}
+
+fn read_user_config(
+    value: Option<&Value>,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, UserConfigField> {
+    let mut fields = BTreeMap::new();
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return fields;
+    };
+    let Some(entries) = value.as_object() else {
+        warnings.push("userConfig must be an object".into());
+        return fields;
+    };
+    for (key, value) in entries {
+        let Ok(mut field) = serde_json::from_value::<UserConfigField>(value.clone()) else {
+            warnings.push(format!(
+                "userConfig {} ignored: unknown type or invalid declaration",
+                printable(key)
+            ));
+            continue;
+        };
+        if field
+            .default
+            .as_ref()
+            .is_some_and(|value| !field.accepts(value))
+        {
+            warnings.push(format!(
+                "userConfig {}: invalid default ignored",
+                printable(key)
+            ));
+            field.default = None;
+        }
+        fields.insert(key.clone(), field);
+    }
+    fields
 }

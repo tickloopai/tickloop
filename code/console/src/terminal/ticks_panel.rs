@@ -5,7 +5,13 @@
 //! masked entry of a key. The panel keeps what it shows and what the user chose; the Console runs
 //! the work and hands each result back through [`TicksPanel::apply`].
 
-use std::time::{Duration, Instant};
+use super::plugin_configuration::{ConfigAction, ConfigInput, ConfigurationForm};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+use tickloop_code_settings::plugin_config::PluginUserConfig;
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tick_packages::{ApiKey, LoginState, OAuthIssuer, PackageAuth};
@@ -47,6 +53,10 @@ const CONTEXT_INDENT: &str = "  ";
 pub(super) enum TickPackageRequest {
     /// Reads the installed packages with their login states, and the Tick marketplace.
     Load,
+    SaveConfiguration {
+        name: String,
+        input: ConfigInput,
+    },
     /// Installs or updates to the version the marketplace offers.
     Install(PluginRequest),
     Update(PluginRequest),
@@ -86,10 +96,15 @@ pub(super) struct TickPackageWork {
 pub(super) struct InstalledList {
     pub(super) packages: InstalledPlugins,
     pub(super) logins: Vec<LoginState>,
+    pub(super) configurations: BTreeMap<String, PluginUserConfig>,
 }
 
 #[derive(Debug)]
 pub(super) enum TickPackageResult {
+    ConfigurationSaved {
+        name: String,
+        result: Result<(), String>,
+    },
     /// The installed packages as the read numbered `read` found them; reads are numbered in the
     /// order they start, so one that started later is the more recent.
     Installed {
@@ -138,6 +153,9 @@ pub(super) enum TickPackageResult {
         name: String,
         result: Result<(), String>,
     },
+    /// The MCP servers of the Chat's Worker, whose states tell which plugin servers need a
+    /// login.
+    McpStates(Vec<McpServerStatus>),
 }
 
 /// What became of a result handed to a panel.
@@ -157,14 +175,14 @@ pub(super) struct Notice {
 }
 
 impl Notice {
-    fn success(text: String) -> Self {
+    pub(super) fn success(text: String) -> Self {
         Self {
             text,
             is_failure: false,
         }
     }
 
-    fn failure(text: String) -> Self {
+    pub(super) fn failure(text: String) -> Self {
         Self {
             text,
             is_failure: true,
@@ -176,10 +194,16 @@ impl TickPackageResult {
     /// What an operation's result tells the user; `None` for a result that only refreshes a list.
     pub(super) fn notice(&self) -> Option<Notice> {
         Some(match self {
+            Self::ConfigurationSaved { result: Ok(()), .. } => return None,
+            Self::ConfigurationSaved {
+                name,
+                result: Err(error),
+            } => Notice::failure(format!("Cannot configure {name}: {error}")),
             Self::Installed { .. }
             | Self::Marketplace { .. }
             | Self::Login { .. }
-            | Self::LoginWaiting { .. } => return None,
+            | Self::LoginWaiting { .. }
+            | Self::McpStates(_) => return None,
             Self::LoginEnded {
                 name,
                 result: Ok(()),
@@ -307,6 +331,7 @@ enum Listing<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Choice {
+    Configure(String),
     Run(TickPackageRequest),
     /// Opens the masked entry of the key `label` names for the package.
     EnterKey {
@@ -411,6 +436,8 @@ pub(super) struct TicksPanel {
     top: [usize; 2],
     menus: Vec<PanelMenu>,
     login: Option<LoginView>,
+    configuration: Option<ConfigurationForm>,
+    pending_configuration: Option<String>,
     /// The number of the last OAuth login started.
     login_attempts: u64,
     /// The operation under way, as the panel shows it.
@@ -418,6 +445,8 @@ pub(super) struct TicksPanel {
     notice: Option<Notice>,
     /// The body rows each list row or menu option was drawn on, for pointer selection.
     row_targets: Vec<(std::ops::Range<usize>, usize)>,
+    /// The Worker's MCP servers, once read; before an Agent runs, none.
+    mcp_states: Vec<McpServerStatus>,
 }
 
 impl TicksPanel {
@@ -438,10 +467,13 @@ impl TicksPanel {
             top: [0; 2],
             menus: Vec::new(),
             login: None,
+            configuration: None,
+            pending_configuration: None,
             login_attempts: 0,
             busy: None,
             notice: None,
             row_targets: Vec::new(),
+            mcp_states: Vec::new(),
         }
     }
 
@@ -479,6 +511,9 @@ impl TicksPanel {
             TickPackageResult::Installed { read, listing } => {
                 self.installed_read = read;
                 self.installed = listing.map_or_else(Listing::Failed, Listing::Loaded);
+                if let Some(name) = self.pending_configuration.take() {
+                    self.configure(&name, true);
+                }
             }
             TickPackageResult::Marketplace { read, .. } if read < self.marketplace_read => {}
             TickPackageResult::Marketplace { read, listing } => {
@@ -508,6 +543,27 @@ impl TicksPanel {
                 self.login = None;
                 self.busy = None;
             }
+            TickPackageResult::Installation {
+                result: Ok(installation),
+                ..
+            } => {
+                self.busy = None;
+                if installation.plugin.enabled {
+                    self.pending_configuration = Some(installation.plugin.name().to_owned());
+                }
+            }
+            TickPackageResult::Enabled {
+                name,
+                enabled: true,
+                result: Ok(()),
+            } => {
+                self.busy = None;
+                self.pending_configuration = Some(name);
+            }
+            TickPackageResult::ConfigurationSaved { .. } => {
+                self.busy = None;
+            }
+            TickPackageResult::McpStates(states) => self.mcp_states = states,
             TickPackageResult::Installation { .. }
             | TickPackageResult::Uninstallation { .. }
             | TickPackageResult::Logout { .. }
@@ -523,12 +579,18 @@ impl TicksPanel {
 
     /// Takes pasted text into the key being entered; elsewhere the panel takes no text.
     pub(super) fn filter_text(&self) -> &str {
-        self.filter.draft()
+        self.configuration
+            .as_ref()
+            .map_or_else(|| self.filter.draft(), |form| form.editor.draft())
     }
 
     pub(super) fn replace_filter(&mut self, text: &str) {
         let text = compact_line(text);
         let cursor = text.len();
+        if let Some(form) = &mut self.configuration {
+            form.editor.replace_draft(text, cursor);
+            return;
+        }
         self.filter.replace_draft(text, cursor);
         self.selected[MARKETPLACE_PAGE] = 0;
         self.top[MARKETPLACE_PAGE] = 0;
@@ -539,6 +601,10 @@ impl TicksPanel {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
+        if let Some(form) = &mut self.configuration {
+            form.paste(text);
+            return;
+        }
         self.cancel_uninstall();
         if self.filtering
             && self.page == MARKETPLACE_PAGE
@@ -561,6 +627,23 @@ impl TicksPanel {
     }
 
     pub(super) fn key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        if let Some(form) = &mut self.configuration {
+            return match form.key(key) {
+                ConfigAction::None => TicksPanelEffect::None,
+                ConfigAction::Cancel => {
+                    self.configuration = None;
+                    TicksPanelEffect::None
+                }
+                ConfigAction::ExternalEditor => TicksPanelEffect::EditFilter,
+                ConfigAction::Save => {
+                    let form = self.configuration.take().expect("configuration form");
+                    self.start(TickPackageRequest::SaveConfiguration {
+                        name: form.name,
+                        input: form.input,
+                    })
+                }
+            };
+        }
         let uninstall_key = key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::NONE;
         if !uninstall_key {
             self.cancel_uninstall();
@@ -794,8 +877,32 @@ impl TicksPanel {
         true
     }
 
+    fn configure(&mut self, name: &str, only_missing: bool) {
+        if let Listing::Loaded(list) = &self.installed
+            && let Some(plugin) = list
+                .packages
+                .plugins
+                .iter()
+                .find(|plugin| plugin.name() == name)
+        {
+            self.configuration = ConfigurationForm::new(
+                &plugin.manifest,
+                list.configurations.get(name).cloned().unwrap_or_default(),
+                only_missing,
+            );
+            if self.configuration.is_some() {
+                self.menus.clear();
+                self.notice = None;
+            }
+        }
+    }
+
     fn choose(&mut self, choice: Choice) -> TicksPanelEffect {
         match choice {
+            Choice::Configure(name) => {
+                self.configure(&name, false);
+                TicksPanelEffect::None
+            }
             Choice::Back => {
                 self.menus.pop();
                 TicksPanelEffect::None
@@ -832,6 +939,9 @@ impl TicksPanel {
     /// Starts `request` unless an operation is under way; reading lists never waits.
     fn start(&mut self, mut request: TickPackageRequest) -> TicksPanelEffect {
         let busy = match &request {
+            TickPackageRequest::SaveConfiguration { name, .. } => {
+                format!("Saving configuration for {name}…")
+            }
             TickPackageRequest::Load => {
                 self.installed = Listing::Loading;
                 self.marketplace = Listing::Loading;
@@ -936,6 +1046,9 @@ impl TicksPanel {
         let (title, mut context) = match entry {
             InstalledEntry::Usable { package, login } => {
                 let manifest = &package.manifest;
+                if !manifest.user_config.is_empty() {
+                    options.push(("Configure".into(), Choice::Configure(name.clone())));
+                }
                 match &manifest.auth {
                     PackageAuth::None => {}
                     PackageAuth::ApiKey { label, .. } => options.push((
@@ -978,13 +1091,14 @@ impl TicksPanel {
                         enabled: !package.enabled,
                     }),
                 ));
-                (
-                    format!("{name} {}", package.version),
-                    vec![
-                        login_label(*login).to_owned(),
-                        safe_line(manifest.description.as_deref().unwrap_or_default()),
-                    ],
-                )
+                let mut context = vec![
+                    login_label(*login).to_owned(),
+                    safe_line(manifest.description.as_deref().unwrap_or_default()),
+                ];
+                if self.mcp_login_needed(&name) {
+                    context.push("Log in to its MCP servers in /mcp".to_owned());
+                }
+                (format!("{name} {}", package.version), context)
             }
             InstalledEntry::Unusable(package) => {
                 options.extend(update());
@@ -1008,6 +1122,32 @@ impl TicksPanel {
             context,
             options,
             selected: 0,
+        })
+    }
+
+    /// How many MCP servers the plugin carries, and whether one of them waits for a login.
+    fn mcp_summary(&self, package: &InstalledPlugin) -> String {
+        match package.manifest.mcp_servers.len() {
+            0 => String::new(),
+            count => format!(
+                " · {count} MCP server{}{}",
+                if count == 1 { "" } else { "s" },
+                if self.mcp_login_needed(package.name()) {
+                    " · MCP login needed"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+
+    fn mcp_login_needed(&self, plugin: &str) -> bool {
+        self.mcp_states.iter().any(|server| {
+            server.state == McpServerState::NeedsLogin
+                && server
+                    .source
+                    .strip_prefix(tickloop_code_settings::mcp::PLUGIN_SOURCE_PREFIX)
+                    == Some(plugin)
         })
     }
 
@@ -1152,7 +1292,7 @@ impl TicksPanel {
                     let (details, glyph_role) = match entry {
                         InstalledEntry::Usable { package, login } => (
                             format!(
-                                "{} · {} · {} · {}",
+                                "{} · {} · {} · {}{}",
                                 package.marketplace,
                                 if package.enabled {
                                     "enabled"
@@ -1160,8 +1300,23 @@ impl TicksPanel {
                                     "disabled"
                                 },
                                 package.version,
-                                login_label(*login)
-                            ),
+                                login_label(*login),
+                                if let Listing::Loaded(list) = &self.installed {
+                                    if list
+                                        .configurations
+                                        .get(package.name())
+                                        .cloned()
+                                        .unwrap_or_default()
+                                        .needs_configuration(&package.manifest)
+                                    {
+                                        " · needs configuration"
+                                    } else {
+                                        ""
+                                    }
+                                } else {
+                                    ""
+                                },
+                            ) + &self.mcp_summary(package),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
@@ -1332,6 +1487,9 @@ impl TicksPanel {
     }
 
     pub(super) fn content_rows(&self, width: usize) -> usize {
+        if let Some(form) = &self.configuration {
+            return CHROME_ROWS + form.lines(width).0.len() + self.status_lines(width).len();
+        }
         let body = match (&self.login, self.menus.last()) {
             (Some(login), _) => login_lines(login, width, DisplayProfile::default())
                 .lines
@@ -1362,7 +1520,13 @@ impl TicksPanel {
         let mut body = Vec::new();
         let mut targets = Vec::new();
         let mut cursor = None;
-        let (hint, selected_rows) = if let Some(login) = &self.login {
+        let (hint, selected_rows) = if let Some(form) = &self.configuration {
+            let (shown, column) = form.lines(width);
+            body = shown;
+            let focus = body.len().saturating_sub(1);
+            cursor = Some((focus, column));
+            (form.hint().to_owned(), focus..focus + 1)
+        } else if let Some(login) = &self.login {
             let shown = login_lines(login, width, display);
             body = shown.lines;
             if shown.has_option {
@@ -1443,7 +1607,8 @@ impl TicksPanel {
             (hint, selected_rows)
         };
         let top = &mut self.top[self.page];
-        let shows_list = self.menus.is_empty() && self.login.is_none();
+        let shows_list =
+            self.menus.is_empty() && self.login.is_none() && self.configuration.is_none();
         if shows_list {
             if selected_rows.start < *top {
                 *top = selected_rows.start;
@@ -1631,7 +1796,7 @@ fn context_lines(menu: &PanelMenu, width: usize) -> Vec<RoleLine> {
         .collect()
 }
 
-fn step(selected: usize, count: usize, down: bool) -> usize {
+pub(super) fn step(selected: usize, count: usize, down: bool) -> usize {
     if down {
         (selected + 1).min(count.saturating_sub(1))
     } else {
@@ -1665,6 +1830,8 @@ mod tests {
         };
         InstalledPlugin {
             manifest: PluginManifest {
+                mcp_servers: Default::default(),
+                user_config: Default::default(),
                 name: name.into(),
                 display_name: None,
                 version: Some(version.into()),
@@ -1701,6 +1868,7 @@ mod tests {
         TickPackageResult::Installed {
             read,
             listing: Ok(InstalledList {
+                configurations: BTreeMap::new(),
                 packages: InstalledPlugins {
                     plugins: packages,
                     broken: Vec::new(),
@@ -2648,6 +2816,53 @@ mod tests {
                 && shown.contains("team · 1.0.0 · not installed"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn an_installed_plugin_shows_its_mcp_servers_and_which_need_a_login() {
+        use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+        let mut notes = without_tick(installed("notes", "1.0.0", false));
+        notes.manifest.mcp_servers = [
+            (
+                "search".to_owned(),
+                serde_json::json!({"url":"https://example.com/search"}),
+            ),
+            ("local".to_owned(), serde_json::json!({"command":"node"})),
+        ]
+        .into_iter()
+        .collect();
+        let mut panel = TicksPanel::new(None, PluginKind::Plugin);
+        panel.apply(installed_list(1, vec![(notes, LoginState::NotRequired)]));
+        let row = |panel: &mut TicksPanel| {
+            text(panel)
+                .lines()
+                .find(|line| line.contains("notes"))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            row(&mut panel).ends_with("· 2 MCP servers"),
+            "{}",
+            row(&mut panel)
+        );
+        panel.apply(TickPackageResult::McpStates(vec![McpServerStatus {
+            name: "plugin_notes_search".into(),
+            source: "plugin:notes".into(),
+            transport: "http".into(),
+            state: McpServerState::NeedsLogin,
+            exposure: "direct".into(),
+            tools: Vec::new(),
+            failure: None,
+            oauth: true,
+            logged_in: false,
+        }]));
+        assert!(
+            row(&mut panel).ends_with("· 2 MCP servers · MCP login needed"),
+            "{}",
+            row(&mut panel)
+        );
+        press(&mut panel, KeyCode::Enter);
+        assert!(text(&mut panel).contains("Log in to its MCP servers in /mcp"));
     }
 
     #[test]

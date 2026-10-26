@@ -39,6 +39,7 @@ const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]
        tickloop plugin uninstall PLUGIN [--keep-data]
        tickloop plugin enable PLUGIN
        tickloop plugin disable PLUGIN
+       tickloop plugin configure PLUGIN
        tickloop plugin list [--available]
        tickloop plugin validate DIRECTORY [--name NAME]
        tickloop plugin marketplace add SOURCE
@@ -56,7 +57,7 @@ validate shows what Tickloop reads from a plugin directory: its manifest, Skills
 marketplace add registers a marketplace from a GitHub OWNER/REPO[#REF], a Git URL (https, ssh or file), a local directory, or an https URL of a marketplace.json; it takes the name its marketplace file gives. marketplace list shows them, marketplace update reads one or every one again, and marketplace remove unregisters one and keeps the plugins installed from it. The built-in marketplaces cannot be removed: tickloop, read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file), and claude-plugins-official, fetched with git the first time it is used.
 Installing runs nothing in the plugin, and a plugin's Skills grant no tools; tools still ask as usual.
   -h, --help  Show this help.";
-const SUBCOMMANDS: [&str; 10] = [
+const SUBCOMMANDS: [&str; 11] = [
     "install",
     "update",
     "login",
@@ -67,6 +68,7 @@ const SUBCOMMANDS: [&str; 10] = [
     "list",
     "validate",
     "marketplace",
+    "configure",
 ];
 const KEEP_DATA_OPTION: &str = "--keep-data";
 
@@ -78,6 +80,7 @@ enum PluginCommand<'a> {
         issuer: Option<String>,
     },
     Logout(String),
+    Configure(String),
     ListAvailable,
     InstallPath(&'a Path),
     Uninstall {
@@ -105,7 +108,8 @@ impl PluginCommand<'_> {
     fn is_offered_to(&self, kind: PluginKind) -> bool {
         match self {
             Self::Login { .. } | Self::Logout(_) => kind == PluginKind::Tick,
-            Self::Validate { .. }
+            Self::Configure(_)
+            | Self::Validate { .. }
             | Self::MarketplaceAdd(_)
             | Self::MarketplaceList
             | Self::MarketplaceUpdate(_)
@@ -118,6 +122,7 @@ impl PluginCommand<'_> {
     fn installed_name(&self) -> Option<&str> {
         match self {
             Self::Login { name, .. }
+            | Self::Configure(name)
             | Self::Logout(name)
             | Self::Uninstall { name, .. }
             | Self::SetEnabled { name, .. }
@@ -136,7 +141,25 @@ fn usage(kind: PluginKind) -> &'static str {
 
 /// Runs `tickloop tick` or `tickloop plugin`, as `kind` names it, with `arguments`.
 pub async fn run(kind: PluginKind, arguments: &[OsString]) -> Result<(), String> {
-    let command = parse(arguments)
+    let command = parse(arguments);
+    if kind == PluginKind::Plugin
+        && let Some(PluginCommand::Login { name, .. }) = &command
+        && let Ok(plugin) = store()?.get(name)
+        && PluginKind::of_installed(&plugin) == PluginKind::Plugin
+        && plugin.manifest.mcp_servers.values().any(|entry| {
+            entry["url"].is_string()
+                && !entry["headers"].as_object().is_some_and(|headers| {
+                    headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("authorization"))
+                })
+        })
+    {
+        return Err(format!(
+            "This plugin uses MCP server login; log in from /mcp or with tickloop mcp login plugin:{name}:<server>."
+        ));
+    }
+    let command = command
         .filter(|command| command.is_offered_to(kind))
         .ok_or_else(|| {
             format!(
@@ -188,6 +211,10 @@ pub async fn run(kind: PluginKind, arguments: &[OsString]) -> Result<(), String>
         PluginCommand::Uninstall { name, keep_data } => uninstall(&store, kind, &name, keep_data)?,
         PluginCommand::SetEnabled { name, enabled } => set_enabled(&store, &name, enabled)?,
         PluginCommand::List => list(&store, kind)?,
+        PluginCommand::Configure(name) => {
+            let plugin = store.get(&name).map_err(|error| error.to_string())?;
+            super::plugin_config::configure(&store, &plugin, true)?;
+        }
         PluginCommand::MarketplaceAdd(source) => {
             super::plugin_marketplace::add_marketplace(&store, &source).await?
         }
@@ -255,6 +282,9 @@ fn parse(arguments: &[OsString]) -> Option<PluginCommand<'_>> {
                 name: name(plugin),
                 issuer: Some(name(issuer)),
             }
+        }
+        [command, plugin] if command == "configure" && !is_option(plugin) => {
+            PluginCommand::Configure(name(plugin))
         }
         [command, plugin] if command == "logout" && !is_option(plugin) => {
             PluginCommand::Logout(name(plugin))
@@ -376,6 +406,7 @@ fn install_path(
         .install_path(path)
         .map_err(|error| format!("cannot install {}: {error}", path.display()))?;
     report(&installation, kind);
+    super::plugin_config::configure(store, &installation.plugin, false)?;
     Ok(())
 }
 
@@ -428,6 +459,7 @@ pub(super) fn report_notes(plugin: &InstalledPlugin) {
         println!("When opened, its Tick program runs as your user. Installing runs nothing.");
     }
     report_manifest_notes(&plugin.manifest);
+    super::plugin_mcp::installed(plugin);
 }
 
 /// Prints the components Tickloop does not use yet and what it ignored in the manifest.
@@ -502,6 +534,12 @@ fn set_enabled(store: &PluginStore, name: &str, enabled: bool) -> Result<(), Str
         (false, false) => {
             println!("Disabled {noun} {id}; its Skills stop loading from the next request.")
         }
+    }
+    if enabled {
+        super::plugin_config::configure(store, &plugin, false)?;
+        super::plugin_mcp::installed(&plugin);
+    } else if !plugin.manifest.mcp_servers.is_empty() {
+        println!("Its MCP servers stop from the next Agent request.");
     }
     Ok(())
 }
@@ -627,6 +665,7 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
         );
     }
     report_manifest_notes(&manifest);
+    super::plugin_mcp::validate(&manifest, &root);
     Ok(())
 }
 

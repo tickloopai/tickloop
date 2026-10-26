@@ -8,6 +8,55 @@ pub struct McpServerConfig {
     pub source: String,
     pub transport: McpTransport,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub oauth: McpOAuthConfig,
+    /// Host-provided secrets to remove from every server response.
+    #[serde(default)]
+    pub sensitive_values: Vec<serde_json::Value>,
+    /// The user turned the server off where the Agent works: it stays listed but never runs.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// Until servers choose how their tools reach the model, every tool is listed directly.
+pub const DIRECT_EXPOSURE: &str = "direct";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerState {
+    Connecting,
+    Connected,
+    Failed,
+    Unsupported,
+    NeedsLogin,
+    NeedsConfiguration,
+    Disabled,
+}
+
+/// What a View shows of one of the Agent's MCP Servers. It carries no secret: tool descriptions
+/// and the failure are redacted like everything else the server sends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    /// `global`, `directory` or `plugin:<plugin>`.
+    pub source: String,
+    /// `stdio`, `http`, or the unsupported type the configuration names.
+    pub transport: String,
+    pub state: McpServerState,
+    /// How the server's tools reach the model.
+    pub exposure: String,
+    pub tools: Vec<McpToolSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    /// Whether the user logs in to the server with OAuth, and whether a login is saved.
+    pub oauth: bool,
+    pub logged_in: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolSummary {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +75,17 @@ pub enum McpTransport {
     Unsupported {
         kind: String,
     },
+    NeedsConfiguration,
     Failed {
         reason: String,
     },
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthConfig {
+    pub client_id: Option<String>,
+    pub callback_port: Option<u16>,
+    #[serde(rename = "authServerMetadataUrl")]
+    pub authorization_server_metadata_url: Option<String>,
 }

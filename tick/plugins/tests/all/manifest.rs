@@ -44,7 +44,7 @@ fn a_claude_plugin_lists_its_skills_and_the_components_tickloop_does_not_use_yet
     );
     assert_eq!(
         manifest.unsupported(),
-        vec![Component::Commands, Component::Hooks, Component::McpServers]
+        vec![Component::Commands, Component::Hooks]
     );
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
     let root = root.canonicalize().unwrap();
@@ -392,10 +392,8 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
             Component::Commands,
             Component::Agents,
             Component::Hooks,
-            Component::McpServers,
             Component::LspServers,
             Component::OutputStyles,
-            Component::UserConfig,
             Component::Channels,
             Component::Settings,
             Component::Dependencies
@@ -462,4 +460,63 @@ fn invalid_component_paths_are_not_rediscovered_at_default_locations() {
             );
         }
     }
+}
+
+#[test]
+fn mcp_entries_merge_default_file_and_manifest_objects_paths_and_arrays() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "mcp",
+        &json!({
+            "name":"mcp", "mcpServers":["./extra.json", {"inline":{"command":"inline"}}]
+        }),
+        &[],
+    );
+    write_json(
+        &root.join(".mcp.json"),
+        &json!({"mcpServers":{"default":{"command":"default"}}}),
+    );
+    write_json(
+        &root.join("extra.json"),
+        &json!({"extra":{"url":"https://example.com/mcp"}}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert!(!manifest.unsupported().contains(&Component::McpServers));
+    assert_eq!(
+        serde_json::to_value(&manifest.mcp_servers).unwrap(),
+        json!({
+            "default":{"command":"default"}, "extra":{"url":"https://example.com/mcp"}, "inline":{"command":"inline"}
+        })
+    );
+    assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
+}
+
+#[test]
+fn user_config_declarations_keep_supported_types_and_ignore_unknown_types() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("configured", &json!({
+        "name":"configured", "userConfig": {
+            "key":{"type":"string","title":"API key","description":"Your key","sensitive":true,"required":true},
+            "count":{"type":"number","default":3},
+            "active":{"type":"boolean","default":false},
+            "folder":{"type":"directory"}, "document":{"type":"file"},
+            "unknown":{"type":"future","default":"do-not-print"}
+        }
+    }), &[]);
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(manifest.user_config.len(), 5);
+    let key = &manifest.user_config["key"];
+    assert!(key.sensitive && key.required);
+    assert_eq!(key.title.as_deref(), Some("API key"));
+    assert_eq!(key.description.as_deref(), Some("Your key"));
+    assert_eq!(manifest.user_config["count"].default, Some(json!(3)));
+    assert_eq!(manifest.user_config["active"].default, Some(json!(false)));
+    assert!(!manifest.unsupported().contains(&Component::UserConfig));
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown"))
+    );
+    assert!(!format!("{:?}", manifest.warnings).contains("do-not-print"));
 }

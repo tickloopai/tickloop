@@ -8,18 +8,38 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tickloop_harness_protocol::{ChatId, HostToolAuthority};
 
+pub struct McpConfiguration {
+    pub servers: Vec<McpServerConfig>,
+    pub warnings: Vec<String>,
+}
+
 pub struct McpToolProvider {
     connections: McpConnections,
-    configuration: Arc<dyn Fn() -> Vec<McpServerConfig> + Send + Sync>,
+    configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
+    warnings: RwLock<Vec<String>>,
 }
 impl McpToolProvider {
     pub fn new(
         connections: McpConnections,
         configuration: Arc<dyn Fn() -> Vec<McpServerConfig> + Send + Sync>,
     ) -> Self {
+        Self::with_configuration(
+            connections,
+            Arc::new(move || McpConfiguration {
+                servers: configuration(),
+                warnings: Vec::new(),
+            }),
+        )
+    }
+
+    pub fn with_configuration(
+        connections: McpConnections,
+        configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
+    ) -> Self {
         Self {
             connections,
             configuration,
+            warnings: RwLock::new(Vec::new()),
         }
     }
     fn authority(entry: &Entry) -> HostToolAuthority {
@@ -64,16 +84,47 @@ impl HostToolProvider for McpToolProvider {
         if cancel.is_cancelled() {
             return Err("MCP refresh cancelled".into());
         }
-        self.connections.reconcile((self.configuration)()).await;
+        let configuration = (self.configuration)();
+        self.connections.reconcile(configuration.servers).await;
+        *self.warnings.write().unwrap() = configuration.warnings;
         Ok(())
     }
+    async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
+        if !cancel.is_cancelled() {
+            let configuration = (self.configuration)();
+            self.connections
+                .reconcile_keeping_failures(configuration.servers)
+                .await;
+            *self.warnings.write().unwrap() = configuration.warnings;
+        }
+        self.connections.statuses()
+    }
+    async fn reconnect_mcp_server(&self, name: &str) -> bool {
+        let configuration = (self.configuration)();
+        let reconnected = self
+            .connections
+            .reconnect(configuration.servers, name)
+            .await;
+        *self.warnings.write().unwrap() = configuration.warnings;
+        reconnected
+    }
+    fn service_connections(&self) -> Value {
+        serde_json::json!({"mcp": {"warnings": *self.warnings.read().unwrap()}})
+    }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
-        self.connections.snapshot().into_iter().filter_map(|snapshot| {
+        self.connections.snapshot().into_iter().filter(|snapshot| snapshot.state != McpServerState::Disabled).filter_map(|snapshot| {
             let entries = self.connections.inner.entries.read().unwrap();
             let entry = entries.get(&snapshot.name)?;
-            Some(McpServerInstructions {server:McpResourceServer {name:snapshot.name.clone(), authority:Self::authority(entry)}, text:format!("MCP server: {}; source: {}; status: {:?}. Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, redact(entry, snapshot.instructions))})
+            let login_hint = if snapshot.state == McpServerState::NeedsLogin {
+                " Ask the user to log in from /mcp or with tickloop mcp login <server>. Only the user can log in."
+            } else { "" };
+            Some(McpServerInstructions {
+                server: McpResourceServer { name: snapshot.name.clone(), authority: Self::authority(entry), third_party: true },
+                text: format!("MCP server: {}; source: {}; status: {:?}.{} Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, login_hint, redact(entry, snapshot.instructions)),
+            })
         }).collect()
     }
+
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
         self.connections
             .inner
@@ -81,10 +132,19 @@ impl HostToolProvider for McpToolProvider {
             .read()
             .unwrap()
             .values()
-            .filter(|entry| *entry.state.read().unwrap() == McpServerState::Connected)
+            .filter(|entry| {
+                *entry.state.read().unwrap() == McpServerState::Connected
+                    && entry
+                        .connection
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|connection| connection.resources.is_some())
+            })
             .map(|entry| McpResourceServer {
                 name: entry.config.name.clone(),
                 authority: Self::authority(entry),
+                third_party: true,
             })
             .collect()
     }

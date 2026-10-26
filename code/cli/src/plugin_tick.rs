@@ -182,7 +182,7 @@ fn save_key(credentials: &PackageCredentials, name: &str, label: &str) -> Result
 }
 
 /// Reads a line from the terminal without showing it; `None` when Esc or Ctrl+C cancels.
-fn read_hidden_line() -> io::Result<Option<String>> {
+pub(super) fn read_hidden_line() -> io::Result<Option<String>> {
     terminal::enable_raw_mode()?;
     let entered = read_hidden_keys();
     terminal::disable_raw_mode()?;

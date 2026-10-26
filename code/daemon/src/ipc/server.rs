@@ -320,6 +320,7 @@ pub(super) async fn serve_connection_mode(
         AccessCapability::ClearCompletedTasks,
         AccessCapability::EnqueueAfterTurn,
         AccessCapability::RefreshConfiguration,
+        AccessCapability::ReconnectMcpServer,
         AccessCapability::FlushTranscripts,
         AccessCapability::DisplayRegistration,
         AccessCapability::TrustWorkingDirectory,

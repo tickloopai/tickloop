@@ -301,7 +301,7 @@ impl State {
             && self.history_search.is_none()
             && self.suspended_dialog.is_none()
             && self.artifacts_picker.is_none()
-            && self.ticks_panel.is_none()
+            && self.user_panel.is_none()
             && self.conversation_picker.is_none()
             && self.picker_search.is_none()
             && self.menu_comment.is_none()

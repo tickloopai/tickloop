@@ -334,6 +334,7 @@ pub(super) enum InputEvent {
     ArtifactSignOut,
     /// Work `/plugins` asks for, or the login state to read again once a login program ended.
     TickPackages(super::ticks_panel::TickPackageWork),
+    Mcp(super::mcp_panel::McpWork),
     TickAction {
         chat: Uuid,
         action: super::tick_actions::PreparedTickAction,
@@ -393,6 +394,7 @@ impl fmt::Debug for InputEvent {
                 .finish(),
             Self::ArtifactSignOut => formatter.write_str("ArtifactSignOut"),
             Self::TickPackages(work) => formatter.debug_tuple("TickPackages").field(work).finish(),
+            Self::Mcp(work) => formatter.debug_tuple("Mcp").field(work).finish(),
             Self::TickAction { chat, action } => formatter
                 .debug_struct("TickAction")
                 .field("chat", chat)
@@ -857,7 +859,7 @@ pub(super) struct State {
     /// The `/resume` picker owns input while open; the
     /// draft and conversation underneath stay untouched.
     artifacts_picker: Option<super::artifacts_picker::ArtifactsPicker>,
-    ticks_panel: Option<super::ticks_panel::TicksPanel>,
+    user_panel: Option<super::user_panel::UserPanel>,
     conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
@@ -1815,15 +1817,15 @@ impl Console {
         Ok(())
     }
 
-    pub(super) fn show_ticks_panel(
+    pub(super) fn show_user_panel(
         &self,
-        panel: super::ticks_panel::TicksPanel,
+        panel: super::user_panel::UserPanel,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
-            return Err("/plugins needs an interactive terminal".into());
+            return Err(format!("{} needs an interactive terminal", panel.title()));
         }
-        state.install_ticks_panel(panel);
+        state.install_user_panel(panel);
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -1837,7 +1839,7 @@ impl Console {
         result: super::ticks_panel::TickPackageResult,
     ) -> Result<super::ticks_panel::Applied, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let Some(open) = state.ticks_panel_mut(panel) else {
+        let Some(super::user_panel::UserPanel::Packages(open)) = state.user_panel_mut(panel) else {
             return Ok(super::ticks_panel::Applied::NoPanel);
         };
         let applied = open.apply(result);
@@ -1845,6 +1847,35 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
         Ok(applied)
+    }
+
+    /// Hands `result` to the `/mcp` panel `panel`, shown or waiting; `None` when it is closed,
+    /// otherwise whether it took the result.
+    pub(super) fn apply_mcp_result(
+        &self,
+        panel: Uuid,
+        result: super::mcp_panel::McpResult,
+    ) -> Result<Option<bool>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(super::user_panel::UserPanel::Mcp(open)) = state.user_panel_mut(panel) else {
+            return Ok(None);
+        };
+        let taken = open.apply(result);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(taken))
+    }
+
+    /// The `/mcp` panel shown while its servers are still connecting.
+    pub(super) fn mcp_panel_awaiting_connections(&self) -> Result<Option<Uuid>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(match &state.user_panel {
+            Some(super::user_panel::UserPanel::Mcp(panel)) if panel.awaits_connections() => {
+                Some(panel.id())
+            }
+            _ => None,
+        })
     }
 
     pub(super) fn set_monitor_preference(
@@ -2281,7 +2312,7 @@ impl Console {
             && !state.menu_submission_is_pending()
             && (state.input_dialog_visible()
                 || state.artifacts_picker.is_some()
-                || state.ticks_panel.is_some()
+                || state.user_panel.is_some()
                 || state.conversation_picker.is_some()
                 || state.permissions_surface.is_some()
                 || state
@@ -5984,7 +6015,7 @@ impl State {
             picker_presentation: Default::default(),
             picker_search: None,
             artifacts_picker: None,
-            ticks_panel: None,
+            user_panel: None,
             conversation_picker: None,
             menu_link: None,
             menu_review: None,
@@ -6223,7 +6254,7 @@ impl State {
                 let body_row = row - rule_rows;
                 if self.menu.is_none()
                     && (self.artifacts_picker.is_some()
-                        || self.ticks_panel.is_some()
+                        || self.user_panel.is_some()
                         || self.conversation_picker.is_some())
                 {
                     match event.kind {
@@ -6238,7 +6269,7 @@ impl State {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let selected = if let Some(picker) = &mut self.artifacts_picker {
                                 picker.select_at_row(body_row)
-                            } else if let Some(panel) = &mut self.ticks_panel {
+                            } else if let Some(panel) = &mut self.user_panel {
                                 panel.select_at_row(body_row)
                             } else {
                                 self.conversation_picker
@@ -6866,7 +6897,7 @@ impl State {
                     && self.menu.is_none()
                     && self.conversation_picker.is_none()
                     && self.artifacts_picker.is_none()
-                    && self.ticks_panel.is_none()
+                    && self.user_panel.is_none()
                     && self.permissions_surface.is_none())
             && self.transcript.is_none()
             && self.diff_screen.is_none()
@@ -7362,7 +7393,7 @@ impl State {
             || self.footer.selected().is_some()
             || self.help_open
             || self.permissions_surface.is_some()
-            || self.ticks_panel.is_some()
+            || self.user_panel.is_some()
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 && !self.dialog_cursor_visible
             || self.conversation_focused
@@ -10736,7 +10767,7 @@ impl State {
             self.clear_prompt_suggestion();
         }
         if self.menu.is_none()
-            && let Some(panel) = &mut self.ticks_panel
+            && let Some(panel) = &mut self.user_panel
         {
             panel.paste(text);
             return None;
@@ -11749,7 +11780,7 @@ impl State {
             self.monitor_notice = None;
         }
         let plugin_expired = self
-            .ticks_panel
+            .user_panel
             .as_mut()
             .is_some_and(|panel| panel.expire_confirmation());
         plugin_expired
@@ -12062,17 +12093,17 @@ impl State {
             };
         }
         if self.menu.is_none()
-            && let Some(panel) = &mut self.ticks_panel
+            && let Some(panel) = &mut self.user_panel
         {
             return match panel.key(key) {
-                super::ticks_panel::TicksPanelEffect::None => None,
-                super::ticks_panel::TicksPanelEffect::EditFilter => {
-                    let query = panel.filter_text().to_owned();
-                    let outcome = self.run_external_editor(&query);
-                    let panel = self.ticks_panel.as_mut().unwrap();
+                super::user_panel::UserPanelEffect::None => None,
+                super::user_panel::UserPanelEffect::EditText => {
+                    let text = panel.editable_text().to_owned();
+                    let outcome = self.run_external_editor(&text);
+                    let panel = self.user_panel.as_mut().unwrap();
                     match outcome {
                         Some(ExternalEditorOutcome::Updated { content }) => {
-                            panel.replace_filter(&content)
+                            panel.replace_text(&content)
                         }
                         Some(ExternalEditorOutcome::Failed(error)) => {
                             panel.report(error.to_string())
@@ -12084,17 +12115,23 @@ impl State {
                     }
                     None
                 }
-                super::ticks_panel::TicksPanelEffect::Close => {
-                    self.ticks_panel = None;
+                super::user_panel::UserPanelEffect::Close => {
+                    self.user_panel = None;
                     self.rendered_region = None;
                     None
                 }
-                super::ticks_panel::TicksPanelEffect::Work(request) => Some(
+                super::user_panel::UserPanelEffect::Packages(request) => Some(
                     InputEvent::TickPackages(super::ticks_panel::TickPackageWork {
                         panel: panel.id(),
                         request,
                     }),
                 ),
+                super::user_panel::UserPanelEffect::Mcp(request) => {
+                    Some(InputEvent::Mcp(super::mcp_panel::McpWork {
+                        panel: panel.id(),
+                        request,
+                    }))
+                }
             };
         }
         if self.menu.is_none() && self.conversation_picker.is_some() {

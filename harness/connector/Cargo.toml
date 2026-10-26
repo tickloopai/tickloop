@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tracing = "0.1"
 async-trait = "0.1"
 futures-util = "0.3"
 http = "1"
@@ -25,5 +26,6 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tickloop-tick-oauth-test-server = { path = "../../tick/oauth-test-server" }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -4246,6 +4246,9 @@ dependencies = [
 name = "tickloop-code-settings"
 version = "0.2.25"
 dependencies = [
+ "async-trait",
+ "libc",
+ "percent-encoding",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4254,9 +4257,12 @@ dependencies = [
  "thiserror 2.0.20",
  "tickloop-harness",
  "tickloop-tick-installer",
+ "tickloop-tick-oauth-test-server",
  "tickloop-tick-packages",
  "tickloop-tick-plugins",
  "time",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -4356,6 +4362,8 @@ dependencies = [
  "tickloop-tick-oauth-test-server",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4473,6 +4481,7 @@ dependencies = [
  "tickloop-harness-tools",
  "tickloop-harness-transcript",
  "tickloop-ids",
+ "tickloop-tick-oauth-test-server",
  "tickloop-tick-protocol",
  "time",
  "tokio",

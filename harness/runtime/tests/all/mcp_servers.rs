@@ -22,12 +22,15 @@ async fn http_connection_discovers_and_calls_the_original_tool() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "sample".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 300_000,
         }])
         .await;
@@ -76,12 +79,15 @@ async fn schema_unions_are_flattened_and_ambiguous_tools_are_withdrawn() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "schema".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 300_000,
         }])
         .await;
@@ -116,6 +122,8 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "local".into(),
             source: "global".into(),
             transport: McpTransport::Stdio {
@@ -124,6 +132,7 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
                 env: BTreeMap::new(),
                 cwd: std::env::current_dir().unwrap(),
             },
+            oauth: Default::default(),
             timeout_ms: 300_000,
         }])
         .await;
@@ -172,12 +181,15 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"approved result"}]}));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
         name: "review".into(),
         source: "global".into(),
         transport: McpTransport::Http {
             url: server.url(),
             headers: BTreeMap::new(),
         },
+        oauth: Default::default(),
         timeout_ms: 300_000,
     }];
     let connections = McpConnections::new(
@@ -263,12 +275,15 @@ async fn resources_and_unknown_call_outcomes_remain_bound_to_the_server() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "resources".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -311,12 +326,15 @@ async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
         BTreeMap::new(),
     );
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
         name: "expiry".into(),
         source: "global".into(),
         transport: McpTransport::Http {
             url: server.url(),
             headers: BTreeMap::new(),
         },
+        oauth: Default::default(),
         timeout_ms: 1000,
     }];
     connections.reconcile(configs.clone()).await;
@@ -371,12 +389,15 @@ async fn text_embedded_resources_and_images_reach_the_host_result() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "mixed".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -409,12 +430,15 @@ async fn large_results_keep_both_ends_and_save_full_text_in_family_temporary_sto
     let full = format!("START{}END", "中".repeat(8000));
     server.set_result(json!({"content":[{"type":"text","text":full}]}));
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
         name: "output".into(),
         source: "global".into(),
         transport: McpTransport::Http {
             url: server.url(),
             headers: BTreeMap::new(),
         },
+        oauth: Default::default(),
         timeout_ms: 1000,
     }];
     let connections = McpConnections::new(
@@ -491,21 +515,27 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
     connections
         .reconcile(vec![
             McpServerConfig {
+                sensitive_values: Vec::new(),
+                disabled: false,
                 name: "a".into(),
                 source: "global".into(),
                 transport: McpTransport::Http {
                     url: first.url(),
                     headers: BTreeMap::new(),
                 },
+                oauth: Default::default(),
                 timeout_ms: 1000,
             },
             McpServerConfig {
+                sensitive_values: Vec::new(),
+                disabled: false,
                 name: "a__b".into(),
                 source: "global".into(),
                 transport: McpTransport::Http {
                     url: second.url(),
                     headers: BTreeMap::new(),
                 },
+                oauth: Default::default(),
                 timeout_ms: 1000,
             },
         ])
@@ -561,12 +591,15 @@ async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "secrets".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -601,12 +634,15 @@ async fn a_resource_404_cannot_reclassify_a_later_timed_out_mutation() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "outcome".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -661,12 +697,15 @@ async fn resource_uri_collisions_do_not_redirect_to_another_provider() {
     };
     let server = McpService::start().await;
     let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
         name: "other".into(),
         source: "global".into(),
         transport: McpTransport::Http {
             url: server.url(),
             headers: BTreeMap::new(),
         },
+        oauth: Default::default(),
         timeout_ms: 1000,
     }];
     let connections = McpConnections::new(
@@ -755,6 +794,8 @@ for line in sys.stdin:
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "blocked".into(),
             source: "global".into(),
             transport: McpTransport::Stdio {
@@ -763,6 +804,7 @@ for line in sys.stdin:
                 env: BTreeMap::new(),
                 cwd: std::env::current_dir().unwrap(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -821,9 +863,12 @@ async fn bearer_scheme_spelling_and_stdio_arguments_do_not_expose_tokens() {
         );
         connections
             .reconcile(vec![McpServerConfig {
+                sensitive_values: Vec::new(),
+                disabled: false,
                 name: "secret".into(),
                 source: "global".into(),
                 transport,
+                oauth: Default::default(),
                 timeout_ms: 1000,
             }])
             .await;
@@ -870,12 +915,15 @@ async fn credential_renewal_does_not_block_background_connection_startup() {
     let started = tokio::time::timeout(
         Duration::from_millis(500),
         connections.reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "renew".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }]),
     )
@@ -902,12 +950,15 @@ async fn list_change_withdraws_old_tools_while_the_new_directory_is_loading() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "revision".into(),
             source: "global".into(),
             transport: McpTransport::Http {
                 url: server.url(),
                 headers: BTreeMap::new(),
             },
+            oauth: Default::default(),
             timeout_ms: 1000,
         }])
         .await;
@@ -934,5 +985,673 @@ async fn list_change_withdraws_old_tools_while_the_new_directory_is_loading() {
         HostCallResult::NotDispatched(_)
     ));
     assert_eq!(server.calls().len(), 1);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn insufficient_scope_withdraws_tools_and_stops_connection_retries() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    server.set_status(403);
+    server.set_challenge("Bearer error=\"insufficient_scope\", scope=\"write\"");
+    connections
+        .call("mcp__remote__probe", json!({}), CancellationToken::new())
+        .await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert!(connections.snapshot()[0].tools.is_empty());
+    let requests = server.request_count();
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert_eq!(server.request_count(), requests);
+    connections.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_renews_rejected_and_expiring_tokens_and_stops_after_invalid_grant() {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH, TOKEN_PATH, TokenReply};
+    use tickloop_harness_connector::{Connector, OAuthSettings};
+    let server = McpService::start().await;
+    let authorization = AuthorizationServer::start();
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let cancel = CancellationToken::new();
+    let metadata = format!("{}{METADATA_PATH}", authorization.issuer());
+    let connector = Connector::new(
+        &server.url(),
+        OAuthSettings {
+            authorization_server_metadata_url: Some(metadata.clone()),
+            ..Default::default()
+        },
+        credentials.clone(),
+    )
+    .unwrap();
+    let login = connector.start_login(None, &cancel).await.unwrap();
+    login
+        .paste()
+        .submit(&authorization.approve(login.authorization_url()))
+        .unwrap();
+    login.finish(&cancel).await.unwrap();
+    server.require_bearer("access-2");
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: tickloop_harness_protocol::mcp::McpOAuthConfig {
+            authorization_server_metadata_url: Some(metadata),
+            ..Default::default()
+        },
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials.clone() as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(
+        connections.snapshot()[0].state,
+        McpServerState::Connected,
+        "a rejected saved token should be renewed during connection"
+    );
+    assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 2);
+
+    server.require_bearer("access-3");
+    let outcome = connections
+        .call("mcp__remote__probe", json!({}), cancel.clone())
+        .await;
+    assert!(matches!(outcome, HostCallResult::OutcomeUnknown(_)));
+    assert_eq!(
+        server.calls().len(),
+        1,
+        "the dispatched call must not be replayed"
+    );
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 3);
+
+    let mut saved = credentials.current().unwrap();
+    saved.token.as_mut().unwrap().expires_at = 0;
+    credentials.replace(Some(saved));
+    server.require_bearer("access-4");
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 4);
+
+    authorization.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
+    let mut saved = credentials.current().unwrap();
+    saved.token.as_mut().unwrap().expires_at = 0;
+    credentials.replace(Some(saved));
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert!(credentials.current().unwrap().token.is_none());
+    let requests = server.request_count();
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert_eq!(server.request_count(), requests);
+    connections.shutdown().await;
+}
+
+async fn settled(connections: &McpConnections) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state == McpServerState::Connecting {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn resource_authentication_failure_requires_login_before_more_requests() {
+    let server = McpService::start().await;
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    server.set_status(401);
+    assert!(
+        connections
+            .read_resource("remote", "fixture://text", CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    let requests = server.request_count();
+    assert!(
+        connections
+            .read_resource("remote", "fixture://text", CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(
+        connections
+            .list_resources("remote", None, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.request_count(), requests);
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    connections.shutdown().await;
+}
+
+#[derive(Clone, Default)]
+struct ProtocolLog(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for ProtocolLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH, TokenReply};
+    use tickloop_harness_connector::{Connector, OAuthSettings};
+    let log = ProtocolLog::default();
+    let writer = log.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
+    let server = McpService::start().await;
+    let authorization = AuthorizationServer::start();
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let cancel = CancellationToken::new();
+    let connector = Connector::new(
+        &server.url(),
+        OAuthSettings {
+            authorization_server_metadata_url: Some(format!(
+                "{}{METADATA_PATH}",
+                authorization.issuer()
+            )),
+            ..Default::default()
+        },
+        credentials.clone(),
+    )
+    .unwrap();
+    let login = connector.start_login(None, &cancel).await.unwrap();
+    login
+        .paste()
+        .submit(&authorization.approve(login.authorization_url()))
+        .unwrap();
+    login.finish(&cancel).await.unwrap();
+    let token = credentials.current().unwrap().token.unwrap();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_resources(json!([{"uri":"fixture://text", "name":token.refresh_token}]));
+    server.notify_log_with_unicode_escapes(&format!(
+        "{} {}",
+        token.access_token,
+        token.refresh_token.as_ref().unwrap()
+    ));
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections.reconcile(configs).await;
+    settled(&connections).await;
+    connections
+        .call("mcp__remote__probe", json!({}), cancel.clone())
+        .await;
+    server.notify_custom(&format!("fixture/{}", token.access_token));
+    connections
+        .call("mcp__remote__probe", json!({}), cancel.clone())
+        .await;
+    let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.contains(&token.access_token),
+        "SDK logging exposed the access token"
+    );
+    assert!(
+        !logged.contains(token.refresh_token.as_ref().unwrap()),
+        "SDK logging exposed the refresh token"
+    );
+    authorization.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
+    server.set_status(401);
+    connections
+        .call("mcp__remote__probe", json!({}), cancel)
+        .await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    let visible = serde_json::to_string(&connections.snapshot()).unwrap();
+    assert!(
+        !visible.contains(token.refresh_token.as_ref().unwrap()),
+        "invalidation forgot a secret still present in cached resources"
+    );
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
+    use tickloop_harness_connector::{
+        ConnectorCredential, ConnectorCredentials, CredentialError, CredentialLock,
+    };
+    #[derive(Default)]
+    struct StalledCredentials {
+        inner: InMemoryCredentials,
+        entered: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl ConnectorCredentials for StalledCredentials {
+        async fn lock(&self) -> Result<CredentialLock, CredentialError> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn load(&self) -> Result<Option<ConnectorCredential>, CredentialError> {
+            self.inner.load().await
+        }
+        async fn save(&self, credential: &ConnectorCredential) -> Result<(), CredentialError> {
+            self.inner.save(credential).await
+        }
+    }
+    let server = McpService::start().await;
+    let credentials = Arc::new(StalledCredentials::default());
+    credentials.inner.replace(Some(ConnectorCredential {
+        server_url:server.url(), registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()}, resource:None,
+        token:Some(serde_json::from_value(json!({"access_token":"expired-access","refresh_token":"expired-refresh","token_type":"Bearer","issuer":server.url(),"expires_at":0,"client_id":"client","token_endpoint":server.url()})).unwrap()),
+    }));
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials.clone() as Arc<dyn ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), credentials.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert_eq!(server.request_count(), 0);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc_ids() {
+    let server = McpService::start().await;
+    server.require_bearer("1");
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}},{"name":"v1_probe","inputSchema":{"type":"object"}}]));
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let released = Arc::downgrade(&credentials);
+    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential {
+        server_url:server.url(), resource:None,
+        registration:tickloop_harness_connector::ClientRegistration{authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()},
+        token:Some(serde_json::from_value(json!({"access_token":"1","token_type":"Bearer","issuer":server.url(),"expires_at":u64::MAX,"client_id":"client","token_endpoint":server.url()})).unwrap()),
+    }));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            sensitive_values: Vec::new(),
+            disabled: false,
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(
+        connections.snapshot()[0].tools.len(),
+        1,
+        "a sensitive tool name must be omitted instead of rewritten for dispatch"
+    );
+    assert_eq!(
+        connections.snapshot()[0].tools[0].name,
+        "mcp__remote__probe"
+    );
+    assert!(matches!(
+        connections
+            .call("mcp__remote__probe", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    connections.shutdown().await;
+    drop(connections);
+    assert!(
+        released.upgrade().is_none(),
+        "a closed connection retained its host credential adapter"
+    );
+}
+
+#[tokio::test]
+async fn http_private_configuration_preserves_protocol_flags_and_original_schema_validation() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271,"default":839271},"flag":{"type":"boolean","default":false}}}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+            sensitive_values: vec![json!(true), json!(false), json!(839271)],
+            disabled: false,
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    let shown = &connections.snapshot()[0].tools[0].input_schema;
+    assert!(shown["properties"]["pin"].get("minimum").is_none());
+    assert!(shown["properties"]["flag"].get("default").is_none());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":0}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::NotDispatched(_)
+    ));
+    assert!(server.calls().is_empty());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":839272}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(server.calls().len(), 1);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
+    let server = McpService::start().await;
+    server.resume_tool_directory_once();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271}}}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        Default::default(),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+            sensitive_values: vec![json!(839271)],
+            disabled: false,
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(server.directory_resumes(), 1);
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(connections.snapshot()[0].tools.len(), 1);
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":0}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::NotDispatched(_)
+    ));
+    assert!(server.calls().is_empty());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__remote__probe",
+                json!({"pin":839272}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    connections.shutdown().await;
+}
+
+fn http_config(name: &str, server: &McpService) -> McpServerConfig {
+    McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: name.into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        oauth: Default::default(),
+        timeout_ms: 300_000,
+    }
+}
+
+async fn wait_for_state(connections: &McpConnections, name: &str, state: McpServerState) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !connections
+            .statuses()
+            .iter()
+            .any(|status| status.name == name && status.state == state)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{name} never became {state:?}: {:?}",
+            connections.statuses()
+        )
+    });
+}
+
+#[tokio::test]
+async fn statuses_report_each_server_and_a_disabled_server_never_runs() {
+    let server = McpService::start().await;
+    server.set_tools(
+        json!([{"name":"search","description":"Find notes","inputSchema":{"type":"object"}}]),
+    );
+    let idle = McpService::start().await;
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let mut disabled = http_config("idle", &idle);
+    disabled.disabled = true;
+    connections
+        .reconcile(vec![http_config("notes", &server), disabled])
+        .await;
+    wait_for_state(&connections, "notes", McpServerState::Connected).await;
+    assert_eq!(
+        serde_json::to_value(connections.statuses()).unwrap(),
+        json!([
+            {"name":"idle","source":"global","transport":"http","state":"disabled","exposure":"direct","tools":[],"oauth":true,"logged_in":false},
+            {"name":"notes","source":"global","transport":"http","state":"connected","exposure":"direct",
+             "tools":[{"name":"mcp__notes__search","description":"Find notes"}],"oauth":true,"logged_in":false}
+        ])
+    );
+    assert_eq!(idle.request_count(), 0);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnecting_a_server_reads_its_tools_again() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"first","inputSchema":{"type":"object"}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let configs = vec![http_config("notes", &server)];
+    connections.reconcile(configs.clone()).await;
+    wait_for_state(&connections, "notes", McpServerState::Connected).await;
+    server.set_tools(json!([{"name":"second","inputSchema":{"type":"object"}}]));
+    assert!(!connections.reconnect(configs.clone(), "absent").await);
+    assert!(connections.reconnect(configs, "notes").await);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while connections.statuses()[0]
+            .tools
+            .first()
+            .map(|tool| tool.name.as_str())
+            != Some("mcp__notes__second")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reconnected server lists its new tools");
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "broken".into(),
+        source: "directory".into(),
+        transport: McpTransport::Stdio {
+            command: "tickloop-missing-mcp-program".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: std::env::temp_dir(),
+        },
+        oauth: Default::default(),
+        timeout_ms: 300_000,
+    }];
+    connections.reconcile(configs.clone()).await;
+    wait_for_state(&connections, "broken", McpServerState::Failed).await;
+    connections
+        .reconcile_keeping_failures(configs.clone())
+        .await;
+    let status = &connections.statuses()[0];
+    assert_eq!(
+        (status.state.clone(), status.transport.as_str()),
+        (McpServerState::Failed, "stdio")
+    );
+    assert!(status.failure.is_some());
+    connections.reconcile(configs).await;
+    assert_ne!(connections.statuses()[0].state, McpServerState::Failed);
     connections.shutdown().await;
 }

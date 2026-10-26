@@ -61,7 +61,15 @@ impl Fixture {
     }
 
     /// Runs tickloop on a terminal of its own, which the test reads and types on.
-    fn tickloop_on_terminal(&self, arguments: &[&str]) -> Terminal {
+    pub(crate) fn tickloop_on_terminal(&self, arguments: &[&str]) -> Terminal {
+        self.tickloop_on_terminal_with_env(arguments, &[])
+    }
+
+    pub(crate) fn tickloop_on_terminal_with_env(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Terminal {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -79,6 +87,9 @@ impl Fixture {
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
         command.env("TICKLOOP_CONFIG_DIR", self.root.join("config"));
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -110,7 +121,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn command(&self, arguments: &[&str]) -> Command {
+    pub(crate) fn command(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
         command
             .args(arguments)
@@ -267,7 +278,7 @@ pub(crate) struct Terminal {
 
 impl Terminal {
     /// Waits until the terminal shows `text`, and returns all it showed so far.
-    fn wait_for(&self, text: &str) -> String {
+    pub(crate) fn wait_for(&self, text: &str) -> String {
         let deadline = Instant::now() + TERMINAL_TIMEOUT;
         loop {
             let shown = self.shown.lock().unwrap().clone();
@@ -279,13 +290,13 @@ impl Terminal {
         }
     }
 
-    fn type_text(&mut self, text: &str) {
+    pub(crate) fn type_text(&mut self, text: &str) {
         self.input.write_all(text.as_bytes()).unwrap();
         self.input.flush().unwrap();
     }
 
     /// Waits for tickloop to exit; returns its exit code and all it showed.
-    fn finish(mut self) -> (u32, String) {
+    pub(crate) fn finish(mut self) -> (u32, String) {
         let code = self.child.wait().unwrap().exit_code();
         // The output may still be on its way once the program has exited.
         thread::sleep(Duration::from_millis(100));

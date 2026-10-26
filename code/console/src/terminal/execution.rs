@@ -4099,6 +4099,34 @@ impl ConsoleExecution {
         .map_err(|error| AccessError::storage(error.to_string()))?;
         Ok(tickloop_harness::protocol::ApiKeyStatus::Saved)
     }
+    /// The Chat's MCP servers as its Worker has them, once it has taken up its configuration.
+    pub(super) async fn mcp_servers(
+        &self,
+        chat: Uuid,
+    ) -> Result<Vec<tickloop_harness::protocol::mcp::McpServerStatus>, AccessError> {
+        match self.value(chat, AgentDetailQuery::McpServers).await? {
+            ObservationValue::McpServers(servers) => Ok(servers),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn reconnect_mcp_server(
+        &self,
+        chat: Uuid,
+        name: &str,
+    ) -> Result<(), AccessError> {
+        let execution = self.reference(chat).await?;
+        self.command(
+            AgentCommand::ReconnectMcpServer {
+                execution,
+                name: name.to_owned(),
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(super) async fn refresh_configuration(&self, chat: Uuid) -> Result<(), AccessError> {
         let execution = self.reference(chat).await?;
         self.command(AgentCommand::RefreshConfiguration { execution }, None)

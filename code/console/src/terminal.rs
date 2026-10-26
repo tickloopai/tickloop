@@ -54,6 +54,8 @@ mod late_receipt_tests;
 mod list_row;
 mod login;
 mod loop_view_text;
+mod mcp_panel;
+mod mcp_work;
 mod menus;
 #[cfg(test)]
 mod mode_cycle_tests;
@@ -66,6 +68,7 @@ mod opener;
 mod paste_blocks;
 mod pasted_image_paths;
 mod permissions_surface;
+mod plugin_configuration;
 pub mod popup;
 mod presentation;
 mod process_registry;
@@ -99,6 +102,7 @@ mod ticks_panel;
 mod ticks_work;
 mod transcript;
 mod update_notice;
+mod user_panel;
 mod view_upgrade;
 mod workflows;
 mod workspace_trust;
@@ -415,6 +419,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/artifacts"
                 | "/plugins"
                 | "/ticks"
+                | "/mcp"
                 | "/settings"
                 | "/permissions"
                 | "/auto-mode-setup"
@@ -859,6 +864,7 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop monitor attach
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
+       tickloop mcp list | add NAME URL [--header 'NAME: VALUE']... [--dir] | add NAME [--env NAME=VALUE]... [--dir] -- COMMAND [ARGUMENTS...] | remove NAME [--dir] | login NAME | logout NAME
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
@@ -866,6 +872,7 @@ monitor popup install asks before registering Tickloop's popup plugin in that He
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
 plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
+mcp lists the MCP servers an Agent here would have without starting any, adds or removes your own servers in the global settings or, with --dir, this directory's, and logs in to or out of a remote server.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -912,6 +919,7 @@ Each user invocation shows a Skill row with its source, also in reopened history
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
 /ticks manages Ticks, the plugins with a Tick program: Installed shows versions and login states; Available installs or updates. Tab or left/right switches pages.
 /plugins manages the plugins without a Tick program the same way. A Tick's login runs in its panel; installed or updated Skills load on the next request.
+/mcp shows the Agent's MCP servers by source with their state, tools and exposure; enter opens a server's tools, login, logout, reconnect, and turning it off or on in this directory.
 /model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
@@ -1767,7 +1775,11 @@ async fn interact_with_herdr(
         config_root.clone(),
     ));
     let mut artifact_loads = tokio::task::JoinSet::new();
-    let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
+    let mut tick_package_tasks = ticks_work::TickPackageTasks::new(agent.clone());
+    let mut mcp_tasks = mcp_work::McpTasks::default();
+    // While `/mcp` shows servers that are still connecting, it reads them again this often.
+    let mut mcp_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+    mcp_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut suggestions: tokio::task::JoinSet<(
         prompt_suggestion::SuggestionRequest,
         prompt_suggestion::SuggestionResult,
@@ -2722,6 +2734,16 @@ async fn interact_with_herdr(
                     ticks_work::finish(console, root, panel, result, &mut tick_package_tasks)?;
                 }
             },
+            result = mcp_tasks.join_next(), if !mcp_tasks.is_empty() => {
+                if let Some((panel, done)) = result && let Some(root) = config_root.as_deref() {
+                    mcp_work::finish(console, root, agent, panel, done, &mut mcp_tasks)?;
+                }
+            },
+            _ = mcp_refresh.tick(), if console.mcp_panel_awaiting_connections()?.is_some() => {
+                if let Some(panel) = console.mcp_panel_awaiting_connections()? && let Some(root) = config_root.as_deref() {
+                    mcp_work::refresh(root, agent, panel, &mut mcp_tasks);
+                }
+            },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
                 if let Some(Ok((request, mut result))) = result {
                     let suppression = if selected_chat != Some(request.chat.into()) || overview_active {
@@ -3004,6 +3026,9 @@ async fn interact_with_herdr(
                 },
                 Some(InputEvent::TickPackages(work)) => {
                     if let Some(root) = config_root.as_deref() { ticks_work::start(root, work, &mut tick_package_tasks); }
+                },
+                Some(InputEvent::Mcp(work)) => {
+                    if let Some(root) = config_root.as_deref() { mcp_work::start(console, root, agent, work, &mut mcp_tasks)?; }
                 },
                 Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
@@ -3662,6 +3687,12 @@ async fn interact_with_herdr(
                             let Some(root) = config_root.as_deref() else { outln!(console, "{name} needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
                             if !interactive { outln!(console, "{name} needs an interactive terminal; run {cli} there instead."); continue; }
                             if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), kind, &mut tick_package_tasks) { outln!(console, "Cannot open {name}: {}", safe_text(&error)); }
+                        },
+                        command if command.split_whitespace().next() == Some("/mcp") => {
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use /mcp"); continue; }
+                            let Some(root) = config_root.as_deref() else { outln!(console, "/mcp needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            if !interactive { outln!(console, "/mcp needs an interactive terminal; run tickloop mcp list there instead."); continue; }
+                            if let Err(error) = mcp_work::open(console, root, agent, selected_chat.map(Into::into), workdir.clone(), &mut mcp_tasks) { outln!(console, "Cannot open /mcp: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
@@ -7630,6 +7661,24 @@ fn model_retry_parts(
             max_retries + 1,
         ),
     )
+}
+
+/// Edits standalone terminal input using the Console's private temporary file and editor rules.
+/// The caller suspends raw input while the editor owns the terminal.
+pub fn edit_external_text(
+    draft: &str,
+    directory: &std::path::Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>, String> {
+    use external_editor::ExternalEditorOutcome;
+    match external_editor::edit_prompt_with_cancellation(draft, directory, Some(cancellation)) {
+        ExternalEditorOutcome::Updated { content } => Ok(Some(content)),
+        ExternalEditorOutcome::Unchanged | ExternalEditorOutcome::Cancelled { .. } => Ok(None),
+        ExternalEditorOutcome::Unavailable => {
+            Err("No external editor found; set VISUAL or EDITOR".into())
+        }
+        ExternalEditorOutcome::Failed(error) => Err(error.to_string()),
+    }
 }
 
 /// Claude Code's output count, `· ↓ 14.5k tokens`; input tokens are not part of the summary.

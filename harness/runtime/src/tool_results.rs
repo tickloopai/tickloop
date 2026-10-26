@@ -142,6 +142,57 @@ impl Agent {
         )
     }
 
+    /// Third-party MCP results over 20 KB keep both ends; the full text goes to the Family's
+    /// temporary directory, which a Chat without a Folder does not have.
+    pub(super) async fn limit_third_party_mcp_result(
+        &self,
+        receipt: &Receipt,
+        tool_use_id: &str,
+        mut result: ToolResult,
+    ) -> Result<ToolResult, AgentError> {
+        if result.content.len() <= MCP_MAX_RESULT_BYTES {
+            return Ok(result);
+        }
+        let family = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+            chat.tools.family_temp_directory().map(|_| {
+                private_family_temp_directory(
+                    chat.snapshot
+                        .delegation
+                        .as_ref()
+                        .map_or(receipt.chat_id, |delegation| delegation.root_chat_id())
+                        .into(),
+                )
+            })
+        };
+        let call_id = tool_use_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let persisted = family.and_then(|directory| {
+                persist_tool_result(&directory, &call_id, &result.content).ok()
+            });
+            let note = persisted.as_ref().map_or_else(
+                || "Full output could not be saved".into(),
+                |output| format!("Full output saved to: {}", output.path.display()),
+            );
+            let head = result.content.floor_char_boundary(MCP_PREVIEW_SIDE_BYTES);
+            let tail = result
+                .content
+                .ceil_char_boundary(result.content.len() - MCP_PREVIEW_SIDE_BYTES);
+            result.content = format!(
+                "{}\n\n[Output truncated in the middle. {note}]\n\n{}",
+                &result.content[..head],
+                &result.content[tail..]
+            );
+            if let Some(persisted) = persisted {
+                result.output_ref = Some(persisted.path);
+            }
+            result
+        })
+        .await
+        .map_err(|_| AgentError::Storage("MCP output storage did not finish".into()))
+    }
+
     /// Externalizes tool results by threshold before they are written to the conversation;
     /// afterwards the result content becomes the replacement text, and results without their own
     /// output reference point at the externalized file. A Chat without a Folder stores nothing, so
@@ -154,47 +205,9 @@ impl Agent {
         mut result: ToolResult,
     ) -> Result<ToolResult, AgentError> {
         if tool_name.starts_with("mcp__") {
-            if result.content.len() <= MCP_MAX_RESULT_BYTES {
-                return Ok(result);
-            }
-            let family = {
-                let chats = self.inner.chats.lock().await;
-                let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-                chat.tools.family_temp_directory().map(|_| {
-                    private_family_temp_directory(
-                        chat.snapshot
-                            .delegation
-                            .as_ref()
-                            .map_or(receipt.chat_id, |delegation| delegation.root_chat_id())
-                            .into(),
-                    )
-                })
-            };
-            let call_id = tool_use_id.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                let persisted = family.and_then(|directory| {
-                    persist_tool_result(&directory, &call_id, &result.content).ok()
-                });
-                let note = persisted.as_ref().map_or_else(
-                    || "Full output could not be saved".into(),
-                    |output| format!("Full output saved to: {}", output.path.display()),
-                );
-                let head = result.content.floor_char_boundary(MCP_PREVIEW_SIDE_BYTES);
-                let tail = result
-                    .content
-                    .ceil_char_boundary(result.content.len() - MCP_PREVIEW_SIDE_BYTES);
-                result.content = format!(
-                    "{}\n\n[Output truncated in the middle. {note}]\n\n{}",
-                    &result.content[..head],
-                    &result.content[tail..]
-                );
-                if let Some(persisted) = persisted {
-                    result.output_ref = Some(persisted.path);
-                }
-                result
-            })
-            .await
-            .map_err(|_| AgentError::Storage("MCP output storage did not finish".into()));
+            return self
+                .limit_third_party_mcp_result(receipt, tool_use_id, result)
+                .await;
         }
         let chat_directory = self
             .inner
