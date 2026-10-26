@@ -87,7 +87,7 @@ impl PluginStore {
                 "the built-in marketplace {name} cannot be removed"
             )));
         }
-        let _lock = self.lock_directory()?;
+        let _lock = self.lock()?;
         let mut registry = self.read_marketplace_registry()?;
         let removed = registry
             .remove(name)
@@ -153,7 +153,7 @@ impl PluginStore {
         http: &HttpClient,
     ) -> Result<MarketplaceCatalog, PluginError> {
         {
-            let _lock = self.lock_directory()?;
+            let _lock = self.lock()?;
             if let Some(cached) = self.read_marketplace_registry()?.get(name) {
                 let current = self
                     .marketplaces()?
@@ -253,7 +253,7 @@ impl PluginStore {
             commit,
         };
         let catalog = MarketplaceCatalog::parse(registration.clone(), &document)?;
-        let _lock = self.lock_directory()?;
+        let _lock = self.lock()?;
         let mut registry = self.read_marketplace_registry()?;
         if previous.is_none() && registry.contains_key(name) {
             return Err(PluginError::Invalid(format!(
