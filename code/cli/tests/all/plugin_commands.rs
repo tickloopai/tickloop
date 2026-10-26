@@ -151,3 +151,148 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
         "No plugins are installed.\n"
     );
 }
+
+#[test]
+fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "notes",
+        json!({"name": "notes", "version": "1.0.0", "skills": ["./skills", "../outside"]}),
+        &["read", "write"],
+    );
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
+        "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.\n\
+         Skills: skills/read, skills/write\n\
+         Not supported yet, so not used: commands, MCP servers.\n\
+         Warning: skills path \"../outside\" is ignored: it must start with ./\n"
+    );
+
+    let bare = fixture.root.join("sources/bare-plugin");
+    fs::create_dir_all(&bare).unwrap();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&bare)])),
+        "Plugin bare-plugin, read from its directory.\nSkills: none\n"
+    );
+
+    fs::write(source.join(".claude-plugin/plugin.json"), r#"{"name": 7}"#).unwrap();
+    assert_eq!(
+        failed(&plugin(&fixture, &["validate", &path_text(&source)])),
+        format!(
+            "Error: {} is not a valid plugin: name in .claude-plugin/plugin.json must be a string\n",
+            source.display()
+        )
+    );
+    let missing = fixture.root.join("missing");
+    assert_eq!(
+        failed(&plugin(&fixture, &["validate", &path_text(&missing)])),
+        format!("Error: {} is not a plugin directory\n", missing.display())
+    );
+    assert!(
+        !fixture.root.join("config").exists(),
+        "validate installs nothing"
+    );
+}
+
+#[test]
+fn a_plugin_cannot_take_a_tick_package_name_and_an_unusable_one_is_listed() {
+    let fixture = Fixture::new();
+    succeeded(&fixture.tickloop(&[
+        "tick",
+        "install",
+        "--path",
+        &path_text(&fixture.package_named("sample", "1.0.0")),
+    ]));
+    let clash = claude_plugin(&fixture, "sample", json!({"name": "sample"}), &[]);
+
+    assert_eq!(
+        failed(&plugin(
+            &fixture,
+            &["install", "--path", &path_text(&clash)]
+        )),
+        format!(
+            "Error: cannot install {}: sample is already installed as a Tick package; uninstall \
+             it first\n",
+            clash.display()
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "No plugins are installed.\n"
+    );
+
+    let notes = claude_plugin(&fixture, "notes", json!({"name": "notes"}), &["write"]);
+    succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&notes)],
+    ));
+    fs::remove_dir_all(installed_root(&fixture, "notes")).unwrap();
+    let listed = succeeded(&plugin(&fixture, &["list"]));
+    assert!(
+        listed.starts_with(
+            "notes@local  local  enabled  login unknown  unusable: its directory cannot be opened"
+        ),
+        "{listed}"
+    );
+    assert!(listed.ends_with("; install it again\n"), "{listed}");
+    let error = failed(&plugin(&fixture, &["disable", "notes"]));
+    assert!(
+        error.starts_with("Error: cannot disable notes: plugin notes cannot be used"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_plugin_command_explains_its_usage() {
+    let fixture = Fixture::new();
+    for arguments in [
+        &["plugin"][..],
+        &["plugin", "install"],
+        &["plugin", "install", "notes"],
+        &["plugin", "install", "--path"],
+        &["plugin", "uninstall"],
+        &["plugin", "uninstall", "notes", "--all"],
+        &["plugin", "enable"],
+        &["plugin", "disable", "--all"],
+        &["plugin", "list", "--available"],
+        &["plugin", "validate"],
+        &["plugin", "login", "notes"],
+        &["plugin", "update"],
+    ] {
+        let error = failed(&fixture.tickloop(arguments));
+        assert!(
+            error.starts_with(
+                "Error: Unknown plugin command. Usage: tickloop plugin install --path PATH"
+            ),
+            "{arguments:?}: {error}"
+        );
+    }
+    for arguments in [
+        &["plugin", "--help"][..],
+        &["plugin", "-h"],
+        &["plugin", "install", "--help"],
+        &["plugin", "validate", "-h"],
+    ] {
+        let help = succeeded(&fixture.tickloop(arguments));
+        assert!(
+            help.starts_with(
+                "Usage: tickloop plugin install --path PATH\n       \
+                 tickloop plugin uninstall PLUGIN [--keep-data]\n"
+            ),
+            "{help}"
+        );
+        assert!(help.contains("TICKLOOP_CONFIG_DIR"), "{help}");
+        assert!(help.contains("named PLUGIN:SKILL"), "{help}");
+        assert!(help.contains("grant no tools"), "{help}");
+    }
+    let console_help = succeeded(&fixture.tickloop(&["--help"]));
+    assert!(
+        console_help.contains(
+            "tickloop plugin install --path PATH | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list | validate DIRECTORY"
+        ),
+        "{console_help}"
+    );
+    assert!(!fixture.root.join("config").exists());
+}
