@@ -168,6 +168,13 @@ struct PreparedMcpCall {
     tool: catalog::Tool,
     input: Value,
 }
+/// Which unchanged servers a reconcile connects again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Restart<'a> {
+    Failed,
+    Nothing,
+    Server(&'a str),
+}
 #[derive(Clone)]
 pub struct McpConnections {
     inner: Arc<Inner>,
@@ -221,8 +228,15 @@ impl McpConnections {
         *self.inner.credentials.write().unwrap() = credentials;
     }
 
+    /// Takes up `configs`, connecting changed servers and again those that failed.
     pub async fn reconcile(&self, configs: Vec<McpServerConfig>) {
-        self.reconcile_restarting(configs, None).await;
+        self.reconcile_restarting(configs, Restart::Failed).await;
+    }
+
+    /// Takes up `configs` as [`Self::reconcile`] does, but leaves failed servers failed, so that
+    /// reading their state retries nothing.
+    pub async fn reconcile_keeping_failures(&self, configs: Vec<McpServerConfig>) {
+        self.reconcile_restarting(configs, Restart::Nothing).await;
     }
 
     /// Reconciles `configs` and connects the server `name` again even when nothing about it
@@ -231,11 +245,12 @@ impl McpConnections {
         if !configs.iter().any(|config| config.name == name) {
             return false;
         }
-        self.reconcile_restarting(configs, Some(name)).await;
+        self.reconcile_restarting(configs, Restart::Server(name))
+            .await;
         true
     }
 
-    async fn reconcile_restarting(&self, configs: Vec<McpServerConfig>, restart: Option<&str>) {
+    async fn reconcile_restarting(&self, configs: Vec<McpServerConfig>, restart: Restart<'_>) {
         let _guard = self.inner.reconcile_lock.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
@@ -290,10 +305,11 @@ impl McpConnections {
                 .get(&config.name)
                 .cloned();
             let entry = if let Some(entry) = existing.filter(|entry| {
-                restart != Some(config.name.as_str())
+                restart != Restart::Server(config.name.as_str())
                     && entry.config == config
                     && *entry.credential.read().unwrap() == credential
-                    && *entry.state.read().unwrap() != McpServerState::Failed
+                    && (restart == Restart::Nothing
+                        || *entry.state.read().unwrap() != McpServerState::Failed)
                     && !(*entry.state.read().unwrap() == McpServerState::Connected
                         && credential
                             .as_ref()

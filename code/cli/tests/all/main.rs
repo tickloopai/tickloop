@@ -32,3 +32,4 @@ mod workspace_trust_pty;
 
 mod mcp_commands;
 mod mcp_login;
+mod mcp_panel_pty;

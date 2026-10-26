@@ -1615,3 +1615,43 @@ async fn reconnecting_a_server_reads_its_tools_again() {
     .expect("the reconnected server lists its new tools");
     connections.shutdown().await;
 }
+
+#[tokio::test]
+async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let configs = vec![McpServerConfig {
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "broken".into(),
+        source: "directory".into(),
+        transport: McpTransport::Stdio {
+            command: "tickloop-missing-mcp-program".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: std::env::temp_dir(),
+        },
+        oauth: Default::default(),
+        timeout_ms: 300_000,
+    }];
+    connections.reconcile(configs.clone()).await;
+    wait_for_state(&connections, "broken", McpServerState::Failed).await;
+    connections
+        .reconcile_keeping_failures(configs.clone())
+        .await;
+    let status = &connections.statuses()[0];
+    assert_eq!(
+        (status.state.clone(), status.transport.as_str()),
+        (McpServerState::Failed, "stdio")
+    );
+    assert!(status.failure.is_some());
+    connections.reconcile(configs).await;
+    assert_ne!(connections.statuses()[0].state, McpServerState::Failed);
+    connections.shutdown().await;
+}

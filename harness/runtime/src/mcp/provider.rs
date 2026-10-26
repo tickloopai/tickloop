@@ -90,8 +90,13 @@ impl HostToolProvider for McpToolProvider {
         Ok(())
     }
     async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
-        // A refused refresh leaves the servers as the last one found them.
-        let _ = self.refresh(cancel).await;
+        if !cancel.is_cancelled() {
+            let configuration = (self.configuration)();
+            self.connections
+                .reconcile_keeping_failures(configuration.servers)
+                .await;
+            *self.warnings.write().unwrap() = configuration.warnings;
+        }
         self.connections.statuses()
     }
     async fn reconnect_mcp_server(&self, name: &str) -> bool {

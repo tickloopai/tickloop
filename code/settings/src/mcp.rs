@@ -755,3 +755,79 @@ fn parse_oauth(entry: &Value) -> Result<McpOAuthConfig, String> {
     }
     Ok(oauth)
 }
+
+/// The Connector that logs the user in to `server` and out again, with its saved credential in
+/// the config root `root`.
+pub fn login_connector(
+    root: &Path,
+    server: &McpServerConfig,
+) -> Result<tickloop_harness::connector::Connector, String> {
+    let McpTransport::Http { url, headers } = &server.transport else {
+        return Err("MCP login requires a configured streamable HTTP server".into());
+    };
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"))
+    {
+        return Err("This MCP server uses an Authorization header; manage that credential in its configuration instead of OAuth login or logout.".into());
+    }
+    let credentials = std::sync::Arc::new(
+        crate::mcp_credentials::FileCredentials::new(root, &server.source, &server.name)
+            .map_err(|error| error.to_string())?,
+    );
+    tickloop_harness::connector::Connector::new(
+        url,
+        tickloop_harness::connector::OAuthSettings {
+            client_id: server.oauth.client_id.clone(),
+            callback_port: server.oauth.callback_port,
+            authorization_server_metadata_url: server
+                .oauth
+                .authorization_server_metadata_url
+                .clone(),
+        },
+        credentials,
+    )
+    .map_err(|error| error.to_string())
+}
+
+// A resource URI may already contain escapes before it is encoded into the login URL.
+const AUTHORIZATION_URL_ENCODING_LAYERS: usize = 2;
+
+/// Refuses an authorization link that carries one of the server's sensitive plugin values, in
+/// any of the encodings a link can give it, so it is never shown.
+pub fn check_authorization_link(link: &str, sensitive_values: &[Value]) -> Result<(), String> {
+    let secrets = sensitive_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = std::collections::BTreeSet::from([link.to_owned()]);
+    for _ in 0..=AUTHORIZATION_URL_ENCODING_LAYERS {
+        if candidates
+            .iter()
+            .any(|candidate| secrets.iter().any(|secret| candidate.contains(secret)))
+        {
+            return Err("The authorization link contains sensitive plugin configuration and cannot be displayed; OAuth client identifiers and resource addresses must be public.".into());
+        }
+        let mut next = std::collections::BTreeSet::new();
+        for candidate in &candidates {
+            for encoded in [candidate.clone(), candidate.replace('+', " ")] {
+                next.insert(
+                    percent_encoding::percent_decode_str(&encoded)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        if next == candidates {
+            break;
+        }
+        candidates = next;
+    }
+    Ok(())
+}
