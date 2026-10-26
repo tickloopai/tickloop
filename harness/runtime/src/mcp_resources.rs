@@ -89,6 +89,9 @@ impl PreparedResourceCall {
         if sources.is_empty() {
             return Err("unknown or unavailable MCP resource server".into());
         }
+        if server.is_some() && sources.len() > 1 {
+            return Err("MCP resource server name is ambiguous".into());
+        }
         let skill = if let Some(target) = &uri {
             let definition = provider.remote_skills().into_iter().find(|definition| {
                 matches!(&definition.source, SkillSource::Remote {server_id, account_id, resources, ..} if sources.iter().any(|source| source.authority == tickloop_harness_protocol::HostToolAuthority::Mcp {server_id:server_id.clone(),account_id:account_id.clone()}) && resources.iter().any(|resource| &resource.uri == target))
@@ -133,6 +136,7 @@ impl Agent {
     pub(crate) async fn mcp_resource_tool(
         &self,
         receipt: &Receipt,
+        call_id: &str,
         provider: &Arc<dyn HostToolProvider>,
         prepared: &PreparedResourceCall,
         cancel: CancellationToken,
@@ -168,14 +172,21 @@ impl Agent {
         let result = if prepared.name == LIST_MCP_RESOURCES_TOOL {
             let mut results = Vec::new();
             for source in &prepared.sources {
-                let mut result = provider
+                let listed = provider
                     .list_mcp_resources_for(
                         &source.name,
                         prepared.input["cursor"].as_str(),
                         cancel.clone(),
                     )
-                    .await?;
-                if let Some(resources) = result["resources"].as_array_mut() {
+                    .await;
+                let mut result = match listed {
+                    Ok(result) => result,
+                    Err(error) if prepared.sources.len() > 1 && !cancel.is_cancelled() => {
+                        json!({"error": error})
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(resources) = result.get_mut("resources").and_then(Value::as_array_mut) {
                     for resource in resources {
                         resource["server"] = json!(source.name);
                     }
@@ -233,11 +244,19 @@ impl Agent {
         {
             return Ok(unchanged(uri));
         }
-        Ok(ToolResult {
+        drop(chats);
+        let result = ToolResult {
             content: result.to_string(),
             is_error: false,
             output_ref: None,
-        })
+        };
+        if prepared.sources.iter().any(|source| source.third_party) {
+            return self
+                .limit_third_party_mcp_result(receipt, call_id, result)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        Ok(result)
     }
 }
 

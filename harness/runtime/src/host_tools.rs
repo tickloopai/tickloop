@@ -384,6 +384,9 @@ impl HostCallResult {
 pub struct McpResourceServer {
     pub name: String,
     pub authority: HostToolAuthority,
+    /// A server the host connects to for the user, as opposed to Tickloop Artifacts; its
+    /// resource results follow the same size rule as its `mcp__` tool results.
+    pub third_party: bool,
 }
 
 /// The instructions an MCP server gave when the host connected to it for an account.
