@@ -2611,7 +2611,7 @@ impl ConsoleExecution {
         workdir: &std::path::Path,
         name: &str,
         arguments: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), tickloop_code_settings::skills::SkillError> {
         tickloop_code_settings::skills::SkillRegistry::discover(
             workdir,
             self.inner.launch.config_root.as_deref(),
@@ -2623,7 +2623,6 @@ impl ConsoleExecution {
         )
         .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
         .map(|_| ())
-        .map_err(|error| error.to_string())
     }
     /// What the worker of the first Create starts with, read the way it will read it.
     fn new_agent_defaults(&self) -> AgentConfiguration {

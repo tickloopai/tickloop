@@ -9222,7 +9222,7 @@ impl State {
                         .and_then(|candidate| candidate.menu_group)
                         .map_or("Commands", |group| group.title())
                 };
-                if group != Some(current_group) {
+                if group != Some(current_group) && capacity > 1 {
                     lines.push(RoleLine::role(current_group, Role::MutedText));
                     group = Some(current_group);
                 }

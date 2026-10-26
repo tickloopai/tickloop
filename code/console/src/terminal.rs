@@ -4059,9 +4059,15 @@ async fn interact_with_herdr(
                                 .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
                             let directory=global.projection().dispatch_directory;
                             if selected_chat.is_none() && let Err(error) = agent.check_new_agent_skill(&directory,name,arguments) {
-                                console.restore_rejected_prompt(restored_contexts,&safe_line(&error))?;
-                                console.hold_status(&safe_line(&error))?;
-                                report_refused_input(console,&error,&mut failed);
+                                if matches!(error, tickloop_code_settings::skills::SkillError::Unknown(_)) {
+                                    outln!(console, "Unknown command; use /help.");
+                                    console.restore_rejected_prompt(restored_contexts,"Unknown command; use /help")?;
+                                } else {
+                                    let error = safe_line(&error.to_string());
+                                    console.restore_rejected_prompt(restored_contexts,&error)?;
+                                    console.hold_status(&error)?;
+                                    report_refused_input(console,&error,&mut failed);
+                                }
                                 continue;
                             }
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {

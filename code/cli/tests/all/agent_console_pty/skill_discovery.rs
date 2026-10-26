@@ -176,10 +176,7 @@ async fn run_skill_rows(fixture: &PrivateFixture) {
                 && frame.contains("Plugin · frontend-design")
         })
         .await;
-    reopened.send(b"\x1b");
-    reopened
-        .wait_for_editor("continue prompt dismissed before closing", Some(""))
-        .await;
+    reopened.keep_history_paused().await;
     reopened.close().await;
 }
 
