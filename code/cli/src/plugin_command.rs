@@ -156,7 +156,7 @@ pub async fn run(kind: PluginKind, arguments: &[OsString]) -> Result<(), String>
         })
     {
         return Err(format!(
-            "This plugin uses MCP server login; use tickloop mcp login plugin:{name}:<server>."
+            "This plugin uses MCP server login; log in from /mcp or with tickloop mcp login plugin:{name}:<server>."
         ));
     }
     let command = command

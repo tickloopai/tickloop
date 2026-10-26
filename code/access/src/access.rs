@@ -72,8 +72,9 @@ use tickloop_harness::protocol::{
 /// lightweight Chat status.
 /// 28.3 adds user-controlled pauses of individual scheduled tasks and periodic subscriptions.
 /// 28.4 adds the plugin source of an invoked Skill.
+/// 28.5 adds the status of the Agent's MCP servers and reconnecting one of them.
 pub const PROTOCOL_MAJOR: u16 = 28;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -396,6 +397,11 @@ pub enum AgentCommand {
     RefreshConfiguration {
         execution: ExecutionRef,
     },
+    /// Connects one of the Agent's MCP servers again at the user's request.
+    ReconnectMcpServer {
+        execution: ExecutionRef,
+        name: String,
+    },
     TrustWorkingDirectory {
         folder: PathBuf,
     },
@@ -433,6 +439,7 @@ impl AgentCommand {
             | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution }
+            | Self::ReconnectMcpServer { execution, .. }
             | Self::ClearCompletedTasks { execution, .. } => Some(*execution),
             Self::DecidePermission { request, .. }
             | Self::AnswerQuestion { request, .. }
@@ -659,6 +666,8 @@ pub enum AgentDetailQuery {
         name: Option<String>,
     },
     Warnings,
+    /// The Agent's MCP servers, once it has taken up its current configuration.
+    McpServers,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -963,6 +972,7 @@ pub enum ObservationValue {
         warnings: Vec<String>,
     },
     Warnings(Vec<String>),
+    McpServers(Vec<tickloop_harness::protocol::mcp::McpServerStatus>),
     Records(Vec<SavedChat>),
     Transcript(Box<RecordedTranscript>),
     Receipt(Option<Box<CommandReceipt>>),
@@ -1226,6 +1236,7 @@ pub enum AccessCapability {
     ClearCompletedTasks,
     EnqueueAfterTurn,
     RefreshConfiguration,
+    ReconnectMcpServer,
     TrustWorkingDirectory,
     FlushTranscripts,
     DisplayRegistration,

@@ -2397,6 +2397,26 @@ impl Agent {
         submitted
     }
 
+    /// The Agent's MCP servers as they stand once its current configuration is taken up.
+    pub async fn mcp_servers(&self) -> Vec<tickloop_harness_protocol::mcp::McpServerStatus> {
+        let provider = self.inner.host_tools.read().unwrap().clone();
+        match provider {
+            Some(provider) => provider.mcp_server_statuses(CancellationToken::new()).await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Connects the Agent's MCP server `name` again, at the user's request.
+    pub async fn reconnect_mcp_server(&self, name: &str) -> Result<(), AgentError> {
+        let provider = self.inner.host_tools.read().unwrap().clone();
+        match provider {
+            Some(provider) if provider.reconnect_mcp_server(name).await => Ok(()),
+            _ => Err(AgentError::Invalid(format!(
+                "no MCP server is named {name}"
+            ))),
+        }
+    }
+
     pub async fn skill_warnings(&self, chat_id: ChatId) -> Result<Vec<String>, AgentError> {
         self.rediscover_skills(chat_id).await;
         Ok(self

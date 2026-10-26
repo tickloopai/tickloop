@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tickloop_code_settings::plugin_config::PluginUserConfig;
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tick_packages::{ApiKey, LoginState, OAuthIssuer, PackageAuth};
@@ -152,6 +153,9 @@ pub(super) enum TickPackageResult {
         name: String,
         result: Result<(), String>,
     },
+    /// The MCP servers of the Chat's Worker, whose states tell which plugin servers need a
+    /// login.
+    McpStates(Vec<McpServerStatus>),
 }
 
 /// What became of a result handed to a panel.
@@ -171,14 +175,14 @@ pub(super) struct Notice {
 }
 
 impl Notice {
-    fn success(text: String) -> Self {
+    pub(super) fn success(text: String) -> Self {
         Self {
             text,
             is_failure: false,
         }
     }
 
-    fn failure(text: String) -> Self {
+    pub(super) fn failure(text: String) -> Self {
         Self {
             text,
             is_failure: true,
@@ -198,7 +202,8 @@ impl TickPackageResult {
             Self::Installed { .. }
             | Self::Marketplace { .. }
             | Self::Login { .. }
-            | Self::LoginWaiting { .. } => return None,
+            | Self::LoginWaiting { .. }
+            | Self::McpStates(_) => return None,
             Self::LoginEnded {
                 name,
                 result: Ok(()),
@@ -440,6 +445,8 @@ pub(super) struct TicksPanel {
     notice: Option<Notice>,
     /// The body rows each list row or menu option was drawn on, for pointer selection.
     row_targets: Vec<(std::ops::Range<usize>, usize)>,
+    /// The Worker's MCP servers, once read; before an Agent runs, none.
+    mcp_states: Vec<McpServerStatus>,
 }
 
 impl TicksPanel {
@@ -466,6 +473,7 @@ impl TicksPanel {
             busy: None,
             notice: None,
             row_targets: Vec::new(),
+            mcp_states: Vec::new(),
         }
     }
 
@@ -555,6 +563,7 @@ impl TicksPanel {
             TickPackageResult::ConfigurationSaved { .. } => {
                 self.busy = None;
             }
+            TickPackageResult::McpStates(states) => self.mcp_states = states,
             TickPackageResult::Installation { .. }
             | TickPackageResult::Uninstallation { .. }
             | TickPackageResult::Logout { .. }
@@ -1082,13 +1091,14 @@ impl TicksPanel {
                         enabled: !package.enabled,
                     }),
                 ));
-                (
-                    format!("{name} {}", package.version),
-                    vec![
-                        login_label(*login).to_owned(),
-                        safe_line(manifest.description.as_deref().unwrap_or_default()),
-                    ],
-                )
+                let mut context = vec![
+                    login_label(*login).to_owned(),
+                    safe_line(manifest.description.as_deref().unwrap_or_default()),
+                ];
+                if self.mcp_login_needed(&name) {
+                    context.push("Log in to its MCP servers in /mcp".to_owned());
+                }
+                (format!("{name} {}", package.version), context)
             }
             InstalledEntry::Unusable(package) => {
                 options.extend(update());
@@ -1112,6 +1122,32 @@ impl TicksPanel {
             context,
             options,
             selected: 0,
+        })
+    }
+
+    /// How many MCP servers the plugin carries, and whether one of them waits for a login.
+    fn mcp_summary(&self, package: &InstalledPlugin) -> String {
+        match package.manifest.mcp_servers.len() {
+            0 => String::new(),
+            count => format!(
+                " · {count} MCP server{}{}",
+                if count == 1 { "" } else { "s" },
+                if self.mcp_login_needed(package.name()) {
+                    " · MCP login needed"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+
+    fn mcp_login_needed(&self, plugin: &str) -> bool {
+        self.mcp_states.iter().any(|server| {
+            server.state == McpServerState::NeedsLogin
+                && server
+                    .source
+                    .strip_prefix(tickloop_code_settings::mcp::PLUGIN_SOURCE_PREFIX)
+                    == Some(plugin)
         })
     }
 
@@ -1279,8 +1315,8 @@ impl TicksPanel {
                                     }
                                 } else {
                                     ""
-                                }
-                            ),
+                                },
+                            ) + &self.mcp_summary(package),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
@@ -1760,7 +1796,7 @@ fn context_lines(menu: &PanelMenu, width: usize) -> Vec<RoleLine> {
         .collect()
 }
 
-fn step(selected: usize, count: usize, down: bool) -> usize {
+pub(super) fn step(selected: usize, count: usize, down: bool) -> usize {
     if down {
         (selected + 1).min(count.saturating_sub(1))
     } else {
@@ -2780,6 +2816,53 @@ mod tests {
                 && shown.contains("team · 1.0.0 · not installed"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn an_installed_plugin_shows_its_mcp_servers_and_which_need_a_login() {
+        use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+        let mut notes = without_tick(installed("notes", "1.0.0", false));
+        notes.manifest.mcp_servers = [
+            (
+                "search".to_owned(),
+                serde_json::json!({"url":"https://example.com/search"}),
+            ),
+            ("local".to_owned(), serde_json::json!({"command":"node"})),
+        ]
+        .into_iter()
+        .collect();
+        let mut panel = TicksPanel::new(None, PluginKind::Plugin);
+        panel.apply(installed_list(1, vec![(notes, LoginState::NotRequired)]));
+        let row = |panel: &mut TicksPanel| {
+            text(panel)
+                .lines()
+                .find(|line| line.contains("notes"))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            row(&mut panel).ends_with("· 2 MCP servers"),
+            "{}",
+            row(&mut panel)
+        );
+        panel.apply(TickPackageResult::McpStates(vec![McpServerStatus {
+            name: "plugin_notes_search".into(),
+            source: "plugin:notes".into(),
+            transport: "http".into(),
+            state: McpServerState::NeedsLogin,
+            exposure: "direct".into(),
+            tools: Vec::new(),
+            failure: None,
+            oauth: true,
+            logged_in: false,
+        }]));
+        assert!(
+            row(&mut panel).ends_with("· 2 MCP servers · MCP login needed"),
+            "{}",
+            row(&mut panel)
+        );
+        press(&mut panel, KeyCode::Enter);
+        assert!(text(&mut panel).contains("Log in to its MCP servers in /mcp"));
     }
 
     #[test]

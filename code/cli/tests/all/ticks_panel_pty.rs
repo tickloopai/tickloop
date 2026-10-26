@@ -27,9 +27,9 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_SETTLE: Duration = Duration::from_millis(40);
 const CONTROL_N: &[u8] = b"\x0e";
 const CONTROL_P: &[u8] = b"\x10";
-const ESCAPE: &[u8] = b"\x1b";
+pub(crate) const ESCAPE: &[u8] = b"\x1b";
 const TAB: &[u8] = b"\t";
-struct Terminal {
+pub(crate) struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<String>>,
@@ -41,7 +41,7 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn start(fixture: &Fixture, marketplace: &str) -> Self {
+    pub(crate) fn start(fixture: &Fixture, marketplace: &str) -> Self {
         let root = &fixture.root;
         fs::create_dir_all(root.join("tmp")).unwrap();
         let pty = native_pty_system()
@@ -113,16 +113,16 @@ impl Terminal {
             .unwrap();
     }
 
-    fn send(&mut self, input: &[u8]) {
+    pub(crate) fn send(&mut self, input: &[u8]) {
         self.writer.write_all(input).unwrap();
         self.writer.flush().unwrap();
     }
 
-    fn mark(&self) -> usize {
+    pub(crate) fn mark(&self) -> usize {
         self.output.lock().unwrap().len()
     }
 
-    fn frame(&self) -> String {
+    pub(crate) fn frame(&self) -> String {
         screen::visible_screen_with_selection(
             &self.output.lock().unwrap(),
             usize::from(self.columns),
@@ -131,7 +131,12 @@ impl Terminal {
     }
 
     /// Waits for a frame drawn after `mark` that `matches`.
-    fn wait_for_frame(&self, mark: usize, label: &str, matches: impl Fn(&str) -> bool) -> String {
+    pub(crate) fn wait_for_frame(
+        &self,
+        mark: usize,
+        label: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
             let drawn = self.output.lock().unwrap()[mark..].contains("\x1b[?2026l");
@@ -149,7 +154,12 @@ impl Terminal {
     }
 
     /// Sends `input` and waits for the frame it leads to.
-    fn press(&mut self, input: &[u8], label: &str, matches: impl Fn(&str) -> bool) -> String {
+    pub(crate) fn press(
+        &mut self,
+        input: &[u8],
+        label: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let mark = self.mark();
         self.send(input);
         self.wait_for_frame(mark, label, matches)
@@ -163,7 +173,7 @@ impl Terminal {
         );
     }
 
-    fn exit(&mut self) {
+    pub(crate) fn exit(&mut self) {
         self.send(b"/exit\r");
         let deadline = Instant::now() + TIMEOUT;
         while self.child.try_wait().unwrap().is_none() {
@@ -237,7 +247,7 @@ fn is_selected(frame: &str, name: &str) -> bool {
 }
 
 /// The input dialog's rows: those after its top rule.
-fn dialog(frame: &str) -> String {
+pub(crate) fn dialog(frame: &str) -> String {
     let lines = frame.lines().collect::<Vec<_>>();
     let top = lines
         .iter()
@@ -247,7 +257,7 @@ fn dialog(frame: &str) -> String {
 }
 
 /// The dialog's text with its rows joined, so a wrapped message reads as one.
-fn dialog_text(frame: &str) -> String {
+pub(crate) fn dialog_text(frame: &str) -> String {
     dialog(frame)
         .replace(screen::SELECTED_MARK, " ")
         .lines()
@@ -629,17 +639,28 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
     let frame = terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
-        row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
-            && frame.contains("Not supported yet: hooks")
+        row_shows(
+            frame,
+            "notes",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+        ) && frame.contains("Not supported yet: hooks")
     });
     assert!(!frame.contains("Not supported yet: MCP"), "{frame}");
     terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
     terminal.press(b"\r", "disabled", |frame| {
-        row_shows(frame, "notes", "local · disabled · 1.0.0 · no login needed")
+        row_shows(
+            frame,
+            "notes",
+            "local · disabled · 1.0.0 · no login needed · 1 MCP server",
+        )
     });
     terminal.press(b"\r", "enable action", |frame| frame.contains("❯ Enable"));
     terminal.press(b"\r", "enabled", |frame| {
-        row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
+        row_shows(
+            frame,
+            "notes",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+        )
     });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();

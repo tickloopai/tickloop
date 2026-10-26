@@ -3,14 +3,12 @@ use std::{
     ffi::OsString,
     io::{self, BufRead, IsTerminal, Write},
     path::Path,
-    sync::Arc,
     time::Duration,
 };
 use tickloop_code_console::terminal::safe_line;
-use tickloop_code_settings::{UserSettings, mcp::PluginServers, mcp_credentials::FileCredentials};
 use tickloop_harness::{
-    connector::{Connector, Logout, OAuthSettings},
-    protocol::mcp::{McpServerConfig, McpTransport},
+    connector::{Connector, Logout},
+    protocol::mcp::McpServerConfig,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -25,29 +23,7 @@ pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
     let root = tickloop_code_settings::config_root_directory()
         .ok_or("cannot find the Tickloop config directory")?;
     let server = resolve(&root, name)?;
-    let McpTransport::Http { url, headers } = &server.transport else {
-        return Err("MCP login requires a configured streamable HTTP server".into());
-    };
-    if headers
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case("authorization"))
-    {
-        return Err("This MCP server uses an Authorization header; manage that credential in its configuration instead of OAuth login or logout.".into());
-    }
-    let credentials = Arc::new(
-        FileCredentials::new(&root, &server.source, &server.name)
-            .map_err(|error| error.to_string())?,
-    );
-    let connector = Connector::new(
-        url,
-        OAuthSettings {
-            client_id: server.oauth.client_id,
-            callback_port: server.oauth.callback_port,
-            authorization_server_metadata_url: server.oauth.authorization_server_metadata_url,
-        },
-        credentials,
-    )
-    .map_err(|error| error.to_string())?;
+    let connector = tickloop_code_settings::mcp::login_connector(&root, &server)?;
     let cancel = CancellationToken::new();
     let operation = async {
         if *command == "login" {
@@ -84,30 +60,10 @@ fn resolve(root: &Path, name: &str) -> Result<McpServerConfig, String> {
     } else {
         name.to_owned()
     };
-    let store = tick_plugins::PluginStore::in_config_root(root);
-    let plugins = store
-        .installed()
-        .map_err(|error| error.to_string())?
-        .plugins
-        .into_iter()
-        .filter(|plugin| plugin.enabled)
-        .map(|plugin| PluginServers {
-            user_config: tickloop_code_settings::plugin_config::PluginUserConfig::load(
-                root,
-                &plugin.manifest,
-            )
-            .unwrap_or_default(),
-            data_directory: store.data_directory(plugin.name()),
-            name: plugin.name().to_owned(),
-            root: plugin.root,
-            entries: plugin.manifest.mcp_servers,
-        })
-        .collect::<Vec<_>>();
-    let settings = UserSettings::in_root(root).load();
-    let resolved = settings.mcp_servers_with_plugins(
-        &std::env::current_dir().map_err(|error| error.to_string())?,
+    let resolved = tickloop_code_settings::mcp::configured_servers(
+        root,
+        &super::mcp_command::working_directory()?,
         &std::env::vars().collect(),
-        &plugins,
     );
     resolved
         .servers
@@ -130,39 +86,10 @@ async fn login(
         .start_login(None, cancel)
         .await
         .map_err(|error| error.to_string())?;
-    let secrets = sensitive_values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| value.to_string())
-        })
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let mut candidates = std::collections::BTreeSet::from([pending.authorization_url().to_owned()]);
-    for _ in 0..=AUTHORIZATION_URL_ENCODING_LAYERS {
-        if candidates
-            .iter()
-            .any(|candidate| secrets.iter().any(|secret| candidate.contains(secret)))
-        {
-            return Err("The authorization link contains sensitive plugin configuration and cannot be displayed; OAuth client identifiers and resource addresses must be public.".into());
-        }
-        let mut next = std::collections::BTreeSet::new();
-        for candidate in &candidates {
-            for encoded in [candidate.clone(), candidate.replace('+', " ")] {
-                next.insert(
-                    percent_encoding::percent_decode_str(&encoded)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-        if next == candidates {
-            break;
-        }
-        candidates = next;
-    }
+    tickloop_code_settings::mcp::check_authorization_link(
+        pending.authorization_url(),
+        sensitive_values,
+    )?;
     println!("Open this link in your browser to log in:");
     println!("{}", pending.authorization_url());
     println!(
@@ -293,8 +220,6 @@ async fn login(
     result
 }
 
-// A resource URI may already contain escapes before it is encoded into the login URL.
-const AUTHORIZATION_URL_ENCODING_LAYERS: usize = 2;
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 struct RawInput;
 impl RawInput {

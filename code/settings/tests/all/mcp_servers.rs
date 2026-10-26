@@ -294,3 +294,58 @@ fn a_fixed_authorization_header_does_not_require_valid_oauth_configuration() {
         tickloop_harness::protocol::mcp::McpTransport::Http { .. }
     ));
 }
+
+#[test]
+fn the_artifacts_server_name_is_reserved_for_user_servers() {
+    let settings = json!({"mcpServers":{
+        "tickloop-artifacts":{"url":"https://example.com/mcp"},
+        "notes":{"url":"https://example.com/notes"}
+    }});
+    let resolved = resolve_servers(&settings, Path::new("/work"), &BTreeMap::new());
+    let names = resolved
+        .servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["notes"]);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("tickloop-artifacts")),
+        "{:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
+fn servers_disabled_in_a_directory_stay_listed_as_disabled_there_only() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    let settings = json!({
+        "mcpServers":{"notes":{"url":"https://example.com/notes"}, "local":{"command":"node"}},
+        "projects":{"/work":{"disabledMcpServers":["notes","plugin_docs_search"]}}
+    });
+    let plugins = [PluginServers {
+        user_config: Default::default(),
+        name: "docs".into(),
+        root: "/plugins/docs".into(),
+        data_directory: "/data/docs".into(),
+        entries: BTreeMap::from([("search".into(), json!({"url":"https://example.com/search"}))]),
+    }];
+    let disabled = |directory: &str| {
+        resolve_servers_with_plugins(&settings, Path::new(directory), &BTreeMap::new(), &plugins)
+            .servers
+            .into_iter()
+            .map(|server| (server.name, server.disabled))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        disabled("/work"),
+        BTreeMap::from([
+            ("local".into(), false),
+            ("notes".into(), true),
+            ("plugin_docs_search".into(), true)
+        ])
+    );
+    assert!(disabled("/elsewhere").values().all(|disabled| !disabled));
+}

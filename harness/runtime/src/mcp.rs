@@ -13,7 +13,7 @@ use rmcp::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -39,16 +39,8 @@ use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, TokenErr
 pub use tickloop_harness_connector::{
     ConnectorCredential, ConnectorCredentials, InMemoryCredentials,
 };
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum McpServerState {
-    Connecting,
-    Connected,
-    Failed,
-    Unsupported,
-    NeedsLogin,
-    NeedsConfiguration,
-}
+use tickloop_harness_protocol::mcp::DIRECT_EXPOSURE;
+pub use tickloop_harness_protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerSnapshot {
     pub name: String,
@@ -62,6 +54,8 @@ pub struct McpServerSnapshot {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
+const CONNECTION_CLOSED: &str = "MCP connection closed";
+const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
 struct Handler {
     revision: Arc<AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
@@ -120,6 +114,8 @@ struct Entry {
     tool_schemas: RwLock<BTreeMap<String, Value>>,
     state: RwLock<McpServerState>,
     connection: RwLock<Option<Arc<Connection>>>,
+    /// Why the last connection attempt failed or ended, in our own fixed words.
+    failure: RwLock<Option<String>>,
     cancel: CancellationToken,
 }
 impl Entry {
@@ -150,6 +146,21 @@ impl Entry {
         originals.retain(|name, _| tools.values().any(|tool| tool.original == *name));
     }
 
+    /// Whether a login for the server's current address is saved.
+    fn has_saved_token(&self) -> bool {
+        let McpTransport::Http { url, .. } = &self.config.transport else {
+            return false;
+        };
+        self.credential
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|saved| {
+                saved.token.is_some()
+                    && reqwest::Url::parse(url).is_ok_and(|url| saved.server_url == url.as_str())
+            })
+    }
+
     fn remember_credential(&self, credential: Option<ConnectorCredential>) {
         if let Some(token) = credential
             .as_ref()
@@ -170,6 +181,13 @@ struct PreparedMcpCall {
     connection: Arc<Connection>,
     tool: catalog::Tool,
     input: Value,
+}
+/// Which unchanged servers a reconcile connects again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Restart<'a> {
+    Failed,
+    Nothing,
+    Server(&'a str),
 }
 #[derive(Clone)]
 pub struct McpConnections {
@@ -224,7 +242,29 @@ impl McpConnections {
         *self.inner.credentials.write().unwrap() = credentials;
     }
 
+    /// Takes up `configs`, connecting changed servers and again those that failed.
     pub async fn reconcile(&self, configs: Vec<McpServerConfig>) {
+        self.reconcile_restarting(configs, Restart::Failed).await;
+    }
+
+    /// Takes up `configs` as [`Self::reconcile`] does, but leaves failed servers failed, so that
+    /// reading their state retries nothing.
+    pub async fn reconcile_keeping_failures(&self, configs: Vec<McpServerConfig>) {
+        self.reconcile_restarting(configs, Restart::Nothing).await;
+    }
+
+    /// Reconciles `configs` and connects the server `name` again even when nothing about it
+    /// changed; false when no server has that name.
+    pub async fn reconnect(&self, configs: Vec<McpServerConfig>, name: &str) -> bool {
+        if !configs.iter().any(|config| config.name == name) {
+            return false;
+        }
+        self.reconcile_restarting(configs, Restart::Server(name))
+            .await;
+        true
+    }
+
+    async fn reconcile_restarting(&self, configs: Vec<McpServerConfig>, restart: Restart<'_>) {
         let _guard = self.inner.reconcile_lock.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
@@ -279,9 +319,11 @@ impl McpConnections {
                 .get(&config.name)
                 .cloned();
             let entry = if let Some(entry) = existing.filter(|entry| {
-                entry.config == config
+                restart != Restart::Server(config.name.as_str())
+                    && entry.config == config
                     && *entry.credential.read().unwrap() == credential
-                    && *entry.state.read().unwrap() != McpServerState::Failed
+                    && (restart == Restart::Nothing
+                        || *entry.state.read().unwrap() != McpServerState::Failed)
                     && !(*entry.state.read().unwrap() == McpServerState::Connected
                         && credential
                             .as_ref()
@@ -295,15 +337,19 @@ impl McpConnections {
             }) {
                 entry
             } else {
-                let state = credential_failure.unwrap_or_else(|| match &config.transport {
-                    McpTransport::Unsupported { .. } => McpServerState::Unsupported,
-                    McpTransport::Failed { .. } => McpServerState::Failed,
-                    McpTransport::NeedsConfiguration => McpServerState::NeedsConfiguration,
-                    McpTransport::Stdio { .. } if !self.inner.capabilities.local_processes => {
-                        McpServerState::Unsupported
-                    }
-                    _ => McpServerState::Connecting,
-                });
+                let state = if config.disabled {
+                    McpServerState::Disabled
+                } else {
+                    credential_failure.unwrap_or_else(|| match &config.transport {
+                        McpTransport::Unsupported { .. } => McpServerState::Unsupported,
+                        McpTransport::Failed { .. } => McpServerState::Failed,
+                        McpTransport::NeedsConfiguration => McpServerState::NeedsConfiguration,
+                        McpTransport::Stdio { .. } if !self.inner.capabilities.local_processes => {
+                            McpServerState::Unsupported
+                        }
+                        _ => McpServerState::Connecting,
+                    })
+                };
                 let environment_secrets = self
                     .inner
                     .environment
@@ -327,6 +373,7 @@ impl McpConnections {
                     environment_secrets,
                     state: RwLock::new(state),
                     connection: RwLock::new(None),
+                    failure: RwLock::new(None),
                     cancel: CancellationToken::new(),
                 });
                 entry.remember_credential(credential);
@@ -364,7 +411,7 @@ impl McpConnections {
             let authenticating = AtomicBool::new(false);
             let connect = async {
                 let _permit = slots.acquire().await.map_err(|_| "MCP connection cancelled")?;
-                let has_token = entry.credential.read().unwrap().as_ref().is_some_and(|saved| matches!(&entry.config.transport, McpTransport::Http {url, ..} if reqwest::Url::parse(url).is_ok_and(|url| saved.server_url == url.as_str())) && saved.token.is_some());
+                let has_token = entry.has_saved_token();
                 if has_token && let Some(connector) = &entry.connector {
                     authenticating.store(true, Ordering::SeqCst);
                     let token = connector.access_token(&entry.cancel).await;
@@ -410,7 +457,7 @@ impl McpConnections {
                     loop {
                         tokio::select! {
                             _ = entry.cancel.cancelled() => { stop.cancel(); let _ = waiting.await; break; }
-                            _ = &mut waiting => { if *entry.state.read().unwrap() != McpServerState::NeedsLogin { *entry.state.write().unwrap() = McpServerState::Failed; } state_changed.notify_waiters(); break; }
+                            _ = &mut waiting => { if *entry.state.read().unwrap() != McpServerState::NeedsLogin { *entry.state.write().unwrap() = McpServerState::Failed; *entry.failure.write().unwrap() = Some(CONNECTION_CLOSED.into()); } state_changed.notify_waiters(); break; }
                             _ = connection.changed.notified() => {
                                 if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
                                 let revision = connection.revision.load(Ordering::SeqCst);
@@ -459,7 +506,7 @@ impl McpConnections {
                     }
 
                 }
-                error => { *entry.state.write().unwrap() = if (error.is_err() && authenticating.load(Ordering::SeqCst)) || matches!(error, Ok(Err(ref error)) if (error == "MCP login required" || error == "MCP scope required") && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
+                error => { *entry.failure.write().unwrap() = Some(match &error { Ok(Err(reason)) => reason.clone(), _ => CONNECTION_TIMED_OUT.into() }); *entry.state.write().unwrap() = if (error.is_err() && authenticating.load(Ordering::SeqCst)) || matches!(error, Ok(Err(ref error)) if (error == "MCP login required" || error == "MCP scope required") && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
             }
         });
     }
@@ -505,6 +552,52 @@ impl McpConnections {
         }
         tools
     }
+    /// What a View shows of each server, in name order.
+    pub fn statuses(&self) -> Vec<McpServerStatus> {
+        let catalog = self.catalog();
+        self.inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .map(|entry| {
+                let state = entry.state.read().unwrap().clone();
+                let (transport, oauth) = match &entry.config.transport {
+                    McpTransport::Stdio { .. } => ("stdio".to_owned(), false),
+                    McpTransport::Http { .. } => ("http".to_owned(), entry.connector.is_some()),
+                    McpTransport::Unsupported { kind } => (kind.clone(), false),
+                    McpTransport::NeedsConfiguration | McpTransport::Failed { .. } => {
+                        (String::new(), false)
+                    }
+                };
+                let failure = match &entry.config.transport {
+                    McpTransport::Failed { reason } => Some(reason.clone()),
+                    _ => entry.failure.read().unwrap().clone(),
+                }
+                .filter(|_| state == McpServerState::Failed)
+                .map(|reason| redact(entry, reason));
+                McpServerStatus {
+                    name: entry.config.name.clone(),
+                    source: entry.config.source.clone(),
+                    transport,
+                    exposure: DIRECT_EXPOSURE.into(),
+                    tools: catalog
+                        .iter()
+                        .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
+                        .map(|(_, _, tool)| McpToolSummary {
+                            name: tool.definition.name.clone(),
+                            description: tool.definition.description.clone(),
+                        })
+                        .collect(),
+                    failure,
+                    oauth,
+                    logged_in: oauth && entry.has_saved_token(),
+                    state,
+                }
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Vec<McpServerSnapshot> {
         let catalog = self.catalog();
         self.inner

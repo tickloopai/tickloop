@@ -26,7 +26,9 @@ pub struct FileCredentials {
 
 impl FileCredentials {
     pub fn new(root: &Path, source: &str, name: &str) -> Result<Self, CredentialError> {
-        let (relative, name) = if let Some(plugin) = source.strip_prefix("plugin:") {
+        let (relative, name) = if let Some(plugin) =
+            source.strip_prefix(crate::mcp::PLUGIN_SOURCE_PREFIX)
+        {
             tick_packages::validate_package_name(plugin).map_err(|_| CredentialError("located"))?;
             let name = name
                 .strip_prefix(&format!("plugin_{plugin}_"))
@@ -36,7 +38,7 @@ impl FileCredentials {
             (PathBuf::from("credentials/_mcp"), name)
         };
         if name.is_empty()
-            || (!source.starts_with("plugin:")
+            || (!source.starts_with(crate::mcp::PLUGIN_SOURCE_PREFIX)
                 && !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
