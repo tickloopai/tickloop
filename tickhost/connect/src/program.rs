@@ -126,35 +126,39 @@ pub fn plugin_not_installed(program: &str, name: &str) -> HostError {
     )
 }
 
-/// The package a program recorded at `path` came from, once that package is no longer installed
-/// in `packages`: the program lay in the package's directory there and was named after it.
-pub fn uninstalled_plugin_of(path: &Path, packages: &PluginStore) -> Option<String> {
-    let name = path
-        .file_name()?
+/// The plugin a recorded program came from, once uninstalled. The cache path carries the
+/// installation identity; a marketplace alias can differ from the program's file name.
+pub fn uninstalled_plugin_of(path: &Path, plugins: &PluginStore) -> Option<String> {
+    path.file_name()?
         .to_str()?
         .strip_prefix(PACKAGE_PROGRAM_PREFIX)?;
-    let directory = packages
+    let directory = plugins
         .directory()
         .canonicalize()
-        .unwrap_or_else(|_| packages.directory().to_path_buf());
+        .unwrap_or_else(|_| plugins.directory().to_path_buf());
     let relative = path.strip_prefix(directory.join("cache")).ok()?;
     let mut components = relative.components();
     let marketplace = components.next()?.as_os_str().to_str()?;
     tick_plugins::validate_plugin_name(marketplace).ok()?;
-    if components.next()?.as_os_str() != name {
-        return None;
-    }
-    matches!(packages.get(name), Err(PluginError::NotInstalled(_))).then(|| name.to_owned())
+    let name = components.next()?.as_os_str().to_str()?;
+    tick_plugins::validate_plugin_name(name).ok()?;
+    matches!(plugins.get(name), Err(PluginError::NotInstalled(_))).then(|| name.to_owned())
 }
 
-/// The installed package whose program `path` is.
-pub fn installed_plugin_of(path: &Path, packages: &PluginStore) -> Option<InstalledPlugin> {
-    let name = path
-        .file_name()?
-        .to_str()?
-        .strip_prefix(PACKAGE_PROGRAM_PREFIX)?;
-    let package = packages.get(name).ok()?;
-    (executable_file(&package.executable()?).as_deref() == Some(path)).then_some(package)
+/// The installed plugin whose canonical program path is exactly `path`.
+pub fn installed_plugin_of(path: &Path, plugins: &PluginStore) -> Option<InstalledPlugin> {
+    plugins
+        .installed()
+        .ok()?
+        .plugins
+        .into_iter()
+        .find(|plugin| {
+            plugin
+                .executable()
+                .and_then(|program| executable_file(&program))
+                .as_deref()
+                == Some(path)
+        })
 }
 
 /// The canonical path of `path` when it is an executable file.

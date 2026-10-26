@@ -1305,6 +1305,7 @@ mod tests {
         InstalledPlugin {
             manifest: PluginManifest {
                 name: name.into(),
+                display_name: None,
                 version: Some(version.into()),
                 description: Some(format!("The {name} package")),
                 format: ManifestFormat::TickPackage,

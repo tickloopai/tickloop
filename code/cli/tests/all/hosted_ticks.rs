@@ -1779,6 +1779,82 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_marketplace_alias_keeps_program_ownership_credentials_and_directory_variables() {
+        let daemon = Daemon::start(1).await;
+        let sources = daemon.root.join("sources");
+        let plugins = super::support::hosted::install_environment_recording_package(
+            &daemon.config_root,
+            &sources,
+            "original",
+            json!({"type":"api_key","env":"SAMPLE_API_KEY","label":"Alias key"}),
+        );
+        plugins.uninstall("original", false).unwrap();
+        let (archive, sha256) =
+            crate::tick_package_commands::archive_of(&sources.join("original-package"));
+        let path = sources.join("alias.tar.gz");
+        std::fs::write(&path, archive).unwrap();
+        let alias = plugins
+            .install_archive(
+                &path,
+                tick_plugins::ExpectedArchive {
+                    marketplace: "aliases",
+                    name: "renamed",
+                    version: "1.0.0",
+                    sha256: &sha256,
+                    url: "https://example.test/alias.tar.gz",
+                },
+            )
+            .unwrap()
+            .plugin;
+        plugins
+            .credentials("renamed")
+            .unwrap()
+            .save_api_key(&tick_packages::ApiKey::new("fixture-alias-key").unwrap())
+            .unwrap();
+        let tools = daemon.tools().with_plugins(plugins.clone());
+        let opened = run_tool(
+            &tools,
+            daemon.chats[0],
+            "TickManage",
+            json!({"action":"open","command":["tick-renamed"],"cwd":daemon.root}),
+        )
+        .await;
+        let environment = super::support::hosted::recorded_environment(&sources, "original");
+        assert_eq!(
+            environment.get("SAMPLE_API_KEY").map(String::as_str),
+            Some("fixture-alias-key")
+        );
+        assert_eq!(
+            environment["TICKLOOP_PLUGIN_ROOT"],
+            alias.root.to_str().unwrap()
+        );
+        assert_eq!(
+            environment["CLAUDE_PLUGIN_DATA"],
+            plugins.data_directory("renamed").to_str().unwrap()
+        );
+        let executable = alias.executable().unwrap();
+        let resolved = tickhost_connect::program::resolve_executable(
+            executable.to_str().unwrap(),
+            &daemon.root,
+            Some(&plugins),
+        )
+        .unwrap();
+        assert_eq!(resolved.plugin.unwrap().id(), "renamed@aliases");
+        run_tool(
+            &tools,
+            daemon.chats[0],
+            "TickManage",
+            json!({"action":"close","tick_instance_id":opened["tick_instance_id"]}),
+        )
+        .await;
+        plugins.uninstall("renamed", false).unwrap();
+        assert_eq!(
+            tickhost_connect::program::uninstalled_plugin_of(&executable, &plugins).as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_plugin_credential_cannot_replace_a_plugin_directory_variable() {
         let daemon = Daemon::start(1).await;
         let sources = daemon.root.join("sources");
