@@ -230,7 +230,7 @@ fn dialog_text(frame: &str) -> String {
 }
 
 fn panel_is_open(frame: &str) -> bool {
-    frame.contains("Plugins · ")
+    frame.contains("Plugins ·")
 }
 
 #[test]
@@ -598,4 +598,28 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
     assert!(succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@local  1.0.0  enabled"));
+}
+
+#[test]
+fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter() {
+    let fixture = Fixture::new();
+    let packages = (0..350).map(|index| offered(&format!("jk-{index:03}"), "1.0.0", &[])).collect::<Vec<_>>();
+    let marketplace = fixture.marketplace_file("many", &marketplace_json(json!(packages)));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "plugins", panel_is_open);
+    terminal.press(TAB, "available plugins", |frame| frame.contains("[Available]") && frame.contains("jk-000"));
+    terminal.press(b"/jk-34", "filtered plugins", |frame| {
+        frame.contains("Filter: jk-34") && is_selected(frame, "jk-340") && !frame.contains("jk-000")
+    });
+    terminal.press(CONTROL_N, "next filtered row", |frame| is_selected(frame, "jk-341"));
+    terminal.press(CONTROL_P, "previous filtered row", |frame| is_selected(frame, "jk-340"));
+    terminal.press(b"z", "no matching plugins", |frame| frame.contains("No plugins match"));
+    terminal.press(b"\x7f", "backspace restores matches", |frame| is_selected(frame, "jk-340"));
+    terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter") && panel_is_open(frame));
+    terminal.press(b"j", "list navigation restored", |frame| is_selected(frame, "jk-341"));
+    terminal.press(b"\r", "unavailable source explanation", |frame| frame.contains("no prebuilt program"));
+    terminal.press(TAB, "installed unaffected", |frame| frame.contains("[Installed]"));
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
 }

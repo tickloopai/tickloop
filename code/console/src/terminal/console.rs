@@ -12017,6 +12017,18 @@ impl State {
         {
             return match panel.key(key) {
                 super::ticks_panel::TicksPanelEffect::None => None,
+                super::ticks_panel::TicksPanelEffect::EditFilter => {
+                    let query = panel.filter_text().to_owned();
+                    let outcome = self.run_external_editor(&query);
+                    let panel = self.ticks_panel.as_mut().unwrap();
+                    match outcome {
+                        Some(ExternalEditorOutcome::Updated { content }) => panel.replace_filter(&content),
+                        Some(ExternalEditorOutcome::Failed(error)) => panel.report(error.to_string()),
+                        Some(ExternalEditorOutcome::Unavailable) => panel.report("No external editor found; set VISUAL or EDITOR".into()),
+                        _ => {}
+                    }
+                    None
+                }
                 super::ticks_panel::TicksPanelEffect::Close => {
                     self.ticks_panel = None;
                     self.rendered_region = None;

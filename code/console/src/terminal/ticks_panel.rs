@@ -20,10 +20,11 @@ use uuid::Uuid;
 
 use super::{
     console::wrap_text,
-    conversation_picker::{ConversationPickerFrame, fit_hint},
+    conversation_picker::{ConversationPickerFrame, compact_line, fit_hint},
     display::{DisplayProfile, Glyph},
+    editor::{Editor, EditorCommand},
     list_row::ListRow,
-    permissions_surface::tab_header_line,
+    permissions_surface::{edit_text, editor_window, tab_header_line},
     safe_line,
     style::{Role, RoleLine},
 };
@@ -263,6 +264,7 @@ impl TickPackageResult {
 pub(super) enum TicksPanelEffect {
     None,
     Close,
+    EditFilter,
     Work(TickPackageRequest),
 }
 
@@ -348,6 +350,8 @@ pub(super) struct TicksPanel {
     id: Uuid,
     pub(super) chat: Option<Uuid>,
     page: usize,
+    filter: Editor,
+    filtering: bool,
     installed: Listing<InstalledList>,
     /// The number of the read `installed` holds; a read that started before it is stale.
     installed_read: u64,
@@ -371,6 +375,8 @@ impl TicksPanel {
             id: tickloop_ids::generate(),
             chat,
             page: INSTALLED_PAGE,
+            filter: Editor::new(),
+            filtering: false,
             installed: Listing::Loading,
             installed_read: 0,
             marketplace: Listing::Loading,
@@ -453,7 +459,29 @@ impl TicksPanel {
     }
 
     /// Takes pasted text into the key being entered; elsewhere the panel takes no text.
+    pub(super) fn filter_text(&self) -> &str {
+        self.filter.draft()
+    }
+
+    pub(super) fn replace_filter(&mut self, text: &str) {
+        let text = compact_line(text);
+        let cursor = text.len();
+        self.filter.replace_draft(text, cursor);
+        self.selected[MARKETPLACE_PAGE] = 0;
+        self.top[MARKETPLACE_PAGE] = 0;
+    }
+
+    pub(super) fn report(&mut self, error: String) {
+        self.notice = Some(Notice::failure(error));
+    }
+
     pub(super) fn paste(&mut self, text: &str) {
+        if self.filtering && self.page == MARKETPLACE_PAGE && self.menus.is_empty() && self.login.is_none() {
+            self.filter.apply(EditorCommand::InsertPasted(compact_line(text)));
+            self.selected[MARKETPLACE_PAGE] = 0;
+            self.top[MARKETPLACE_PAGE] = 0;
+            return;
+        }
         if let Some(LoginView {
             stage: LoginStage::Key { entered },
             ..
@@ -491,12 +519,19 @@ impl TicksPanel {
                 _ => TicksPanelEffect::None,
             };
         }
+        if self.filtering && self.page == MARKETPLACE_PAGE {
+            return self.filter_key(key);
+        }
         if let Some(down) = movement {
             let count = self.entry_count(self.page);
             self.selected[self.page] = step(self.selected[self.page], count, down);
             return TicksPanelEffect::None;
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('/'), KeyModifiers::NONE) if self.page == MARKETPLACE_PAGE => {
+                self.filtering = true;
+                TicksPanelEffect::None
+            }
             (KeyCode::Esc, _) => TicksPanelEffect::Close,
             (KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right, _) => {
                 self.page = 1 - self.page;
@@ -506,6 +541,26 @@ impl TicksPanel {
             (KeyCode::Enter, _) => self.open_selected(),
             _ => TicksPanelEffect::None,
         }
+    }
+
+    fn filter_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.filtering = false,
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => return TicksPanelEffect::EditFilter,
+            (KeyCode::Enter, _) => return self.open_selected(),
+            (KeyCode::Char('n' | 'p'), KeyModifiers::CONTROL) => {
+                self.selected[MARKETPLACE_PAGE] = step(self.selected[MARKETPLACE_PAGE], self.entry_count(MARKETPLACE_PAGE), key.code == KeyCode::Char('n'));
+            }
+            _ => {
+                let previous = self.filter.draft().to_owned();
+                edit_text(&mut self.filter, key);
+                if previous != self.filter.draft() {
+                    self.selected[MARKETPLACE_PAGE] = 0;
+                    self.top[MARKETPLACE_PAGE] = 0;
+                }
+            }
+        }
+        TicksPanelEffect::None
     }
 
     /// A key while a login is shown: the key entry takes text, enter saves it and esc cancels;
@@ -903,7 +958,10 @@ impl TicksPanel {
             Listing::Loaded(list) => &list.packages,
             _ => &empty,
         };
-        offers(marketplace, installed)
+        let query = self.filter.draft().to_lowercase();
+        offers(marketplace, installed).into_iter().filter(|offer| {
+            self.page != MARKETPLACE_PAGE || format!("{} {} tickloop", offer.package.name, offer.package.description).to_lowercase().contains(&query)
+        }).collect()
     }
 
     fn entry_count(&self, page: usize) -> usize {
@@ -1004,6 +1062,10 @@ impl TicksPanel {
                     .map(|line| RoleLine::role(line, role)),
             );
         };
+        if self.page == MARKETPLACE_PAGE && self.menus.is_empty() && self.login.is_none()
+            && (self.filtering || !self.filter.draft().is_empty()) {
+            add(&format!("Filter: {}", if self.filtering { editor_window(&self.filter, width.saturating_sub(8)) } else { self.filter.draft().to_owned() }), Role::Text);
+        }
         // A login under way shows itself in place of the list.
         if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
             add(busy, Role::Accent);
@@ -1106,16 +1168,18 @@ impl TicksPanel {
             } else {
                 "enter install/update"
             };
-            let hint = fit_hint(
+            let hint = if self.filtering && self.page == MARKETPLACE_PAGE {
+                fit_hint(&[("ctrl+n/p select".into(), 8), ("enter install/update".into(), 7), ("ctrl+g editor".into(), 3), ("esc leave filter".into(), 9)], width, display)
+            } else { fit_hint(
                 &[
                     (enter.to_owned(), 10),
                     ("tab/←/→ page".to_owned(), 6),
-                    ("r refresh".to_owned(), 4),
+                    (if self.page == MARKETPLACE_PAGE { "/ filter" } else { "r refresh" }.to_owned(), 4),
                     ("esc close".to_owned(), 9),
                 ],
                 width,
                 display,
-            );
+            ) };
             (hint, selected_rows)
         };
         let top = &mut self.top[self.page];
@@ -1173,7 +1237,7 @@ impl TicksPanel {
             }
             (_, _, Listing::Failed(error)) => (safe_line(error), Role::Error),
             (_, _, Listing::Loaded(_)) => (
-                "The Tick marketplace offers no packages yet.".to_owned(),
+                if self.filter.draft().is_empty() { "No plugins available".to_owned() } else { format!("No plugins match \"{}\"", self.filter.draft()) },
                 Role::MutedText,
             ),
         };
@@ -1456,6 +1520,7 @@ mod tests {
             TicksPanelEffect::Work(request) => request,
             TicksPanelEffect::None => panic!("no work started"),
             TicksPanelEffect::Close => panic!("the panel closed"),
+            TicksPanelEffect::EditFilter => panic!("the external editor opened"),
         }
     }
 
