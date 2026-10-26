@@ -59,14 +59,23 @@ pub struct McpServerSnapshot {
     pub instructions: String,
     pub warnings: Vec<String>,
 }
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 struct Handler {
     revision: Arc<AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
+    resource_revision: Arc<AtomicU64>,
+    resources_changed: Arc<tokio::sync::Notify>,
 }
 impl ClientHandler for Handler {
     async fn on_tool_list_changed(&self, _: NotificationContext<RoleClient>) {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.changed.notify_one();
+    }
+    async fn on_resource_list_changed(&self, _: NotificationContext<RoleClient>) {
+        self.resource_revision.fetch_add(1, Ordering::SeqCst);
+        self.resources_changed.notify_one();
     }
     fn get_info(&self) -> ClientConfig {
         ClientConfig::default()
@@ -80,8 +89,25 @@ struct Connection {
     changed: Arc<tokio::sync::Notify>,
     tools: RwLock<BTreeMap<String, catalog::Tool>>,
     instructions: String,
-    resources: Vec<Value>,
+    /// `None` when the server does not provide resources.
+    resources: Option<ResourceDirectory>,
     warnings: RwLock<Vec<String>>,
+}
+/// The resources a server listed. A server that announces list changes is listed from here while
+/// the directory is current; any other server is asked each time.
+struct ResourceDirectory {
+    follows_notifications: bool,
+    changed: Arc<tokio::sync::Notify>,
+    revision: Arc<AtomicU64>,
+    loaded_revision: AtomicU64,
+    resources: RwLock<Vec<Value>>,
+}
+impl ResourceDirectory {
+    fn current(&self) -> Option<Vec<Value>> {
+        (self.follows_notifications
+            && self.loaded_revision.load(Ordering::SeqCst) == self.revision.load(Ordering::SeqCst))
+        .then(|| self.resources.read().unwrap().clone())
+    }
 }
 struct Entry {
     config: McpServerConfig,
@@ -286,7 +312,7 @@ impl McpConnections {
             };
             let result = tokio::select! {
                 _ = entry.cancel.cancelled() => return,
-                result = tokio::time::timeout(Duration::from_secs(30), connect) => result,
+                result = tokio::time::timeout(CONNECT_TIMEOUT, connect) => result,
             };
             match result {
                 Ok(Ok((connection, service))) => {
@@ -296,6 +322,7 @@ impl McpConnections {
                     state_changed.notify_waiters();
                     let stop = service.cancellation_token();
                     let mut waiting = Box::pin(service.waiting());
+                    let resources_changed = connection.resources.as_ref().map(|directory| directory.changed.clone());
                     loop {
                         tokio::select! {
                             _ = entry.cancel.cancelled() => { stop.cancel(); let _ = waiting.await; break; }
@@ -304,7 +331,7 @@ impl McpConnections {
                                 let revision = connection.revision.load(Ordering::SeqCst);
                                 let tools = tokio::select! {
                                     _ = entry.cancel.cancelled() => continue,
-                                    tools = tokio::time::timeout(Duration::from_secs(30), connection.peer.list_all_tools()) => tools,
+                                    tools = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.list_all_tools()) => tools,
                                 };
                                 if let Ok(Ok(tools)) = tools {
                                     let (tools, warnings) = catalog::directory(&entry.config.name, tools);
@@ -314,6 +341,22 @@ impl McpConnections {
                                 } else {
                                     connection.tools.write().unwrap().clear();
                                     *connection.warnings.write().unwrap() = vec!["MCP tools unavailable".into()];
+                                }
+                            }
+                            _ = async { resources_changed.as_ref().unwrap().notified().await }, if resources_changed.is_some() => {
+                                let directory = connection.resources.as_ref().unwrap();
+                                let revision = directory.revision.load(Ordering::SeqCst);
+                                let resources = tokio::select! {
+                                    _ = entry.cancel.cancelled() => continue,
+                                    resources = tokio::time::timeout(REQUEST_TIMEOUT, resource_directory(&connection.peer)) => resources,
+                                };
+                                let mut warnings = connection.warnings.write().unwrap();
+                                warnings.retain(|warning| warning != RESOURCES_UNAVAILABLE);
+                                if let Ok(Ok(resources)) = resources {
+                                    *directory.resources.write().unwrap() = resources;
+                                    directory.loaded_revision.store(revision, Ordering::SeqCst);
+                                } else {
+                                    warnings.push(RESOURCES_UNAVAILABLE.into());
                                 }
                             }
                         }
@@ -378,15 +421,9 @@ impl McpConnections {
                         .collect(),
                     resources: connection
                         .as_ref()
-                        .map(|c| {
-                            c.resources
-                                .iter()
-                                .cloned()
-                                .map(|mut value| {
-                                    redact_value(entry, &mut value);
-                                    value
-                                })
-                                .collect()
+                        .and_then(|c| c.resources.as_ref())
+                        .map(|directory| {
+                            redacted_resources(entry, directory.resources.read().unwrap().clone())
                         })
                         .unwrap_or_default(),
                     instructions: connection
@@ -624,7 +661,19 @@ impl McpConnections {
         cursor: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Value, String> {
-        self.resource_request(server, "resources/list", json!({"cursor":cursor}), cancel)
+        if cursor.is_none()
+            && let Some(entry) = self.inner.entries.read().unwrap().get(server)
+            && let Some(resources) = entry
+                .connection
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|connection| connection.resources.as_ref()?.current())
+        {
+            return Ok(json!({"resources": redacted_resources(entry, resources)}));
+        }
+        let params = cursor.map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}));
+        self.resource_request(server, "resources/list", params, cancel)
             .await
     }
     pub async fn read_resource(
@@ -633,8 +682,13 @@ impl McpConnections {
         uri: &str,
         cancel: CancellationToken,
     ) -> Result<Value, String> {
-        self.resource_request(server, "resources/read", json!({"uri":uri}), cancel)
-            .await
+        let result = self
+            .resource_request(server, "resources/read", json!({"uri":uri}), cancel)
+            .await?;
+        if !result["contents"].is_array() {
+            return Err("invalid MCP resource content".into());
+        }
+        Ok(result)
     }
     async fn resource_request(
         &self,
@@ -664,7 +718,7 @@ impl McpConnections {
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err("MCP resource request cancelled".into()),
             _ = entry.cancel.cancelled() => return Err("MCP resource server changed".into()),
-            result = tokio::time::timeout(Duration::from_secs(30), connection.peer.send_request(request)) => result,
+            result = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.send_request(request)) => result,
         }.map_err(|_| "MCP resource request timed out")?.map_err(|_| "MCP resource request failed")?;
         let mut value =
             serde_json::to_value(&response).map_err(|_| "invalid MCP resource result")?;
@@ -689,10 +743,14 @@ async fn open(
     stderr_directory: Option<&tickloop_harness_base::private_fs::PrivateDirectory>,
 ) -> Result<(Connection, RunningService<RoleClient, Handler>), String> {
     let changed = Arc::new(tokio::sync::Notify::new());
+    let resources_changed = Arc::new(tokio::sync::Notify::new());
     let revision = Arc::new(AtomicU64::new(0));
+    let resource_revision = Arc::new(AtomicU64::new(0));
     let handler = Handler {
         changed: changed.clone(),
         revision: revision.clone(),
+        resource_revision: resource_revision.clone(),
+        resources_changed: resources_changed.clone(),
     };
     let lifecycle = ClientLifecycleMode::Auto {
         preferred_versions: vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
@@ -790,23 +848,25 @@ async fn open(
     } else {
         Vec::new()
     };
-    let resources = if capabilities.resources.is_some() {
-        service
-            .peer()
-            .list_all_resources()
-            .await
-            .map_err(|_| {
+    let resources = match &capabilities.resources {
+        Some(capability) => {
+            let loaded_revision = resource_revision.load(Ordering::SeqCst);
+            let resources = resource_directory(service.peer()).await.map_err(|_| {
                 if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
                     "MCP login required"
                 } else {
-                    "MCP resources unavailable"
+                    RESOURCES_UNAVAILABLE
                 }
-            })?
-            .into_iter()
-            .filter_map(|resource| serde_json::to_value(resource).ok())
-            .collect()
-    } else {
-        Vec::new()
+            })?;
+            Some(ResourceDirectory {
+                follows_notifications: capability.list_changed == Some(true),
+                changed: resources_changed,
+                revision: resource_revision,
+                loaded_revision: AtomicU64::new(loaded_revision),
+                resources: RwLock::new(resources),
+            })
+        }
+        None => None,
     };
     let (tools, warnings) = catalog::directory(&config.name, tools);
     let instructions = service
@@ -829,6 +889,22 @@ async fn open(
         },
         service,
     ))
+}
+async fn resource_directory(
+    peer: &rmcp::service::Peer<RoleClient>,
+) -> Result<Vec<Value>, rmcp::ServiceError> {
+    Ok(peer
+        .list_all_resources()
+        .await?
+        .into_iter()
+        .filter_map(|resource| serde_json::to_value(resource).ok())
+        .collect())
+}
+fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {
+    for resource in &mut resources {
+        redact_value(entry, resource);
+    }
+    resources
 }
 fn redact_value(entry: &Entry, value: &mut Value) {
     match value {
