@@ -329,7 +329,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         "{frame}"
     );
     terminal.press(b"\r", "the update", |frame| {
-        frame.contains("Updated alpha 1.0.0 to 2.0.0")
+        frame.contains("Updated plugin alpha@tickloop from 1.0.0 to 2.0.0")
             && dialog_text(frame).contains("Its Tick program runs as you when opened")
             && !frame.contains("new Chat")
             && row_shows(frame, "alpha", "2.0.0 · installed")
@@ -338,7 +338,8 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         is_selected(frame, "sample")
     });
     terminal.press(b"\r", "the install", |frame| {
-        frame.contains("Installed sample 1.0.0") && row_shows(frame, "sample", "1.0.0 · installed")
+        frame.contains("Installed plugin sample@tickloop 1.0.0")
+            && row_shows(frame, "sample", "1.0.0 · installed")
     });
     assert!(
         fixture
@@ -391,10 +392,10 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         is_selected(frame, "sample")
     });
     let frame = terminal.press(b"\r", "sample's actions", |frame| {
-        frame.contains("❯ Disable")
+        frame.contains("❯ Update")
     });
     assert!(!frame.contains("Log in"), "{frame}");
-    terminal.press(ESCAPE, "the list", |frame| !frame.contains("❯ Disable"));
+    terminal.press(ESCAPE, "the list", |frame| !frame.contains("❯ Update"));
     terminal.press(b"\x18", "uninstall confirmation", |frame| {
         frame.contains("Press ctrl+x again to uninstall sample")
     });
@@ -677,7 +678,8 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
         frame.contains("Filter: jk-349") && is_selected(frame, "jk-349")
     });
     terminal.press(b"\r", "install the filtered selection", |frame| {
-        frame.contains("Installed jk-349 1.0.0") && row_shows(frame, "jk-349", "1.0.0 · installed")
+        frame.contains("Installed plugin jk-349@tickloop 1.0.0")
+            && row_shows(frame, "jk-349", "1.0.0 · installed")
     });
     terminal.press(ESCAPE, "leave edited filter", |frame| {
         frame.contains("/ filter")
@@ -766,6 +768,130 @@ fn a_short_terminal_cannot_confirm_a_hidden_plugin_uninstall() {
     terminal.press(b"/plugins\r", "plugin preserved", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+}
+
+#[test]
+fn available_plugins_install_from_each_marketplace_despite_another_marketplace_error() {
+    use crate::marketplace_commands::{marketplace_directory, write_json};
+    let fixture = Fixture::new();
+    let team = marketplace_directory(
+        &fixture,
+        "team",
+        "team",
+        json!([
+            {"name":"notes", "source":"./notes", "version":"1.0.0", "description":"Team notes"},
+            {"name":"unsupported", "source":{"source":"npm", "package":"unsupported"}}
+        ]),
+    );
+    write_json(
+        &team.join("notes/.claude-plugin/plugin.json"),
+        &json!({"name":"Notebook", "version":"1.0.0"}),
+    );
+    succeeded(&fixture.tickloop(&["plugin", "marketplace", "add", &path_text(&team)]));
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    let frame = terminal.press(b"/plugins\r", "installed page", panel_is_open);
+    assert!(!dialog(&frame).contains("cannot read marketplace"));
+    terminal.press(TAB, "all marketplaces", |frame| {
+        frame.contains("notes")
+            && frame.contains("team · 1.0.0 · not installed")
+            && frame.contains("cannot read marketplace claude-plugins-official")
+    });
+    terminal.press(b"/notes\r", "install explicit marketplace", |frame| {
+        frame.contains("Installed plugin notes@team 1.0.0")
+            && dialog_text(frame).contains("Its manifest calls it Notebook")
+    });
+    terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter"));
+    terminal.press(TAB, "installed alias metadata", |frame| {
+        frame.contains("manifest name: Notebook")
+            && row_shows(frame, "notes", "team · enabled · 1.0.0 · no login needed")
+            && !dialog(frame).contains("cannot read marketplace")
+    });
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+    assert!(succeeded(&fixture.tickloop(&["plugin", "list"])).contains("notes@team"));
+}
+
+#[test]
+fn plugin_updates_refresh_git_revisions_even_when_the_display_version_does_not_change() {
+    use crate::marketplace_commands::{
+        commit_all, file_url, marketplace_directory, write_json, write_skill,
+    };
+    let fixture = Fixture::new();
+    let team = marketplace_directory(
+        &fixture,
+        "git-team",
+        "team",
+        json!([
+            {"name":"notes", "source":"./notes", "version":"1.0.0"}
+        ]),
+    );
+    write_json(
+        &team.join("notes/.claude-plugin/plugin.json"),
+        &json!({"name":"notes", "version":"1.0.0"}),
+    );
+    let skill = team.join("notes/skills/check");
+    write_skill(&skill, "check", "First revision");
+    commit_all(&team, "first");
+    succeeded(&fixture.tickloop(&["plugin", "marketplace", "add", &file_url(&team)]));
+    succeeded(&fixture.tickloop(&["plugin", "install", "notes@team"]));
+    succeeded(&fixture.tickloop(&["plugin", "disable", "notes"]));
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "disabled installed plugin", |frame| {
+        row_shows(frame, "notes", "team · disabled · 1.0.0 · no login needed")
+    });
+    write_skill(&skill, "check", "Second revision");
+    let second = commit_all(&team, "second");
+    terminal.press(b"\r", "update action for same version", |frame| {
+        frame.contains("❯ Update")
+    });
+    terminal.press(b"\r", "updated revision", |frame| {
+        dialog_text(frame).contains("Reinstalled plugin notes@team 1.0.0")
+            && frame.contains("It stays disabled")
+    });
+    assert!(
+        fs::read_to_string(fixture.root.join(format!(
+            "config/plugins/cache/team/notes/{}/skills/check/SKILL.md",
+            &second[..12]
+        )))
+        .unwrap()
+        .contains("Second revision")
+    );
+    terminal.press(TAB, "available installed version", |frame| {
+        frame.contains("[Available]") && row_shows(frame, "notes", "team · 1.0.0 · installed")
+    });
+    write_skill(&skill, "check", "Third revision");
+    write_json(
+        &team.join("notes/.claude-plugin/plugin.json"),
+        &json!({"name":"notes", "version":"2.0.0"}),
+    );
+    write_json(
+        &team.join(".claude-plugin/marketplace.json"),
+        &json!({"name":"team", "plugins":[{"name":"notes","source":"./notes","version":"2.0.0"}]}),
+    );
+    let third = commit_all(&team, "third");
+    terminal.press(b"/notes\r", "available update refreshes again", |frame| {
+        dialog_text(frame).contains("Updated plugin notes@team from 1.0.0 to 2.0.0")
+            && row_shows(frame, "notes", "team · 2.0.0 · installed")
+            && frame.contains("It stays disabled")
+    });
+    assert!(
+        fs::read_to_string(fixture.root.join(format!(
+            "config/plugins/cache/team/notes/{}/skills/check/SKILL.md",
+            &third[..12]
+        )))
+        .unwrap()
+        .contains("Third revision")
+    );
+    terminal.press(b"\r", "unchanged revision is up to date", |frame| {
+        frame.contains("Plugin notes@team 2.0.0 is up to date")
+    });
+    terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter"));
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
 }

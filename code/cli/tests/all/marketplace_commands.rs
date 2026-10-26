@@ -46,7 +46,7 @@ fn git(root: &Path, arguments: &[&str]) -> String {
 }
 
 /// Commits everything in `root`, making it a repository first, and returns the commit.
-fn commit_all(root: &Path, message: &str) -> String {
+pub(crate) fn commit_all(root: &Path, message: &str) -> String {
     if !root.join(".git").exists() {
         git(root, &["init"]);
     }
@@ -55,7 +55,7 @@ fn commit_all(root: &Path, message: &str) -> String {
     git(root, &["rev-parse", "HEAD"])
 }
 
-fn write_skill(directory: &Path, name: &str, body: &str) {
+pub(crate) fn write_skill(directory: &Path, name: &str, body: &str) {
     fs::create_dir_all(directory).unwrap();
     fs::write(
         directory.join("SKILL.md"),
@@ -64,13 +64,18 @@ fn write_skill(directory: &Path, name: &str, body: &str) {
     .unwrap();
 }
 
-fn write_json(path: &Path, value: &Value) {
+pub(crate) fn write_json(path: &Path, value: &Value) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, value.to_string()).unwrap();
 }
 
 /// A directory `label` holding a Claude format marketplace called `name` listing `plugins`.
-fn marketplace_directory(fixture: &Fixture, label: &str, name: &str, plugins: Value) -> PathBuf {
+pub(crate) fn marketplace_directory(
+    fixture: &Fixture,
+    label: &str,
+    name: &str,
+    plugins: Value,
+) -> PathBuf {
     let root = fixture.root.join("sources").join(label);
     write_json(
         &root.join(".claude-plugin/marketplace.json"),
@@ -80,7 +85,7 @@ fn marketplace_directory(fixture: &Fixture, label: &str, name: &str, plugins: Va
 }
 
 /// Makes the repository that stands in for the built-in `claude-plugins-official` list `plugins`.
-fn official_marketplace(fixture: &Fixture, plugins: Value) -> PathBuf {
+pub(crate) fn official_marketplace(fixture: &Fixture, plugins: Value) -> PathBuf {
     let root = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
     write_json(
         &root.join(".claude-plugin/marketplace.json"),
@@ -101,7 +106,7 @@ fn cached_root(fixture: &Fixture, marketplace: &str, name: &str, revision: &str)
     )
 }
 
-fn file_url(path: &Path) -> String {
+pub(crate) fn file_url(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 

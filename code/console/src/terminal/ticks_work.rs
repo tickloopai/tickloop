@@ -6,11 +6,14 @@ use std::{collections::HashMap, future::Future, path::Path};
 
 use tick_plugins::PluginStore;
 use tickloop_tick_installer::{
-    DeviceLogin, LoggedOut, LoginError, MarketplaceSource, needs_no_login, start_login,
+    DeviceLogin, LoggedOut, LoginError, install_from, needs_no_login, read_marketplace,
+    read_marketplaces, start_login,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::package_http::client;
 
 use super::{
     console::Console,
@@ -74,6 +77,13 @@ impl TickPackageTasks {
         self.installed_reads
     }
 
+    fn read_marketplaces(&mut self, store: PluginStore, panel: Uuid) {
+        self.spawn(async move {
+            let listing = read_marketplaces(HTTP, &store, false).await;
+            (panel, TickPackageResult::Marketplace(listing))
+        });
+    }
+
     fn read_installed(&mut self, store: PluginStore, panel: Uuid) {
         let read = self.next_installed_read();
         self.spawn(async move {
@@ -107,35 +117,42 @@ pub(super) fn open(
 pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageTasks) {
     let store = PluginStore::in_config_root(root);
     let panel = work.panel;
+    let refresh = matches!(&work.request, TickPackageRequest::Update(_));
     match work.request {
         TickPackageRequest::Load => {
-            tasks.read_installed(store, panel);
-            tasks.spawn(async move {
-                let marketplace = match MarketplaceSource::configured() {
-                    Ok(source) => {
-                        source
-                            .read(&tickloop_code_settings::package_http::client)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
-                (panel, TickPackageResult::Marketplace(marketplace))
-            });
+            tasks.read_installed(store.clone(), panel);
+            tasks.read_marketplaces(store, panel);
         }
-        TickPackageRequest::Install(package) => {
+        TickPackageRequest::Install(request) | TickPackageRequest::Update(request) => {
             tasks.spawn(async move {
-                let result = match MarketplaceSource::configured() {
-                    Ok(source) => tickloop_tick_installer::install(
-                        &tickloop_code_settings::package_http::client,
-                        &store,
-                        &source,
-                        &package,
-                    )
-                    .await
-                    .map(Box::new),
-                    Err(error) => Err(error),
-                };
-                let name = package.name;
+                let name = request.name.clone();
+                let result = async {
+                    let marketplace = request
+                        .marketplace
+                        .as_deref()
+                        .ok_or_else(|| "Choose a marketplace before installing".to_owned())?;
+                    let registration = store
+                        .marketplaces()
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .find(|registration| registration.name == marketplace)
+                        .ok_or_else(|| format!("marketplace {marketplace} is not registered"))?;
+                    let plugins = read_marketplace(HTTP, &store, &registration, refresh)
+                        .await
+                        .map_err(|reason| {
+                            format!("cannot read marketplace {marketplace}: {reason}")
+                        })?;
+                    let plugin = plugins
+                        .iter()
+                        .find(|plugin| plugin.name == name)
+                        .ok_or_else(|| {
+                            format!("marketplace {marketplace} no longer offers {name}")
+                        })?;
+                    install_from(HTTP, &store, marketplace, plugin)
+                        .await
+                        .map(Box::new)
+                }
+                .await;
                 (panel, TickPackageResult::Installation { name, result })
             });
         }
@@ -287,6 +304,10 @@ pub(super) fn finish(
     if let TickPackageResult::LoginEnded { attempt, .. } = result {
         tasks.end_login(panel, attempt);
     }
+    let changed_marketplace = matches!(
+        &result,
+        TickPackageResult::Installation { result: Ok(_), .. }
+    );
     let changed_packages = matches!(
         &result,
         TickPackageResult::Installation { result: Ok(_), .. }
@@ -312,6 +333,9 @@ pub(super) fn finish(
     }
     if changed_packages {
         tasks.read_installed(PluginStore::in_config_root(root), panel);
+    }
+    if changed_marketplace {
+        tasks.read_marketplaces(PluginStore::in_config_root(root), panel);
     }
     if let Some(name) = changed_login {
         start(
