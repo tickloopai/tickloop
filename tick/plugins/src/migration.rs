@@ -33,18 +33,13 @@ pub struct Migration {
 
 impl PluginStore {
     /// Moves the Tick packages an earlier Tickloop installed into this store, unless the store
-    /// has a registry already; `None` when there was nothing to move.
+    /// has a registry already; `None` when there was nothing to move. When a package cannot be
+    /// moved, the ones moved already go back and the earlier directory stays as it was.
     pub fn migrate(&self) -> Result<Option<Migration>, PluginError> {
         if !self.needs_migration() {
             return Ok(None);
         }
-        let _lock = self.lock_directory()?;
-        self.migrate_locked()
-    }
-
-    /// [`PluginStore::migrate`] for a caller that holds the directory's lock. When a package
-    /// cannot be moved, the ones moved already go back and the earlier directory stays as it was.
-    pub(crate) fn migrate_locked(&self) -> Result<Option<Migration>, PluginError> {
+        let _lock = self.lock()?;
         if !self.needs_migration() {
             return Ok(None);
         }

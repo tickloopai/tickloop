@@ -164,7 +164,8 @@ pub struct Uninstalled {
 }
 
 /// The plugins installed under one Tickloop config root, and the credentials kept for them
-/// there. Its first use moves the Tick packages an earlier Tickloop installed into it.
+/// there. The Tick packages an earlier Tickloop installed move into it only through
+/// [`PluginStore::migrate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginStore {
     pub(crate) config_root: PathBuf,
@@ -217,7 +218,6 @@ impl PluginStore {
     /// form a valid plugin. One that looks broken while an install or uninstall is under way is
     /// read again once that has finished.
     pub fn installed(&self) -> Result<InstalledPlugins, PluginError> {
-        self.migrate()?;
         let installed = self.read_installed()?;
         if installed.broken.is_empty() {
             return Ok(installed);
@@ -230,7 +230,6 @@ impl PluginStore {
     /// uninstall is under way is read again once that has finished.
     pub fn get(&self, name: &str) -> Result<InstalledPlugin, PluginError> {
         validate_plugin_name(name)?;
-        self.migrate()?;
         let read = || {
             let registry = Registry::read(&self.registry_path())?;
             let entry = registry
@@ -580,16 +579,9 @@ impl PluginStore {
             .join(name)
     }
 
-    /// Takes the directory's lock, creating the directory when needed, removes what an install,
-    /// uninstall or download that never finished left behind, and moves in the Tick packages
-    /// an earlier Tickloop installed.
-    fn lock(&self) -> Result<File, PluginError> {
-        let lock = self.lock_directory()?;
-        self.migrate_locked()?;
-        Ok(lock)
-    }
-
-    pub(crate) fn lock_directory(&self) -> Result<File, PluginError> {
+    /// Takes the directory's lock, creating the directory when needed, and removes what an
+    /// install, uninstall or download that never finished left behind.
+    pub(crate) fn lock(&self) -> Result<File, PluginError> {
         create_private_directories(&self.directory)?;
         let path = self.directory.join(LOCK_FILE_NAME);
         let lock = OpenOptions::new()
