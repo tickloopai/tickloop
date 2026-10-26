@@ -99,7 +99,7 @@ Any program can become an Extension Tick by speaking the [Tick protocol](tick/pr
 
 ## Plugins
 
-Plugins add Skills to the agent. Open `/plugins` to browse the installed and available plugins without a Tick program, or use the command line:
+Plugins add Skills and MCP servers to the agent. Open `/plugins` to browse the installed and available plugins without a Tick program, or use the command line:
 
 ```sh
 tickloop plugin list --available
@@ -138,7 +138,11 @@ Local-path installations are updated only by running `install --path` again, eve
 
 Type `/` to discover user-invocable Skills for the current folder, including built-in, user, project and enabled plugin and Tick Skills. The Skills group shows each name, description and source; use `Ctrl+N` / `Ctrl+P` to select, then `Enter` or `Tab` to complete. Completion refreshes when Skills or plugins change. Invoke `/plugin:skill [ARGUMENTS]`, or `/skill [ARGUMENTS]` when that short name is unique. Ambiguous short names list the full names to use; exact names win, and built-in commands always take precedence. Each invocation displays a `Skill · name · source` row, preserved when reopening history.
 
-Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills; reinstalling or updating preserves the disabled state. Installation runs nothing and grants no permissions; plugin Skill tool calls still require the usual approval. Only Skills and Tick components work in this release; other components are listed as unsupported. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
+Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills; reinstalling or updating preserves the disabled state. Installation runs nothing and grants no permissions; plugin Skill tool calls still require the usual approval. Skills, Tick programs and MCP servers are supported; other components are listed as unsupported. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
+
+Enabled plugins can declare MCP servers in `.mcp.json` (a server map or an `mcpServers` wrapper), or in the manifest's `mcpServers` object, relative path or array. Stdio and streamable HTTP are supported. Tools are named `mcp__plugin_<plugin>_<server>__<tool>`; long or colliding names receive a hash suffix. `validate`, installation and enablement list the commands or addresses and any missing configuration. Enabling consents to running the servers as your user from the next Agent request; disabling or uninstalling stops them from the next request. Tool calls still follow your permissions.
+
+User-configured servers take priority over plugin servers with the same command and arguments or URL. Between plugins, the first plugin by name wins; skipped duplicates produce a warning. Plugin root and data placeholders (`${TICKLOOP_PLUGIN_ROOT}`, `${TICKLOOP_PLUGIN_DATA}` and their `CLAUDE_` aliases), plus startup environment variables `${VAR}` and `${VAR:-default}`, are expanded when connecting. Services referencing `${user_config.*}` remain unavailable until configuration support is added. HTTP authentication is discovered on connection; validation alone cannot tell whether login is required.
 
 Existing Tick packages migrate automatically on first use, keeping saved login. Broken packages are reported for reinstallation; the old directory is preserved.
 

@@ -1665,6 +1665,7 @@ mod tests {
         };
         InstalledPlugin {
             manifest: PluginManifest {
+                mcp_servers: Default::default(),
                 name: name.into(),
                 display_name: None,
                 version: Some(version.into()),

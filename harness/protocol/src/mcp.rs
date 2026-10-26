@@ -26,6 +26,7 @@ pub enum McpTransport {
     Unsupported {
         kind: String,
     },
+    NeedsConfiguration,
     Failed {
         reason: String,
     },

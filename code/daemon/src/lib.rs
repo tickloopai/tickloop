@@ -781,7 +781,9 @@ pub async fn build_runtime_with_models(
         sources.push(tick_tools);
     }
     if let Some(settings) = settings {
-        use tickloop_harness::runtime::mcp::{HostCapabilities, McpConnections, McpToolProvider};
+        use tickloop_harness::runtime::mcp::{
+            HostCapabilities, McpConfiguration, McpConnections, McpToolProvider,
+        };
         let startup_environment: std::collections::BTreeMap<String, String> = launch
             .environment
             .iter()
@@ -808,20 +810,84 @@ pub async fn build_runtime_with_models(
         )
         .with_stderr_directory(log_directory);
         let folder = launch.folder.clone();
+        let plugins =
+            tick_plugins::PluginStore::in_config_root(settings.root().expect("settings root"));
         let configuration = Arc::new(move || {
-            let resolved = settings.load().mcp_servers(&folder, &startup_environment);
-            for warning in resolved.warnings {
-                eprintln!("{warning}");
+            let (plugin_servers, mut warnings) = enabled_plugin_mcp_servers(&plugins);
+            let resolved = settings.load().mcp_servers_with_plugins(
+                &folder,
+                &startup_environment,
+                &plugin_servers,
+            );
+            warnings.extend(resolved.warnings);
+            McpConfiguration {
+                servers: resolved.servers,
+                warnings,
             }
-            resolved.servers
         });
-        connections.reconcile(configuration()).await;
-        sources.push(Arc::new(McpToolProvider::new(connections, configuration)));
+        connections.reconcile(configuration().servers).await;
+        sources.push(Arc::new(McpToolProvider::with_configuration(
+            connections,
+            configuration,
+        )));
     }
     agent
         .install_host_tools(sources)
         .map_err(|error| format!("cannot install host tools: {error}"))?;
     Ok((agent, environment))
+}
+
+fn enabled_plugin_mcp_servers(
+    store: &tick_plugins::PluginStore,
+) -> (Vec<tickloop_code_settings::mcp::PluginServers>, Vec<String>) {
+    let installed = match store.installed() {
+        Ok(installed) => installed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("Cannot load plugin MCP servers: {error}")],
+            );
+        }
+    };
+    let mut warnings = installed
+        .broken
+        .iter()
+        .filter(|plugin| plugin.enabled)
+        .map(|broken| {
+            format!(
+                "Cannot load MCP servers for plugin {}: {}",
+                broken.name, broken.reason
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut plugins = Vec::new();
+    for plugin in installed
+        .plugins
+        .into_iter()
+        .filter(|plugin| plugin.enabled && !plugin.manifest.mcp_servers.is_empty())
+    {
+        let data_directory = match store.create_data_directory(plugin.name()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                warnings.push(format!("Cannot prepare plugin MCP data directory: {error}"));
+                continue;
+            }
+        };
+        warnings.extend(
+            plugin
+                .manifest
+                .warnings
+                .iter()
+                .map(|warning| format!("Plugin {}: {warning}", plugin.name())),
+        );
+        plugins.push(tickloop_code_settings::mcp::PluginServers {
+            name: plugin.name().to_owned(),
+            root: plugin.root,
+            data_directory,
+            entries: plugin.manifest.mcp_servers,
+        });
+    }
+    (plugins, warnings)
 }
 
 fn validate_daemon_lock_path(lock: &File, path: &Path) -> Result<(), String> {

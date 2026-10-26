@@ -4,7 +4,7 @@
 //! carry is recognized, whether or not Tickloop supports it yet.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Component as PathComponent, Path, PathBuf},
@@ -91,7 +91,7 @@ pub enum Component {
 impl Component {
     /// Whether Tickloop uses this component of an installed plugin.
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Tick | Self::Skills)
+        matches!(self, Self::Tick | Self::Skills | Self::McpServers)
     }
 
     pub fn label(self) -> &'static str {
@@ -136,6 +136,8 @@ pub struct PluginManifest {
     /// The directories that hold Skills, relative to the plugin root.
     pub skill_paths: Vec<PathBuf>,
     pub components: BTreeSet<Component>,
+    /// Raw MCP entries; the host resolves variables and interprets transports.
+    pub mcp_servers: BTreeMap<String, Value>,
     /// What was ignored in the manifest, and why.
     pub warnings: Vec<String>,
 }
@@ -347,8 +349,19 @@ fn from_document(
         components.insert(Component::Skills);
     }
     for (field, component) in COMPONENT_FIELDS {
+        let mut ignored_warnings = Vec::new();
         if let Some(value) = document.get(field)
-            && declared_component(root, field, component, value, &mut warnings)
+            && declared_component(
+                root,
+                field,
+                component,
+                value,
+                if component == Component::McpServers {
+                    &mut ignored_warnings
+                } else {
+                    &mut warnings
+                },
+            )
         {
             components.insert(component);
         }
@@ -372,6 +385,7 @@ fn from_document(
     if tick.is_some() {
         components.insert(Component::Tick);
     }
+    let mcp_servers = read_mcp_servers(root, document.get("mcpServers"), &mut warnings);
     Ok(PluginManifest {
         name,
         display_name,
@@ -382,6 +396,7 @@ fn from_document(
         auth,
         skill_paths,
         components,
+        mcp_servers,
         warnings,
     })
 }
@@ -419,6 +434,7 @@ fn from_tick_package(
         components.insert(Component::Skills);
     }
     insert_default_components(root, &mut components, &mut warnings);
+    let mcp_servers = read_mcp_servers(root, None, &mut warnings);
     Ok(PluginManifest {
         name: marketplace_name.map_or(package.name, str::to_owned),
         display_name,
@@ -432,6 +448,7 @@ fn from_tick_package(
         auth: package.auth,
         skill_paths,
         components,
+        mcp_servers,
         warnings,
     })
 }
@@ -651,4 +668,81 @@ fn is_showable(text: &str) -> bool {
         && !text
             .chars()
             .any(|character| character.is_control() && character != '\n')
+}
+
+fn read_mcp_servers(
+    root: &Path,
+    declaration: Option<&Value>,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Value> {
+    let mut servers = BTreeMap::new();
+    if root.join(".mcp.json").exists() {
+        read_mcp_declaration(
+            root,
+            &Value::String("./.mcp.json".into()),
+            &mut servers,
+            warnings,
+        );
+    }
+    if let Some(declaration) = declaration {
+        read_mcp_declaration(root, declaration, &mut servers, warnings);
+    }
+    servers
+}
+
+fn read_mcp_declaration(
+    root: &Path,
+    declaration: &Value,
+    servers: &mut BTreeMap<String, Value>,
+    warnings: &mut Vec<String>,
+) {
+    match declaration {
+        Value::Null => {}
+        Value::Array(items) => {
+            for item in items {
+                read_mcp_declaration(root, item, servers, warnings);
+            }
+        }
+        Value::Object(document) => {
+            let entries = match document.get("mcpServers") {
+                Some(Value::Object(entries)) => entries,
+                Some(_) => {
+                    warnings.push("MCP mcpServers must be an object".into());
+                    return;
+                }
+                None => document,
+            };
+            for (name, entry) in entries {
+                if servers
+                    .insert(name.clone(), entry.clone())
+                    .is_some_and(|previous| previous != *entry)
+                {
+                    warnings.push(format!(
+                        "MCP {}: later declaration replaces an earlier entry",
+                        printable(name)
+                    ));
+                }
+            }
+        }
+        Value::String(path) => {
+            let document = contained_path(root, path)
+                .map_err(str::to_owned)
+                .and_then(|relative| {
+                    read_document(&root.join(relative))
+                        .map_err(|_| "cannot read MCP JSON object".to_owned())
+                });
+            match document {
+                Ok(Some(document)) => {
+                    // Files contain entries, never more paths to follow.
+                    read_mcp_declaration(root, &Value::Object(document), servers, warnings);
+                }
+                Ok(None) => warnings.push("MCP configuration file is missing".into()),
+                Err(reason) => warnings.push(format!(
+                    "mcpServers path {:?} is ignored: {reason}",
+                    printable(path)
+                )),
+            }
+        }
+        _ => warnings.push("mcpServers must be an object, path or array".into()),
+    }
 }

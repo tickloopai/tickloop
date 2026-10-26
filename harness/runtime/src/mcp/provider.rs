@@ -8,18 +8,38 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tickloop_harness_protocol::{ChatId, HostToolAuthority};
 
+pub struct McpConfiguration {
+    pub servers: Vec<McpServerConfig>,
+    pub warnings: Vec<String>,
+}
+
 pub struct McpToolProvider {
     connections: McpConnections,
-    configuration: Arc<dyn Fn() -> Vec<McpServerConfig> + Send + Sync>,
+    configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
+    warnings: RwLock<Vec<String>>,
 }
 impl McpToolProvider {
     pub fn new(
         connections: McpConnections,
         configuration: Arc<dyn Fn() -> Vec<McpServerConfig> + Send + Sync>,
     ) -> Self {
+        Self::with_configuration(
+            connections,
+            Arc::new(move || McpConfiguration {
+                servers: configuration(),
+                warnings: Vec::new(),
+            }),
+        )
+    }
+
+    pub fn with_configuration(
+        connections: McpConnections,
+        configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
+    ) -> Self {
         Self {
             connections,
             configuration,
+            warnings: RwLock::new(Vec::new()),
         }
     }
     fn authority(entry: &Entry) -> HostToolAuthority {
@@ -64,8 +84,13 @@ impl HostToolProvider for McpToolProvider {
         if cancel.is_cancelled() {
             return Err("MCP refresh cancelled".into());
         }
-        self.connections.reconcile((self.configuration)()).await;
+        let configuration = (self.configuration)();
+        self.connections.reconcile(configuration.servers).await;
+        *self.warnings.write().unwrap() = configuration.warnings;
         Ok(())
+    }
+    fn service_connections(&self) -> Value {
+        serde_json::json!({"mcp": {"warnings": *self.warnings.read().unwrap()}})
     }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
         self.connections.snapshot().into_iter().filter_map(|snapshot| {
