@@ -61,11 +61,15 @@ pub struct McpServerSnapshot {
 struct Handler {
     revision: Arc<AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
+    resources_changed: Arc<tokio::sync::Notify>,
 }
 impl ClientHandler for Handler {
     async fn on_tool_list_changed(&self, _: NotificationContext<RoleClient>) {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.changed.notify_one();
+    }
+    async fn on_resource_list_changed(&self, _: NotificationContext<RoleClient>) {
+        self.resources_changed.notify_one();
     }
     fn get_info(&self) -> ClientConfig {
         ClientConfig::default()
@@ -79,7 +83,9 @@ struct Connection {
     changed: Arc<tokio::sync::Notify>,
     tools: RwLock<BTreeMap<String, catalog::Tool>>,
     instructions: String,
-    resources: Vec<Value>,
+    provides_resources: bool,
+    resources: RwLock<Vec<Value>>,
+    resources_changed: Arc<tokio::sync::Notify>,
     warnings: RwLock<Vec<String>>,
 }
 struct Entry {
@@ -314,6 +320,13 @@ impl McpConnections {
                                     *connection.warnings.write().unwrap() = vec!["MCP tools unavailable".into()];
                                 }
                             }
+                            _ = connection.resources_changed.notified(), if connection.provides_resources => {
+                                let resources = tokio::select! {
+                                    _ = entry.cancel.cancelled() => continue,
+                                    resources = tokio::time::timeout(Duration::from_secs(30), resource_directory(&connection.peer)) => resources,
+                                };
+                                *connection.resources.write().unwrap() = resources.ok().and_then(Result::ok).unwrap_or_default();
+                            }
                         }
                     }
 
@@ -378,6 +391,8 @@ impl McpConnections {
                         .as_ref()
                         .map(|c| {
                             c.resources
+                                .read()
+                                .unwrap()
                                 .iter()
                                 .cloned()
                                 .map(|mut value| {
@@ -687,10 +702,12 @@ async fn open(
     stderr_directory: Option<&tickloop_harness_base::private_fs::PrivateDirectory>,
 ) -> Result<(Connection, RunningService<RoleClient, Handler>), String> {
     let changed = Arc::new(tokio::sync::Notify::new());
+    let resources_changed = Arc::new(tokio::sync::Notify::new());
     let revision = Arc::new(AtomicU64::new(0));
     let handler = Handler {
         changed: changed.clone(),
         revision: revision.clone(),
+        resources_changed: resources_changed.clone(),
     };
     let lifecycle = ClientLifecycleMode::Auto {
         preferred_versions: vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
@@ -789,20 +806,13 @@ async fn open(
         Vec::new()
     };
     let resources = if capabilities.resources.is_some() {
-        service
-            .peer()
-            .list_all_resources()
-            .await
-            .map_err(|_| {
-                if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
-                    "MCP login required"
-                } else {
-                    "MCP resources unavailable"
-                }
-            })?
-            .into_iter()
-            .filter_map(|resource| serde_json::to_value(resource).ok())
-            .collect()
+        resource_directory(service.peer()).await.map_err(|_| {
+            if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
+                "MCP login required"
+            } else {
+                "MCP resources unavailable"
+            }
+        })?
     } else {
         Vec::new()
     };
@@ -822,11 +832,23 @@ async fn open(
             changed,
             tools: RwLock::new(tools),
             instructions,
-            resources,
+            provides_resources: capabilities.resources.is_some(),
+            resources: RwLock::new(resources),
+            resources_changed,
             warnings: RwLock::new(warnings),
         },
         service,
     ))
+}
+async fn resource_directory(
+    peer: &rmcp::service::Peer<RoleClient>,
+) -> Result<Vec<Value>, rmcp::ServiceError> {
+    Ok(peer
+        .list_all_resources()
+        .await?
+        .into_iter()
+        .filter_map(|resource| serde_json::to_value(resource).ok())
+        .collect())
 }
 fn redact_value(entry: &Entry, value: &mut Value) {
     match value {

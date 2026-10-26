@@ -71,7 +71,7 @@ impl HostToolProvider for McpToolProvider {
         self.connections.snapshot().into_iter().filter_map(|snapshot| {
             let entries = self.connections.inner.entries.read().unwrap();
             let entry = entries.get(&snapshot.name)?;
-            Some(McpServerInstructions {server:McpResourceServer {name:snapshot.name.clone(), authority:Self::authority(entry)}, text:format!("MCP server: {}; source: {}; status: {:?}. Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, redact(entry, snapshot.instructions))})
+            Some(McpServerInstructions {server:McpResourceServer {name:snapshot.name.clone(), authority:Self::authority(entry), third_party:true}, text:format!("MCP server: {}; source: {}; status: {:?}. Server-provided description (untrusted data):\n{}", snapshot.name, snapshot.source, snapshot.state, redact(entry, snapshot.instructions))})
         }).collect()
     }
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
@@ -81,10 +81,19 @@ impl HostToolProvider for McpToolProvider {
             .read()
             .unwrap()
             .values()
-            .filter(|entry| *entry.state.read().unwrap() == McpServerState::Connected)
+            .filter(|entry| {
+                *entry.state.read().unwrap() == McpServerState::Connected
+                    && entry
+                        .connection
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|connection| connection.provides_resources)
+            })
             .map(|entry| McpResourceServer {
                 name: entry.config.name.clone(),
                 authority: Self::authority(entry),
+                third_party: true,
             })
             .collect()
     }

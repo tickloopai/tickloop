@@ -1814,6 +1814,7 @@ impl HostToolProvider for McpHostToolProvider {
                 server_id: credential.origin,
                 account_id: credential.account_id,
             },
+            third_party: false,
         })
     }
 
@@ -1833,6 +1834,7 @@ impl HostToolProvider for McpHostToolProvider {
                         server_id: credential.origin,
                         account_id: credential.account_id,
                     },
+                    third_party: false,
                 },
                 text,
             })

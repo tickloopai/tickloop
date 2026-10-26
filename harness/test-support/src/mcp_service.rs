@@ -22,6 +22,10 @@ struct State {
     status: u16,
     error: Option<Value>,
     changed: bool,
+    resources_capability: Option<Value>,
+    resources: Value,
+    resource_text: String,
+    resources_changed: bool,
 }
 impl McpService {
     pub async fn start() -> Self {
@@ -37,6 +41,10 @@ impl McpService {
                 status: 200,
                 error: None,
                 changed: false,
+                resources_capability: Some(json!({})),
+                resources: json!([{"uri":"fixture://text","name":"text"}]),
+                resource_text: "resource text".into(),
+                resources_changed: false,
             })),
             cancel: CancellationToken::new(),
         };
@@ -74,28 +82,35 @@ impl McpService {
                                 bytes.extend_from_slice(&chunk[..size]);
                             }
                             let Ok(request) = serde_json::from_slice::<Value>(&bytes[header_end..header_end + length]) else { return };
-                            let (status, delay, result, error, changed) = {
+                            let (status, delay, result, error, notifications) = {
                                 let mut state = state.lock().unwrap();
                                 let method = request["method"].as_str().unwrap_or("");
                                 let result = match method {
-                                    "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":{"tools":{"listChanged":true},"resources":{}},"serverInfo":{"name":"fixture","version":"1"},"instructions":"Fixture service instructions"}),
+                                    "initialize" => {
+                                        let mut capabilities = json!({"tools":{"listChanged":true}});
+                                        if let Some(resources) = &state.resources_capability { capabilities["resources"] = resources.clone(); }
+                                        json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":capabilities,"serverInfo":{"name":"fixture","version":"1"},"instructions":"Fixture service instructions"})
+                                    }
                                     "tools/list" => json!({"tools":state.tools}),
-                                    "resources/list" => json!({"resources":[{"uri":"fixture://text","name":"text"}]}),
-                                    "resources/read" => json!({"contents":[{"uri":"fixture://text","text":"resource text"}]}),
+                                    "resources/list" => json!({"resources":state.resources}),
+                                    "resources/read" => json!({"contents":[{"uri":request["params"]["uri"],"text":state.resource_text}]}),
                                     "tools/call" => { state.calls.push(request.clone()); state.result.clone() },
                                     _ => json!({}),
                                 };
                                 let call = method == "tools/call";
-                                let changed = call && std::mem::take(&mut state.changed);
-                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed)
+                                let mut notifications = Vec::new();
+                                if call && std::mem::take(&mut state.changed) { notifications.push("notifications/tools/list_changed"); }
+                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push("notifications/resources/list_changed"); }
+                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications)
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
                             let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
                             let (status, content_type, body) = if request.get("id").is_none() {
                                 (202, "application/json", String::new())
-                            } else if changed {
-                                (status, "text/event-stream", format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n"))
+                            } else if !notifications.is_empty() {
+                                let events: String = notifications.iter().map(|method| format!("data: {}\n\n", json!({"jsonrpc":"2.0","method":method}))).collect();
+                                (status, "text/event-stream", format!("{events}data: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
                             let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = stream.write_all(reply.as_bytes()).await;
@@ -132,6 +147,21 @@ impl McpService {
     }
     pub fn notify_tools_changed(&self) {
         self.state.lock().unwrap().changed = true;
+    }
+    /// `None` initializes without the resources capability.
+    pub fn set_resources_capability(&self, capability: Option<Value>) {
+        self.state.lock().unwrap().resources_capability = capability;
+    }
+    pub fn set_resources(&self, resources: Value) {
+        self.state.lock().unwrap().resources = resources;
+    }
+    /// The text every resource read returns.
+    pub fn set_resource_text(&self, text: impl Into<String>) {
+        self.state.lock().unwrap().resource_text = text.into();
+    }
+    /// The next tool call or resource read also delivers a resource list change.
+    pub fn notify_resources_changed(&self) {
+        self.state.lock().unwrap().resources_changed = true;
     }
     pub fn calls(&self) -> Vec<Value> {
         self.state.lock().unwrap().calls.clone()
