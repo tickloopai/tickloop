@@ -1,4 +1,4 @@
-//! `/ticks` in the Agent's terminal, against a private config root, with a local marketplace file
+//! `/ticks` and `/plugins` in the Agent's terminal, against a private config root, with a local marketplace file
 //! and a local HTTP server for its downloads.
 
 use std::{
@@ -216,8 +216,8 @@ fn save_login(fixture: &Fixture, name: &str) {
         .unwrap();
 }
 
-fn install_path(fixture: &Fixture, directory: &Path) {
-    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(directory)]));
+fn install_from_path(fixture: &Fixture, command: &str, directory: &Path) {
+    succeeded(&fixture.tickloop(&[command, "install", "--path", &path_text(directory)]));
 }
 
 /// Whether the row of `name` ends with `details`.
@@ -256,14 +256,14 @@ fn dialog_text(frame: &str) -> String {
 }
 
 fn panel_is_open(frame: &str) -> bool {
-    frame.contains("Plugins ·")
+    frame.contains("Plugins ·") || frame.contains("Ticks ·")
 }
 
 #[test]
 fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     let fixture = Fixture::new();
     fixture.install_official(&fixture.package_with_login("alpha", "1.0.0"));
-    install_path(&fixture, &fixture.package_named("beta", "1.0.0"));
+    install_from_path(&fixture, "tick", &fixture.package_named("beta", "1.0.0"));
     let server = Server::start();
     let (alpha_archive, alpha_sha256) = archive_of(&fixture.package_with_login("alpha", "2.0.0"));
     let (sample_archive, sample_sha256) = archive_of(&fixture.package_named("sample", "1.0.0"));
@@ -294,7 +294,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     assert!(
         frame
             .replace(screen::SELECTED_MARK, " ")
-            .contains("Plugins · [Installed]  Available"),
+            .contains("Ticks · [Installed]  Available"),
         "{frame}"
     );
     assert!(
@@ -333,7 +333,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         "{frame}"
     );
     terminal.press(b"\r", "the update", |frame| {
-        frame.contains("Updated plugin alpha@tickloop from 1.0.0 to 2.0.0")
+        frame.contains("Updated Tick alpha@tickloop from 1.0.0 to 2.0.0")
             && dialog_text(frame).contains("Its Tick program runs as you when opened")
             && !frame.contains("new Chat")
             && row_shows(frame, "alpha", "2.0.0 · installed")
@@ -342,7 +342,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         is_selected(frame, "sample")
     });
     terminal.press(b"\r", "the install", |frame| {
-        frame.contains("Installed plugin sample@tickloop 1.0.0")
+        frame.contains("Installed Tick sample@tickloop 1.0.0")
             && row_shows(frame, "sample", "1.0.0 · installed")
     });
     assert!(
@@ -366,7 +366,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     );
     assert!(!frame.contains("Update to"), "{frame}");
     assert!(frame.contains("enter confirm · esc back"), "{frame}");
-    input_dialog::assert_frame(&frame, usize::from(ROWS), "Plugins");
+    input_dialog::assert_frame(&frame, usize::from(ROWS), "Ticks");
 
     // A login saved elsewhere shows once the list is read again; logging out deletes it.
     terminal.press(ESCAPE, "the list again", |frame| {
@@ -416,7 +416,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
 
     let frame = terminal.press(ESCAPE, "the closed panel", |frame| !panel_is_open(frame));
     assert!(frame.contains("────"), "the input is back:\n{frame}");
-    let listed = succeeded(&fixture.tickloop(&["plugin", "list"]));
+    let listed = succeeded(&fixture.tickloop(&["tick", "list"]));
     assert!(
         listed.starts_with("alpha@tickloop  2.0.0  enabled  needs login"),
         "{listed}"
@@ -473,7 +473,7 @@ fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
             json!({"type": "api_key", "env": "KEYED_API_KEY", "label": "Keyed API key"}),
         ),
     ] {
-        install_path(&fixture, &package);
+        install_from_path(&fixture, "tick", &package);
     }
     let token_path = fixture.root.join("config/credentials/alpha/oauth2.json");
     let missing = path_text(&fixture.root.join("missing.json"));
@@ -500,7 +500,7 @@ fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
             && shown.contains("❯ Cancel login"),
         "{frame}"
     );
-    input_dialog::assert_frame(&frame, usize::from(ROWS), "Plugins");
+    input_dialog::assert_frame(&frame, usize::from(ROWS), "Ticks");
     terminal.wait_for_frame(terminal.mark(), "the refusal", |frame| {
         dialog_text(frame).contains("Cannot log in to alpha: the authorization was denied")
             && row_shows(frame, "alpha", "1.0.0 · needs login")
@@ -575,23 +575,42 @@ fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
 }
 
 #[test]
-fn plugins_command_and_ticks_alias_open_the_plugins_panel() {
+fn ticks_and_plugins_are_separate_commands_and_panels() {
     let fixture = Fixture::new();
+    install_from_path(&fixture, "tick", &fixture.package_named("alpha", "1.0.0"));
+    let notes = fixture.root.join("notes");
+    fs::create_dir_all(notes.join(".claude-plugin")).unwrap();
+    fs::write(
+        notes.join(".claude-plugin/plugin.json"),
+        r#"{"name":"notes","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    install_from_path(&fixture, "plugin", &notes);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "Plugins", |frame| {
+    terminal.press(b"/tic", "the /ticks completion", |frame| {
+        frame.contains("/ticks") && frame.contains("log in to Ticks")
+    });
+    let frame = terminal.press(b"ks\r", "the Ticks panel", |frame| {
+        frame
+            .replace(screen::SELECTED_MARK, " ")
+            .contains("Ticks · [Installed]  Available")
+            && row_shows(frame, "alpha", "1.0.0 · no login needed")
+    });
+    assert!(
+        !frame.contains("◉ notes") && !frame.contains("renamed"),
+        "{frame}"
+    );
+    terminal.press(ESCAPE, "closed Ticks", |frame| !panel_is_open(frame));
+    let frame = terminal.press(b"/plugins\r", "the Plugins panel", |frame| {
         frame
             .replace(screen::SELECTED_MARK, " ")
             .contains("Plugins · [Installed]  Available")
+            && row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
     });
-    terminal.press(ESCAPE, "closed plugins", |frame| {
-        !frame.contains("Plugins ·")
-    });
-    terminal.press(b"/ticks\r", "renamed alias", |frame| {
-        frame.contains("Plugins ·") && frame.contains("/ticks has been renamed to /plugins")
-    });
-    terminal.press(ESCAPE, "closed alias", |frame| !frame.contains("Plugins ·"));
+    assert!(!frame.contains("◉ alpha"), "{frame}");
+    terminal.press(ESCAPE, "closed Plugins", |frame| !panel_is_open(frame));
     terminal.exit();
 }
 
@@ -605,7 +624,7 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
         r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}}}"#,
     )
     .unwrap();
-    install_path(&fixture, &directory);
+    install_from_path(&fixture, "plugin", &directory);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
@@ -650,7 +669,7 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
     let marketplace = fixture.marketplace_file("many", &marketplace_json(json!(packages)));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "plugins", panel_is_open);
+    terminal.press(b"/ticks\r", "ticks", panel_is_open);
     terminal.press(TAB, "available plugins", |frame| {
         frame.contains("[Available]") && frame.contains("jk-000")
     });
@@ -664,7 +683,7 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
         is_selected(frame, "jk-340")
     });
     terminal.press(b"xx", "x stays text in the filter", |frame| {
-        frame.contains("Filter: jk-34xx") && frame.contains("No plugins match")
+        frame.contains("Filter: jk-34xx") && frame.contains("No Ticks match")
     });
     terminal.press(b"\x7f\x7f", "backspace restores matches", |frame| {
         is_selected(frame, "jk-340")
@@ -682,7 +701,7 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
         frame.contains("Filter: jk-349") && is_selected(frame, "jk-349")
     });
     terminal.press(b"\r", "install the filtered selection", |frame| {
-        frame.contains("Installed plugin jk-349@tickloop 1.0.0")
+        frame.contains("Installed Tick jk-349@tickloop 1.0.0")
             && row_shows(frame, "jk-349", "1.0.0 · installed")
     });
     terminal.press(ESCAPE, "leave edited filter", |frame| {
@@ -698,13 +717,13 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
 #[test]
 fn uninstall_requires_two_plain_x_presses_on_the_same_plugin() {
     let fixture = Fixture::new();
-    install_path(&fixture, &fixture.package_named("alpha", "1.0.0"));
-    install_path(&fixture, &fixture.package_named("beta", "1.0.0"));
+    install_from_path(&fixture, "tick", &fixture.package_named("alpha", "1.0.0"));
+    install_from_path(&fixture, "tick", &fixture.package_named("beta", "1.0.0"));
     save_login(&fixture, "alpha");
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "installed plugins", |frame| {
+    terminal.press(b"/ticks\r", "installed Ticks", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
     terminal.press(b"x", "uninstall armed", |frame| {
@@ -755,11 +774,11 @@ fn uninstall_requires_two_plain_x_presses_on_the_same_plugin() {
 #[test]
 fn a_short_terminal_cannot_confirm_a_hidden_plugin_uninstall() {
     let fixture = Fixture::new();
-    install_path(&fixture, &fixture.package_named("alpha", "1.0.0"));
+    install_from_path(&fixture, "tick", &fixture.package_named("alpha", "1.0.0"));
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "installed", |frame| {
+    terminal.press(b"/ticks\r", "installed", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
     terminal.press(b"x", "uninstall armed", |frame| {
@@ -777,7 +796,7 @@ fn a_short_terminal_cannot_confirm_a_hidden_plugin_uninstall() {
     let mark = terminal.mark();
     terminal.resize(COLUMNS, ROWS);
     terminal.wait_for_frame(mark, "full terminal", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "plugin preserved", |frame| {
+    terminal.press(b"/ticks\r", "Tick preserved", |frame| {
         row_shows(frame, "alpha", "1.0.0 · no login needed")
     });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));

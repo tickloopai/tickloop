@@ -8,6 +8,7 @@ use std::ffi::OsString;
 
 use tickloop_code_client::{DAEMON_COMMAND, RUN_SUBCOMMAND};
 use tickloop_code_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_worker};
+use tickloop_tick_installer::PluginKind;
 
 const MONITOR_COMMAND: &str = "monitor";
 const TICK_COMMAND: &str = "tick";
@@ -30,11 +31,8 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         (MONITOR_COMMAND, _) => {
             Some(tickloop_code_console::terminal::monitor_command::run(&arguments[1..]).await)
         }
-        (TICK_COMMAND, _) => {
-            eprintln!("tickloop tick has been renamed; use tickloop plugin instead.");
-            Some(plugin_command::run(&arguments[1..]).await)
-        }
-        (PLUGIN_COMMAND, _) => Some(plugin_command::run(&arguments[1..]).await),
+        (TICK_COMMAND, _) => Some(plugin_command::run(PluginKind::Tick, &arguments[1..]).await),
+        (PLUGIN_COMMAND, _) => Some(plugin_command::run(PluginKind::Plugin, &arguments[1..]).await),
         _ => None,
     }
 }

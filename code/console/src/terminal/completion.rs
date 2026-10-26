@@ -173,7 +173,13 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/plugins",
         arguments: "",
-        description: "Install, update, enable, disable and log in to plugins.",
+        description: "Install, update, enable and disable plugins without a Tick program.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
+        command: "/ticks",
+        arguments: "",
+        description: "Install, update, enable, disable and log in to Ticks.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -685,8 +691,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 26);
-        assert_eq!(builtin_commands().len(), 42);
+        assert_eq!(completion.candidates().len(), 27);
+        assert_eq!(builtin_commands().len(), 43);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -705,6 +711,7 @@ mod tests {
             "/slides",
             "/artifacts",
             "/plugins",
+            "/ticks",
         ] {
             assert!(command_names(&completion).contains(&command));
         }

@@ -1,6 +1,7 @@
-//! Runs the work `/plugins` asks for, through the same installs, updates, uninstalls, logins and
-//! logouts as `tickloop plugin`: each runs as a task, and an OAuth login in two, one that gets the
-//! device code the panel shows and one that waits for the user to approve it.
+//! Runs the work `/ticks` and `/plugins` ask for, through the same installs, updates, uninstalls,
+//! logins and logouts as `tickloop tick` and `tickloop plugin`: each runs as a task, and an OAuth
+//! login in two, one that gets the device code the panel shows and one that waits for the user to
+//! approve it.
 
 use std::{collections::HashMap, future::Future, path::Path};
 
@@ -19,11 +20,20 @@ use super::{
     console::Console,
     safe_line,
     ticks_panel::{
-        Applied, InstalledList, TickPackageRequest, TickPackageResult, TickPackageWork, TicksPanel,
+        Applied, InstalledList, PluginKind, TickPackageRequest, TickPackageResult, TickPackageWork,
+        TicksPanel,
     },
 };
 
-/// What a `/plugins` task ends with.
+/// The Console command that opens the panel of `kind`.
+pub(super) fn panel_command(kind: PluginKind) -> &'static str {
+    match kind {
+        PluginKind::Plugin => "/plugins",
+        PluginKind::Tick => "/ticks",
+    }
+}
+
+/// What a `/ticks` or `/plugins` task ends with.
 pub(super) enum Done {
     Result(TickPackageResult),
     /// The device authorization of a login, which the panel shows while it waits for approval.
@@ -35,8 +45,8 @@ pub(super) enum Done {
     },
 }
 
-/// The `/plugins` work under way. Reads of the installed packages are numbered as they start, so a
-/// panel keeps the most recent one whatever order they finish in.
+/// The `/ticks` and `/plugins` work under way. Reads of the installed packages are numbered as they
+/// start, so a panel keeps the most recent one whatever order they finish in.
 #[derive(Default)]
 pub(super) struct TickPackageTasks {
     running: JoinSet<(Uuid, Done)>,
@@ -44,6 +54,8 @@ pub(super) struct TickPackageTasks {
     marketplace_reads: u64,
     /// The login under way in each panel: its attempt and what cancels it.
     logins: HashMap<Uuid, (u64, CancellationToken)>,
+    /// The command that opened each panel, which names its results once the panel is closed.
+    commands: HashMap<Uuid, &'static str>,
 }
 
 impl TickPackageTasks {
@@ -96,16 +108,18 @@ impl TickPackageTasks {
     }
 }
 
-/// Opens `/plugins` and starts reading what it lists.
+/// Opens the panel of `kind`, `/ticks` or `/plugins`, and starts reading what it lists.
 pub(super) fn open(
     console: &Console,
     root: &Path,
     chat: Option<Uuid>,
+    kind: PluginKind,
     tasks: &mut TickPackageTasks,
 ) -> Result<(), String> {
-    let panel = TicksPanel::new(chat);
+    let panel = TicksPanel::new(chat, kind);
     let id = panel.id();
     console.show_ticks_panel(panel)?;
+    tasks.commands.insert(id, panel_command(kind));
     start(
         root,
         TickPackageWork {
@@ -329,7 +343,12 @@ pub(super) fn finish(
         Applied::Ignored => return Ok(()),
         Applied::NoPanel => {
             if let Some(notice) = notice {
-                console.write_line(&format!("/plugins: {}", safe_line(&notice.text)))?;
+                let command = tasks
+                    .commands
+                    .get(&panel)
+                    .copied()
+                    .unwrap_or(panel_command(PluginKind::Plugin));
+                console.write_line(&format!("{command}: {}", safe_line(&notice.text)))?;
             }
             return Ok(());
         }

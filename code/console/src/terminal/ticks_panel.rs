@@ -1,5 +1,6 @@
-//! `/plugins`: installed plugins and offers from every registered marketplace. Enter opens an
-//! installed plugin's actions, or installs the selected Available entry from its named marketplace.
+//! `/ticks` and `/plugins`: one panel of each [`PluginKind`], listing the installed plugins of that
+//! kind and what every registered marketplace offers of it. Enter opens an installed plugin's
+//! actions, or installs the selected Available entry from its named marketplace.
 //! Logging in happens in the panel: the link and code of an OAuth device authorization, or a
 //! masked entry of a key. The panel keeps what it shows and what the user chose; the Console runs
 //! the work and hands each result back through [`TicksPanel::apply`].
@@ -12,6 +13,7 @@ use tick_plugins::{
     BrokenPlugin, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins,
     LOCAL_MARKETPLACE, MarketplacePlugin, PluginManifest, Uninstalled,
 };
+pub(super) use tickloop_tick_installer::PluginKind;
 use tickloop_tick_installer::{
     LoggedOut, LoginError, MarketplaceOffer, PluginRequest, installed_status, login_label,
     unavailable_reason,
@@ -31,7 +33,6 @@ use super::{
 };
 
 const UNINSTALL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(3);
-const TITLE: &str = "Plugins";
 const PAGES: [&str; 2] = ["Installed", "Available"];
 const INSTALLED_PAGE: usize = 0;
 const MARKETPLACE_PAGE: usize = 1;
@@ -226,14 +227,16 @@ impl TickPackageResult {
             } => {
                 let manifest = &installation.plugin.manifest;
                 let (id, version) = (installation.plugin.id(), &installation.plugin.version);
+                let kind = PluginKind::of_installed(&installation.plugin);
+                let noun = kind.noun();
                 let mut text = match &installation.outcome {
-                    InstallOutcome::Installed => format!("Installed plugin {id} {version}"),
+                    InstallOutcome::Installed => format!("Installed {noun} {id} {version}"),
                     InstallOutcome::Replaced { previous_version } => {
-                        format!("Updated plugin {id} from {previous_version} to {version}")
+                        format!("Updated {noun} {id} from {previous_version} to {version}")
                     }
-                    InstallOutcome::Reinstalled => format!("Reinstalled plugin {id} {version}"),
+                    InstallOutcome::Reinstalled => format!("Reinstalled {noun} {id} {version}"),
                     InstallOutcome::AlreadyInstalled => {
-                        format!("Plugin {id} {version} is up to date")
+                        format!("{} {id} {version} is up to date", kind.label())
                     }
                 };
                 if let Some(display_name) = &manifest.display_name {
@@ -393,6 +396,8 @@ impl AvailablePlugin<'_> {
 pub(super) struct TicksPanel {
     id: Uuid,
     pub(super) chat: Option<Uuid>,
+    /// The kind of plugin the panel lists; the other kind has a panel of its own.
+    kind: PluginKind,
     page: usize,
     filter: Editor,
     filtering: bool,
@@ -416,10 +421,11 @@ pub(super) struct TicksPanel {
 }
 
 impl TicksPanel {
-    pub(super) fn new(chat: Option<Uuid>) -> Self {
+    pub(super) fn new(chat: Option<Uuid>, kind: PluginKind) -> Self {
         Self {
             id: tickloop_ids::generate(),
             chat,
+            kind,
             page: INSTALLED_PAGE,
             filter: Editor::new(),
             filtering: false,
@@ -441,6 +447,13 @@ impl TicksPanel {
 
     pub(super) fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub(super) fn title(&self) -> &'static str {
+        match self.kind {
+            PluginKind::Plugin => "Plugins",
+            PluginKind::Tick => "Ticks",
+        }
     }
 
     /// Takes `result`, unless it belongs to a login that is no longer shown: the end of a login
@@ -982,7 +995,10 @@ impl TicksPanel {
             }
         };
         if entry.marketplace() == LOCAL_MARKETPLACE {
-            context.push(format!("{name}@local was installed from a local path; tickloop plugin install --path updates it"));
+            context.push(format!(
+                "{name}@local was installed from a local path; {} install --path updates it",
+                self.kind.command()
+            ));
         }
         if options.is_empty() {
             options.push(("Back".into(), Choice::Back));
@@ -1022,8 +1038,15 @@ impl TicksPanel {
             .plugins
             .iter()
             .zip(list.logins.iter().copied())
+            .filter(|(package, _)| PluginKind::of_installed(package) == self.kind)
             .map(|(package, login)| InstalledEntry::Usable { package, login })
-            .chain(list.packages.broken.iter().map(InstalledEntry::Unusable))
+            .chain(
+                list.packages
+                    .broken
+                    .iter()
+                    .filter(|package| self.kind.lists_broken(package))
+                    .map(InstalledEntry::Unusable),
+            )
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.name().cmp(right.name()));
         entries
@@ -1043,6 +1066,7 @@ impl TicksPanel {
                     .ok()
                     .into_iter()
                     .flatten()
+                    .filter(|plugin| PluginKind::of_offer(plugin) == self.kind)
                     .map(|plugin| AvailablePlugin {
                         marketplace: &marketplace.registration.name,
                         plugin,
@@ -1272,7 +1296,7 @@ impl TicksPanel {
         }
         if self.uninstall_confirmation.is_some() {
             add(
-                "Uninstall removes plugin files and data. Saved login and running Ticks stay.",
+                "Uninstall removes its files and data. Saved login and running Ticks stay.",
                 Role::MutedText,
             );
         }
@@ -1329,7 +1353,7 @@ impl TicksPanel {
         height: usize,
         display: DisplayProfile,
     ) -> ConversationPickerFrame {
-        let mut lines = vec![tab_header_line(TITLE, self.page, &PAGES, width)];
+        let mut lines = vec![tab_header_line(self.title(), self.page, &PAGES, width)];
         let status = self.status_lines(width);
         let capacity = height.saturating_sub(CHROME_ROWS + status.len());
         let mut body = Vec::new();
@@ -1463,20 +1487,21 @@ impl TicksPanel {
 
     /// What the page shows without packages to list, wrapped at `width`.
     fn empty_lines(&self, width: usize) -> Vec<RoleLine> {
+        let plural = self.kind.plural();
         let (text, role) = match (self.page, &self.installed, &self.marketplace) {
             (INSTALLED_PAGE, Listing::Loading, _) => ("Loading…".to_owned(), Role::MutedText),
             (INSTALLED_PAGE, Listing::Failed(error), _) => (safe_line(error), Role::Error),
             (INSTALLED_PAGE, Listing::Loaded(_), _) => (
-                "No plugins are installed; the Available page offers them.".to_owned(),
+                format!("No {plural} are installed; the Available page offers them."),
                 Role::MutedText,
             ),
             (_, _, Listing::Loading) => ("Reading marketplaces…".to_owned(), Role::MutedText),
             (_, _, Listing::Failed(error)) => (safe_line(error), Role::Error),
             (_, _, Listing::Loaded(_)) => (
                 if self.filter.draft().is_empty() {
-                    "No plugins available".to_owned()
+                    format!("No {plural} available")
                 } else {
-                    format!("No plugins match \"{}\"", self.filter.draft())
+                    format!("No {plural} match \"{}\"", self.filter.draft())
                 },
                 Role::MutedText,
             ),
@@ -1738,7 +1763,7 @@ mod tests {
     /// A panel listing alpha 1.0.0, which logs in, and beta 1.0.0, which needs no login, beside a
     /// marketplace offering alpha 2.0.0 and sample 1.0.0.
     fn loaded_panel() -> TicksPanel {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(
             1,
             vec![
@@ -1799,7 +1824,7 @@ mod tests {
         let mut panel = loaded_panel();
         let shown = text(&mut panel);
         assert!(
-            shown.starts_with("Plugins · [Installed]  Available"),
+            shown.starts_with("Ticks · [Installed]  Available"),
             "{shown}"
         );
         assert!(
@@ -2118,7 +2143,7 @@ mod tests {
 
     #[test]
     fn a_package_with_several_issuers_offers_a_login_at_each() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         let issuers = vec![server("China mainland"), server("Global")];
         panel.apply(installed_list(
             1,
@@ -2178,7 +2203,7 @@ mod tests {
 
     #[test]
     fn a_long_key_wraps_with_the_cursor_after_its_last_star() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(
             1,
             vec![(
@@ -2219,7 +2244,7 @@ mod tests {
 
     #[test]
     fn a_key_is_entered_masked_and_saved() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(
             1,
             vec![(
@@ -2394,7 +2419,7 @@ mod tests {
         });
         let shown = text(&mut panel);
         assert!(
-            shown.contains("Updated plugin alpha@tickloop from 1.0.0 to 2.0.0"),
+            shown.contains("Updated Tick alpha@tickloop from 1.0.0 to 2.0.0"),
             "{shown}"
         );
         assert!(
@@ -2418,7 +2443,7 @@ mod tests {
 
     #[test]
     fn the_marketplace_explains_what_cannot_be_installed() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(
             1,
             vec![(installed("alpha", "1.0.0", true), LoginState::LoggedIn)],
@@ -2444,7 +2469,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_marketplace_leaves_the_installed_page_as_it_is() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         assert!(text(&mut panel).contains("Loading…"));
         panel.apply(marketplace_result(Err(
             "cannot read the Tick marketplace at /missing.json: No such file or directory".into(),
@@ -2481,7 +2506,7 @@ mod tests {
 
     #[test]
     fn an_older_catalog_completion_does_not_replace_the_refreshed_marketplace() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(1, Vec::new()));
         panel.apply(TickPackageResult::Marketplace {
             read: 2,
@@ -2527,9 +2552,141 @@ mod tests {
         assert!(!text(&mut panel).contains("◉ beta"), "{}", text(&mut panel));
     }
 
+    fn without_tick(mut package: InstalledPlugin) -> InstalledPlugin {
+        package.manifest.tick = None;
+        package.manifest.components.clear();
+        package.manifest.format = ManifestFormat::Claude;
+        package.marketplace = "team".into();
+        package
+    }
+
+    /// A marketplace `team` listing `name` from a directory, whose components are unknown until
+    /// it is fetched.
+    fn directory_marketplace(name: &str) -> MarketplaceOffer {
+        MarketplaceOffer {
+            registration: MarketplaceRegistration {
+                name: "team".into(),
+                source: MarketplaceSource::Directory(PathBuf::from("/team")),
+                builtin: false,
+                refreshed_at: None,
+                commit: None,
+            },
+            plugins: Ok(vec![MarketplacePlugin {
+                name: name.into(),
+                description: Some(format!("The {name} plugin")),
+                version: Some("1.0.0".into()),
+                source: MarketplacePluginSource::Relative(format!("./{name}")),
+                manifest: Default::default(),
+            }]),
+        }
+    }
+
+    /// A `kind` panel beside installed alpha, which carries a Tick program, and notes, which does
+    /// not; the Tick marketplace offers alpha 2.0.0 and sample 1.0.0, and team offers docs.
+    fn mixed_panel(kind: PluginKind) -> TicksPanel {
+        let mut panel = TicksPanel::new(None, kind);
+        panel.apply(installed_list(
+            1,
+            vec![
+                (installed("alpha", "1.0.0", true), LoginState::LoggedOut),
+                (
+                    without_tick(installed("notes", "1.0.0", false)),
+                    LoginState::NotRequired,
+                ),
+            ],
+        ));
+        let mut offers = marketplace(&[("alpha", "2.0.0", true), ("sample", "1.0.0", true)]);
+        offers.push(directory_marketplace("docs"));
+        panel.apply(marketplace_result(Ok(offers)));
+        panel
+    }
+
+    /// The names of the rows on the page shown, in order.
+    fn listed(panel: &mut TicksPanel) -> Vec<String> {
+        frame(panel)
+            .iter()
+            .filter_map(|line| {
+                let text = line.text();
+                let name = text.strip_prefix("◉ ")?.split_whitespace().next()?;
+                Some(name.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ticks_panel_lists_only_plugins_that_carry_a_tick_program() {
+        let mut panel = mixed_panel(PluginKind::Tick);
+        let shown = text(&mut panel);
+        assert!(
+            shown.starts_with("Ticks · [Installed]  Available"),
+            "{shown}"
+        );
+        assert_eq!(listed(&mut panel), ["alpha"], "{shown}");
+        press(&mut panel, KeyCode::Tab);
+        let shown = text(&mut panel);
+        assert_eq!(listed(&mut panel), ["alpha", "sample"], "{shown}");
+        assert!(!shown.contains("docs"), "{shown}");
+    }
+
+    #[test]
+    fn the_plugins_panel_leaves_out_every_plugin_that_carries_a_tick_program() {
+        let mut panel = mixed_panel(PluginKind::Plugin);
+        let shown = text(&mut panel);
+        assert!(
+            shown.starts_with("Plugins · [Installed]  Available"),
+            "{shown}"
+        );
+        assert_eq!(listed(&mut panel), ["notes"], "{shown}");
+        press(&mut panel, KeyCode::Tab);
+        let shown = text(&mut panel);
+        assert_eq!(listed(&mut panel), ["docs"], "{shown}");
+        assert!(
+            shown.contains("docs · The docs plugin")
+                && shown.contains("team · 1.0.0 · not installed"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn each_panel_names_its_own_kind_when_it_is_empty() {
+        for (kind, installed, available) in [
+            (
+                PluginKind::Tick,
+                "No Ticks are installed; the Available page offers them.",
+                "No Ticks available",
+            ),
+            (
+                PluginKind::Plugin,
+                "No plugins are installed; the Available page offers them.",
+                "No plugins available",
+            ),
+        ] {
+            let mut panel = TicksPanel::new(None, kind);
+            panel.apply(installed_list(1, Vec::new()));
+            panel.apply(marketplace_result(Ok(Vec::new())));
+            assert!(text(&mut panel).contains(installed));
+            press(&mut panel, KeyCode::Tab);
+            assert!(text(&mut panel).contains(available));
+        }
+    }
+
+    #[test]
+    fn a_local_tick_points_to_the_tick_command_to_update_it() {
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
+        let mut local = installed("alpha", "1.0.0", false);
+        local.marketplace = LOCAL_MARKETPLACE.into();
+        panel.apply(installed_list(1, vec![(local, LoginState::NotRequired)]));
+        press(&mut panel, KeyCode::Enter);
+        assert!(
+            text(&mut panel).contains("tickloop tick install --path updates it"),
+            "{}",
+            text(&mut panel)
+        );
+    }
+
     #[test]
     fn an_update_reports_actual_versions_even_when_the_offered_version_is_older() {
-        let mut panel = TicksPanel::new(None);
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
         panel.apply(installed_list(
             1,
             vec![(installed("alpha", "0.3.0", true), LoginState::LoggedIn)],
@@ -2557,6 +2714,6 @@ mod tests {
                 },
             })),
         });
-        assert!(text(&mut panel).contains("Updated plugin alpha@tickloop from 0.3.0 to 0.2.0"));
+        assert!(text(&mut panel).contains("Updated Tick alpha@tickloop from 0.3.0 to 0.2.0"));
     }
 }

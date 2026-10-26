@@ -200,7 +200,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
 fn a_local_tick_plugin_can_be_replaced_and_an_unusable_plugin_is_listed() {
     let fixture = Fixture::new();
     succeeded(&fixture.tickloop(&[
-        "plugin",
+        "tick",
         "install",
         "--path",
         &path_text(&fixture.package_named("sample", "1.0.0")),
@@ -256,6 +256,8 @@ fn the_plugin_command_explains_its_usage() {
         &["plugin", "marketplace", "add"],
         &["plugin", "marketplace", "remove"],
         &["plugin", "marketplace", "list", "extra"],
+        &["plugin", "login", "notes"],
+        &["plugin", "logout", "notes"],
     ] {
         let error = failed(&fixture.tickloop(arguments));
         assert!(
@@ -293,7 +295,7 @@ fn the_plugin_command_explains_its_usage() {
     let console_help = succeeded(&fixture.tickloop(&["--help"]));
     assert!(
         console_help.contains(
-            "tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE"
+            "tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE"
         ),
         "{console_help}"
     );
@@ -301,21 +303,79 @@ fn the_plugin_command_explains_its_usage() {
 }
 
 #[test]
-fn tick_is_a_renamed_alias_and_installing_a_program_explains_its_execution_identity() {
+fn tick_and_plugin_each_manage_only_their_own_kind() {
     let fixture = Fixture::new();
-    let source = fixture.package_named("sample", "1.0.0");
-    let output = fixture.tickloop(&["tick", "install", "--path", &path_text(&source)]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let tick = path_text(&fixture.package_named("sample", "1.0.0"));
+    let notes = path_text(&claude_plugin(
+        &fixture,
+        "notes",
+        json!({"name": "notes", "version": "1.0.0"}),
+        &["write"],
+    ));
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "--path", &tick])),
+        format!("Error: sample carries a Tick program; use tickloop tick install --path {tick}\n")
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("tickloop plugin"));
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("sample@local"), "{text}");
-    assert!(text.contains("runs as your user"), "{text}");
-    let listed = succeeded(&plugin(&fixture, &["list"]));
-    assert!(listed.contains("sample@local"));
+    assert_eq!(
+        failed(&fixture.tickloop(&["tick", "install", "--path", &notes])),
+        format!("Error: notes has no Tick program; use tickloop plugin install --path {notes}\n")
+    );
+    assert!(!fixture.root.join("config/plugins/cache/local").exists());
+
+    let output = fixture.tickloop(&["tick", "install", "--path", &tick]);
+    let installed = succeeded(&output);
+    assert!(
+        installed.starts_with("Installed Tick sample@local 1.0.0")
+            && installed.contains("When opened, its Tick program runs as your user."),
+        "{installed}"
+    );
+    assert!(output.stderr.is_empty(), "no rename notice");
+    succeeded(&plugin(&fixture, &["install", "--path", &notes]));
+
+    let ticks = succeeded(&fixture.tickloop(&["tick", "list"]));
+    assert!(
+        ticks.starts_with("sample@local  1.0.0  enabled  no login needed")
+            && !ticks.contains("notes"),
+        "{ticks}"
+    );
+    let plugins = succeeded(&plugin(&fixture, &["list"]));
+    assert!(
+        plugins.starts_with("notes@local  1.0.0  enabled") && !plugins.contains("sample"),
+        "{plugins}"
+    );
+
+    for (arguments, error) in [
+        (
+            &["plugin", "disable", "sample"][..],
+            "Error: sample carries a Tick program; use tickloop tick disable sample\n",
+        ),
+        (
+            &["plugin", "uninstall", "sample"],
+            "Error: sample carries a Tick program; use tickloop tick uninstall sample\n",
+        ),
+        (
+            &["tick", "uninstall", "notes", "--keep-data"],
+            "Error: notes has no Tick program; use tickloop plugin uninstall notes --keep-data\n",
+        ),
+        (
+            &["tick", "update", "notes"],
+            "Error: notes has no Tick program; use tickloop plugin update notes\n",
+        ),
+    ] {
+        assert_eq!(failed(&fixture.tickloop(arguments)), error, "{arguments:?}");
+    }
+    assert_eq!(
+        succeeded(&fixture.tickloop(&["tick", "disable", "sample"])),
+        "Disabled Tick sample@local; its Skills stop loading from the next request.\n"
+    );
+    assert!(
+        succeeded(&fixture.tickloop(&["tick", "uninstall", "sample"]))
+            .starts_with("Uninstalled Tick sample@local 1.0.0.")
+    );
+    assert_eq!(
+        succeeded(&fixture.tickloop(&["tick", "list"])),
+        "No Ticks are installed.\n"
+    );
     assert!(!fixture.root.join("config/ticks/installed.json").exists());
 }
 
@@ -335,7 +395,7 @@ fn first_cli_use_migrates_an_earlier_package_and_reports_it_only_once() {
         .unwrap()
         .save_api_key(&tick_packages::ApiKey::new("saved-key").unwrap())
         .unwrap();
-    let first = plugin(&fixture, &["list"]);
+    let first = fixture.tickloop(&["tick", "list"]);
     assert!(first.status.success());
     assert!(
         String::from_utf8_lossy(&first.stderr)
@@ -346,7 +406,7 @@ fn first_cli_use_migrates_an_earlier_package_and_reports_it_only_once() {
         listed.contains("sample@local  1.0.0  enabled  logged in"),
         "{listed}"
     );
-    assert_eq!(succeeded(&plugin(&fixture, &["list"])), listed);
+    assert_eq!(succeeded(&fixture.tickloop(&["tick", "list"])), listed);
     assert!(!fixture.root.join("config/ticks").exists());
 }
 

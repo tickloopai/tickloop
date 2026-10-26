@@ -111,7 +111,7 @@ pub fn plugin_disabled(name: &str) -> HostError {
     HostError::before(
         INVALID_ARGUMENTS,
         format!(
-            "plugin {name} is disabled; the user enables it with `tickloop plugin enable {name}`"
+            "plugin {name} is disabled; the user enables it with `tickloop tick enable {name}`"
         ),
     )
 }
@@ -121,7 +121,7 @@ pub fn plugin_not_installed(program: &str, name: &str) -> HostError {
     HostError::before(
         INVALID_ARGUMENTS,
         format!(
-            "executable not found: {program} comes from plugin {name}, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install {name}` in a terminal)"
+            "executable not found: {program} comes from plugin {name}, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install {name}` in a terminal)"
         ),
     )
 }
@@ -259,7 +259,7 @@ mod tests {
         let error = resolve("tick-sample").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "InvalidArguments: executable not found: tick-sample comes from plugin sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install sample` in a terminal)"
+            "InvalidArguments: executable not found: tick-sample comes from plugin sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install sample` in a terminal)"
         );
         assert!(!error.dispatched);
         assert_eq!(
@@ -330,7 +330,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.message.contains("tickloop plugin enable sample"),
+            error.message.contains("tickloop tick enable sample"),
             "{error}"
         );
         assert!(!error.dispatched);

@@ -1617,7 +1617,7 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(
-            refused.contains("`tickloop plugin install counter`"),
+            refused.contains("`tickloop tick install counter`"),
             "{refused}"
         );
     }
@@ -1653,7 +1653,7 @@ for line in sys.stdin:
         };
         assert!(
             uninstalled.contains(
-                "executable not found: tick-counter comes from plugin counter, which is not installed; the user installs it from /ticks in the Agent (or `tickloop plugin install counter` in a terminal)"
+                "executable not found: tick-counter comes from plugin counter, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install counter` in a terminal)"
             ),
             "{uninstalled}"
         );
