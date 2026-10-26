@@ -25,3 +25,6 @@ mod tick_package_skills;
 
 #[path = "all/mcp_servers.rs"]
 mod mcp_servers;
+
+#[path = "all/mcp_credentials.rs"]
+mod mcp_credentials;

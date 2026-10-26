@@ -18,6 +18,7 @@ use std::sync::Arc;
 use reqwest::Url;
 use tickloop_harness_base::network::is_loopback;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 pub use credentials::{
     ClientRegistration, ConnectorCredential, ConnectorCredentials, CredentialError, CredentialLock,
@@ -127,7 +128,9 @@ pub(crate) async fn cancellable<T>(
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(Cancelled),
-        value = future => Ok(value),
+        // The OAuth SDK traces authorization codes and untrusted response bodies. Keep these
+        // protocol operations out of the caller's subscriber, including at debug/trace levels.
+        value = future.with_subscriber(tracing::subscriber::NoSubscriber::default()) => Ok(value),
     }
 }
 

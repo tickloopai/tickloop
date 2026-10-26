@@ -178,12 +178,29 @@ impl ExternalEditor {
 }
 
 pub(super) fn edit_prompt(draft: &str, working_directory: &Path) -> ExternalEditorOutcome {
+    edit_prompt_with_cancellation(draft, working_directory, None)
+}
+
+pub(super) fn edit_prompt_with_cancellation(
+    draft: &str,
+    working_directory: &Path,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> ExternalEditorOutcome {
     let editor = match ExternalEditor::from_environment() {
         Ok(Some(editor)) => editor,
         Ok(None) => return ExternalEditorOutcome::Unavailable,
         Err(error) => return ExternalEditorOutcome::Failed(error),
     };
-    edit_prompt_with(&editor, draft, working_directory)
+    match cancellation {
+        Some(cancellation) => edit_prompt_with_limit_and_cancellation(
+            &editor,
+            draft,
+            working_directory,
+            MAX_PROMPT_BYTES,
+            Some(cancellation),
+        ),
+        None => edit_prompt_with(&editor, draft, working_directory),
+    }
 }
 
 pub(super) fn edit_prompt_with(
@@ -199,6 +216,16 @@ fn edit_prompt_with_limit(
     draft: &str,
     working_directory: &Path,
     byte_limit: usize,
+) -> ExternalEditorOutcome {
+    edit_prompt_with_limit_and_cancellation(editor, draft, working_directory, byte_limit, None)
+}
+
+fn edit_prompt_with_limit_and_cancellation(
+    editor: &ExternalEditor,
+    draft: &str,
+    working_directory: &Path,
+    byte_limit: usize,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> ExternalEditorOutcome {
     if draft.len() > byte_limit {
         return ExternalEditorOutcome::Failed(ExternalEditorFailure::DraftTooLarge {
@@ -218,7 +245,23 @@ fn edit_prompt_with_limit(
         .args(&editor.arguments)
         .arg(temporary.path())
         .current_dir(working_directory);
-    let status = match command.status() {
+    let waited = if let Some(cancellation) = cancellation {
+        command.spawn().and_then(|mut child| {
+            loop {
+                if cancellation.is_cancelled() {
+                    let _ = child.kill();
+                    return child.wait();
+                }
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    } else {
+        command.status()
+    };
+    let status = match waited {
         Ok(status) => status,
         Err(error) => {
             return ExternalEditorOutcome::Failed(ExternalEditorFailure::Launch {

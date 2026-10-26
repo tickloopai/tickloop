@@ -29,3 +29,5 @@ mod ticks_panel_pty;
 mod update_command;
 mod upgrade_races;
 mod workspace_trust_pty;
+
+mod mcp_login;

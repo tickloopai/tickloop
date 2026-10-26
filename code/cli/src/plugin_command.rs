@@ -141,7 +141,25 @@ fn usage(kind: PluginKind) -> &'static str {
 
 /// Runs `tickloop tick` or `tickloop plugin`, as `kind` names it, with `arguments`.
 pub async fn run(kind: PluginKind, arguments: &[OsString]) -> Result<(), String> {
-    let command = parse(arguments)
+    let command = parse(arguments);
+    if kind == PluginKind::Plugin
+        && let Some(PluginCommand::Login { name, .. }) = &command
+        && let Ok(plugin) = store()?.get(name)
+        && PluginKind::of_installed(&plugin) == PluginKind::Plugin
+        && plugin.manifest.mcp_servers.values().any(|entry| {
+            entry["url"].is_string()
+                && !entry["headers"].as_object().is_some_and(|headers| {
+                    headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("authorization"))
+                })
+        })
+    {
+        return Err(format!(
+            "This plugin uses MCP server login; use tickloop mcp login plugin:{name}:<server>."
+        ));
+    }
+    let command = command
         .filter(|command| command.is_offered_to(kind))
         .ok_or_else(|| {
             format!(

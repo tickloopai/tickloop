@@ -812,13 +812,44 @@ pub async fn build_runtime_with_models(
         let folder = launch.folder.clone();
         let plugins =
             tick_plugins::PluginStore::in_config_root(settings.root().expect("settings root"));
+        let credential_connections = connections.clone();
+        let credential_root = settings.root().expect("settings root").to_owned();
         let configuration = Arc::new(move || {
             let (plugin_servers, mut warnings) = enabled_plugin_mcp_servers(&plugins);
-            let resolved = settings.load().mcp_servers_with_plugins(
+            let mut resolved = settings.load().mcp_servers_with_plugins(
                 &folder,
                 &startup_environment,
                 &plugin_servers,
             );
+            let mut credentials = std::collections::BTreeMap::new();
+            for server in &mut resolved.servers {
+                if !matches!(
+                    server.transport,
+                    tickloop_harness::protocol::mcp::McpTransport::Http { .. }
+                ) {
+                    continue;
+                }
+                match tickloop_code_settings::mcp_credentials::FileCredentials::new(
+                    &credential_root,
+                    &server.source,
+                    &server.name,
+                ) {
+                    Ok(adapter) => {
+                        credentials.insert(
+                            server.name.clone(),
+                            Arc::new(adapter)
+                                as Arc<dyn tickloop_harness::connector::ConnectorCredentials>,
+                        );
+                    }
+                    Err(error) => {
+                        warnings.push(format!("MCP {}: {error}", server.name));
+                        server.transport = tickloop_harness::protocol::mcp::McpTransport::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+            }
+            credential_connections.set_credentials(credentials);
             warnings.extend(resolved.warnings);
             McpConfiguration {
                 servers: resolved.servers,

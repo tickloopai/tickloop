@@ -8,6 +8,8 @@ pub struct McpServerConfig {
     pub source: String,
     pub transport: McpTransport,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub oauth: McpOAuthConfig,
     /// Host-provided secrets to remove from every server response.
     #[serde(default)]
     pub sensitive_values: Vec<serde_json::Value>,
@@ -33,4 +35,13 @@ pub enum McpTransport {
     Failed {
         reason: String,
     },
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthConfig {
+    pub client_id: Option<String>,
+    pub callback_port: Option<u16>,
+    #[serde(rename = "authServerMetadataUrl")]
+    pub authorization_server_metadata_url: Option<String>,
 }

@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-use tickloop_harness::protocol::mcp::{McpServerConfig, McpTransport};
+use tickloop_harness::protocol::mcp::{McpOAuthConfig, McpServerConfig, McpTransport};
 
 /// An enabled plugin's raw entries and host-owned locations.
 pub struct PluginServers {
@@ -166,7 +166,7 @@ impl ResolvedServers {
         } else {
             expand_value(&entry, environment)
         };
-        let transport = match &expanded {
+        let mut transport = match &expanded {
             Ok(entry) => parse_transport(entry, directory)
                 .unwrap_or_else(|reason| McpTransport::Failed { reason }),
             Err(reason) if plugin && reason.starts_with("missing userConfig") => {
@@ -177,6 +177,19 @@ impl ResolvedServers {
             },
         };
         let expanded_entry = expanded.as_ref().unwrap_or(&entry);
+        let oauth = if matches!(&transport, McpTransport::Http { headers, .. } if !headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")))
+        {
+            match parse_oauth(expanded_entry) {
+                Ok(oauth) => oauth,
+                Err(reason) => {
+                    transport = McpTransport::Failed { reason };
+                    McpOAuthConfig::default()
+                }
+            }
+        } else {
+            McpOAuthConfig::default()
+        };
+
         match &transport {
             McpTransport::Failed { reason } => self.warnings.push(format!("MCP {name}: {reason}")),
             McpTransport::NeedsConfiguration => self.warnings.push(format!(
@@ -192,6 +205,7 @@ impl ResolvedServers {
             source,
             transport,
             sensitive_values: Vec::new(),
+            oauth,
             timeout_ms: expanded_entry["timeout"]
                 .as_u64()
                 .or_else(|| expanded_entry["timeout"].as_str()?.parse().ok())
@@ -430,4 +444,28 @@ pub(crate) fn missing_user_config(value: &Value, variables: &BTreeMap<String, St
         .any(|(key, has_default)| {
             !has_default && !variables.contains_key(&format!("user_config.{key}"))
         })
+}
+
+fn parse_oauth(entry: &Value) -> Result<McpOAuthConfig, String> {
+    let mut value = entry
+        .get("oauth")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(port) = value.get("callbackPort").and_then(Value::as_str) {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| "invalid MCP OAuth callback port")?;
+        value["callbackPort"] = Value::from(port);
+    }
+    let mut oauth: McpOAuthConfig =
+        serde_json::from_value(value).map_err(|_| "invalid MCP OAuth settings")?;
+    if let Some(metadata) = entry.get("authServerMetadataUrl") {
+        oauth.authorization_server_metadata_url = Some(
+            metadata
+                .as_str()
+                .ok_or("invalid MCP OAuth metadata URL")?
+                .into(),
+        );
+    }
+    Ok(oauth)
 }

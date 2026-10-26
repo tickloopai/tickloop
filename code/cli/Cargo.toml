@@ -27,7 +27,8 @@ path = "tests/support/cli_fixture_main.rs"
 harness = false
 
 [dependencies]
-tickloop-harness = { path = "../../harness/sdk" }
+percent-encoding = "2"
+tickloop-harness = { path = "../../harness/sdk", features = ["connector"] }
 crossterm = "0.29"
 serde_json = "1"
 tickloop-code-access = { path = "../access" }
@@ -53,7 +54,6 @@ flate2 = "1"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libc = "0.2"
-percent-encoding = "2"
 portable-pty = "0.9"
 regex = "1"
 rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client"] }

@@ -22,6 +22,13 @@ struct State {
     status: u16,
     error: Option<Value>,
     changed: bool,
+    challenge: Option<String>,
+    bearer: Option<String>,
+    requests: usize,
+    notification: Option<String>,
+    resume_directory: bool,
+    directory_response: Option<Value>,
+    directory_resumes: usize,
     resources_capability: Option<Value>,
     resources: Value,
     resource_text: String,
@@ -41,6 +48,13 @@ impl McpService {
                 status: 200,
                 error: None,
                 changed: false,
+                challenge: None,
+                bearer: None,
+                requests: 0,
+                notification: None,
+                resume_directory: false,
+                directory_response: None,
+                directory_resumes: 0,
                 resources_capability: Some(json!({})),
                 resources: json!([{"uri":"fixture://text","name":"text"}]),
                 resource_text: "resource text".into(),
@@ -69,10 +83,25 @@ impl McpService {
                                 if bytes.len() > 65536 { return; }
                             };
                             let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                            if headers.starts_with("GET ") && headers.lines().any(|line| line.to_ascii_lowercase().starts_with("last-event-id:")) {
+                                let response = {
+                                    let mut state = state.lock().unwrap();
+                                    let response = state.directory_response.take();
+                                    if response.is_some() { state.directory_resumes += 1; }
+                                    response
+                                };
+                                if let Some(response) = response {
+                                    let body = format!("data: {response}\n\n");
+                                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                                    let _ = stream.write_all(reply.as_bytes()).await;
+                                    return;
+                                }
+                            }
                             if !headers.starts_with("POST ") {
                                 let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
                             }
+                            let authorization = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value.trim().to_owned()));
                             let length = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).and_then(|(_, n)| n.trim().parse::<usize>().ok())).unwrap_or(0);
                             if length > 8 * 1024 * 1024 { return; }
                             while bytes.len() < header_end + length {
@@ -82,8 +111,9 @@ impl McpService {
                                 bytes.extend_from_slice(&chunk[..size]);
                             }
                             let Ok(request) = serde_json::from_slice::<Value>(&bytes[header_end..header_end + length]) else { return };
-                            let (status, delay, result, error, notifications) = {
+                            let (status, delay, result, error, notifications, challenge) = {
                                 let mut state = state.lock().unwrap();
+                                state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
                                 let result = match method {
                                     "initialize" => {
@@ -99,20 +129,31 @@ impl McpService {
                                 };
                                 let call = method == "tools/call";
                                 let mut notifications = Vec::new();
-                                if call && std::mem::take(&mut state.changed) { notifications.push("notifications/tools/list_changed"); }
-                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push("notifications/resources/list_changed"); }
-                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications)
+                                if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()); }
+                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"}).to_string()); }
+                                if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
+                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
                             let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
-                            let (status, content_type, body) = if request.get("id").is_none() {
+                            let resume_directory = {
+                                let mut state = state.lock().unwrap();
+                                if request["method"] == "tools/list" && std::mem::take(&mut state.resume_directory) {
+                                    state.directory_response = Some(response.clone());
+                                    true
+                                } else { false }
+                            };
+                            let (status, content_type, body) = if resume_directory {
+                                (200, "text/event-stream", "id: directory-cut\nretry: 0\n\n".into())
+                            } else if request.get("id").is_none() {
                                 (202, "application/json", String::new())
                             } else if !notifications.is_empty() {
-                                let events: String = notifications.iter().map(|method| format!("data: {}\n\n", json!({"jsonrpc":"2.0","method":method}))).collect();
+                                let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
                                 (status, "text/event-stream", format!("{events}data: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
-                            let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
+                            let reply = format!("HTTP/1.1 {status} Fixture\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = stream.write_all(reply.as_bytes()).await;
                         });
                     }
@@ -141,6 +182,46 @@ impl McpService {
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
+    }
+    pub fn resume_tool_directory_once(&self) {
+        self.state.lock().unwrap().resume_directory = true;
+    }
+    pub fn directory_resumes(&self) -> usize {
+        self.state.lock().unwrap().directory_resumes
+    }
+    pub fn notify_log(&self, text: &str) {
+        self.state.lock().unwrap().notification = Some(
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":text}}).to_string(),
+        );
+    }
+    pub fn notify_custom(&self, method: &str) {
+        self.state.lock().unwrap().notification =
+            Some(json!({"jsonrpc":"2.0", "method":method,"params":{}}).to_string());
+    }
+    pub fn notify_log_with_unicode_escapes(&self, text: &str) {
+        self.notify_log(text);
+        let mut state = self.state.lock().unwrap();
+        let wire = state.notification.take().unwrap();
+        state.notification = Some(
+            wire.chars()
+                .map(|character| {
+                    if character.is_ascii_alphabetic() {
+                        format!("\\u{:04x}", character as u32)
+                    } else {
+                        character.to_string()
+                    }
+                })
+                .collect(),
+        );
+    }
+    pub fn require_bearer(&self, token: &str) {
+        self.state.lock().unwrap().bearer = Some(token.into());
+    }
+    pub fn set_challenge(&self, challenge: &str) {
+        self.state.lock().unwrap().challenge = Some(challenge.into());
+    }
+    pub fn request_count(&self) -> usize {
+        self.state.lock().unwrap().requests
     }
     pub fn set_error(&self, error: Option<Value>) {
         self.state.lock().unwrap().error = error;

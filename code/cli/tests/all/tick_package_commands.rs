@@ -62,6 +62,14 @@ impl Fixture {
 
     /// Runs tickloop on a terminal of its own, which the test reads and types on.
     pub(crate) fn tickloop_on_terminal(&self, arguments: &[&str]) -> Terminal {
+        self.tickloop_on_terminal_with_env(arguments, &[])
+    }
+
+    pub(crate) fn tickloop_on_terminal_with_env(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Terminal {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -79,6 +87,9 @@ impl Fixture {
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
         command.env("TICKLOOP_CONFIG_DIR", self.root.join("config"));
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -110,7 +121,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn command(&self, arguments: &[&str]) -> Command {
+    pub(crate) fn command(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
         command
             .args(arguments)
