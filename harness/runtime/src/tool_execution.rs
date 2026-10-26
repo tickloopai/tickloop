@@ -720,7 +720,7 @@ impl Agent {
                 let Some(PreparedLocalCall::McpResource(prepared)) = prepared_local else {
                     return Err("MCP resource call was not prepared".into());
                 };
-                self.mcp_resource_tool(receipt, provider, prepared, cancel)
+                self.mcp_resource_tool(receipt, &operation.call_id, provider, prepared, cancel)
                     .await
             }
             ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
