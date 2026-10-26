@@ -329,7 +329,7 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
         frame.contains("alpha 2.0.0") && frame.contains("❯ Log in")
     });
     assert!(
-        frame.contains("  Log out") && frame.contains("  Uninstall"),
+        frame.contains("  Log out") && frame.contains("  Disable"),
         "{frame}"
     );
     assert!(!frame.contains("Update to"), "{frame}");
@@ -363,32 +363,11 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     terminal.press(b"jj", "sample selected", |frame| {
         is_selected(frame, "sample")
     });
-    let frame = terminal.press(b"\r", "sample's actions", |frame| {
-        frame.contains("sample 1.0.0") && frame.contains("❯ Uninstall")
-    });
-    assert!(
-        !frame.contains("Log in"),
-        "a package without login offers none:\n{frame}"
-    );
-    let frame = terminal.press(b"\r", "the uninstall confirmation", |frame| {
-        frame.contains("Uninstall sample 1.0.0?")
-    });
-    assert!(frame.contains("Its saved login stays."), "{frame}");
-    assert!(
-        frame.contains("Its running Ticks keep running until they are closed."),
-        "{frame}"
-    );
-    assert!(
-        frame.contains("❯ Uninstall") && frame.contains("  Cancel"),
-        "{frame}"
-    );
-    terminal.press(ESCAPE, "sample's actions again", |frame| {
-        frame.contains("sample 1.0.0") && !frame.contains("Cancel")
-    });
-    terminal.press(b"\r", "the confirmation again", |frame| {
-        frame.contains("  Cancel")
-    });
-    terminal.press(b"\r", "the uninstall", |frame| {
+    let frame = terminal.press(b"\r", "sample's actions", |frame| frame.contains("❯ Disable"));
+    assert!(!frame.contains("Log in"), "{frame}");
+    terminal.press(ESCAPE, "the list", |frame| !frame.contains("❯ Disable"));
+    terminal.press(b"\x18", "uninstall confirmation", |frame| frame.contains("Press ctrl+x again to uninstall sample"));
+    terminal.press(b"\x18", "the uninstall", |frame| {
         frame.contains("Uninstalled sample 1.0.0; its running Ticks keep running until closed")
             && !frame.contains("◉ sample")
     });
@@ -620,6 +599,30 @@ fn available_plugins_filter_hundreds_of_entries_and_keep_text_keys_in_the_filter
     terminal.press(b"j", "list navigation restored", |frame| is_selected(frame, "jk-341"));
     terminal.press(b"\r", "unavailable source explanation", |frame| frame.contains("no prebuilt program"));
     terminal.press(TAB, "installed unaffected", |frame| frame.contains("[Installed]"));
+    terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    terminal.exit();
+}
+
+#[test]
+fn uninstall_requires_two_control_x_presses_on_the_same_plugin() {
+    let fixture = Fixture::new();
+    install_path(&fixture, &fixture.package_named("alpha", "1.0.0"));
+    install_path(&fixture, &fixture.package_named("beta", "1.0.0"));
+    save_login(&fixture, "alpha");
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/plugins\r", "installed plugins", |frame| row_shows(frame, "alpha", "1.0.0 · no login needed"));
+    terminal.press(b"\x18", "uninstall armed", |frame| frame.contains("Press ctrl+x again to uninstall alpha"));
+    terminal.press(b"j", "selection cancels uninstall", |frame| is_selected(frame, "beta") && !frame.contains("Press ctrl+x again"));
+    terminal.press(b"\x18", "beta armed", |frame| frame.contains("Press ctrl+x again to uninstall beta"));
+    terminal.press(b"k", "alpha selected", |frame| is_selected(frame, "alpha"));
+    terminal.press(b"\x18", "confirmation will expire", |frame| frame.contains("Press ctrl+x again to uninstall alpha"));
+    terminal.wait_for_frame(terminal.mark(), "confirmation expired", |frame| !frame.contains("Press ctrl+x again") && frame.contains("ctrl+x uninstall"));
+    terminal.press(b"\x18", "alpha armed again", |frame| frame.contains("Press ctrl+x again to uninstall alpha"));
+    terminal.press(b"\x18", "alpha uninstalled", |frame| frame.contains("Uninstalled alpha") && !frame.contains("◉ alpha"));
+    assert!(fixture.root.join("config/credentials/alpha/oauth2.json").exists());
+    assert!(row_shows(&terminal.frame(), "beta", "1.0.0 · no login needed"));
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
 }

@@ -221,6 +221,9 @@ impl State {
     }
 
     pub(super) fn replace_dialog(&mut self, next: DialogState) -> DialogState {
+        if let Some(panel) = &mut self.ticks_panel {
+            panel.cancel_uninstall();
+        }
         DialogState {
             menu: std::mem::replace(&mut self.menu, next.menu),
             menu_rule_role: std::mem::replace(&mut self.menu_rule_role, next.menu_rule_role),

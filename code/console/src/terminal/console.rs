@@ -11704,7 +11704,8 @@ impl State {
         if monitor_notice_expired {
             self.monitor_notice = None;
         }
-        exit_expired
+        let plugin_expired = self.ticks_panel.as_mut().is_some_and(|panel| panel.expire_confirmation());
+        plugin_expired || exit_expired
             || escape_expired
             || copy_notice_expired
             || monitor_expired
