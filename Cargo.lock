@@ -4465,6 +4465,7 @@ name = "tickloop-tick-plugins"
 version = "0.2.25"
 dependencies = [
  "flate2",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

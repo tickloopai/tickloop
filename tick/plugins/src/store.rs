@@ -375,6 +375,45 @@ impl PluginStore {
         })
     }
 
+    pub(crate) fn install_marketplace_directory(
+        &self,
+        root: &Path,
+        marketplace: &str,
+        name: &str,
+        entry: &Map<String, Value>,
+    ) -> Result<Installation, PluginError> {
+        validate_plugin_name(marketplace)?;
+        validate_plugin_name(name)?;
+        let request = Request {
+            marketplace,
+            source: PluginSource::Path {
+                path: root.to_string_lossy().into_owned(),
+            },
+            revision: LOCAL_REVISION.to_owned(),
+            sha256: None,
+            default_name: name.to_owned(),
+            entry: Some(entry),
+            expected: None,
+            same_revision: SameRevision::Replace,
+        };
+        self.install(request, |staged| {
+            if canonical(&self.directory)?.starts_with(root) {
+                return Err(PluginError::Invalid(
+                    "plugin source contains the plugins directory".into(),
+                ));
+            }
+            staging::copy_directory(root, staged)?;
+            let manifest = PluginManifest::load(staged, name, Some(entry))?;
+            if manifest.name != name {
+                return Err(PluginError::Invalid(format!(
+                    "the plugin is named {}, not {name}",
+                    manifest.name
+                )));
+            }
+            Ok(())
+        })
+    }
+
     /// Removes the plugin and its registration, and its data unless `keep_data`. Its data source
     /// credentials stay.
     pub fn uninstall(&self, name: &str, keep_data: bool) -> Result<Uninstalled, PluginError> {

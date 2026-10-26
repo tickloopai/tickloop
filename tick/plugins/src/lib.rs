@@ -7,6 +7,7 @@
 
 mod catalog;
 mod git;
+mod http;
 mod manifest;
 mod marketplace;
 mod migration;

@@ -306,3 +306,437 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
     assert_eq!(before, fixture.registry());
     assert!(installed.root.join("skills/old/SKILL.md").exists());
 }
+
+#[tokio::test]
+async fn local_marketplace_plugins_reinstall_and_cannot_escape_or_change_names() {
+    let fixture = Fixture::new();
+    let root = fixture.source("local-market");
+    crate::support::write_skill(&root.join("review/skills/check"), "check");
+    let listing = root.join("marketplace.json");
+    write_json(
+        &listing,
+        &json!({"name": "local-market", "plugins": [{"name": "review", "source": "./review"}]}),
+    );
+    fixture
+        .store
+        .add_marketplace(&MarketplaceSource::Directory(root.clone()), &no_http)
+        .await
+        .unwrap();
+    let installed = fixture
+        .store
+        .install_marketplace_plugin("local-market", "review", &no_http)
+        .await
+        .unwrap();
+    assert_eq!(installed.plugin.revision, "local");
+    assert_eq!(installed.plugin.id(), "review@local-market");
+    assert_eq!(
+        fixture
+            .store
+            .install_marketplace_plugin("local-market", "review", &no_http)
+            .await
+            .unwrap()
+            .outcome,
+        tick_plugins::InstallOutcome::Reinstalled
+    );
+    let before = fixture.registry();
+    write_json(
+        &root.join("review/.claude-plugin/plugin.json"),
+        &json!({"name": "wrong"}),
+    );
+    assert!(
+        fixture
+            .store
+            .install_marketplace_plugin("local-market", "review", &no_http)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not review")
+    );
+    assert_eq!(fixture.registry(), before);
+    for relative in ["./../review", "./escape"] {
+        if relative == "./escape" {
+            std::os::unix::fs::symlink(fixture.root(), root.join("escape")).unwrap();
+        }
+        write_json(
+            &listing,
+            &json!({"name": "local-market", "plugins": [{"name": "review", "source": relative}]}),
+        );
+        fixture
+            .store
+            .refresh_marketplace("local-market", &no_http)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .install_marketplace_plugin("local-market", "review", &no_http)
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.registry(), before);
+    }
+}
+
+#[tokio::test]
+async fn https_marketplaces_use_the_callers_client_and_reject_insecure_downloads() {
+    let fixture = Fixture::new();
+    let source = MarketplaceSource::parse("https://example.test/marketplace.json").unwrap();
+    let http = |url: &reqwest::Url, request| {
+        assert_eq!(url.as_str(), "https://example.test/marketplace.json");
+        assert!(matches!(request, tick_plugins::HttpRequest::Marketplace));
+        Err("client policy denied this request".to_owned())
+    };
+    let error = fixture
+        .store
+        .add_marketplace(&source, &http)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("client policy denied"),
+        "{error}"
+    );
+    assert!(
+        source
+            .download_url("https://example.test/archive.tar.gz")
+            .is_ok()
+    );
+    assert!(
+        source
+            .download_url("http://127.0.0.1/archive.tar.gz")
+            .is_err()
+    );
+    let local = MarketplaceSource::Directory(fixture.root());
+    assert!(
+        local
+            .download_url("http://127.0.0.1/archive.tar.gz")
+            .is_ok()
+    );
+    assert!(
+        local
+            .download_url("http://example.test/archive.tar.gz")
+            .is_err()
+    );
+    assert!(local.download_url("file:///tmp/archive.tar.gz").is_err());
+    assert_eq!(fixture.store.marketplaces().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn archive_entries_use_download_policy_without_mutating_the_installation_on_failure() {
+    let fixture = Fixture::new();
+    let root = fixture.source("downloads");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name": "downloads", "owner": {"name": "Test"}, "packages": [{
+            "name": "quotes", "version": "1.0", "description": "Quotes", "downloads": {
+                (tick_packages::CURRENT_TARGET): {"url": "https://example.test/quotes.tar.gz", "sha256": "a".repeat(64)}
+            }
+        }]}),
+    );
+    fixture
+        .store
+        .add_marketplace(&MarketplaceSource::Directory(root), &no_http)
+        .await
+        .unwrap();
+    let files = fixture.plugin_files();
+    let http = |url: &reqwest::Url, request| {
+        assert_eq!(url.as_str(), "https://example.test/quotes.tar.gz");
+        assert!(matches!(request, tick_plugins::HttpRequest::Download));
+        Err("download policy denied".to_owned())
+    };
+    let error = fixture
+        .store
+        .install_marketplace_plugin("downloads", "quotes", &http)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("download policy denied"),
+        "{error}"
+    );
+    assert_eq!(fixture.plugin_files(), files);
+}
+
+#[tokio::test]
+async fn missing_git_is_clear_and_timed_out_git_does_not_leave_helpers_running() {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    let fixture = Fixture::new();
+    let source = GitSource {
+        url: format!("file://{}", fixture.root().display()),
+        reference: None,
+        sha: None,
+        subdirectory: None,
+    };
+    let missing =
+        tick_plugins::GitClient::new(fixture.root().join("missing-git"), Duration::from_secs(1));
+    let error = match missing.checkout(&source, &fixture.root()).await {
+        Ok(_) => panic!("missing git succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("Git is not installed"),
+        "{error}"
+    );
+    let executable = fixture.root().join("slow-git");
+    let pid_file = fixture.root().join("helper-pid");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let slow = tick_plugins::GitClient::new(executable, Duration::from_secs(3));
+    let error = match slow.checkout(&source, &fixture.root()).await {
+        Ok(_) => panic!("slow git succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let mut alive = true;
+    for _ in 0..50 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        alive =
+            output.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z');
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if alive {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+    assert!(!alive, "Git helper survived timeout");
+    assert!(!std::fs::read_dir(fixture.root()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".checkout-")
+    }));
+}
+
+#[tokio::test]
+async fn relative_git_sources_can_select_their_own_ref() {
+    let fixture = Fixture::new();
+    let root = fixture.source("relative-ref");
+    let listing = root.join("marketplace.json");
+    write_json(
+        &listing,
+        &json!({"name": "relative-ref", "plugins": [{"name": "review", "source": "./review", "ref": "release"}]}),
+    );
+    crate::support::write_skill(&root.join("review/skills/old"), "old");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "release"]);
+    git(&root, &["tag", "release"]);
+    let release = git(&root, &["rev-parse", "HEAD"]);
+    std::fs::remove_dir_all(root.join("review/skills/old")).unwrap();
+    crate::support::write_skill(&root.join("review/skills/new"), "new");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "next"]);
+    fixture
+        .store
+        .add_marketplace(
+            &MarketplaceSource::parse(&format!("file://{}", root.display())).unwrap(),
+            &no_http,
+        )
+        .await
+        .unwrap();
+    let plugin = fixture
+        .store
+        .install_marketplace_plugin("relative-ref", "review", &no_http)
+        .await
+        .unwrap()
+        .plugin;
+    assert_eq!(plugin.revision, release[..12]);
+    assert!(plugin.root.join("skills/old/SKILL.md").is_file());
+}
+
+#[tokio::test]
+async fn reserved_names_duplicate_registrations_and_failed_refreshes_keep_the_catalog() {
+    let fixture = Fixture::new();
+    let root = fixture.source("reserved");
+    let file = root.join("marketplace.json");
+    let source = MarketplaceSource::Directory(root.clone());
+    for name in ["tickloop", "claude-plugins-official", "local"] {
+        write_json(&file, &json!({"name": name, "plugins": []}));
+        assert!(
+            fixture
+                .store
+                .add_marketplace(&source, &no_http)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+    }
+    write_json(
+        &file,
+        &json!({"name": "valid", "plugins": [{"name": "unsupported", "source": {"source": "pip", "package": "package"}}]}),
+    );
+    let catalog = fixture
+        .store
+        .add_marketplace(&source, &no_http)
+        .await
+        .unwrap();
+    assert!(!catalog.plugins[0].is_installable());
+    assert!(
+        fixture
+            .store
+            .add_marketplace(&source, &no_http)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already registered")
+    );
+    let files = fixture.plugin_files();
+    for contents in [
+        "{",
+        r#"{"name":"renamed","plugins":[]}"#,
+        r#"{"name":"valid","plugins":[{"name":"duplicate","source":"./a"},{"name":"duplicate","source":"./b"}]}"#,
+    ] {
+        std::fs::write(&file, contents).unwrap();
+        assert!(
+            fixture
+                .store
+                .refresh_marketplace("valid", &no_http)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.store.marketplace("valid", &no_http).await.unwrap(),
+            catalog
+        );
+        assert_eq!(fixture.plugin_files(), files);
+    }
+    assert!(
+        fixture
+            .store
+            .install_marketplace_plugin("valid", "unsupported", &no_http)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported source")
+    );
+    assert_eq!(
+        crate::support::mode(&fixture.store.directory().join("marketplaces.json")),
+        0o600
+    );
+    assert_eq!(
+        crate::support::mode(&fixture.store.directory().join("marketplaces")),
+        0o700
+    );
+    for path in files {
+        if path.ends_with("marketplace.json") {
+            assert_eq!(
+                crate::support::mode(&fixture.store.directory().join(path)),
+                0o600
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn refreshing_a_git_marketplace_updates_plugins_even_when_their_version_is_unchanged() {
+    let fixture = Fixture::new();
+    let root = fixture.source("updates");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name": "updates", "plugins": [{"name": "review", "source": "./review"}]}),
+    );
+    write_json(
+        &root.join("review/.claude-plugin/plugin.json"),
+        &json!({"name": "review", "version": "1.0"}),
+    );
+    crate::support::write_skill(&root.join("review/skills/check"), "old");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "first"]);
+    fixture
+        .store
+        .add_marketplace(
+            &MarketplaceSource::parse(&format!("file://{}#main", root.display())).unwrap(),
+            &no_http,
+        )
+        .await
+        .unwrap();
+    let first = fixture
+        .store
+        .install_marketplace_plugin("updates", "review", &no_http)
+        .await
+        .unwrap()
+        .plugin;
+    fixture.store.set_enabled("review", false).unwrap();
+    crate::support::write_skill(&root.join("review/skills/check"), "new");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "second"]);
+    let second = git(&root, &["rev-parse", "HEAD"]);
+    let pinned = fixture
+        .store
+        .install_marketplace_plugin("updates", "review", &no_http)
+        .await
+        .unwrap();
+    assert_eq!(pinned.plugin.revision, first.revision);
+    assert_eq!(
+        pinned.outcome,
+        tick_plugins::InstallOutcome::AlreadyInstalled
+    );
+    fixture
+        .store
+        .refresh_marketplace("updates", &no_http)
+        .await
+        .unwrap();
+    let updated = fixture
+        .store
+        .install_marketplace_plugin("updates", "review", &no_http)
+        .await
+        .unwrap();
+    assert_eq!(updated.outcome, tick_plugins::InstallOutcome::Reinstalled);
+    assert_eq!(updated.plugin.revision, second[..12]);
+    assert_eq!(updated.plugin.version, "1.0");
+    assert!(!updated.plugin.enabled);
+    assert!(!first.root.exists());
+    fixture.store.remove_marketplace("updates").unwrap();
+    assert_eq!(fixture.store.get("review").unwrap().revision, second[..12]);
+}
+
+#[tokio::test]
+async fn installed_names_cannot_be_taken_by_another_git_marketplace() {
+    let fixture = Fixture::new();
+    let local = fixture.claude_plugin("review", &json!({"name": "review"}), &[]);
+    fixture.store.install_path(&local).unwrap();
+    let market = fixture.source("conflict");
+    write_json(
+        &market.join("marketplace.json"),
+        &json!({"name": "conflict", "plugins": [{"name": "review", "source": "./review"}]}),
+    );
+    crate::support::write_skill(&market.join("review/skills/check"), "check");
+    git(&market, &["init", "-b", "main"]);
+    git(&market, &["add", "."]);
+    git(&market, &["commit", "-m", "first"]);
+    fixture
+        .store
+        .add_marketplace(
+            &MarketplaceSource::parse(&format!("file://{}", market.display())).unwrap(),
+            &no_http,
+        )
+        .await
+        .unwrap();
+    let before = fixture.registry();
+    assert!(matches!(
+        fixture
+            .store
+            .install_marketplace_plugin("conflict", "review", &no_http)
+            .await
+            .unwrap_err(),
+        tick_plugins::PluginError::NameTaken { .. }
+    ));
+    assert_eq!(fixture.registry(), before);
+}

@@ -156,18 +156,22 @@ impl GitClient {
         ] {
             command.env_remove(variable);
         }
-        let output = tokio::time::timeout(self.timeout, command.output())
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.process_group(0);
+        let child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PluginError::Invalid(
+                    "Git is not installed; install git to use Git plugin sources".into(),
+                )
+            } else {
+                PluginError::io("cannot run Git")(error)
+            }
+        })?;
+        let _group = ProcessGroup(child.id().expect("spawned Git has a process id"));
+        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
             .map_err(|_| PluginError::Invalid("Git operation timed out".into()))?
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    PluginError::Invalid(
-                        "Git is not installed; install git to use Git plugin sources".into(),
-                    )
-                } else {
-                    PluginError::io("cannot run Git")(error)
-                }
-            })?;
+            .map_err(PluginError::io("cannot wait for Git"))?;
         if !output.status.success() {
             return Err(PluginError::Invalid(format!(
                 "Git operation failed: {}",
@@ -245,4 +249,15 @@ pub(crate) fn contained_directory(root: &Path, relative: &str) -> Result<PathBuf
         ));
     }
     Ok(directory)
+}
+
+struct ProcessGroup(u32);
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        // Git starts SSH and credential helpers; cancellation must also stop those descendants.
+        unsafe {
+            libc::kill(-(self.0 as libc::pid_t), libc::SIGKILL);
+        }
+    }
 }

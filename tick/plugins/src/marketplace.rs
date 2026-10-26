@@ -111,7 +111,7 @@ const MARKETPLACE_LOCATIONS: [&str; 3] = [
     ".claude-plugin/marketplace.json",
     "marketplace.json",
 ];
-const MARKETPLACE_SIZE_LIMIT: u64 = 1024 * 1024;
+use crate::http::MARKETPLACE_SIZE_LIMIT;
 
 impl PluginStore {
     pub async fn add_marketplace(
@@ -172,7 +172,7 @@ impl PluginStore {
         &self,
         source: &MarketplaceSource,
         previous: Option<&MarketplaceRegistration>,
-        _http: &HttpClient,
+        http: &HttpClient,
     ) -> Result<MarketplaceCatalog, PluginError> {
         let mut commit = None;
         let document = match source {
@@ -203,10 +203,23 @@ impl PluginStore {
                 commit = Some(checkout.commit().to_owned());
                 document
             }
-            _ => {
-                return Err(PluginError::Invalid(
-                    "marketplace transport is not supported".into(),
-                ));
+            MarketplaceSource::Url(text) => {
+                let url = crate::http::secure_url(text, true)?;
+                let mut bytes = Vec::new();
+                crate::http::receive(
+                    http,
+                    &url,
+                    HttpRequest::Marketplace,
+                    MARKETPLACE_SIZE_LIMIT,
+                    |chunk| {
+                        bytes.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                )
+                .await?;
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    PluginError::Invalid(format!("invalid marketplace JSON: {error}"))
+                })?
             }
         };
         let name = document
@@ -301,15 +314,45 @@ impl PluginStore {
             })?;
         match &plugin.source {
             crate::MarketplacePluginSource::Relative(relative) => {
-                let MarketplaceSource::Git(source) = &catalog.registration.source else {
-                    return Err(PluginError::Invalid(
-                        "relative plugin needs a Git marketplace".into(),
-                    ));
+                let source = match &catalog.registration.source {
+                    MarketplaceSource::Git(source) => source,
+                    MarketplaceSource::Directory(root) => {
+                        let root = crate::git::contained_directory(root, relative)?;
+                        return self.install_marketplace_directory(
+                            &root,
+                            marketplace,
+                            name,
+                            &plugin.manifest,
+                        );
+                    }
+                    MarketplaceSource::File(_) | MarketplaceSource::Url(_) => {
+                        return Err(PluginError::Invalid(
+                            "relative plugin requires a directory or Git marketplace".into(),
+                        ));
+                    }
                 };
                 let mut source = source.clone();
-                source.reference = None;
-                source.sha = catalog.registration.commit.clone();
-                source.subdirectory = Some(relative.clone());
+                source.reference = plugin
+                    .manifest
+                    .get("ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                source.sha = plugin
+                    .manifest
+                    .get("sha")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        source
+                            .reference
+                            .is_none()
+                            .then(|| catalog.registration.commit.clone())
+                            .flatten()
+                    });
+                source.subdirectory = Some(match source.subdirectory {
+                    Some(parent) => format!("{parent}/{relative}"),
+                    None => relative.clone(),
+                });
                 let checkout = crate::GitClient::default()
                     .checkout(&source, &self.directory)
                     .await?;
@@ -320,6 +363,53 @@ impl PluginStore {
                     .checkout(source, &self.directory)
                     .await?;
                 self.install_checkout(&checkout, marketplace, name, Some(&plugin.manifest))
+            }
+            crate::MarketplacePluginSource::Archive(package) => {
+                match self.get(name) {
+                    Ok(plugin)
+                        if plugin.marketplace == marketplace
+                            && plugin.revision == package.version =>
+                    {
+                        return Ok(crate::Installation {
+                            plugin,
+                            outcome: crate::InstallOutcome::AlreadyInstalled,
+                        });
+                    }
+                    Ok(plugin) if plugin.marketplace != marketplace => {
+                        return Err(PluginError::NameTaken {
+                            name: name.to_owned(),
+                            marketplace: plugin.marketplace,
+                        });
+                    }
+                    Ok(_) | Err(PluginError::NotInstalled(_) | PluginError::Unusable { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+                let download = package.current_download().ok_or_else(|| {
+                    PluginError::Invalid(format!(
+                        "plugin {name} has no download for {}",
+                        tick_packages::CURRENT_TARGET
+                    ))
+                })?;
+                let url = catalog.registration.source.download_url(&download.url)?;
+                let mut file = self.download_file()?;
+                crate::http::receive(
+                    http,
+                    &url,
+                    HttpRequest::Download,
+                    crate::http::DOWNLOAD_SIZE_LIMIT,
+                    |chunk| file.write_all(chunk),
+                )
+                .await?;
+                self.install_archive(
+                    file.path(),
+                    crate::ExpectedArchive {
+                        marketplace,
+                        name,
+                        version: &package.version,
+                        sha256: &download.sha256,
+                        url: url.as_str(),
+                    },
+                )
             }
             _ => Err(PluginError::Invalid(format!(
                 "plugin {name} has an unsupported source"

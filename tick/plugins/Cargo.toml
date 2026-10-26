@@ -12,6 +12,7 @@ name = "tick_plugins"
 doctest = false
 
 [dependencies]
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["process", "time", "io-util", "macros", "rt-multi-thread"] }
 flate2 = "1"
