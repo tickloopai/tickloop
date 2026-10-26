@@ -1102,10 +1102,10 @@ impl TicksPanel {
                         ),
                     };
                     let mut lines = row(index, entry.name(), details, glyph_role);
-                    if let InstalledEntry::Usable { package, .. } = entry {
-                        if let Some(warning) = unsupported_summary(&package.manifest) {
-                            lines.push(RoleLine::role(format!("  {warning}"), Role::Warning));
-                        }
+                    if let InstalledEntry::Usable { package, .. } = entry
+                        && let Some(warning) = unsupported_summary(&package.manifest)
+                    {
+                        lines.push(RoleLine::role(format!("  {warning}"), Role::Warning));
                     }
                     (index, lines)
                 })
