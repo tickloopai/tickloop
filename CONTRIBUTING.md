@@ -6,7 +6,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 
 - **Bugs and feature requests:** open a [GitHub issue](https://github.com/tickloopai/tickloop/issues/new/choose). Search existing issues first.
 - **Security problems:** report them privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
-- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Package mechanics on the agent side (`tick/packages`, `tick/installer`, `/ticks`, `tickloop tick ...`) stay in this repository.
+- **Tick packages** (the official ones or a new data source) live in [tickloopai/ticks](https://github.com/tickloopai/ticks), together with their packaging and the Tick marketplace. Plugin mechanics on the agent side (`tick/plugins`, `tick/installer`, `/plugins`, `tickloop plugin ...`) stay in this repository.
 - **Larger changes:** open an issue to discuss the design before writing a lot of code, especially for changes to the Tick protocol, the permission system or process lifecycle.
 
 ## Development setup
@@ -25,7 +25,7 @@ make install   # install both programs into ~/.cargo/bin
 make package   # build a release archive into dist/
 ```
 
-`make dev` copies this checkout's build into `target/dev-runs/` and registers it as a development runtime. It uses your normal configuration root (`~/.tickloop` or `TICKLOOP_CONFIG_DIR`), including logins and installed Tick packages, and the same daemon and Tickhost as an installed `tickloop`. Model API keys can go in a `.env` file at the repository root (ignored by Git), for example `DEEPSEEK_API_KEY=...`.
+`make dev` copies this checkout's build into `target/dev-runs/` and registers it as a development runtime. It uses your normal configuration root (`~/.tickloop` or `TICKLOOP_CONFIG_DIR`), including logins and installed plugins, and the same daemon and Tickhost as an installed `tickloop`. Model API keys can go in a `.env` file at the repository root (ignored by Git), for example `DEEPSEEK_API_KEY=...`.
 
 `ENV` picks the Tickloop Cloud the agent talks to. `make dev` always sets the agent's `TICKLOOP_ARTIFACT_ORIGIN`, which also gives the Accounts issuer and the MCP endpoint, replacing any value from `.env` or your shell, and prints the choice before it builds:
 
@@ -74,7 +74,7 @@ It first checks dependency boundaries and the Tick public API, then runs `cargo 
 
 The shared Harness lives in `harness/`, with its only host entry point at `harness/sdk` (`tickloop-harness`). Tickloop Code lives in `code/`: `code/cli` is package `tickloop-code` and still builds the `tickloop` executable; `code/access` owns AgentAccess, `code/settings` persists settings.json, and `code/local-environment` implements local execution. Harness implementation packages use `tickloop-harness-*`; Code packages use `tickloop-code-*`. Both share the workspace version and release tag.
 
-The Tick host stays in `tickhost/`, the Tick standard, SDK, package mechanism, installer, OAuth and examples in `tick/`, shared terminal presentation in `ui/`, the crates.io launcher in `distribution/cargo/`, and the patched crossterm copy in `vendor/crossterm/`. These public paths and package names are unchanged. Tick authors depend on the Tick public layer and `ui`, never on Harness or Code internals. The per-crate table and dependency rules are in [AGENTS.md](AGENTS.md) under "Structure and integration boundaries".
+The Tick host stays in `tickhost/`, the Tick standard, SDK, package compatibility layer, plugin mechanism, installer, OAuth and examples in `tick/`, shared terminal presentation in `ui/`, the crates.io launcher in `distribution/cargo/`, and the patched crossterm copy in `vendor/crossterm/`. These public paths and package names are unchanged. Tick authors depend on the Tick public layer and `ui`, never on Harness or Code internals. The per-crate table and dependency rules are in [AGENTS.md](AGENTS.md) under "Structure and integration boundaries".
 
 Hosts migrate `tickloop-agent-{runtime,protocol,transcript,model,tools,cron,artifacts,base,test-support}` imports to the corresponding `tickloop_harness::{runtime,protocol,transcript,model,tools,cron,artifacts,base,test_support}` modules; policy is exported as `policy`. Select only needed features (`base`, `engine`, `model`, `tools`, `policy`, `transcript`, `cron`, `artifacts`, `test-support`). `protocol` and `ids` are always exported. `base` is optional and also enabled by `tools`, `model`, `artifacts`, `policy`, `engine` and `test-support`; `cron` and `transcript` do not enable it. The `tools` feature supports UI and settings consumers without enabling the runtime. Deployment scripts that update a shared dependency now select `tickloop-harness`; size reports should include `tickloop-harness`, `tickloop-harness-*` and `tickloop-code*` in place of `tickloop-agent-*`. `tickloop`, `tl`, package installation and saved data formats are unchanged.
 

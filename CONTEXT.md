@@ -69,12 +69,23 @@ _Avoid_: background task, Task (these describe only how it runs)
 A Tick whose instance is one Artifact in Tickloop Artifacts. Its only updates are Artifact Feedback, delivered to the Loop through an Artifact Association; edits to the content by a person or the Agent are not Tick Updates.
 _Avoid_: "associated Artifact" (Artifact Association refers specifically to the feedback relationship)
 
+### Plugins
+
+**Plugin**:
+An installable unit of components that extend the Agent's available Skills or Tick programs. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; a plugin grants no additional permissions.
+
+**Plugin Marketplace**:
+A named catalog of plugins and their sources. Tickloop includes `tickloop` and `claude-plugins-official`; users can register additional marketplaces.
+
+**Plugin ID**:
+A plugin's name qualified by its marketplace, written `<name>@<marketplace>`. Installed plugin names are globally unique; marketplace entries determine their installed names, while a manifest may supply a different display name. Local installations belong to `local`.
+
 **Tick Package**:
-A program `tick-<package>`, a manifest `tick-package.json`, and a Skill that teaches the Agent to use it, installed as a unit from the Tick Marketplace and divided by data source; once opened, the program is an Extension Tick and can provide several Ticks through subcommands. The authentication method is declared by the package (`none`, `api_key`, `oauth2`) and belongs to the package, not the Tick Protocol. Only the user initiates installation and login, which neither open nor subscribe to Ticks and grant no permissions.
-_Avoid_: Plugin, builtin provider (Terminal, Shell, Artifact, and the protocol are Tick types, not data sources)
+A plugin with a Tick component: a program the Agent can open as a Tick, with a manifest and optional Skills teaching the Agent to use it. Authentication belongs to the plugin, not the Tick Protocol.
+_Avoid_: builtin provider (Terminal, Shell, Artifact, and the protocol are Tick types, not data sources)
 
 **Tick Marketplace**:
-The listing (`marketplace.json`) of installable Tick Packages and their prebuilt downloads; currently there is only the official marketplace [tickloopai/ticks](https://github.com/tickloopai/ticks).
+The built-in `tickloop` Plugin Marketplace, listing Tick Packages and their prebuilt downloads from [tickloopai/ticks](https://github.com/tickloopai/ticks).
 _Avoid_: Store
 
 ### Loop and Trigger
@@ -96,7 +107,7 @@ _Avoid_: inbox, to-do queue
 
 **Send Now**:
 A way of submitting while the Agent is working that makes a message start a new turn immediately (`ctrl+enter`): it first interrupts the current turn, then runs this message. A normal submission only queues.
-_Avoid_: "jump the queue", Steer (Codex uses it for a normal submission merged into the current turn)
+_Avoid_: "jump the queue", Steer
 
 **Receiving**:
 The Loop's single switch for whether it accepts Triggers, with only two states: receiving and paused. `/stop`, ordinary history loading, and Trigger input that cannot be written to the Transcript for a long time pause it; Continue resumes it.
@@ -113,7 +124,7 @@ _Avoid_: event trigger, timer, clock rule
 The user, in the Monitor, hands the current content of an unsubscribed Extension Tick or Terminal Tick to the Agent once, without creating a subscription.
 
 **Scheduled Task**:
-Modeled on Claude Code's `/loop` and cron tools, makes the Loop run a user-authorized instruction repeatedly on a schedule or at a point in time; it is the time source of Triggers and belongs only to the root Agent. A schedule can be recurring (a `/loop` interval or a 5-field cron), one-time, or self-paced. A Scheduled Task is not a Tick.
+A schedule that makes the Loop run a user-authorized instruction repeatedly on a schedule or at a point in time; it is the time source of Triggers and belongs only to the root Agent. A schedule can be recurring (a `/loop` interval or a 5-field cron), one-time, or self-paced. A Scheduled Task is not a Tick.
 _Avoid_: clock rule, scheduled Tick
 
 **Self-paced `/loop`**:
