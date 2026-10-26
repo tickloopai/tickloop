@@ -125,7 +125,7 @@ fn next_sequence() -> u64 {
         .as_nanos()
         .min(u64::MAX as u128) as u64;
     LAST_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(epoch.max(last.saturating_add(1)))
         })
         .map(|last| epoch.max(last.saturating_add(1)))

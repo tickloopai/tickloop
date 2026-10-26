@@ -12104,11 +12104,10 @@ impl State {
                             return None;
                         }
                         super::scheduled_tasks::PauseAction::Scheduled(task.id)
-                    } else if let Some(entry) = self.monitor.selected() {
+                    } else {
+                        let entry = self.monitor.selected()?;
                         entry.subscription?;
                         super::scheduled_tasks::PauseAction::Subscription(entry.instance.clone())
-                    } else {
-                        return None;
                     };
                     let chat = self.chat?;
                     match super::tick_actions::TickActionExecutor::prepare(
