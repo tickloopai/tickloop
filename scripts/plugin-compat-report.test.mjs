@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -297,4 +297,22 @@ test("the built tickloop reads the fixture marketplace the same way", { skip: !e
   assert.deepEqual(plugins.remote.unsupportedComponents, ["MCP servers"]);
   assert.deepEqual({ format: plugins.sub.manifestFormat, skills: plugins.sub.skills }, { format: "marketplace entry", skills: ["skills/draft"] });
   assert.match(plugins.broken.errors[0], /Broken_Name/);
+});
+
+
+test("validation staging rejects escaping and dangling links before writing a fallback manifest", async () => {
+  for (const kind of ["external", "dangling"]) {
+    const marketplace = join(scratch, `linked-market-${kind}`);
+    const outside = join(scratch, `outside-${kind}`);
+    mkdirSync(outside);
+    writeFiles(marketplace, {
+      "marketplace.json": { name: "linked", plugins: [{ name: "linked", source: "./linked" }] },
+      "linked/skills/read/SKILL.md": skill("read"),
+    });
+    symlinkSync(kind === "external" ? outside : join(outside, "missing"), join(marketplace, "linked/.claude-plugin"));
+    const report = await createReport({ marketplace, tickloop: fakeTickloop(), workDirectory: join(scratch, `linked-work-${kind}`), target: "aarch64-apple-darwin" });
+    assert.deepEqual(readdirSync(outside), [], "staging must not write through the directory link");
+    assert.equal(report.plugins[0].status, STATUS.notFetchable);
+    assert.match(report.plugins[0].errors[0], /symbolic link/);
+  }
 });

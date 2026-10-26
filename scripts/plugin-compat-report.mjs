@@ -10,7 +10,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -274,6 +274,25 @@ async function fetchTickArchive(plugin, context, destination) {
   return { revision: plugin.entry.version };
 }
 
+async function checkStagedLinks(directory) {
+  const root = await realpath(directory);
+  const pending = [root];
+  while (pending.length) {
+    const parent = pending.pop();
+    for (const entry of await readdir(parent, { withFileTypes: true })) {
+      const path = join(parent, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = await realpath(path).catch(() => null);
+        if (target === null || !isInside(root, target)) {
+          throw new Error(`symbolic link ${relative(root, path)} is dangling or leaves the plugin`);
+        }
+      } else if (entry.isDirectory()) {
+        pending.push(path);
+      }
+    }
+  }
+}
+
 /** A copy of the plugin to validate, with its marketplace entry as its manifest when it has none, as installing writes it. */
 async function stageForValidation(plugin, fetched, destination) {
   await cp(fetched.directory, destination, {
@@ -281,11 +300,18 @@ async function stageForValidation(plugin, fetched, destination) {
     verbatimSymlinks: true,
     filter: path => !path.endsWith("/.git"),
   });
+  await checkStagedLinks(destination);
   const hasManifest = PLUGIN_MANIFESTS.some(file => existsSync(join(destination, file)));
   if (hasManifest) return false;
   const manifest = Object.fromEntries(Object.entries(plugin.entry).filter(([field]) => !MARKETPLACE_ONLY_FIELDS.includes(field)));
-  await mkdir(join(destination, ".claude-plugin"), { recursive: true });
-  await writeFile(join(destination, CLAUDE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
+  const manifestDirectory = join(destination, ".claude-plugin");
+  const existing = await lstat(manifestDirectory).catch(error => {
+    if (error.code !== "ENOENT") throw error;
+    return null;
+  });
+  if (existing && !existing.isDirectory()) throw new Error(".claude-plugin must be a real directory to create a manifest");
+  if (!existing) await mkdir(manifestDirectory);
+  await writeFile(join(destination, CLAUDE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
   return true;
 }
 
