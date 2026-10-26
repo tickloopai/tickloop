@@ -79,7 +79,7 @@ pub(super) fn installed(plugin: &InstalledPlugin) {
 
 fn render(manifest: &PluginManifest, enabled: bool, resolved: ResolvedServers) {
     for (name, entry) in &manifest.mcp_servers {
-        let name = format!("plugin_{}_{name}", manifest.name);
+        let name = tickloop_code_settings::mcp::plugin_server_name(&manifest.name, name);
         let kind = transport_kind(entry).unwrap_or("invalid");
         let (target_kind, target) = if kind == "stdio" {
             let mut command = vec![entry["command"].clone()];

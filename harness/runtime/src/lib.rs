@@ -3452,6 +3452,7 @@ impl Agent {
             permission_input,
             &chat.snapshot.policy,
             denials::AllowedDecision {
+                mcp_server: admission.mcp_server,
                 path: admission.approval_path,
                 direct_basis: admission.direct_basis,
                 approval_source: admission.approval_source,

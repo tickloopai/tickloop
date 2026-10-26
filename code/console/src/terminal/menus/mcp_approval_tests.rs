@@ -26,6 +26,9 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
         service.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}}}]));
         service.set_result(json!({"content":[{"type":"text","text":"OK"}]}));
         let configs = vec![McpServerConfig {
+            oauth: Default::default(),
+            sensitive_values: Vec::new(),
+            disabled: false,
             name: "review".into(),
             source: "global".into(),
             transport: McpTransport::Http {

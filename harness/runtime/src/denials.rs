@@ -34,6 +34,7 @@ pub(super) enum DirectApprovalBasis {
 }
 
 pub(super) struct AllowedDecision<'a> {
+    pub mcp_server: Option<&'a str>,
     pub path: ApprovalPath,
     pub direct_basis: DirectApprovalBasis,
     pub approval_source: Option<PermissionApprovalSource>,
@@ -54,6 +55,7 @@ pub(super) fn allowed_approval_record(
         decision.approval_source,
         policy,
         decision.assessment,
+        decision.mcp_server,
     )
     .finish(chat_id, operation);
     let mut record = ApprovalRecord::from_denial(sanitized);
@@ -165,9 +167,10 @@ impl DenialCandidate {
         approval_source: Option<PermissionApprovalSource>,
         policy: &PermissionPolicy,
         assessment: Option<&ApprovalAssessmentDetails>,
+        mcp_server: Option<&str>,
     ) -> Self {
         let (matching_rules, matching_rules_truncated) =
-            matching_rule_summaries(policy, operation, permission_input);
+            matching_rule_summaries(policy, operation, permission_input, mcp_server);
         Self {
             category,
             approval_source,
@@ -291,6 +294,7 @@ fn matching_rule_summaries(
     policy: &PermissionPolicy,
     operation: &OperationRecord,
     permission_input: &Value,
+    mcp_server: Option<&str>,
 ) -> (Vec<DenialRuleSummary>, bool) {
     let rules = policy
         .managed_constraints
@@ -313,13 +317,20 @@ fn matching_rule_summaries(
             )
         }));
     let mut matched = rules
-        .filter(|(_, rule)| {
-            tickloop_harness_tools::permissions::rule_matches_call(
+        .filter(|(_, rule)| match mcp_server {
+            Some(server) => tickloop_harness_tools::permissions::mcp_rule_matches_call(
+                rule,
+                &operation.name,
+                server,
+                permission_input,
+                operation.loop_id.into(),
+            ),
+            None => tickloop_harness_tools::permissions::rule_matches_call(
                 rule,
                 &operation.name,
                 permission_input,
                 operation.loop_id.into(),
-            )
+            ),
         })
         .take(13)
         .map(|(source, rule)| DenialRuleSummary {
@@ -732,6 +743,7 @@ impl Agent {
             Some(PermissionApprovalSource::AutoReviewer),
             policy,
             Some(&assessment.details),
+            None,
         )
         .finish(receipt.chat_id, operation);
         let diagnostic = serde_json::json!({

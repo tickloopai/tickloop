@@ -64,25 +64,26 @@ pub(super) fn directory(
     (directory, warnings)
 }
 fn normalize(server: &str, tool: &str) -> String {
-    format!("mcp__{server}__{tool}")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-pub(super) fn hashed_name(normalized: &str, identity: &str) -> String {
-    let digest = format!("{:x}", Sha256::digest(identity));
+    use tickloop_harness_protocol::mcp::normalize_mcp_name_component;
     format!(
-        "{}_{}",
-        &normalized[..normalized.len().min(55)],
-        &digest[..8]
+        "mcp__{}__{}",
+        normalize_mcp_name_component(server),
+        normalize_mcp_name_component(tool)
     )
 }
+pub(super) fn hashed_name(normalized: &str, identity: &str) -> String {
+    const MAX_SERVER_PREFIX_BYTES: usize = 40;
+    const COMPONENT_PREFIX_BUDGET: usize = 48;
+    let digest = format!("{:x}", Sha256::digest(identity));
+    let (server, tool) = normalized
+        .strip_prefix("mcp__")
+        .and_then(|name| name.split_once("__"))
+        .expect("normalized MCP tool name");
+    let server = server[..server.len().min(MAX_SERVER_PREFIX_BYTES)].trim_end_matches('_');
+    let tool = tool[..tool.len().min(COMPONENT_PREFIX_BUDGET - server.len())].trim_end_matches('_');
+    format!("mcp__{server}__{tool}_{}", &digest[..8])
+}
+
 fn flatten(value: Value) -> Option<Value> {
     match value {
         Value::Array(items) => items

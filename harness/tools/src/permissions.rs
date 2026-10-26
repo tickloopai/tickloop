@@ -232,8 +232,7 @@ impl PermissionPolicyExt for PermissionPolicy {
         session: Option<SessionPermissionDecision>,
     ) -> Option<ExplicitRuleMatch> {
         let mut policy = self.clone();
-        let server_rule = format!("mcp__{server}");
-        let wildcard_rule = format!("{server_rule}__*");
+
         // Resolve service rules before generic matching: display names may be hashed, and
         // underscores in service names must not grant a different service's authority.
         for rules in [
@@ -243,12 +242,14 @@ impl PermissionPolicyExt for PermissionPolicy {
             &mut policy.managed_constraints,
         ] {
             rules.retain_mut(|rule| {
-                if rule.tool == server_rule || rule.tool == wildcard_rule {
-                    rule.tool = name.to_owned();
-                    true
-                } else {
-                    !rule.tool.starts_with("mcp__") || rule.tool == name
+                if !rule.tool.starts_with("mcp__") {
+                    return true;
                 }
+                if !mcp_tool_rule_matches(&rule.tool, name, server) {
+                    return false;
+                }
+                rule.tool = name.to_owned();
+                true
             });
         }
         policy.explicit_rule_match(name, input, loop_id, session)
@@ -639,6 +640,29 @@ fn rule_matches_any(
 
 pub fn rule_matches_call(rule: &PermissionRule, name: &str, input: &Value, loop_id: Uuid) -> bool {
     rule_matches_any(rule, rule.decision, name, input, loop_id)
+}
+
+fn mcp_tool_rule_matches(rule: &str, name: &str, server: &str) -> bool {
+    rule == name || rule == format!("mcp__{server}") || rule == format!("mcp__{server}__*")
+}
+
+/// Match the original rule against the same resolved service used for admission.
+pub fn mcp_rule_matches_call(
+    rule: &PermissionRule,
+    name: &str,
+    server: &str,
+    input: &Value,
+    loop_id: Uuid,
+) -> bool {
+    if !rule.tool.starts_with("mcp__") {
+        return rule_matches_call(rule, name, input, loop_id);
+    }
+    if !mcp_tool_rule_matches(&rule.tool, name, server) {
+        return false;
+    }
+    let mut resolved = rule.clone();
+    resolved.tool = name.into();
+    rule_matches_call(&resolved, name, input, loop_id)
 }
 
 fn allow_rules_cover_call(

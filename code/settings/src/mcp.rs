@@ -363,7 +363,13 @@ pub fn resolve_servers_with_plugins(
         }
         environment.extend(plugin.user_config.variables());
         for (name, entry) in &plugin.entries {
-            let name = format!("{PLUGIN_SERVER_PREFIX}{}_{name}", plugin.name);
+            let name = plugin_server_name(&plugin.name, name);
+            if resolved.servers.iter().any(|server| server.name == name) {
+                resolved.warnings.push(format!(
+                    "MCP {name} skipped: normalized server name already exists"
+                ));
+                continue;
+            }
             resolved.push(
                 name.clone(),
                 format!("{PLUGIN_SOURCE_PREFIX}{}", plugin.name),
@@ -393,6 +399,15 @@ pub fn resolve_servers_with_plugins(
     resolved
 }
 
+pub fn plugin_server_name(plugin: &str, server: &str) -> String {
+    use tickloop_harness::protocol::mcp::normalize_mcp_name_component;
+    format!(
+        "{PLUGIN_SERVER_PREFIX}{}_{}",
+        normalize_mcp_name_component(plugin),
+        normalize_mcp_name_component(server)
+    )
+}
+
 /// The names of user servers: letters, digits, `_` and `-`, without the prefix of plugin servers
 /// or the name of the Artifacts server, whose resources are read under that name.
 pub fn validate_user_server_name(name: &str) -> Result<(), String> {
@@ -401,16 +416,13 @@ pub fn validate_user_server_name(name: &str) -> Result<(), String> {
             "MCP server name {ARTIFACTS_SERVER_NAME} is reserved for Tickloop Artifacts"
         ));
     }
-    let valid = !name.is_empty()
-        && !name.starts_with(PLUGIN_SERVER_PREFIX)
-        && name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+    let valid = tickloop_harness::protocol::mcp::is_valid_mcp_server_name(name)
+        && !name.starts_with(PLUGIN_SERVER_PREFIX);
     if valid {
         Ok(())
     } else {
         Err(
-            "invalid user MCP server name (letters, digits, _ and - only; plugin_ is reserved)"
+            "invalid user MCP server name (letters, digits, _ and - only; __ is not allowed; plugin_ is reserved)"
                 .into(),
         )
     }

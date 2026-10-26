@@ -109,6 +109,7 @@ fn add_and_remove_refuse_conflicts_and_names_they_cannot_own() {
             &["add", "plugin_notes", "https://example.com/mcp"][..],
             "plugin_ is reserved",
         ),
+        (&["add", "team__read", "https://example.com/mcp"][..], "__"),
         (&["add", "plain", "http://example.com/mcp"][..], "HTTPS"),
         (
             &["add", "both", "https://example.com/mcp", "--", "node"][..],

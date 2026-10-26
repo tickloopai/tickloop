@@ -17,6 +17,9 @@ async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, Str
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MCP_OK"}]}));
     let configs = vec![McpServerConfig {
+        oauth: Default::default(),
+        sensitive_values: Vec::new(),
+        disabled: false,
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -64,7 +67,7 @@ fn rule(tool: &str, decision: Decision) -> PermissionRule {
 async fn server_allow_rules_admit_mcp_in_auto_even_for_hashed_names() {
     for server_name in [
         "review",
-        "team__review",
+        "team_review",
         "a_service_name_long_enough_to_require_hashing_the_complete_model_tool_name",
     ] {
         for suffix in ["", "__*"] {
@@ -278,7 +281,7 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
 async fn another_servers_prefix_never_grants_or_denies_this_service() {
     for decision in [Decision::Allow, Decision::Ask, Decision::Deny] {
         let server = McpService::start().await;
-        let (provider, tool) = provider(&server, "team__review").await;
+        let (provider, tool) = provider(&server, "team_review").await;
         let agent = Agent::new_embedded(
             config(),
             Arc::new(ScriptedModel::new(vec![
@@ -586,14 +589,14 @@ async fn mcp_explicit_ask_and_deny_override_wider_allows() {
 }
 
 #[tokio::test]
-async fn allowing_one_tool_does_not_allow_a_server_with_the_same_rule_name() {
+async fn allowing_one_tool_does_not_allow_a_different_service() {
     use tickloop_harness_policy::settings::MemorySettingsStore;
     use tickloop_harness_runtime::{HarnessOptions, HarnessSeams, environment::FolderEnvironment};
     use tickloop_harness_test_support::harness::ChosenModels;
     let first = McpService::start().await;
     let second = McpService::start().await;
     let (first_provider, first_tool) = provider(&first, "team").await;
-    let (second_provider, second_tool) = provider(&second, "team__read").await;
+    let (second_provider, second_tool) = provider(&second, "team_read").await;
     let model = Arc::new(ScriptedModel::new(vec![
         call("first", &first_tool, json!({})),
         call("second", &second_tool, json!({})),
@@ -650,4 +653,100 @@ async fn allowing_one_tool_does_not_allow_a_server_with_the_same_rule_name() {
         }
     }
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn service_rules_appear_in_permission_history_with_their_original_identity() {
+    for decision in [Decision::Allow, Decision::Ask, Decision::Deny] {
+        for suffix in ["", "__*"] {
+            let service = McpService::start().await;
+            let server =
+                "a_service_name_long_enough_to_require_hashing_the_complete_model_tool_name";
+            let (provider, tool) = provider(&service, server).await;
+            assert!(tool.strip_prefix("mcp__").unwrap().contains("__"));
+            let agent = Agent::new_embedded(
+                config(),
+                Arc::new(ScriptedModel::new(vec![
+                    call("read", &tool, json!({})),
+                    text("done"),
+                ])),
+            );
+            agent.install_host_tools(provider).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let chat = agent.create_chat(directory.path().into()).await.unwrap();
+            let rule = rule(&format!("mcp__{server}{suffix}"), decision);
+            agent
+                .set_permission_rules(chat, vec![rule.clone()])
+                .await
+                .unwrap();
+            let mut events = agent.subscribe();
+            agent.submit(chat, "Read".into()).await.unwrap();
+            loop {
+                match next_event(&mut events).await.kind {
+                    EventKind::PermissionRequested { request } => agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap(),
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            let history = agent.approval_history_view(chat).await.unwrap();
+            let record = history
+                .records
+                .iter()
+                .find(|record| record.call_id == "read")
+                .unwrap();
+            assert_eq!(record.matching_rules.len(), 1, "{decision:?} {suffix}");
+            assert_eq!(record.matching_rules[0].id, rule.id);
+            assert_eq!(record.matching_rules[0].decision, decision);
+            assert_eq!(
+                record.matching_rules[0].matcher.text,
+                format!("{} (any input)", rule.tool)
+            );
+            agent.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_resolved_service_names_cannot_expose_ambiguous_tools() {
+    let service = McpService::start().await;
+    service.set_tools(json!([{"name":"read","inputSchema":{"type":"object"}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "team__read".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: service.url(),
+                headers: BTreeMap::new(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+            sensitive_values: Vec::new(),
+            disabled: false,
+        }])
+        .await;
+    let statuses = connections.statuses();
+    assert_eq!(statuses[0].state, McpServerState::Failed);
+    assert!(statuses[0].failure.as_deref().unwrap().contains("__"));
+    assert!(statuses[0].tools.is_empty());
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__team__read__read",
+                json!({}),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await,
+        tickloop_harness_runtime::host_tools::HostCallResult::NotDispatched(_)
+    ));
+    assert!(service.calls().is_empty());
+    connections.shutdown().await;
 }
