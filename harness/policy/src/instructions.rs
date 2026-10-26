@@ -11,6 +11,14 @@ const INSTRUCTIONS_CONTEXT_KEY: &str = "claudeMd";
 const CURRENT_DATE_CONTEXT_KEY: &str = "currentDate";
 const CONTEXT_RELEVANCE_NOTE: &str = "IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.";
 
+/// Claude Code's `date_change` reminder, appended to the conversation when the user's date moved
+/// on, so the user context that told an earlier date stays the conversation's unchanged prefix.
+pub fn date_change_message(current_date: &str) -> String {
+    format!(
+        "<system-reminder>\nThe date has changed. Today's date is now {current_date}. DO NOT mention this to the user explicitly because they are already aware.\n</system-reminder>"
+    )
+}
+
 /// Where an instruction file comes from; an imported file has the scope of the file importing it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstructionScope {

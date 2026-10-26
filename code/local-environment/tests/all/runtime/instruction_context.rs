@@ -54,14 +54,13 @@ fn text_of(request: &ModelRequest, index: usize) -> (Role, String) {
     (message.role, text)
 }
 
-/// The conversation request whose last user text is `prompt`.
+/// The first request that carries `prompt`: the one its own turn sent.
 fn request_for(model: &ScriptedModel, prompt: &str) -> ModelRequest {
     model
         .requests
         .lock()
         .unwrap()
         .iter()
-        .rev()
         .find(|request| {
             request.messages.iter().any(|message| {
                 message.role == Role::User
@@ -199,4 +198,68 @@ async fn a_subagent_receives_the_instructions_its_parent_loaded() {
             .contains("Rule when the parent started.")
     );
     assert_eq!(text_of(child, 1), text_of(parent, 1));
+}
+
+#[tokio::test]
+async fn a_new_day_is_announced_once_at_the_end_and_the_user_context_stays() {
+    use chrono::TimeZone;
+    const DATE_CHANGE: &str = "<system-reminder>\nThe date has changed. Today's date is now 2026-10-28. DO NOT mention this to the user explicitly because they are already aware.\n</system-reminder>";
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let root = directory.path().join("root");
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("first answer"),
+        text("second answer"),
+        text("third answer"),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    set_clock(&agent);
+    let chat = agent.create_chat(project).await.unwrap();
+
+    complete_turn(&agent, chat, "first prompt").await;
+    agent.set_scheduled_now_for_tests(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 27, 17, 0, 0)
+            .unwrap(),
+    );
+    complete_turn(&agent, chat, "second prompt").await;
+    complete_turn(&agent, chat, "third prompt").await;
+
+    let first = request_for(&model, "first prompt");
+    let second = request_for(&model, "second prompt");
+    let third = request_for(&model, "third prompt");
+    assert_eq!(text_of(&second, 1), text_of(&first, 1));
+    let last = second.messages.len() - 1;
+    assert_eq!(text_of(&second, last), (Role::User, DATE_CHANGE.into()));
+    assert_eq!(
+        text_of(&second, last - 1),
+        (Role::User, "second prompt".into())
+    );
+    let mentions = |request: &ModelRequest| {
+        (0..request.messages.len())
+            .filter(|&index| text_of(request, index).1 == DATE_CHANGE)
+            .count()
+    };
+    assert_eq!(mentions(&third), 1);
+    assert_eq!(text_of(&third, 1), text_of(&first, 1));
+    agent.shutdown().await;
+
+    let resumed_model = Arc::new(ScriptedModel::new(vec![text("fourth answer")]));
+    let resumed = Agent::open_embedded(root, config(), resumed_model.clone()).unwrap();
+    set_clock(&resumed);
+    resumed.set_scheduled_now_for_tests(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 27, 18, 0, 0)
+            .unwrap(),
+    );
+    resumed.resume_chat(chat).await.unwrap();
+    complete_turn(&resumed, chat, "fourth prompt").await;
+    let fourth = request_for(&resumed_model, "fourth prompt");
+    assert!(
+        text_of(&fourth, 1)
+            .1
+            .contains("Today's date is 2026-10-28.")
+    );
+    assert_eq!(mentions(&fourth), 1);
 }

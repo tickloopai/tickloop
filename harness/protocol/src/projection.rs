@@ -111,7 +111,7 @@ impl ChatSnapshot {
                         .mcp_servers
                         .retain(|server, _| !mcp_servers.contains(server));
                 }
-                HostNote::HostTools(_) | HostNote::PlanModeExit => {}
+                HostNote::HostTools(_) | HostNote::PlanModeExit | HostNote::DateChange(_) => {}
             }
         }
         visible

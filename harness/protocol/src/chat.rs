@@ -399,13 +399,16 @@ pub enum HostNote {
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
+    /// Claude Code's `date_change` attachment: the user's date moved on to this `YYYY-MM-DD`
+    /// after the user context told the model an earlier one.
+    DateChange(String),
 }
 
 impl HostNote {
     pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::HostTools(announced) => Some(announced),
-            Self::PlanModeExit | Self::Guidance(_) => None,
+            Self::PlanModeExit | Self::Guidance(_) | Self::DateChange(_) => None,
         }
     }
 }

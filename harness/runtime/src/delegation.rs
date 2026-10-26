@@ -1014,6 +1014,7 @@ impl Agent {
                         client,
                         output_style,
                         user_context,
+                        announced_date,
                         session_denials,
                         name,
                         ancestors,
@@ -1060,6 +1061,7 @@ impl Agent {
                             chat.client.clone(),
                             chat.output_style,
                             chat.user_context.clone(),
+                            chat.announced_date.clone(),
                             sessions.freeze_denials(parent_owner),
                             unique_agent_name(
                                 requested_name.as_deref().unwrap_or(&fallback_name),
@@ -1223,6 +1225,7 @@ impl Agent {
                                 client,
                                 output_style,
                                 user_context,
+                                announced_date,
                             }),
                         )
                         .await

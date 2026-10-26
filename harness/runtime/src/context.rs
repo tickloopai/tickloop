@@ -532,6 +532,7 @@ impl Agent {
                         // reads the user context again.
                         chat.tools.file_reads().clear();
                         chat.user_context = Default::default();
+                        chat.announced_date = None;
                         Ok(CompactionOutcome {
                             summary,
                             snapshot: chat.snapshot.clone(),

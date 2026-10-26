@@ -293,6 +293,10 @@ pub struct ChainEntry {
     /// Code's `plan_mode_exit` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_mode_exit: bool,
+    /// Tickloop extension: marks the host note telling the model the date it now is, Claude
+    /// Code's `date_change` attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_change: Option<String>,
     /// Tickloop extension: marks a host note carrying guidance, like Claude Code's Skill messages
     /// and `mcp_instructions_delta` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]

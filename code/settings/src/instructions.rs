@@ -245,7 +245,7 @@ impl Discovery<'_> {
     }
 
     /// Rules in `directory` and its subdirectories without `paths` frontmatter; a rule limited to
-    /// some paths applies only when a matching file is read.
+    /// some paths is left out.
     fn load_rules(&mut self, directory: &Path, scope: InstructionScope) {
         let mut visited = HashSet::new();
         self.load_rules_in(directory, scope, &mut visited);
@@ -334,7 +334,7 @@ impl Discovery<'_> {
         loaded
     }
 
-    /// Whether `path` is inside the Folder once links are followed, so a link checked into the
+    /// Whether `path` is inside the Folder once links are followed, so an import linked into the
     /// project cannot bring in a file from elsewhere.
     fn is_inside_folder(&self, path: &Path) -> bool {
         self.folder
@@ -649,9 +649,9 @@ fn main_repository_root(worktree_root: &Path) -> Option<PathBuf> {
         return None;
     }
     if common_directory.file_name()? != GIT_ENTRY {
-        return Some(common_directory);
+        return Some(resolve(&common_directory));
     }
-    common_directory.parent().map(Path::to_path_buf)
+    common_directory.parent().map(resolve)
 }
 
 #[cfg(test)]
