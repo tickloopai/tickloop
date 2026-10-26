@@ -137,6 +137,10 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
     } else {
         None
     };
+    if terminal {
+        print!("Callback input ready (hidden; Ctrl+G editor; Esc cancels).\r\n");
+        io::stdout().flush().map_err(|error| error.to_string())?;
+    }
     let (sender, mut lines) = tokio::sync::mpsc::unbounded_channel();
     let input_thread = std::thread::spawn(move || {
         if terminal {
@@ -149,6 +153,9 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
                 let Ok(Event::Key(key)) = event::read() else {
                     continue;
                 };
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    continue;
+                }
                 match key.code {
                     KeyCode::Esc => {
                         input_cancel.cancel();
@@ -158,6 +165,31 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
                         input_cancel.cancel();
                         break;
                     }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let edited = crossterm::terminal::disable_raw_mode()
+                            .map_err(|error| error.to_string())
+                            .and_then(|()| {
+                                tickloop_code_console::terminal::edit_external_text(
+                                    &line,
+                                    Path::new("."),
+                                    &input_cancel,
+                                )
+                            });
+                        if crossterm::terminal::enable_raw_mode().is_err() {
+                            input_cancel.cancel();
+                            break;
+                        }
+                        match edited {
+                            Ok(Some(content)) if content.len() <= MAX_CALLBACK_BYTES => {
+                                line = content;
+                                print!("Callback updated; press Enter to submit.\r\n");
+                            }
+                            Ok(Some(_)) => print!("Callback address is too long.\r\n"),
+                            Ok(None) => {}
+                            Err(error) => print!("{}\r\n", safe_line(&error)),
+                        }
+                        let _ = io::stdout().flush();
+                    }
                     KeyCode::Enter => {
                         if sender.send(std::mem::take(&mut line)).is_err() {
                             break;
@@ -166,7 +198,12 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
                     KeyCode::Backspace => {
                         line.pop();
                     }
-                    KeyCode::Char(character) if line.len() < MAX_CALLBACK_BYTES => {
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && line.len() < MAX_CALLBACK_BYTES =>
+                    {
                         line.push(character)
                     }
                     _ => {}
@@ -193,21 +230,25 @@ async fn login(connector: &Connector, cancel: &CancellationToken) -> Result<(), 
             }
         }
     });
-    // A pipe reader may still be waiting for its writer; it must not hold up runtime shutdown.
-    drop(input_thread);
     let finish = pending.finish(cancel);
     tokio::pin!(finish);
-    loop {
+    let result = loop {
         tokio::select! {
-            result = &mut finish => return result.map_err(|error| error.to_string()),
-            _ = input_finished.cancelled() => { cancel.cancel(); return finish.await.map_err(|error| error.to_string()); }
+            result = &mut finish => break result.map_err(|error| error.to_string()),
+            _ = input_finished.cancelled() => { cancel.cancel(); break finish.await.map_err(|error| error.to_string()); }
             Some(line) = lines.recv() => {
                 if let Err(error) = paste.submit(line.trim()) {
                     eprintln!("{error}");
                 }
             }
         }
+    };
+    input_finished.cancel();
+    if terminal {
+        let _ = input_thread.join();
     }
+    // A pipe reader may still wait for its writer; it must not hold up runtime shutdown.
+    result
 }
 
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;

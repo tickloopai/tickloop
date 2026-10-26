@@ -7632,6 +7632,24 @@ fn model_retry_parts(
     )
 }
 
+/// Edits standalone terminal input using the Console's private temporary file and editor rules.
+/// The caller suspends raw input while the editor owns the terminal.
+pub fn edit_external_text(
+    draft: &str,
+    directory: &std::path::Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>, String> {
+    use external_editor::ExternalEditorOutcome;
+    match external_editor::edit_prompt_with_cancellation(draft, directory, Some(cancellation)) {
+        ExternalEditorOutcome::Updated { content } => Ok(Some(content)),
+        ExternalEditorOutcome::Unchanged | ExternalEditorOutcome::Cancelled { .. } => Ok(None),
+        ExternalEditorOutcome::Unavailable => {
+            Err("No external editor found; set VISUAL or EDITOR".into())
+        }
+        ExternalEditorOutcome::Failed(error) => Err(error.to_string()),
+    }
+}
+
 /// Claude Code's output count, `· ↓ 14.5k tokens`; input tokens are not part of the summary.
 fn usage_text(usage: &Usage) -> String {
     usage.output_tokens.map_or_else(String::new, |tokens| {

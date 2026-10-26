@@ -25,6 +25,7 @@ struct State {
     challenge: Option<String>,
     bearer: Option<String>,
     requests: usize,
+    notification: Option<Value>,
     resources_capability: Option<Value>,
     resources: Value,
     resource_text: String,
@@ -47,6 +48,7 @@ impl McpService {
                 challenge: None,
                 bearer: None,
                 requests: 0,
+                notification: None,
                 resources_capability: Some(json!({})),
                 resources: json!([{"uri":"fixture://text","name":"text"}]),
                 resource_text: "resource text".into(),
@@ -107,8 +109,9 @@ impl McpService {
                                 };
                                 let call = method == "tools/call";
                                 let mut notifications = Vec::new();
-                                if call && std::mem::take(&mut state.changed) { notifications.push("notifications/tools/list_changed"); }
-                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push("notifications/resources/list_changed"); }
+                                if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})); }
+                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"})); }
+                                if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
                                 (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
@@ -117,7 +120,7 @@ impl McpService {
                             let (status, content_type, body) = if request.get("id").is_none() {
                                 (202, "application/json", String::new())
                             } else if !notifications.is_empty() {
-                                let events: String = notifications.iter().map(|method| format!("data: {}\n\n", json!({"jsonrpc":"2.0","method":method}))).collect();
+                                let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
                                 (status, "text/event-stream", format!("{events}data: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
                             let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
@@ -150,6 +153,11 @@ impl McpService {
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
+    }
+    pub fn notify_log(&self, text: &str) {
+        self.state.lock().unwrap().notification = Some(
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":text}}),
+        );
     }
     pub fn require_bearer(&self, token: &str) {
         self.state.lock().unwrap().bearer = Some(token.into());

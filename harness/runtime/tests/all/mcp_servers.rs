@@ -1147,3 +1147,165 @@ async fn resource_authentication_failure_requires_login_before_more_requests() {
     assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
     connections.shutdown().await;
 }
+
+#[derive(Clone, Default)]
+struct ProtocolLog(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for ProtocolLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH, TokenReply};
+    use tickloop_harness_connector::{Connector, OAuthSettings};
+    let log = ProtocolLog::default();
+    let writer = log.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
+    let server = McpService::start().await;
+    let authorization = AuthorizationServer::start();
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let cancel = CancellationToken::new();
+    let connector = Connector::new(
+        &server.url(),
+        OAuthSettings {
+            authorization_server_metadata_url: Some(format!(
+                "{}{METADATA_PATH}",
+                authorization.issuer()
+            )),
+            ..Default::default()
+        },
+        credentials.clone(),
+    )
+    .unwrap();
+    let login = connector.start_login(None, &cancel).await.unwrap();
+    login
+        .paste()
+        .submit(&authorization.approve(login.authorization_url()))
+        .unwrap();
+    login.finish(&cancel).await.unwrap();
+    let token = credentials.current().unwrap().token.unwrap();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_resources(json!([{"uri":"fixture://text", "name":token.refresh_token}]));
+    server.notify_log(&format!(
+        "{} {}",
+        token.access_token,
+        token.refresh_token.as_ref().unwrap()
+    ));
+    let configs = vec![McpServerConfig {
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections.reconcile(configs).await;
+    settled(&connections).await;
+    connections
+        .call("mcp__remote__probe", json!({}), cancel.clone())
+        .await;
+    let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.contains(&token.access_token),
+        "SDK logging exposed the access token"
+    );
+    assert!(
+        !logged.contains(token.refresh_token.as_ref().unwrap()),
+        "SDK logging exposed the refresh token"
+    );
+    authorization.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
+    server.set_status(401);
+    connections
+        .call("mcp__remote__probe", json!({}), cancel)
+        .await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    let visible = serde_json::to_string(&connections.snapshot()).unwrap();
+    assert!(
+        !visible.contains(token.refresh_token.as_ref().unwrap()),
+        "invalidation forgot a secret still present in cached resources"
+    );
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
+    use tickloop_harness_connector::{
+        ConnectorCredential, ConnectorCredentials, CredentialError, CredentialLock,
+    };
+    #[derive(Default)]
+    struct StalledCredentials {
+        inner: InMemoryCredentials,
+        entered: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl ConnectorCredentials for StalledCredentials {
+        async fn lock(&self) -> Result<CredentialLock, CredentialError> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn load(&self) -> Result<Option<ConnectorCredential>, CredentialError> {
+            self.inner.load().await
+        }
+        async fn save(&self, credential: &ConnectorCredential) -> Result<(), CredentialError> {
+            self.inner.save(credential).await
+        }
+    }
+    let server = McpService::start().await;
+    let credentials = Arc::new(StalledCredentials::default());
+    credentials.inner.replace(Some(ConnectorCredential {
+        server_url:server.url(), registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()}, resource:None,
+        token:Some(serde_json::from_value(json!({"access_token":"expired-access","refresh_token":"expired-refresh","token_type":"Bearer","issuer":server.url(),"expires_at":0,"client_id":"client","token_endpoint":server.url()})).unwrap()),
+    }));
+    let configs = vec![McpServerConfig {
+        name: "remote".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: Default::default(),
+        },
+        timeout_ms: 1000,
+        oauth: Default::default(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials.clone() as Arc<dyn ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), credentials.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    connections.reconcile(configs).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    assert_eq!(server.request_count(), 0);
+    connections.shutdown().await;
+}

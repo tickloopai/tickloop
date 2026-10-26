@@ -184,3 +184,108 @@ fn authorization_headers_do_not_start_oauth() {
     assert!(server.requests().is_empty());
     assert!(!fixture.root.join("config/credentials").exists());
 }
+
+#[test]
+fn terminal_callback_input_supports_the_external_editor() {
+    let fixture = Fixture::new();
+    let server = AuthorizationServer::start();
+    fs::create_dir_all(fixture.root.join("config")).unwrap();
+    fs::write(
+        fixture.root.join("config/settings.json"),
+        json!({"mcpServers":{"remote":{"url":server.resource()}}}).to_string(),
+    )
+    .unwrap();
+    let editor = fixture.root.join("editor.sh");
+    fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\ncat '{}' > \"$1\"\n",
+            fixture.root.join("callback.txt").display()
+        ),
+    )
+    .unwrap();
+    let visual = format!("/bin/sh {}", editor.display());
+    let mut terminal =
+        fixture.tickloop_on_terminal_with_env(&["mcp", "login", "remote"], &[("VISUAL", &visual)]);
+    let output = terminal.wait_for("Callback input ready");
+    let url = output
+        .lines()
+        .find(|line| line.starts_with("http"))
+        .unwrap();
+    fs::write(fixture.root.join("callback.txt"), server.approve(url)).unwrap();
+    terminal.type_text("\x07");
+    terminal.wait_for("Callback updated; press Enter to submit");
+    terminal.type_text("\r");
+    terminal.wait_for("Logged in to MCP remote");
+    let (code, _) = terminal.finish();
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_browser_callback_closes_the_editor_owned_by_the_login() {
+    use std::{io::Read, net::TcpStream, time::Instant};
+    let fixture = Fixture::new();
+    let server = AuthorizationServer::start();
+    fs::create_dir_all(fixture.root.join("config")).unwrap();
+    fs::write(
+        fixture.root.join("config/settings.json"),
+        json!({"mcpServers":{"remote":{"url":server.resource()}}}).to_string(),
+    )
+    .unwrap();
+    let editor = fixture.root.join("editor.sh");
+    let pid_path = fixture.root.join("editor.pid");
+    fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let visual = format!("/bin/sh {}", editor.display());
+    let mut terminal =
+        fixture.tickloop_on_terminal_with_env(&["mcp", "login", "remote"], &[("VISUAL", &visual)]);
+    let output = terminal.wait_for("Callback input ready");
+    let url = output
+        .lines()
+        .find(|line| line.starts_with("http"))
+        .unwrap();
+    let callback = server.approve(url);
+    terminal.type_text("\x07");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(text) = fs::read_to_string(&pid_path)
+            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "editor did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (host, path) = callback
+        .strip_prefix("http://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let mut browser = TcpStream::connect(host).unwrap();
+    write!(
+        browser,
+        "GET /{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    browser.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    terminal.wait_for("Logged in to MCP remote");
+    assert_eq!(terminal.finish().0, 0);
+    // SAFETY: Signal zero observes the specific editor PID recorded by this test.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "the login left its editor running"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}

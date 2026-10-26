@@ -134,6 +134,8 @@ fn is_invisible_format(character: char) -> bool {
     )
 }
 
+type ResponseRedactor = Arc<dyn Fn(String) -> String + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
     client: Client,
@@ -142,6 +144,7 @@ pub(crate) struct McpHttpClient {
     unauthorized: Arc<AtomicBool>,
     insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
+    redactor: Option<ResponseRedactor>,
     headers: HashMap<HeaderName, HeaderValue>,
 }
 
@@ -159,6 +162,7 @@ impl McpHttpClient {
             unauthorized: Arc::new(AtomicBool::new(false)),
             insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
+            redactor: None,
             headers: HashMap::new(),
         })
     }
@@ -208,6 +212,11 @@ impl McpHttpClient {
             http.headers.insert(name, value);
         }
         Ok(http)
+    }
+
+    pub(crate) fn with_redactor(mut self, redactor: ResponseRedactor) -> Self {
+        self.redactor = Some(redactor);
+        self
     }
 
     pub(crate) fn with_artifact_credentials(
@@ -349,6 +358,7 @@ async fn json_bytes(
 fn sse_stream(
     response: reqwest::Response,
     max_event_bytes: usize,
+    redactor: Option<ResponseRedactor>,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let mut event_bytes = 0_usize;
     let mut line_bytes = 0_usize;
@@ -370,7 +380,17 @@ fn sse_stream(
         }
         Ok(chunk)
     });
-    SseStream::from_bytes_stream(stream).boxed()
+    SseStream::from_bytes_stream(stream)
+        .map(move |event| {
+            event.map(|mut event| {
+                if let Some(redact) = &redactor {
+                    event.data = event.data.map(|data| redact(data));
+                    event.id = event.id.map(|id| redact(id));
+                }
+                event
+            })
+        })
+        .boxed()
 }
 
 impl StreamableHttpClient for McpHttpClient {
@@ -426,6 +446,11 @@ impl StreamableHttpClient for McpHttpClient {
             .get("Mcp-Session-Id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        if let (Some(id), Some(redact)) = (&session_id, &self.redactor)
+            && redact(id.clone()) != *id
+        {
+            return Err(unexpected("MCP session identifier contains a credential"));
+        }
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -433,14 +458,19 @@ impl StreamableHttpClient for McpHttpClient {
             .unwrap_or("");
         if content_type.starts_with("text/event-stream") {
             return Ok(StreamableHttpPostResponse::Sse(
-                sse_stream(response, max_sse_event_size),
+                sse_stream(response, max_sse_event_size, self.redactor.clone()),
                 session_id,
             ));
         }
         if !content_type.starts_with("application/json") {
             return Err(unexpected("invalid MCP content type"));
         }
-        let body = json_bytes(response).await?;
+        let mut body = json_bytes(response).await?;
+        if let Some(redact) = &self.redactor {
+            let text =
+                String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
+            body = redact(text).into_bytes();
+        }
         // The SDK's untagged result decoder mistakes extension metadata for a tool result.
         let decoded = if preserve_custom_result {
             serde_json::from_slice::<JsonRpcResponse<serde_json::Value>>(&body)
@@ -509,7 +539,11 @@ impl StreamableHttpClient for McpHttpClient {
         {
             return Err(unexpected("invalid MCP event stream content type"));
         }
-        Ok(sse_stream(response, max_sse_event_size))
+        Ok(sse_stream(
+            response,
+            max_sse_event_size,
+            self.redactor.clone(),
+        ))
     }
 
     async fn delete_session(

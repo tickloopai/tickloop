@@ -160,3 +160,33 @@ async fn the_credential_lock_excludes_another_process() {
             .unwrap(),
     );
 }
+
+#[tokio::test]
+async fn plugin_service_names_are_encoded_without_collisions_or_path_escape() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["team/remote", "team%2Fremote", "team\\remote"] {
+        let adapter =
+            FileCredentials::new(root.path(), "plugin:notes", &format!("plugin_notes_{name}"))
+                .unwrap();
+        let mut saved = credential();
+        saved.registration.client_id = name.into();
+        let _lock = adapter.lock().await.unwrap();
+        adapter.save(&saved).await.unwrap();
+    }
+    for name in ["team/remote", "team%2Fremote", "team\\remote"] {
+        let adapter =
+            FileCredentials::new(root.path(), "plugin:notes", &format!("plugin_notes_{name}"))
+                .unwrap();
+        assert_eq!(
+            adapter
+                .load()
+                .await
+                .unwrap()
+                .unwrap()
+                .registration
+                .client_id,
+            name
+        );
+    }
+    assert!(!root.path().join("credentials/notes/mcp/team").exists());
+}

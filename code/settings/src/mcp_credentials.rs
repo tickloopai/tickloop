@@ -32,12 +32,26 @@ impl FileCredentials {
         } else {
             (PathBuf::from("credentials/_mcp"), name)
         };
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        if name.is_empty()
+            || (!source.starts_with("plugin:")
+                && !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
             return Err(CredentialError("located"));
         }
         Ok(Self {
             directory: PrivateDirectory::anchored(root.to_owned(), relative),
-            name: name.into(),
+            name: name
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                        char::from(byte).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect(),
         })
     }
 
