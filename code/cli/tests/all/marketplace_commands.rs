@@ -112,14 +112,23 @@ pub(crate) fn file_url(path: &Path) -> String {
 
 /// Runs `tickloop plugin …` with the Tick marketplace read from an empty local file.
 fn plugin(fixture: &Fixture, arguments: &[&str]) -> Output {
+    with_local_tick_marketplace(fixture, &[&["plugin"][..], arguments].concat())
+}
+
+fn tick(fixture: &Fixture, arguments: &[&str]) -> Output {
+    with_local_tick_marketplace(fixture, &[&["tick"][..], arguments].concat())
+}
+
+/// Runs tickloop with `arguments` against the fixture's Tick marketplace file, an empty one unless
+/// the test wrote it.
+fn with_local_tick_marketplace(fixture: &Fixture, arguments: &[&str]) -> Output {
     let tick_marketplace = fixture
         .root
         .join(format!("{DEFAULT_TICK_MARKETPLACE}.json"));
     if !tick_marketplace.exists() {
         fixture.marketplace_file(DEFAULT_TICK_MARKETPLACE, &marketplace_json(json!([])));
     }
-    let arguments = [&["plugin"][..], arguments].concat();
-    fixture.tickloop_from(&path_text(&tick_marketplace), &arguments)
+    fixture.tickloop_from(&path_text(&tick_marketplace), arguments)
 }
 
 /// The cells of each line of a table, which separates them by at least two spaces.
@@ -556,6 +565,19 @@ fn the_available_plugins_merge_every_marketplace_and_one_that_cannot_be_read_sto
     succeeded(&plugin(&fixture, &["marketplace", "add", &path_text(&lab)]));
     succeeded(&plugin(&fixture, &["install", "review@team-tools"]));
     succeeded(&plugin(&fixture, &["install", "lint@lab"]));
+    for (arguments, error) in [
+        (
+            &["install", "lint@lab"][..],
+            "Error: lint is not offered as a Tick; use tickloop plugin install lint@lab\n",
+        ),
+        (
+            &["install", "lint"],
+            "Error: lint is not offered as a Tick; use tickloop plugin install lint\n",
+        ),
+    ] {
+        let refused = failed(&tick(&fixture, arguments));
+        assert!(refused.ends_with(error), "{arguments:?}: {refused}");
+    }
 
     let available = plugin(&fixture, &["list", "--available"]);
     assert!(available.status.success(), "{}", stderr(&available));
@@ -563,12 +585,6 @@ fn the_available_plugins_merge_every_marketplace_and_one_that_cannot_be_read_sto
     assert_eq!(
         rows(&stdout(&available)),
         [
-            vec![
-                "elsewhere@tickloop".to_owned(),
-                "0.1.0".to_owned(),
-                format!("not installed; no prebuilt program for {CURRENT_TARGET}"),
-                "The elsewhere package".to_owned(),
-            ],
             vec![
                 "lint@lab".to_owned(),
                 "-".to_owned(),
@@ -590,6 +606,18 @@ fn the_available_plugins_merge_every_marketplace_and_one_that_cannot_be_read_sto
                 "-".to_owned(),
                 format!("installed {short}"),
                 "Reviews code".to_owned(),
+            ],
+        ]
+    );
+    let ticks = tick(&fixture, &["list", "--available"]);
+    assert_eq!(
+        rows(&stdout(&ticks)),
+        [
+            vec![
+                "elsewhere@tickloop".to_owned(),
+                "0.1.0".to_owned(),
+                format!("not installed; no prebuilt program for {CURRENT_TARGET}"),
+                "The elsewhere package".to_owned(),
             ],
             vec![
                 "sample@tickloop".to_owned(),
@@ -805,23 +833,31 @@ fn a_tick_package_installs_and_updates_by_name_from_the_tickloop_marketplace() {
     };
     offer("1.0.0");
     assert_eq!(
-        succeeded(&plugin(&fixture, &["install", "sample"])),
+        failed(&plugin(&fixture, &["install", "sample"])),
+        "Error: sample carries a Tick program; use tickloop tick install sample\n"
+    );
+    assert_eq!(
+        succeeded(&tick(&fixture, &["install", "sample"])),
         format!(
-            "Installed plugin sample@tickloop 1.0.0 in {}.\n\
-             When opened, this plugin's program runs as your user. Installing runs nothing.\n",
+            "Installed Tick sample@tickloop 1.0.0 in {}.\n\
+             When opened, its Tick program runs as your user. Installing runs nothing.\n",
             cached_root(&fixture, "tickloop", "sample", "1.0.0")
         )
     );
     assert_eq!(
-        succeeded(&plugin(&fixture, &["update", "sample"])),
-        "Plugin sample@tickloop 1.0.0 is up to date.\n"
+        succeeded(&tick(&fixture, &["update", "sample"])),
+        "Tick sample@tickloop 1.0.0 is up to date.\n"
     );
     offer("2.0.0");
     assert_eq!(
         succeeded(&plugin(&fixture, &["update"])),
+        "No plugins are installed.\n"
+    );
+    assert_eq!(
+        succeeded(&tick(&fixture, &["update"])),
         format!(
-            "Updated plugin sample@tickloop from 1.0.0 to 2.0.0 in {}.\n\
-             When opened, this plugin's program runs as your user. Installing runs nothing.\n",
+            "Updated Tick sample@tickloop from 1.0.0 to 2.0.0 in {}.\n\
+             When opened, its Tick program runs as your user. Installing runs nothing.\n",
             cached_root(&fixture, "tickloop", "sample", "2.0.0")
         )
     );

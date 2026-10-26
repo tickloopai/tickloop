@@ -1,5 +1,7 @@
-//! `tickloop plugin`: installs plugins from local directories or archives under the Tickloop config
-//! root, enables, disables, lists and removes them, and checks a plugin directory.
+//! `tickloop tick` and `tickloop plugin`: each installs the plugins of its [`PluginKind`] by name
+//! or from local directories or archives under the Tickloop config root, enables, disables, lists
+//! and removes them. Only `tick` logs in, and only `plugin` manages marketplaces and checks a
+//! plugin directory.
 
 use std::{ffi::OsString, path::Path};
 
@@ -9,33 +11,49 @@ use tick_plugins::{
     PluginManifest, PluginStore,
 };
 use tickloop_code_console::terminal::safe_line;
-use tickloop_tick_installer::login_label;
+use tickloop_tick_installer::{PluginKind, login_label};
 
+const TICK_USAGE: &str = "Usage: tickloop tick install TICK[@MARKETPLACE]
+       tickloop tick install --path PATH
+       tickloop tick update [TICK]
+       tickloop tick uninstall TICK [--keep-data]
+       tickloop tick enable TICK
+       tickloop tick disable TICK
+       tickloop tick login TICK [--issuer LABEL]
+       tickloop tick logout TICK
+       tickloop tick list [--available]";
+const TICK_GUIDE: &str = "Manage Ticks: the plugins that carry a Tick program, which the Agent opens as a Tick. They are kept with the other plugins in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set; tickloop plugin manages the plugins without a Tick program.
+install TICK installs the Tick of that name from the one marketplace that offers it, or from the one it is installed from; when several offer it, it lists them, and TICK@MARKETPLACE chooses. A Tick cannot take the name of an installed plugin from another marketplace.
+install --path installs a Tick directory or its .tar.gz archive from the local marketplace, replacing the installed Tick of that name even at the same version.
+update reads the Tick's marketplace again and installs what it offers now, unless that version is installed already. Without TICK it updates every Tick except those installed with --path.
+uninstall removes a Tick and its data directory; --keep-data keeps the data. Its saved login stays, and its running Ticks keep running until closed.
+enable and disable turn a Tick on and off without uninstalling it; a disabled Tick cannot be opened by name, stays disabled when it is installed again, and its Skills, named TICK:SKILL, stop loading from the Agent's next request.
+list shows the installed Ticks: their marketplace, version, whether they are enabled and their login state. list --available shows the Ticks every marketplace offers, with what is installed and why one cannot be installed; the built-in tickloop marketplace, read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file), lists them.
+login and logout manage the Tick's data source credentials: an OAuth login shows a link and code to approve in a browser on any device, and a key is read without showing it.
+tickloop plugin marketplace adds, lists, updates and removes the marketplaces both commands read.
+Installing runs nothing in the Tick; its program runs as your user when opened. Its Skills grant no tools; tools still ask as usual.
+  -h, --help  Show this help.";
 const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]
        tickloop plugin install --path PATH
        tickloop plugin update [PLUGIN]
        tickloop plugin uninstall PLUGIN [--keep-data]
        tickloop plugin enable PLUGIN
        tickloop plugin disable PLUGIN
-       tickloop plugin login PLUGIN [--issuer LABEL]
-       tickloop plugin logout PLUGIN
        tickloop plugin list [--available]
        tickloop plugin validate DIRECTORY [--name NAME]
        tickloop plugin marketplace add SOURCE
        tickloop plugin marketplace list
        tickloop plugin marketplace update [MARKETPLACE]
        tickloop plugin marketplace remove MARKETPLACE";
-const PLUGIN_GUIDE: &str = "Manage the plugins in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set. A plugin is a directory with a .tickloop-plugin/plugin.json, a .claude-plugin/plugin.json or a tick-package.json manifest, or none, when it is named after its directory.
+const PLUGIN_GUIDE: &str = "Manage the plugins without a Tick program in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set; tickloop tick manages Ticks, the plugins that carry one. A plugin is a directory with a .tickloop-plugin/plugin.json, a .claude-plugin/plugin.json or a tick-package.json manifest, or none, when it is named after its directory.
 install PLUGIN installs the plugin of that name from the one marketplace that offers it, or from the one it is installed from; when several offer it, it lists them, and PLUGIN@MARKETPLACE chooses. A marketplace is read as last fetched; marketplace update reads it again. A plugin cannot take the name of an installed plugin from another marketplace.
 install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet.
 update reads the plugin's marketplace again and installs what it offers now, unless that is installed already: the same version, or for Git sources the same commit. Without PLUGIN it updates every plugin except those installed with --path.
-uninstall removes a plugin and its data directory; --keep-data keeps the data. Its saved login stays.
+uninstall removes a plugin and its data directory; --keep-data keeps the data.
 enable and disable turn a plugin on and off without uninstalling it; a disabled plugin stays disabled when it is installed again. Its Skills, named PLUGIN:SKILL, load or stop loading from the Agent's next request.
 list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet. list --available shows what every marketplace offers: its latest version, what is installed and why a plugin cannot be installed. A marketplace that cannot be read is reported and the others are shown.
 validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores. --name uses a marketplace entry name as the installation identity and keeps the declared name for display.
-login and logout manage the plugin's data source credentials.
 marketplace add registers a marketplace from a GitHub OWNER/REPO[#REF], a Git URL (https, ssh or file), a local directory, or an https URL of a marketplace.json; it takes the name its marketplace file gives. marketplace list shows them, marketplace update reads one or every one again, and marketplace remove unregisters one and keeps the plugins installed from it. The built-in marketplaces cannot be removed: tickloop, read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file), and claude-plugins-official, fetched with git the first time it is used.
-tickloop tick is a deprecated alias for tickloop plugin.
 Installing runs nothing in the plugin, and a plugin's Skills grant no tools; tools still ask as usual.
   -h, --help  Show this help.";
 const SUBCOMMANDS: [&str; 10] = [
@@ -82,49 +100,139 @@ enum PluginCommand<'a> {
     MarketplaceRemove(String),
 }
 
-pub async fn run(arguments: &[OsString]) -> Result<(), String> {
-    match parse(arguments)? {
-        PluginCommand::Help => println!("{PLUGIN_USAGE}\n\n{PLUGIN_GUIDE}"),
-        PluginCommand::Install(name) => {
-            super::plugin_marketplace::install(&store()?, &name).await?
+impl PluginCommand<'_> {
+    /// Whether `tickloop tick` or `tickloop plugin`, as `kind` names it, takes this command.
+    fn is_offered_to(&self, kind: PluginKind) -> bool {
+        match self {
+            Self::Login { .. } | Self::Logout(_) => kind == PluginKind::Tick,
+            Self::Validate { .. }
+            | Self::MarketplaceAdd(_)
+            | Self::MarketplaceList
+            | Self::MarketplaceUpdate(_)
+            | Self::MarketplaceRemove(_) => kind == PluginKind::Plugin,
+            _ => true,
         }
-        PluginCommand::Update(name) => {
-            super::plugin_marketplace::update(&store()?, name.as_deref()).await?
+    }
+
+    /// The installed plugin the command acts on by name.
+    fn installed_name(&self) -> Option<&str> {
+        match self {
+            Self::Login { name, .. }
+            | Self::Logout(name)
+            | Self::Uninstall { name, .. }
+            | Self::SetEnabled { name, .. }
+            | Self::Update(Some(name)) => Some(name),
+            _ => None,
         }
-        PluginCommand::Login { name, issuer } => {
-            super::plugin_tick::login(&store()?, &name, issuer.as_deref()).await?
+    }
+}
+
+fn usage(kind: PluginKind) -> &'static str {
+    match kind {
+        PluginKind::Plugin => PLUGIN_USAGE,
+        PluginKind::Tick => TICK_USAGE,
+    }
+}
+
+/// Runs `tickloop tick` or `tickloop plugin`, as `kind` names it, with `arguments`.
+pub async fn run(kind: PluginKind, arguments: &[OsString]) -> Result<(), String> {
+    let command = parse(arguments)
+        .filter(|command| command.is_offered_to(kind))
+        .ok_or_else(|| {
+            format!(
+                "Unknown {} command. {}",
+                kind.noun().to_lowercase(),
+                usage(kind)
+            )
+        })?;
+    match command {
+        PluginCommand::Help => {
+            let guide = match kind {
+                PluginKind::Plugin => PLUGIN_GUIDE,
+                PluginKind::Tick => TICK_GUIDE,
+            };
+            println!("{}\n\n{guide}", usage(kind));
+            return Ok(());
         }
-        PluginCommand::Logout(name) => super::plugin_tick::logout(&store()?, &name).await?,
-        PluginCommand::ListAvailable => {
-            super::plugin_marketplace::list_available(&store()?).await?
-        }
-        PluginCommand::InstallPath(path) => install_path(&store()?, path)?,
-        PluginCommand::Uninstall { name, keep_data } => uninstall(&store()?, &name, keep_data)?,
-        PluginCommand::SetEnabled { name, enabled } => set_enabled(&store()?, &name, enabled)?,
-        PluginCommand::List => list(&store()?)?,
         PluginCommand::Validate {
             path,
             marketplace_name,
-        } => validate(path, marketplace_name.as_deref())?,
+        } => return validate(path, marketplace_name.as_deref()),
+        _ => {}
+    }
+    let typed = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let store = store()?;
+    if let Some(name) = command.installed_name() {
+        ensure_installed_kind(&store, kind, name, &typed)?;
+    }
+    match command {
+        PluginCommand::Help | PluginCommand::Validate { .. } => {}
+        PluginCommand::Install(name) => {
+            super::plugin_marketplace::install(&store, kind, &name, &typed).await?
+        }
+        PluginCommand::Update(name) => {
+            super::plugin_marketplace::update(&store, kind, name.as_deref()).await?
+        }
+        PluginCommand::Login { name, issuer } => {
+            super::plugin_tick::login(&store, &name, issuer.as_deref()).await?
+        }
+        PluginCommand::Logout(name) => super::plugin_tick::logout(&store, &name).await?,
+        PluginCommand::ListAvailable => {
+            super::plugin_marketplace::list_available(&store, kind).await?
+        }
+        PluginCommand::InstallPath(path) => install_path(&store, kind, path, &typed)?,
+        PluginCommand::Uninstall { name, keep_data } => uninstall(&store, kind, &name, keep_data)?,
+        PluginCommand::SetEnabled { name, enabled } => set_enabled(&store, &name, enabled)?,
+        PluginCommand::List => list(&store, kind)?,
         PluginCommand::MarketplaceAdd(source) => {
-            super::plugin_marketplace::add_marketplace(&store()?, &source).await?
+            super::plugin_marketplace::add_marketplace(&store, &source).await?
         }
         PluginCommand::MarketplaceUpdate(name) => {
-            super::plugin_marketplace::update_marketplaces(&store()?, name.as_deref()).await?
+            super::plugin_marketplace::update_marketplaces(&store, name.as_deref()).await?
         }
-        PluginCommand::MarketplaceList => super::plugin_marketplace::list_marketplaces(&store()?)?,
+        PluginCommand::MarketplaceList => super::plugin_marketplace::list_marketplaces(&store)?,
         PluginCommand::MarketplaceRemove(name) => {
-            super::plugin_marketplace::remove_marketplace(&store()?, &name)?
+            super::plugin_marketplace::remove_marketplace(&store, &name)?
         }
     }
     Ok(())
 }
 
-fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
+/// Refuses `typed` on an installed plugin of the other kind; an unusable plugin's kind cannot be
+/// read, so either command takes it.
+fn ensure_installed_kind(
+    store: &PluginStore,
+    kind: PluginKind,
+    name: &str,
+    typed: &str,
+) -> Result<(), String> {
+    match store.get(name) {
+        Ok(plugin) if PluginKind::of_installed(&plugin) != kind => {
+            Err(other_kind(name, PluginKind::of_installed(&plugin), typed))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Why the command for one kind does not take `name`, which is of `actual` kind, and the command
+/// that runs `typed` for it.
+pub(super) fn other_kind(name: &str, actual: PluginKind, typed: &str) -> String {
+    let what = match actual {
+        PluginKind::Tick => "carries a Tick program",
+        PluginKind::Plugin => "has no Tick program",
+    };
+    format!("{name} {what}; use {} {typed}", actual.command())
+}
+
+fn parse(arguments: &[OsString]) -> Option<PluginCommand<'_>> {
     let is_help = |argument: &OsString| argument == "--help" || argument == "-h";
     let is_option = |argument: &OsString| argument.to_string_lossy().starts_with('-');
     let name = |argument: &OsString| argument.to_string_lossy().into_owned();
-    Ok(match arguments {
+    Some(match arguments {
         [help] if is_help(help) => PluginCommand::Help,
         [command, help] if is_help(help) && SUBCOMMANDS.iter().any(|name| command == name) => {
             PluginCommand::Help
@@ -218,7 +326,7 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
                 marketplace_name: Some(name(identity)),
             }
         }
-        _ => return Err(format!("Unknown plugin command. {PLUGIN_USAGE}")),
+        _ => return None,
     })
 }
 
@@ -237,30 +345,70 @@ fn store() -> Result<PluginStore, String> {
     Ok(store)
 }
 
-fn install_path(store: &PluginStore, path: &Path) -> Result<(), String> {
+/// Installs the directory or archive at `path`; a directory whose manifest shows the other kind is
+/// refused before anything is copied, while an archive's kind shows only once it is installed.
+fn install_path(
+    store: &PluginStore,
+    kind: PluginKind,
+    path: &Path,
+    typed: &str,
+) -> Result<(), String> {
+    if path.is_dir() {
+        let directory_name = path
+            .canonicalize()
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        if let Ok(manifest) = PluginManifest::load(path, &directory_name, None)
+            && PluginKind::of_manifest(&manifest) != kind
+        {
+            return Err(other_kind(
+                &manifest.name,
+                PluginKind::of_manifest(&manifest),
+                typed,
+            ));
+        }
+    }
     let installation = store
         .install_path(path)
         .map_err(|error| format!("cannot install {}: {error}", path.display()))?;
-    report(&installation);
+    report(&installation, kind);
     Ok(())
 }
 
-pub(super) fn report(installation: &Installation) {
+/// Reports what installing did; `kind` is the command that installed it, so a plugin that turns
+/// out to be of the other kind says which command manages it.
+pub(super) fn report(installation: &Installation, kind: PluginKind) {
     let plugin = &installation.plugin;
     let id = plugin.id();
     let version = &plugin.version;
     let root = safe_line(&plugin.root.display().to_string());
+    let actual = PluginKind::of_installed(plugin);
+    let noun = actual.noun();
     match &installation.outcome {
-        InstallOutcome::Installed => println!("Installed plugin {id} {version} in {root}."),
+        InstallOutcome::Installed => println!("Installed {noun} {id} {version} in {root}."),
         InstallOutcome::Replaced { previous_version } => {
-            println!("Replaced plugin {id} {previous_version} with {version} in {root}.")
+            println!("Replaced {noun} {id} {previous_version} with {version} in {root}.")
         }
-        InstallOutcome::Reinstalled => println!("Reinstalled plugin {id} {version} in {root}."),
-        InstallOutcome::AlreadyInstalled => {
-            println!("Plugin {id} {version} is already installed in {root}; nothing changed.")
-        }
+        InstallOutcome::Reinstalled => println!("Reinstalled {noun} {id} {version} in {root}."),
+        InstallOutcome::AlreadyInstalled => println!(
+            "{} {id} {version} is already installed in {root}; nothing changed.",
+            actual.label()
+        ),
     }
     report_notes(plugin);
+    if actual != kind {
+        let what = match actual {
+            PluginKind::Tick => "It carries a Tick program, so tickloop tick and /ticks manage it.",
+            PluginKind::Plugin => {
+                "It has no Tick program, so tickloop plugin and /plugins manage it."
+            }
+        };
+        println!("{what}");
+    }
 }
 
 /// The name its manifest gives `plugin`, whether it stays disabled, that its program runs as the user, and what its manifest
@@ -271,12 +419,13 @@ pub(super) fn report_notes(plugin: &InstalledPlugin) {
     }
     if !plugin.enabled {
         println!(
-            "It stays disabled; tickloop plugin enable {} turns it on.",
+            "It stays disabled; {} enable {} turns it on.",
+            PluginKind::of_installed(plugin).command(),
             plugin.name()
         );
     }
     if plugin.manifest.tick.is_some() {
-        println!("When opened, this plugin's program runs as your user. Installing runs nothing.");
+        println!("When opened, its Tick program runs as your user. Installing runs nothing.");
     }
     report_manifest_notes(&plugin.manifest);
 }
@@ -303,13 +452,21 @@ fn component_labels(components: &[Component]) -> String {
         .join(", ")
 }
 
-fn uninstall(store: &PluginStore, name: &str, keep_data: bool) -> Result<(), String> {
+fn uninstall(
+    store: &PluginStore,
+    kind: PluginKind,
+    name: &str,
+    keep_data: bool,
+) -> Result<(), String> {
     let uninstalled = store
         .uninstall(name, keep_data)
         .map_err(|error| failure(name, "uninstall", error))?;
     println!(
-        "Uninstalled plugin {}@{} {}.",
-        uninstalled.name, uninstalled.marketplace, uninstalled.version
+        "Uninstalled {} {}@{} {}.",
+        kind.noun(),
+        uninstalled.name,
+        uninstalled.marketplace,
+        uninstalled.version
     );
     if let Some(data) = uninstalled.data {
         println!(
@@ -336,12 +493,14 @@ fn set_enabled(store: &PluginStore, name: &str, enabled: bool) -> Result<(), Str
         .set_enabled(name, enabled)
         .map_err(|error| failure(name, action, error))?;
     let id = plugin.id();
+    let kind = PluginKind::of_installed(&plugin);
+    let (label, noun) = (kind.label(), kind.noun());
     match (was_enabled == enabled, enabled) {
-        (true, true) => println!("Plugin {id} is already enabled."),
-        (true, false) => println!("Plugin {id} is already disabled."),
-        (false, true) => println!("Enabled plugin {id}; its Skills load from the next request."),
+        (true, true) => println!("{label} {id} is already enabled."),
+        (true, false) => println!("{label} {id} is already disabled."),
+        (false, true) => println!("Enabled {noun} {id}; its Skills load from the next request."),
         (false, false) => {
-            println!("Disabled plugin {id}; its Skills stop loading from the next request.")
+            println!("Disabled {noun} {id}; its Skills stop loading from the next request.")
         }
     }
     Ok(())
@@ -355,12 +514,13 @@ fn failure(name: &str, action: &str, error: PluginError) -> String {
     }
 }
 
-fn list(store: &PluginStore) -> Result<(), String> {
+fn list(store: &PluginStore, kind: PluginKind) -> Result<(), String> {
     let InstalledPlugins { plugins, broken } =
         store.installed().map_err(|error| error.to_string())?;
     let enabled_label = |enabled: bool| if enabled { "enabled" } else { "disabled" };
     let mut rows = plugins
         .iter()
+        .filter(|plugin| PluginKind::of_installed(plugin) == kind)
         .map(|plugin| {
             let unsupported = plugin.manifest.unsupported();
             let notes = plugin
@@ -381,18 +541,23 @@ fn list(store: &PluginStore) -> Result<(), String> {
                 notes.join("; "),
             ]
         })
-        .chain(broken.iter().map(|plugin| {
-            [
-                format!("{}@{}", plugin.name, plugin.marketplace),
-                plugin.version.clone(),
-                enabled_label(plugin.enabled).to_owned(),
-                login_label(LoginState::Unknown).to_owned(),
-                format!("unusable: {}; install it again", safe_line(&plugin.reason)),
-            ]
-        }))
+        .chain(
+            broken
+                .iter()
+                .filter(|plugin| kind.lists_broken(plugin))
+                .map(|plugin| {
+                    [
+                        format!("{}@{}", plugin.name, plugin.marketplace),
+                        plugin.version.clone(),
+                        enabled_label(plugin.enabled).to_owned(),
+                        login_label(LoginState::Unknown).to_owned(),
+                        format!("unusable: {}; install it again", safe_line(&plugin.reason)),
+                    ]
+                }),
+        )
         .collect::<Vec<_>>();
     if rows.is_empty() {
-        println!("No plugins are installed.");
+        println!("No {} are installed.", kind.plural());
         return Ok(());
     }
     rows.sort();

@@ -3,6 +3,7 @@
 //! `tickloop tick` both go through it, so they check and fail alike: a failed install leaves no
 //! temporary file and the installed package as it was.
 
+mod kind;
 mod login;
 mod marketplace;
 mod marketplaces;
@@ -15,6 +16,7 @@ use tick_plugins::{
     TICKLOOP_MARKETPLACE, Uninstalled,
 };
 
+pub use kind::PluginKind;
 pub use login::{LoggedOut, log_out, start_login};
 pub use marketplace::MarketplaceSource;
 pub use marketplaces::{

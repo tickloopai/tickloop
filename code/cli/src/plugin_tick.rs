@@ -1,4 +1,4 @@
-//! Official Tick marketplace installation and plugin login for `tickloop plugin`.
+//! Official Tick marketplace installation and Tick login for `tickloop tick`.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
@@ -10,7 +10,9 @@ use crossterm::{
 use tick_packages::{ApiKey, OAuthIssuer, PackageAuth, PackageCredentials, validate_package_name};
 use tick_plugins::{InstalledPlugin, PluginError, PluginStore};
 use tickloop_code_console::terminal::safe_line;
-use tickloop_tick_installer::{MarketplaceSource, log_out, needs_no_login, start_login};
+use tickloop_tick_installer::{
+    MarketplaceSource, PluginKind, log_out, needs_no_login, start_login,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Installs the version of `name` the marketplace offers, unless it is installed already.
@@ -34,6 +36,7 @@ pub(super) async fn install(store: &PluginStore, name: &str) -> Result<(), Strin
             package,
         )
         .await?,
+        PluginKind::Tick,
     );
     Ok(())
 }
@@ -86,7 +89,7 @@ fn choose_issuer<'a>(
         (None, [only]) => Ok(only),
         (None, _) if !io::stdin().is_terminal() => Err(format!(
             "Tick package {name} logs in with one of: {labels}; choose one with \
-             tickloop plugin login {name} --issuer LABEL"
+             tickloop tick login {name} --issuer LABEL"
         )),
         (None, _) => {
             println!("Tick package {name} logs in with one of: {labels}.");
@@ -247,7 +250,7 @@ pub(super) async fn logout(store: &PluginStore, name: &str) -> Result<(), String
 fn installed_package(store: &PluginStore, name: &str) -> Result<InstalledPlugin, String> {
     store.get(name).map_err(|error| match error {
         PluginError::NotInstalled(_) => {
-            format!("{error}; install it with tickloop plugin install {name}")
+            format!("{error}; install it with tickloop tick install {name}")
         }
         _ => error.to_string(),
     })

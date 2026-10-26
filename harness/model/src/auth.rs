@@ -13,22 +13,20 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tickloop_harness_base::network::{
     HttpPolicy, NetworkDiagnostic, NetworkRoute, build_http_client,
+};
+use tickloop_harness_base::oauth_callback::{
+    CallbackError, CallbackListener, CallbackPages, CallbackPaste, PendingCallback,
 };
 use tickloop_harness_base::private_fs::{
     OpenTarget, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, current_uid,
@@ -53,13 +51,16 @@ const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_FILE_BYTES: usize = 1024 * 1024;
 const BROWSER_CALLBACK_PORT: u16 = 1455;
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
 const CALLBACK_PATH: &str = "/auth/callback";
 const BROWSER_SCOPE: &str = "openid profile email offline_access";
-const INVALID_CALLBACK_REQUEST: &str = "Could not read the browser callback. Return to the current sign-in flow or start again from /provider.";
-const INVALID_CALLBACK_URL: &str = "Callback URL is invalid or missing an authorization code. If this browser tab is old, start again from /provider.";
-const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign-in flow. Return to the current browser tab or start again from /provider.";
+const BROWSER_CALLBACK_PAGES: CallbackPages = CallbackPages {
+    received: "Authorization code received. Return to Tickloop to finish login; the terminal will confirm whether it succeeded.",
+    state_mismatch: "This callback belongs to a different sign-in flow. Return to the current browser tab or start again from /provider.",
+    invalid_url: "Callback URL is invalid or missing an authorization code. If this browser tab is old, start again from /provider.",
+    invalid_request: "Could not read the browser callback. Return to the current sign-in flow or start again from /provider.",
+    denied: "Authorization was denied.",
+    failed: "Authorization failed.",
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -161,27 +162,14 @@ pub struct BrowserLogin {
     generation: Uuid,
     pub authorization_url: String,
     pub callback_uri: String,
-    session: BrowserSession,
-}
-
-struct BrowserSession {
     verifier: String,
-    started_at: Instant,
-    callback_codes: mpsc::UnboundedReceiver<Result<String, AuthError>>,
-    callback_sender: mpsc::UnboundedSender<Result<String, AuthError>>,
-    callback_task: tokio::task::JoinHandle<()>,
-    stop: CancellationToken,
-    completed: Arc<AtomicBool>,
-    state: String,
+    callback: PendingCallback,
 }
 
 impl BrowserLogin {
     pub fn manual_callback(&self) -> BrowserCallback {
         BrowserCallback {
-            callback_uri: self.callback_uri.clone(),
-            state: self.session.state.clone(),
-            sender: self.session.callback_sender.clone(),
-            completed: self.session.completed.clone(),
+            paste: self.callback.paste(),
         }
     }
 }
@@ -194,48 +182,16 @@ impl fmt::Debug for BrowserLogin {
     }
 }
 
-impl Drop for BrowserLogin {
-    fn drop(&mut self) {
-        self.session.stop.cancel();
-        self.session.callback_task.abort();
-    }
-}
-
 #[derive(Clone)]
 pub struct BrowserCallback {
-    callback_uri: String,
-    state: String,
-    sender: mpsc::UnboundedSender<Result<String, AuthError>>,
-    completed: Arc<AtomicBool>,
+    paste: CallbackPaste,
 }
 
 impl BrowserCallback {
     pub fn submit(&self, pasted_redirect_url: &str) -> Result<(), AuthError> {
-        match parse_browser_callback(pasted_redirect_url, &self.callback_uri, &self.state) {
-            Ok(code) => {
-                if self.completed.swap(true, Ordering::AcqRel) {
-                    return Err(AuthError::BrowserLoginEnded);
-                }
-                self.sender
-                    .send(Ok(code))
-                    .map_err(|_| AuthError::BrowserLoginEnded)
-            }
-            Err(AuthError::AuthorizationDenied) => {
-                if self.completed.swap(true, Ordering::AcqRel) {
-                    return Err(AuthError::BrowserLoginEnded);
-                }
-                let _ = self.sender.send(Err(AuthError::AuthorizationDenied));
-                Err(AuthError::AuthorizationDenied)
-            }
-            Err(AuthError::BrowserAuthorizationFailed) => {
-                if self.completed.swap(true, Ordering::AcqRel) {
-                    return Err(AuthError::BrowserLoginEnded);
-                }
-                let _ = self.sender.send(Err(AuthError::BrowserAuthorizationFailed));
-                Err(AuthError::BrowserAuthorizationFailed)
-            }
-            Err(error) => Err(error),
-        }
+        self.paste
+            .submit(pasted_redirect_url)
+            .map_err(browser_callback_error)
     }
 }
 
@@ -391,17 +347,13 @@ impl CodexAuth {
             return Err(AuthError::Cancelled);
         }
         let generation = self.begin_login(cancellation).await?;
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.callback_port))
+        let listener = CallbackListener::bind(self.callback_port, CALLBACK_PATH)
             .await
-            .map_err(|_| AuthError::CallbackPortUnavailable)?;
+            .map_err(browser_callback_error)?;
         if cancellation.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
-        let port = listener
-            .local_addr()
-            .map_err(|_| AuthError::CallbackPortUnavailable)?
-            .port();
-        let callback_uri = format!("http://localhost:{port}{CALLBACK_PATH}");
+        let callback_uri = listener.redirect_uri().to_owned();
         let verifier = new_pkce_verifier();
         let challenge = encode_base64url(&Sha256::digest(verifier.as_bytes()));
         let state = tickloop_ids::random_token();
@@ -420,32 +372,12 @@ impl CodexAuth {
             .append_pair("id_token_add_organizations", "true")
             .append_pair("codex_cli_simplified_flow", "true")
             .append_pair("originator", "tickloop");
-
-        let (callback_sender, callback_codes) = mpsc::unbounded_channel();
-        let stop = CancellationToken::new();
-        let completed = Arc::new(AtomicBool::new(false));
-        let callback_task = tokio::spawn(serve_browser_callbacks(
-            listener,
-            callback_uri.clone(),
-            state.clone(),
-            callback_sender.clone(),
-            completed.clone(),
-            stop.clone(),
-        ));
         Ok(BrowserLogin {
             generation,
             authorization_url: authorize_url.into(),
             callback_uri,
-            session: BrowserSession {
-                verifier,
-                started_at: Instant::now(),
-                callback_codes,
-                callback_sender,
-                callback_task,
-                stop,
-                completed,
-                state,
-            },
+            verifier,
+            callback: listener.receive(state, BROWSER_CALLBACK_PAGES, BROWSER_TIMEOUT),
         })
     }
 
@@ -454,19 +386,15 @@ impl CodexAuth {
         mut login: BrowserLogin,
         cancellation: &CancellationToken,
     ) -> Result<Credentials, AuthError> {
-        let remaining = BROWSER_TIMEOUT.saturating_sub(login.session.started_at.elapsed());
-        if remaining.is_zero() {
-            return Err(AuthError::TimedOut);
-        }
-        let code = tokio::select! {
-            () = cancellation.cancelled() => return Err(AuthError::Cancelled),
-            () = tokio::time::sleep(remaining) => return Err(AuthError::TimedOut),
-            received = login.session.callback_codes.recv() => received.ok_or(AuthError::BrowserLoginEnded)??,
-        };
+        let response = login
+            .callback
+            .wait(cancellation)
+            .await
+            .map_err(browser_callback_error)?;
         let credential = self
             .exchange_code(
-                &code,
-                &login.session.verifier,
+                &response.code,
+                &login.verifier,
                 &login.callback_uri,
                 cancellation,
             )
@@ -949,179 +877,17 @@ fn encode_base64url(bytes: &[u8]) -> String {
     encoded
 }
 
-fn parse_browser_callback(
-    pasted_redirect_url: &str,
-    callback_uri: &str,
-    expected_state: &str,
-) -> Result<String, AuthError> {
-    let callback =
-        reqwest::Url::parse(pasted_redirect_url.trim()).map_err(|_| AuthError::InvalidCallback)?;
-    let expected = reqwest::Url::parse(callback_uri).expect("known callback URL");
-    if callback.scheme() != expected.scheme()
-        || callback.host_str() != expected.host_str()
-        || callback.port() != expected.port()
-        || callback.path() != expected.path()
-        || callback.fragment().is_some()
-        || !callback.username().is_empty()
-        || callback.password().is_some()
-    {
-        return Err(AuthError::InvalidCallback);
+fn browser_callback_error(error: CallbackError) -> AuthError {
+    match error {
+        CallbackError::PortUnavailable(_) => AuthError::CallbackPortUnavailable,
+        CallbackError::InvalidCallback => AuthError::InvalidCallback,
+        CallbackError::StateMismatch => AuthError::StateMismatch,
+        CallbackError::Denied => AuthError::AuthorizationDenied,
+        CallbackError::AuthorizationFailed => AuthError::BrowserAuthorizationFailed,
+        CallbackError::Ended => AuthError::BrowserLoginEnded,
+        CallbackError::Cancelled => AuthError::Cancelled,
+        CallbackError::TimedOut => AuthError::TimedOut,
     }
-    let mut state = None;
-    let mut code = None;
-    let mut error = None;
-    for (name, value) in callback.query_pairs() {
-        let field = match name.as_ref() {
-            "state" => &mut state,
-            "code" => &mut code,
-            "error" => &mut error,
-            _ => continue,
-        };
-        if field.replace(value.into_owned()).is_some() {
-            return Err(AuthError::InvalidCallback);
-        }
-    }
-    if state.as_deref() != Some(expected_state) {
-        return Err(AuthError::StateMismatch);
-    }
-    if let Some(error) = error {
-        return Err(if error == "access_denied" {
-            AuthError::AuthorizationDenied
-        } else {
-            AuthError::BrowserAuthorizationFailed
-        });
-    }
-    code.filter(|code| !code.is_empty())
-        .ok_or(AuthError::InvalidCallback)
-}
-
-async fn serve_browser_callbacks(
-    listener: TcpListener,
-    callback_uri: String,
-    state: String,
-    sender: mpsc::UnboundedSender<Result<String, AuthError>>,
-    completed: Arc<AtomicBool>,
-    stop: CancellationToken,
-) {
-    loop {
-        let accepted = tokio::select! {
-            () = stop.cancelled() => return,
-            accepted = listener.accept() => accepted,
-        };
-        let Ok((stream, _)) = accepted else {
-            return;
-        };
-        handle_browser_callback(stream, &callback_uri, &state, &sender, &completed).await;
-    }
-}
-
-async fn handle_browser_callback(
-    mut stream: TcpStream,
-    callback_uri: &str,
-    state: &str,
-    sender: &mpsc::UnboundedSender<Result<String, AuthError>>,
-    completed: &AtomicBool,
-) {
-    let target = read_callback_target(&mut stream).await;
-    let (status, body, completion) = match target {
-        Err(_) => (400, INVALID_CALLBACK_REQUEST, None),
-        Ok(target) => {
-            let url = if target.starts_with('/') {
-                format!(
-                    "http://localhost:{}{target}",
-                    stream.local_addr().map_or(0, |address| address.port())
-                )
-            } else {
-                target
-            };
-            if reqwest::Url::parse(&url).is_ok_and(|parsed| parsed.path() != CALLBACK_PATH) {
-                (404, "Callback route not found.", None)
-            } else {
-                match parse_browser_callback(&url, callback_uri, state) {
-                    Ok(_) if completed.swap(true, Ordering::AcqRel) => {
-                        (409, "Callback already completed.", None)
-                    }
-                    Ok(code) => (
-                        200,
-                        "Authorization code received. Return to Tickloop to finish login; the terminal will confirm whether it succeeded.",
-                        Some(Ok(code)),
-                    ),
-                    Err(AuthError::StateMismatch) => (400, CALLBACK_STATE_MISMATCH, None),
-                    Err(AuthError::AuthorizationDenied) => {
-                        if completed.swap(true, Ordering::AcqRel) {
-                            (409, "Callback already completed.", None)
-                        } else {
-                            (
-                                400,
-                                "OpenAI authorization was denied.",
-                                Some(Err(AuthError::AuthorizationDenied)),
-                            )
-                        }
-                    }
-                    Err(AuthError::BrowserAuthorizationFailed) => {
-                        if completed.swap(true, Ordering::AcqRel) {
-                            (409, "Callback already completed.", None)
-                        } else {
-                            (
-                                400,
-                                "OpenAI authorization failed.",
-                                Some(Err(AuthError::BrowserAuthorizationFailed)),
-                            )
-                        }
-                    }
-                    Err(_) => (400, INVALID_CALLBACK_URL, None),
-                }
-            }
-        }
-    };
-    let response = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        match status {
-            200 => "OK",
-            404 => "Not Found",
-            409 => "Conflict",
-            _ => "Bad Request",
-        },
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-    if let Some(completion) = completion {
-        let _ = sender.send(completion);
-    }
-}
-
-async fn read_callback_target(stream: &mut TcpStream) -> Result<String, AuthError> {
-    let request = tokio::time::timeout(CALLBACK_REQUEST_TIMEOUT, async {
-        let mut bytes = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 1024];
-            let count = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|_| AuthError::InvalidCallback)?;
-            if count == 0 || bytes.len().saturating_add(count) > MAX_CALLBACK_REQUEST_BYTES {
-                return Err(AuthError::InvalidCallback);
-            }
-            bytes.extend_from_slice(&chunk[..count]);
-            if bytes.windows(2).any(|pair| pair == b"\r\n") {
-                break;
-            }
-        }
-        let line_end = bytes
-            .windows(2)
-            .position(|pair| pair == b"\r\n")
-            .ok_or(AuthError::InvalidCallback)?;
-        let line =
-            std::str::from_utf8(&bytes[..line_end]).map_err(|_| AuthError::InvalidCallback)?;
-        let mut parts = line.split(' ');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some("GET"), Some(target), Some("HTTP/1.1"), None) => Ok(target.to_owned()),
-            _ => Err(AuthError::InvalidCallback),
-        }
-    })
-    .await
-    .map_err(|_| AuthError::InvalidCallback)??;
-    Ok(request)
 }
 
 fn verify_private_file(file: &File) -> Result<(), AuthError> {
@@ -1273,6 +1039,7 @@ mod network_tests {
         process::Command,
         thread,
     };
+    use tokio::net::TcpListener;
 
     #[test]
     fn oauth_requests_use_environment_proxy() {

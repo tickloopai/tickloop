@@ -1,5 +1,5 @@
-//! `tickloop plugin marketplace …`, and installing, updating and listing plugins by name from
-//! every registered marketplace.
+//! `tickloop plugin marketplace …`, and installing, updating and listing Ticks and plugins by name
+//! from every registered marketplace.
 
 use std::collections::BTreeMap;
 
@@ -9,11 +9,11 @@ use tick_plugins::{
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
-    PluginRequest, install_from, installed_status, plugin_http, read_marketplace,
+    PluginKind, PluginRequest, install_from, installed_status, plugin_http, read_marketplace,
     read_marketplaces, source_label, unavailable_reason,
 };
 
-use super::plugin_command::{print_table, report, report_notes};
+use super::plugin_command::{other_kind, print_table, report, report_notes};
 
 const SHORT_COMMIT_LENGTH: usize = 12;
 const NO_MARKETPLACE_READ: &str = "no marketplace could be read";
@@ -156,17 +156,28 @@ fn registration(store: &PluginStore, name: &str) -> Result<MarketplaceRegistrati
         .ok_or_else(|| format!("marketplace {name} is not registered"))
 }
 
-/// Installs `NAME@MARKETPLACE`, or `NAME` from the one marketplace that offers it.
-pub(super) async fn install(store: &PluginStore, text: &str) -> Result<(), String> {
+/// Installs `NAME@MARKETPLACE`, or `NAME` from the one marketplace that offers it, when what the
+/// marketplace offers is of `kind`; `typed` is the command as the user gave it.
+pub(super) async fn install(
+    store: &PluginStore,
+    kind: PluginKind,
+    text: &str,
+    typed: &str,
+) -> Result<(), String> {
     let request = PluginRequest::parse(text)?;
     let name = &request.name;
     let installation = match request.marketplace.as_deref() {
         Some(LOCAL_MARKETPLACE) => {
             return Err(format!(
-                "plugins of the {LOCAL_MARKETPLACE} marketplace install with tickloop plugin install --path PATH"
+                "{} of the {LOCAL_MARKETPLACE} marketplace install with {} install --path PATH",
+                kind.plural(),
+                kind.command()
             ));
         }
-        Some(TICKLOOP_MARKETPLACE) => return super::plugin_tick::install(store, name).await,
+        Some(TICKLOOP_MARKETPLACE) if kind == PluginKind::Tick => {
+            return super::plugin_tick::install(store, name).await;
+        }
+        Some(TICKLOOP_MARKETPLACE) => return Err(other_kind(name, PluginKind::Tick, typed)),
         Some(marketplace) => {
             let registration = registration(store, marketplace)?;
             let plugins = read_marketplace(HTTP, store, &registration, false)
@@ -181,22 +192,40 @@ pub(super) async fn install(store: &PluginStore, text: &str) -> Result<(), Strin
                          tickloop plugin marketplace update {marketplace} reads it again"
                     )
                 })?;
+            let offered = PluginKind::of_offer(plugin);
+            if offered != kind {
+                return Err(other_kind_offer(name, offered, typed));
+            }
             install_from(HTTP, store, marketplace, plugin).await?
         }
         None => {
-            let (marketplace, plugin) = choose_offer(store, name).await?;
+            let (marketplace, plugin) = choose_offer(store, kind, name, typed).await?;
             install_from(HTTP, store, &marketplace, &plugin).await?
         }
     };
-    report(&installation);
+    report(&installation, kind);
     Ok(())
 }
 
-/// The marketplace that offers `name`: the only one, or the one it is installed from. A
-/// marketplace that cannot be read is reported and passed over.
+/// Why the offer `name` belongs to the other command: a Tick marketplace package is known to carry
+/// a Tick program, while any other offer is only not known to until it is fetched.
+fn other_kind_offer(name: &str, offered: PluginKind, typed: &str) -> String {
+    match offered {
+        PluginKind::Tick => other_kind(name, offered, typed),
+        PluginKind::Plugin => format!(
+            "{name} is not offered as a Tick; use {} {typed}",
+            offered.command()
+        ),
+    }
+}
+
+/// The marketplace that offers `name` as `kind`: the only one, or the one it is installed from.
+/// A marketplace that cannot be read is reported and passed over.
 async fn choose_offer(
     store: &PluginStore,
+    kind: PluginKind,
     name: &str,
+    typed: &str,
 ) -> Result<(String, MarketplacePlugin), String> {
     let mut offers = Vec::new();
     let mut is_any_readable = false;
@@ -221,6 +250,14 @@ async fn choose_offer(
     if !is_any_readable {
         return Err(NO_MARKETPLACE_READ.to_owned());
     }
+    let (mut offers, others): (Vec<_>, Vec<_>) = offers
+        .into_iter()
+        .partition(|(_, plugin)| PluginKind::of_offer(plugin) == kind);
+    if offers.is_empty()
+        && let Some((_, other)) = others.first()
+    {
+        return Err(other_kind_offer(name, PluginKind::of_offer(other), typed));
+    }
     let installed = store.installed().map_err(|error| error.to_string())?;
     let installed_from = installed
         .plugins
@@ -242,44 +279,55 @@ async fn choose_offer(
     }
     match offers.len() {
         0 => Err(format!(
-            "no marketplace that could be read offers plugin {name}; \
-             tickloop plugin list --available shows what they offer"
+            "no marketplace that could be read offers {} {name}; \
+             {} list --available shows what they offer",
+            kind.noun(),
+            kind.command()
         )),
         1 => Ok(offers.remove(0)),
         _ => Err(format!(
-            "plugin {name} is offered by several marketplaces: {}; choose one with tickloop plugin install {name}@MARKETPLACE",
+            "{} {name} is offered by several marketplaces: {}; choose one with {} install {name}@MARKETPLACE",
+            kind.noun(),
             offers
                 .iter()
                 .map(|(marketplace, _)| format!("{name}@{marketplace}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            kind.command()
         )),
     }
 }
 
-/// Updates one installed plugin, or every one, from its marketplace read afresh.
-pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<(), String> {
+/// Updates one installed plugin, or every one of `kind`, from its marketplace read afresh; the
+/// caller has checked that a named one, if usable, is of `kind`.
+pub(super) async fn update(
+    store: &PluginStore,
+    kind: PluginKind,
+    name: Option<&str>,
+) -> Result<(), String> {
     let installed = store.installed().map_err(|error| error.to_string())?;
+    let is_single = name.is_some();
     let mut targets = installed
         .plugins
         .iter()
+        .filter(|plugin| is_single || PluginKind::of_installed(plugin) == kind)
         .map(|plugin| (plugin.name().to_owned(), plugin.marketplace.clone()))
         .chain(
             installed
                 .broken
                 .iter()
+                .filter(|plugin| is_single || kind.lists_broken(plugin))
                 .map(|plugin| (plugin.name.clone(), plugin.marketplace.clone())),
         )
         .collect::<Vec<_>>();
     targets.sort();
-    let is_single = name.is_some();
     if let Some(name) = name {
         targets.retain(|(installed, _)| installed == name);
         if targets.is_empty() {
-            return Err(format!("plugin {name} is not installed"));
+            return Err(format!("{} {name} is not installed", kind.noun()));
         }
     } else if targets.is_empty() {
-        println!("No plugins are installed.");
+        println!("No {} are installed.", kind.plural());
         return Ok(());
     }
     let mut marketplaces = BTreeMap::new();
@@ -288,12 +336,13 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
         if marketplace == LOCAL_MARKETPLACE {
             let installed_locally = format!(
                 "{name}@{marketplace} was installed from a local path; \
-                 tickloop plugin install --path updates it"
+                 {} install --path updates it",
+                kind.command()
             );
             if is_single {
-                return Err(format!("plugin {installed_locally}"));
+                return Err(format!("{} {installed_locally}", kind.noun()));
             }
-            println!("Plugin {installed_locally}.");
+            println!("{} {installed_locally}.", kind.label());
             continue;
         }
         if !marketplaces.contains_key(marketplace) {
@@ -306,8 +355,9 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
                 }
                 Err(reason) => {
                     println!(
-                        "Plugin {name}@{marketplace} is not updated: {reason}; \
-                         tickloop plugin marketplace add registers it again."
+                        "{} {name}@{marketplace} is not updated: {reason}; \
+                         tickloop plugin marketplace add registers it again.",
+                        kind.label()
                     );
                     continue;
                 }
@@ -335,8 +385,9 @@ pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<()
     match failures {
         0 => Ok(()),
         _ => Err(format!(
-            "{failures} of {} plugins could not be updated",
-            targets.len()
+            "{failures} of {} {} could not be updated",
+            targets.len(),
+            kind.plural()
         )),
     }
 }
@@ -346,23 +397,25 @@ fn report_update(installation: &Installation) {
     let id = plugin.id();
     let version = &plugin.version;
     let root = safe_line(&plugin.root.display().to_string());
+    let kind = PluginKind::of_installed(plugin);
+    let noun = kind.noun();
     match &installation.outcome {
         InstallOutcome::AlreadyInstalled => {
-            println!("Plugin {id} {version} is up to date.");
+            println!("{} {id} {version} is up to date.", kind.label());
             return;
         }
-        InstallOutcome::Installed => println!("Installed plugin {id} {version} in {root}."),
+        InstallOutcome::Installed => println!("Installed {noun} {id} {version} in {root}."),
         InstallOutcome::Replaced { previous_version } => {
-            println!("Updated plugin {id} from {previous_version} to {version} in {root}.")
+            println!("Updated {noun} {id} from {previous_version} to {version} in {root}.")
         }
-        InstallOutcome::Reinstalled => println!("Reinstalled plugin {id} {version} in {root}."),
+        InstallOutcome::Reinstalled => println!("Reinstalled {noun} {id} {version} in {root}."),
     }
     report_notes(plugin);
 }
 
-/// Lists what every marketplace offers, merged by name, beside what is installed; a marketplace
-/// that cannot be read is reported and passed over.
-pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
+/// Lists what every marketplace offers of `kind`, merged by name, beside what is installed; a
+/// marketplace that cannot be read is reported and passed over.
+pub(super) async fn list_available(store: &PluginStore, kind: PluginKind) -> Result<(), String> {
     let offers = read_marketplaces(HTTP, store, false).await?;
     let installed = store.installed().map_err(|error| error.to_string())?;
     let mut rows = Vec::new();
@@ -372,7 +425,10 @@ pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
         match offer.plugins {
             Ok(plugins) => {
                 is_any_readable = true;
-                rows.extend(plugins.iter().map(|plugin| {
+                let offered = plugins
+                    .iter()
+                    .filter(|plugin| PluginKind::of_offer(plugin) == kind);
+                rows.extend(offered.map(|plugin| {
                     let mut status = installed_status(&installed, marketplace, plugin);
                     if let Some(reason) = unavailable_reason(plugin) {
                         status.push_str(&format!("; {reason}"));
@@ -399,7 +455,7 @@ pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
         return Err(NO_MARKETPLACE_READ.to_owned());
     }
     if rows.is_empty() {
-        println!("No marketplace offers plugins yet.");
+        println!("No marketplace offers {} yet.", kind.plural());
         return Ok(());
     }
     rows.sort_by(|left, right| {

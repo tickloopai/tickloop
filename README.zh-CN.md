@@ -55,7 +55,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/rewind`、`/diff` | 撤回到之前的某条消息；查看文件改动 |
 | `/resume`、`/clear` | 重新打开以前的对话；开始新对话 |
 | `/permissions`、`/settings` | 设置 Agent 可以自行做多少事；其他偏好 |
-| `/plugins`、`/artifacts` | 管理插件；登录 Artifacts |
+| `/ticks`、`/plugins` | 安装并登录 Tick；管理其他插件 |
+| `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 
 按键：
@@ -68,26 +69,52 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - 在 Monitor 中 `enter` 打开 Tick，`esc` 再隐藏；程序会继续运行。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
 
-## 插件与数据源
+## Tick
 
-插件为 Agent 增加 Skill 和 Tick 程序。用 `/plugins` 浏览已安装和可安装的插件，或在命令行中操作：
+Tick 是 Agent 可以打开、盯着并操作的实时程序，比如行情源或文档阅读器。Tick 和插件一样安装，共用 marketplace 和存储，但单独管理：用 `/ticks` 查找、安装和登录 Tick，或在命令行中操作：
+
+```sh
+tickloop tick list --available
+tickloop tick install NAME                # 或 NAME@MARKETPLACE
+tickloop tick list
+tickloop tick login NAME                  # 数据源需要登录时使用
+tickloop tick logout NAME
+tickloop tick update NAME                 # 省略 NAME 更新所有 Tick
+tickloop tick disable NAME
+tickloop tick enable NAME
+tickloop tick uninstall NAME              # 删除其数据，保留登录
+tickloop tick uninstall NAME --keep-data  # 同时保留数据
+tickloop tick install --path ./my-tick    # 本地 Tick 目录或 .tar.gz 压缩包
+```
+
+官方 Tick 来自内置的 `tickloop` marketplace，源码在 [tickloopai/ticks](https://github.com/tickloopai/ticks)。带 Tick 程序的插件就是 Tick，即使它也带 Skill：装好后只出现在 `/ticks` 和 `tickloop tick` 中，不出现在 `/plugins`。安装前就能看出种类时（Tick marketplace 的包或本地目录），`tickloop plugin` 拒绝 Tick 并给出应改用的 `tickloop tick` 命令，反之亦然。
+
+在 `/ticks` 中，用 `Tab` 或左右键切换 **Installed**（已安装）和 **Available**（可安装），`j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择。已安装页按 `Enter` 打开 Tick 的操作：登录/退出登录、更新、启用/禁用；每行显示 marketplace、启用状态、版本和登录状态。登录在面板内完成：OAuth 的 Tick 显示链接和验证码，在任意设备的浏览器中确认；密钥以遮掩方式输入。可安装页按 `Enter` 安装或更新所选 Tick，按 `/` 开始过滤名字、说明和 marketplace，不区分大小写；过滤时 `j`/`k` 是文字，`Ctrl+N`/`Ctrl+P` 选择，`Ctrl+G` 打开外部编辑器。`Esc` 退出过滤并保留查询，再按一次关闭面板。
+
+在已安装页同一行三秒内按两次 `x` 卸载：删除该 Tick 的数据，保留登录，不停止运行中的 Tick。移动选择、按其他键、离开或超时都会取消确认。登录保留在配置目录的 `credentials/NAME/`；要删除保存的登录，先退出登录再卸载。
+
+装好 Tick（需要登录的先登录）后，让 Agent 按名字打开它，例如"打开 NAME 这个 Tick 并盯着它"。安装不运行任何程序：Tick 程序只在按你的权限设置打开时以你的身份运行。禁用的 Tick 不能按名字打开。安装、更新、卸载和登录由你发起，Agent 只会请你去做。
+
+程序实现 [Tick 协议](tick/protocol/SPECIFICATION.md) 就能成为扩展 Tick；可从 [Counter 示例](tick/examples/counter.py) 开始。
+
+## 插件
+
+插件为 Agent 增加 Skill。用 `/plugins` 浏览不带 Tick 程序的已安装和可安装插件，或在命令行中操作：
 
 ```sh
 tickloop plugin list --available
 tickloop plugin install NAME@MARKETPLACE
 tickloop plugin list
-tickloop plugin login NAME                  # 插件需要登录时使用
-tickloop plugin logout NAME
 tickloop plugin update NAME                 # 省略 NAME 更新所有 marketplace 插件
 tickloop plugin disable NAME
 tickloop plugin enable NAME
-tickloop plugin uninstall NAME              # 删除插件数据，保留登录
+tickloop plugin uninstall NAME              # 删除插件数据
 tickloop plugin uninstall NAME --keep-data  # 同时保留插件数据
 ```
 
-内置 marketplace 为 `tickloop` 和 `claude-plugins-official`，不能删除；Git marketplace 在首次使用时才下载。官方 Tick 包在 [tickloopai/ticks](https://github.com/tickloopai/ticks)。来源明确时可只写 `NAME`；多个 marketplace 提供同名插件时，命令列出候选，已有安装则优先使用其来源。要把已安装的同名插件换到另一个 marketplace，先卸载。
+内置 marketplace 为 `tickloop` 和 `claude-plugins-official`，不能删除；Git marketplace 在首次使用时才下载。来源明确时可只写 `NAME`；多个 marketplace 提供同名插件时，命令列出候选，已有安装则优先使用其来源。要把已安装的同名插件换到另一个 marketplace，先卸载。Git marketplace 中的插件若装好后才看出带 Tick 程序，由 `tickloop plugin` 安装，之后按 Tick 报告和管理。
 
-添加其他来源只在命令行中操作：
+用命令行登记其他来源，`/ticks` 和 `/plugins` 都会读取：
 
 ```sh
 tickloop plugin marketplace add OWNER/REPO
@@ -96,7 +123,7 @@ tickloop plugin marketplace update MARKETPLACE  # 省略名称刷新全部
 tickloop plugin marketplace remove MARKETPLACE
 ```
 
-`add` 也接受 `OWNER/REPO#REF`、Git 地址（HTTPS、SSH 或 file）、本地目录和 HTTPS marketplace JSON 地址，名称取自 marketplace 声明。删除 marketplace 会保留从中安装的插件。浏览使用上次取得的 Git 目录，用 `marketplace update` 刷新；`tickloop` 目录每次读取。插件 `update` 会刷新来源，并按 Git 提交判断更新，因此显示版本不变也能更新内容。更新全部时跳过来源已被删除的插件。
+`add` 也接受 `OWNER/REPO#REF`、Git 地址（HTTPS、SSH 或 file）、本地目录或 HTTPS 上的 marketplace JSON。名称取自 marketplace 文件。删除 marketplace 不会卸载已安装的插件。浏览使用上次取得的 Git 目录，用 `marketplace update` 刷新；`tickloop` 目录每次实时读取。插件 `update` 会刷新来源并检查 Git 提交，所以显示版本不变时也能更新内容。全部更新会跳过来自已删除 marketplace 的插件。
 
 本地插件目录或 `.tar.gz` 压缩包：
 
@@ -105,19 +132,15 @@ tickloop plugin validate ./my-plugin
 tickloop plugin install --path ./my-plugin
 ```
 
-本地路径安装的插件只能重新运行 `install --path` 更新，同版本也会重装；`update` 和面板不更新它们。`validate` 报告清单、组件和路径警告；安装还会检查文件树。安装失败保留原安装。插件标为不可用时，从原来源重装。
+本地路径安装的插件只能重新运行 `install --path` 更新，同版本也会重装；`update` 和面板不更新它们。`validate` 报告清单、组件和路径警告；安装还会检查文件树。安装失败保留原安装。插件标为不可用时，从原来源重装；看不出种类的不可用插件同时列在 `/ticks` 和 `/plugins` 中。
 
-在 `/plugins` 中，用 `Tab` 或左右键切换 **Installed**（已安装）和 **Available**（可安装），`j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 安装或打开操作。已安装行显示来源、版本、启用状态、登录和暂不支持的组件，可启用/禁用、更新、登录/退出登录。可安装页按 `/` 开始过滤名字、说明和 marketplace，不区分大小写；过滤时 `j`/`k` 是文字，`Ctrl+N`/`Ctrl+P` 选择，`Ctrl+G` 打开外部编辑器。`Esc` 退出过滤并保留查询，再按一次关闭面板。取不到的 marketplace 各自显示最多三行的错误摘要，其他来源和已安装页仍可用。
+`/plugins` 的用法与 `/ticks` 相同：已安装和可安装两页，`Enter` 打开操作（启用/禁用、更新）或安装，`/` 过滤，同一行按两次 `x` 卸载。已安装行还显示暂不支持的组件。取不到的 marketplace 各自显示最多三行的错误摘要，其他来源和已安装页仍可用。
 
-在已安装页同一行三秒内按两次 `x` 卸载：默认删除插件数据，保留登录，不停止运行中的 Tick。移动选择、按其他键、离开或超时都会取消确认。保留数据请用命令行的 `--keep-data`。登录保留在配置目录的 `credentials/NAME/`；要删除保存的登录，先 `logout` 再卸载。
+输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目以及已启用插件和 Tick 的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
 
-输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目和已启用插件的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
+已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装不运行程序，也不增加权限；插件 Skill 的工具调用照常审批。本版本只有 Skill 和 Tick 组件生效，其余列为暂不支持；npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
 
-已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill，并阻止按名字打开该插件的 Tick；重装或更新后仍保持禁用。安装不运行程序，也不增加权限。Tick 程序在按你的权限设置打开时才以你的身份运行；插件 Skill 的工具调用照常审批。本版本只有 Skill 和 Tick 组件生效，其余列为暂不支持；npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
-
-旧 Tick 包在首次使用时自动迁移，保留登录；损坏的包会提示重装，旧目录保留。`tickloop tick …` 和 `/ticks` 本版本仍可作为别名使用，并提示改名。
-
-程序实现 [Tick 协议](tick/protocol/SPECIFICATION.md) 就能成为扩展 Tick；可从 [Counter 示例](tick/examples/counter.py) 开始。
+旧 Tick 包在首次使用时自动迁移，保留登录；损坏的包会提示重装，旧目录保留。
 
 ## 运行环境
 

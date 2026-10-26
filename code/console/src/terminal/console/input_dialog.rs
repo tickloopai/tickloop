@@ -678,8 +678,8 @@ impl State {
             || {
                 if self.artifacts_picker.is_some() {
                     "Artifacts"
-                } else if self.ticks_panel.is_some() {
-                    "Plugins"
+                } else if let Some(panel) = &self.ticks_panel {
+                    panel.title()
                 } else if let Some(picker) = &self.conversation_picker {
                     picker.title()
                 } else if self.permissions_surface.is_some() {

@@ -27,7 +27,7 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`logged_in`",
         "`not_required`",
         "from `/ticks` in this Agent",
-        "marketplace page of `/ticks`",
+        "Available page of `/ticks`",
         "No Agent restart is needed",
         "never suggest `!` for a login",
         "never log in, log out, install, update or uninstall a package yourself",

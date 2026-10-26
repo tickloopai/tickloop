@@ -857,15 +857,15 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
-       tickloop tick ... (deprecated alias for tickloop plugin)
-       tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | login PLUGIN [--issuer LABEL] | logout PLUGIN | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
+       tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
+       tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
 monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
-tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, logs one in or out of its data source, or lists those installed or in the marketplace; tickloop tick --help explains them.
-plugin installs a plugin by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, lists those installed or available, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
+tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
+plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -910,8 +910,8 @@ Use /plugin:skill, or /skill when unique; full names and built-in commands take 
 Each user invocation shows a Skill row with its source, also in reopened history.
 /slides [TOPIC] makes new Slides in Tickloop Artifacts; without a topic the Agent asks for one.
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
-/plugins manages plugins: Installed shows versions and login states; Available installs or updates. /ticks is a renamed alias. Tab or left/right switches pages.
-Plugin login runs in the panel; installed or updated Skills load on the next request.
+/ticks manages Ticks, the plugins with a Tick program: Installed shows versions and login states; Available installs or updates. Tab or left/right switches pages.
+/plugins manages the plugins without a Tick program the same way. A Tick's login runs in its panel; installed or updated Skills load on the next request.
 /model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
@@ -3656,11 +3656,12 @@ async fn interact_with_herdr(
                             }
                         },
                         command if matches!(command.split_whitespace().next(), Some("/plugins" | "/ticks")) => {
-                            if command.split_whitespace().count() != 1 { outln!(console, "Use /plugins"); continue; }
-                            let Some(root) = config_root.as_deref() else { outln!(console, "Plugins need a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
-                            if !interactive { outln!(console, "/plugins needs an interactive terminal; run tickloop plugin there instead."); continue; }
-                            if command.trim() == "/ticks" { outln!(console, "/ticks has been renamed to /plugins"); }
-                            if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), &mut tick_package_tasks) { outln!(console, "Cannot open /plugins: {}", safe_text(&error)); }
+                            let kind = if command.split_whitespace().next() == Some("/ticks") { ticks_panel::PluginKind::Tick } else { ticks_panel::PluginKind::Plugin };
+                            let (name, cli) = (ticks_work::panel_command(kind), kind.command());
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use {name}"); continue; }
+                            let Some(root) = config_root.as_deref() else { outln!(console, "{name} needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            if !interactive { outln!(console, "{name} needs an interactive terminal; run {cli} there instead."); continue; }
+                            if let Err(error) = ticks_work::open(console, root, selected_chat.map(Into::into), kind, &mut tick_package_tasks) { outln!(console, "Cannot open {name}: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
