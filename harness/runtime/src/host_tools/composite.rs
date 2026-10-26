@@ -43,6 +43,18 @@ impl CompositeHostTools {
         }
         Ok(source)
     }
+    fn authority_source(&self, name: &str) -> Result<Option<&Arc<dyn HostToolProvider>>, String> {
+        let artifact = crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name);
+        let mut matches = self.sources.iter().filter(|source| {
+            source.definitions().iter().any(|tool| tool.name == name)
+                || artifact && source.artifact_client().is_some()
+        });
+        let source = matches.next();
+        if matches.next().is_some() {
+            return Err("host tool has conflicting authorities".into());
+        }
+        Ok(source)
+    }
     fn resource_source(&self, server: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
         let mut matches = self.sources.iter().filter(|source| {
             source
@@ -178,14 +190,20 @@ impl HostToolProvider for CompositeHostTools {
         self.sources.iter().find_map(|s| s.workspace_host_context())
     }
     fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
-        self.source(name)?.tool_authorities(name)
+        self.authority_source(name)?
+            .map(|source| source.tool_authorities(name))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
     fn call_authority(
         &self,
         name: &str,
         input: &Value,
     ) -> Result<Option<HostToolAuthority>, String> {
-        self.source(name)?.call_authority(name, input)
+        self.authority_source(name)?
+            .map(|source| source.call_authority(name, input))
+            .transpose()
+            .map(Option::flatten)
     }
     fn service_connections(&self) -> Value {
         let mut combined = serde_json::Map::new();

@@ -995,3 +995,43 @@ async fn multiple_host_sources_keep_their_tools_and_route_calls() {
     }
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn composed_host_sources_allow_delegation_without_available_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Return the child report", "name":"peer"}),
+        ),
+        text("child report"),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(vec![
+            Arc::new(WorkspaceTools::default()) as Arc<dyn HostToolProvider>,
+            Arc::new(AutomaticTools(WorkspaceTools::default())),
+        ])
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .submit(chat, "Delegate the bounded report".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let result = snapshot.operations[0].result.as_ref().unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("child report"),
+        "{}",
+        result.content
+    );
+    agent.shutdown().await;
+}

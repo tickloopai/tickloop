@@ -1059,7 +1059,9 @@ for line in sys.stdin:
     /// Runs one hosted Tick tool for `chat` that must complete, and returns its answer.
     async fn run_tool(tools: &HostedTickTools, chat: Uuid, name: &str, input: Value) -> Value {
         match call_tool(tools, chat, name, input).await {
-            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+            HostCallResult::Completed(result)
+            | HostCallResult::CompletedWithImages(result, _)
+            | HostCallResult::CompletedWithEffect(result, _) => {
                 serde_json::from_str(&result.content).unwrap()
             }
             HostCallResult::NotDispatched(error) | HostCallResult::OutcomeUnknown(error) => {
@@ -3848,7 +3850,9 @@ for line in sys.stdin:
         .await
         {
             HostCallResult::OutcomeUnknown(_) => None,
-            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+            HostCallResult::Completed(result)
+            | HostCallResult::CompletedWithImages(result, _)
+            | HostCallResult::CompletedWithEffect(result, _) => {
                 Some(format!("completed: {}", result.content))
             }
             HostCallResult::NotDispatched(reason) => Some(format!("not dispatched: {reason}")),
