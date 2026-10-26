@@ -1,0 +1,284 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { after, test } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { cloneUrl, createReport, describeSource, parseValidateOutput, renderMarkdown, STATUS } from "./plugin-compat-report.mjs";
+
+const script = fileURLToPath(new URL("./plugin-compat-report.mjs", import.meta.url));
+const builtTickloop = fileURLToPath(new URL("../target/debug/tickloop", import.meta.url));
+const scratch = mkdtempSync(join(tmpdir(), "plugin-compat-"));
+after(() => rmSync(scratch, { recursive: true, force: true }));
+
+function git(cwd, ...args) {
+  return execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim();
+}
+
+function writeFiles(root, files) {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), typeof content === "string" ? content : `${JSON.stringify(content)}\n`);
+  }
+}
+
+function commit(root, files) {
+  writeFiles(root, files);
+  git(root, "add", "--all");
+  git(root, "commit", "--quiet", "-m", "change");
+  return git(root, "rev-parse", "HEAD");
+}
+
+let repositoryCount = 0;
+function repository(name) {
+  const root = join(scratch, `${name}-${++repositoryCount}`);
+  mkdirSync(root, { recursive: true });
+  git(root, "init", "--quiet", "--initial-branch=main");
+  return root;
+}
+
+const skill = name => `---\nname: ${name}\ndescription: Does ${name}\n---\nBody of ${name}\n`;
+
+// Prints what `tickloop plugin validate` prints for the few manifest shapes the fixtures use.
+function fakeTickloop() {
+  const path = join(scratch, "fake-tickloop.mjs");
+  writeFileSync(path, `#!/usr/bin/env node
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
+if (process.argv[2] === "--version") { console.log("tickloop 0.0.0-fake"); process.exit(0); }
+const directory = process.argv[4];
+const found = [".tickloop-plugin/plugin.json", ".claude-plugin/plugin.json", "tick-package.json"].find(file => existsSync(join(directory, file)));
+const manifest = found ? JSON.parse(readFileSync(join(directory, found), "utf8")) : { name: basename(directory) };
+if (!/^[a-z0-9][a-z0-9-]*$/.test(manifest.name)) {
+  console.error(\`Error: \${directory} is not a valid plugin: "\${manifest.name}" is not a plugin name\`);
+  process.exit(1);
+}
+console.log(\`Plugin \${manifest.name}\${manifest.version ? " " + manifest.version : ""}, read from \${found ?? "its directory"}.\`);
+const skills = existsSync(join(directory, "skills")) ? readdirSync(join(directory, "skills")).sort().map(name => "skills/" + name) : [];
+console.log(\`Skills: \${skills.length ? skills.join(", ") : "none"}\`);
+if (manifest.executable) console.log(\`Tick program: \${manifest.executable} (speaks the Tick protocol)\`);
+const unsupported = [["commands", "commands"], [".mcp.json", "MCP servers"]].filter(([file]) => existsSync(join(directory, file))).map(([, label]) => label);
+if (unsupported.length) console.log(\`Not supported yet, so not used: \${unsupported.join(", ")}.\`);
+`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+function claudeMarketplace() {
+  const external = repository("external");
+  const externalCommit = commit(external, {
+    ".claude-plugin/plugin.json": { name: "remote", version: "2.0.0" },
+    "skills/lookup/SKILL.md": skill("lookup"),
+    ".mcp.json": { mcpServers: {} },
+  });
+  const monorepo = repository("monorepo");
+  const firstMonorepoCommit = commit(monorepo, { "plugins/pinned/skills/old/SKILL.md": skill("old"), "README.md": "monorepo\n" });
+  const monorepoCommit = commit(monorepo, { "plugins/sub/skills/draft/SKILL.md": skill("draft"), "other/large.txt": "not needed\n" });
+  const marketplace = repository("marketplace");
+  const marketplaceCommit = commit(marketplace, {
+    ".claude-plugin/marketplace.json": {
+      name: "fixture-market",
+      owner: { name: "Test" },
+      plugins: [
+        { name: "notes", source: "./plugins/notes" },
+        { name: "remote", source: { source: "url", url: pathToFileURL(external).href } },
+        { name: "sub", description: "From the entry", version: "0.3.0", source: { source: "git-subdir", url: pathToFileURL(monorepo).href, path: "plugins/sub", ref: "main" } },
+        { name: "pinned", source: { source: "git-subdir", url: pathToFileURL(monorepo).href, path: "./plugins/pinned/", sha: firstMonorepoCommit } },
+        { name: "wrong-pin", source: { source: "url", url: pathToFileURL(external).href, sha: "0".repeat(40) } },
+        { name: "gone", source: { source: "url", url: pathToFileURL(join(scratch, "missing.git")).href } },
+        { name: "from-npm", source: { source: "npm", package: "@example/plugin" } },
+        { name: "broken", source: "./plugins/broken" },
+        { name: "escape", source: "../outside" },
+      ],
+    },
+    "plugins/notes/.claude-plugin/plugin.json": { name: "notes", version: "1.0.0" },
+    "plugins/notes/skills/read/SKILL.md": skill("read"),
+    "plugins/notes/commands/summarize.md": "Summarize\n",
+    "plugins/broken/.claude-plugin/plugin.json": { name: "Broken_Name" },
+  });
+  return { marketplace, marketplaceCommit, external, externalCommit, monorepo, monorepoCommit, firstMonorepoCommit };
+}
+
+function byName(report) {
+  return Object.fromEntries(report.plugins.map(plugin => [plugin.name, plugin]));
+}
+
+test("GitHub shorthands become clone URLs and unsupported sources are named", () => {
+  assert.equal(cloneUrl("anthropics/claude-plugins-official"), "https://github.com/anthropics/claude-plugins-official.git");
+  assert.equal(cloneUrl("git@example.com:team/plugins.git"), "git@example.com:team/plugins.git");
+  assert.deepEqual(describeSource({ source: { source: "github", repo: "o/r", ref: "v1" } }, "claude"), { type: "github", url: "https://github.com/o/r.git", ref: "v1" });
+  assert.deepEqual(describeSource({ source: { source: "git-subdir", url: "o/r", path: "p", sha: "abc" } }, "claude"), { type: "git-subdir", url: "https://github.com/o/r.git", path: "p", sha: "abc" });
+  assert.deepEqual(describeSource({ source: "formatter" }, "claude", "./plugins"), { type: "path", path: "plugins/formatter" });
+  assert.deepEqual(describeSource({ source: { source: "pip", package: "x" } }, "claude"), { type: "pip", unsupported: true });
+  assert.deepEqual(describeSource({ name: "demo" }, "tick"), { type: "tick-archive" });
+});
+
+test("the output of tickloop plugin validate is read line by line", () => {
+  assert.deepEqual(parseValidateOutput([
+    "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.",
+    "Skills: skills/read, skills/write",
+    "Tick program: bin/tick-notes (speaks the Tick protocol)",
+    "Not supported yet, so not used: commands, MCP servers.",
+    "Warning: skills path \"../outside\" is ignored: it must start with ./",
+    "",
+  ].join("\n")), {
+    name: "notes",
+    version: "1.0.0",
+    format: ".claude-plugin/plugin.json",
+    skills: ["skills/read", "skills/write"],
+    tick: { executable: "bin/tick-notes", kind: "speaks the Tick protocol" },
+    unsupported: ["commands", "MCP servers"],
+    warnings: ["skills path \"../outside\" is ignored: it must start with ./"],
+  });
+  assert.deepEqual(parseValidateOutput("Plugin bare-plugin, read from its directory.\nSkills: none\n"), {
+    name: "bare-plugin", version: null, format: "its directory", skills: [], tick: null, unsupported: [], warnings: [],
+  });
+});
+
+test("a Claude marketplace in a git repository reports every plugin's source, status, components and problems", async () => {
+  const fixture = claudeMarketplace();
+  const report = await createReport({
+    marketplace: pathToFileURL(fixture.marketplace).href,
+    tickloop: fakeTickloop(),
+    workDirectory: join(scratch, "claude-work"),
+    target: "aarch64-apple-darwin",
+  });
+  const plugins = byName(report);
+
+  assert.equal(report.marketplace.name, "fixture-market");
+  assert.equal(report.marketplace.file, ".claude-plugin/marketplace.json");
+  assert.equal(report.marketplace.commit, fixture.marketplaceCommit);
+  assert.deepEqual(Object.fromEntries(report.plugins.map(plugin => [plugin.name, plugin.status])), {
+    notes: STATUS.installable,
+    remote: STATUS.installable,
+    sub: STATUS.installable,
+    pinned: STATUS.installable,
+    "wrong-pin": STATUS.notFetchable,
+    gone: STATUS.notFetchable,
+    "from-npm": STATUS.unsupportedSource,
+    broken: STATUS.invalid,
+    escape: STATUS.notFetchable,
+  });
+  assert.deepEqual(
+    { revision: plugins.notes.revision, format: plugins.notes.manifestFormat, skills: plugins.notes.skills, unsupported: plugins.notes.unsupportedComponents },
+    { revision: fixture.marketplaceCommit.slice(0, 12), format: ".claude-plugin/plugin.json", skills: ["skills/read"], unsupported: ["commands"] },
+  );
+  assert.deepEqual(
+    { revision: plugins.remote.revision, version: plugins.remote.version, used: plugins.remote.supportedComponents, unsupported: plugins.remote.unsupportedComponents },
+    { revision: fixture.externalCommit.slice(0, 12), version: "2.0.0", used: ["skills"], unsupported: ["MCP servers"] },
+  );
+  assert.deepEqual(
+    { revision: plugins.sub.revision, format: plugins.sub.manifestFormat, version: plugins.sub.version, skills: plugins.sub.skills },
+    { revision: fixture.monorepoCommit.slice(0, 12), format: "marketplace entry", version: "0.3.0", skills: ["skills/draft"] },
+  );
+  assert.deepEqual({ revision: plugins.pinned.revision, skills: plugins.pinned.skills }, { revision: fixture.firstMonorepoCommit.slice(0, 12), skills: ["skills/old"] });
+  assert.match(plugins["wrong-pin"].errors[0], /0000000000000000000000000000000000000000/);
+  assert.equal(plugins.gone.errors.length, 1);
+  assert.deepEqual(plugins["from-npm"].errors, ["npm sources cannot be installed"]);
+  assert.deepEqual(plugins.broken.errors, ["\"Broken_Name\" is not a plugin name"]);
+  assert.deepEqual(plugins.escape.errors, ["../outside leaves the marketplace"]);
+
+  assert.deepEqual(report.totals, {
+    plugins: 9,
+    installable: 4,
+    installableWithSkillsOrTick: 4,
+    invalid: 1,
+    notFetchable: 3,
+    unsupportedSource: 1,
+    withWarnings: 0,
+    bySourceType: {
+      "git-subdir": { plugins: 2, installable: 2, invalid: 0, "not fetchable": 0, "unsupported source": 0 },
+      npm: { plugins: 1, installable: 0, invalid: 0, "not fetchable": 0, "unsupported source": 1 },
+      path: { plugins: 3, installable: 1, invalid: 1, "not fetchable": 1, "unsupported source": 0 },
+      url: { plugins: 3, installable: 1, invalid: 0, "not fetchable": 2, "unsupported source": 0 },
+    },
+    manifestFormats: { ".claude-plugin/plugin.json": 2, "marketplace entry": 2 },
+    supportedComponents: { skills: 4 },
+    unsupportedComponents: { "MCP servers": 1, commands: 1 },
+  });
+  assert.equal(git(fixture.monorepo, "status", "--porcelain"), "", "the plugin sources stay untouched");
+  assert.ok(!existsSync(join(scratch, "claude-work", "git", "1", "other")), "a git subdirectory is checked out sparsely");
+
+  const markdown = renderMarkdown(report);
+  assert.match(markdown, /^# Plugin compatibility: fixture-market$/m);
+  assert.match(markdown, /^\| Installable \| 4 \|$/m);
+  assert.match(markdown, /^\| commands \| 1 \| not yet \|$/m);
+  assert.match(markdown, new RegExp(`^\\| sub \\| git-subdir \\S+ plugins/sub #main \\| installable \\| ${fixture.monorepoCommit.slice(0, 12)} \\| marketplace entry \\| 0.3.0 \\| skills \\|`, "m"));
+  assert.match(markdown, /^\| from-npm \| npm @example\/plugin \| unsupported source \|/m);
+});
+
+test("a Tick marketplace downloads the archive for the target and checks its SHA-256", async () => {
+  const packageRoot = join(scratch, "tick-package");
+  writeFiles(packageRoot, {
+    "tick-package.json": { name: "demo", version: "1.2.0", description: "Demo", executable: "tick-demo", protocol: true },
+    "tick-demo": "#!/bin/sh\n",
+    "skills/usage/SKILL.md": skill("usage"),
+  });
+  const archive = join(scratch, "demo.tar.gz");
+  execFileSync("tar", ["-czf", archive, "-C", packageRoot, "."]);
+  const sha256 = createHash("sha256").update(readFileSync(archive)).digest("hex");
+  const download = (checksum, target = "aarch64-apple-darwin") => ({ [target]: { url: pathToFileURL(archive).href, sha256: checksum } });
+  const marketplace = join(scratch, "tick-market");
+  writeFiles(marketplace, {
+    "marketplace.json": {
+      name: "ticks",
+      owner: { name: "Test" },
+      packages: [
+        { name: "demo", version: "1.2.0", description: "Demo", downloads: download(sha256) },
+        { name: "tampered", version: "1.0.0", description: "Tampered", downloads: download("f".repeat(64)) },
+        { name: "elsewhere", version: "1.0.0", description: "Linux only", downloads: download(sha256, "x86_64-unknown-linux-musl") },
+      ],
+    },
+  });
+
+  const report = await createReport({ marketplace, tickloop: fakeTickloop(), workDirectory: join(scratch, "tick-work"), target: "aarch64-apple-darwin" });
+  const plugins = byName(report);
+
+  assert.equal(report.marketplace.format, "tick");
+  assert.equal(report.marketplace.file, "marketplace.json");
+  assert.deepEqual(
+    { status: plugins.demo.status, revision: plugins.demo.revision, format: plugins.demo.manifestFormat, used: plugins.demo.supportedComponents },
+    { status: STATUS.installable, revision: "1.2.0", format: "tick-package.json", used: ["tick", "skills"] },
+  );
+  assert.equal(plugins.tampered.status, STATUS.notFetchable);
+  assert.match(plugins.tampered.errors[0], new RegExp(`SHA-256 is ${sha256}`));
+  assert.deepEqual({ status: plugins.elsewhere.status, errors: plugins.elsewhere.errors }, { status: STATUS.unsupportedSource, errors: ["no download for aarch64-apple-darwin"] });
+});
+
+test("the command writes the Markdown and JSON reports under the output directory", () => {
+  const marketplace = join(scratch, "local-market");
+  writeFiles(marketplace, {
+    ".claude-plugin/marketplace.json": { name: "local market", owner: { name: "Test" }, plugins: [{ name: "solo", source: "./solo" }] },
+    "solo/skills/one/SKILL.md": skill("one"),
+  });
+  const out = join(scratch, "out");
+  const output = execFileSync(process.execPath, [script, marketplace, "--tickloop", fakeTickloop(), "--out", out], { encoding: "utf8" });
+
+  assert.match(output, /^1 plugins: 1 installable \(1 with Skills or a Tick program\), 0 invalid, 0 not fetchable, 0 with an unsupported source\.$/m);
+  assert.equal(JSON.parse(readFileSync(join(out, "local-market.json"), "utf8")).plugins[0].manifestFormat, "marketplace entry");
+  assert.match(readFileSync(join(out, "local-market.md"), "utf8"), /^\| solo \| path \.\/solo \| installable \|/m);
+  assert.ok(existsSync(join(out, "work", "plugins", "solo", ".claude-plugin", "plugin.json")));
+  assert.ok(!existsSync(join(marketplace, "solo", ".claude-plugin")), "the marketplace stays untouched");
+});
+
+test("the built tickloop reads the fixture marketplace the same way", { skip: !existsSync(builtTickloop) && "build tickloop with cargo build -p tickloop-code first" }, async () => {
+  const fixture = claudeMarketplace();
+  const report = await createReport({
+    marketplace: pathToFileURL(fixture.marketplace).href,
+    tickloop: builtTickloop,
+    workDirectory: join(scratch, "built-work"),
+    target: "aarch64-apple-darwin",
+  });
+  const plugins = byName(report);
+
+  assert.deepEqual(
+    { installable: report.totals.installable, invalid: report.totals.invalid, notFetchable: report.totals.notFetchable, unsupportedSource: report.totals.unsupportedSource },
+    { installable: 4, invalid: 1, notFetchable: 3, unsupportedSource: 1 },
+  );
+  assert.deepEqual(plugins.notes.unsupportedComponents, ["commands"]);
+  assert.deepEqual(plugins.remote.unsupportedComponents, ["MCP servers"]);
+  assert.deepEqual({ format: plugins.sub.manifestFormat, skills: plugins.sub.skills }, { format: "marketplace entry", skills: ["skills/draft"] });
+  assert.match(plugins.broken.errors[0], /Broken_Name/);
+});
