@@ -15,7 +15,6 @@ edition = "2024"
 publish = false
 license = "MIT"
 repository = "https://github.com/tickloopai/tickloop"
-homepage = "https://tickloop.ai"
 
 [profile.dev]
 debug = "line-tables-only"

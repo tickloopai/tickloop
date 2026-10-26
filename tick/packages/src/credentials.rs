@@ -115,7 +115,7 @@ impl PackageCredentials {
     }
 
     /// The credentials around the OAuth token file at `token_file`, an absolute path to a file
-    /// named [`OAUTH_TOKEN_FILE_NAME`], as a program is pointed at it: the lock and the other
+    /// named `oauth2.json`, as a program is pointed at it: the lock and the other
     /// files are beside it.
     pub fn with_token_file(token_file: &Path) -> Result<Self, PackageError> {
         match token_file.parent() {
@@ -356,7 +356,7 @@ impl LockedOAuth {
     }
 }
 
-/// The config root Tickloop uses: [`CONFIG_ROOT_VARIABLE`] when it is set and not empty, else
+/// The config root Tickloop uses: `TICKLOOP_CONFIG_DIR` when it is set and not empty, else
 /// `.tickloop` in the home directory; `None` when there is neither.
 pub fn default_config_root() -> Option<PathBuf> {
     std::env::var_os(CONFIG_ROOT_VARIABLE)
