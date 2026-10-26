@@ -72,7 +72,7 @@ fn main() {
     let is_console = !arguments.first().is_some_and(|arg| {
         matches!(
             arg.to_str(),
-            Some("update" | "daemon" | "worker" | "monitor" | "tick")
+            Some("update" | "daemon" | "worker" | "monitor" | "tick" | "plugin")
         )
     }) && !arguments
         .iter()

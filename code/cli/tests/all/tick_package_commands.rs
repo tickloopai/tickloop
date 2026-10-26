@@ -422,7 +422,7 @@ pub(crate) fn succeeded(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
-fn failed(output: &Output) -> String {
+pub(crate) fn failed(output: &Output) -> String {
     assert_eq!(
         output.status.code(),
         Some(1),

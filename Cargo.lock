@@ -3950,6 +3950,7 @@ dependencies = [
  "tickloop-tick-installer",
  "tickloop-tick-oauth-test-server",
  "tickloop-tick-packages",
+ "tickloop-tick-plugins",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",
