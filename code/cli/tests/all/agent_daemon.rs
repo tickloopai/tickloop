@@ -838,9 +838,10 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
     use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
     const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
-    let daemon = PrivateDaemon::new();
-    let private_directory = daemon.path().to_path_buf();
-    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
+    let config_root = support::cli_runtime::config_root();
+    let private_directory = support::cli_runtime::daemon_directory_of(&config_root);
+    let executable =
+        support::cli_runtime::executable_in(&config_root, &support::fixture_cli::executable());
     let mut calls = Vec::new();
     for _ in 0..8 {
         let directory = private_directory.clone();
@@ -936,6 +937,7 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
             .unwrap();
     assert_eq!(replacement.daemon_epoch(), epoch);
     for (label, target, task_id) in &targets {
+        let mut last_shells = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let observation = replacement
@@ -959,12 +961,13 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
                     }) {
                         break;
                     }
+                    last_shells = snapshot.user_shells;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("Shell did not complete: {error}; {last_shells:?}"));
         let output = replacement
             .observe(ObservationRequest::Agent {
                 execution: *target,
