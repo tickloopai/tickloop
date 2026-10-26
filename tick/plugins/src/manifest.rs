@@ -359,9 +359,17 @@ fn from_document(
     insert_default_components(root, &mut components);
 
     let (tick, auth) = if format == ManifestFormat::Tickloop {
+        let program_name = marketplace_name.and_then(|_| {
+            document
+                .get("tick")?
+                .get("executable")?
+                .as_str()
+                .and_then(|path| Path::new(path).file_name()?.to_str())
+                .and_then(|file| file.strip_prefix("tick-"))
+        });
         tick_fields(
             root,
-            &name,
+            program_name.unwrap_or(&name),
             version.as_deref(),
             description.as_deref(),
             document,

@@ -456,8 +456,8 @@ async fn archive_entries_use_download_policy_without_mutating_the_installation_o
 }
 
 #[tokio::test]
-async fn missing_git_is_clear_and_timed_out_git_does_not_leave_helpers_running() {
-    use std::{os::unix::fs::PermissionsExt, time::Duration};
+async fn missing_git_is_clear_and_git_operations_are_bounded() {
+    use std::time::Duration;
     let fixture = Fixture::new();
     let source = GitSource {
         url: format!("file://{}", fixture.root().display()),
@@ -475,44 +475,16 @@ async fn missing_git_is_clear_and_timed_out_git_does_not_leave_helpers_running()
         error.to_string().contains("Git is not installed"),
         "{error}"
     );
-    let executable = fixture.root().join("slow-git");
-    let pid_file = fixture.root().join("helper-pid");
-    std::fs::write(
-        &executable,
-        format!(
-            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
-            pid_file.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (executable, pid_file) = blocking_git(&fixture);
     let slow = tick_plugins::GitClient::new(executable, Duration::from_secs(3));
     let error = match slow.checkout(&source, &fixture.root()).await {
         Ok(_) => panic!("slow git succeeded"),
         Err(error) => error,
     };
     assert!(error.to_string().contains("timed out"), "{error}");
-    let pid = std::fs::read_to_string(pid_file).unwrap();
-    let mut alive = true;
-    for _ in 0..50 {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", pid.trim()])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&output.stdout);
-        alive =
-            output.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z');
-        if !alive {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    if let Ok(pid) = std::fs::read_to_string(pid_file) {
+        assert_helper_stopped(&pid).await;
     }
-    if alive {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", pid.trim()])
-            .status();
-    }
-    assert!(!alive, "Git helper survived timeout");
     assert!(!std::fs::read_dir(fixture.root()).unwrap().any(|entry| {
         entry
             .unwrap()
@@ -1129,4 +1101,109 @@ async fn short_git_pins_can_select_a_commit_on_another_branch() {
         .await
         .unwrap();
     assert_eq!(checkout.commit(), feature);
+}
+
+#[tokio::test]
+async fn tickloop_marketplace_aliases_keep_the_authors_executable_path() {
+    let fixture = Fixture::new();
+    let root = fixture.source("tick-alias");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name":"tick-alias", "plugins":[{"name":"alias", "source":"./plugin"}]}),
+    );
+    write_json(
+        &root.join("plugin/.tickloop-plugin/plugin.json"),
+        &json!({
+            "name":"Original Display Name", "version":"1.0", "description":"A Tick plugin", "tick":{"executable":"bin/tick-original", "protocol":true}
+        }),
+    );
+    crate::support::write_program(&root.join("plugin/bin/tick-original"), "original");
+    fixture
+        .store
+        .add_marketplace(&MarketplaceSource::Directory(root), &no_http)
+        .await
+        .unwrap();
+    let installed = fixture
+        .store
+        .install_marketplace_plugin("tick-alias", "alias", &no_http)
+        .await
+        .unwrap()
+        .plugin;
+    assert_eq!(installed.name(), "alias");
+    assert_eq!(
+        installed.manifest.display_name.as_deref(),
+        Some("Original Display Name")
+    );
+    assert_eq!(
+        installed.executable(),
+        Some(installed.root.join("bin/tick-original"))
+    );
+    assert_eq!(fixture.store.get("alias").unwrap(), installed);
+}
+
+fn blocking_git(fixture: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = fixture.root().join("slow-git");
+    let pid_file = fixture.root().join("helper-pid");
+    let quoted_path = pid_file.to_string_lossy().replace('\'', "'\\''");
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\nsleep 30 &\necho $! > '{quoted_path}'\nwait\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (executable, pid_file)
+}
+
+async fn assert_helper_stopped(pid: &str) {
+    let mut alive = true;
+    for _ in 0..50 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        alive =
+            output.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z');
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if alive {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+    }
+    assert!(!alive, "Git helper survived cleanup");
+}
+
+#[tokio::test]
+async fn cancelling_git_stops_a_helper_after_it_has_started() {
+    let fixture = Fixture::new();
+    let (executable, pid_file) = blocking_git(&fixture);
+    let root = fixture.root();
+    let source = GitSource {
+        url: format!("file://{}", root.display()),
+        reference: None,
+        sha: None,
+        subdirectory: None,
+    };
+    let client = tick_plugins::GitClient::new(executable, std::time::Duration::from_secs(120));
+    let operation = tokio::spawn(async move { client.checkout(&source, &root).await });
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                if pid.trim().parse::<u32>().is_ok() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    operation.abort();
+    let _ = operation.await;
+    let pid = ready.expect("Git helper did not announce readiness");
+    assert_helper_stopped(&pid).await;
 }
