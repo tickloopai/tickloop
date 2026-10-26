@@ -164,7 +164,13 @@ async fn the_credential_lock_excludes_another_process() {
 #[tokio::test]
 async fn plugin_service_names_are_encoded_without_collisions_or_path_escape() {
     let root = tempfile::tempdir().unwrap();
-    for name in ["team/remote", "team%2Fremote", "team\\remote"] {
+    for name in [
+        "team/remote",
+        "team%2Fremote",
+        "team\\remote",
+        "remote",
+        "Remote",
+    ] {
         let adapter =
             FileCredentials::new(root.path(), "plugin:notes", &format!("plugin_notes_{name}"))
                 .unwrap();
@@ -173,7 +179,13 @@ async fn plugin_service_names_are_encoded_without_collisions_or_path_escape() {
         let _lock = adapter.lock().await.unwrap();
         adapter.save(&saved).await.unwrap();
     }
-    for name in ["team/remote", "team%2Fremote", "team\\remote"] {
+    for name in [
+        "team/remote",
+        "team%2Fremote",
+        "team\\remote",
+        "remote",
+        "Remote",
+    ] {
         let adapter =
             FileCredentials::new(root.path(), "plugin:notes", &format!("plugin_notes_{name}"))
                 .unwrap();
@@ -189,4 +201,30 @@ async fn plugin_service_names_are_encoded_without_collisions_or_path_escape() {
         );
     }
     assert!(!root.path().join("credentials/notes/mcp/team").exists());
+}
+
+#[tokio::test]
+async fn long_service_names_keep_distinct_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let names = ["x".repeat(300), format!("{}y", "x".repeat(299))];
+    for name in &names {
+        let adapter = FileCredentials::new(root.path(), "global", name).unwrap();
+        let mut saved = credential();
+        saved.registration.client_id = name.clone();
+        let _held = adapter.lock().await.unwrap();
+        adapter.save(&saved).await.unwrap();
+    }
+    for name in &names {
+        let adapter = FileCredentials::new(root.path(), "global", name).unwrap();
+        assert_eq!(
+            adapter
+                .load()
+                .await
+                .unwrap()
+                .unwrap()
+                .registration
+                .client_id,
+            *name
+        );
+    }
 }

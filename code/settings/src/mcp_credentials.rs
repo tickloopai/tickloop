@@ -1,6 +1,7 @@
 //! File adapter for one MCP Server's credential. Locks are shared by CLI logins and Workers.
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read},
@@ -15,6 +16,8 @@ use tickloop_harness::{
 
 const LOCK_RETRY: Duration = Duration::from_millis(20);
 const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+// Leave room for the atomic writer's pid and random suffix.
+const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 
 pub struct FileCredentials {
     directory: PrivateDirectory,
@@ -40,18 +43,29 @@ impl FileCredentials {
         {
             return Err(CredentialError("located"));
         }
+        // Preserve distinct identities on case-insensitive filesystems too.
+        let encoded_name = name
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+                {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect::<String>();
+        // A short encoded name never starts with the reserved hash marker.
+        let name = if encoded_name.len() > MAX_CREDENTIAL_NAME_BYTES {
+            format!("~{:x}", Sha256::digest(name.as_bytes()))
+        } else {
+            encoded_name
+        };
         Ok(Self {
             directory: PrivateDirectory::anchored(root.to_owned(), relative),
-            name: name
-                .bytes()
-                .map(|byte| {
-                    if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
-                        char::from(byte).to_string()
-                    } else {
-                        format!("%{byte:02X}")
-                    }
-                })
-                .collect(),
+            name,
         })
     }
 
