@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use tick_plugins::InstalledPlugins;
 use tick_plugins::{
     InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, MarketplaceRegistration,
     MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
@@ -10,6 +11,7 @@ use tick_plugins::{
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
     PluginRequest, install_from, plugin_http, read_marketplace, read_marketplaces, source_label,
+    unavailable_reason,
 };
 
 use super::plugin_command::{print_table, report, report_notes};
@@ -326,4 +328,85 @@ fn report_update(installation: &Installation) {
         InstallOutcome::Reinstalled => println!("Reinstalled plugin {id} {version} in {root}."),
     }
     report_notes(plugin);
+}
+
+/// Lists what every marketplace offers, merged by name, beside what is installed; a marketplace
+/// that cannot be read is reported and passed over.
+pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
+    let offers = read_marketplaces(HTTP, store, false).await?;
+    let installed = store.installed().map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    for offer in offers {
+        let marketplace = &offer.registration.name;
+        match offer.plugins {
+            Ok(plugins) => rows.extend(plugins.iter().map(|plugin| {
+                let mut status = installed_status(&installed, marketplace, plugin);
+                if let Some(reason) = unavailable_reason(plugin) {
+                    status.push_str(&format!("; {reason}"));
+                }
+                [
+                    format!("{}@{marketplace}", plugin.name),
+                    plugin.version.as_deref().map_or("-".to_owned(), safe_line),
+                    status,
+                    plugin
+                        .description
+                        .as_deref()
+                        .map(safe_line)
+                        .unwrap_or_default(),
+                ]
+            })),
+            Err(reason) => eprintln!(
+                "Warning: cannot read marketplace {marketplace}: {}",
+                safe_line(&reason)
+            ),
+        }
+    }
+    if rows.is_empty() {
+        println!("No marketplace offers plugins yet.");
+        return Ok(());
+    }
+    rows.sort_by(|left, right| {
+        let key = |row: &[String; 4]| {
+            row[0]
+                .split_once('@')
+                .map(|(name, marketplace)| (name.to_owned(), marketplace.to_owned()))
+        };
+        key(left).cmp(&key(right))
+    });
+    print_table(&rows);
+    Ok(())
+}
+
+/// What is installed of the plugin `offered` the marketplace `marketplace` lists.
+fn installed_status(
+    installed: &InstalledPlugins,
+    marketplace: &str,
+    offered: &MarketplacePlugin,
+) -> String {
+    let usable = installed
+        .plugins
+        .iter()
+        .find(|plugin| plugin.name() == offered.name);
+    let unusable = installed
+        .broken
+        .iter()
+        .find(|plugin| plugin.name == offered.name);
+    match (usable, unusable) {
+        (Some(plugin), _) if plugin.marketplace == marketplace => {
+            if offered.version.as_ref() == Some(&plugin.version) {
+                "installed".to_owned()
+            } else {
+                format!("installed {}", plugin.version)
+            }
+        }
+        (None, Some(plugin)) if plugin.marketplace == marketplace => {
+            format!("installed {} but unusable", plugin.version)
+        }
+        (Some(plugin), _) => format!("not installed; {} is installed", plugin.id()),
+        (None, Some(plugin)) => format!(
+            "not installed; {}@{} is installed",
+            plugin.name, plugin.marketplace
+        ),
+        (None, None) => "not installed".to_owned(),
+    }
 }

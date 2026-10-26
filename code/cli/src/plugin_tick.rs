@@ -2,20 +2,15 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use super::plugin_command::{print_table, report};
+use super::plugin_command::report;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
-use tick_packages::{
-    ApiKey, CURRENT_TARGET, LoginState, OAuthIssuer, PackageAuth, PackageCredentials,
-    validate_package_name,
-};
+use tick_packages::{ApiKey, OAuthIssuer, PackageAuth, PackageCredentials, validate_package_name};
 use tick_plugins::{InstalledPlugin, PluginError, PluginStore};
 use tickloop_code_console::terminal::safe_line;
-use tickloop_tick_installer::{
-    InstalledVersion, MarketplaceSource, log_out, login_label, needs_no_login, start_login,
-};
+use tickloop_tick_installer::{MarketplaceSource, log_out, needs_no_login, start_login};
 use tokio_util::sync::CancellationToken;
 
 /// Installs the version of `name` the marketplace offers, unless it is installed already.
@@ -256,63 +251,4 @@ fn installed_package(store: &PluginStore, name: &str) -> Result<InstalledPlugin,
         }
         _ => error.to_string(),
     })
-}
-
-/// Lists the marketplace's packages with the version each offers, the version installed and its
-/// login state, and whether this platform has a download.
-pub(super) async fn list_available(store: &PluginStore) -> Result<(), String> {
-    let source = MarketplaceSource::configured()?;
-    let marketplace = source
-        .read(&tickloop_code_settings::package_http::client)
-        .await?;
-    let installed = store.installed().map_err(|error| error.to_string())?;
-    println!(
-        "Tick marketplace {} by {}: {}",
-        marketplace.name,
-        marketplace.owner.name,
-        safe_line(&source.to_string())
-    );
-    if marketplace.packages.is_empty() {
-        println!("It offers no Tick packages yet.");
-        return Ok(());
-    }
-    let login_of = |name: &str| {
-        installed
-            .plugins
-            .iter()
-            .find(|package| package.manifest.name == name)
-            .map_or(LoginState::Unknown, |package| store.login_state(package))
-    };
-    let rows = tickloop_tick_installer::offers(&marketplace, &installed)
-        .into_iter()
-        .map(|offer| {
-            let package = offer.package;
-            let (mut status, login) = match offer.installed {
-                InstalledVersion::Offered => {
-                    ("installed".to_owned(), login_label(login_of(&package.name)))
-                }
-                InstalledVersion::Other(version) => (
-                    format!("installed {version}"),
-                    login_label(login_of(&package.name)),
-                ),
-                InstalledVersion::Unusable(version) => (
-                    format!("installed {version} but unusable"),
-                    login_label(LoginState::Unknown),
-                ),
-                InstalledVersion::NotInstalled => ("not installed".to_owned(), "-"),
-            };
-            if !offer.is_installable {
-                status.push_str(&format!("; no prebuilt program for {CURRENT_TARGET}"));
-            }
-            [
-                package.name,
-                package.version,
-                status,
-                login.to_owned(),
-                package.description,
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_table(&rows);
-    Ok(())
 }

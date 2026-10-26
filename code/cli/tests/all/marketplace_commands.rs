@@ -10,8 +10,11 @@ use std::{
 
 use serde_json::{Value, json};
 
+use tick_packages::CURRENT_TARGET;
+
 use crate::tick_package_commands::{
-    Fixture, OFFICIAL_MARKETPLACE_REPOSITORY, failed, marketplace_json, path_text, succeeded,
+    Fixture, OFFICIAL_MARKETPLACE_REPOSITORY, failed, marketplace_json, offered, path_text,
+    succeeded,
 };
 
 const DEFAULT_TICK_MARKETPLACE: &str = "tick-marketplace";
@@ -423,5 +426,282 @@ fn a_name_several_marketplaces_offer_lists_them_and_an_unreadable_marketplace_is
         ),
         "{}",
         stderr(&absent)
+    );
+}
+
+#[test]
+fn the_available_plugins_merge_every_marketplace_and_one_that_cannot_be_read_stops_nothing() {
+    let fixture = Fixture::new();
+    let other_target = "x86_64-unknown-linux-gnu";
+    let sha256 = "a".repeat(64);
+    fixture.marketplace_file(
+        DEFAULT_TICK_MARKETPLACE,
+        &marketplace_json(json!([
+            offered(
+                "sample",
+                "1.0.0",
+                &[(CURRENT_TARGET, "https://example.com/sample.tar.gz", &sha256)]
+            ),
+            offered(
+                "elsewhere",
+                "0.1.0",
+                &[(
+                    other_target,
+                    "https://example.com/elsewhere.tar.gz",
+                    &sha256
+                )]
+            ),
+        ])),
+    );
+    let team = marketplace_directory(
+        &fixture,
+        "team",
+        "team-tools",
+        json!([
+            {"name": "review", "source": "./plugins/review", "description": "Reviews code"},
+            {"name": "packaged", "source": {"source": "npm", "package": "packaged"}},
+        ]),
+    );
+    write_skill(&team.join("plugins/review/skills/check"), "check", "Team");
+    let commit = commit_all(&team, "team");
+    let lab = marketplace_directory(
+        &fixture,
+        "lab",
+        "lab",
+        json!([
+            {"name": "review", "source": "./review", "version": "3.0.0"},
+            {"name": "lint", "source": "./lint", "description": "Lints"},
+        ]),
+    );
+    write_skill(&lab.join("review/skills/check"), "check", "Lab");
+    write_skill(&lab.join("lint/skills/lint"), "lint", "Lint");
+    succeeded(&plugin(&fixture, &["marketplace", "add", &file_url(&team)]));
+    succeeded(&plugin(&fixture, &["marketplace", "add", &path_text(&lab)]));
+    succeeded(&plugin(&fixture, &["install", "review@team-tools"]));
+    succeeded(&plugin(&fixture, &["install", "lint@lab"]));
+
+    let available = plugin(&fixture, &["list", "--available"]);
+    assert!(available.status.success(), "{}", stderr(&available));
+    let short = &commit[..12];
+    assert_eq!(
+        rows(&stdout(&available)),
+        [
+            vec![
+                "elsewhere@tickloop".to_owned(),
+                "0.1.0".to_owned(),
+                format!("not installed; no prebuilt program for {CURRENT_TARGET}"),
+                "The elsewhere package".to_owned(),
+            ],
+            vec![
+                "lint@lab".to_owned(),
+                "-".to_owned(),
+                "installed local".to_owned(),
+                "Lints".to_owned()
+            ],
+            vec![
+                "packaged@team-tools".to_owned(),
+                "-".to_owned(),
+                "not installed; npm sources are not supported yet".to_owned(),
+            ],
+            vec![
+                "review@lab".to_owned(),
+                "3.0.0".to_owned(),
+                "not installed; review@team-tools is installed".to_owned(),
+            ],
+            vec![
+                "review@team-tools".to_owned(),
+                "-".to_owned(),
+                format!("installed {short}"),
+                "Reviews code".to_owned(),
+            ],
+            vec![
+                "sample@tickloop".to_owned(),
+                "1.0.0".to_owned(),
+                "not installed".to_owned(),
+                "The sample package".to_owned(),
+            ],
+        ]
+    );
+    assert!(
+        stderr(&available).starts_with(
+            "Warning: cannot read marketplace claude-plugins-official: Git operation failed: "
+        ),
+        "{}",
+        stderr(&available)
+    );
+    assert_eq!(stderr(&available).lines().count(), 1);
+
+    fs::rename(&team, fixture.root.join("sources/team-moved")).unwrap();
+    let updated = plugin(&fixture, &["update"]);
+    assert_eq!(updated.status.code(), Some(1));
+    assert_eq!(
+        stdout(&updated),
+        format!(
+            "Reinstalled plugin lint@lab local in {}.\n",
+            cached_root(&fixture, "lab", "lint", "local")
+        )
+    );
+    let errors = stderr(&updated);
+    assert!(
+        errors.starts_with(
+            "Error: cannot update review@team-tools: cannot read marketplace team-tools: Git operation failed: "
+        ),
+        "{errors}"
+    );
+    assert!(
+        errors.ends_with("\nError: 1 of 2 plugins could not be updated\n"),
+        "{errors}"
+    );
+
+    let refreshed = plugin(&fixture, &["marketplace", "update"]);
+    assert_eq!(refreshed.status.code(), Some(1));
+    assert_eq!(
+        stdout(&refreshed),
+        "Updated marketplace tickloop; it offers 2 plugins.\n\
+         Updated marketplace lab; it offers 2 plugins.\n"
+    );
+    let errors = stderr(&refreshed)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(errors[0].starts_with("Error: cannot update marketplace claude-plugins-official: "));
+    assert!(errors[1].starts_with("Error: cannot update marketplace team-tools: "));
+    assert_eq!(errors[2], "Error: 2 of 4 marketplaces could not be updated");
+    assert_eq!(
+        rows(&succeeded(&plugin(&fixture, &["list"])))
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        ["lint@lab", "review@team-tools"]
+    );
+}
+
+#[test]
+fn the_built_in_git_marketplace_is_fetched_on_first_use_and_installs_each_kind_of_git_source() {
+    let fixture = Fixture::new();
+    let external = fixture.root.join("sources/external");
+    write_skill(&external.join("skills/fetch"), "fetch", "Fetch");
+    let external_commit = commit_all(&external, "external");
+    let monorepo = fixture.root.join("sources/monorepo");
+    write_skill(&monorepo.join("plugins/nested/skills/nest"), "nest", "Nest");
+    write_skill(&monorepo.join("other/skills/other"), "other", "Other");
+    let monorepo_commit = commit_all(&monorepo, "monorepo");
+    let official = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
+    write_json(
+        &official.join("plugins/notion/.claude-plugin/plugin.json"),
+        &json!({"name": "Notion", "version": "1.0.0"}),
+    );
+    write_skill(
+        &official.join("plugins/notion/skills/pages"),
+        "pages",
+        "Pages",
+    );
+    let official_commit = {
+        official_marketplace(
+            &fixture,
+            json!([
+                {"name": "notion", "source": "./plugins/notion"},
+                {"name": "fetcher", "source": {"source": "url", "url": file_url(&external)}},
+                {"name": "nested", "source": {
+                    "source": "git-subdir", "url": file_url(&monorepo), "path": "plugins/nested"
+                }},
+            ]),
+        );
+        git(&official, &["rev-parse", "HEAD"])
+    };
+    let official_row = |fixture: &Fixture| {
+        rows(&succeeded(&plugin(fixture, &["marketplace", "list"])))
+            .into_iter()
+            .find(|row| row[0] == "claude-plugins-official")
+            .unwrap()
+    };
+    assert_eq!(official_row(&fixture)[2], "built in; not fetched yet");
+
+    let notion_root = cached_root(
+        &fixture,
+        "claude-plugins-official",
+        "notion",
+        &official_commit[..12],
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "notion"])),
+        format!(
+            "Installed plugin notion@claude-plugins-official 1.0.0 in {notion_root}.\n\
+             Its manifest calls it Notion.\n"
+        )
+    );
+    let state = &official_row(&fixture)[2];
+    assert!(
+        state.starts_with("built in; updated ")
+            && state.ends_with(&format!(" at {}", &official_commit[..12])),
+        "{state}"
+    );
+    let fetcher_root = cached_root(
+        &fixture,
+        "claude-plugins-official",
+        "fetcher",
+        &external_commit[..12],
+    );
+    assert_eq!(
+        succeeded(&plugin(
+            &fixture,
+            &["install", "fetcher@claude-plugins-official"]
+        )),
+        format!(
+            "Installed plugin fetcher@claude-plugins-official {} in {fetcher_root}.\n",
+            &external_commit[..12]
+        )
+    );
+    let nested_root = cached_root(
+        &fixture,
+        "claude-plugins-official",
+        "nested",
+        &monorepo_commit[..12],
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "nested"])),
+        format!(
+            "Installed plugin nested@claude-plugins-official {} in {nested_root}.\n",
+            &monorepo_commit[..12]
+        )
+    );
+    for (root, skill) in [
+        (&notion_root, "pages"),
+        (&fetcher_root, "fetch"),
+        (&nested_root, "nest"),
+    ] {
+        assert!(
+            Path::new(root)
+                .join("skills")
+                .join(skill)
+                .join("SKILL.md")
+                .is_file()
+        );
+    }
+    assert!(!Path::new(&nested_root).join("other").exists());
+    assert_eq!(
+        rows(&succeeded(&plugin(&fixture, &["list"]))),
+        [
+            vec![
+                "fetcher@claude-plugins-official".to_owned(),
+                external_commit[..12].to_owned(),
+                "enabled".to_owned(),
+                "no login needed".to_owned(),
+            ],
+            vec![
+                "nested@claude-plugins-official".to_owned(),
+                monorepo_commit[..12].to_owned(),
+                "enabled".to_owned(),
+                "no login needed".to_owned(),
+            ],
+            vec![
+                "notion@claude-plugins-official".to_owned(),
+                "1.0.0".to_owned(),
+                "enabled".to_owned(),
+                "no login needed".to_owned(),
+                "manifest name: Notion".to_owned(),
+            ],
+        ]
     );
 }

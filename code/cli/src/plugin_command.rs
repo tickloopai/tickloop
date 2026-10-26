@@ -82,7 +82,9 @@ pub async fn run(arguments: &[OsString]) -> Result<(), String> {
             super::plugin_tick::login(&store()?, &name, issuer.as_deref()).await?
         }
         PluginCommand::Logout(name) => super::plugin_tick::logout(&store()?, &name).await?,
-        PluginCommand::ListAvailable => super::plugin_tick::list_available(&store()?).await?,
+        PluginCommand::ListAvailable => {
+            super::plugin_marketplace::list_available(&store()?).await?
+        }
         PluginCommand::InstallPath(path) => install_path(&store()?, path)?,
         PluginCommand::Uninstall { name, keep_data } => uninstall(&store()?, &name, keep_data)?,
         PluginCommand::SetEnabled { name, enabled } => set_enabled(&store()?, &name, enabled)?,
@@ -235,9 +237,12 @@ pub(super) fn report(installation: &Installation) {
     report_notes(plugin);
 }
 
-/// Whether `plugin` stays disabled, that its program runs as the user, and what its manifest
+/// The name its manifest gives `plugin`, whether it stays disabled, that its program runs as the user, and what its manifest
 /// leaves unused.
 pub(super) fn report_notes(plugin: &InstalledPlugin) {
+    if let Some(display_name) = &plugin.manifest.display_name {
+        println!("Its manifest calls it {}.", safe_line(display_name));
+    }
     if !plugin.enabled {
         println!(
             "It stays disabled; tickloop plugin enable {} turns it on.",
@@ -332,16 +337,22 @@ fn list(store: &PluginStore) -> Result<(), String> {
         .iter()
         .map(|plugin| {
             let unsupported = plugin.manifest.unsupported();
+            let notes = plugin
+                .manifest
+                .display_name
+                .iter()
+                .map(|display_name| format!("manifest name: {}", safe_line(display_name)))
+                .chain(
+                    (!unsupported.is_empty())
+                        .then(|| format!("not supported yet: {}", component_labels(&unsupported))),
+                )
+                .collect::<Vec<_>>();
             [
                 plugin.id(),
                 plugin.version.clone(),
                 enabled_label(plugin.enabled).to_owned(),
                 login_label(store.login_state(plugin)).to_owned(),
-                if unsupported.is_empty() {
-                    String::new()
-                } else {
-                    format!("not supported yet: {}", component_labels(&unsupported))
-                },
+                notes.join("; "),
             ]
         })
         .chain(broken.iter().map(|plugin| {
