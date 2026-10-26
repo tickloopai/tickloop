@@ -4100,6 +4100,7 @@ dependencies = [
  "tickloop-harness",
  "tickloop-ids",
  "tickloop-tick-packages",
+ "tickloop-tick-plugins",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",

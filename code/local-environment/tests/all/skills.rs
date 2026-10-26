@@ -732,6 +732,80 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
     agent.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_plugin_skill_with_allowed_tools_loads_but_its_tools_still_ask_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_root = root.join("config");
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    let source = root.join("sources/notes");
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        json!({"name": "notes"}).to_string(),
+    )
+    .unwrap();
+    write_skill(
+        &source.join("skills"),
+        "mark",
+        "name: mark\ndescription: Marks the folder\nallowed-tools: [Write]",
+        "Create the marker with Write.",
+    );
+    tick_plugins::PluginStore::in_config_root(&config_root)
+        .install_path(&source)
+        .unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("load", "Skill", json!({"skill": "notes:mark"})),
+        call(
+            "write",
+            "Write",
+            json!({"file_path": root.join("marker"), "content": "marked"}),
+        ),
+    ]));
+    let agent = Agent::open(config_root.clone(), config(), model.clone()).unwrap();
+    agent
+        .trust_working_directory(workdir.clone())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+
+    agent.submit(chat, "Mark the folder".into()).await.unwrap();
+    let mut asked = false;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                assert!(!asked, "asked twice");
+                asked = true;
+                agent
+                    .answer_permission(chat, request.id, false)
+                    .await
+                    .unwrap();
+            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if call_id == "load" => {
+                assert!(!result.is_error, "{}", result.content);
+            }
+            EventKind::Interrupted => break,
+            EventKind::Completed { .. } => panic!("the denied write did not stop the turn"),
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+
+    assert!(asked, "the Skill's allowed-tools did not approve Write");
+    assert!(!root.join("marker").exists());
+    let loaded = serde_json::to_string(&model.requests.lock().unwrap()[1].messages).unwrap();
+    assert!(loaded.contains("Create the marker with Write."), "{loaded}");
+    agent.shutdown().await;
+}
+
 /// An Agent whose config root is `config_root`, with a Chat in `workdir` and the replies it gives,
 /// one per request.
 async fn agent_in(
