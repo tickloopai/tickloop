@@ -324,11 +324,11 @@ Where the Agent's Bash, file tools, and Ticks actually run, connected to the Har
 _Avoid_: hands (colloquial only), executor
 
 **Folder**:
-The directory bound to a Chat in which the Agent reads and writes files and runs commands, located in that Chat's Execution Environment; a local Chat uses its startup working directory as its Folder.
+The directory bound to a Chat in which the Agent reads and writes files and runs commands, located in that Chat's Execution Environment, which decides which of these it supports (a read-only connected directory supports reading files only); a local Chat uses its startup working directory as its Folder.
 _Avoid_: Workspace (that means the Herdr Workspace), Project
 
 **Work**:
-A Chat with a Folder bound; it is a state of a Chat, not a separate kind of conversation entity, and the UI shows it alongside Chat as Chat/Work. Ticks (except Artifact Ticks) are available only in Work.
+A Chat with a Folder bound; it is a state of a Chat, not a separate kind of conversation entity, and the UI shows it alongside Chat as Chat/Work. Ticks (except Artifact Ticks) are available only in Work whose Execution Environment supports them.
 _Avoid_: Cowork, agent mode, work mode
 
 **Tickloop Accounts**:
