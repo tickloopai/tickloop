@@ -82,6 +82,10 @@ pub(crate) fn request_failure(error: &ServiceError, resource_uri: Option<&str>) 
     }
 }
 
+pub(crate) fn session_expired(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::TransportSend(error) if matches!(error.error.downcast_ref::<StreamableHttpError<McpHttpError>>(), Some(StreamableHttpError::Client(McpHttpError::Status(StatusCode::NOT_FOUND)))))
+}
+
 fn transport_failure(error: &StreamableHttpError<McpHttpError>) -> String {
     match error {
         StreamableHttpError::Client(McpHttpError::Status(StatusCode::UNAUTHORIZED)) => {
@@ -137,6 +141,7 @@ pub(crate) struct McpHttpClient {
     token: Arc<str>,
     unauthorized: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
+    headers: HashMap<HeaderName, HeaderValue>,
 }
 
 impl McpHttpClient {
@@ -152,7 +157,55 @@ impl McpHttpClient {
             token: token.into(),
             unauthorized: Arc::new(AtomicBool::new(false)),
             artifact: None,
+            headers: HashMap::new(),
         })
+    }
+
+    pub(crate) fn for_server(
+        endpoint: Url,
+        headers: &std::collections::BTreeMap<String, String>,
+        token: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let local = endpoint.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && local)
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            return Err("MCP endpoint requires HTTPS or loopback HTTP".into());
+        }
+        let mut http = Self::new(endpoint.clone(), token.unwrap_or_default())?;
+        let mut policy = HttpPolicy::new(Policy::none());
+        policy.timeout = Some(timeout);
+        policy.connect_timeout = Some(Duration::from_secs(5));
+        http.client = build_http_client(&endpoint, policy)
+            .map_err(|_| "MCP HTTP client unavailable")?
+            .0;
+        for (name, value) in headers {
+            let name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| "invalid MCP header name")?;
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "accept"
+                    | "content-type"
+                    | "mcp-session-id"
+                    | "last-event-id"
+                    | "content-length"
+                    | "transfer-encoding"
+            ) {
+                return Err("reserved MCP header".into());
+            }
+            let value = HeaderValue::from_str(value).map_err(|_| "invalid MCP header value")?;
+            http.headers.insert(name, value);
+        }
+        Ok(http)
     }
 
     pub(crate) fn with_artifact_credentials(
@@ -203,15 +256,20 @@ impl McpHttpClient {
         custom: HashMap<HeaderName, HeaderValue>,
     ) -> Result<reqwest::RequestBuilder, StreamableHttpError<McpHttpError>> {
         let url = Url::parse(uri).map_err(|_| unexpected("invalid MCP endpoint"))?;
-        if url != self.endpoint || auth.as_deref() != Some(&self.token) {
+        if url != self.endpoint || auth.as_deref().unwrap_or("") != self.token.as_ref() {
             return Err(unexpected("MCP endpoint or authorization changed"));
         }
         let mut request = self
             .client
             .request(method, url)
             .header(header::USER_AGENT, USER_AGENT)
-            .header(header::ACCEPT, "application/json, text/event-stream")
-            .bearer_auth(self.token.as_ref());
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if !self.token.is_empty() {
+            request = request.bearer_auth(self.token.as_ref());
+        }
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
         for (name, value) in custom {
             if matches!(
                 name.as_str(),

@@ -388,13 +388,14 @@ mod tests {
                 Vec::new(),
             )),
         );
-        core.install_host_tools(Arc::new(
+        core.install_host_tools(vec![Arc::new(
             tickloop_harness::runtime::mcp_tools::McpHostToolProvider::new(
                 ArtifactClient::for_origin(directory.canonicalize().unwrap(), origin).unwrap(),
                 None,
             ),
-        ))
-        .unwrap();
+        )
+            as Arc<dyn tickloop_harness::runtime::host_tools::HostToolProvider>])
+            .unwrap();
         let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
         let agent = ConsoleExecution::from_access_for_test(
             access.clone(),

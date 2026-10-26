@@ -49,6 +49,8 @@ use tickloop_harness::protocol::{
     ModelConfig, PermissionRule, ReasoningEffort,
 };
 
+pub mod mcp;
+
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
 const MODEL_KEY: &str = "model";

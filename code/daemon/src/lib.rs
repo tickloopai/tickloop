@@ -741,7 +741,7 @@ pub async fn build_runtime_with_models(
             local_state_root: settings
                 .as_ref()
                 .and_then(|settings| settings.root().map(ToOwned::to_owned)),
-            settings: settings.map(|settings| {
+            settings: settings.clone().map(|settings| {
                 Arc::new(settings) as Arc<dyn tickloop_harness::policy::settings::SettingsStore>
             }),
             host: launch.host_options,
@@ -766,22 +766,61 @@ pub async fn build_runtime_with_models(
         }),
     ));
     agent.install_tick_stream(adapters.clone()).await;
+    let mut sources: Vec<Arc<dyn tickloop_harness::runtime::host_tools::HostToolProvider>> =
+        Vec::new();
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = tickloop_harness::artifacts::ArtifactClient::new(root)
     {
-        agent
-            .install_host_tools(Arc::new(
-                tickloop_harness::runtime::mcp_tools::McpHostToolProvider::new(
-                    artifact,
-                    tick_tools.clone(),
-                ),
-            ))
-            .map_err(|error| format!("cannot install MCP tools: {error}"))?;
+        sources.push(Arc::new(
+            tickloop_harness::runtime::mcp_tools::McpHostToolProvider::new(
+                artifact,
+                tick_tools.clone(),
+            ),
+        ));
     } else if let Some(tick_tools) = tick_tools {
-        agent
-            .install_host_tools(tick_tools)
-            .map_err(|error| format!("cannot install Tick tools: {error}"))?;
+        sources.push(tick_tools);
     }
+    if let Some(settings) = settings {
+        use tickloop_harness::runtime::mcp::{HostCapabilities, McpConnections, McpToolProvider};
+        let startup_environment: std::collections::BTreeMap<String, String> = launch
+            .environment
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    String::from_utf8(entry.name.clone()).ok()?,
+                    String::from_utf8(entry.value.clone()).ok()?,
+                ))
+            })
+            .collect();
+        let log_directory = tickloop_harness::base::private_fs::PrivateDirectory::trusted(
+            settings.root().expect("settings root").to_owned(),
+        )
+        .join("logs")
+        .join("mcp")
+        .join(std::process::id().to_string());
+        let connections = McpConnections::new(
+            HostCapabilities {
+                local_processes: true,
+                scripts: false,
+            },
+            std::collections::BTreeMap::new(),
+            startup_environment.clone(),
+        )
+        .with_stderr_directory(log_directory);
+        let folder = launch.folder.clone();
+        let configuration = Arc::new(move || {
+            let resolved = settings.load().mcp_servers(&folder, &startup_environment);
+            for warning in resolved.warnings {
+                eprintln!("{warning}");
+            }
+            resolved.servers
+        });
+        connections.reconcile(configuration()).await;
+        sources.push(Arc::new(McpToolProvider::new(connections, configuration)));
+    }
+    agent
+        .install_host_tools(sources)
+        .map_err(|error| format!("cannot install host tools: {error}"))?;
     Ok((agent, environment))
 }
 

@@ -11,6 +11,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+percent-encoding = "2"
+base64 = "0.22"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
@@ -23,12 +25,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 jsonschema = { version = "0.56", default-features = false }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
-rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
+rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client", "transport-async-rw"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sse-stream = "0.2.4"
 thiserror = "2"
+tickloop-harness-connector = { path = "../connector" }
 tickloop-harness-artifacts = { path = "../artifacts" }
 tickloop-harness-base = { path = "../base" }
 tickloop-harness-policy = { path = "../policy" }
@@ -46,8 +49,6 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 [dev-dependencies]
-base64 = "0.22"
-percent-encoding = "2"
 serde_yaml_ng = "0.10"
 tempfile = "3"
 tickloop-harness-test-support = { path = "../test-support" }

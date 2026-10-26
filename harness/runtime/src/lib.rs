@@ -38,6 +38,7 @@ mod lifecycle;
 pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
 mod loop_lease;
+pub mod mcp;
 mod mcp_http;
 mod mcp_resources;
 pub mod mcp_tools;
@@ -719,6 +720,17 @@ fn host_tool_decision(
     execution_mode: ExecutionMode,
     has_human_input: bool,
 ) -> Decision {
+    if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
+        return if execution_mode == ExecutionMode::Plan {
+            Decision::Deny
+        } else if let Some(rule) = configured {
+            Decision::from(rule.decision)
+        } else if execution_mode == ExecutionMode::FullAccess {
+            Decision::Allow
+        } else {
+            Decision::Ask
+        };
+    }
     let is_allowed_by_host = configured.is_some_and(|matched| {
         matched.decision == tickloop_harness_tools::permissions::ExplicitPermissionDecision::Allow
             && matched.source == tickloop_harness_tools::permissions::RuleSource::Host
@@ -1132,12 +1144,15 @@ impl Agent {
     /// [`crate::host_tools::HostToolProvider::refresh`] to observe discovery failures.
     pub fn install_host_tools(
         &self,
-        provider: Arc<dyn crate::host_tools::HostToolProvider>,
+        sources: impl crate::host_tools::IntoHostToolSources,
     ) -> Result<(), AgentError> {
+        let sources = sources.into_sources();
         let reserved = reserved_host_tool_names();
-        let serves_artifacts = provider.artifact_client().is_some();
+        let serves_artifacts = sources
+            .iter()
+            .any(|source| source.artifact_client().is_some());
         let mut names = HashSet::new();
-        for definition in provider.definitions() {
+        for definition in sources.iter().flat_map(|source| source.definitions()) {
             let is_artifact_tool =
                 crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&definition.name.as_str());
             if definition.name.trim().is_empty()
@@ -1152,7 +1167,8 @@ impl Agent {
                 )));
             }
         }
-        *self.inner.host_tools.write().unwrap() = Some(provider);
+        *self.inner.host_tools.write().unwrap() =
+            Some(crate::host_tools::CompositeHostTools::combine(sources));
         Ok(())
     }
 
@@ -5429,8 +5445,11 @@ fn mcp_resource_authority_allowed(
         delegation
             .ceiling
             .host_tools
-            .get(crate::mcp_tools::ARTIFACT_READ_TOOL)
-            .is_some_and(|authorities| authorities.contains(authority))
+            .iter()
+            .any(|(name, authorities)| {
+                (name == crate::mcp_tools::ARTIFACT_READ_TOOL || name.starts_with("mcp__"))
+                    && authorities.contains(authority)
+            })
     })
 }
 

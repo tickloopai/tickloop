@@ -1,0 +1,161 @@
+//! A programmable MCP peer, also reachable over stdio using the bridge below.
+use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct McpService {
+    url: String,
+    state: Arc<Mutex<State>>,
+    cancel: CancellationToken,
+}
+struct State {
+    tools: Value,
+    result: Value,
+    calls: Vec<Value>,
+    delay: std::time::Duration,
+    directory_delay: std::time::Duration,
+    status: u16,
+    error: Option<Value>,
+    changed: bool,
+}
+impl McpService {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Self {
+            url: format!("http://{}/mcp", listener.local_addr().unwrap()),
+            state: Arc::new(Mutex::new(State {
+                tools: json!([]),
+                result: json!({"content":[]}),
+                calls: Vec::new(),
+                delay: std::time::Duration::ZERO,
+                directory_delay: std::time::Duration::ZERO,
+                status: 200,
+                error: None,
+                changed: false,
+            })),
+            cancel: CancellationToken::new(),
+        };
+        let state = server.state.clone();
+        let cancel = server.cancel.clone();
+        tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break };
+                        let state = state.clone();
+                        tasks.spawn(async move {
+                            let mut bytes = Vec::new();
+                            let header_end = loop {
+                                let mut chunk = [0; 4096];
+                                let Ok(size) = stream.read(&mut chunk).await else { return };
+                                if size == 0 { return; }
+                                bytes.extend_from_slice(&chunk[..size]);
+                                if let Some(index) = bytes.windows(4).position(|s| s == b"\r\n\r\n") { break index + 4; }
+                                if bytes.len() > 65536 { return; }
+                            };
+                            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                            if !headers.starts_with("POST ") {
+                                let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            let length = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).and_then(|(_, n)| n.trim().parse::<usize>().ok())).unwrap_or(0);
+                            if length > 8 * 1024 * 1024 { return; }
+                            while bytes.len() < header_end + length {
+                                let mut chunk = [0; 4096];
+                                let Ok(size) = stream.read(&mut chunk).await else { return };
+                                if size == 0 { return; }
+                                bytes.extend_from_slice(&chunk[..size]);
+                            }
+                            let Ok(request) = serde_json::from_slice::<Value>(&bytes[header_end..header_end + length]) else { return };
+                            let (status, delay, result, error, changed) = {
+                                let mut state = state.lock().unwrap();
+                                let method = request["method"].as_str().unwrap_or("");
+                                let result = match method {
+                                    "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":{"tools":{"listChanged":true},"resources":{}},"serverInfo":{"name":"fixture","version":"1"},"instructions":"Fixture service instructions"}),
+                                    "tools/list" => json!({"tools":state.tools}),
+                                    "resources/list" => json!({"resources":[{"uri":"fixture://text","name":"text"}]}),
+                                    "resources/read" => json!({"contents":[{"uri":"fixture://text","text":"resource text"}]}),
+                                    "tools/call" => { state.calls.push(request.clone()); state.result.clone() },
+                                    _ => json!({}),
+                                };
+                                let call = method == "tools/call";
+                                let changed = call && std::mem::take(&mut state.changed);
+                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed)
+                            };
+                            tokio::time::sleep(delay).await;
+                            let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
+                            let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
+                            let (status, content_type, body) = if request.get("id").is_none() {
+                                (202, "application/json", String::new())
+                            } else if changed {
+                                (status, "text/event-stream", format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n"))
+                            } else { (status, "application/json", response.to_string()) };
+                            let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                        });
+                    }
+                    Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                }
+            }
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        });
+        server
+    }
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+    pub fn set_tools(&self, tools: Value) {
+        self.state.lock().unwrap().tools = tools;
+    }
+    pub fn set_result(&self, result: Value) {
+        self.state.lock().unwrap().result = result;
+    }
+    pub fn set_delay(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().delay = delay;
+    }
+    pub fn set_directory_delay(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().directory_delay = delay;
+    }
+    pub fn set_status(&self, status: u16) {
+        self.state.lock().unwrap().status = status;
+    }
+    pub fn set_error(&self, error: Option<Value>) {
+        self.state.lock().unwrap().error = error;
+    }
+    pub fn notify_tools_changed(&self) {
+        self.state.lock().unwrap().changed = true;
+    }
+    pub fn calls(&self) -> Vec<Value> {
+        self.state.lock().unwrap().calls.clone()
+    }
+    pub fn stdio_args(&self) -> Vec<String> {
+        vec!["-u".into(), "-c".into(), STDIO_BRIDGE.into(), self.url()]
+    }
+}
+impl Drop for McpService {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+const STDIO_BRIDGE: &str = r#"
+import json, sys, urllib.request
+for line in sys.stdin:
+    req = urllib.request.Request(sys.argv[1], data=line.encode(), headers={'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req) as response:
+            body = response.read().decode()
+            if response.headers.get('Content-Type') == 'text/event-stream':
+                for event in body.splitlines():
+                    if event.startswith('data: '): print(event[6:], flush=True)
+            elif body: print(body, flush=True)
+    except Exception:
+        sys.exit(1)
+"#;

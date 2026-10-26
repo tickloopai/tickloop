@@ -22,3 +22,6 @@ mod streaming_snapshot;
 mod tick_tool_approval;
 #[path = "all/tick_tool_routes.rs"]
 mod tick_tool_routes;
+
+#[path = "all/mcp_servers.rs"]
+mod mcp_servers;

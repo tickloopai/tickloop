@@ -73,3 +73,6 @@ mod waiting_runs;
 
 #[path = "all/native_task_auto.rs"]
 mod native_task_auto;
+
+#[path = "all/mcp_servers.rs"]
+mod mcp_servers;

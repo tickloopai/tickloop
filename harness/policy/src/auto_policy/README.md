@@ -93,3 +93,7 @@ persistence or out-of-scope actions carried out through Bash or other exposed to
 There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 8.
 One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently nine native entry points that are not applicable.
 Custom rules and group replacements stay independent; users who replace the built-in Soft allow are not forced to have the Scheduling exception added back.
+
+## Third-party MCP tools
+
+`mcp__<server>__<tool>` uses `HostToolPermission::ThirdParty`. Without a user rule, Ask and Auto require human confirmation; Plan denies execution and Full Access allows it. Server annotations never grant permission. These calls do not enter the classifier by default, so no frozen rule is added or removed: the 82-rule policy and nine inapplicable native entry points above are unchanged. Resource discovery and reading use ReadOnly admission with the same frozen server authority.

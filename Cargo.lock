@@ -4464,6 +4464,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tickloop-harness-artifacts",
  "tickloop-harness-base",
+ "tickloop-harness-connector",
  "tickloop-harness-cron",
  "tickloop-harness-model",
  "tickloop-harness-policy",
@@ -4859,6 +4860,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

@@ -1325,10 +1325,11 @@ mod feedback_admission_tests {
             let (agent, receipt) = folderless_loop().await;
             let root = tempfile::tempdir().unwrap();
             agent
-                .install_host_tools(Arc::new(crate::mcp_tools::McpHostToolProvider::new(
+                .install_host_tools(vec![Arc::new(crate::mcp_tools::McpHostToolProvider::new(
                     ArtifactClient::for_origin(root.path(), "https://docs.example").unwrap(),
                     None,
-                )))
+                ))
+                    as Arc<dyn crate::host_tools::HostToolProvider>])
                 .unwrap();
             let identity = feedback_identity(&receipt);
             let pending: PendingInput = serde_json::from_value(serde_json::json!({

@@ -1,3 +1,6 @@
+mod composite;
+pub(crate) use composite::CompositeHostTools;
+pub use composite::IntoHostToolSources;
 use std::{any::Any, collections::BTreeSet, path::PathBuf};
 
 use async_trait::async_trait;
@@ -28,6 +31,8 @@ pub enum HostToolPermission {
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.
     Confirmation,
+    /// Third-party tools ask by default in Ask and Auto, regardless of server annotations.
+    ThirdParty,
 }
 
 struct HostPolicyIdentity {
@@ -191,6 +196,7 @@ impl PreparedHostCall {
 
 pub enum HostCallResult {
     Completed(ToolResult),
+    CompletedWithImages(ToolResult, Vec<tickloop_harness_protocol::Image>),
     CompletedWithEffect(ToolResult, Box<HostEffect>),
     NotDispatched(String),
     OutcomeUnknown(String),
@@ -347,7 +353,9 @@ pub fn current_workspace_host(provider: Option<&dyn HostToolProvider>) -> Worksp
 impl HostCallResult {
     pub fn status(&self) -> HostCallStatus {
         match self {
-            Self::Completed(_) | Self::CompletedWithEffect(_, _) => HostCallStatus::Completed,
+            Self::Completed(_)
+            | Self::CompletedWithImages(_, _)
+            | Self::CompletedWithEffect(_, _) => HostCallStatus::Completed,
             Self::NotDispatched(_) => HostCallStatus::NotDispatched,
             Self::OutcomeUnknown(_) => HostCallStatus::OutcomeUnknown,
         }
@@ -355,7 +363,7 @@ impl HostCallResult {
 
     pub fn into_tool_result(self) -> ToolResult {
         match self {
-            Self::Completed(result) => result,
+            Self::Completed(result) | Self::CompletedWithImages(result, _) => result,
             Self::CompletedWithEffect(result, _) => result,
             Self::NotDispatched(message) => host_error_result(message),
             Self::OutcomeUnknown(message) => host_error_result(format!(
@@ -430,6 +438,42 @@ pub trait HostToolProvider: Send + Sync {
 
     fn mcp_resource_server(&self) -> Option<McpResourceServer> {
         None
+    }
+
+    fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
+        self.mcp_resource_server().into_iter().collect()
+    }
+
+    async fn list_mcp_resources_for(
+        &self,
+        server: &str,
+        cursor: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        if !self
+            .mcp_resource_servers()
+            .iter()
+            .any(|source| source.name == server)
+        {
+            return Err("MCP resource server unavailable".into());
+        }
+        self.list_mcp_resources(cursor, cancel).await
+    }
+
+    async fn read_mcp_resource_for(
+        &self,
+        server: &str,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        if !self
+            .mcp_resource_servers()
+            .iter()
+            .any(|source| source.name == server)
+        {
+            return Err("MCP resource server unavailable".into());
+        }
+        self.read_mcp_resource(uri, cancel).await
     }
 
     /// The instructions of the MCP servers whose tools this provider currently offers.
