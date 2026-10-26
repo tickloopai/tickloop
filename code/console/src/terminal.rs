@@ -3478,6 +3478,12 @@ async fn interact_with_herdr(
                             report_refused_input(console,&refusal,&mut failed);
                             continue;
                         }
+                        if let Some(usage) = completion::unhandled_builtin_usage(&line) {
+                            console.restore_rejected_prompt(restored_contexts,&usage)?;
+                            console.hold_status(&usage)?;
+                            report_refused_input(console,&usage,&mut failed);
+                            continue;
+                        }
                         let input=if let Some(skill)=line.trim().strip_prefix('/') {
                             let (name,arguments)=skill.split_once(' ').unwrap_or((skill,""));
                             UserInput::Skill {name:name.into(),arguments:arguments.into()}
@@ -4041,6 +4047,12 @@ async fn interact_with_herdr(
                             }
                         },
                         _ if line.starts_with('/') => {
+                            if let Some(usage) = completion::unhandled_builtin_usage(&line) {
+                                console.restore_rejected_prompt(restored_contexts,&usage)?;
+                                console.hold_status(&usage)?;
+                                report_refused_input(console,&usage,&mut failed);
+                                continue;
+                            }
                             let command = line.trim_start_matches('/');
                             let (name, arguments) = command
                                 .split_once(char::is_whitespace)
@@ -4048,6 +4060,8 @@ async fn interact_with_herdr(
                             let directory=global.projection().dispatch_directory;
                             if selected_chat.is_none() && let Err(error) = agent.check_new_agent_skill(&directory,name,arguments) {
                                 console.restore_rejected_prompt(restored_contexts,&safe_line(&error))?;
+                                console.hold_status(&safe_line(&error))?;
+                                report_refused_input(console,&error,&mut failed);
                                 continue;
                             }
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {

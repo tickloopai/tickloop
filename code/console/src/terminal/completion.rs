@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use tickloop_code_settings::skills::SkillRegistry;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum CommandGroup {
     Conversation,
     ModelAndSettings,
@@ -385,6 +386,14 @@ pub(super) fn builtin_commands() -> &'static [CommandSpec] {
     COMMANDS
 }
 
+pub(super) fn unhandled_builtin_usage(line: &str) -> Option<String> {
+    let name = line.split_whitespace().next()?;
+    COMMANDS
+        .iter()
+        .find(|spec| spec.command == name && spec.menu_group != Some(CommandGroup::Skills))
+        .map(|spec| format!("Usage: {}", spec.syntax()))
+}
+
 /// The built-in command a submitted line names, and why it cannot act in `scope`.
 pub(super) fn unavailable_command(
     line: &str,
@@ -435,7 +444,7 @@ pub(super) struct CompletionCandidate {
 }
 
 impl CompletionCandidate {
-    fn syntax(&self) -> String {
+    pub(super) fn syntax(&self) -> String {
         if self.arguments.is_empty() {
             self.command.clone()
         } else {
@@ -444,11 +453,26 @@ impl CompletionCandidate {
     }
 }
 
+pub(super) fn skill_candidates(registry: &SkillRegistry) -> Arc<[CompletionCandidate]> {
+    registry
+        .user_definitions()
+        .map(|skill| CompletionCandidate {
+            command: format!("/{}", skill.name),
+            arguments: "[ARGUMENTS]".into(),
+            description: super::safe_line(&format!(
+                "{} · {}",
+                skill.source.display_label(),
+                skill.description
+            )),
+            menu_group: Some(CommandGroup::Skills),
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Completion {
-    scope: CommandScope,
     matches: Vec<CompletionCandidate>,
-    skills: Vec<CompletionCandidate>,
+    skills: Arc<[CompletionCandidate]>,
     selected: Option<usize>,
     draft: String,
     token_start: usize,
@@ -456,16 +480,8 @@ pub(super) struct Completion {
 }
 
 impl Completion {
-    pub(super) fn set_skills(&mut self, registry: &SkillRegistry) {
-        self.skills = registry
-            .user_definitions()
-            .map(|skill| CompletionCandidate {
-                command: format!("/{}", skill.name),
-                arguments: "[ARGUMENTS]".into(),
-                description: format!("{} · {}", skill.source.display_label(), skill.description),
-                menu_group: Some(CommandGroup::Skills),
-            })
-            .collect();
+    pub(super) fn set_skills(&mut self, skills: Arc<[CompletionCandidate]>) {
+        self.skills = skills;
     }
 
     #[cfg(test)]
@@ -475,7 +491,6 @@ impl Completion {
 
     pub(super) fn update_at(&mut self, draft: &str, cursor: usize, scope: CommandScope) {
         self.dismiss();
-        self.scope = scope;
 
         let Some((token_start, token_end)) = command_token(draft, cursor) else {
             return;
@@ -522,8 +537,11 @@ impl Completion {
                 })
                 .cloned(),
         );
-        self.matches
-            .sort_by(|left, right| left.command.cmp(&right.command));
+        self.matches.sort_by(|left, right| {
+            left.menu_group
+                .cmp(&right.menu_group)
+                .then_with(|| left.command.cmp(&right.command))
+        });
         if !self.matches.is_empty() {
             self.draft.push_str(draft);
             self.token_start = token_start;
@@ -745,7 +763,7 @@ mod tests {
         completion.update("/s");
         assert_eq!(
             command_names(&completion),
-            vec!["/settings", "/slides", "/stop"]
+            vec!["/settings", "/stop", "/slides"]
         );
         completion.update("/operations");
         assert!(!completion.is_open());

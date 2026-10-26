@@ -797,7 +797,7 @@ pub(super) struct State {
     completion: Completion,
     file_mentions: FileMentionState,
     file_index_worker: Option<Arc<FileIndexWorker>>,
-    completion_skills: Option<(PathBuf, tickloop_code_settings::skills::SkillRegistry)>,
+    completion_skills: Option<(PathBuf, Arc<[super::completion::CompletionCandidate]>)>,
     file_index_focused: bool,
     input_owner: Uuid,
     editor: Editor,

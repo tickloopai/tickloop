@@ -1,6 +1,12 @@
 use super::*;
 use tickloop_code_settings::skills::{SkillDiscoveryCache, SkillRegistry};
 
+static BUILTIN_CANDIDATES: std::sync::LazyLock<
+    Arc<[super::super::completion::CompletionCandidate]>,
+> = std::sync::LazyLock::new(|| {
+    super::super::completion::skill_candidates(&SkillRegistry::builtin())
+});
+
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 impl Console {
@@ -22,14 +28,19 @@ impl Console {
                         Ok(state) => state.working_directory().to_path_buf(),
                         Err(_) => return,
                     };
-                    if let Some(registry) = cache.refresh(&folder, root.as_deref())
-                        && let Ok(mut state) = shared.lock()
-                        && state.working_directory() == folder
-                    {
-                        state.completion_skills = Some((folder, registry));
-                        state.refresh_completion();
-                        if !state.terminal_lent {
-                            let _ = state.draw(&mut io::stdout().lock());
+                    if let Some(registry) = cache.refresh(&folder, root.as_deref()) {
+                        let candidates = super::super::completion::skill_candidates(&registry);
+                        if let Ok(mut state) = shared.lock()
+                            && state.working_directory() == folder
+                            && state.completion_skills.as_ref().is_none_or(|previous| {
+                                previous.0 != folder || previous.1 != candidates
+                            })
+                        {
+                            state.completion_skills = Some((folder, candidates));
+                            state.refresh_completion();
+                            if !state.terminal_lent {
+                                let _ = state.draw(&mut io::stdout().lock());
+                            }
                         }
                     }
                     drop(shared);
@@ -43,12 +54,12 @@ impl Console {
 
 impl State {
     pub(super) fn refresh_skill_candidates(&mut self) {
-        let registry = self
+        let candidates = self
             .completion_skills
             .as_ref()
             .filter(|(folder, _)| folder == self.working_directory())
-            .map(|(_, registry)| registry);
+            .map(|(_, candidates)| candidates);
         self.completion
-            .set_skills(registry.unwrap_or(&SkillRegistry::builtin()));
+            .set_skills(candidates.unwrap_or(&BUILTIN_CANDIDATES).clone());
     }
 }

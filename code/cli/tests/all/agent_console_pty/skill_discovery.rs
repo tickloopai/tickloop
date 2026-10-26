@@ -69,6 +69,36 @@ async fn run_skill_completion(fixture: &PrivateFixture) {
         frame.contains("/canvas:frontend-design") && frame.contains("Skills")
     })
     .await;
+    std::fs::remove_file(fixture.path("config/skills/personal/SKILL.md")).unwrap();
+    std::fs::remove_file(fixture.path("work/.tickloop/skills/project/SKILL.md")).unwrap();
+    view.send(b"\x03\x03/f");
+    view.wait_for_editor("edited-files query is in the input", Some("/f"))
+        .await;
+    view.wait_for("removed disk Skills leave the cached candidates", |frame| {
+        frame.contains("/canvas:frontend-design")
+            && !frame.contains("/f-personal")
+            && !frame.contains("/f-project")
+    })
+    .await;
+    view.resize(120, 60).await;
+    view.send(b"\x03\x03/");
+    view.send(&[0x0e; 40]);
+    let grouped = view
+        .wait_for("all Skills share one contiguous group", |frame| {
+            frame.contains("/canvas:frontend-design")
+                && frame.contains("/loop")
+                && frame.contains("/slides")
+                && frame.contains("/tickloop")
+        })
+        .await;
+    assert_eq!(
+        grouped
+            .lines()
+            .filter(|line| line.trim() == "Skills")
+            .count(),
+        1,
+        "{grouped}"
+    );
     view.close().await;
 }
 
@@ -168,6 +198,13 @@ async fn actual_cli_short_skill_invocations_show_source_and_restore_history_rows
 async fn run_ambiguous_skills(fixture: &PrivateFixture) {
     install_design_plugin(fixture, "alpha");
     install_design_plugin(fixture, "beta");
+    let directory = fixture.path("config/skills/help");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("SKILL.md"),
+        "---\nname: help\ndescription: Shadow help\n---\nSHOULD_NOT_RUN",
+    )
+    .unwrap();
     let (base_url, mut requests) = model_http_support::serve_responses(vec![(
         200,
         chat_reply(None, "Qualified design ready"),
@@ -176,6 +213,12 @@ async fn run_ambiguous_skills(fixture: &PrivateFixture) {
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start(fixture);
     view.wait_for("new input ready", new_input_is_visible).await;
+    view.send(b"/help report\r");
+    view.wait_for("built-in help reserves its name before creation", |frame| {
+        frame.contains("Usage: /help")
+    })
+    .await;
+    view.send(b"\x03");
     view.send(b"/frontend-design first\r");
     view.wait_for("new Agent rejects ambiguous short name", |frame| {
         frame.contains("ambiguous skill")
@@ -204,6 +247,11 @@ async fn run_ambiguous_skills(fixture: &PrivateFixture) {
         frame.contains("ambiguous skill")
             && frame.contains("/alpha:frontend-design")
             && frame.contains("/beta:frontend-design")
+    })
+    .await;
+    view.send(b"/help report\r");
+    view.wait_for("built-in help reserves its name in a Chat", |frame| {
+        frame.contains("Usage: /help")
     })
     .await;
     assert_eq!(catalog(&client).await.len(), 1);

@@ -455,3 +455,42 @@ fn cached_discovery_refreshes_plugin_enablement_and_project_edits() {
     );
     assert!(cache.refresh(directory.path(), Some(&config)).is_none());
 }
+
+#[test]
+fn cached_discovery_recovers_a_repaired_plugin_without_registry_changes() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "repair",
+        serde_json::json!({"name":"repair"}),
+        &[("skills/guide", &skill("guide", "Guide", "body"))],
+    );
+    let plugin = install(&config, &source);
+    let manifest = plugin.root.join(".claude-plugin/plugin.json");
+    let original = fs::read(&manifest).unwrap();
+    fs::write(&manifest, "invalid JSON").unwrap();
+    let mut cache = SkillDiscoveryCache::default();
+    assert!(
+        !cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("repair:guide")
+    );
+    fs::write(&manifest, original).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if cache
+            .refresh(directory.path(), Some(&config))
+            .is_some_and(|registry| registry.contains("repair:guide"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a repaired plugin must return to cached discovery"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

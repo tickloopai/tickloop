@@ -11,6 +11,7 @@ use tickloop_harness::protocol::SkillSource;
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_SKILLS_DIRECTORY: &str = ".tickloop/skills";
+const INCOMPLETE_DISCOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub trait SkillDiscovery {
     fn discover(folder: &Path, config_root: Option<&Path>) -> Self;
@@ -37,6 +38,7 @@ impl SkillDiscovery for SkillRegistry {
 #[derive(Default)]
 pub struct SkillDiscoveryCache {
     context: Option<(PathBuf, Option<PathBuf>)>,
+    retry_at: Option<std::time::Instant>,
     watched: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
 }
 
@@ -44,6 +46,9 @@ impl SkillDiscoveryCache {
     pub fn refresh(&mut self, folder: &Path, config_root: Option<&Path>) -> Option<SkillRegistry> {
         let context = (folder.to_path_buf(), config_root.map(Path::to_path_buf));
         if self.context.as_ref() == Some(&context)
+            && self
+                .retry_at
+                .is_none_or(|retry| std::time::Instant::now() < retry)
             && self
                 .watched
                 .iter()
@@ -59,6 +64,10 @@ impl SkillDiscoveryCache {
                 (path, stamp)
             })
             .collect();
+        // Invalid manifests may hide their own input paths; retry incomplete discovery so repairs
+        // become visible even when the installation registry did not change.
+        self.retry_at = (!registry.warnings().is_empty())
+            .then(|| std::time::Instant::now() + INCOMPLETE_DISCOVERY_RETRY);
         self.context = Some(context);
         Some(registry)
     }
