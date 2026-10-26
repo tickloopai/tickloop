@@ -382,7 +382,12 @@ impl McpConnections {
                         continue;
                     }
                     tool.definition.description = redact(entry, tool.definition.description);
-                    redact_value(entry, &mut tool.definition.input_schema);
+                    redact_schema(entry, &mut tool.definition.input_schema);
+                    if tool.definition.input_schema["type"] != "object"
+                        || jsonschema::validator_for(&tool.definition.input_schema).is_err()
+                    {
+                        continue;
+                    }
                     tools.push((entry.clone(), connection.clone(), tool));
                 }
             }
@@ -909,7 +914,41 @@ fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {
     }
     resources
 }
+fn redact_schema(entry: &Entry, schema: &mut Value) {
+    fn remove_sensitive_constraints(entry: &Entry, value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.retain(|_, value| {
+                    !entry.config.sensitive_values.contains(value)
+                        && !value.as_array().is_some_and(|items| {
+                            items
+                                .iter()
+                                .any(|item| entry.config.sensitive_values.contains(item))
+                        })
+                });
+                for value in fields.values_mut() {
+                    remove_sensitive_constraints(entry, value);
+                }
+            }
+            Value::Array(items) => {
+                for value in items {
+                    remove_sensitive_constraints(entry, value);
+                }
+            }
+            _ => {}
+        }
+    }
+    remove_sensitive_constraints(entry, schema);
+    redact_value(entry, schema);
+}
+
 fn redact_value(entry: &Entry, value: &mut Value) {
+    if matches!(value, Value::Number(_) | Value::Bool(_))
+        && entry.config.sensitive_values.contains(value)
+    {
+        *value = Value::String("[redacted]".into());
+        return;
+    }
     match value {
         Value::String(text) => *text = redact(entry, std::mem::take(text)),
         Value::Array(values) => {
@@ -931,7 +970,12 @@ fn redact(entry: &Entry, content: String) -> String {
     let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
     let mut content = normalizer.normalize(&content).into_owned();
     let mut secrets = entry.environment_secrets.clone();
-    secrets.extend(entry.config.sensitive_values.iter().cloned());
+    secrets.extend(entry.config.sensitive_values.iter().map(|value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string())
+    }));
     if let Some(token) = entry.token.read().unwrap().as_ref() {
         secrets.push(token.secret().to_owned());
     }

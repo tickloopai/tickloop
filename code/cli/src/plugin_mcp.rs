@@ -17,7 +17,7 @@ pub(super) fn validate(manifest: &PluginManifest, root: &Path) {
         .map(|config| PluginStore::in_config_root(&config).data_directory(&manifest.name))
         .unwrap_or_else(|| "<plugin data directory>".into());
     let plugin = PluginServers {
-        user_config: Default::default(),
+        user_config: tickloop_code_settings::plugin_config::PluginUserConfig::defaults(manifest),
         name: manifest.name.clone(),
         root: root.to_owned(),
         data_directory,

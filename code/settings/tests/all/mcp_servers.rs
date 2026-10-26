@@ -182,7 +182,8 @@ fn plugin_user_config_is_typed_private_persistent_and_resolves_mcp_fields() {
                 "key":{"type":"string","sensitive":true,"required":true},
                 "host":{"type":"string","default":"example.com"},
                 "timeout":{"type":"number","default":1234},
-                "active":{"type":"boolean","default":false}
+                "active":{"type":"boolean","default":false},
+            "unused":{"type":"string","sensitive":true,"default":"unreferenced-secret"}
             }
         })
         .to_string(),
@@ -229,6 +230,7 @@ fn plugin_user_config_is_typed_private_persistent_and_resolves_mcp_fields() {
         resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &[plugin]);
     assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
     assert_eq!(resolved.servers[0].timeout_ms, 1234);
+    assert_eq!(resolved.servers[0].sensitive_values.len(), 1);
     let transport = serde_json::to_value(&resolved.servers[0].transport).unwrap();
     assert_eq!(transport["url"], "https://service.example/mcp");
     assert_eq!(

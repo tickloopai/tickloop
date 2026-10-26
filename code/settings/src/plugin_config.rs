@@ -23,6 +23,22 @@ impl std::fmt::Debug for PluginUserConfig {
 }
 
 impl PluginUserConfig {
+    pub fn defaults(manifest: &PluginManifest) -> Self {
+        Self {
+            values: manifest
+                .user_config
+                .iter()
+                .filter_map(|(key, field)| field.default.clone().map(|value| (key.clone(), value)))
+                .collect(),
+            sensitive: manifest
+                .user_config
+                .iter()
+                .filter(|(_, field)| field.sensitive)
+                .map(|(key, _)| key.clone())
+                .collect(),
+        }
+    }
+
     pub fn load(root: &Path, manifest: &PluginManifest) -> Result<Self, String> {
         tick_plugins::validate_plugin_name(&manifest.name).map_err(|error| error.to_string())?;
         let settings = UserSettings::in_root(root)
@@ -43,11 +59,8 @@ impl PluginUserConfig {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
             Err(_) => return Err("cannot read private plugin user config".into()),
         };
-        let mut config = Self::default();
+        let mut config = Self::defaults(manifest);
         for (key, field) in &manifest.user_config {
-            if field.sensitive {
-                config.sensitive.push(key.clone());
-            }
             let saved = if field.sensitive {
                 private.get(key)
             } else {
@@ -88,11 +101,12 @@ impl PluginUserConfig {
         })
     }
 
-    pub fn secrets(&self) -> Vec<String> {
+    pub fn secrets_for(&self, entry: &Value) -> Vec<Value> {
+        let references = crate::mcp::user_config_references(entry);
         self.sensitive
             .iter()
-            .filter_map(|key| self.values.get(key))
-            .map(value_text)
+            .filter(|key| references.contains_key(*key))
+            .filter_map(|key| self.values.get(key).cloned())
             .collect()
     }
 
@@ -153,24 +167,25 @@ impl PluginUserConfig {
         let _lock = lock_exclusively(&directory.path().join("user-config.lock"))
             .map_err(|_| "cannot lock plugin configuration".to_owned())?;
         let path = directory.path().join("user-config.json");
-        let mut private = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Map<String, Value>>(&bytes)
-                .map_err(|_| "invalid private plugin configuration".to_owned())?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        let previous_private = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err("cannot read private plugin configuration".into()),
         };
+        let mut private = previous_private
+            .as_deref()
+            .map(serde_json::from_slice::<Map<String, Value>>)
+            .transpose()
+            .map_err(|_| "invalid private plugin configuration".to_owned())?
+            .unwrap_or_default();
         for (key, value) in updates {
             if manifest.user_config[key].sensitive {
                 private.insert(key.clone(), value.clone());
             }
         }
-        replace_file_atomically(
-            &path,
-            &serde_json::to_vec_pretty(&private).expect("JSON serializes"),
-            PRIVATE_FILE_MODE,
-        )
-        .map_err(|_| "cannot save private plugin configuration".to_owned())?;
-        UserSettings::in_root(root)
+        let private_bytes = serde_json::to_vec_pretty(&private).expect("JSON serializes");
+        let mut private_written = false;
+        let public_result = UserSettings::in_root(root)
             .update(|settings| {
                 let plugins = object_entry(settings, "plugins", "plugins".into())?;
                 let plugin = object_entry(plugins, &manifest.name, "plugins entry".into())?;
@@ -182,9 +197,31 @@ impl PluginUserConfig {
                         options.insert(key.clone(), value.clone());
                     }
                 }
+                replace_file_atomically(&path, &private_bytes, PRIVATE_FILE_MODE).map_err(
+                    |_| crate::InvalidEntry {
+                        key: "plugin user config".into(),
+                        expected: "a writable private configuration file".into(),
+                    },
+                )?;
+                private_written = true;
                 Ok(())
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        if let Err(error) = public_result {
+            if !private_written {
+                return Err(error);
+            }
+            let restored = match previous_private {
+                Some(bytes) => replace_file_atomically(&path, &bytes, PRIVATE_FILE_MODE),
+                None => fs::remove_file(&path),
+            };
+            return Err(if restored.is_ok() {
+                error
+            } else {
+                "Public configuration failed; private values were saved and could not be restored"
+                    .into()
+            });
+        }
         *self = Self::load(root, manifest)?;
         Ok(())
     }

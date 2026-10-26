@@ -596,3 +596,19 @@ fn user_config_terminal_prompts_only_for_missing_values_and_masks_reconfiguratio
         7
     );
 }
+
+#[test]
+fn plugin_validate_uses_declared_user_config_defaults_without_saved_credentials() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(
+        &fixture,
+        "configured",
+        json!({
+            "name":"configured","userConfig":{"host":{"type":"string","default":"example.com"}},
+            "mcpServers":{"remote":{"url":"https://${user_config.host}/mcp"}}
+        }),
+        &[],
+    );
+    let shown = succeeded(&plugin(&fixture, &["validate", &path_text(&source)]));
+    assert!(shown.contains("status: ready"), "{shown}");
+}

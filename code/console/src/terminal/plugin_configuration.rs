@@ -111,6 +111,14 @@ impl ConfigurationForm {
         }
     }
 
+    pub fn hint(&self) -> &'static str {
+        if self.fields[self.index].1.sensitive {
+            "enter next/save · esc cancel"
+        } else {
+            "enter next/save · esc cancel · ctrl+g editor"
+        }
+    }
+
     pub fn lines(&self, width: usize) -> (Vec<RoleLine>, usize) {
         let (name, field) = &self.fields[self.index];
         let mut lines = vec![RoleLine::role(
@@ -142,15 +150,17 @@ impl ConfigurationForm {
             );
         }
         let input = if field.sensitive {
-            "*".repeat(self.editor.draft().chars().count())
-                .chars()
-                .rev()
-                .take(width.saturating_sub(2))
-                .collect::<String>()
+            let mut masked = Editor::new();
+            masked.replace_draft(
+                "*".repeat(self.editor.draft().chars().count()),
+                self.editor.draft()[..self.editor.cursor()].chars().count(),
+            );
+            editor_window(&masked, width.saturating_sub(2))
         } else {
             editor_window(&self.editor, width.saturating_sub(2))
         };
-        let column = (2 + input.width()).min(width.saturating_sub(1));
+        let before_cursor = input.split('▏').next().unwrap_or_default();
+        let column = (2 + before_cursor.width()).min(width.saturating_sub(1));
         lines.push(RoleLine::role(format!("> {input}"), Role::Text));
         (lines, column)
     }

@@ -1035,6 +1035,12 @@ fn plugin_user_config_page_masks_secrets_and_reconfigures_saved_values() {
         frame.contains("*****************")
     });
     assert!(!shown.contains("panel-private-key"));
+    terminal.press(b"\x1b[D", "masked cursor moves left", |frame| {
+        frame.contains("****************▏*")
+    });
+    terminal.press(b"X", "insert at masked cursor", |frame| {
+        frame.contains("*****************▏*")
+    });
     terminal.press(b"\r", "workspace field", |frame| {
         frame.contains("Workspace")
     });
@@ -1046,7 +1052,7 @@ fn plugin_user_config_page_masks_secrets_and_reconfigures_saved_values() {
         .join("config/credentials/configured/user-config.json");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(private).unwrap()).unwrap()["key"],
-        "panel-private-key"
+        "panel-private-keXy"
     );
     let public = fs::read_to_string(fixture.root.join("config/settings.json")).unwrap();
     assert!(public.contains("/tmp/jk"));

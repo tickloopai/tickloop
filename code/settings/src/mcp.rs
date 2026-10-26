@@ -120,7 +120,7 @@ pub fn resolve_servers_with_plugins(
                 &environment,
             );
             if let Some(server) = resolved.servers.last_mut() {
-                server.sensitive_values = plugin.user_config.secrets();
+                server.sensitive_values = plugin.user_config.secrets_for(entry);
             }
             if let Some(signature) = signature(entry, directory, &environment) {
                 if let Some(preferred) = signatures.get(&signature) {
@@ -239,7 +239,9 @@ pub fn needs_user_config(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains("${user_config."),
         Value::Array(items) => items.iter().any(needs_user_config),
-        Value::Object(fields) => fields.values().any(needs_user_config),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(key, value)| key.contains("${user_config.") || needs_user_config(value)),
         _ => false,
     }
 }
@@ -376,29 +378,56 @@ fn expand_value(value: &Value, environment: &BTreeMap<String, String>) -> Result
     }
 }
 
-pub(crate) fn missing_user_config(value: &Value, variables: &BTreeMap<String, String>) -> bool {
-    let missing = |text: &str| {
-        text.match_indices("${user_config.").any(|(start, _)| {
-            let expression = &text[start + 2..];
+pub(crate) fn user_config_references(entry: &Value) -> BTreeMap<String, bool> {
+    fn text_references(text: &str, found: &mut BTreeMap<String, bool>) {
+        for (start, _) in text.match_indices("${user_config.") {
+            let expression = &text[start + "${user_config.".len()..];
             let Some(end) = expression.find('}') else {
-                return true;
+                continue;
             };
             let expression = &expression[..end];
             let (name, default) = expression
                 .split_once(":-")
                 .map_or((expression, None), |(name, default)| (name, Some(default)));
-            default.is_none() && !variables.contains_key(name)
-        })
-    };
-    match value {
-        Value::String(text) => missing(text),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| missing_user_config(item, variables)),
-        Value::Object(fields) => fields
-            .iter()
-            .filter(|(key, _)| !is_approval_field(key))
-            .any(|(key, value)| missing(key) || missing_user_config(value, variables)),
-        _ => false,
+            found
+                .entry(name.to_owned())
+                .and_modify(|has_default| *has_default &= default.is_some())
+                .or_insert(default.is_some());
+        }
     }
+    fn visit(value: &Value, found: &mut BTreeMap<String, bool>) {
+        match value {
+            Value::String(text) => text_references(text, found),
+            Value::Array(items) => {
+                for item in items {
+                    visit(item, found);
+                }
+            }
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    text_references(key, found);
+                    visit(value, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = BTreeMap::new();
+    if let Some(fields) = entry.as_object() {
+        for (key, value) in fields.iter().filter(|(key, _)| !is_approval_field(key)) {
+            text_references(key, &mut found);
+            visit(value, &mut found);
+        }
+    } else {
+        visit(entry, &mut found);
+    }
+    found
+}
+
+pub(crate) fn missing_user_config(value: &Value, variables: &BTreeMap<String, String>) -> bool {
+    user_config_references(value)
+        .iter()
+        .any(|(key, has_default)| {
+            !has_default && !variables.contains_key(&format!("user_config.{key}"))
+        })
 }

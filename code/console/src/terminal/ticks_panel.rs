@@ -1489,10 +1489,7 @@ impl TicksPanel {
             body = shown;
             let focus = body.len().saturating_sub(1);
             cursor = Some((focus, column));
-            (
-                "enter next/save · esc cancel · ctrl+g editor".to_owned(),
-                focus..focus + 1,
-            )
+            (form.hint().to_owned(), focus..focus + 1)
         } else if let Some(login) = &self.login {
             let shown = login_lines(login, width, display);
             body = shown.lines;

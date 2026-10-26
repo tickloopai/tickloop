@@ -389,18 +389,20 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
         configured_agent(&canonical, model, ChosenModels::new(scripted.clone())).await;
     let service = McpService::start().await;
     let secret = "sensitive-config-marker";
-    service.set_tools(json!([{"name":"probe","description":format!("Returns {secret}"),"inputSchema":{"type":"object","properties":{"note":{"type":"string","description":secret}}}}]));
+    service.set_tools(json!([{"name":"probe","description":format!("Returns {secret}"),"inputSchema":{"type":"object","properties":{"note":{"type":"string","description":secret},"pin":{"type":"number","default":839271},"flag":{"type":"boolean","default":false}}}}]));
     service.set_result(json!({"content":[{"type":"text","text":format!("result {secret}")}],"structuredContent":{"value":secret}}));
     let source = canonical.join("source");
     std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
     let mut args = service.stdio_args();
     args.push("prefix${user_config.key}suffix".into());
+    args.push("prefix${user_config.pin}suffix".into());
+    args.push("${user_config.flag}".into());
     args[2] = format!(
         "import sys\nsys.stderr.write('sensitive-config-marker\\n')\n{}",
         args[2]
     );
     std::fs::write(source.join(".claude-plugin/plugin.json"), json!({
-        "name":"configured", "userConfig":{"key":{"type":"string","required":true,"sensitive":true}},
+        "name":"configured", "userConfig":{"key":{"type":"string","required":true,"sensitive":true},"pin":{"type":"number","sensitive":true},"flag":{"type":"boolean","sensitive":true}},
         "mcpServers":{"probe":{"command":"python3","args":args}}
     }).to_string()).unwrap();
     let plugin = tick_plugins::PluginStore::in_config_root(&canonical)
@@ -434,7 +436,7 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
         .save(
             &canonical,
             &plugin.manifest,
-            &serde_json::from_value(json!({"key":secret})).unwrap(),
+            &serde_json::from_value(json!({"key":secret,"pin":839271,"flag":false})).unwrap(),
         )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -506,6 +508,22 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
     {
         let requests = scripted.requests.lock().unwrap();
         for request in requests.iter() {
+            assert!(
+                !serde_json::to_string(&request.tools)
+                    .unwrap()
+                    .contains("839271")
+            );
+            if let Some(tool) = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == "mcp__plugin_configured_probe__probe")
+            {
+                assert!(
+                    tool.input_schema["properties"]["flag"]
+                        .get("default")
+                        .is_none()
+                );
+            }
             assert!(
                 !serde_json::to_string(&request.messages)
                     .unwrap()

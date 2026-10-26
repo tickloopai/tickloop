@@ -10,7 +10,7 @@ pub struct McpServerConfig {
     pub timeout_ms: u64,
     /// Host-provided secrets to remove from every server response.
     #[serde(default)]
-    pub sensitive_values: Vec<String>,
+    pub sensitive_values: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
