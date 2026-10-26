@@ -353,7 +353,7 @@ fn from_document(
             components.insert(component);
         }
     }
-    insert_default_components(root, &mut components);
+    insert_default_components(root, &mut components, &mut warnings);
 
     let (tick, auth) = if format == ManifestFormat::Tickloop {
         let program_name = marketplace_name
@@ -413,11 +413,12 @@ fn from_tick_package(
         (PackageManifest::load(root)?, None)
     };
     let skill_paths = default_skill_paths(root);
+    let mut warnings = Vec::new();
     let mut components = BTreeSet::from([Component::Tick]);
     if !skill_directories(root, &skill_paths).is_empty() {
         components.insert(Component::Skills);
     }
-    insert_default_components(root, &mut components);
+    insert_default_components(root, &mut components, &mut warnings);
     Ok(PluginManifest {
         name: marketplace_name.map_or(package.name, str::to_owned),
         display_name,
@@ -431,7 +432,7 @@ fn from_tick_package(
         auth: package.auth,
         skill_paths,
         components,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -575,10 +576,19 @@ fn declared_component(
     }
 }
 
-fn insert_default_components(root: &Path, components: &mut BTreeSet<Component>) {
+fn insert_default_components(
+    root: &Path,
+    components: &mut BTreeSet<Component>,
+    warnings: &mut Vec<String>,
+) {
     for (location, component) in DEFAULT_COMPONENT_LOCATIONS {
         if fs::symlink_metadata(root.join(location)).is_ok() {
-            components.insert(component);
+            match contained_path(root, &format!("./{location}")) {
+                Ok(_) => {
+                    components.insert(component);
+                }
+                Err(reason) => warnings.push(format!("default {location} is ignored: {reason}")),
+            }
         }
     }
 }

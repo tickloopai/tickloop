@@ -425,3 +425,41 @@ fn inline_commands_are_recognized_without_a_source_path() {
     assert_eq!(manifest.unsupported(), vec![Component::Commands]);
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
 }
+
+#[test]
+fn invalid_component_paths_are_not_rediscovered_at_default_locations() {
+    let fixture = Fixture::new();
+    let outside = fixture.source("outside");
+    for (field, location) in [
+        ("commands", "commands"),
+        ("agents", "agents"),
+        ("outputStyles", "output-styles"),
+        ("hooks", "hooks/hooks.json"),
+        ("mcpServers", ".mcp.json"),
+        ("lspServers", ".lsp.json"),
+        ("settings", "settings.json"),
+    ] {
+        for (kind, target) in [
+            ("escape", outside.clone()),
+            ("dangling", outside.join("missing")),
+        ] {
+            let root = fixture.claude_plugin(
+                &format!("{field}-{kind}"),
+                &json!({"name": "paths", field: format!("./{location}")}),
+                &[],
+            );
+            fs::create_dir_all(root.join(location).parent().unwrap()).unwrap();
+            symlink(target, root.join(location)).unwrap();
+            let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+            assert!(manifest.unsupported().is_empty(), "{field}: {kind}");
+            assert!(
+                manifest
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.starts_with(&format!("{field} path"))),
+                "{:?}",
+                manifest.warnings
+            );
+        }
+    }
+}
