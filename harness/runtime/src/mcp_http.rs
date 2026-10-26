@@ -134,7 +134,7 @@ fn is_invisible_format(character: char) -> bool {
     )
 }
 
-type ResponseRedactor = Arc<dyn Fn(String) -> String + Send + Sync>;
+type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
@@ -382,15 +382,48 @@ fn sse_stream(
     });
     SseStream::from_bytes_stream(stream)
         .map(move |event| {
-            event.map(|mut event| {
+            event.and_then(|mut event| {
                 if let Some(redact) = &redactor {
-                    event.data = event.data.map(|data| redact(data));
-                    event.id = event.id.map(|id| redact(id));
+                    if let Some(data) = event.data.take() {
+                        event.data = Some(redact_message(&data, redact).map_err(|_| {
+                            SseError::Body(Box::new(io::Error::other("invalid MCP event response")))
+                        })?);
+                    }
+                    for value in [&mut event.id, &mut event.event].into_iter().flatten() {
+                        let mut text = serde_json::Value::String(std::mem::take(value));
+                        redact(&mut text);
+                        *value = text.as_str().unwrap_or_default().to_owned();
+                    }
                 }
-                event
+                Ok(event)
             })
         })
         .boxed()
+}
+
+fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde_json::Error> {
+    let mut message: serde_json::Value = serde_json::from_str(text)?;
+    if let Some(id) = message.get_mut("id").filter(|id| id.is_string()) {
+        redact(id);
+    }
+    for field in ["params", "result", "error"] {
+        if let Some(payload) = message.get_mut(field) {
+            // The protocol version and envelope are routing facts, not server display text.
+            let protocol_version = (field == "result")
+                .then(|| payload.get("protocolVersion").cloned())
+                .flatten()
+                .filter(|version| matches!(version.as_str(), Some("2026-07-28" | "2025-11-25")));
+            redact(payload);
+            if let Some(version) = protocol_version
+                && let Some(fields) = payload.as_object_mut()
+            {
+                fields.insert("protocolVersion".into(), version);
+            }
+        }
+    }
+    // Reject undecodable messages here so SDK diagnostics cannot echo their raw fields.
+    serde_json::from_value::<ServerJsonRpcMessage>(message.clone())?;
+    serde_json::to_string(&message)
 }
 
 impl StreamableHttpClient for McpHttpClient {
@@ -446,10 +479,12 @@ impl StreamableHttpClient for McpHttpClient {
             .get("Mcp-Session-Id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if let (Some(id), Some(redact)) = (&session_id, &self.redactor)
-            && redact(id.clone()) != *id
-        {
-            return Err(unexpected("MCP session identifier contains a credential"));
+        if let (Some(id), Some(redact)) = (&session_id, &self.redactor) {
+            let mut redacted = serde_json::Value::String(id.clone());
+            redact(&mut redacted);
+            if redacted.as_str() != Some(id.as_str()) {
+                return Err(unexpected("MCP session identifier contains a credential"));
+            }
         }
         let content_type = response
             .headers()
@@ -469,7 +504,9 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(redact) = &self.redactor {
             let text =
                 String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
-            body = redact(text).into_bytes();
+            body = redact_message(&text, redact)
+                .map_err(|_| unexpected("invalid MCP JSON response"))?
+                .into_bytes();
         }
         // The SDK's untagged result decoder mistakes extension metadata for a tool result.
         let decoded = if preserve_custom_result {

@@ -1198,7 +1198,7 @@ async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
     let token = credentials.current().unwrap().token.unwrap();
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     server.set_resources(json!([{"uri":"fixture://text", "name":token.refresh_token}]));
-    server.notify_log(&format!(
+    server.notify_log_with_unicode_escapes(&format!(
         "{} {}",
         token.access_token,
         token.refresh_token.as_ref().unwrap()
@@ -1308,4 +1308,52 @@ async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
     assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
     assert_eq!(server.request_count(), 0);
     connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc_ids() {
+    let server = McpService::start().await;
+    server.require_bearer("1");
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let released = Arc::downgrade(&credentials);
+    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential {
+        server_url:server.url(), resource:None,
+        registration:tickloop_harness_connector::ClientRegistration{authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()},
+        token:Some(serde_json::from_value(json!({"access_token":"1","token_type":"Bearer","issuer":server.url(),"expires_at":u64::MAX,"client_id":"client","token_endpoint":server.url()})).unwrap()),
+    }));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "remote".into(),
+            credentials as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+        )]),
+        Default::default(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: Default::default(),
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert!(matches!(
+        connections
+            .call("mcp__remote__probe", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    connections.shutdown().await;
+    drop(connections);
+    assert!(
+        released.upgrade().is_none(),
+        "a closed connection retained its host credential adapter"
+    );
 }

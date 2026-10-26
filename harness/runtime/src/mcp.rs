@@ -866,8 +866,14 @@ async fn open(
                 token.clone(),
                 Duration::from_millis(config.timeout_ms),
             )?;
-            let redact_entry = entry.clone();
-            let http = http.with_redactor(Arc::new(move |content| redact(&redact_entry, content)));
+            let redact_entry = Arc::downgrade(entry);
+            let http = http.with_redactor(Arc::new(move |value| {
+                if let Some(entry) = redact_entry.upgrade() {
+                    redact_value(&entry, value);
+                } else {
+                    *value = Value::Null;
+                }
+            }));
             let mut options = StreamableHttpClientTransportConfig::with_uri(url.clone())
                 .reinit_on_expired_session(false);
             if let Some(token) = token {

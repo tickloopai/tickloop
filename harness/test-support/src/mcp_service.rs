@@ -25,7 +25,7 @@ struct State {
     challenge: Option<String>,
     bearer: Option<String>,
     requests: usize,
-    notification: Option<Value>,
+    notification: Option<String>,
     resources_capability: Option<Value>,
     resources: Value,
     resource_text: String,
@@ -109,8 +109,8 @@ impl McpService {
                                 };
                                 let call = method == "tools/call";
                                 let mut notifications = Vec::new();
-                                if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})); }
-                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"})); }
+                                if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()); }
+                                if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"}).to_string()); }
                                 if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
                                 (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications, state.challenge.clone())
                             };
@@ -156,7 +156,23 @@ impl McpService {
     }
     pub fn notify_log(&self, text: &str) {
         self.state.lock().unwrap().notification = Some(
-            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":text}}),
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":text}}).to_string(),
+        );
+    }
+    pub fn notify_log_with_unicode_escapes(&self, text: &str) {
+        self.notify_log(text);
+        let mut state = self.state.lock().unwrap();
+        let wire = state.notification.take().unwrap();
+        state.notification = Some(
+            wire.chars()
+                .map(|character| {
+                    if character.is_ascii_alphabetic() {
+                        format!("\\u{:04x}", character as u32)
+                    } else {
+                        character.to_string()
+                    }
+                })
+                .collect(),
         );
     }
     pub fn require_bearer(&self, token: &str) {
