@@ -25,6 +25,9 @@ use crate::support;
 
 const OTHER_TARGET: &str = "x86_64-unknown-linux-gnu";
 const TERMINAL_TIMEOUT: Duration = Duration::from_secs(20);
+const OFFICIAL_MARKETPLACE_URL: &str = "https://github.com/anthropics/claude-plugins-official.git";
+/// Where a test creates the repository that stands in for the built-in Git marketplace.
+pub(crate) const OFFICIAL_MARKETPLACE_REPOSITORY: &str = "official-marketplace";
 
 pub(crate) struct Fixture {
     _directory: tempfile::TempDir,
@@ -36,6 +39,16 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         fs::create_dir(root.join("home")).unwrap();
+        // Tests never reach GitHub: the built-in Git marketplace is read from a local repository
+        // a test may create, and is unreadable otherwise.
+        fs::write(
+            root.join("home/.gitconfig"),
+            format!(
+                "[url \"file://{}\"]\n\tinsteadOf = {OFFICIAL_MARKETPLACE_URL}\n",
+                root.join(OFFICIAL_MARKETPLACE_REPOSITORY).display()
+            ),
+        )
+        .unwrap();
         support::cli_runtime::adopt(&root.join("config"));
         Self {
             _directory: directory,
@@ -90,7 +103,7 @@ impl Fixture {
         }
     }
 
-    fn tickloop_from(&self, marketplace: &str, arguments: &[&str]) -> Output {
+    pub(crate) fn tickloop_from(&self, marketplace: &str, arguments: &[&str]) -> Output {
         self.command(arguments)
             .env("TICKLOOP_TICK_MARKETPLACE", marketplace)
             .output()

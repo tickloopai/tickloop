@@ -62,6 +62,10 @@ enum PluginCommand<'a> {
     },
     List,
     Validate(&'a Path),
+    MarketplaceAdd(String),
+    MarketplaceList,
+    MarketplaceUpdate(Option<String>),
+    MarketplaceRemove(String),
 }
 
 pub async fn run(arguments: &[OsString]) -> Result<(), String> {
@@ -78,6 +82,16 @@ pub async fn run(arguments: &[OsString]) -> Result<(), String> {
         PluginCommand::SetEnabled { name, enabled } => set_enabled(&store()?, &name, enabled)?,
         PluginCommand::List => list(&store()?)?,
         PluginCommand::Validate(path) => validate(path)?,
+        PluginCommand::MarketplaceAdd(source) => {
+            super::plugin_marketplace::add_marketplace(&store()?, &source).await?
+        }
+        PluginCommand::MarketplaceUpdate(name) => {
+            super::plugin_marketplace::update_marketplaces(&store()?, name.as_deref()).await?
+        }
+        PluginCommand::MarketplaceList => super::plugin_marketplace::list_marketplaces(&store()?)?,
+        PluginCommand::MarketplaceRemove(name) => {
+            super::plugin_marketplace::remove_marketplace(&store()?, &name)?
+        }
     }
     Ok(())
 }
@@ -142,6 +156,27 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
             }
         }
         [command] if command == "list" => PluginCommand::List,
+        [command, action, source]
+            if command == "marketplace" && action == "add" && !is_option(source) =>
+        {
+            PluginCommand::MarketplaceAdd(name(source))
+        }
+        [command, action] if command == "marketplace" && action == "list" => {
+            PluginCommand::MarketplaceList
+        }
+        [command, action] if command == "marketplace" && action == "update" => {
+            PluginCommand::MarketplaceUpdate(None)
+        }
+        [command, action, marketplace]
+            if command == "marketplace" && action == "update" && !is_option(marketplace) =>
+        {
+            PluginCommand::MarketplaceUpdate(Some(name(marketplace)))
+        }
+        [command, action, marketplace]
+            if command == "marketplace" && action == "remove" && !is_option(marketplace) =>
+        {
+            PluginCommand::MarketplaceRemove(name(marketplace))
+        }
         [command, path] if command == "validate" && !is_option(path) => {
             PluginCommand::Validate(Path::new(path))
         }

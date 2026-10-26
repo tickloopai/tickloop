@@ -16,6 +16,7 @@ mod command_consolidation;
 mod graceful_upgrade;
 mod hosted_bounds;
 mod hosted_ticks;
+mod marketplace_commands;
 mod monitor_attach;
 mod monitor_popup;
 mod monitor_pty;

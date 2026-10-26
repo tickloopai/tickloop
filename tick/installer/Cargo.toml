@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false }
+serde_json = "1"
 tickloop-tick-oauth = { path = "../oauth" }
 tickloop-tick-plugins = { path = "../plugins" }
 tickloop-tick-packages = { path = "../packages" }
