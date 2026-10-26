@@ -3,6 +3,18 @@ use std::{collections::BTreeMap, path::Path};
 use tickloop_code_settings::mcp::resolve_servers;
 
 #[test]
+fn exposure_defaults_to_search_and_preserves_override_order() {
+    let settings = serde_json::from_str(r#"{"mcpServers":{"sample":{"command":"server","toolExposure":{"z*":"hidden","*":"direct","zoom":"search"}}}}"#).unwrap();
+    let resolved = resolve_servers(&settings, Path::new("/work"), &BTreeMap::new());
+    let server = serde_json::to_value(&resolved.servers[0]).unwrap();
+    assert_eq!(server["exposure"], "search");
+    assert_eq!(
+        server["tool_exposure"],
+        json!([["z*", "hidden"], ["*", "direct"], ["zoom", "search"]])
+    );
+}
+
+#[test]
 fn directory_overrides_global_and_expands_only_the_startup_environment() {
     let settings = json!({"mcpServers": {
         "local": {"command":"old"},

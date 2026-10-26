@@ -90,6 +90,15 @@ impl HostToolProvider for CompositeHostTools {
             .cloned()
             .collect()
     }
+    fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.discovery_tools())
+            .collect()
+    }
+    fn has_tool_search(&self) -> bool {
+        self.sources.iter().any(|source| source.has_tool_search())
+    }
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
         let mut states = Vec::new();
         for source in &self.sources {

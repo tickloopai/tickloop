@@ -105,6 +105,35 @@ pub fn render_diff(
     )
 }
 
+pub fn render_diff_with_context(
+    review: &FileChangeReview,
+    context: &[String],
+    navigation: &DiffNavigation,
+    viewport: DiffViewport,
+) -> DiffFrame {
+    if viewport.width == 0 || viewport.height == 0 {
+        return empty_frame();
+    }
+    let mut layout = ReviewLayout::new(review, viewport.width);
+    layout.context = context;
+    frame(&layout, navigation, viewport)
+}
+
+pub fn navigate_diff_with_context(
+    review: &FileChangeReview,
+    context: &[String],
+    navigation: &DiffNavigation,
+    viewport: DiffViewport,
+    action: DiffNavigationAction,
+) -> DiffNavigation {
+    if viewport.width == 0 || viewport.height == 0 {
+        return DiffNavigation::default();
+    }
+    let mut layout = ReviewLayout::new(review, viewport.width);
+    layout.context = context;
+    navigate(&layout, navigation, viewport, action)
+}
+
 pub fn navigate_diff(
     review: &FileChangeReview,
     navigation: &DiffNavigation,
@@ -445,6 +474,7 @@ trait DiffLayout {
 }
 
 struct ReviewLayout<'a> {
+    context: &'a [String],
     review: &'a FileChangeReview,
     width: usize,
     gutter: Gutter,
@@ -455,6 +485,7 @@ impl<'a> ReviewLayout<'a> {
         let width = width.max(1);
         Self {
             review,
+            context: &[],
             width,
             gutter: Gutter::for_review(review, width),
         }
@@ -502,7 +533,7 @@ impl DiffLayout for ReviewLayout<'_> {
                 yes_no(self.review.after.ends_with_newline)
             ),
         ];
-        for (row, text) in header_lines.iter().enumerate() {
+        for (row, text) in self.context.iter().chain(header_lines.iter()).enumerate() {
             if !visitor(self.plain_line(
                 DiffLineKind::Header,
                 text,

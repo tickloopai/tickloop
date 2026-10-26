@@ -204,14 +204,13 @@ async fn agent_answers_from_a_real_file_in_its_chat_directory() {
         .find(|tool| tool.name == "Read")
         .expect("the model is offered Read");
     assert_eq!(read.input_schema["required"], json!(["file_path"]));
-    assert_eq!(
-        read.input_schema["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        ["file_path", "limit", "offset"]
-    );
+    let mut fields = read.input_schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(fields, ["file_path", "limit", "offset"]);
     agent.shutdown().await;
 }
 

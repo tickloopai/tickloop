@@ -436,6 +436,7 @@ mod tests {
                 .snapshot
                 .operations
                 .push(OperationRecord {
+                    parent_call_id: None,
                     task_binding: None,
                     id: operation_id,
                     loop_id: loop_id.into(),

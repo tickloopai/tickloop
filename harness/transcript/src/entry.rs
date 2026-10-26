@@ -53,6 +53,7 @@ pub enum Line {
     Input(InputEntry),
     /// A Run's durable wait; the latest record of a wait id wins.
     Wait(WaitEntry),
+    NestedCall(NestedCallEntry),
     /// The retained state of the Chat as of this Line: loading it stands for every retained Line
     /// before it.
     RetainedSnapshot(RetainedSnapshotEntry),
@@ -153,6 +154,7 @@ pub enum MetadataKind {
     Response,
     Input,
     Wait,
+    NestedCall,
     RetainedSnapshot,
     #[serde(other)]
     Other,
@@ -178,7 +180,7 @@ impl MetadataKind {
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Goal | Self::ScheduledTasks => Retention::SourceState,
-            Self::Response | Self::Input | Self::Wait => Retention::LatestById,
+            Self::Response | Self::Input | Self::Wait | Self::NestedCall => Retention::LatestById,
             Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
                 Retention::Accumulating
             }
@@ -256,6 +258,7 @@ impl Line {
             Self::Response(_) => MetadataKind::Response,
             Self::Input(_) => MetadataKind::Input,
             Self::Wait(_) => MetadataKind::Wait,
+            Self::NestedCall(_) => MetadataKind::NestedCall,
             Self::RetainedSnapshot(_) => MetadataKind::RetainedSnapshot,
             Self::Unknown(_) => MetadataKind::Other,
         }
@@ -1280,4 +1283,11 @@ mod tests {
             br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
         ));
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedCallEntry {
+    pub chat_id: Uuid,
+    pub operation: tickloop_harness_protocol::OperationRecord,
 }

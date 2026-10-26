@@ -825,6 +825,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::TaskToolsSetting(true),
             ObservationValue::TaskToolsSetting(false),
             ObservationValue::Operation(Some(Box::new(OperationRecord {
+                parent_call_id: None,
                 task_binding: None,
                 id: id(0x50),
                 loop_id: tickloop_ids::Id::from(id(0x10)),

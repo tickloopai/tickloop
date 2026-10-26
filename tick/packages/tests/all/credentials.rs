@@ -232,8 +232,10 @@ fn an_oauth_token_is_saved_in_the_standard_fields_and_replaced_at_once() {
     locked.save_token(&short).unwrap();
     let saved: Value =
         serde_json::from_slice(&fs::read(credentials.oauth_token_path()).unwrap()).unwrap();
+    let mut keys = saved.as_object().unwrap().keys().collect::<Vec<_>>();
+    keys.sort_unstable();
     assert_eq!(
-        saved.as_object().unwrap().keys().collect::<Vec<_>>(),
+        keys,
         [
             "access_token",
             "client_id",

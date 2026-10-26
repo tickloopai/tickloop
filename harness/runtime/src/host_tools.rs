@@ -416,6 +416,14 @@ pub(crate) struct HostToolUpgradeCheckpoint {
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+        Vec::new()
+    }
+
+    fn has_tool_search(&self) -> bool {
+        false
+    }
+
     /// Private process-transfer state. `None` defers replacement while the provider owns an
     /// interaction that cannot move, such as a pending device sign-in.
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {

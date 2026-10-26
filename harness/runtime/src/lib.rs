@@ -76,6 +76,7 @@ mod file_read_tests;
 mod input_context;
 mod interaction;
 mod monitor_members;
+mod nested_calls;
 mod recovery;
 #[cfg(test)]
 mod request_failure_tests;
@@ -90,6 +91,7 @@ mod suspension;
 mod system_prompt;
 mod tool_batch;
 mod tool_execution;
+pub mod tool_exposure;
 mod tool_results;
 pub mod upgrade;
 mod web_fetch;
@@ -516,7 +518,7 @@ struct Chat {
 
 enum RunAdmission {
     Idle,
-    Ready(Receipt, ModelRequest, CancellationToken),
+    Ready(Receipt, Box<ModelRequest>, CancellationToken),
     /// The first takeable input is a Trigger's whose source proves it again outside the lock.
     ValidateTrigger(Box<PendingInput>),
 }
@@ -1533,6 +1535,9 @@ impl Agent {
             );
             context.tool_history =
                 approval_context::recovered_tool_history(&snapshot, operation, Some(ancestors));
+        }
+        if let Some(evidence) = nested_calls::review_evidence().await {
+            approval_context::append_nested_evidence(&mut context, evidence);
         }
         if operation.name == "ListSubagents"
             && operation
@@ -3440,12 +3445,21 @@ impl Agent {
             return Err("host operation permission changed before admission".into());
         }
         drop(session_context);
+        nested_calls::check_dispatch()?;
         chat.snapshot
             .operations
             .iter_mut()
             .find(|record| record.id == operation.id)
             .expect("proposed host operation remains present")
             .state = OperationState::Admitted;
+        if let Some(operation) = chat
+            .snapshot
+            .operations
+            .iter()
+            .find(|record| record.id == operation.id)
+        {
+            self.record_nested_operation(receipt.chat_id, operation);
+        }
         let approval = denials::allowed_approval_record(
             receipt.chat_id,
             operation,
@@ -3841,7 +3855,9 @@ impl Agent {
                 "operation has already been admitted".into(),
             ));
         }
+        nested_calls::check_dispatch().map_err(AgentError::Invalid)?;
         operation.state = OperationState::Admitted;
+        self.record_nested_operation(chat.snapshot.id, operation);
         Ok(())
     }
 
@@ -3955,7 +3971,7 @@ impl Agent {
             match admission {
                 RunAdmission::Idle => return Ok(None),
                 RunAdmission::Ready(receipt, request, cancel) => {
-                    return Ok(Some((receipt, request, cancel)));
+                    return Ok(Some((receipt, *request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
                     match self.take_trigger_input(chat_id, *pending).await? {
@@ -4111,7 +4127,7 @@ impl Agent {
                     return Ok(TriggerTake::Waits);
                 }
                 drop(boundary);
-                self.run_task((receipt, request, cancel));
+                self.run_task((receipt, *request, cancel));
                 Ok(TriggerTake::Started)
             }
         }
@@ -4437,7 +4453,7 @@ impl Agent {
                 reasoning_effort: candidate.snapshot.effective_reasoning_effort(),
             };
             *chat = candidate;
-            return Ok(RunAdmission::Ready(receipt, request, cancel));
+            return Ok(RunAdmission::Ready(receipt, Box::new(request), cancel));
         }
         if preceding_model_runs.is_some()
             && command_barrier.is_none_or(|command_sequence| {
@@ -4468,6 +4484,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
         let request = PermissionRequest {
+            parent_call: nested_calls::parent_call().await,
             mcp_server: prompt.mcp_server,
             id: tickloop_ids::generate(),
             loop_id: receipt.loop_id,
@@ -4492,7 +4509,10 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
-        tool_batch::serialize_permission_prompt(&cancel).await?;
+        let nested = nested_calls::is_nested();
+        if !nested {
+            tool_batch::serialize_permission_prompt(&cancel).await?;
+        }
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
@@ -4517,8 +4537,10 @@ impl Agent {
                     .run_cancel(receipt.run_id)
                     .cloned()
                     .ok_or("permission Run is unavailable")?;
-                self.park_run(chat, receipt, run_cancel)
-                    .map_err(|error| error.to_string())?;
+                if !nested {
+                    self.park_run(chat, receipt, run_cancel)
+                        .map_err(|error| error.to_string())?;
+                }
             } else if let PermissionExecution::UserShell { command_id } = request.execution
                 && !chat.snapshot.user_shells.iter().any(|shell| {
                     shell.id == command_id && shell.state == UserShellState::WaitingPermission
@@ -4548,7 +4570,8 @@ impl Agent {
                 },
             );
         }
-        if model_receipt.is_some()
+        if !nested
+            && model_receipt.is_some()
             && let Some(next) = self
                 .next_run(chat_id)
                 .await
@@ -4556,9 +4579,11 @@ impl Agent {
         {
             self.run_task(next);
         }
-        let answer = tokio::select! {biased; _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
+        let answer = tokio::select! {biased; _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
-            if let Some(receipt) = &model_receipt {
+            if let Some(receipt) = &model_receipt
+                && !nested
+            {
                 self.resume_parked_run(receipt, cancel.clone()).await
             } else {
                 Ok(())
@@ -4571,6 +4596,12 @@ impl Agent {
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
+            if nested
+                && chat.snapshot.permissions.is_empty()
+                && chat.active_run == model_receipt.as_ref().map(|receipt| receipt.run_id)
+            {
+                chat.snapshot.chat_loop.set_state(LoopState::Running);
+            }
             self.save(&chat.snapshot);
         }
         self.inner.approvals.lock().await.remove(&request.id);
@@ -5383,6 +5414,7 @@ fn response_continuation_prompt(error: &AgentError) -> Option<&'static str> {
 pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
+        .chain(tool_exposure::fold_definitions())
         .chain(plan::definitions(false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())

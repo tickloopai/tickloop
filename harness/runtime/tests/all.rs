@@ -82,3 +82,6 @@ mod mcp_servers;
 
 #[path = "all/third_party_approval.rs"]
 mod third_party_approval;
+
+#[path = "all/tool_exposure.rs"]
+mod tool_exposure;

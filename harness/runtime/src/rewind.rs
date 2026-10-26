@@ -409,6 +409,13 @@ pub(super) fn conversation_before(
         .filter(|run| !kept_runs.contains(run))
         .collect::<HashSet<RunId>>();
     candidate.messages.truncate(index);
+    candidate.operations = std::mem::take(&mut candidate.operations)
+        .into_iter()
+        .filter(|operation| {
+            operation.parent_call_id.is_none()
+                || super::nested_calls::parent_on_chain(&candidate, operation)
+        })
+        .collect();
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);

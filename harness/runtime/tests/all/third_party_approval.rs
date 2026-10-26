@@ -17,6 +17,9 @@ async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, Str
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MCP_OK"}]}));
     let configs = vec![McpServerConfig {
+        exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+        tool_exposure: Vec::new(),
+        description: String::new(),
         oauth: Default::default(),
         sensitive_values: Vec::new(),
         disabled: false,
@@ -721,6 +724,9 @@ async fn invalid_resolved_service_names_cannot_expose_ambiguous_tools() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
             name: "team__read".into(),
             source: "global".into(),
             transport: McpTransport::Http {

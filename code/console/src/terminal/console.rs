@@ -105,8 +105,8 @@ use super::{
     },
     diff_dialog::{DiffDialog, DiffDialogAction, DiffDialogMode, DiffDialogOutcome},
     diff_view::{
-        DiffLineKind, DiffNavigation, DiffNavigationAction, DiffViewport, navigate_diff,
-        navigate_error, render_diff, render_error,
+        DiffLineKind, DiffNavigation, DiffNavigationAction, DiffViewport,
+        navigate_diff_with_context, navigate_error, render_diff_with_context, render_error,
     },
     display::{DisplayProfile, Glyph},
     editor::{Editor, EditorCommand, EditorOutcome},
@@ -1158,9 +1158,21 @@ impl MenuCommentState {
 }
 
 struct MenuReviewState {
+    context: Vec<String>,
     review: Result<FileChangeReview, String>,
     navigation: DiffNavigation,
     viewport: DiffViewport,
+}
+
+impl MenuReviewState {
+    fn error_text(&self, error: &str) -> String {
+        self.context
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(error))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 struct DiffScreen {
@@ -4565,6 +4577,7 @@ impl Console {
         };
         state.menu_expand_options = expand_options;
         state.menu_review = review.map(|review| MenuReviewState {
+            context: menu.context.iter().skip(1).cloned().collect(),
             review,
             navigation: DiffNavigation::default(),
             viewport: DiffViewport {
@@ -7903,10 +7916,18 @@ impl State {
                     height: context_capacity,
                 };
                 let frame = match &review.review {
-                    Ok(source) => render_diff(source, &review.navigation, viewport),
-                    Err(error) => {
-                        render_error("Review unavailable", error, &review.navigation, viewport)
-                    }
+                    Ok(source) => render_diff_with_context(
+                        source,
+                        &review.context,
+                        &review.navigation,
+                        viewport,
+                    ),
+                    Err(error) => render_error(
+                        "Review unavailable",
+                        &review.error_text(error),
+                        &review.navigation,
+                        viewport,
+                    ),
                 };
                 review.navigation = frame.navigation;
                 review.viewport = viewport;
@@ -10484,15 +10505,16 @@ impl State {
             return;
         };
         review_state.navigation = match &review_state.review {
-            Ok(review) => navigate_diff(
+            Ok(review) => navigate_diff_with_context(
                 review,
+                &review_state.context,
                 &review_state.navigation,
                 review_state.viewport,
                 action,
             ),
             Err(error) => navigate_error(
                 "Review unavailable",
-                error,
+                &review_state.error_text(error),
                 &review_state.navigation,
                 review_state.viewport,
                 action,
@@ -15645,6 +15667,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_permission_context_is_visible_and_scrollable_with_the_file_diff() {
+        let console = console_with_state(State::new(true, 80, 24));
+        let mut request = menu();
+        request.context = vec![
+            "Agent".into(),
+            "From ExecuteTools call batch-context".into(),
+            format!(
+                "Full batch: {} END_OF_BATCH",
+                "independent operation ".repeat(100)
+            ),
+        ];
+        let id = request.id;
+        let catalog = diff_catalog(2);
+        let CatalogChangeDetail::Available(review) = &catalog.sources[0].files[0].detail else {
+            unreachable!()
+        };
+        console.set_request_layout(Some(id)).unwrap();
+        console
+            .show_reviewable_menu(request, vec![0], Ok(review.as_ref().clone()))
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen.join("\n").contains("batch-context"));
+        state.key(key(KeyCode::Char('v')));
+        let mut reached_end = false;
+        for _ in 0..20 {
+            state.draw(&mut Vec::new()).unwrap();
+            reached_end |= state.rendered_screen.join("\n").contains("END_OF_BATCH");
+            state.key(key(KeyCode::PageDown));
+        }
+        assert!(
+            reached_end,
+            "full batch must be reachable in the diff review"
+        );
+        assert!(state.key(key(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
     fn diff_focus_owns_j_k_navigation_and_cannot_approve_a_permission() {
         let mut state = State::new(true, 40, 18);
         state.prompt_enabled = true;
@@ -15654,6 +15714,7 @@ mod tests {
             unreachable!()
         };
         state.menu_review = Some(MenuReviewState {
+            context: Vec::new(),
             review: Ok(review.as_ref().clone()),
             navigation: DiffNavigation::default(),
             viewport: DiffViewport {
@@ -15695,6 +15756,7 @@ mod tests {
         let permission_id = permission.id;
         state.menu = Some(permission);
         state.menu_review = Some(MenuReviewState {
+            context: Vec::new(),
             review: Err("review artifact is missing".into()),
             navigation: DiffNavigation::default(),
             viewport: DiffViewport {
@@ -15723,6 +15785,7 @@ mod tests {
         let permission_id = permission.id;
         state.menu = Some(permission);
         state.menu_review = Some(MenuReviewState {
+            context: Vec::new(),
             review: Err("review artifact is missing".into()),
             navigation: DiffNavigation::default(),
             viewport: DiffViewport {
@@ -15748,6 +15811,7 @@ mod tests {
         let mut state = State::new(true, 40, 4);
         state.menu = Some(menu());
         state.menu_review = Some(MenuReviewState {
+            context: Vec::new(),
             review: Err("review unavailable".into()),
             navigation: DiffNavigation::default(),
             viewport: DiffViewport {

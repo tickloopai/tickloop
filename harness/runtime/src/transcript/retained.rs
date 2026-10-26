@@ -34,6 +34,8 @@ struct LoadableChain {
     responses: HashSet<Uuid>,
     inputs: HashSet<Uuid>,
     tool_results: HashSet<String>,
+    nested_parents: HashSet<(Uuid, String)>,
+    compacted_nested_parents: HashSet<(Uuid, String)>,
     compacted_entries: HashSet<Uuid>,
     compacted_tool_results: HashSet<String>,
 }
@@ -48,8 +50,23 @@ impl LoadableChain {
             let tool_results = std::mem::take(&mut self.tool_results);
             self.compacted_entries.extend(entries);
             self.compacted_tool_results.extend(tool_results);
+            self.compacted_nested_parents
+                .extend(std::mem::take(&mut self.nested_parents));
             self.responses.clear();
             self.inputs.clear();
+        }
+        if let Some(run) = entry.run_id {
+            self.nested_parents
+                .extend(
+                    entry
+                        .message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::ToolUse { id, .. } => Some((run, id.clone())),
+                            _ => None,
+                        }),
+                );
         }
         self.entries.insert(entry.uuid);
         self.entries.extend(entry.original_message_id);
@@ -72,6 +89,11 @@ impl LoadableChain {
 impl LoadableChain {
     fn keeps_entry(&self, entry: Uuid) -> bool {
         self.entries.contains(&entry) || !self.compacted_entries.contains(&entry)
+    }
+
+    fn keeps_nested_parent(&self, run: Uuid, call_id: &str) -> bool {
+        let parent = (run, call_id.to_owned());
+        self.nested_parents.contains(&parent) || !self.compacted_nested_parents.contains(&parent)
     }
 
     fn keeps_tool_result(&self, call_id: &str) -> bool {
@@ -120,6 +142,7 @@ impl RetainedFold {
                 let mut chain = std::mem::take(&mut self.chain);
                 chain.compacted_entries.clear();
                 chain.compacted_tool_results.clear();
+                chain.compacted_nested_parents.clear();
                 *self = Self {
                     next_order: self.next_order,
                     chain,
@@ -155,6 +178,9 @@ impl RetainedFold {
             }
             (Retention::LatestById, Line::Input(entry)) => {
                 self.by_id.insert((kind, entry.input_id), kept);
+            }
+            (Retention::LatestById, Line::NestedCall(entry)) => {
+                self.by_id.insert((kind, entry.operation.id), kept);
             }
             (Retention::LatestById, Line::Wait(entry)) => {
                 self.by_id.insert((kind, entry.wait_id), kept);
@@ -236,6 +262,7 @@ impl RetainedFold {
                         || response_inputs.contains(&entry.input_id)
                         || recent_external_inputs.contains(&entry.input_id)
                 }
+                Line::NestedCall(entry) => entry.operation.parent_call_id.as_ref().is_some_and(|parent| self.chain.keeps_nested_parent(entry.operation.run_id.into(), parent)),
                 Line::Wait(entry) => {
                     matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
                         || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. })

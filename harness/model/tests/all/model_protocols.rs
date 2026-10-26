@@ -779,7 +779,7 @@ async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
         complete[..last_frame].to_owned(),
         complete.replace("call-2", "call-1"),
         complete.replace("first.md\\\"}", "first.md"),
-        complete.replace("\"sequence_number\":2,", "\"sequence_number\":1,"),
+        complete.replacen("\"sequence_number\":2", "\"sequence_number\":1", 1),
         complete.replace("event: response.completed", "event: response.failed"),
         complete.replace(duplicate, &format!("{duplicate}\n\n{duplicate}")),
         response_event(
@@ -789,6 +789,10 @@ async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
         ),
     ];
     for (index, body) in invalid.into_iter().enumerate() {
+        assert_ne!(
+            body, complete,
+            "invalid fixture {index} did not change the stream"
+        );
         let (base_url, _) = serve_response(200, body).await;
         let client = LocalModelClients::new(None)
             .client(&configuration(base_url, Protocol::Responses))

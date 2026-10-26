@@ -9,6 +9,12 @@ pub struct McpServerConfig {
     pub transport: McpTransport,
     pub timeout_ms: u64,
     #[serde(default)]
+    pub exposure: ToolExposure,
+    #[serde(default)]
+    pub tool_exposure: Vec<(String, ToolExposure)>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub oauth: McpOAuthConfig,
     /// Host-provided secrets to remove from every server response.
     #[serde(default)]
@@ -18,8 +24,34 @@ pub struct McpServerConfig {
     pub disabled: bool,
 }
 
-/// Until servers choose how their tools reach the model, every tool is listed directly.
-pub const DIRECT_EXPOSURE: &str = "direct";
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExposure {
+    #[default]
+    Search,
+    Direct,
+    Codemode,
+    Hidden,
+}
+
+impl ToolExposure {
+    pub fn for_host(self, scripts: bool) -> Self {
+        if self == Self::Codemode && !scripts {
+            Self::Search
+        } else {
+            self
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Direct => "direct",
+            Self::Codemode => "codemode",
+            Self::Hidden => "hidden",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

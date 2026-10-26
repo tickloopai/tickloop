@@ -26,6 +26,9 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
         service.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}}}]));
         service.set_result(json!({"content":[{"type":"text","text":"OK"}]}));
         let configs = vec![McpServerConfig {
+            exposure: tickloop_harness::protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
             oauth: Default::default(),
             sensitive_values: Vec::new(),
             disabled: false,
@@ -138,4 +141,77 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
         );
         core.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn nested_file_change_confirmation_shows_the_entire_parent_batch() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().canonicalize().unwrap();
+    let root = project.join("settings");
+    let settings = UserSettings::in_root(&root);
+    let configs:Vec<McpServerConfig>=vec![serde_json::from_value(json!({"name":"unused","source":"global","transport":{"type":"unsupported","kind":"fixture"},"timeout_ms":1000})).unwrap()];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(configs.clone()).await;
+    let core = Runtime::new_with_user_settings_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "batch-context",
+                "ExecuteTools",
+                json!({"calls":[
+                    {"name":"Write","arguments":{"file_path":project.join("note.txt"),"content":"first operation"}},
+                    {"name":"SearchTools","arguments":{"queries":["second-operation-marker"]}}
+                ]}),
+            ),
+            text("done"),
+        ])),
+        settings.clone(),
+    );
+    core.install_host_tools(Arc::new(McpToolProvider::new(
+        connections,
+        Arc::new(move || configs.clone()),
+    )))
+    .unwrap();
+    let view = Agent::from_embedded(core.clone(), config());
+    let chat = view.create_chat(project).await.unwrap();
+    core.set_permission_rules(
+        chat.into(),
+        vec![tickloop_harness::protocol::PermissionRule {
+            id: tickloop_harness::ids::generate(),
+            decision: tickloop_harness::protocol::Decision::Ask,
+            tool: "Write".into(),
+            specifier: None,
+            input: None,
+            loop_id: None,
+            persistent: false,
+        }],
+    )
+    .await
+    .unwrap();
+    let console = Console::test_interactive_for_chat(chat);
+    let mut menus = Menus::new(Some(settings), Some(root));
+    let mut events = core.subscribe();
+    core.submit(chat.into(), "Write the note".into())
+        .await
+        .unwrap();
+    let request = loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => break request,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(request.file_change.is_some());
+    menus
+        .permission(&console, chat, &request, "Agent".into(), true)
+        .unwrap();
+    let menu = console.menu_snapshot(request.id).unwrap().unwrap();
+    let context = menu.context.join("\n");
+    assert!(context.contains("batch-context"));
+    assert!(context.contains("second-operation-marker"));
+    core.shutdown().await;
 }

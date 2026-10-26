@@ -21,6 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 fn http_server(name: &str, server: &McpService) -> McpServerConfig {
     McpServerConfig {
+        exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+        tool_exposure: Vec::new(),
+        description: String::new(),
         sensitive_values: Vec::new(),
         disabled: false,
         name: name.into(),
@@ -390,7 +393,7 @@ async fn artifact_resources_keep_the_artifacts_result_size_rule() {
 }
 
 #[tokio::test]
-async fn resource_tools_are_not_offered_when_no_server_provides_resources() {
+async fn resource_definitions_stay_available_for_configured_servers() {
     let plain = McpService::start().await;
     plain.set_resources_capability(None);
     plain.set_tools(json!([{"name":"ping","inputSchema":{"type":"object"}}]));
@@ -404,7 +407,8 @@ async fn resource_tools_are_not_offered_when_no_server_provides_resources() {
 
     let tools = offered_tools(&model, 0);
     assert!(tools.contains(&"mcp__plain__ping".to_owned()));
-    assert!(!tools.iter().any(|name| name.contains("McpResource")));
+    assert!(tools.contains(&"ListMcpResourcesTool".to_owned()));
+    assert!(tools.contains(&"ReadMcpResourceTool".to_owned()));
     agent.shutdown().await;
 }
 

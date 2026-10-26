@@ -37,6 +37,7 @@ struct AutoPermissionDecision {
 
 #[derive(Clone)]
 enum ToolRoute {
+    Fold(Arc<crate::tool_exposure::ExposureDirectory>),
     BuiltIn,
     Plan,
     Interaction,
@@ -166,6 +167,8 @@ const FOLDER_HOST_TOOLS: [&str; 6] = [
 
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+    folded: std::collections::BTreeSet<String>,
+    script_only: std::collections::BTreeSet<String>,
     /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
     offers_web_search: bool,
 }
@@ -296,11 +299,14 @@ impl ToolRegistry {
                     }),
             );
         }
+        let mut folded = std::collections::BTreeSet::new();
+        let mut script_only = std::collections::BTreeSet::new();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
-            if provider
-                .mcp_resource_servers()
-                .iter()
-                .any(|server| crate::mcp_resource_authority_allowed(chat, &server.authority))
+            if provider.has_tool_search()
+                || provider
+                    .mcp_resource_servers()
+                    .iter()
+                    .any(|server| crate::mcp_resource_authority_allowed(chat, &server.authority))
             {
                 tools.extend(
                     crate::mcp_resources::definitions()
@@ -310,6 +316,47 @@ impl ToolRegistry {
                             route: ToolRoute::McpResource(provider.clone()),
                         }),
                 );
+            }
+            if provider.has_tool_search() {
+                let discovery = provider
+                    .discovery_tools()
+                    .into_iter()
+                    .filter(|tool| {
+                        chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                            delegation
+                                .ceiling
+                                .host_tools
+                                .contains_key(&tool.definition.name)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                script_only.extend(
+                    discovery
+                        .iter()
+                        .filter(|tool| {
+                            tool.exposure == tickloop_harness_protocol::mcp::ToolExposure::Codemode
+                        })
+                        .map(|tool| tool.definition.name.clone()),
+                );
+                folded.extend(
+                    discovery
+                        .iter()
+                        .filter(|tool| {
+                            tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
+                        })
+                        .map(|tool| tool.definition.name.clone()),
+                );
+                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
+                    discovery,
+                    crate::tool_exposure::SearchSupport::Fold,
+                    true,
+                ));
+                tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
+                    |definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Fold(directory.clone()),
+                    },
+                ));
             }
             tools.extend(
                 provider
@@ -329,6 +376,8 @@ impl ToolRegistry {
         }
         Self {
             tools: merge_tick_management(tools),
+            folded,
+            script_only,
             offers_web_search: policy.web_search,
         }
     }
@@ -336,6 +385,7 @@ impl ToolRegistry {
     pub(super) fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
+            .filter(|tool| !self.folded.contains(&tool.definition.name))
             .map(|tool| tool.definition.clone())
             .collect()
     }
@@ -374,6 +424,7 @@ impl ToolRegistry {
     pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tools
             .iter()
+            .filter(|tool| !self.folded.contains(&tool.definition.name))
             .filter(|tool| {
                 matches!(
                     tool.route,
@@ -385,6 +436,17 @@ impl ToolRegistry {
     }
 
     pub(super) fn resolve(&self, name: &str) -> Option<RegisteredTool> {
+        if self.folded.contains(name) {
+            return None;
+        }
+        self.resolve_nested(name)
+    }
+
+    pub(super) fn script_only(&self, name: &str) -> bool {
+        self.script_only.contains(name)
+    }
+
+    pub(super) fn resolve_nested(&self, name: &str) -> Option<RegisteredTool> {
         self.tools
             .iter()
             .find(|tool| tool.definition.name == name)
@@ -596,7 +658,7 @@ pub(super) struct ToolCallOutcome {
 }
 
 impl ToolCallOutcome {
-    fn not_admitted(message: String) -> Self {
+    pub(super) fn not_admitted(message: String) -> Self {
         Self {
             result: ToolResult {
                 content: message,
@@ -678,6 +740,18 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            ToolRoute::Fold(directory) => {
+                let value = match operation.name.as_str() {
+                    crate::tool_exposure::SEARCH_TOOLS => directory.search(&operation.input),
+                    crate::tool_exposure::DESCRIBE_TOOLS => directory.describe(&operation.input),
+                    _ => unreachable!("ExecuteTools runs through nested calls"),
+                }?;
+                Ok(ToolResult {
+                    content: value.to_string(),
+                    is_error: false,
+                    output_ref: None,
+                })
+            }
             ToolRoute::SharedTask => self.shared_task_tool(receipt, operation, &cancel).await,
             ToolRoute::Goal => self.goal_tool(receipt, operation, cancel).await,
             ToolRoute::ScheduledTask => self.scheduled_task_tool(receipt, operation).await,
@@ -767,6 +841,21 @@ impl Agent {
         invocation: ToolInvocation,
         cancel: CancellationToken,
     ) -> Result<ToolCallOutcome, ToolCallError> {
+        if invocation.name == crate::tool_exposure::EXECUTE_TOOLS
+            && matches!(
+                invocation.registration.as_ref().map(|tool| &tool.route),
+                Some(ToolRoute::Fold(_))
+            )
+        {
+            return Box::pin(self.execute_fold(
+                receipt,
+                assistant_message_id,
+                invocation.id,
+                invocation.input,
+                cancel,
+            ))
+            .await;
+        }
         let call_id = invocation.id.clone();
         let is_shell = invocation.name == tickloop_harness_tools::BASH_TOOL_NAME;
         // Retries reuse call IDs; settle only the operation created by this invocation.
@@ -869,6 +958,7 @@ impl Agent {
                 operation.state = state;
             }
             operation.result = Some(result);
+            self.record_nested_operation(receipt.chat_id, operation);
             self.save(&chat.snapshot);
         }
         outcome
@@ -1187,9 +1277,11 @@ impl Agent {
                 let route = &registration.as_ref()?.route;
                 // As in Codex, the goal tools never wait on an approval: reading and reporting on
                 // the goal change nothing outside it, and setting one runs directly too.
-                if matches!(route, ToolRoute::SharedTask | ToolRoute::McpResource(_))
-                    || matches!(route, ToolRoute::Goal)
-                        && name != crate::goal::tools::CREATE_GOAL_TOOL_NAME
+                if matches!(
+                    route,
+                    ToolRoute::SharedTask | ToolRoute::McpResource(_) | ToolRoute::Fold(_)
+                ) || matches!(route, ToolRoute::Goal)
+                    && name != crate::goal::tools::CREATE_GOAL_TOOL_NAME
                 {
                     return Some(crate::host_tools::HostToolPermission::ReadOnly);
                 }
@@ -1252,6 +1344,7 @@ impl Agent {
             )
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
+                parent_call_id: crate::nested_calls::parent_call_id(),
                 task_binding: task_binding.flatten(),
                 id: tickloop_ids::generate(),
                 loop_id: receipt.loop_id,
@@ -1277,6 +1370,7 @@ impl Agent {
                 if cancel.is_cancelled() {
                     return Err("run interrupted before host operation".into());
                 }
+                self.record_nested_operation(receipt.chat_id, &operation);
                 chat.snapshot.operations.push(operation.clone());
                 self.save(&chat.snapshot);
                 let sessions = self.inner.session_permissions.lock().await;
@@ -1822,6 +1916,7 @@ impl Agent {
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
+                        parent_call_id: crate::nested_calls::parent_call_id(),
                         task_binding: task_binding.flatten(),
                         id: operation_id,
                         loop_id: receipt.loop_id,
@@ -1836,6 +1931,7 @@ impl Agent {
                     {
                         let mut chats = self.inner.chats.lock().await;
                         let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                        self.record_nested_operation(receipt.chat_id, &operation);
                         chat.snapshot.operations.push(operation.clone());
                         self.save(&chat.snapshot);
                     }
@@ -2501,6 +2597,7 @@ impl Agent {
                             None,
                         )
                         .finish(receipt.chat_id, operation);
+                        crate::nested_calls::stop_after_denial();
                         return Err(ToolCallError::denied(reason, record));
                     }
                     Some(warning) if kind == AutoBlockKind::SoftDeny => {
@@ -2539,6 +2636,9 @@ impl Agent {
             reason
                 .get_or_insert_with(String::new)
                 .push_str(&format!("\n{warning}"));
+        }
+        if decision == Decision::Deny && matches!(assessment.verdict, AutoReview::Block { .. }) {
+            crate::nested_calls::stop_after_denial();
         }
         Ok(AutoPermissionDecision {
             decision,

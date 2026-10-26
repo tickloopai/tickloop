@@ -2338,7 +2338,7 @@ impl Menus {
                 })
         });
         let mut context = vec![requester.clone()];
-        if review.is_none() {
+        if review.is_none() || request.parent_call.is_some() {
             context.extend(permission_context(request));
         }
         let explicit_ask = request.approval_source == PermissionApprovalSource::ExplicitAsk;
@@ -3809,6 +3809,7 @@ mod tests {
         snapshot
             .permissions
             .push(tickloop_harness::protocol::PermissionRequest {
+                parent_call: None,
                 mcp_server: None,
                 id: permission,
                 loop_id: receipt.loop_id,

@@ -144,6 +144,8 @@ tickloop plugin install --path ./my-plugin
 
 你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
 
+MCP 工具默认采用 `exposure: "search"`：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
+
 `/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。在 `/mcp` 中登录时显示链接，本机时打开浏览器；浏览器在其他机器上时，把跳转后的地址粘贴到输入框；Esc 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。

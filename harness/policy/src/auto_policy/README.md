@@ -108,3 +108,12 @@ These calls do not enter the classifier by default, so no frozen rule is added o
 The browser-specific entries above remain inapplicable: connecting an arbitrary MCP browser does not implement the trusted native browser admission paths. Its tools follow ThirdParty admission. Automated coverage is in `harness/runtime/tests/all/third_party_approval.rs` and the Console MCP confirmation tests; these prove deterministic admission, persistence and denial boundaries, not semantic acceptance by a real reviewer.
 
 Permission history uses the same prepared service identity for matching as admission, and records the original service rule ID and matcher for Allow, Ask and Deny, including tools whose displayed names were hashed.
+
+## Fold and nested calls
+
+| Tool | Permission and Auto handling | Authorization boundary |
+| --- | --- | --- |
+| SearchTools / DescribeTools | ReadOnly; no review | Discovery respects exposure and the delegated tool ceiling; annotations are reference data only |
+| ExecuteTools | No wrapper approval | Each independent child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
+
+Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and nine inapplicable entries remain unchanged.

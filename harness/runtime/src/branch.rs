@@ -1024,6 +1024,7 @@ mod tests {
                     chat.snapshot
                         .permissions
                         .push(tickloop_harness_protocol::PermissionRequest {
+                            parent_call: None,
                             mcp_server: None,
                             id: Uuid::new_v4(),
                             loop_id: loop_id.into(),
@@ -1127,6 +1128,7 @@ mod tests {
                     chat.snapshot
                         .operations
                         .push(tickloop_harness_protocol::OperationRecord {
+                            parent_call_id: None,
                             task_binding: None,
                             id: Uuid::new_v4(),
                             loop_id: loop_id.into(),

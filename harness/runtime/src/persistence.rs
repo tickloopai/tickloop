@@ -2371,6 +2371,32 @@ fn recover_transcript(
             .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
     );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
+    let mut nested = std::collections::BTreeMap::new();
+    for line in &loaded.lifecycle {
+        if let Line::NestedCall(entry) = line
+            && entry.chat_id == source_chat_id
+            && super::nested_calls::parent_on_chain(&snapshot, &entry.operation)
+        {
+            let mut operation = entry.operation.clone();
+            if matches!(
+                operation.state,
+                tickloop_harness_protocol::OperationState::Proposed
+                    | tickloop_harness_protocol::OperationState::Admitted
+            ) {
+                let admitted =
+                    operation.state == tickloop_harness_protocol::OperationState::Admitted;
+                operation.state = if admitted {
+                    tickloop_harness_protocol::OperationState::Unknown
+                } else {
+                    tickloop_harness_protocol::OperationState::Failed
+                };
+                operation.result = Some(tickloop_harness_protocol::ToolResult {content:if admitted {"Nested call interrupted after admission; outcome unknown. Do not retry automatically."} else {"Nested call interrupted before admission; not executed."}.into(),is_error:true,output_ref:None});
+            }
+            nested.insert(operation.id, operation);
+        }
+    }
+    snapshot.operations.extend(nested.into_values());
+
     recover_snapshot_for_resume(
         snapshot,
         bookkeeping,

@@ -382,14 +382,13 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
         .iter()
         .find(|tool| tool.name == "Skill")
         .unwrap();
-    assert_eq!(
-        skill_tool.input_schema["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        ["args", "skill"]
-    );
+    let mut fields = skill_tool.input_schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(fields, ["args", "skill"]);
     assert_eq!(skill_tool.input_schema["required"], json!(["skill"]));
     assert_eq!(
         skill_tool.input_schema["properties"]["args"]["type"],

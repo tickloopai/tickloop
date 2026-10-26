@@ -4,7 +4,9 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-use tickloop_harness::protocol::mcp::{McpOAuthConfig, McpServerConfig, McpTransport};
+use tickloop_harness::protocol::mcp::{
+    McpOAuthConfig, McpServerConfig, McpTransport, ToolExposure,
+};
 
 const PROJECTS_KEY: &str = "projects";
 const SERVERS_KEY: &str = "mcpServers";
@@ -291,7 +293,7 @@ pub async fn configured_statuses(
             } else {
                 state
             },
-            exposure: tickloop_harness::protocol::mcp::DIRECT_EXPOSURE.into(),
+            exposure: server.exposure.as_str().into(),
             tools: Vec::new(),
             failure: match &server.transport {
                 McpTransport::Failed { reason } => Some(reason.clone()),
@@ -490,6 +492,30 @@ impl ResolvedServers {
             McpOAuthConfig::default()
         };
 
+        let exposure = expanded_entry
+            .get("exposure")
+            .map(|value| serde_json::from_value::<ToolExposure>(value.clone()))
+            .transpose();
+        let tool_exposure = expanded_entry
+            .get("toolExposure")
+            .map(|value| {
+                value.as_object().ok_or(()).and_then(|overrides| {
+                    overrides
+                        .iter()
+                        .map(|(pattern, value)| {
+                            serde_json::from_value::<ToolExposure>(value.clone())
+                                .map(|exposure| (pattern.clone(), exposure))
+                                .map_err(|_| ())
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .transpose();
+        if exposure.is_err() || tool_exposure.is_err() {
+            transport = McpTransport::Failed {
+                reason: "invalid tool exposure configuration".into(),
+            };
+        }
         match &transport {
             McpTransport::Failed { reason } => self.warnings.push(format!("MCP {name}: {reason}")),
             McpTransport::NeedsConfiguration => self.warnings.push(format!(
@@ -507,6 +533,14 @@ impl ResolvedServers {
             sensitive_values: Vec::new(),
             disabled: false,
             oauth,
+            exposure: exposure.ok().flatten().unwrap_or_default(),
+            tool_exposure: tool_exposure.ok().flatten().unwrap_or_default(),
+            description: expanded_entry["description"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .take(2048)
+                .collect(),
             timeout_ms: expanded_entry["timeout"]
                 .as_u64()
                 .or_else(|| expanded_entry["timeout"].as_str()?.parse().ok())
