@@ -331,7 +331,7 @@ pub(super) enum InputEvent {
     },
     ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
     ArtifactSignOut,
-    /// Work `/ticks` asks for, or the login state to read again once a login program ended.
+    /// Work `/plugins` asks for, or the login state to read again once a login program ended.
     TickPackages(super::ticks_panel::TickPackageWork),
     TickAction {
         chat: Uuid,
@@ -1819,7 +1819,7 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
-            return Err("/ticks needs an interactive terminal".into());
+            return Err("/plugins needs an interactive terminal".into());
         }
         state.install_ticks_panel(panel);
         state.rendered_region = None;
@@ -1828,7 +1828,7 @@ impl Console {
             .map_err(|error| error.to_string())
     }
 
-    /// Hands `result` to the `/ticks` panel `panel`, shown or waiting, and says what became of it.
+    /// Hands `result` to the `/plugins` panel `panel`, shown or waiting, and says what became of it.
     pub(super) fn apply_tick_package_result(
         &self,
         panel: Uuid,
@@ -11704,7 +11704,12 @@ impl State {
         if monitor_notice_expired {
             self.monitor_notice = None;
         }
-        exit_expired
+        let plugin_expired = self
+            .ticks_panel
+            .as_mut()
+            .is_some_and(|panel| panel.expire_confirmation());
+        plugin_expired
+            || exit_expired
             || escape_expired
             || copy_notice_expired
             || monitor_expired
@@ -12017,6 +12022,24 @@ impl State {
         {
             return match panel.key(key) {
                 super::ticks_panel::TicksPanelEffect::None => None,
+                super::ticks_panel::TicksPanelEffect::EditFilter => {
+                    let query = panel.filter_text().to_owned();
+                    let outcome = self.run_external_editor(&query);
+                    let panel = self.ticks_panel.as_mut().unwrap();
+                    match outcome {
+                        Some(ExternalEditorOutcome::Updated { content }) => {
+                            panel.replace_filter(&content)
+                        }
+                        Some(ExternalEditorOutcome::Failed(error)) => {
+                            panel.report(error.to_string())
+                        }
+                        Some(ExternalEditorOutcome::Unavailable) => {
+                            panel.report("No external editor found; set VISUAL or EDITOR".into())
+                        }
+                        _ => {}
+                    }
+                    None
+                }
                 super::ticks_panel::TicksPanelEffect::Close => {
                     self.ticks_panel = None;
                     self.rendered_region = None;
