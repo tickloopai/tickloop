@@ -1,11 +1,18 @@
 //! `tickloop plugin marketplace …`, and installing, updating and listing plugins by name from
 //! every registered marketplace.
 
-use tick_plugins::{MarketplaceRegistration, MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE};
-use tickloop_code_console::terminal::safe_line;
-use tickloop_tick_installer::{plugin_http, read_marketplace, source_label};
+use std::collections::BTreeMap;
 
-use super::plugin_command::print_table;
+use tick_plugins::{
+    InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, MarketplaceRegistration,
+    MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
+};
+use tickloop_code_console::terminal::safe_line;
+use tickloop_tick_installer::{
+    PluginRequest, install_from, plugin_http, read_marketplace, read_marketplaces, source_label,
+};
+
+use super::plugin_command::{print_table, report, report_notes};
 
 const SHORT_COMMIT_LENGTH: usize = 12;
 const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::package_http::client;
@@ -41,7 +48,7 @@ pub(super) async fn update_marketplaces(
                 Err(reason) => {
                     failures += 1;
                     eprintln!(
-                        "Cannot update marketplace {}: {}",
+                        "Error: cannot update marketplace {}: {}",
                         registration.name,
                         safe_line(&reason)
                     );
@@ -136,4 +143,187 @@ pub(super) fn remove_marketplace(store: &PluginStore, name: &str) -> Result<(), 
         );
     }
     Ok(())
+}
+
+fn registration(store: &PluginStore, name: &str) -> Result<MarketplaceRegistration, String> {
+    store
+        .marketplaces()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|registration| registration.name == name)
+        .ok_or_else(|| format!("marketplace {name} is not registered"))
+}
+
+/// Installs `NAME@MARKETPLACE`, or `NAME` from the one marketplace that offers it.
+pub(super) async fn install(store: &PluginStore, text: &str) -> Result<(), String> {
+    let request = PluginRequest::parse(text)?;
+    let name = &request.name;
+    let installation = match request.marketplace.as_deref() {
+        Some(LOCAL_MARKETPLACE) => {
+            return Err(format!(
+                "plugins of the {LOCAL_MARKETPLACE} marketplace install with tickloop plugin install --path PATH"
+            ));
+        }
+        Some(TICKLOOP_MARKETPLACE) => return super::plugin_tick::install(store, name).await,
+        Some(marketplace) => {
+            let registration = registration(store, marketplace)?;
+            let plugins = read_marketplace(HTTP, store, &registration, false)
+                .await
+                .map_err(|reason| format!("cannot read marketplace {marketplace}: {reason}"))?;
+            let plugin = plugins
+                .iter()
+                .find(|plugin| &plugin.name == name)
+                .ok_or_else(|| {
+                    format!(
+                        "marketplace {marketplace} has no plugin {name}; \
+                         tickloop plugin marketplace update {marketplace} reads it again"
+                    )
+                })?;
+            install_from(HTTP, store, marketplace, plugin).await?
+        }
+        None => {
+            let (marketplace, plugin) = choose_offer(store, name).await?;
+            install_from(HTTP, store, &marketplace, &plugin).await?
+        }
+    };
+    report(&installation);
+    Ok(())
+}
+
+/// The marketplace that offers `name`: the only one, or the one it is installed from. A
+/// marketplace that cannot be read is reported and passed over.
+async fn choose_offer(
+    store: &PluginStore,
+    name: &str,
+) -> Result<(String, MarketplacePlugin), String> {
+    let mut offers = Vec::new();
+    for offer in read_marketplaces(HTTP, store, false).await? {
+        match offer.plugins {
+            Ok(plugins) => offers.extend(
+                plugins
+                    .into_iter()
+                    .filter(|plugin| plugin.name == name)
+                    .map(|plugin| (offer.registration.name.clone(), plugin)),
+            ),
+            Err(reason) => eprintln!(
+                "Warning: cannot read marketplace {}: {}",
+                offer.registration.name,
+                safe_line(&reason)
+            ),
+        }
+    }
+    let installed_from = store.get(name).ok().map(|plugin| plugin.marketplace);
+    if let Some(position) = offers
+        .iter()
+        .position(|(marketplace, _)| Some(marketplace) == installed_from.as_ref())
+    {
+        return Ok(offers.swap_remove(position));
+    }
+    match offers.len() {
+        0 => Err(format!(
+            "no marketplace offers plugin {name}; tickloop plugin list --available shows what they offer"
+        )),
+        1 => Ok(offers.remove(0)),
+        _ => Err(format!(
+            "plugin {name} is offered by several marketplaces: {}; choose one with tickloop plugin install {name}@MARKETPLACE",
+            offers
+                .iter()
+                .map(|(marketplace, _)| format!("{name}@{marketplace}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Updates one installed plugin, or every one, from its marketplace read afresh.
+pub(super) async fn update(store: &PluginStore, name: Option<&str>) -> Result<(), String> {
+    let installed = store.installed().map_err(|error| error.to_string())?;
+    let mut targets = installed
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.name().to_owned(), plugin.marketplace.clone()))
+        .chain(
+            installed
+                .broken
+                .iter()
+                .map(|plugin| (plugin.name.clone(), plugin.marketplace.clone())),
+        )
+        .collect::<Vec<_>>();
+    targets.sort();
+    if let Some(name) = name {
+        targets.retain(|(installed, _)| installed == name);
+        if targets.is_empty() {
+            return Err(format!("plugin {name} is not installed"));
+        }
+    } else if targets.is_empty() {
+        println!("No plugins are installed.");
+        return Ok(());
+    }
+    let mut marketplaces = BTreeMap::new();
+    let mut failures = 0;
+    for (name, marketplace) in &targets {
+        if marketplace == LOCAL_MARKETPLACE {
+            let installed_locally = format!(
+                "{name}@{marketplace} was installed from a local path; \
+                 tickloop plugin install --path updates it"
+            );
+            if targets.len() == 1 {
+                return Err(format!("plugin {installed_locally}"));
+            }
+            println!("Plugin {installed_locally}.");
+            continue;
+        }
+        if !marketplaces.contains_key(marketplace) {
+            let plugins = match registration(store, marketplace) {
+                Ok(registration) => read_marketplace(HTTP, store, &registration, true)
+                    .await
+                    .map_err(|reason| format!("cannot read marketplace {marketplace}: {reason}")),
+                Err(reason) => Err(reason),
+            };
+            marketplaces.insert(marketplace.clone(), plugins);
+        }
+        let result = match &marketplaces[marketplace] {
+            Ok(plugins) => match plugins.iter().find(|plugin| &plugin.name == name) {
+                Some(plugin) => install_from(HTTP, store, marketplace, plugin).await,
+                None => Err(format!(
+                    "cannot update {name}@{marketplace}: marketplace {marketplace} no longer offers it"
+                )),
+            },
+            Err(reason) => Err(format!("cannot update {name}@{marketplace}: {reason}")),
+        };
+        match result {
+            Ok(installation) => report_update(&installation),
+            Err(message) if targets.len() == 1 => return Err(message),
+            Err(message) => {
+                failures += 1;
+                eprintln!("Error: {}", safe_line(&message));
+            }
+        }
+    }
+    match failures {
+        0 => Ok(()),
+        _ => Err(format!(
+            "{failures} of {} plugins could not be updated",
+            targets.len()
+        )),
+    }
+}
+
+fn report_update(installation: &Installation) {
+    let plugin = &installation.plugin;
+    let id = plugin.id();
+    let version = &plugin.version;
+    let root = safe_line(&plugin.root.display().to_string());
+    match &installation.outcome {
+        InstallOutcome::AlreadyInstalled => {
+            println!("Plugin {id} {version} is up to date.");
+            return;
+        }
+        InstallOutcome::Installed => println!("Installed plugin {id} {version} in {root}."),
+        InstallOutcome::Replaced { previous_version } => {
+            println!("Updated plugin {id} from {previous_version} to {version} in {root}.")
+        }
+        InstallOutcome::Reinstalled => println!("Reinstalled plugin {id} {version} in {root}."),
+    }
+    report_notes(plugin);
 }

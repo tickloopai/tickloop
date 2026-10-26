@@ -76,6 +76,28 @@ fn marketplace_directory(fixture: &Fixture, label: &str, name: &str, plugins: Va
     root
 }
 
+/// Makes the repository that stands in for the built-in `claude-plugins-official` list `plugins`.
+fn official_marketplace(fixture: &Fixture, plugins: Value) -> PathBuf {
+    let root = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
+    write_json(
+        &root.join(".claude-plugin/marketplace.json"),
+        &json!({"name": "claude-plugins-official", "plugins": plugins}),
+    );
+    commit_all(&root, "official");
+    root
+}
+
+fn cached_root(fixture: &Fixture, marketplace: &str, name: &str, revision: &str) -> String {
+    path_text(
+        &fixture
+            .root
+            .join("config/plugins/cache")
+            .join(marketplace)
+            .join(name)
+            .join(revision),
+    )
+}
+
 fn file_url(path: &Path) -> String {
     format!("file://{}", path.display())
 }
@@ -221,5 +243,185 @@ fn a_git_marketplace_is_added_listed_updated_and_removed() {
     assert_eq!(
         failed(&plugin(&fixture, &["marketplace", "remove", "team-tools"])),
         "Error: marketplace team-tools is not registered\n"
+    );
+}
+
+#[test]
+fn a_plugin_installs_by_name_from_a_git_marketplace_and_updates_when_its_commit_changes() {
+    let fixture = Fixture::new();
+    official_marketplace(&fixture, json!([]));
+    let root = marketplace_directory(
+        &fixture,
+        "team",
+        "team-tools",
+        json!([{"name": "review", "source": "./plugins/review"}]),
+    );
+    write_skill(&root.join("plugins/review/skills/check"), "check", "First");
+    let first = commit_all(&root, "first");
+    succeeded(&plugin(&fixture, &["marketplace", "add", &file_url(&root)]));
+    let first_root = cached_root(&fixture, "team-tools", "review", &first[..12]);
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "review"])),
+        format!(
+            "Installed plugin review@team-tools {} in {first_root}.\n",
+            &first[..12]
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "review@team-tools"])),
+        format!(
+            "Plugin review@team-tools {} is already installed in {first_root}; nothing changed.\n",
+            &first[..12]
+        )
+    );
+    assert!(!Path::new(&first_root).join(".git").exists());
+
+    write_skill(&root.join("plugins/review/skills/check"), "check", "Second");
+    let second = commit_all(&root, "second");
+    let second_root = cached_root(&fixture, "team-tools", "review", &second[..12]);
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "review"])),
+        format!(
+            "Plugin review@team-tools {} is already installed in {first_root}; nothing changed.\n",
+            &first[..12]
+        ),
+        "install reads the marketplace as last fetched"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update", "review"])),
+        format!(
+            "Updated plugin review@team-tools from {} to {} in {second_root}.\n",
+            &first[..12],
+            &second[..12]
+        )
+    );
+    assert!(
+        fs::read_to_string(Path::new(&second_root).join("skills/check/SKILL.md"))
+            .unwrap()
+            .contains("Second")
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update", "review"])),
+        format!(
+            "Plugin review@team-tools {} is up to date.\n",
+            &second[..12]
+        )
+    );
+
+    let notes = fixture.root.join("sources/notes");
+    write_skill(&notes.join("skills/write"), "write", "Write");
+    succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&notes)],
+    ));
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["update"])),
+        format!(
+            "Plugin notes@local was installed from a local path; tickloop plugin install --path updates it.\n\
+             Plugin review@team-tools {} is up to date.\n",
+            &second[..12]
+        )
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["update", "notes"])),
+        "Error: plugin notes@local was installed from a local path; tickloop plugin install --path updates it\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["update", "absent"])),
+        "Error: plugin absent is not installed\n"
+    );
+}
+
+#[test]
+fn a_name_several_marketplaces_offer_lists_them_and_an_unreadable_marketplace_is_only_reported() {
+    let fixture = Fixture::new();
+    let team = marketplace_directory(
+        &fixture,
+        "team",
+        "team-tools",
+        json!([
+            {"name": "review", "source": "./plugins/review"},
+            {"name": "packaged", "source": {"source": "npm", "package": "packaged"}},
+        ]),
+    );
+    write_skill(&team.join("plugins/review/skills/check"), "check", "Team");
+    commit_all(&team, "team");
+    let lab = marketplace_directory(
+        &fixture,
+        "lab",
+        "lab",
+        json!([{"name": "review", "source": "./review"}]),
+    );
+    write_skill(&lab.join("review/skills/check"), "check", "Lab");
+    succeeded(&plugin(&fixture, &["marketplace", "add", &file_url(&team)]));
+    succeeded(&plugin(&fixture, &["marketplace", "add", &path_text(&lab)]));
+
+    let ambiguous = plugin(&fixture, &["install", "review"]);
+    assert_eq!(ambiguous.status.code(), Some(1));
+    assert!(
+        stderr(&ambiguous).starts_with(
+            "Warning: cannot read marketplace claude-plugins-official: Git operation failed: "
+        ),
+        "{}",
+        stderr(&ambiguous)
+    );
+    assert!(
+        stderr(&ambiguous).ends_with(
+            "Error: plugin review is offered by several marketplaces: review@lab, review@team-tools; \
+             choose one with tickloop plugin install review@MARKETPLACE\n"
+        ),
+        "{}",
+        stderr(&ambiguous)
+    );
+    assert!(!fixture.root.join("config/plugins/installed.json").exists());
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["install", "review@lab"])),
+        format!(
+            "Installed plugin review@lab local in {}.\n",
+            cached_root(&fixture, "lab", "review", "local")
+        )
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "review@team-tools"])),
+        "Error: plugin review is already installed from marketplace lab; uninstall it first\n"
+    );
+    let again = plugin(&fixture, &["install", "review"]);
+    assert!(
+        stdout(&again).starts_with("Reinstalled plugin review@lab local"),
+        "{}",
+        stdout(&again)
+    );
+    assert!(
+        stderr(&again).starts_with("Warning: cannot read marketplace claude-plugins-official: ")
+    );
+
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "packaged@team-tools"])),
+        "Error: cannot install packaged@team-tools: npm sources are not supported yet\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "absent@team-tools"])),
+        "Error: marketplace team-tools has no plugin absent; \
+         tickloop plugin marketplace update team-tools reads it again\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "review@nowhere"])),
+        "Error: marketplace nowhere is not registered\n"
+    );
+    assert_eq!(
+        failed(&plugin(&fixture, &["install", "review@local"])),
+        "Error: plugins of the local marketplace install with tickloop plugin install --path PATH\n"
+    );
+    let absent = plugin(&fixture, &["install", "absent"]);
+    assert_eq!(absent.status.code(), Some(1));
+    assert!(
+        stderr(&absent).ends_with(
+            "Error: no marketplace offers plugin absent; \
+             tickloop plugin list --available shows what they offer\n"
+        ),
+        "{}",
+        stderr(&absent)
     );
 }

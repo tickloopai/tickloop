@@ -5,8 +5,8 @@ use std::{ffi::OsString, path::Path};
 
 use tick_packages::LoginState;
 use tick_plugins::{
-    Component, InstallOutcome, Installation, InstalledPlugins, PluginError, PluginManifest,
-    PluginStore,
+    Component, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins, PluginError,
+    PluginManifest, PluginStore,
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::login_label;
@@ -62,6 +62,7 @@ enum PluginCommand<'a> {
     },
     List,
     Validate(&'a Path),
+    Update(Option<String>),
     MarketplaceAdd(String),
     MarketplaceList,
     MarketplaceUpdate(Option<String>),
@@ -71,7 +72,12 @@ enum PluginCommand<'a> {
 pub async fn run(arguments: &[OsString]) -> Result<(), String> {
     match parse(arguments)? {
         PluginCommand::Help => println!("{PLUGIN_USAGE}\n\n{PLUGIN_GUIDE}"),
-        PluginCommand::Install(name) => super::plugin_tick::install(&store()?, &name).await?,
+        PluginCommand::Install(name) => {
+            super::plugin_marketplace::install(&store()?, &name).await?
+        }
+        PluginCommand::Update(name) => {
+            super::plugin_marketplace::update(&store()?, name.as_deref()).await?
+        }
         PluginCommand::Login { name, issuer } => {
             super::plugin_tick::login(&store()?, &name, issuer.as_deref()).await?
         }
@@ -156,6 +162,10 @@ fn parse(arguments: &[OsString]) -> Result<PluginCommand<'_>, String> {
             }
         }
         [command] if command == "list" => PluginCommand::List,
+        [command] if command == "update" => PluginCommand::Update(None),
+        [command, plugin] if command == "update" && !is_option(plugin) => {
+            PluginCommand::Update(Some(name(plugin)))
+        }
         [command, action, source]
             if command == "marketplace" && action == "add" && !is_option(source) =>
         {
@@ -222,6 +232,12 @@ pub(super) fn report(installation: &Installation) {
             println!("Plugin {id} {version} is already installed in {root}; nothing changed.")
         }
     }
+    report_notes(plugin);
+}
+
+/// Whether `plugin` stays disabled, that its program runs as the user, and what its manifest
+/// leaves unused.
+pub(super) fn report_notes(plugin: &InstalledPlugin) {
     if !plugin.enabled {
         println!(
             "It stays disabled; tickloop plugin enable {} turns it on.",
