@@ -253,12 +253,14 @@ fn a_plugin_without_a_manifest_takes_its_marketplace_entry_or_its_directory_name
     let fixture = Fixture::new();
     let root = fixture.source("bare");
     write_skill(&root.join("skills/tidy"), "tidy");
+    fs::create_dir_all(root.join("custom-commands")).unwrap();
+    fs::write(root.join("custom-commands/tidy.md"), "Tidy up").unwrap();
     let entry = json!({
         "name": "from-entry",
         "description": "Tidies up",
         "source": "./plugins/bare",
         "strict": false,
-        "commands": ["./commands/tidy.md"],
+        "commands": ["./custom-commands/tidy.md"],
     });
 
     let from_entry = PluginManifest::load(&root, "bare", Some(entry.as_object().unwrap())).unwrap();
@@ -325,4 +327,85 @@ fn a_manifest_that_cannot_name_the_plugin_fails() {
     let manifest = PluginManifest::load(&root, "broken", None).unwrap();
     assert_eq!(manifest.description, None);
     assert_eq!(manifest.warnings.len(), 1, "{:?}", manifest.warnings);
+}
+
+#[test]
+fn unsupported_component_paths_are_checked_without_rejecting_the_plugin() {
+    let fixture = Fixture::new();
+    let outside = fixture.source("outside");
+    let fields = [
+        "commands",
+        "agents",
+        "outputStyles",
+        "hooks",
+        "mcpServers",
+        "lspServers",
+        "settings",
+    ];
+    for field in fields {
+        let root = fixture.claude_plugin(field, &json!({"name": "paths"}), &[]);
+        symlink(&outside, root.join("escape")).unwrap();
+        for (path, reason) in [
+            ("./missing", "does not exist"),
+            ("./../outside", "must stay inside"),
+            ("/outside", "must start with ./"),
+            ("./escape", "leads outside"),
+        ] {
+            write_json(
+                &root.join(".claude-plugin/plugin.json"),
+                &json!({"name": "paths", field: path}),
+            );
+            let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+            assert!(manifest.unsupported().is_empty(), "{field}: {path}");
+            assert_eq!(manifest.warnings.len(), 1, "{field}: {path}");
+            assert!(manifest.warnings[0].starts_with(&format!("{field} path")));
+            assert!(manifest.warnings[0].contains(reason));
+        }
+    }
+}
+
+#[test]
+fn component_paths_keep_valid_entries_and_inline_configurations() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "mixed",
+        &json!({
+            "name": "mixed",
+            "commands": {"valid": {"source": "./guide.md"}, "missing": {"source": "./missing.md"}},
+            "agents": ["./guide.md", "./missing.md"],
+            "outputStyles": "./guide.md",
+            "hooks": {"hooks": {}},
+            "mcpServers": ["./missing.json", {"server": {"command": "server"}}],
+            "lspServers": {"rust": {"command": "rust-analyzer"}},
+            "settings": {"model": "default"},
+            "userConfig": {"key": {"type": "string"}},
+            "channels": [{"server": "server"}],
+            "dependencies": ["another-plugin@market"],
+        }),
+        &[],
+    );
+    fs::write(root.join("guide.md"), "Guide").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(
+        manifest.unsupported(),
+        vec![
+            Component::Commands,
+            Component::Agents,
+            Component::Hooks,
+            Component::McpServers,
+            Component::LspServers,
+            Component::OutputStyles,
+            Component::UserConfig,
+            Component::Channels,
+            Component::Settings,
+            Component::Dependencies
+        ]
+    );
+    assert_eq!(manifest.warnings.len(), 3, "{:?}", manifest.warnings);
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commands.missing.source path"))
+    );
 }

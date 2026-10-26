@@ -345,7 +345,9 @@ fn from_document(
         components.insert(Component::Skills);
     }
     for (field, component) in COMPONENT_FIELDS {
-        if document.get(field).is_some_and(|value| !value.is_null()) {
+        if let Some(value) = document.get(field)
+            && declared_component(root, field, component, value, &mut warnings)
+        {
             components.insert(component);
         }
     }
@@ -516,6 +518,52 @@ fn default_skill_paths(root: &Path) -> Vec<PathBuf> {
         vec![PathBuf::from(DEFAULT_SKILLS_DIRECTORY)]
     } else {
         Vec::new()
+    }
+}
+
+fn declared_component(
+    root: &Path,
+    field: &str,
+    component: Component,
+    value: &Value,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    match component {
+        Component::Commands if value.is_object() => {
+            let mut found = false;
+            for (name, metadata) in value.as_object().expect("an object").iter() {
+                let field = format!("{field}.{name}.source");
+                found |= !contained_paths(
+                    root,
+                    &field,
+                    metadata.get("source").unwrap_or(&Value::Null),
+                    warnings,
+                )
+                .is_empty();
+            }
+            found
+        }
+        Component::Commands | Component::Agents | Component::OutputStyles => {
+            !contained_paths(root, field, value, warnings).is_empty()
+        }
+        Component::Hooks | Component::McpServers | Component::LspServers | Component::Settings => {
+            match value {
+                Value::Null => false,
+                Value::Object(_) => true,
+                Value::Array(items) => {
+                    let mut found = false;
+                    for item in items {
+                        found |= declared_component(root, field, component, item, warnings);
+                    }
+                    found
+                }
+                _ => !contained_paths(root, field, value, warnings).is_empty(),
+            }
+        }
+        _ => !value.is_null(),
     }
 }
 
