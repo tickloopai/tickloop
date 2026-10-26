@@ -4,7 +4,7 @@ mod process;
 mod provider;
 use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
-pub use provider::McpToolProvider;
+pub use provider::{McpConfiguration, McpToolProvider};
 use rmcp::{
     ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
@@ -47,6 +47,7 @@ pub enum McpServerState {
     Failed,
     Unsupported,
     NeedsLogin,
+    NeedsConfiguration,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct McpServerSnapshot {
@@ -236,6 +237,7 @@ impl McpConnections {
                 let state = credential_failure.unwrap_or_else(|| match &config.transport {
                     McpTransport::Unsupported { .. } => McpServerState::Unsupported,
                     McpTransport::Failed { .. } => McpServerState::Failed,
+                    McpTransport::NeedsConfiguration => McpServerState::NeedsConfiguration,
                     McpTransport::Stdio { .. } if !self.inner.capabilities.local_processes => {
                         McpServerState::Unsupported
                     }

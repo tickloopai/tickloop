@@ -44,7 +44,7 @@ fn a_claude_plugin_lists_its_skills_and_the_components_tickloop_does_not_use_yet
     );
     assert_eq!(
         manifest.unsupported(),
-        vec![Component::Commands, Component::Hooks, Component::McpServers]
+        vec![Component::Commands, Component::Hooks]
     );
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
     let root = root.canonicalize().unwrap();
@@ -392,7 +392,6 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
             Component::Commands,
             Component::Agents,
             Component::Hooks,
-            Component::McpServers,
             Component::LspServers,
             Component::OutputStyles,
             Component::UserConfig,
@@ -462,4 +461,33 @@ fn invalid_component_paths_are_not_rediscovered_at_default_locations() {
             );
         }
     }
+}
+
+#[test]
+fn mcp_entries_merge_default_file_and_manifest_objects_paths_and_arrays() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "mcp",
+        &json!({
+            "name":"mcp", "mcpServers":["./extra.json", {"inline":{"command":"inline"}}]
+        }),
+        &[],
+    );
+    write_json(
+        &root.join(".mcp.json"),
+        &json!({"mcpServers":{"default":{"command":"default"}}}),
+    );
+    write_json(
+        &root.join("extra.json"),
+        &json!({"extra":{"url":"https://example.com/mcp"}}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert!(!manifest.unsupported().contains(&Component::McpServers));
+    assert_eq!(
+        serde_json::to_value(&manifest.mcp_servers).unwrap(),
+        json!({
+            "default":{"command":"default"}, "extra":{"url":"https://example.com/mcp"}, "inline":{"command":"inline"}
+        })
+    );
+    assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
 }

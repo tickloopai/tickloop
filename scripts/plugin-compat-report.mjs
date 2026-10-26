@@ -81,7 +81,7 @@ export function describeSource(entry, format, pluginRoot) {
 
 /** What `tickloop plugin validate` printed for a plugin it could read. */
 export function parseValidateOutput(stdout) {
-  const result = { name: null, displayName: null, version: null, format: null, skills: [], tick: null, unsupported: [], warnings: [] };
+  const result = { name: null, displayName: null, version: null, format: null, skills: [], tick: null, mcp: [], unsupported: [], warnings: [] };
   for (const line of stdout.split("\n")) {
     let match;
     if ((match = /^Plugin (\S+)(?: (\S+))?, read from (.+)\.$/.exec(line))) {
@@ -94,6 +94,9 @@ export function parseValidateOutput(stdout) {
       result.tick = { executable: match[1], kind: match[2] };
     } else if ((match = /^Not supported yet, so not used: (.+)\.$/.exec(line))) {
       result.unsupported = match[1].split(", ");
+    } else if ((match = /^MCP server: (.*?) \| transport: (.*?) \| (command|address): (.*?) \| OAuth: (.*?) \| userConfig: (.*?) \| status: (.*?)$/.exec(line))) {
+      const [, name, transport, targetKind, target, oauth, userConfig, status] = match;
+      result.mcp.push({ name, transport, targetKind, target, oauth, userConfig, status });
     } else if ((match = /^Warning: (.+)$/.exec(line))) {
       result.warnings.push(match[1]);
     }
@@ -341,6 +344,7 @@ async function examinePlugin(plugin, context) {
     version: null,
     skills: [],
     tick: null,
+    mcp: [],
     supportedComponents: [],
     unsupportedComponents: [],
     warnings: [],
@@ -380,7 +384,8 @@ async function examinePlugin(plugin, context) {
   result.version = validated.version;
   result.skills = validated.skills;
   result.tick = validated.tick;
-  result.supportedComponents = [...(validated.tick ? ["tick"] : []), ...(validated.skills.length ? ["skills"] : [])];
+  result.mcp = validated.mcp;
+  result.supportedComponents = [...(validated.tick ? ["tick"] : []), ...(validated.skills.length ? ["skills"] : []), ...(validated.mcp.length ? ["MCP servers"] : [])];
   result.unsupportedComponents = validated.unsupported;
   result.warnings = validated.warnings;
   if (validated.displayName) result.warnings.push(`the manifest names it ${validated.displayName}, the marketplace ${plugin.name}`);
@@ -395,6 +400,7 @@ function countBy(items, key) {
 
 export function summarize(plugins) {
   const installable = plugins.filter(plugin => plugin.status === STATUS.installable);
+  const mcp = installable.flatMap(plugin => plugin.mcp ?? []);
   const bySourceType = {};
   for (const plugin of plugins) {
     const row = bySourceType[plugin.sourceType] ??= { plugins: 0, ...Object.fromEntries(Object.values(STATUS).map(status => [status, 0])) };
@@ -402,9 +408,17 @@ export function summarize(plugins) {
     row[plugin.status] += 1;
   }
   return {
+    mcp: {
+      servers: mcp.length,
+      byTransport: countBy(mcp, server => server.transport),
+      oauthConfigured: mcp.filter(server => server.oauth === "configured").length,
+      oauthDiscovery: mcp.filter(server => server.oauth === "discover on connect").length,
+      needsUserConfig: mcp.filter(server => server.userConfig === "required").length,
+      unsupported: mcp.filter(server => server.status === "unsupported").length,
+    },
     plugins: plugins.length,
     installable: installable.length,
-    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.length > 0).length,
+    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.some(component => component === "skills" || component === "tick")).length,
     invalid: plugins.filter(plugin => plugin.status === STATUS.invalid).length,
     notFetchable: plugins.filter(plugin => plugin.status === STATUS.notFetchable).length,
     unsupportedSource: plugins.filter(plugin => plugin.status === STATUS.unsupportedSource).length,
@@ -498,6 +512,22 @@ export function renderMarkdown(report) {
     "### Manifests of installable plugins",
     "",
     table(["Read from", "Plugins"], Object.entries(totals.manifestFormats)),
+    "",
+    "## MCP servers",
+    "",
+    "OAuth discovery means authentication is unknown until connection; validation starts no servers and makes no MCP requests.",
+    "",
+    table(["Measure", "Servers"], [
+      ["Total", totals.mcp.servers],
+      ...Object.entries(totals.mcp.byTransport),
+      ["OAuth configured", totals.mcp.oauthConfigured],
+      ["OAuth discovery on connect", totals.mcp.oauthDiscovery],
+      ["Needs userConfig", totals.mcp.needsUserConfig],
+      ["Unsupported transport", totals.mcp.unsupported],
+    ]),
+    "",
+    table(["Plugin", "Server", "Transport", "Command or address", "OAuth", "userConfig", "Status"],
+      report.plugins.flatMap(plugin => (plugin.mcp ?? []).map(server => [plugin.name, server.name, server.transport, server.target, server.oauth, server.userConfig, server.status]))),
     "",
     "## Plugins",
     "",

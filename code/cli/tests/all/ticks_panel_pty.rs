@@ -621,17 +621,18 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
     fs::write(
         directory.join(".claude-plugin/plugin.json"),
-        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}}}"#,
+        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"hooks":{}}}"#,
     )
     .unwrap();
     install_from_path(&fixture, "plugin", &directory);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
     terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
-    terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
+    let frame = terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
         row_shows(frame, "notes", "local · enabled · 1.0.0 · no login needed")
-            && frame.contains("Not supported yet: MCP")
+            && frame.contains("Not supported yet: hooks")
     });
+    assert!(!frame.contains("Not supported yet: MCP"), "{frame}");
     terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
     terminal.press(b"\r", "disabled", |frame| {
         row_shows(frame, "notes", "local · disabled · 1.0.0 · no login needed")
