@@ -106,9 +106,17 @@ function checkPublicApi() {
     for (const pkg of baseline.packages) {
       const snapshots = [];
       for (const [label, checkout] of [["baseline", source], ["current", root]]) {
-        const output = execFileSync("cargo", [`+${baseline.toolchain}`, "public-api", "--manifest-path", join(checkout, "Cargo.toml"), "--target-dir", join(directory, "build"), "-p", pkg, "--all-features", "--omit", "blanket-impls", "--color", "never"], {
-          cwd: checkout, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "inherit"],
-        });
+        // The immutable release source repeats diagnostics fixed since then; show its build output only when it fails.
+        const isBaseline = label === "baseline";
+        let output;
+        try {
+          output = execFileSync("cargo", [`+${baseline.toolchain}`, "public-api", "--manifest-path", join(checkout, "Cargo.toml"), "--target-dir", join(directory, "build"), "-p", pkg, "--all-features", "--omit", "blanket-impls", "--color", "never"], {
+            cwd: checkout, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", isBaseline ? "pipe" : "inherit"],
+          });
+        } catch (error) {
+          if (isBaseline && error.stderr) process.stderr.write(error.stderr);
+          throw error;
+        }
         writeFileSync(join(run, `${pkg}.${label}.txt`), output);
         collected[label][pkg] = output;
         if (baseline.groups?.some(group => group.packages.includes(pkg))) {
