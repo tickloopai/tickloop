@@ -148,6 +148,11 @@ impl McpConnections {
             .stderr_directory = Some(directory);
         self
     }
+    /// Replaces the host's credential adapters before reconciling a fresh configuration.
+    pub fn set_credentials(&self, credentials: BTreeMap<String, Arc<dyn ConnectorCredentials>>) {
+        *self.inner.credentials.write().unwrap() = credentials;
+    }
+
     pub async fn reconcile(&self, configs: Vec<McpServerConfig>) {
         let _guard = self.inner.reconcile_lock.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -174,8 +179,19 @@ impl McpConnections {
                         .entry(config.name.clone())
                         .or_insert_with(|| Arc::new(InMemoryCredentials::default()))
                         .clone();
-                    let connector =
-                        Connector::new(url, OAuthSettings::default(), credentials.clone()).ok();
+                    let connector = Connector::new(
+                        url,
+                        OAuthSettings {
+                            client_id: config.oauth.client_id.clone(),
+                            callback_port: config.oauth.callback_port,
+                            authorization_server_metadata_url: config
+                                .oauth
+                                .authorization_server_metadata_url
+                                .clone(),
+                        },
+                        credentials.clone(),
+                    )
+                    .ok();
                     let (credential, failure) = match credentials.load().await {
                         Ok(credential) => (credential, None),
                         Err(_) => (None, Some(McpServerState::Failed)),
@@ -273,16 +289,31 @@ impl McpConnections {
         self.inner.tasks.lock().await.spawn(async move {
             let connect = async {
                 let _permit = slots.acquire().await.map_err(|_| "MCP connection cancelled")?;
-                let has_token = entry.credential.read().unwrap().as_ref().is_some_and(|saved| matches!(&entry.config.transport, McpTransport::Http {url, ..} if saved.server_url == *url) && saved.token.is_some());
+                let has_token = entry.credential.read().unwrap().as_ref().is_some_and(|saved| matches!(&entry.config.transport, McpTransport::Http {url, ..} if reqwest::Url::parse(url).is_ok_and(|url| saved.server_url == url.as_str())) && saved.token.is_some());
                 if has_token && let Some(connector) = &entry.connector {
-                    let token = connector.access_token(&entry.cancel).await.map_err(|error| if error == TokenError::NeedsLogin {"MCP login required"} else {"MCP credential unavailable"})?;
-                    *entry.token.write().unwrap() = Some(token);
+                    let token = connector.access_token(&entry.cancel).await;
                     if let Some(credentials) = &entry.credentials {
                         *entry.credential.write().unwrap() = credentials.load().await.map_err(|_| "MCP credential unavailable")?;
                     }
+                    *entry.token.write().unwrap() = Some(token.map_err(|error| match error {
+                        TokenError::NeedsLogin | TokenError::RenewalFailed => "MCP login required",
+                        _ => "MCP credential unavailable",
+                    })?);
                 }
-                let token = entry.token.read().unwrap().as_ref().map(|token| token.secret().to_owned());
-                open(&entry.config, token, &environment, stderr_directory.as_ref()).await
+                let token = entry.token.read().unwrap().clone();
+                let opened = open(&entry.config, token.as_ref().map(|token| token.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
+                if matches!(&opened, Err(error) if error == "MCP login required")
+                    && let (Some(connector), Some(token)) = (&entry.connector, token)
+                {
+                    let renewed = connector.renew_rejected(&token, &entry.cancel).await;
+                    if let Some(credentials) = &entry.credentials {
+                        *entry.credential.write().unwrap() = credentials.load().await.map_err(|_| "MCP credential unavailable")?;
+                    }
+                    let renewed = renewed.map_err(|_| "MCP login required")?;
+                    *entry.token.write().unwrap() = Some(renewed.clone());
+                    return open(&entry.config, Some(renewed.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
+                }
+                opened
             };
             let result = tokio::select! {
                 _ = entry.cancel.cancelled() => return,
@@ -320,13 +351,16 @@ impl McpConnections {
                     }
 
                 }
-                error => { *entry.state.write().unwrap() = if matches!(error, Ok(Err(ref error)) if error == "MCP login required") {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
+                error => { *entry.state.write().unwrap() = if matches!(error, Ok(Err(ref error)) if (error == "MCP login required" || error == "MCP scope required") && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
             }
         });
     }
     fn catalog(&self) -> Vec<(Arc<Entry>, Arc<Connection>, catalog::Tool)> {
         let mut tools = Vec::new();
         for entry in self.inner.entries.read().unwrap().values() {
+            if *entry.state.read().unwrap() == McpServerState::NeedsLogin {
+                continue;
+            }
             if let Some(connection) = entry.connection.read().unwrap().clone() {
                 if connection.revision.load(Ordering::SeqCst)
                     != connection.catalog_revision.load(Ordering::SeqCst)
@@ -533,18 +567,8 @@ impl McpConnections {
             .as_ref()
             .is_some_and(McpHttpClient::unauthorized)
         {
-            let token = entry.token.read().unwrap().clone();
-            let renewed = match (&entry.connector, &token) {
-                (Some(connector), Some(token)) => {
-                    connector.renew_rejected(token, &cancel).await.is_ok()
-                }
-                _ => false,
-            };
-            *entry.state.write().unwrap() = if renewed {
-                McpServerState::Failed
-            } else {
-                McpServerState::NeedsLogin
-            };
+            authentication_rejected(&entry, connection.http.as_ref().unwrap(), &cancel).await;
+            self.inner.state_changed.notify_waiters();
         } else if !matches!(response, Ok(Ok(rmcp::model::CallToolResponse::Complete(_)))) {
             *entry.state.write().unwrap() = McpServerState::Failed;
         }
@@ -682,6 +706,28 @@ impl McpConnections {
         self.inner.entries.write().unwrap().clear();
     }
 }
+async fn authentication_rejected(entry: &Entry, http: &McpHttpClient, cancel: &CancellationToken) {
+    let token = entry.token.read().unwrap().clone();
+    let renewed = match (&entry.connector, token) {
+        (Some(connector), Some(token)) if !http.insufficient_scope() => {
+            connector.renew_rejected(&token, cancel).await.is_ok()
+        }
+        _ => false,
+    };
+    if !renewed && let Some(credentials) = &entry.credentials {
+        // Remember invalidation too: a deleted token is not a new login on the next request.
+        if let Ok(credential) = credentials.load().await {
+            *entry.credential.write().unwrap() = credential;
+        }
+    }
+    *entry.state.write().unwrap() = if renewed || entry.connector.is_none() || cancel.is_cancelled()
+    {
+        McpServerState::Failed
+    } else {
+        McpServerState::NeedsLogin
+    };
+}
+
 async fn open(
     config: &McpServerConfig,
     token: Option<String>,
@@ -717,7 +763,9 @@ async fn open(
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
                 .map_err(|_| {
-                    if http.unauthorized() {
+                    if http.insufficient_scope() {
+                        "MCP scope required"
+                    } else if http.unauthorized() {
                         "MCP login required"
                     } else {
                         "MCP connection failed"
@@ -781,7 +829,9 @@ async fn open(
         .unwrap_or_default();
     let tools = if capabilities.tools.is_some() {
         service.peer().list_all_tools().await.map_err(|_| {
-            if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
+            if http.as_ref().is_some_and(McpHttpClient::insufficient_scope) {
+                "MCP scope required"
+            } else if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
                 "MCP login required"
             } else {
                 "MCP tools unavailable"
@@ -796,7 +846,9 @@ async fn open(
             .list_all_resources()
             .await
             .map_err(|_| {
-                if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
+                if http.as_ref().is_some_and(McpHttpClient::insufficient_scope) {
+                    "MCP scope required"
+                } else if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
                     "MCP login required"
                 } else {
                     "MCP resources unavailable"
@@ -854,6 +906,16 @@ fn redact(entry: &Entry, content: String) -> String {
     let mut secrets = entry.environment_secrets.clone();
     if let Some(token) = entry.token.read().unwrap().as_ref() {
         secrets.push(token.secret().to_owned());
+    }
+    if let Some(token) = entry
+        .credential
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|saved| saved.token.as_ref())
+    {
+        secrets.push(token.access_token.clone());
+        secrets.extend(token.refresh_token.clone());
     }
     match &entry.config.transport {
         McpTransport::Http { url, headers } => {

@@ -161,3 +161,19 @@ fn signature_priority_does_not_depend_on_credentials_and_unsupported_stays_unsup
             .any(|w| w.contains("auto_approve") && w.contains("ignored"))
     );
 }
+
+#[test]
+fn remote_oauth_settings_survive_resolution() {
+    let resolved = tickloop_code_settings::mcp::resolve_servers(
+        &serde_json::json!({"mcpServers":{"remote":{"url":"https://example.com/mcp", "oauth":{"clientId":"client", "callbackPort":9911}, "authServerMetadataUrl":"https://example.com/metadata"}}}),
+        std::path::Path::new("/workspace"),
+        &Default::default(),
+    );
+    let oauth = &resolved.servers[0].oauth;
+    assert_eq!(oauth.client_id.as_deref(), Some("client"));
+    assert_eq!(oauth.callback_port, Some(9911));
+    assert_eq!(
+        oauth.authorization_server_metadata_url.as_deref(),
+        Some("https://example.com/metadata")
+    );
+}

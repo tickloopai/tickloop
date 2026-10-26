@@ -373,3 +373,118 @@ async fn live_model_calls_an_installed_marketplace_plugin() {
     std::fs::write(root.parent().unwrap().join("live-model-result.json"), serde_json::to_vec_pretty(&json!({"model":"claude-sonnet-5", "tool":operations[0].name, "is_error":result.is_error, "result":result.content})).unwrap()).unwrap();
     eprintln!("Live plugin acceptance passed: ui5 get_guidelines=1, model=claude-sonnet-5");
 }
+
+#[tokio::test]
+async fn worker_picks_up_a_login_saved_after_startup() {
+    use tickloop_code_settings::mcp_credentials::FileCredentials;
+    use tickloop_harness::connector::{
+        ClientRegistration, ConnectorCredential, ConnectorCredentials, OAuthToken,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let server = McpService::start().await;
+    server.require_bearer("worker-secret-access");
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_result(
+        json!({"content":[{"type":"text","text":"worker-secret-access worker-secret-refresh"}]}),
+    );
+    std::fs::write(
+        root.join("settings.json"),
+        json!({"mcpServers":{"remote":{"url":server.url()}}}).to_string(),
+    )
+    .unwrap();
+    tickloop_harness::base::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture")
+        .unwrap();
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+    let mut launch = LaunchSpec::embedded(root.clone());
+    launch.config_root = Some(root.clone());
+    launch.model = Some(model);
+    launch.session_persistence = false;
+    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(
+        &launch,
+        ChosenModels::new(scripted.clone()),
+        None,
+        &std::env::current_exe().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            scripted.enqueue(text("status"));
+            complete(&agent, chat, "Report the service status").await;
+            if format!("{:?}", scripted.requests.lock().unwrap()).contains("NeedsLogin") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Worker did not report that login is needed");
+    let credentials = FileCredentials::new(&root, "global", "remote").unwrap();
+    let held = credentials.lock().await.unwrap();
+    credentials
+        .save(&ConnectorCredential {
+            server_url: server.url(),
+            resource: None,
+            registration: ClientRegistration {
+                authorization_server: server.url(),
+                client_id: "client".into(),
+                redirect_uri: "http://localhost:1234/callback".into(),
+            },
+            token: Some(OAuthToken {
+                access_token: "worker-secret-access".into(),
+                refresh_token: Some("worker-secret-refresh".into()),
+                token_type: "Bearer".into(),
+                scope: None,
+                issuer: server.url(),
+                client_id: "client".into(),
+                token_endpoint: server.url(),
+                revocation_endpoint: None,
+                expires_at: u64::MAX,
+            }),
+        })
+        .await
+        .unwrap();
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            scripted.enqueue(text("ready"));
+            complete(&agent, chat, "Report readiness after login").await;
+            if scripted
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__remote__probe")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Worker did not observe the saved login");
+    scripted.enqueue(call("probe", "mcp__remote__probe", json!({})));
+    scripted.enqueue(text("done"));
+    complete(&agent, chat, "Call the remote probe").await;
+    assert_eq!(server.calls().len(), 1);
+    let visible = format!(
+        "{:?} {:?}",
+        scripted.requests.lock().unwrap(),
+        agent.snapshot(chat).await.unwrap()
+    );
+    assert!(!visible.contains("worker-secret-access"));
+    assert!(!visible.contains("worker-secret-refresh"));
+    agent.shutdown().await;
+}

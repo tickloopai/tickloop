@@ -110,7 +110,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn command(&self, arguments: &[&str]) -> Command {
+    pub(crate) fn command(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
         command
             .args(arguments)

@@ -27,7 +27,7 @@ path = "tests/support/cli_fixture_main.rs"
 harness = false
 
 [dependencies]
-tickloop-harness = { path = "../../harness/sdk" }
+tickloop-harness = { path = "../../harness/sdk", features = ["connector"] }
 crossterm = "0.29"
 serde_json = "1"
 tickloop-code-access = { path = "../access" }

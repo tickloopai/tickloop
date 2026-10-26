@@ -140,6 +140,7 @@ pub(crate) struct McpHttpClient {
     endpoint: Url,
     token: Arc<str>,
     unauthorized: Arc<AtomicBool>,
+    insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
     headers: HashMap<HeaderName, HeaderValue>,
 }
@@ -156,6 +157,7 @@ impl McpHttpClient {
             endpoint,
             token: token.into(),
             unauthorized: Arc::new(AtomicBool::new(false)),
+            insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
             headers: HashMap::new(),
         })
@@ -289,8 +291,31 @@ impl McpHttpClient {
         Ok(request)
     }
 
-    fn verify_status(&self, status: StatusCode) -> Result<(), StreamableHttpError<McpHttpError>> {
-        if status == StatusCode::UNAUTHORIZED {
+    pub(crate) fn insufficient_scope(&self) -> bool {
+        self.insufficient_scope.load(Ordering::SeqCst)
+    }
+
+    fn verify_status(
+        &self,
+        response: &reqwest::Response,
+    ) -> Result<(), StreamableHttpError<McpHttpError>> {
+        let status = response.status();
+        let insufficient_scope = status == StatusCode::FORBIDDEN
+            && response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
+                    rmcp::transport::auth::WWWAuthenticateParams::parse(value, &self.endpoint)
+                        .error
+                        .as_deref()
+                        == Some("insufficient_scope")
+                });
+        if insufficient_scope {
+            self.insufficient_scope.store(true, Ordering::SeqCst);
+        }
+        if status == StatusCode::UNAUTHORIZED || insufficient_scope {
             self.unauthorized.store(true, Ordering::SeqCst);
         }
         if !status.is_success() {
@@ -389,7 +414,7 @@ impl StreamableHttpClient for McpHttpClient {
             request = request.header("Mcp-Session-Id", session_id.as_ref());
         }
         let response = self.send(request.json(&message)).await?;
-        self.verify_status(response.status())?;
+        self.verify_status(&response)?;
         if matches!(
             response.status(),
             StatusCode::ACCEPTED | StatusCode::NO_CONTENT
@@ -475,7 +500,7 @@ impl StreamableHttpClient for McpHttpClient {
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
-        self.verify_status(response.status())?;
+        self.verify_status(&response)?;
         if !response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -503,7 +528,7 @@ impl StreamableHttpClient for McpHttpClient {
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
-        self.verify_status(response.status())
+        self.verify_status(&response)
     }
 }
 

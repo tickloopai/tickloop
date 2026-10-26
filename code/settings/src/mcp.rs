@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-use tickloop_harness::protocol::mcp::{McpServerConfig, McpTransport};
+use tickloop_harness::protocol::mcp::{McpOAuthConfig, McpServerConfig, McpTransport};
 
 /// An enabled plugin's raw entries and host-owned locations.
 pub struct PluginServers {
@@ -156,6 +156,17 @@ impl ResolvedServers {
         {
             transport = McpTransport::NeedsConfiguration;
         }
+        let oauth = if matches!(transport, McpTransport::Http { .. }) {
+            match parse_oauth(entry, environment) {
+                Ok(oauth) => oauth,
+                Err(reason) => {
+                    transport = McpTransport::Failed { reason };
+                    McpOAuthConfig::default()
+                }
+            }
+        } else {
+            McpOAuthConfig::default()
+        };
         match &transport {
             McpTransport::Failed { reason } => self.warnings.push(format!("MCP {name}: {reason}")),
             McpTransport::NeedsConfiguration => self.warnings.push(format!(
@@ -170,6 +181,7 @@ impl ResolvedServers {
             name,
             source,
             transport,
+            oauth,
             timeout_ms: entry["timeout"]
                 .as_u64()
                 .filter(|n| *n >= 1000)
@@ -346,4 +358,34 @@ fn expand_variables(text: &str, environment: &BTreeMap<String, String>) -> Resul
     }
     output.push_str(rest);
     Ok(output)
+}
+
+fn parse_oauth(
+    entry: &Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<McpOAuthConfig, String> {
+    let value = entry
+        .get("oauth")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut oauth: McpOAuthConfig =
+        serde_json::from_value(value).map_err(|_| "invalid MCP OAuth settings")?;
+    if let Some(metadata) = entry.get("authServerMetadataUrl") {
+        oauth.authorization_server_metadata_url = Some(
+            metadata
+                .as_str()
+                .ok_or("invalid MCP OAuth metadata URL")?
+                .into(),
+        );
+    }
+    for value in [
+        &mut oauth.client_id,
+        &mut oauth.authorization_server_metadata_url,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *value = expand_variables(value, environment)?;
+    }
+    Ok(oauth)
 }

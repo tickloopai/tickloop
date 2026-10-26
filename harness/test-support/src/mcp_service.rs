@@ -22,6 +22,9 @@ struct State {
     status: u16,
     error: Option<Value>,
     changed: bool,
+    challenge: Option<String>,
+    bearer: Option<String>,
+    requests: usize,
 }
 impl McpService {
     pub async fn start() -> Self {
@@ -37,6 +40,9 @@ impl McpService {
                 status: 200,
                 error: None,
                 changed: false,
+                challenge: None,
+                bearer: None,
+                requests: 0,
             })),
             cancel: CancellationToken::new(),
         };
@@ -65,6 +71,7 @@ impl McpService {
                                 let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
                             }
+                            let authorization = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value.trim().to_owned()));
                             let length = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).and_then(|(_, n)| n.trim().parse::<usize>().ok())).unwrap_or(0);
                             if length > 8 * 1024 * 1024 { return; }
                             while bytes.len() < header_end + length {
@@ -74,8 +81,9 @@ impl McpService {
                                 bytes.extend_from_slice(&chunk[..size]);
                             }
                             let Ok(request) = serde_json::from_slice::<Value>(&bytes[header_end..header_end + length]) else { return };
-                            let (status, delay, result, error, changed) = {
+                            let (status, delay, result, error, changed, challenge) = {
                                 let mut state = state.lock().unwrap();
+                                state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
                                 let result = match method {
                                     "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":{"tools":{"listChanged":true},"resources":{}},"serverInfo":{"name":"fixture","version":"1"},"instructions":"Fixture service instructions"}),
@@ -87,7 +95,7 @@ impl McpService {
                                 };
                                 let call = method == "tools/call";
                                 let changed = call && std::mem::take(&mut state.changed);
-                                (state.status, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed)
+                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, changed, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
@@ -97,7 +105,8 @@ impl McpService {
                             } else if changed {
                                 (status, "text/event-stream", format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
-                            let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
+                            let reply = format!("HTTP/1.1 {status} Fixture\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = stream.write_all(reply.as_bytes()).await;
                         });
                     }
@@ -126,6 +135,15 @@ impl McpService {
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
+    }
+    pub fn require_bearer(&self, token: &str) {
+        self.state.lock().unwrap().bearer = Some(token.into());
+    }
+    pub fn set_challenge(&self, challenge: &str) {
+        self.state.lock().unwrap().challenge = Some(challenge.into());
+    }
+    pub fn request_count(&self) -> usize {
+        self.state.lock().unwrap().requests
     }
     pub fn set_error(&self, error: Option<Value>) {
         self.state.lock().unwrap().error = error;
