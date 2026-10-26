@@ -62,7 +62,7 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
         .unwrap();
         let view = Agent::from_embedded(core.clone(), config());
         let chat = view.create_chat(project.clone()).await.unwrap();
-        let console = Console::test_interactive_for_chat(chat.into());
+        let console = Console::test_interactive_for_chat(chat);
         let mut menus = Menus::new(Some(settings.clone()), Some(root.clone()));
         let mut events = core.subscribe();
         core.submit(chat.into(), "Read the service".into())
@@ -76,7 +76,7 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
             }
         };
         menus
-            .permission(&console, chat.into(), &request, "Agent".into(), true)
+            .permission(&console, chat, &request, "Agent".into(), true)
             .unwrap();
         let menu = console.menu_snapshot(request.id).unwrap().unwrap();
         assert_eq!(

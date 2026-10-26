@@ -584,3 +584,70 @@ async fn mcp_explicit_ask_and_deny_override_wider_allows() {
         agent.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn allowing_one_tool_does_not_allow_a_server_with_the_same_rule_name() {
+    use tickloop_harness_policy::settings::MemorySettingsStore;
+    use tickloop_harness_runtime::{HarnessOptions, HarnessSeams, environment::FolderEnvironment};
+    use tickloop_harness_test_support::harness::ChosenModels;
+    let first = McpService::start().await;
+    let second = McpService::start().await;
+    let (first_provider, first_tool) = provider(&first, "team").await;
+    let (second_provider, second_tool) = provider(&second, "team__read").await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("first", &first_tool, json!({})),
+        call("second", &second_tool, json!({})),
+        text("done"),
+    ]));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(FolderEnvironment::bare())),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions {
+            settings: Some(Arc::new(MemorySettingsStore::default())),
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    let providers: Vec<Arc<dyn tickloop_harness_runtime::host_tools::HostToolProvider>> =
+        vec![first_provider, second_provider];
+    agent.install_host_tools(providers).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, "Read only the first service".into())
+        .await
+        .unwrap();
+    let mut approved_first = false;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } if !approved_first => {
+                assert_eq!(request.name, first_tool);
+                agent
+                    .answer_permission_with_rule(chat, request.id, first_tool.clone())
+                    .await
+                    .unwrap();
+                approved_first = true;
+            }
+            EventKind::PermissionRequested { request } => {
+                assert_eq!(request.name, second_tool);
+                assert!(second.calls().is_empty());
+                agent
+                    .answer_permission(chat, request.id, false)
+                    .await
+                    .unwrap();
+                break;
+            }
+            EventKind::Completed { .. } => {
+                panic!("the tool grant silently authorized another service")
+            }
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.shutdown().await;
+}
