@@ -18,5 +18,7 @@ mod plugin_skills;
 mod settings_store;
 #[path = "all/skill_catalog.rs"]
 mod skill_catalog;
+#[path = "all/skill_frontmatter.rs"]
+mod skill_frontmatter;
 #[path = "all/tick_package_skills.rs"]
 mod tick_package_skills;
