@@ -43,7 +43,7 @@ pub(crate) struct Registry {
     pub plugins: BTreeMap<String, RegistryEntry>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RegistryEntry {
     pub marketplace: String,
     /// The version shown for the plugin.

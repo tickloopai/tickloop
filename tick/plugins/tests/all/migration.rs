@@ -204,3 +204,193 @@ fn a_background_first_use_keeps_the_migration_notice_for_the_next_cli_use() {
     assert!(notices[0].contains("Skipped Tick package local-tool"));
     assert!(reopened.take_migration_notices().unwrap().is_empty());
 }
+
+#[test]
+fn migration_retries_leftover_cache_copies_without_losing_old_packages() {
+    let fixture = Fixture::new();
+    let packages = earlier_packages(&fixture);
+    let original = packages.installed().unwrap();
+    let cache = fixture
+        .store
+        .directory()
+        .join("cache/local/local-tool/local");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(
+        cache.join("partial-copy"),
+        "interrupted before copying all files",
+    )
+    .unwrap();
+    let reopened = PluginStore::in_config_root(&fixture.config_root());
+    let migration = reopened.migrate().unwrap().unwrap();
+    assert_eq!(
+        migration.migrated,
+        vec!["local-tool@local", "quotes@tickloop"]
+    );
+    let installed = reopened.installed().unwrap();
+    assert_eq!(installed.plugins.len(), 2);
+    assert!(installed.broken.is_empty());
+    for package in original.packages {
+        let kept = migration.kept_at.join(&package.manifest.name);
+        assert_eq!(
+            fs::read(kept.join("tick-package.json")).unwrap(),
+            fs::read(
+                reopened
+                    .get(&package.manifest.name)
+                    .unwrap()
+                    .root
+                    .join("tick-package.json")
+            )
+            .unwrap()
+        );
+    }
+    assert!(!cache.join("partial-copy").exists());
+    assert_eq!(
+        reopened.login_state(&reopened.get("quotes").unwrap()),
+        LoginState::LoggedIn
+    );
+    assert_eq!(reopened.migrate().unwrap(), None);
+}
+
+#[test]
+fn migration_resumes_after_registry_publication_before_retiring_ticks() {
+    let fixture = Fixture::new();
+    earlier_packages(&fixture);
+    let completed = fixture.store.migrate().unwrap().unwrap();
+    let registry = fs::read(fixture.store.directory().join("installed.json")).unwrap();
+    // Recreate the on-disk boundary after publication but before retiring the intact old tree.
+    fs::rename(&completed.kept_at, fixture.config_root().join("ticks")).unwrap();
+    let reopened = PluginStore::in_config_root(&fixture.config_root());
+    let resumed = reopened.migrate().unwrap().unwrap();
+    assert_eq!(
+        resumed.migrated,
+        vec!["local-tool@local", "quotes@tickloop"]
+    );
+    assert!(resumed.skipped.is_empty());
+    assert_eq!(
+        fs::read(reopened.directory().join("installed.json")).unwrap(),
+        registry
+    );
+    let installed = reopened.installed().unwrap();
+    assert_eq!(installed.plugins.len(), 2);
+    assert!(installed.broken.is_empty());
+    assert_eq!(
+        reopened.login_state(&reopened.get("quotes").unwrap()),
+        LoginState::LoggedIn
+    );
+    let notices = reopened.take_migration_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("local-tool@local, quotes@tickloop"));
+    assert!(!notices[0].contains("Skipped"));
+    assert!(reopened.take_migration_notices().unwrap().is_empty());
+    assert_eq!(reopened.migrate().unwrap(), None);
+}
+
+#[test]
+fn a_fresh_store_recovers_each_migration_interruption_boundary() {
+    for boundary in [
+        "copying",
+        "first-copy",
+        "all-copies",
+        "notice",
+        "registry-temporary",
+        "published",
+        "retired",
+    ] {
+        let fixture = Fixture::new();
+        let notes = fixture.claude_plugin("notes", &json!({"name": "notes"}), &["write"]);
+        fixture.store.install_path(&notes).unwrap();
+        fixture.store.set_enabled("notes", false).unwrap();
+        let registry_path = fixture.store.directory().join("installed.json");
+        let original_registry = fs::read(&registry_path).unwrap();
+        let packages = earlier_packages(&fixture);
+        let original_packages = packages.installed().unwrap();
+        let credentials = fixture.config_root().join("credentials/quotes/api_key");
+        let original_credentials = fs::read(&credentials).unwrap();
+        let completed = fixture.store.migrate().unwrap().unwrap();
+        let published_registry = fs::read(&registry_path).unwrap();
+        let ticks = fixture.config_root().join("ticks");
+        if boundary != "retired" {
+            fs::rename(&completed.kept_at, &ticks).unwrap();
+        }
+        if !matches!(boundary, "published" | "retired") {
+            fs::write(&registry_path, &original_registry).unwrap();
+            if matches!(boundary, "copying" | "first-copy" | "all-copies") {
+                fs::remove_file(ticks.join(".plugin-migration-notice")).unwrap();
+            }
+            if matches!(boundary, "copying" | "first-copy") {
+                fs::remove_dir_all(
+                    fixture
+                        .store
+                        .directory()
+                        .join("cache/tickloop/quotes/0.2.7"),
+                )
+                .unwrap();
+            }
+            if boundary == "copying" {
+                fs::remove_dir_all(
+                    fixture
+                        .store
+                        .directory()
+                        .join("cache/local/local-tool/local"),
+                )
+                .unwrap();
+                let partial = fixture
+                    .store
+                    .directory()
+                    .join(".staging-interrupted/package");
+                fs::create_dir_all(&partial).unwrap();
+                fs::write(partial.join("tick-package.json"), "partial").unwrap();
+            }
+            if boundary == "registry-temporary" {
+                fs::write(
+                    fixture
+                        .store
+                        .directory()
+                        .join(".installed.json.interrupted"),
+                    &published_registry,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                packages.installed().unwrap(),
+                original_packages,
+                "{boundary}"
+            );
+        }
+        let reopened = PluginStore::in_config_root(&fixture.config_root());
+        let installed = reopened.installed().unwrap();
+        assert_eq!(
+            installed
+                .plugins
+                .iter()
+                .map(|plugin| plugin.id())
+                .collect::<Vec<_>>(),
+            vec!["local-tool@local", "notes@local", "quotes@tickloop"],
+            "{boundary}"
+        );
+        assert!(installed.broken.is_empty(), "{boundary}");
+        assert!(!reopened.get("notes").unwrap().enabled, "{boundary}");
+        assert_eq!(
+            fs::read(&credentials).unwrap(),
+            original_credentials,
+            "{boundary}"
+        );
+        assert_eq!(
+            fs::read(&registry_path).unwrap(),
+            published_registry,
+            "{boundary}"
+        );
+        assert!(!ticks.exists(), "{boundary}");
+        let notices = reopened.take_migration_notices().unwrap();
+        assert_eq!(notices.len(), 1, "{boundary}");
+        assert!(
+            notices[0].contains("local-tool@local, quotes@tickloop"),
+            "{boundary}: {notices:?}"
+        );
+        assert!(
+            reopened.take_migration_notices().unwrap().is_empty(),
+            "{boundary}"
+        );
+        assert_eq!(reopened.migrate().unwrap(), None, "{boundary}");
+    }
+}

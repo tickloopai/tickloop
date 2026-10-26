@@ -707,7 +707,7 @@ impl PluginStore {
 
     /// A private staging directory beside the plugins, removed with everything in it when
     /// dropped.
-    fn staging(&self) -> Result<tempfile::TempDir, PluginError> {
+    pub(crate) fn staging(&self) -> Result<tempfile::TempDir, PluginError> {
         tempfile::Builder::new()
             .prefix(STAGING_PREFIX)
             .tempdir_in(&self.directory)

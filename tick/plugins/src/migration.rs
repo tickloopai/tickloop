@@ -1,14 +1,9 @@
-//! Moving the Tick packages an earlier Tickloop installed in `ticks/` into the plugin store,
+//! Copying the Tick packages an earlier Tickloop installed in `ticks/` into the plugin store,
 //! once: each becomes a plugin of the `tickloop` marketplace, or of `local` when it was installed
 //! from a local directory or archive. Their credentials stay where they are, since a plugin keeps
 //! its package's name.
 
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Write, path::PathBuf};
 
 use tick_packages::{BrokenPackage, PACKAGES_DIRECTORY, PackageStore};
 use time::OffsetDateTime;
@@ -35,9 +30,10 @@ pub struct Migration {
 }
 
 impl PluginStore {
-    /// Moves the Tick packages an earlier Tickloop installed into this store, unless there
-    /// is no earlier registry; `None` when there was nothing to move. When a package cannot be
-    /// moved, the ones moved already go back and the earlier directory stays as it was.
+    /// Copies earlier Tick packages, publishes their registration, then preserves `ticks/`.
+    /// Before publication, failures leave the earlier installation and registry unchanged.
+    /// After publication, a retry finishes preserving the old directory without recopying.
+    /// Returns `None` when there is no earlier registry.
     pub fn migrate(&self) -> Result<Option<Migration>, PluginError> {
         if !self.needs_migration() {
             return Ok(None);
@@ -50,27 +46,10 @@ impl PluginStore {
         let packages = PackageStore::in_config_root(&self.config_root).installed()?;
         let mut registry = Registry::read(&self.registry_path())?;
         let mut skipped = packages.broken;
-        let mut moved = Vec::<(PathBuf, PathBuf)>::new();
-        let restore = |moved: &[(PathBuf, PathBuf)]| {
-            for (from, to) in moved.iter().rev() {
-                let _ = fs::rename(to, from);
-            }
-        };
         let mut migrated = Vec::new();
         for package in packages.packages {
             let name = package.manifest.name.clone();
             let version = package.manifest.version.clone();
-            if let Some(existing) = registry.plugins.get(&name) {
-                skipped.push(BrokenPackage {
-                    name,
-                    version,
-                    reason: format!(
-                        "name already held by plugin from {}; left unchanged",
-                        existing.marketplace
-                    ),
-                });
-                continue;
-            }
             let is_download = DOWNLOAD_SCHEMES
                 .iter()
                 .any(|scheme| package.source.starts_with(scheme));
@@ -91,62 +70,75 @@ impl PluginStore {
                     },
                 )
             };
+            let entry = RegistryEntry {
+                marketplace: marketplace.to_owned(),
+                version: version.clone(),
+                revision: revision.clone(),
+                source,
+                sha256: package.sha256,
+                installed_at: package.installed_at,
+                enabled: true,
+            };
+            if let Some(existing) = registry.plugins.get(&name) {
+                if existing == &entry {
+                    migrated.push(format!("{name}@{marketplace}"));
+                } else {
+                    skipped.push(BrokenPackage {
+                        name,
+                        version,
+                        reason: format!(
+                            "name already held by plugin from {}; left unchanged",
+                            existing.marketplace
+                        ),
+                    });
+                }
+                continue;
+            }
             let plugin_directory = self.plugin_directory(marketplace, &name);
             let target = plugin_directory.join(&revision);
-            let moved_package = create_private_directories(&plugin_directory)
-                .and_then(|()| move_package(&package.root, &target));
-            if let Err(error) = moved_package {
-                restore(&moved);
-                return Err(error);
+            create_private_directories(&plugin_directory)?;
+            let staging = self.staging()?;
+            let copied = staging.path().join("package");
+            create_private_directories(&copied)?;
+            crate::staging::copy_directory(&package.root, &copied)?;
+            crate::staging::check_tree(&copied)?;
+            // Unregistered cache copies may be left by an interrupted migration.
+            if fs::symlink_metadata(&target).is_ok() {
+                fs::rename(&target, staging.path().join("leftover"))
+                    .map_err(PluginError::io("cannot replace an earlier migration copy"))?;
             }
-            moved.push((package.root.clone(), target));
+            fs::rename(&copied, &target)
+                .map_err(PluginError::io("cannot publish a migrated Tick package"))?;
             migrated.push(format!("{name}@{marketplace}"));
-            registry.plugins.insert(
-                name,
-                RegistryEntry {
-                    marketplace: marketplace.to_owned(),
-                    version,
-                    revision,
-                    source,
-                    sha256: package.sha256,
-                    installed_at: package.installed_at,
-                    enabled: true,
-                },
-            );
+            registry.plugins.insert(name, entry);
         }
         let kept_at = self.config_root.join(format!(
             "{MIGRATED_PREFIX}{}",
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
-        if let Err(error) = fs::rename(&old_directory, &kept_at) {
-            restore(&moved);
-            return Err(PluginError::io("cannot preserve earlier Tick packages")(
-                error,
-            ));
-        }
         let migration = Migration {
             migrated,
             skipped,
             kept_at,
         };
-        let notice_path = migration.kept_at.join(MIGRATION_NOTICE);
-        let publish = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&notice_path)
-            .and_then(|mut file| file.write_all(migration.notice().as_bytes()))
-            .map_err(PluginError::io(
-                "cannot save the Tick package migration notice",
-            ))
-            .and_then(|()| registry.write(&self.registry_path()));
-        if let Err(error) = publish {
-            let _ = fs::remove_file(&notice_path);
-            fs::rename(&migration.kept_at, &old_directory)
-                .map_err(PluginError::io("cannot restore earlier Tick packages"))?;
-            restore(&moved);
-            return Err(error);
-        }
+        let notice_path = old_directory.join(MIGRATION_NOTICE);
+        let save_notice = || PluginError::io("cannot save the Tick package migration notice");
+        let mut notice = tempfile::Builder::new()
+            .prefix(MIGRATION_NOTICE)
+            .tempfile_in(&old_directory)
+            .map_err(save_notice())?;
+        notice
+            .write_all(migration.notice().as_bytes())
+            .map_err(save_notice())?;
+        notice.as_file().sync_all().map_err(save_notice())?;
+        notice
+            .persist(&notice_path)
+            .map_err(|error| save_notice()(error.error))?;
+        registry.write(&self.registry_path())?;
+        // The registry is the commit point. Until then every earlier package stays intact;
+        // afterwards a restart recognizes its exact entry and only finishes retirement.
+        fs::rename(&old_directory, &migration.kept_at)
+            .map_err(PluginError::io("cannot preserve earlier Tick packages"))?;
         Ok(Some(migration))
     }
 
@@ -219,12 +211,4 @@ impl Migration {
         }
         notice
     }
-}
-
-fn move_package(from: &Path, to: &Path) -> Result<(), PluginError> {
-    fs::rename(from, to).map_err(PluginError::io(format!(
-        "cannot move Tick package {} to {}",
-        from.display(),
-        to.display()
-    )))
 }
