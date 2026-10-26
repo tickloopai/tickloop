@@ -668,6 +668,9 @@ impl MentionDirectory {
         {
             return Some(Self::Home(PathBuf::from(relative.trim_start_matches('/'))));
         }
+        if is_parent_relative(&query) {
+            return Some(Self::Browse(PathBuf::from(parent)));
+        }
         if query.starts_with('/') {
             Some(Self::Browse(PathBuf::from(if parent.is_empty() {
                 "/"
@@ -734,7 +737,7 @@ impl FileMentionIndex {
             MentionDirectory::Browse(_) | MentionDirectory::Home(_)
         );
         let directories = match &directory {
-            MentionDirectory::Browse(path) => vec![path.clone()],
+            MentionDirectory::Browse(path) => vec![working_directory.join(path)],
             MentionDirectory::Home(relative) => {
                 let home = home.filter(|path| path.is_absolute()).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable")
@@ -852,7 +855,8 @@ impl FileMentionIndex {
         let token = mention_token(draft, cursor)?;
         let query = unescape_path_token(&draft[token.start + 1..token.cursor]);
         let uses_home_path = query == "~" || query.starts_with("~/");
-        let uses_absolute_path = query.starts_with('/') || uses_home_path;
+        let keeps_spelled_parent = uses_home_path || is_parent_relative(&query);
+        let uses_absolute_path = query.starts_with('/') || keeps_spelled_parent;
         let uses_explicit_relative_path = query.starts_with("./");
         let query_for_matching = normalize_separators(
             query
@@ -914,7 +918,7 @@ impl FileMentionIndex {
             .into_iter()
             .take(limit)
             .map(|(_, entry, path)| {
-                let display_path = if uses_home_path {
+                let display_path = if keeps_spelled_parent {
                     let parent = query.rsplit_once('/').map_or("~", |(parent, _)| parent);
                     let name = path
                         .trim_end_matches('/')
@@ -1427,6 +1431,10 @@ impl PartialOrd for FuzzyScore {
     }
 }
 
+fn is_parent_relative(query: &str) -> bool {
+    query.starts_with("../")
+}
+
 fn is_hidden_entry(path: &str) -> bool {
     path.trim_end_matches('/')
         .rsplit('/')
@@ -1582,6 +1590,69 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(project.index().allowed_roots, root.allowed_roots);
+    }
+
+    #[test]
+    fn parent_navigation_preserves_prefix_and_requires_separate_attachment_authorization() {
+        let workspace = Fixture::new();
+        workspace.file("project/main.rs");
+        workspace.file("sibling/notes.txt");
+        workspace.file("sibling/nested/deep.txt");
+        let project = workspace.root.join("project");
+        let build = |query: &str, additional: &[PathBuf]| {
+            FileMentionIndex::build_directory(
+                &project,
+                additional,
+                MentionDirectory::for_query(query, query.len()).unwrap(),
+                &|| false,
+            )
+            .unwrap()
+        };
+
+        let query = "@../";
+        let completion = build(query, &[]).complete(query, query.len(), 100).unwrap();
+        let paths = completion
+            .candidates
+            .iter()
+            .map(|candidate| candidate.display_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["../project/", "../sibling/"]);
+
+        let query = "@../sibling/no";
+        let index = build(query, &[]);
+        let completion = index.complete(query, query.len(), 100).unwrap();
+        assert_eq!(completion.candidates.len(), 1);
+        let applied = completion.apply(query, 0).unwrap();
+        assert_eq!(applied.token, "@../sibling/notes.txt");
+        assert_eq!(
+            applied.path,
+            workspace
+                .root
+                .join("sibling/notes.txt")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            index.revalidate(&applied).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let authorized = build(query, &[workspace.root.join("sibling")]);
+        let applied = authorized
+            .complete(query, query.len(), 100)
+            .unwrap()
+            .apply(query, 0)
+            .unwrap();
+        assert_eq!(authorized.revalidate(&applied).unwrap(), applied.path);
+
+        assert_eq!(
+            MentionDirectory::for_query("@../../", 7),
+            Some(MentionDirectory::Browse(PathBuf::from("../..")))
+        );
+        assert_eq!(
+            MentionDirectory::for_query("@src/../", 8),
+            Some(MentionDirectory::Path(PathBuf::from("src/..")))
+        );
     }
 
     #[test]
