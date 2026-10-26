@@ -750,3 +750,57 @@ async fn invalid_resolved_service_names_cannot_expose_ambiguous_tools() {
     assert!(service.calls().is_empty());
     connections.shutdown().await;
 }
+
+#[tokio::test]
+async fn saved_tool_permissions_do_not_move_between_separately_connected_services() {
+    use tickloop_harness_runtime::host_tools::HostToolProvider;
+    for (first_name, second_name) in [
+        ("review", "review_"),
+        ("_review", "review"),
+        ("_", "unnamed"),
+    ] {
+        let first = McpService::start().await;
+        let second = McpService::start().await;
+        let (first_provider, first_tool) = provider(&first, first_name).await;
+        first_provider.shutdown().await;
+        let (second_provider, second_tool) = provider(&second, second_name).await;
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("read", &second_tool, json!({})),
+                text("done"),
+            ])),
+        );
+        agent.install_host_tools(second_provider).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_permission_rules(chat, vec![rule(&first_tool, Decision::Allow)])
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Read".into()).await.unwrap();
+        let mut asked = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.mcp_server.as_deref(), Some(second_name));
+                    assert!(second.calls().is_empty());
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolStarted { .. } => {
+                    assert!(asked, "{first_name} permission authorized {second_name}")
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(asked);
+        agent.shutdown().await;
+    }
+}

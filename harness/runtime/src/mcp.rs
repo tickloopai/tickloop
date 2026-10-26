@@ -550,10 +550,7 @@ impl McpConnections {
         }
         for (entry, _, tool) in &mut tools {
             if counts[&tool.definition.name] > 1 {
-                tool.definition.name = catalog::hashed_name(
-                    &tool.definition.name,
-                    &format!("{}\0{}", entry.config.name, tool.original),
-                );
+                tool.definition.name = catalog::hashed_name(&entry.config.name, &tool.original);
             }
         }
         tools
