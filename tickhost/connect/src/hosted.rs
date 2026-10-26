@@ -857,18 +857,27 @@ mod tests {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
         let (_, client_writer) = client.into_split();
         let (server_reader, _) = server.into_split();
+        let (spawn_started, spawning) = std::sync::mpsc::channel();
+        let (finish_spawn, spawn_may_finish) = std::sync::mpsc::channel::<()>();
+        let spawner = std::thread::spawn(move || {
+            spawn_child(|| {
+                spawn_started.send(()).unwrap();
+                spawn_may_finish.recv().unwrap();
+            })
+        });
+        spawning.recv().unwrap();
         send_with_descriptors(client_writer.as_ref().as_raw_fd(), &[folder.as_raw_fd()]).unwrap();
         let receiving = tokio::spawn(async move {
             let reader = BufReader::new(server_reader);
             receive_descriptors(&reader, 1).await
         });
-        spawn_child(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(
-                !receiving.is_finished(),
-                "a descriptor arrived while a child was being spawned"
-            );
-        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !receiving.is_finished(),
+            "a descriptor arrived while a child was being spawned"
+        );
+        finish_spawn.send(()).unwrap();
+        spawner.join().unwrap();
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), receiving)
             .await
             .expect("the descriptor arrives once the spawn is done")

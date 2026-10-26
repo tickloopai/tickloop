@@ -181,7 +181,10 @@ impl AgentAccess for MeasuredThinkingAccess {
             }
         ) {
             let queries = self.task_queries.fetch_add(1, Ordering::Relaxed) + 1;
-            std::fs::write(THINKING_QUERY_FILE, queries.to_string()).unwrap();
+            // The test reads the count concurrently, so replace the file atomically instead of truncating it.
+            let pending = format!("{THINKING_QUERY_FILE}.{queries}");
+            std::fs::write(&pending, queries.to_string()).unwrap();
+            std::fs::rename(&pending, THINKING_QUERY_FILE).unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.daemon.observe(query).await
