@@ -64,7 +64,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
         .collect::<Vec<_>>();
     let auto = tickloop_harness_policy::AutoSettings {
         schema_version: request.auto_schema_version,
-        reviewer: request.auto_reviewer.clone(),
+        reviewer: request.auto_reviewer,
         rules: request.auto_rules.clone(),
     };
     let revision = request.auto_revision.clone();
