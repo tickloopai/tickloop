@@ -407,3 +407,5 @@ impl Drop for ExternalIoGuard {
         tokio::time::pause();
     }
 }
+
+pub mod mcp_service;

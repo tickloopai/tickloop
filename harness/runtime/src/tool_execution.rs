@@ -297,9 +297,11 @@ impl ToolRegistry {
             );
         }
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
-            if provider.mcp_resource_server().is_some_and(|server| {
-                crate::mcp_resource_authority_allowed(chat, &server.authority)
-            }) {
+            if provider
+                .mcp_resource_servers()
+                .iter()
+                .any(|server| crate::mcp_resource_authority_allowed(chat, &server.authority))
+            {
                 tools.extend(
                     crate::mcp_resources::definitions()
                         .into_iter()
@@ -1319,8 +1321,13 @@ impl Agent {
                     if execution_mode == ExecutionMode::Auto
                         && !explicit_ask
                         && name != ASK_USER_QUESTION_TOOL_NAME
-                        && host_permission
-                            != Some(crate::host_tools::HostToolPermission::Confirmation) =>
+                        && !matches!(
+                            host_permission,
+                            Some(
+                                crate::host_tools::HostToolPermission::Confirmation
+                                    | crate::host_tools::HostToolPermission::ThirdParty
+                            )
+                        ) =>
                 {
                     Decision::Allow
                 }
@@ -1331,7 +1338,13 @@ impl Agent {
             let mut decision = self.apply_prompt_policy_with_explicit_ask(
                 decision,
                 explicit_ask
-                    || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation),
+                    || matches!(
+                        host_permission,
+                        Some(
+                            crate::host_tools::HostToolPermission::Confirmation
+                                | crate::host_tools::HostToolPermission::ThirdParty
+                        )
+                    ),
             );
             // A write to an Artifact with provenance needs no review; rules still decide.
             if decision == Decision::Check
@@ -1667,7 +1680,27 @@ impl Agent {
                                 .execute_prepared(receipt.chat_id, prepared, cancel.clone())
                                 .await;
                             host_call_status = Some(host_result.status());
-                            let (mut result, effect) = host_result.into_parts();
+                            let (mut result, effect) = match host_result {
+                                crate::host_tools::HostCallResult::CompletedWithImages(
+                                    mut result,
+                                    host_images,
+                                ) => {
+                                    let accepts_images = self
+                                        .inner
+                                        .chats
+                                        .lock()
+                                        .await
+                                        .get(&receipt.chat_id)
+                                        .is_some_and(|chat| chat.snapshot.model.accepts_images());
+                                    if accepts_images {
+                                        images = host_images;
+                                    } else if !host_images.is_empty() {
+                                        result.content.push_str("\n[MCP images omitted: this model does not accept images]");
+                                    }
+                                    (result, None)
+                                }
+                                other => other.into_parts(),
+                            };
                             if crate::tick_tools::is_tick_tool(&name) {
                                 result.content =
                                     match serde_json::from_str::<Value>(&result.content) {

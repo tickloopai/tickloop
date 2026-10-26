@@ -470,12 +470,15 @@ impl ExecutionPort for LocalPort {
                 .execute_native(self.scope.chat, call, cancel, Some(dispatch.clone()))
                 .await
             {
-                HostCallResult::Completed(result) => ExecutionOutcome::Completed(ExecutionResult {
-                    result,
-                    opened: None,
-                    shell: None,
-                    handoff: None,
-                }),
+                HostCallResult::Completed(result)
+                | HostCallResult::CompletedWithImages(result, _) => {
+                    ExecutionOutcome::Completed(ExecutionResult {
+                        result,
+                        opened: None,
+                        shell: None,
+                        handoff: None,
+                    })
+                }
                 HostCallResult::CompletedWithEffect(result, effect) => {
                     let opened = match *effect {
                         HostEffect::OpenedTick {

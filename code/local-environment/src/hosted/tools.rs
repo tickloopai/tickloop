@@ -1574,7 +1574,7 @@ impl HostedTickTools {
             HostCallResult::OutcomeUnknown(message) => {
                 Err(HostError::after("OutcomeUnknown", message))
             }
-            HostCallResult::Completed(result) => {
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithImages(result, _) => {
                 Err(HostError::after("OutcomeUnknown", result.content))
             }
         }
@@ -1598,12 +1598,16 @@ impl HostedTickTools {
             .await
             .map_err(|error| HostError::before("Invalid", error))?;
         match self.execute_prepared(chat, prepared, cancel).await {
-            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _)
+            HostCallResult::Completed(result)
+            | HostCallResult::CompletedWithImages(result, _)
+            | HostCallResult::CompletedWithEffect(result, _)
                 if !result.is_error =>
             {
                 Ok(())
             }
-            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+            HostCallResult::Completed(result)
+            | HostCallResult::CompletedWithImages(result, _)
+            | HostCallResult::CompletedWithEffect(result, _) => {
                 Err(HostError::after("ToolError", result.content))
             }
             HostCallResult::NotDispatched(message) => Err(HostError::before("Refused", message)),

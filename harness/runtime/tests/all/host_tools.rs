@@ -948,3 +948,49 @@ async fn plan_mode_denies_mutating_host_tools_without_prompting() {
     assert!(provider.0.calls.lock().unwrap().is_empty());
     assert!(agent.snapshot(chat).await.unwrap().permissions.is_empty());
 }
+
+#[tokio::test]
+async fn multiple_host_sources_keep_their_tools_and_route_calls() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("one", "ReadWorkspace", json!({})),
+        call("two", "ModifyLayout", json!({})),
+        text("done"),
+    ]));
+    let read = Arc::new(WorkspaceTools::default());
+    let write = Arc::new(AutomaticTools(WorkspaceTools::default()));
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .install_host_tools(vec![
+            read.clone() as Arc<dyn HostToolProvider>,
+            write.clone(),
+        ])
+        .unwrap();
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, "Read and change the layout".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(read.calls.lock().unwrap().len(), 1);
+    assert_eq!(write.0.calls.lock().unwrap().len(), 1);
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ReadWorkspace")
+    );
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ModifyLayout")
+    );
+    drop(requests);
+    agent.shutdown().await;
+}

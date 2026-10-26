@@ -22,3 +22,6 @@ mod skill_catalog;
 mod skill_frontmatter;
 #[path = "all/tick_package_skills.rs"]
 mod tick_package_skills;
+
+#[path = "all/mcp_servers.rs"]
+mod mcp_servers;

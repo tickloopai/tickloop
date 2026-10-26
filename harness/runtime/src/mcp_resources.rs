@@ -46,7 +46,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
 pub(crate) struct PreparedResourceCall {
     pub input: Value,
     name: String,
-    source: McpResourceServer,
+    sources: Vec<McpResourceServer>,
     skill: Option<(RemoteSkillDefinition, Option<String>)>,
 }
 
@@ -68,9 +68,7 @@ impl PreparedResourceCall {
             server: String,
             uri: String,
         }
-        let source = provider
-            .mcp_resource_server()
-            .ok_or("MCP resource source unavailable")?;
+
         let (server, uri) = if name == LIST_MCP_RESOURCES_TOOL {
             let parsed: ListInput =
                 serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
@@ -83,7 +81,12 @@ impl PreparedResourceCall {
                 serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
             (Some(parsed.server), Some(parsed.uri))
         };
-        if server.as_ref().is_some_and(|server| server != &source.name) {
+        let sources: Vec<_> = provider
+            .mcp_resource_servers()
+            .into_iter()
+            .filter(|source| server.as_ref().is_none_or(|server| server == &source.name))
+            .collect();
+        if sources.is_empty() {
             return Err("unknown or unavailable MCP resource server".into());
         }
         let skill = if let Some(target) = &uri {
@@ -120,7 +123,7 @@ impl PreparedResourceCall {
         Ok(Self {
             input: input.clone(),
             name: name.into(),
-            source,
+            sources,
             skill,
         })
     }
@@ -139,8 +142,14 @@ impl Agent {
             let chat = chats.get(&receipt.chat_id).ok_or("chat unavailable")?;
             if cancel.is_cancelled()
                 || chat.active_run != Some(receipt.run_id)
-                || !crate::mcp_resource_authority_allowed(chat, &prepared.source.authority)
-                || provider.mcp_resource_server().as_ref() != Some(&prepared.source)
+                || !prepared
+                    .sources
+                    .iter()
+                    .all(|source| crate::mcp_resource_authority_allowed(chat, &source.authority))
+                || !prepared
+                    .sources
+                    .iter()
+                    .all(|source| provider.mcp_resource_servers().contains(source))
             {
                 return Err("MCP resource is outside this Run's current service authority".into());
             }
@@ -156,10 +165,29 @@ impl Agent {
                 crate::delegation::ancestor_revisions(&chats, receipt.chat_id)?,
             )
         };
-        let mut result = if prepared.name == LIST_MCP_RESOURCES_TOOL {
-            provider
-                .list_mcp_resources(prepared.input["cursor"].as_str(), cancel.clone())
-                .await?
+        let result = if prepared.name == LIST_MCP_RESOURCES_TOOL {
+            let mut results = Vec::new();
+            for source in &prepared.sources {
+                let mut result = provider
+                    .list_mcp_resources_for(
+                        &source.name,
+                        prepared.input["cursor"].as_str(),
+                        cancel.clone(),
+                    )
+                    .await?;
+                if let Some(resources) = result["resources"].as_array_mut() {
+                    for resource in resources {
+                        resource["server"] = json!(source.name);
+                    }
+                }
+                result["server"] = json!(source.name);
+                results.push(result);
+            }
+            if results.len() == 1 {
+                results.remove(0)
+            } else {
+                json!({"servers":results})
+            }
         } else if let Some((definition, relative)) = &prepared.skill {
             let text = provider
                 .read_remote_skill(definition, relative.as_deref(), cancel.clone())
@@ -167,7 +195,8 @@ impl Agent {
             json!({"contents":[{"uri":prepared.input["uri"],"mimeType":"text/markdown","text":text}]})
         } else {
             provider
-                .read_mcp_resource(
+                .read_mcp_resource_for(
+                    &prepared.sources[0].name,
                     prepared.input["uri"]
                         .as_str()
                         .ok_or("resource URI missing")?,
@@ -183,8 +212,14 @@ impl Agent {
             || chat.active_run != Some(receipt.run_id)
             || chat.snapshot.policy.revision != revision
             || crate::delegation::ancestor_revisions(&chats, receipt.chat_id)? != ancestor_revisions
-            || !crate::mcp_resource_authority_allowed(chat, &prepared.source.authority)
-            || provider.mcp_resource_server().as_ref() != Some(&prepared.source)
+            || !prepared
+                .sources
+                .iter()
+                .all(|source| crate::mcp_resource_authority_allowed(chat, &source.authority))
+            || !prepared
+                .sources
+                .iter()
+                .all(|source| provider.mcp_resource_servers().contains(source))
             || prepared.skill.as_ref().is_some_and(|(definition, _)| {
                 !provider.remote_skill_is_current(&definition.source)
             })
@@ -197,14 +232,6 @@ impl Agent {
             && read_unchanged(chat, uri, &digest(text))
         {
             return Ok(unchanged(uri));
-        }
-        if prepared.name == LIST_MCP_RESOURCES_TOOL {
-            if let Some(resources) = result["resources"].as_array_mut() {
-                for resource in resources {
-                    resource["server"] = json!(prepared.source.name);
-                }
-            }
-            result["server"] = json!(prepared.source.name);
         }
         Ok(ToolResult {
             content: result.to_string(),

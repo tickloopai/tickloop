@@ -21,6 +21,7 @@ mod input;
 mod interaction;
 pub mod local_messages;
 mod loops;
+pub mod mcp;
 mod model;
 mod model_availability;
 mod model_card;
