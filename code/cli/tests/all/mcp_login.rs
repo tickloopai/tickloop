@@ -326,3 +326,32 @@ fn sensitive_plugin_values_are_not_printed_in_the_authorization_link() {
             .exists()
     );
 }
+
+#[test]
+fn a_private_resource_path_keeps_literal_plus_during_nested_link_decoding() {
+    let fixture = Fixture::new();
+    let server = AuthorizationServer::start();
+    let inner = format!(
+        "https://example.test/private+{}",
+        percent_encoding::utf8_percent_encode("值", percent_encoding::NON_ALPHANUMERIC)
+    );
+    let nested = percent_encoding::utf8_percent_encode(&inner, percent_encoding::NON_ALPHANUMERIC)
+        .to_string();
+    server.edit_metadata(|metadata| {
+        metadata["authorization_endpoint"] =
+            json!(format!("{}/authorize?continue={nested}", server.issuer()));
+    });
+    let source = fixture.root.join("source");
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    fs::write(source.join(".claude-plugin/plugin.json"),json!({"name":"private-resource","userConfig":{"key":{"type":"string","sensitive":true,"default":"private+值"}},"mcpServers":{"remote":{"url":server.resource(),"headers":{"X-Api-Key":"${user_config.key}"},"oauth":{"clientId":"public-client"}}}}).to_string()).unwrap();
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", source.to_str().unwrap()]));
+    let mut login = Login::start(&fixture, "plugin:private-resource:remote");
+    assert!(
+        matches!(
+            login.lines.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "the private resource path appeared in the printed authorization URL"
+    );
+    assert!(!login.child.wait().unwrap().success());
+}

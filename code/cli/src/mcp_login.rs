@@ -140,19 +140,28 @@ async fn login(
         })
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    let mut decoded = pending.authorization_url().to_owned();
+    let mut candidates = std::collections::BTreeSet::from([pending.authorization_url().to_owned()]);
     for _ in 0..=AUTHORIZATION_URL_ENCODING_LAYERS {
-        if secrets.iter().any(|secret| decoded.contains(secret)) {
+        if candidates
+            .iter()
+            .any(|candidate| secrets.iter().any(|secret| candidate.contains(secret)))
+        {
             return Err("The authorization link contains sensitive plugin configuration and cannot be displayed; OAuth client identifiers and resource addresses must be public.".into());
         }
-        let form = decoded.replace('+', " ");
-        let next = percent_encoding::percent_decode_str(&form)
-            .decode_utf8_lossy()
-            .into_owned();
-        if next == decoded {
+        let mut next = std::collections::BTreeSet::new();
+        for candidate in &candidates {
+            for encoded in [candidate.clone(), candidate.replace('+', " ")] {
+                next.insert(
+                    percent_encoding::percent_decode_str(&encoded)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        if next == candidates {
             break;
         }
-        decoded = next;
+        candidates = next;
     }
     println!("Open this link in your browser to log in:");
     println!("{}", pending.authorization_url());
