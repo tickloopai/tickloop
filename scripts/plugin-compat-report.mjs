@@ -277,6 +277,7 @@ async function fetchTickArchive(plugin, context, destination) {
 }
 
 async function checkStagedLinks(directory) {
+  if (!(await lstat(directory)).isDirectory()) throw new Error("plugin root must be a real directory");
   const root = await realpath(directory);
   const pending = [root];
   while (pending.length) {

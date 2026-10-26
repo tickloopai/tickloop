@@ -341,3 +341,16 @@ test("marketplace compatibility uses entry identity and retains the manifest dis
   assert.equal(report.totals.installableWithSkillsOrTick, 1);
   assert.deepEqual(JSON.parse(readFileSync(join(marketplace, "notion/.claude-plugin/plugin.json"))), manifest);
 });
+
+
+test("validation staging rejects a linked plugin root without modifying its target", async () => {
+  const marketplace = join(scratch, "linked-root-market");
+  const outside = join(scratch, "linked-root-target");
+  writeFiles(outside, { "skills/read/SKILL.md": skill("read") });
+  writeFiles(marketplace, { "marketplace.json": { name: "linked-root", plugins: [{ name: "linked", source: "./linked" }] } });
+  symlinkSync(outside, join(marketplace, "linked"));
+  const report = await createReport({ marketplace, tickloop: fakeTickloop(), workDirectory: join(scratch, "linked-root-work"), target: "aarch64-apple-darwin" });
+  assert.deepEqual(readdirSync(outside), ["skills"]);
+  assert.equal(report.plugins[0].status, STATUS.notFetchable);
+  assert.match(report.plugins[0].errors[0], /real directory/);
+});

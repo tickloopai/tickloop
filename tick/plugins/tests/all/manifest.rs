@@ -409,3 +409,19 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
             .any(|warning| warning.contains("commands.missing.source path"))
     );
 }
+
+#[test]
+fn inline_commands_are_recognized_without_a_source_path() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "inline",
+        &json!({
+            "name": "inline",
+            "commands": {"hello": {"content": "Say hello", "description": "Greeting"}},
+        }),
+        &[],
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(manifest.unsupported(), vec![Component::Commands]);
+    assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
+}

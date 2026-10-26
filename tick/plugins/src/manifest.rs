@@ -537,6 +537,12 @@ fn declared_component(
         Component::Commands if value.is_object() => {
             let mut found = false;
             for (name, metadata) in value.as_object().expect("an object").iter() {
+                if metadata.get("source").is_none()
+                    && metadata.get("content").is_some_and(Value::is_string)
+                {
+                    found = true;
+                    continue;
+                }
                 let field = format!("{field}.{name}.source");
                 found |= !contained_paths(
                     root,
