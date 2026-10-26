@@ -408,6 +408,20 @@ fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde
     }
     for field in ["params", "result", "error"] {
         if let Some(payload) = message.get_mut(field) {
+            if field == "result"
+                && let Some(tools) = payload
+                    .get_mut("tools")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| {
+                    let Some(name) = tool.get("name") else {
+                        return true;
+                    };
+                    let mut display = name.clone();
+                    redact(&mut display);
+                    display == *name
+                });
+            }
             // The protocol version and envelope are routing facts, not server display text.
             let protocol_version = (field == "result")
                 .then(|| payload.get("protocolVersion").cloned())
@@ -422,7 +436,21 @@ fn redact_message(text: &str, redact: &ResponseRedactor) -> Result<String, serde
         }
     }
     // Reject undecodable messages here so SDK diagnostics cannot echo their raw fields.
-    serde_json::from_value::<ServerJsonRpcMessage>(message.clone())?;
+    let decoded = serde_json::from_value::<ServerJsonRpcMessage>(message.clone())?;
+    let custom_method = match decoded {
+        ServerJsonRpcMessage::Notification(notification) => matches!(
+            notification.notification,
+            rmcp::model::ServerNotification::CustomNotification(_)
+        ),
+        ServerJsonRpcMessage::Request(request) => matches!(
+            request.request,
+            rmcp::model::ServerRequest::CustomRequest(_)
+        ),
+        _ => false,
+    };
+    if custom_method && let Some(method) = message.get_mut("method") {
+        redact(method);
+    }
     serde_json::to_string(&message)
 }
 

@@ -159,6 +159,10 @@ impl McpService {
             json!({"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":text}}).to_string(),
         );
     }
+    pub fn notify_custom(&self, method: &str) {
+        self.state.lock().unwrap().notification =
+            Some(json!({"jsonrpc":"2.0", "method":method,"params":{}}).to_string());
+    }
     pub fn notify_log_with_unicode_escapes(&self, text: &str) {
         self.notify_log(text);
         let mut state = self.state.lock().unwrap();

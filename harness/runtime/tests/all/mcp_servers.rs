@@ -1226,6 +1226,10 @@ async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
     connections
         .call("mcp__remote__probe", json!({}), cancel.clone())
         .await;
+    server.notify_custom(&format!("fixture/{}", token.access_token));
+    connections
+        .call("mcp__remote__probe", json!({}), cancel.clone())
+        .await;
     let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
     assert!(
         !logged.contains(&token.access_token),
@@ -1314,7 +1318,7 @@ async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
 async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc_ids() {
     let server = McpService::start().await;
     server.require_bearer("1");
-    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}},{"name":"v1_probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let released = Arc::downgrade(&credentials);
     credentials.replace(Some(tickloop_harness_connector::ConnectorCredential {
@@ -1344,6 +1348,15 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
         .await;
     settled(&connections).await;
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert_eq!(
+        connections.snapshot()[0].tools.len(),
+        1,
+        "a sensitive tool name must be omitted instead of rewritten for dispatch"
+    );
+    assert_eq!(
+        connections.snapshot()[0].tools[0].name,
+        "mcp__remote__probe"
+    );
     assert!(matches!(
         connections
             .call("mcp__remote__probe", json!({}), CancellationToken::new())
