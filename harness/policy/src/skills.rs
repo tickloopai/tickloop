@@ -127,8 +127,8 @@ struct Frontmatter {
     name: String,
     #[serde(deserialize_with = "deserialize_text")]
     description: String,
-    #[serde(default, deserialize_with = "deserialize_allowed_tools")]
-    allowed_tools: Vec<String>,
+    #[serde(default)]
+    allowed_tools: RawAllowedTools,
     #[serde(
         default = "default_user_invocable",
         deserialize_with = "deserialize_bool"
@@ -184,10 +184,7 @@ impl SkillRegistry {
         let parsed = parse_skill(markdown, source).map(|mut skill| {
             let namespace = match &skill.source {
                 SkillSource::TickPackage { package, .. } => Some(package.clone()),
-                SkillSource::Plugin { plugin, .. } => {
-                    skill.allowed_tools.clear();
-                    Some(plugin.clone())
-                }
+                SkillSource::Plugin { plugin, .. } => Some(plugin.clone()),
                 _ => None,
             };
             if let Some(namespace) = namespace {
@@ -511,15 +508,22 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
         .strip_prefix("---\n")
         .or_else(|| markdown.strip_prefix("---\r\n"))
         .ok_or_else(|| SkillError::Invalid("missing YAML frontmatter".into()))?;
-    let (frontmatter, body) = rest
-        .split_once("\n---\n")
-        .or_else(|| rest.split_once("\n---\r\n"))
+    let (frontmatter, body) = ["\n---\n", "\n---\r\n"]
+        .into_iter()
+        .filter_map(|delimiter| rest.find(delimiter).map(|index| (index, delimiter.len())))
+        .min_by_key(|(index, _)| *index)
+        .map(|(index, length)| (&rest[..index], &rest[index + length..]))
         .ok_or_else(|| SkillError::Invalid("unterminated YAML frontmatter".into()))?;
     let frontmatter = parse_frontmatter(frontmatter)?;
     validate_name(&frontmatter.name)?;
     if frontmatter.description.trim().is_empty() {
         return Err(SkillError::Invalid("description cannot be empty".into()));
     }
+    let allowed_tools = if matches!(source, SkillSource::Plugin { .. }) {
+        Vec::new()
+    } else {
+        parse_allowed_tools(frontmatter.allowed_tools)?
+    };
     let body = body.trim().to_owned();
     if body.is_empty() {
         return Err(SkillError::Invalid("body cannot be empty".into()));
@@ -529,7 +533,7 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
         description: frontmatter.description,
         source,
         body,
-        allowed_tools: frontmatter.allowed_tools,
+        allowed_tools,
         user_invocable: frontmatter.user_invocable,
         disable_model_invocation: frontmatter.disable_model_invocation,
         context: frontmatter.context,
@@ -560,10 +564,26 @@ fn deserialize_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, 
     }
 }
 
-fn deserialize_allowed_tools<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error> {
-    match Value::deserialize(deserializer)? {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawAllowedTools {
+    Value(Value),
+    Unsupported(de::IgnoredAny),
+}
+
+impl Default for RawAllowedTools {
+    fn default() -> Self {
+        Self::Value(Value::Array(Vec::new()))
+    }
+}
+
+fn parse_allowed_tools(value: RawAllowedTools) -> Result<Vec<String>, SkillError> {
+    let RawAllowedTools::Value(value) = value else {
+        return Err(SkillError::Invalid(
+            "allowed-tools must be a string or list of strings".into(),
+        ));
+    };
+    match value {
         Value::String(value) if !value.is_empty() => Ok(value
             .split(',')
             .map(str::trim)
@@ -574,11 +594,13 @@ fn deserialize_allowed_tools<'de, D: Deserializer<'de>>(
             .into_iter()
             .map(|value| match value {
                 Value::String(value) if !value.is_empty() => Ok(value),
-                _ => Err(de::Error::custom("allowed-tools entries must be strings")),
+                _ => Err(SkillError::Invalid(
+                    "allowed-tools entries must be strings".into(),
+                )),
             })
             .collect(),
-        _ => Err(de::Error::custom(
-            "allowed-tools must be a string or list of strings",
+        _ => Err(SkillError::Invalid(
+            "allowed-tools must be a string or list of strings".into(),
         )),
     }
 }

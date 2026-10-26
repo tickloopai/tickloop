@@ -252,3 +252,20 @@ fn yaml_metadata_preserves_invocation_restrictions_and_never_grants_tools() {
         );
     }
 }
+
+#[test]
+fn discovery_keeps_body_separators_out_of_yaml_when_line_endings_are_mixed() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = "Introduction.\n---\nMore instructions.";
+    let markdown = format!("---\r\nname: guide\r\ndescription: Read the guide.\r\n---\r\n{body}\n");
+    let registry =
+        SkillRegistry::discover_with_builtins(directory.path(), None, [markdown.as_str()]);
+    assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
+    assert_eq!(
+        registry
+            .expand("guide", "", SkillCaller::Model)
+            .unwrap()
+            .content,
+        body
+    );
+}
