@@ -72,6 +72,7 @@ fn plugins_resolve_after_users_with_roots_and_deterministic_signature_priority()
         "configure":{"command":"node", "args":["${user_config.key}"]}
     })).unwrap();
     let plugins = ["zeta", "alpha"].map(|name| PluginServers {
+        user_config: Default::default(),
         name: name.into(),
         root: format!("/plugins/{name}").into(),
         data_directory: format!("/data/{name}").into(),
@@ -116,6 +117,7 @@ fn plugins_resolve_after_users_with_roots_and_deterministic_signature_priority()
 fn signature_priority_does_not_depend_on_credentials_and_unsupported_stays_unsupported() {
     use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
     let plugin = PluginServers {
+        user_config: Default::default(),
         name: "demo".into(),
         root: "/plugin".into(),
         data_directory: "/data".into(),
@@ -160,4 +162,106 @@ fn signature_priority_does_not_depend_on_credentials_and_unsupported_stays_unsup
             .iter()
             .any(|w| w.contains("auto_approve") && w.contains("ignored"))
     );
+}
+
+#[test]
+fn plugin_user_config_is_typed_private_persistent_and_resolves_mcp_fields() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tick_plugins::{PluginManifest, PluginStore};
+    use tickloop_code_settings::{
+        mcp::{PluginServers, resolve_servers_with_plugins},
+        plugin_config::PluginUserConfig,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        json!({
+            "name":"configured", "userConfig": {
+                "key":{"type":"string","sensitive":true,"required":true},
+                "host":{"type":"string","default":"example.com"},
+                "timeout":{"type":"number","default":1234},
+                "active":{"type":"boolean","default":false},
+            "unused":{"type":"string","sensitive":true,"default":"unreferenced-secret"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let manifest = PluginManifest::load(&source, "unused", None).unwrap();
+    let root = temp.path().join("config");
+    let mut config = PluginUserConfig::load(&root, &manifest).unwrap();
+    assert!(!config.is_filled("key"));
+    assert!(config.is_filled("active"));
+    config
+        .save(
+            &root,
+            &manifest,
+            &serde_json::from_value(json!({"key":"private-${LITERAL}","host":"service.example"}))
+                .unwrap(),
+        )
+        .unwrap();
+    let public = fs::read_to_string(root.join("settings.json")).unwrap();
+    assert!(!public.contains("private-"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&public).unwrap()["plugins"]["configured"]["options"]
+            ["host"],
+        "service.example"
+    );
+    let private_path = root.join("credentials/configured/user-config.json");
+    assert_eq!(
+        fs::metadata(&private_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let store = PluginStore::in_config_root(&root);
+    store.install_path(&source).unwrap();
+    store.uninstall("configured", false).unwrap();
+    let config = PluginUserConfig::load(&root, &manifest).unwrap();
+    assert!(config.is_filled("key"));
+    let plugin = PluginServers {
+        name:"configured".into(),root:source,data_directory:root.join("data"),user_config:config,
+        entries:serde_json::from_value(json!({"remote":{
+            "type":"http","url":"https://${user_config.host}/mcp",
+            "headers":{"${user_config.host}":"${user_config.key}"},"timeout":"${user_config.timeout}"
+        }})).unwrap()
+    };
+    let resolved =
+        resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &[plugin]);
+    assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    assert_eq!(resolved.servers[0].timeout_ms, 1234);
+    assert_eq!(resolved.servers[0].sensitive_values.len(), 1);
+    let transport = serde_json::to_value(&resolved.servers[0].transport).unwrap();
+    assert_eq!(transport["url"], "https://service.example/mcp");
+    assert_eq!(
+        transport["headers"]["service.example"],
+        "private-${LITERAL}"
+    );
+}
+
+#[test]
+fn missing_plugin_config_takes_precedence_and_ignored_approval_fields_do_not_expand() {
+    use tickloop_code_settings::mcp::{PluginServers, resolve_servers_with_plugins};
+    use tickloop_harness::protocol::mcp::McpTransport;
+    let plugin = PluginServers {
+        name: "configured".into(),
+        root: "/plugin".into(),
+        data_directory: "/data".into(),
+        user_config: Default::default(),
+        entries: serde_json::from_value(json!({
+            "missing":{"command":"${ABSENT}","env":{"KEY":"${user_config.key}"}},
+            "ignored":{"command":"server","autoApprove":["${ABSENT}"]}
+        }))
+        .unwrap(),
+    };
+    let resolved =
+        resolve_servers_with_plugins(&json!({}), Path::new("/work"), &BTreeMap::new(), &[plugin]);
+    assert!(matches!(
+        resolved.servers[0].transport,
+        McpTransport::Stdio { .. }
+    ));
+    assert!(matches!(
+        resolved.servers[1].transport,
+        McpTransport::NeedsConfiguration
+    ));
 }

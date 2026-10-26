@@ -8,6 +8,9 @@ pub struct McpServerConfig {
     pub source: String,
     pub transport: McpTransport,
     pub timeout_ms: u64,
+    /// Host-provided secrets to remove from every server response.
+    #[serde(default)]
+    pub sensitive_values: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

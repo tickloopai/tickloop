@@ -1,6 +1,7 @@
 //! The process entries the `tickloop` executable dispatches before it starts the Console.
 
 mod plugin_command;
+mod plugin_config;
 mod plugin_marketplace;
 mod plugin_mcp;
 mod plugin_tick;

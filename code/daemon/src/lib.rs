@@ -881,6 +881,14 @@ fn enabled_plugin_mcp_servers(
                 .map(|warning| format!("Plugin {}: {warning}", plugin.name())),
         );
         plugins.push(tickloop_code_settings::mcp::PluginServers {
+            user_config: tickloop_code_settings::plugin_config::PluginUserConfig::load(
+                store.config_root(),
+                &plugin.manifest,
+            )
+            .unwrap_or_else(|_| {
+                warnings.push(format!("Plugin {}: cannot read user config", plugin.name()));
+                Default::default()
+            }),
             name: plugin.name().to_owned(),
             root: plugin.root,
             data_directory,

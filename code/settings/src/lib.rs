@@ -50,6 +50,7 @@ use tickloop_harness::protocol::{
 };
 
 pub mod mcp;
+pub mod plugin_config;
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 

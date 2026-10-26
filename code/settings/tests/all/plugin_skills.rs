@@ -494,3 +494,52 @@ fn cached_discovery_recovers_a_repaired_plugin_without_registry_changes() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+#[test]
+fn plugin_skill_config_replaces_public_values_and_masks_sensitive_values_after_updates() {
+    use serde_json::json;
+    use tickloop_code_settings::{plugin_config::PluginUserConfig, skills::SkillDiscoveryCache};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("config");
+    let plugin = install(
+        &root,
+        &claude_plugin(
+            temp.path(),
+            "configured",
+            json!({
+                "name":"configured", "userConfig": {
+                    "key":{"type":"string","sensitive":true},"host":{"type":"string","default":"initial"}
+                }
+            }),
+            &[(
+                "skills/guide",
+                &skill(
+                    "guide",
+                    "Configure",
+                    "Host ${user_config.host}; key ${user_config.key}",
+                ),
+            )],
+        ),
+    );
+    let mut cache = SkillDiscoveryCache::default();
+    let registry = cache.refresh(temp.path(), Some(&root)).unwrap();
+    let expansion = registry
+        .expand("configured:guide", "", SkillCaller::Model)
+        .unwrap();
+    assert!(expansion.content.contains("Host initial"));
+    assert!(expansion.content.contains("敏感配置不在此显示"));
+    let mut config = PluginUserConfig::load(&root, &plugin.manifest).unwrap();
+    config
+        .save(
+            &root,
+            &plugin.manifest,
+            &serde_json::from_value(json!({"key":"private-config-key","host":"updated"})).unwrap(),
+        )
+        .unwrap();
+    let registry = cache.refresh(temp.path(), Some(&root)).unwrap();
+    let expansion = registry
+        .expand("configured:guide", "", SkillCaller::Model)
+        .unwrap();
+    assert!(expansion.content.contains("Host updated"));
+    assert!(!expansion.content.contains("private-config-key"));
+}
