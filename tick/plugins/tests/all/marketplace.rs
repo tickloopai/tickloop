@@ -894,6 +894,12 @@ async fn marketplace_entry_names_own_identity_even_when_manifest_names_collide_o
 fn marketplace_archives_also_use_the_entry_name_as_identity() {
     let fixture = Fixture::new();
     let root = fixture.tick_package("original", "original", "1.0");
+    let manifest_path = root.join("tick-package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["name"] = json!("Original Display Name");
+    write_json(&manifest_path, &manifest);
+    assert!(fixture.store.install_path(&root).is_err());
     let archive = fixture.root().join("original.tar.gz");
     let sha256 = crate::support::pack(&root, &archive);
     let installed = fixture

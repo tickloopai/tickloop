@@ -183,14 +183,7 @@ impl PluginManifest {
             }
         }
         if tick_package.is_file() {
-            let mut manifest = from_tick_package(&root)?;
-            if let Some(name) = marketplace_name {
-                if manifest.name != name {
-                    manifest.display_name = Some(manifest.name.clone());
-                }
-                manifest.name = name.to_owned();
-            }
-            return Ok(manifest);
+            return from_tick_package(&root, marketplace_name);
         }
         match entry {
             Some(entry) => from_document(
@@ -359,14 +352,8 @@ fn from_document(
     insert_default_components(root, &mut components);
 
     let (tick, auth) = if format == ManifestFormat::Tickloop {
-        let program_name = marketplace_name.and_then(|_| {
-            document
-                .get("tick")?
-                .get("executable")?
-                .as_str()
-                .and_then(|path| Path::new(path).file_name()?.to_str())
-                .and_then(|file| file.strip_prefix("tick-"))
-        });
+        let program_name = marketplace_name
+            .and_then(|_| tick_program_name(document.get("tick")?.get("executable")));
         tick_fields(
             root,
             program_name.unwrap_or(&name),
@@ -395,8 +382,32 @@ fn from_document(
     })
 }
 
-fn from_tick_package(root: &Path) -> Result<PluginManifest, PluginError> {
-    let package = PackageManifest::load(root)?;
+fn from_tick_package(
+    root: &Path,
+    marketplace_name: Option<&str>,
+) -> Result<PluginManifest, PluginError> {
+    let (package, display_name) = if let Some(name) = marketplace_name {
+        let mut document = read_document(&root.join(TICK_PACKAGE_MANIFEST))?.ok_or_else(|| {
+            PluginError::Invalid(format!("plugin has no {TICK_PACKAGE_MANIFEST}"))
+        })?;
+        let declared_name = document
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PluginError::Invalid(format!("name in {TICK_PACKAGE_MANIFEST} must be a string"))
+            })?
+            .to_owned();
+        let program_name = tick_program_name(document.get("executable"))
+            .unwrap_or(name)
+            .to_owned();
+        document.insert("name".to_owned(), Value::String(program_name));
+        let package =
+            PackageManifest::parse(&serde_json::to_vec(&document).expect("manifest serializes"))?;
+        check_program(root, &package.executable).map_err(PluginError::Invalid)?;
+        (package, (declared_name != name).then_some(declared_name))
+    } else {
+        (PackageManifest::load(root)?, None)
+    };
     let skill_paths = default_skill_paths(root);
     let mut components = BTreeSet::from([Component::Tick]);
     if !skill_directories(root, &skill_paths).is_empty() {
@@ -404,8 +415,8 @@ fn from_tick_package(root: &Path) -> Result<PluginManifest, PluginError> {
     }
     insert_default_components(root, &mut components);
     Ok(PluginManifest {
-        name: package.name,
-        display_name: None,
+        name: marketplace_name.map_or(package.name, str::to_owned),
+        display_name,
         version: Some(package.version),
         description: Some(package.description),
         format: ManifestFormat::TickPackage,
@@ -418,6 +429,13 @@ fn from_tick_package(root: &Path) -> Result<PluginManifest, PluginError> {
         components,
         warnings: Vec::new(),
     })
+}
+
+fn tick_program_name(executable: Option<&Value>) -> Option<&str> {
+    Path::new(executable?.as_str()?)
+        .file_name()?
+        .to_str()?
+        .strip_prefix("tick-")
 }
 
 /// The `tick` and `auth` fields of a Tickloop manifest, checked by the rules of
