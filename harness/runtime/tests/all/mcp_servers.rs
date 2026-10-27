@@ -1829,7 +1829,7 @@ async fn discovery_resources_and_failures_redact_server_text() {
         "Query [redacted]"
     );
     let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
-    let found = directory.search(&json!({"queries":["probe"]})).unwrap();
+    let found = directory.search(&json!({"query":"probe"})).unwrap();
     assert_eq!(found["matches"][0]["summary"], "Find [redacted].");
     let described = directory
         .describe(&json!({"names":["mcp__notes__probe"]}))

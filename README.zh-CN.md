@@ -175,7 +175,7 @@ tickloop plugin install --path ./my-plugin
 
 ### Tool Search 与 Codemode
 
-MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 时，模型用自身搜索找到工具后直接调用；其他模型采用 Fold：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。切换模型时自动选择可用方式。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
+MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 时，模型用自身搜索找到工具后直接调用；其他模型采用 Fold：通过 `SearchTools` 搜索（一个 `query`，按空格分词、任一词命中即可；也可写完整工具名、`mcp__<服务>` 列出该服务的工具、`select:A,B` 按名选取，或用 `+词` 要求必须命中）、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。切换模型时自动选择可用方式。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
 
 本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。`SearchTools` 和 `DescribeTools` 可发现只能从脚本调用的工具及其原始参数 schema；启用原生 Tool Search 时，这两个工具只覆盖脚本专用工具，不提供 `ExecuteTools`。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。`store(key, value)` 与 `load(key)` 在同一对话的后续脚本之间保留小量 JSON 值（如分页游标）；只有脚本成功时保存，各 Branch 的值独立。Rewind 恢复所选路径上的值，但压缩保留了对话前缀后，再 Rewind 到该前缀内，仍可能看到压缩时保存的较晚值。`store(key, undefined)` 删除值，`load(key)` 返回副本或 `undefined`。单个 JSON 值最多 262144 个 UTF-16 字符，键和值合计最多 1048576 个，最多 4096 个键。脚本运行中 Agent 进程退出时不会重跑：载入的历史列出脚本里每次调用的结局。对话中脚本内的每次调用显示在它的 Codemode 调用之下，ctrl+o 可查看整段脚本。
 

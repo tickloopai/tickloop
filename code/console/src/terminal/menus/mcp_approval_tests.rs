@@ -164,7 +164,7 @@ async fn nested_file_change_confirmation_shows_the_entire_parent_batch() {
                 "ExecuteTools",
                 json!({"calls":[
                     {"name":"Write","arguments":{"file_path":project.join("note.txt"),"content":"first operation"}},
-                    {"name":"SearchTools","arguments":{"queries":["second-operation-marker"]}}
+                    {"name":"SearchTools","arguments":{"query":"second-operation-marker"}}
                 ]}),
             ),
             text("done"),

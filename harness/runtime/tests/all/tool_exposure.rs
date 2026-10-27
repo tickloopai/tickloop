@@ -37,7 +37,7 @@ fn fold_searches_without_changing_definitions_or_revealing_hidden_tools() {
         serde_json::to_vec(&directory.definitions()).unwrap(),
         before
     );
-    let found = directory.search(&json!({"queries":["email"]})).unwrap();
+    let found = directory.search(&json!({"query":"email"})).unwrap();
     assert_eq!(
         found["matches"],
         json!([{"name":"mcp__office__mail","server":"office","summary":"Send an email message.","required":["recipient"]}])
@@ -110,7 +110,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         Arc::new(move || current.read().unwrap().clone()),
     ));
     let model = Arc::new(ScriptedModel::new(vec![
-        call("find", "SearchTools", json!({"queries":["email"]})),
+        call("find", "SearchTools", json!({"query":"email"})),
         call(
             "describe",
             "DescribeTools",
@@ -509,9 +509,14 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
         false,
     );
     for input in [
-        json!({"queries":[]}),
-        json!({"queries":[" "]}),
-        json!({"queries":["a","b","c","d","e","f"]}),
+        json!({}),
+        json!({"query":" "}),
+        json!({"query":["mail"]}),
+        json!({"queries":["mail"]}),
+        json!({"query":"mail","limit":0}),
+        json!({"query":"mail","limit":2.5}),
+        json!({"query":"mail","limit":"3"}),
+        json!({"query":"select: , "}),
     ] {
         assert!(directory.search(&input).is_err());
     }
@@ -522,9 +527,9 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
     ] {
         assert!(directory.describe(&input).is_err());
     }
-    let found = directory.search(&json!({"queries":["recipient"]})).unwrap();
+    let found = directory.search(&json!({"query":"recipient"})).unwrap();
     assert_eq!(found["matches"][0]["name"], "mcp__office__recipient");
-    let found = directory.search(&json!({"queries":["mail"]})).unwrap();
+    let found = directory.search(&json!({"query":"mail"})).unwrap();
     assert_eq!(
         found["matches"][0]["summary"]
             .as_str()
@@ -533,12 +538,7 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
             .count(),
         160
     );
-    assert!(
-        directory
-            .search(&json!({"queries":["no_such_word"]}))
-            .unwrap()["note"]
-            .is_string()
-    );
+    assert!(directory.search(&json!({"query":"no_such_word"})).unwrap()["note"].is_string());
     let native = ExposureDirectory::new(
         vec![tool("mail", "Mail", ToolExposure::Search)],
         SearchSupport::Native,
@@ -624,7 +624,7 @@ fn hosts_without_scripts_discover_codemode_tools_through_search() {
         false,
     );
     assert_eq!(
-        directory.search(&json!({"queries":["email"]})).unwrap()["matches"][0]["name"],
+        directory.search(&json!({"query":"email"})).unwrap()["matches"][0]["name"],
         "mcp__office__mail"
     );
     let scripted = ExposureDirectory::new(
@@ -633,7 +633,7 @@ fn hosts_without_scripts_discover_codemode_tools_through_search() {
         true,
     );
     assert_eq!(
-        scripted.search(&json!({"queries":["email"]})).unwrap()["matches"][0]["name"],
+        scripted.search(&json!({"query":"email"})).unwrap()["matches"][0]["name"],
         "mcp__office__mail"
     );
 }
@@ -1339,7 +1339,7 @@ async fn native_models_discover_codemode_schemas_and_call_only_through_scripts()
         call(
             "find",
             "SearchTools",
-            json!({"queries":["mail","native","direct","secret"]}),
+            json!({"query":"mail native direct secret"}),
         ),
         call(
             "describe",
@@ -1489,7 +1489,7 @@ fn ui5_directory() -> ExposureDirectory {
 }
 
 fn found_names(directory: &ExposureDirectory, query: &str) -> Vec<String> {
-    directory.search(&json!({"queries":[query]})).unwrap()["matches"]
+    directory.search(&json!({"query":query})).unwrap()["matches"]
         .as_array()
         .unwrap()
         .iter()
@@ -1531,8 +1531,80 @@ fn queries_made_only_of_unrelated_or_generic_words_match_nothing() {
         "mcp server tools",
         "the tool for a server",
     ] {
-        let found = directory.search(&json!({"queries":[query]})).unwrap();
+        let found = directory.search(&json!({"query":query})).unwrap();
         assert_eq!(found["matches"], json!([]), "{query:?}");
         assert!(found["note"].is_string());
     }
+}
+
+#[test]
+fn exact_names_server_prefixes_selections_and_required_words_pick_tools() {
+    let directory = ui5_directory();
+    assert_eq!(
+        found_names(&directory, "mcp__ui5__run_ui5_linter"),
+        ["mcp__ui5__run_ui5_linter"]
+    );
+    assert_eq!(
+        found_names(&directory, "mcp__ui5"),
+        ["mcp__ui5__get_version_info", "mcp__ui5__run_ui5_linter"]
+    );
+    let selected = directory
+        .search(&json!({"query":"select:mcp__office__mail, mcp__ui5__get_version_info,mcp__nowhere__x"}))
+        .unwrap();
+    assert_eq!(
+        selected["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| found["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["mcp__office__mail", "mcp__ui5__get_version_info"]
+    );
+    assert_eq!(selected["not_found"], json!(["mcp__nowhere__x"]));
+    assert_eq!(
+        found_names(&directory, "+linter ui5 version"),
+        ["mcp__ui5__run_ui5_linter"]
+    );
+    assert!(found_names(&directory, "+weather ui5").is_empty());
+}
+
+#[test]
+fn searches_return_eight_matches_by_default_and_at_most_ten() {
+    let directory = ExposureDirectory::new(
+        (0..12)
+            .map(|index| server_tool("ui5", &format!("check_{index}"), "Inspect a UI5 project"))
+            .collect(),
+        SearchSupport::Fold,
+        false,
+    );
+    let count = |input: serde_json::Value| {
+        directory.search(&input).unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count(json!({"query":"ui5 project"})), 8);
+    assert_eq!(count(json!({"query":"ui5 project","limit":3})), 3);
+    assert_eq!(count(json!({"query":"ui5 project","limit":50})), 10);
+    assert_eq!(count(json!({"query":"mcp__ui5"})), 12);
+}
+
+#[test]
+fn words_in_a_tool_name_outrank_the_same_words_in_descriptions() {
+    let directory = ExposureDirectory::new(
+        vec![
+            server_tool(
+                "docs",
+                "release_notes",
+                "Version history: each version, version notes and version changes",
+            ),
+            server_tool("docs", "get_version", "Show details"),
+        ],
+        SearchSupport::Fold,
+        false,
+    );
+    assert_eq!(
+        found_names(&directory, "version"),
+        ["mcp__docs__get_version", "mcp__docs__release_notes"]
+    );
 }
