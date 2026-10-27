@@ -237,18 +237,21 @@ impl Agent {
         self.pin_delegated_artifact_account(receipt.chat_id).await?;
         self.rediscover_skills(receipt.chat_id).await;
         self.synchronize_remote_skills(receipt).await;
-        let chats = self.inner.chats.lock().await;
-        let chat = chats.get(&receipt.chat_id).unwrap();
+        let mut chats = self.inner.chats.lock().await;
+        let task_access = shared_tasks::tool_access(&chats, receipt);
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let _timing = crate::timing::Phase::new("ToolRegistry::for_chat");
-        Ok(ToolRegistry::for_chat(
+        let mut registry = ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
             self.inner.host_options.prompt_policy,
-            shared_tasks::tool_access(&chats, receipt),
+            task_access,
             &self.inner.tool_policy,
             self.scheduled_task_terms(),
-        ))
+        );
+        registry.hold_host_tools(&mut chat.cache_prefix.held_host_tools, receipt.run_id);
+        Ok(registry)
     }
 
     /// Re-enters the Run's tool batch at `at` with freshly prepared tools.

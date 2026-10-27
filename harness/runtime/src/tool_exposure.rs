@@ -18,7 +18,8 @@ const DEFAULT_SEARCH_MATCHES: usize = 8;
 const MAX_SEARCH_MATCHES: usize = 10;
 const MAX_SUMMARY_CHARACTERS: usize = 160;
 const SELECT_PREFIX: &str = "select:";
-const SERVER_PREFIX: &str = "mcp__";
+/// The prefix of every MCP tool name, `mcp__<server>__<tool>`.
+pub(crate) const MCP_TOOL_PREFIX: &str = "mcp__";
 const REQUIRED_PREFIX: char = '+';
 const NO_MATCH_NOTE: &str = "No tool matched.";
 const NAME_WEIGHT: f64 = 2.0;
@@ -175,11 +176,11 @@ impl ExposureDirectory {
                 .filter(|tool| tool.definition.name == query || tool.original_name == query)
                 .collect();
             let server_tools: Vec<_> = query
-                .strip_prefix(SERVER_PREFIX)
+                .strip_prefix(MCP_TOOL_PREFIX)
                 .map(|server| server.trim_end_matches('_'))
                 .filter(|server| !server.is_empty() && !server.contains(char::is_whitespace))
                 .map(|server| {
-                    let prefix = format!("{SERVER_PREFIX}{server}__");
+                    let prefix = format!("{MCP_TOOL_PREFIX}{server}__");
                     tools
                         .iter()
                         .copied()
