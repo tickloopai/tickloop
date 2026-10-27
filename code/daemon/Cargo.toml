@@ -11,7 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-tickloop-harness = { path = "../../harness/sdk", features = ["artifacts", "engine", "model", "policy", "tools", "connector"] }
+tickloop-harness = { path = "../../harness/sdk", features = ["artifacts", "codemode", "engine", "model", "policy", "tools", "connector"] }
 tickloop-code-local-environment = { path = "../local-environment" }
 async-trait = "0.1"
 base64 = "0.22"

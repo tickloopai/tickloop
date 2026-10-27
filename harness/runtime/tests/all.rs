@@ -1,5 +1,9 @@
 //! Every harness/runtime integration test, compiled as one binary.
 
+#[cfg(feature = "codemode")]
+#[path = "all/codemode.rs"]
+mod codemode;
+
 #[path = "all/advance.rs"]
 mod advance;
 #[path = "all/agent_approval_routing.rs"]

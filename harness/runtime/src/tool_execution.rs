@@ -37,6 +37,8 @@ struct AutoPermissionDecision {
 
 #[derive(Clone)]
 enum ToolRoute {
+    #[cfg(feature = "codemode")]
+    Codemode,
     Fold(Arc<crate::tool_exposure::ExposureDirectory>),
     BuiltIn,
     Plan,
@@ -201,6 +203,13 @@ impl ToolRegistry {
                 route: ToolRoute::BuiltIn,
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "codemode")]
+        if policy.scripts {
+            tools.push(RegisteredTool {
+                definition: crate::codemode_tool::definition(),
+                route: ToolRoute::Codemode,
+            });
+        }
         if policy.plan {
             tools.extend(
                 plan::definitions(is_delegated)
@@ -444,6 +453,14 @@ impl ToolRegistry {
 
     pub(super) fn script_only(&self, name: &str) -> bool {
         self.script_only.contains(name)
+    }
+
+    #[cfg(feature = "codemode")]
+    pub(crate) fn script_tools(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|tool| tool.definition.name.clone())
+            .collect()
     }
 
     pub(super) fn resolve_nested(&self, name: &str) -> Option<RegisteredTool> {
@@ -740,6 +757,8 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            #[cfg(feature = "codemode")]
+            ToolRoute::Codemode => unreachable!("Codemode executes through nested calls"),
             ToolRoute::Fold(directory) => {
                 let value = match operation.name.as_str() {
                     crate::tool_exposure::SEARCH_TOOLS => directory.search(&operation.input),
@@ -841,6 +860,20 @@ impl Agent {
         invocation: ToolInvocation,
         cancel: CancellationToken,
     ) -> Result<ToolCallOutcome, ToolCallError> {
+        #[cfg(feature = "codemode")]
+        if matches!(
+            invocation.registration.as_ref().map(|tool| &tool.route),
+            Some(ToolRoute::Codemode)
+        ) {
+            return Box::pin(self.execute_codemode(
+                receipt,
+                assistant_message_id,
+                invocation.id,
+                invocation.input,
+                cancel,
+            ))
+            .await;
+        }
         if invocation.name == crate::tool_exposure::EXECUTE_TOOLS
             && matches!(
                 invocation.registration.as_ref().map(|tool| &tool.route),
@@ -2597,7 +2630,7 @@ impl Agent {
                             None,
                         )
                         .finish(receipt.chat_id, operation);
-                        crate::nested_calls::stop_after_denial();
+                        crate::nested_calls::stop_after_denial(&reason);
                         return Err(ToolCallError::denied(reason, record));
                     }
                     Some(warning) if kind == AutoBlockKind::SoftDeny => {
@@ -2638,7 +2671,11 @@ impl Agent {
                 .push_str(&format!("\n{warning}"));
         }
         if decision == Decision::Deny && matches!(assessment.verdict, AutoReview::Block { .. }) {
-            crate::nested_calls::stop_after_denial();
+            crate::nested_calls::stop_after_denial(
+                auto_denial_message
+                    .as_deref()
+                    .unwrap_or("Auto review rejected the call"),
+            );
         }
         Ok(AutoPermissionDecision {
             decision,

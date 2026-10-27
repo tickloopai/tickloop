@@ -109,11 +109,13 @@ The browser-specific entries above remain inapplicable: connecting an arbitrary 
 
 Permission history uses the same prepared service identity for matching as admission, and records the original service rule ID and matcher for Allow, Ask and Deny, including tools whose displayed names were hashed.
 
-## Fold and nested calls
+## Fold, Codemode and nested calls
 
 | Tool | Permission and Auto handling | Authorization boundary |
 | --- | --- | --- |
 | SearchTools / DescribeTools | ReadOnly; no review | Discovery respects exposure and the delegated tool ceiling; annotations are reference data only |
-| ExecuteTools | No wrapper approval | Each independent child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
+| ExecuteTools / Codemode | No wrapper approval | Each child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
 
 Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and nine inapplicable entries remain unchanged.
+
+Codemode runs only when the host enables scripts and the independent `codemode` facade feature is compiled. Its sandbox has no direct file, network, timer or module access. The complete script and earlier observed child results enter Auto evidence as model-authored material, never user authorization. Human confirmation pauses the script deadline while other calls can finish. An effective Auto rejection ends the script, preserves the rejection reason and uses the existing denial count; user denial throws an Error that the script may handle. Plan and the frozen/current parent permissions still apply to every child. The wrapper grants no permissions and adds no policy rules: the 82 rules and nine inapplicable entries remain unchanged.
