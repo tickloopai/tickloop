@@ -135,10 +135,8 @@ impl State {
             return false;
         }
         if self
-            .paste_blocks
-            .source_text(self.editor.draft())
-            .trim_start()
-            .starts_with('/')
+            .completion
+            .is_command_input(&self.paste_blocks.source_text(self.editor.draft()))
         {
             self.hold_status(
                 "Wait for images and local messages before running a command; draft kept",

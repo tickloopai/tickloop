@@ -374,6 +374,7 @@ impl Scrollback {
         prompt: &str,
         width: usize,
         height: usize,
+        is_command: impl Fn(&str) -> bool,
     ) -> Option<String> {
         self.prepare_frame(width, height);
         let (range, text) = self.inputs.iter().rev().find_map(|(_, range)| {
@@ -387,7 +388,7 @@ impl Scrollback {
                 .collect::<Vec<_>>()
                 .join(" ");
             let text = text.strip_prefix(prompt).unwrap_or(&text).trim();
-            (!text.is_empty() && !text.starts_with('/')).then(|| (range, text.to_owned()))
+            (!text.is_empty() && !is_command(text)).then(|| (range, text.to_owned()))
         })?;
         let first_row = self
             .rows
