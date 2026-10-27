@@ -788,7 +788,7 @@ impl McpConnections {
                     tools: catalog
                         .iter()
                         .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
-                        .map(|(_, _, tool)| tool.definition.clone())
+                        .map(|(_, _, tool)| (*tool.definition).clone())
                         .collect(),
                     resources: connection
                         .as_ref()

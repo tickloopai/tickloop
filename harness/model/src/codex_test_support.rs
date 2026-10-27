@@ -42,6 +42,7 @@ impl LoopbackCodexClient {
         Self(self.0.with_loopback_test_websocket())
     }
 
+    #[cfg(debug_assertions)]
     pub fn with_oauth_origin(self, state_dir: &Path, origin: &str) -> Self {
         Self(self.0.with_loopback_test_auth(state_dir, origin).unwrap())
     }

@@ -143,7 +143,7 @@ impl HostToolProvider for McpToolProvider {
             .filter(|(_, _, tool)| {
                 tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden
             })
-            .map(|(_, _, tool)| tool.definition.clone())
+            .map(|(_, _, tool)| (*tool.definition).clone())
             .collect()
     }
 
@@ -229,23 +229,34 @@ impl HostToolProvider for McpToolProvider {
     }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
         self.connections
-            .snapshot()
-            .into_iter()
-            .filter(|snapshot| snapshot.state != McpServerState::Disabled)
-            .filter_map(|snapshot| {
-                let entries = self.connections.inner.entries.read().unwrap();
-                let entry = entries.get(&snapshot.name)?;
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|entry| {
+                let state = entry.state.read().unwrap().clone();
+                if state == McpServerState::Disabled {
+                    return None;
+                }
+                let instructions = entry
+                    .connection
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|connection| entry.current_catalog(connection).instructions.clone())
+                    .unwrap_or_default();
                 Some(McpServerInstructions {
                     text: crate::tool_exposure::server_message(
-                        &snapshot.name,
-                        &snapshot.source,
-                        &snapshot.state,
+                        &entry.config.name,
+                        &entry.config.source,
+                        &state,
                         entry.config.exposure,
                         &entry.description.read().unwrap(),
-                        &snapshot.instructions,
+                        &instructions,
                     ),
                     server: McpResourceServer {
-                        name: snapshot.name,
+                        name: entry.config.name.clone(),
                         authority: Self::authority(entry),
                         third_party: true,
                     },

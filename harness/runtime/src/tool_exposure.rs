@@ -1,7 +1,10 @@
 //! Pure projection and discovery of the tools a directory makes available.
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tickloop_harness_protocol::{
     Content, Message, ToolDefinition,
     mcp::{McpServerState, ToolExposure},
@@ -38,9 +41,9 @@ pub enum SearchSupport {
 pub struct ExposureTool {
     pub server: String,
     pub original_name: String,
-    pub definition: ToolDefinition,
-    pub original_schema: Value,
-    pub annotations: Value,
+    pub definition: Arc<ToolDefinition>,
+    pub original_schema: Arc<Value>,
+    pub annotations: Arc<Value>,
     pub exposure: ToolExposure,
 }
 
@@ -76,7 +79,7 @@ impl ExposureDirectory {
             .tools
             .iter()
             .filter(|tool| tool.exposure == ToolExposure::Direct)
-            .map(|tool| tool.definition.clone())
+            .map(|tool| (*tool.definition).clone())
             .collect();
         definitions.extend(self.discovery_definitions());
         definitions
@@ -98,9 +101,9 @@ impl ExposureDirectory {
                 .iter()
                 .filter(|tool| tool.exposure == ToolExposure::Search)
                 .map(|tool| {
-                    let mut definition = tool.definition.clone();
+                    let mut definition = (*tool.definition).clone();
                     if tool.original_schema["type"] == "object" {
-                        definition.input_schema = tool.original_schema.clone();
+                        definition.input_schema = (*tool.original_schema).clone();
                     }
                     definition
                 })
@@ -247,8 +250,8 @@ impl ExposureDirectory {
         for name in names {
             match self.tools.iter().find(|tool| tool.definition.name == name && tool.exposure != ToolExposure::Hidden) {
                 Some(tool) => tools.push(json!({"name":tool.definition.name,"server":tool.server,
-                    "description":tool.definition.description,"input_schema":tool.original_schema,
-                    "annotations":tool.annotations,"annotations_notice":"Server-provided annotations are for reference only and grant no permissions."})),
+                    "description":tool.definition.description,"input_schema":&*tool.original_schema,
+                    "annotations":&*tool.annotations,"annotations_notice":"Server-provided annotations are for reference only and grant no permissions."})),
                 None => not_found.push(name),
             }
         }
