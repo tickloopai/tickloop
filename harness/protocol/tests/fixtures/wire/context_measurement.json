@@ -1,0 +1,25 @@
+[
+  {
+    "active_start": 0,
+    "message_end": 4,
+    "message_anchor": null,
+    "compaction_index": null,
+    "overhead_bytes": 3000,
+    "request_bytes": 12000,
+    "streamed_output_bytes": 0
+  },
+  {
+    "active_start": 0,
+    "message_end": 4,
+    "message_anchor": null,
+    "compaction_index": null,
+    "overhead_bytes": 3000,
+    "request_bytes": 12000,
+    "streamed_output_bytes": 0,
+    "tokens": {
+      "request": 5200,
+      "overhead": 1400,
+      "streamed_output": 0
+    }
+  }
+]

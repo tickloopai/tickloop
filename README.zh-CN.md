@@ -57,6 +57,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/permissions`、`/settings` | 设置 Agent 可以自行做多少事；其他偏好 |
 | `/ticks`、`/plugins` | 安装并登录 Tick；管理其他插件 |
 | `/mcp` | 查看 MCP 服务，管理登录及当前目录的启用状态 |
+| `/context` | 按类别查看上下文占用，以及工具搜索能找到多少 MCP 工具；`/context all` 列出每一项 |
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 

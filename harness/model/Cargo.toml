@@ -33,6 +33,7 @@ thiserror = "2"
 tickloop-harness-base = { path = "../base" }
 tickloop-harness-protocol = { path = "../protocol" }
 tickloop-ids = { path = "../../tick/ids" }
+tiktoken-rs = "0.12"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

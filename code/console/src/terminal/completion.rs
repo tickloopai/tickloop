@@ -189,6 +189,12 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
+        command: "/context",
+        arguments: "[all]",
+        description: "Show context usage by category and the tool search pool; all lists every item.",
+        menu_group: Some(CommandGroup::Conversation),
+    },
+    CommandSpec {
         command: "/clear",
         arguments: "",
         description: "Starts a New Agent from your next input; this Agent keeps running.",
@@ -732,8 +738,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 28);
-        assert_eq!(builtin_commands().len(), 44);
+        assert_eq!(completion.candidates().len(), 29);
+        assert_eq!(builtin_commands().len(), 45);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -754,6 +760,7 @@ mod tests {
             "/plugins",
             "/ticks",
             "/mcp",
+            "/context",
         ] {
             assert!(command_names(&completion).contains(&command));
         }

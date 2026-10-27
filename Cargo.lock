@@ -4413,6 +4413,7 @@ dependencies = [
  "tickloop-harness-protocol",
  "tickloop-harness-test-support",
  "tickloop-ids",
+ "tiktoken-rs",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -4743,6 +4744,20 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2aeff724640cfe13037336ddf35befdffd2909cbdb65cf041cc8a4cf8c584cfa"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex 0.19.2",
+ "regex",
+ "rustc-hash",
 ]
 
 [[package]]

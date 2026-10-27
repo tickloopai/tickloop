@@ -58,6 +58,12 @@ pub(super) enum Glyph {
     /// Group headings that fold their rows.
     Collapsed,
     Expanded,
+    /// `/context` grid cells, Claude Code's draughts glyphs: a cell a category fills, one it fills
+    /// in part, free space and the autocompact buffer.
+    ContextFull,
+    ContextPartial,
+    ContextFree,
+    ContextReserved,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -122,6 +128,10 @@ impl DisplayProfile {
             Glyph::AgentViewed => "●",
             Glyph::Collapsed => "▸",
             Glyph::Expanded => "▾",
+            Glyph::ContextFull => "⛁",
+            Glyph::ContextPartial => "⛀",
+            Glyph::ContextFree => "⛶",
+            Glyph::ContextReserved => "⛝",
         }
     }
 
@@ -317,6 +327,10 @@ mod tests {
             Glyph::AgentUnviewed,
             Glyph::Collapsed,
             Glyph::Expanded,
+            Glyph::ContextFull,
+            Glyph::ContextPartial,
+            Glyph::ContextFree,
+            Glyph::ContextReserved,
         ] {
             assert_eq!(
                 unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),

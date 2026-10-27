@@ -1809,6 +1809,13 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?,
             ),
+            AgentDetailQuery::ContextBreakdown => ObservationValue::ContextBreakdown(Box::new(
+                self.inner
+                    .agent
+                    .context_breakdown(chat.into())
+                    .await
+                    .map_err(agent_access_error)?,
+            )),
             AgentDetailQuery::Tasks => ObservationValue::Tasks(
                 ShellTaskCenter::new(self.inner.agent.clone())
                     .snapshot(chat.into())

@@ -28,7 +28,7 @@ harness = false
 
 [dependencies]
 percent-encoding = "2"
-tickloop-harness = { path = "../../harness/sdk", features = ["connector"] }
+tickloop-harness = { path = "../../harness/sdk", features = ["connector", "model"] }
 crossterm = "0.29"
 serde_json = "1"
 tickloop-code-access = { path = "../access" }

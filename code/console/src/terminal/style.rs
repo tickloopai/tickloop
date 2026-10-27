@@ -254,6 +254,12 @@ pub(super) enum Role {
     CodeFunction,
     CodeComment,
     CodeMeta,
+    /// `/context` categories Claude Code paints in its subagent cyan and purple, kept apart from
+    /// Agent Colors, which only tell family members apart; and the tool search category, a hue
+    /// of its own that the tool search pool heading shares.
+    ContextMcpTools,
+    ContextMessages,
+    ContextToolSearch,
 }
 
 impl Role {
@@ -343,6 +349,9 @@ impl Role {
         Self::CodeFunction,
         Self::CodeComment,
         Self::CodeMeta,
+        Self::ContextMcpTools,
+        Self::ContextMessages,
+        Self::ContextToolSearch,
     ];
 
     /// Agent Colors and marks only paint marks, such as a member dot, a row's glyph or its `↻`,
@@ -402,7 +411,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 85;
+const ROLE_COUNT: usize = 88;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -415,6 +424,11 @@ const AGENT_COLORS: [Style; 8] = [
     fg(219, 39, 119),
     fg(8, 145, 178),
 ];
+
+/// `ContextMcpTools`, `ContextMessages` and `ContextToolSearch`: Claude Code's `/context` cyan and
+/// purple (Tailwind 600) and a pink of the same family, the same in both themes as its subagent
+/// palette is.
+const CONTEXT_COLOURS: [Style; 3] = [fg(8, 145, 178), fg(147, 51, 234), fg(219, 39, 119)];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ThemeName {
@@ -610,6 +624,9 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     CODE_COLOURS[5],
     CODE_COLOURS[6],
     CODE_COLOURS[7],
+    CONTEXT_COLOURS[0],
+    CONTEXT_COLOURS[1],
+    CONTEXT_COLOURS[2],
 ];
 
 /// Values reproduced from `lightTheme` in the Claude Code source.
@@ -715,6 +732,9 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     CODE_COLOURS[5],
     CODE_COLOURS[6],
     CODE_COLOURS[7],
+    CONTEXT_COLOURS[0],
+    CONTEXT_COLOURS[1],
+    CONTEXT_COLOURS[2],
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

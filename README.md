@@ -57,6 +57,7 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 | `/permissions`, `/settings` | Choose how much the agent may do on its own; other preferences |
 | `/ticks`, `/plugins` | Install and log in to Ticks; manage other plugins |
 | `/mcp` | Inspect MCP servers, manage their login and turn them on or off here |
+| `/context` | See what fills the context, by category, and how many MCP tools tool search can reach; `/context all` lists every item |
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 

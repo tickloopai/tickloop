@@ -65,6 +65,7 @@ mod chat_title;
 mod citations;
 mod compaction;
 mod context;
+mod context_breakdown;
 mod delegation;
 mod denials;
 mod directed_summary;
@@ -1176,6 +1177,11 @@ impl Agent {
     }
 
     fn tool_definitions(&self, chat: &Chat) -> Vec<tickloop_harness_protocol::ToolDefinition> {
+        self.tool_registry(chat).definitions()
+    }
+
+    /// The tools a request of `chat` offers, without refreshing what they depend on.
+    fn tool_registry(&self, chat: &Chat) -> ToolRegistry {
         ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
@@ -1189,7 +1195,6 @@ impl Agent {
             &self.inner.tool_policy,
             self.scheduled_task_terms(),
         )
-        .definitions()
     }
 
     /// Installs execution-owner services for Shell handoff. An environment is required.
@@ -3171,65 +3176,17 @@ impl Agent {
                 }
                 None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let scope = system_prompt::PromptScope {
-                has_folder: chat.snapshot.folder.is_some(),
-                tools: self.inner.tool_policy,
-                waits: self.inner.waits,
-                host_section: self.inner.system_prompt_addition.as_deref(),
-                citation_style: self.inner.citation_style,
-            };
-            let family_temp = chat.tools.family_temp_directory();
-            let mut web_search =
-                serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
-            if chat.snapshot.folder.is_some() {
-                web_search["settings_command"] = "/websearch".into();
-            }
-            let mut state = serde_json::json!({
-                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-                "artifact_ticks": chat.snapshot.artifact_ticks,
-                "delegation": chat.snapshot.delegation,
-                "family_members": family_roster.iter().map(|member| serde_json::json!({
-                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                    "name": member.handle, "depth": member.depth, "state": member.availability,
-                    })).collect::<Vec<_>>(),
-                "loop": chat.snapshot.chat_loop,
-                "execution_mode": chat.snapshot.policy.mode,
-                "web_search": web_search,
-                "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-            });
-            if let Some(folder) = &chat.snapshot.folder {
-                state.as_object_mut().unwrap().extend(serde_json::json!({
-                    "workdir": folder,
-                    "family_temp_directory": family_temp,
-                    "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
-                    "workspace_host": workspace_host,
-                }).as_object().unwrap().clone());
-            }
-            if chat.snapshot.folder.is_none() {
-                let chat_loop = &chat.snapshot.chat_loop;
-                state["loop"] = serde_json::json!({
-                    "id": chat_loop.id,
-                    "receiving": chat_loop.receiving,
-                    "subscriptions": chat_loop.subscriptions,
-                });
-            }
-            let state = tickloop_harness_protocol::model_ids::model_json(&chat.ids, state);
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
-                Message {
-                    role: Role::System,
-                    content: vec![Content::Text {
-                        text: system_prompt::conversation_system_prompt(
-                            &state,
-                            chat.output_style,
-                            plan_mode.as_deref(),
-                            scope,
-                        ),
-                    }],
-                },
+                self.conversation_system_message(
+                    chat,
+                    receipt.loop_id,
+                    &family_roster,
+                    workspace_host.as_ref(),
+                    plan_mode.as_deref(),
+                ),
             );
             request.history_sources.insert(1, None);
             request.messages.insert(1, user_context);

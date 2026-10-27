@@ -126,6 +126,70 @@ pub(super) fn conversation_system_prompt(
     .join("\n\n")
 }
 
+impl crate::Agent {
+    /// The system message a conversation request of `chat` leads with: the instructions and the
+    /// current host state.
+    pub(super) fn conversation_system_message(
+        &self,
+        chat: &crate::Chat,
+        loop_id: tickloop_harness_protocol::LoopId,
+        family_roster: &[crate::family::FamilyAgent],
+        workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
+        plan_mode: Option<&str>,
+    ) -> tickloop_harness_protocol::Message {
+        let scope = PromptScope {
+            has_folder: chat.snapshot.folder.is_some(),
+            tools: self.inner.tool_policy,
+            waits: self.inner.waits,
+            host_section: self.inner.system_prompt_addition.as_deref(),
+            citation_style: self.inner.citation_style,
+        };
+        let family_temp = chat.tools.family_temp_directory();
+        let mut web_search =
+            serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
+        if chat.snapshot.folder.is_some() {
+            web_search["settings_command"] = "/websearch".into();
+        }
+        let mut state = serde_json::json!({
+            "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
+            "artifact_ticks": chat.snapshot.artifact_ticks,
+            "delegation": chat.snapshot.delegation,
+            "family_members": family_roster.iter().map(|member| serde_json::json!({
+                "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
+                "name": member.handle, "depth": member.depth, "state": member.availability,
+                })).collect::<Vec<_>>(),
+            "loop": chat.snapshot.chat_loop,
+            "execution_mode": chat.snapshot.policy.mode,
+            "web_search": web_search,
+            "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == loop_id),
+            "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+        });
+        if let Some(folder) = &chat.snapshot.folder {
+            state.as_object_mut().unwrap().extend(serde_json::json!({
+                "workdir": folder,
+                "family_temp_directory": family_temp,
+                "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
+                "workspace_host": workspace_host,
+            }).as_object().unwrap().clone());
+        }
+        if chat.snapshot.folder.is_none() {
+            let chat_loop = &chat.snapshot.chat_loop;
+            state["loop"] = serde_json::json!({
+                "id": chat_loop.id,
+                "receiving": chat_loop.receiving,
+                "subscriptions": chat_loop.subscriptions,
+            });
+        }
+        let state = tickloop_harness_protocol::model_ids::model_json(&chat.ids, state);
+        tickloop_harness_protocol::Message {
+            role: tickloop_harness_protocol::Role::System,
+            content: vec![tickloop_harness_protocol::Content::Text {
+                text: conversation_system_prompt(&state, chat.output_style, plan_mode, scope),
+            }],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
