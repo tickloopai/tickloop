@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use tickloop_harness_protocol::ToolDefinition;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Tool {
     pub original: String,
     pub schema: Value,

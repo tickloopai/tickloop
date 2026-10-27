@@ -76,8 +76,11 @@ use tickloop_harness::protocol::{
 /// 29.0 adds the model card's native tool search, which older readers reject as unknown.
 /// 29.1 adds reading the Chat's context breakdown, as `/context` shows it.
 /// 29.2 adds the context breakdown of a New Agent before its first message.
-pub const PROTOCOL_MAJOR: u16 = 29;
-pub const PROTOCOL_MINOR: u16 = 2;
+/// 30.0 adds the display-only event naming the MCP servers a request waits for, which older
+/// readers reject as unknown.
+/// 30.1 carries the context breakdowns of 29.1 and 29.2 onto 30.0.
+pub const PROTOCOL_MAJOR: u16 = 30;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

@@ -736,3 +736,87 @@ async fn codex_native_search_websocket_continuation_keeps_loaded_tools() {
     assert_eq!(frames[1]["input"][0]["call_id"], "call_probe");
     assert_eq!(frames[0]["tools"], frames[1]["tools"]);
 }
+
+/// The tools a request lists before the native search tool: the part of the prompt cache prefix
+/// that a change of the deferred tools must leave alone.
+fn tools_before_search(wire: &Value) -> Vec<Value> {
+    let tools = wire["tools"].as_array().unwrap();
+    let search = tools
+        .iter()
+        .position(|tool| {
+            matches!(
+                tool["type"].as_str(),
+                Some("tool_search_tool_bm25_20251119" | "tool_search")
+            )
+        })
+        .expect("the request offers native search");
+    tools[..search].to_vec()
+}
+
+fn listed_and_deferred(deferred: &[&str]) -> ModelRequest {
+    let mut request = request(vec![(user("Weather?"), None)], deferred);
+    request.tools.push(tool("mcp__alpha__lookup", "Look up"));
+    request
+}
+
+#[tokio::test]
+async fn a_change_of_deferred_tools_leaves_the_tools_before_native_search_byte_identical() {
+    use tickloop_harness_model::codex_test_support::{
+        LoopbackCodexClient, serve_scripted_responses, state_with_credentials,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (messages_endpoint, mut messages_wire) =
+        serve_responses(vec![(200, messages_text()), (200, messages_text())]).await;
+    let anthropic = catalog_model(&root, "anthropic-api", "claude-sonnet-5", messages_endpoint);
+    let (responses_endpoint, mut responses_wire) =
+        serve_responses(vec![(200, responses_text()), (200, responses_text())]).await;
+    let openai = catalog_model(
+        &root,
+        "openai-api",
+        "gpt-5.6-terra",
+        responses_endpoint.trim_end_matches("/anthropic").to_owned() + "/v1",
+    );
+    let mut wires = Vec::new();
+    for (config, captured) in [
+        (&anthropic, &mut messages_wire),
+        (&openai, &mut responses_wire),
+    ] {
+        complete(config, &root, listed_and_deferred(&[WEATHER])).await;
+        complete(config, &root, listed_and_deferred(&[INVOICES, WEATHER])).await;
+        wires.push([
+            captured.recv().await.unwrap().1,
+            captured.recv().await.unwrap().1,
+        ]);
+    }
+    let (_codex_directory, codex_root) = state_with_credentials();
+    let codex = ModelCatalog::defaults()
+        .get("openai-codex", "gpt-6.1-sol")
+        .unwrap();
+    let (endpoint, captured) =
+        serve_scripted_responses(vec![(200, responses_text()), (200, responses_text())]).await;
+    let client =
+        LoopbackCodexClient::new(codex, &codex_root, endpoint.as_str()).into_fixture_client();
+    for deferred in [&[WEATHER][..], &[INVOICES, WEATHER][..]] {
+        let (events, _) = mpsc::unbounded_channel();
+        client
+            .complete(
+                listed_and_deferred(deferred),
+                events,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let codex_wires = captured.await.unwrap();
+    wires.push([codex_wires[0].clone(), codex_wires[1].clone()]);
+    for [first, second] in &wires {
+        let listed = tools_before_search(first);
+        assert_eq!(listed.len(), 2, "{first}");
+        assert_eq!(
+            serde_json::to_vec(&listed).unwrap(),
+            serde_json::to_vec(&tools_before_search(second)).unwrap()
+        );
+        assert_ne!(first["tools"], second["tools"]);
+    }
+}

@@ -150,7 +150,7 @@ tickloop plugin install --path ./my-plugin
 
 已启用插件可在 `.mcp.json` 中声明 MCP 服务（服务映射或带 `mcpServers` 外层），也可在清单的 `mcpServers` 中使用对象、相对路径或数组。支持 stdio 与 streamable HTTP，工具名为 `mcp__plugin_<插件>_<服务>__<工具>`；名称各部分的连续下划线合并为一个；过长或碰撞的工具名补哈希并保留服务／工具分隔符，规范化后同名的插件服务会跳过并警告。`validate`、安装与启用会列出命令、地址及缺少的配置。启用即同意从下一次 Agent 请求起以用户身份运行服务；禁用或卸载后从下一次请求起停止，工具调用仍按用户权限审批。
 
-你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
+你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`--exposure direct|search|hidden` 设定该服务的工具怎样到达模型；不加时条目不含 `exposure`，按 `search` 处理。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
 
 例如，将下面内容合入配置目录中的 `settings.json`，把命令和 URL 换成你的服务：
 
@@ -176,7 +176,7 @@ tickloop plugin install --path ./my-plugin
 
 ### Tool Search
 
-MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 时，模型用自身搜索找到工具后直接调用；其他模型采用 Fold：通过 `SearchTools` 搜索（一个 `query`，按空格分词、任一词命中即可；也可写完整工具名、`mcp__<服务>` 列出该服务的工具、`select:A,B` 按名选取，或用 `+词` 要求必须命中）、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。搜索结果也会列出仍在连接、连接失败或需要登录的服务；第一次请求最多等待 10 秒，让正在启动的服务完成连接。切换模型时自动选择可用方式。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
+MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 时，模型用自身搜索找到工具后直接调用；其他模型采用 Fold：通过 `SearchTools` 搜索（一个 `query`，按空格分词、任一词命中即可；也可写完整工具名、`mcp__<服务>` 列出该服务的工具、`select:A,B` 按名选取，或用 `+词` 要求必须命中）、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。搜索结果也会列出仍在连接、连接失败或需要登录的服务。第一次请求为仍在连接的服务总共最多等待 2 秒，等待时状态行显示在等哪些服务；之后才连上的服务从下一次请求起可被搜到，其直接列出的工具在之后的某一轮开始时加入工具列表。远程服务断开或连接失败后，依次在 1、2、4、8、16 秒后重试，之后保持失败；本地服务启动失败或退出后不会自动重启，直到你在 `/mcp` 中重连、修改其配置或重启 Agent。服务重连或续期登录期间，最近一次列出的工具仍然可用。切换模型时自动选择可用方式。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
 
 工具结果行显示 Auto 审查中或等待人工批准。放行后，在结果下方独立一行以弱化文字显示 Auto 审批方或“Approved by you”；直接放行的调用不显示审批标签。人工审批另保留一行说明确认来源与原因，拒绝的调用显示拒绝方。ExecuteTools 为每个嵌套调用显示状态，并汇总整批结果。重开对话后，仍保留的审批记录会恢复对应标签。
 

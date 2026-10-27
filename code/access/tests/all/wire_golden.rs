@@ -863,21 +863,32 @@ fn observation_values_keep_their_recorded_wire() {
                     output_ref: None,
                 }),
             }))),
-            ObservationValue::Events(vec![Event {
-                sequence: 10,
-                chat_id: tickloop_ids::Id::from(id(0xc1)),
-                loop_id: tickloop_ids::Id::from(id(0x10)),
-                run_id: tickloop_ids::Id::from(id(0x20)),
-                kind: EventKind::ToolCompleted {
-                    sources: Vec::new(),
-                    call_id: "call-read".into(),
-                    result: ToolResult {
-                        content: "A result too long for one feed change".into(),
-                        is_error: false,
-                        output_ref: None,
+            ObservationValue::Events(vec![
+                Event {
+                    sequence: 10,
+                    chat_id: tickloop_ids::Id::from(id(0xc1)),
+                    loop_id: tickloop_ids::Id::from(id(0x10)),
+                    run_id: tickloop_ids::Id::from(id(0x20)),
+                    kind: EventKind::ToolCompleted {
+                        sources: Vec::new(),
+                        call_id: "call-read".into(),
+                        result: ToolResult {
+                            content: "A result too long for one feed change".into(),
+                            is_error: false,
+                            output_ref: None,
+                        },
                     },
                 },
-            }]),
+                Event {
+                    sequence: 11,
+                    chat_id: tickloop_ids::Id::from(id(0xc1)),
+                    loop_id: tickloop_ids::Id::from(id(0x10)),
+                    run_id: tickloop_ids::Id::from(id(0x21)),
+                    kind: EventKind::WaitingForMcpServers {
+                        servers: vec!["longbridge".into(), "notion".into()],
+                    },
+                },
+            ]),
             ObservationValue::OtherTickhost(Some(OtherTickhost {
                 description: "Running Tickhost build 0.1.0+older; this build 0.2.0+current".into(),
                 occupancy: Some(TickhostOccupancy {

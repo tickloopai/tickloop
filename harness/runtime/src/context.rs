@@ -551,6 +551,7 @@ impl Agent {
                         chat.tools.file_reads().clear();
                         chat.user_context = Default::default();
                         chat.announced_date = None;
+                        chat.cache_prefix.compacted();
                         Ok(CompactionOutcome {
                             summary,
                             snapshot: chat.snapshot.clone(),
