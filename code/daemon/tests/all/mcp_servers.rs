@@ -343,6 +343,20 @@ async fn live_model_calls_an_installed_marketplace_plugin() {
     )
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            let servers = agent.mcp_servers().await;
+            if servers.iter().any(|server| {
+                server.name == "plugin_ui5_ui5-mcp-server"
+                    && server.state == tickloop_harness::protocol::mcp::McpServerState::Connected
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("installed UI5 MCP server did not connect");
     let chat = agent.create_chat(root.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)
@@ -354,7 +368,7 @@ async fn live_model_calls_an_installed_marketplace_plugin() {
         "Reply ready while the installed MCP plugin connects. Do not call any tools yet.",
     )
     .await;
-    complete(&agent, chat, "Call mcp__plugin_ui5_ui5-mcp-server__get_guidelines exactly once with an empty object. Then summarize two UI5 guidelines from its result. Use no other tools.").await;
+    complete(&agent, chat, "Use your native tool search to find mcp__plugin_ui5_ui5-mcp-server__get_guidelines and call it exactly once with an empty object. Then summarize two UI5 guidelines from its result. Do not call any other MCP tool or use shell, files or scripts.").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
     let operations = snapshot
@@ -817,10 +831,7 @@ async fn live_fold_search_describe_execute_with_kimi() {
     let root = std::path::PathBuf::from(
         std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
     );
-    assert!(
-        root.to_string_lossy()
-            .contains(".scratch/plugin-mcp/evidence/07-codex/")
-    );
+    assert!(root.to_string_lossy().contains(".scratch/plugin-mcp/"));
     let model = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("kimi-cn-api", "kimi-k3")
         .unwrap();
@@ -885,10 +896,7 @@ async fn live_codemode_composes_tools_and_resumes_after_confirmation() {
     let root = std::path::PathBuf::from(
         std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
     );
-    assert!(
-        root.to_string_lossy()
-            .contains(".scratch/plugin-mcp/evidence/09-codex/")
-    );
+    assert!(root.to_string_lossy().contains(".scratch/plugin-mcp/"));
     let model = tickloop_harness::model::cards::ModelCatalog::defaults()
         .get("kimi-cn-api", "kimi-k3")
         .unwrap();
@@ -1073,4 +1081,103 @@ async fn live_native_tool_search_with_anthropic_and_openai_across_switches() {
         );
     }
     agent.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the user's already logged-in notion plugin and ANTHROPIC_API_KEY in an isolated TICKLOOP_CONFIG_DIR; calls the billed API and one read-only search"]
+async fn live_model_calls_logged_in_notion_search_without_recording_content() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(root.ends_with("notion-login/config"));
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let mut launch = LaunchSpec::embedded(root.clone());
+    launch.config_root = Some(root.clone());
+    launch.model = Some(model);
+    launch.session_persistence = false;
+    launch.environment = std::env::vars()
+        .map(|(name, value)| tickloop_code_access::EnvironmentValue {
+            name: name.into_bytes(),
+            value: value.into_bytes(),
+        })
+        .collect();
+    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(
+        &launch,
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+        None,
+        &std::env::current_exe().unwrap(),
+    )
+    .await
+    .unwrap();
+    let tool = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if let Some(server) = agent.mcp_servers().await.into_iter().find(|server| {
+                server.name == "plugin_notion_notion"
+                    && server.state == tickloop_harness::protocol::mcp::McpServerState::Connected
+            }) {
+                return server
+                    .tools
+                    .into_iter()
+                    .find(|tool| tool.name.ends_with("__notion-search"))
+                    .expect("Notion did not offer its read-only search")
+                    .name;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("already logged-in Notion MCP server did not connect");
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, format!("Use your native tool search to find {tool}. Call it exactly once with query tickloop-mcp-acceptance to verify the existing connection. This is a read-only search; do not create or change anything, fetch page bodies, or call other tools. Do not repeat the call. Finally report only whether the tool succeeded, without quoting any returned content.")).await.unwrap();
+    let mut confirmations = 0;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => {
+                    let allowed = request.name == tool
+                        && request.mcp_server.as_deref() == Some("plugin_notion_notion")
+                        && confirmations == 0;
+                    agent
+                        .answer_permission(chat, request.id, allowed)
+                        .await
+                        .unwrap();
+                    assert!(allowed, "only one Notion read-only search is authorized");
+                    confirmations += 1;
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(_) => panic!("Notion model run failed; response content omitted"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Notion read-only acceptance timed out");
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    let calls = snapshot
+        .operations
+        .iter()
+        .filter(|operation| operation.name == tool)
+        .collect::<Vec<_>>();
+    assert_eq!(confirmations, 1);
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.is_error),
+        "Notion search did not succeed; response content omitted"
+    );
+    eprintln!(
+        "Live Notion acceptance passed: model=claude-sonnet-5; tool={tool}; calls=1; success=true; response content not recorded"
+    );
 }
