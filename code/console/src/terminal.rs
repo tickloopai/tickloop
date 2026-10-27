@@ -8,7 +8,9 @@ use std::{
 
 use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
 
-use tickloop_code_settings::{LoadedSettings, UserSettings, config_root_directory};
+use tickloop_code_settings::{
+    LoadedSettings, UserSettings, config_root_directory, parse_execution_mode,
+};
 use tickloop_harness::tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
@@ -609,29 +611,6 @@ fn should_dismiss_menu_before_dispatch(command: &str) -> bool {
         && !is_branch_command(command)
 }
 
-fn parse_execution_mode(value: &str) -> Result<(ExecutionMode, Option<&'static str>), String> {
-    match value.trim() {
-        "ask" | "acceptEdits" | "accept-edits" => Ok((ExecutionMode::AcceptEdits, None)),
-        "auto" => Ok((ExecutionMode::Auto, None)),
-        "fullAccess" | "full-access" => Ok((ExecutionMode::FullAccess, None)),
-        "plan" => Ok((ExecutionMode::Plan, None)),
-        "manual" => Ok((
-            ExecutionMode::AcceptEdits,
-            Some("`manual` was replaced by Ask; use `ask`"),
-        )),
-        "default" => Ok((
-            ExecutionMode::AcceptEdits,
-            Some("`default` is deprecated and maps to Ask; use `ask`"),
-        )),
-        "dontAsk" => Err("`dontAsk` was replaced by the --deny-on-prompt launch policy".into()),
-        "bypass" => Err(
-            "`bypass` was replaced by --dangerously-skip-permissions and requires external isolation"
-                .into(),
-        ),
-        _ => Err("choose auto, ask, fullAccess or plan".into()),
-    }
-}
-
 fn startup_directory_needs_trust(
     settings: Option<&UserSettings>,
     workdir: &std::path::Path,
@@ -859,7 +838,7 @@ pub fn print_help() {
 fn help_text() -> String {
     let guidance = r#"Tickloop
 Usage: tickloop [--cwd DIRECTORY]
-       [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
+       [--mode | --permission-mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
@@ -880,6 +859,7 @@ plugin manages the plugins without a Tick program the same way, manages marketpl
 mcp lists the MCP servers an Agent here would have without starting any, adds or removes your own servers in the global settings or, with --dir, this directory's, and logs in to or out of a remote server.
 
 The working directory must exist; omitting --cwd uses the current directory.
+--permission-mode is the same as --mode; give one, or both with the same mode. Claude Code's dontAsk and bypassPermissions are --deny-on-prompt and --dangerously-skip-permissions here. defaultMode in settings.json takes the same names.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
 Starting without -c or -r opens a new Chat.
 -c, --continue resumes the most recent Chat in this directory.
@@ -993,7 +973,8 @@ pub fn recover_view_handoff(arguments: &[std::ffi::OsString]) -> Result<bool, St
 pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let launch_arguments = arguments.collect::<Vec<_>>();
     let mut arguments = launch_arguments.clone().into_iter().peekable();
-    let mut execution_mode_override = None;
+    let mut mode_flag = None;
+    let mut permission_mode_flag = None;
     let mut prompt_policy = PromptPolicy::Interactive;
     let mut deny_on_prompt = false;
     let mut unrestricted = false;
@@ -1026,15 +1007,21 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             "--auto-reviewer-config" | "--permission-checker-config" => {
                 return Err("Independent Auto reviewer configuration has moved to /permissions → Auto mode. Remove this startup flag and choose LLM or Judgment there.".into());
             }
-            "--mode" => {
+            "--mode" | "--permission-mode" => {
                 let value = arguments
                     .next()
-                    .ok_or("--mode requires acceptEdits, auto or plan")?;
-                let (mode, warning) = parse_execution_mode(&value)?;
+                    .ok_or_else(|| format!("{argument} requires acceptEdits, auto or plan"))?;
+                let (mode, warning) =
+                    parse_execution_mode(&value).map_err(|error| safe_text(&error))?;
                 if let Some(warning) = warning {
                     eprintln!("Warning: {warning}");
                 }
-                execution_mode_override = Some(mode);
+                let given = Some((value, mode));
+                if argument == "--mode" {
+                    mode_flag = given;
+                } else {
+                    permission_mode_flag = given;
+                }
             }
             "--deny-on-prompt" => {
                 deny_on_prompt = true;
@@ -1079,6 +1066,20 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             }
         }
     }
+    let execution_mode_override = match (mode_flag, permission_mode_flag) {
+        (Some((mode_value, mode)), Some((permission_value, permission_mode)))
+            if mode != permission_mode =>
+        {
+            return Err(format!(
+                "--mode {} and --permission-mode {} name different execution modes; give only one",
+                safe_text(&mode_value),
+                safe_text(&permission_value)
+            ));
+        }
+        (mode_flag, permission_mode_flag) => {
+            mode_flag.or(permission_mode_flag).map(|(_, mode)| mode)
+        }
+    };
     let view_handoff = view_handoff_path
         .as_deref()
         .map(view_upgrade::read_handoff)
@@ -1196,6 +1197,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
     }
+    let saved_execution_mode = saved_settings
+        .as_mut()
+        .and_then(LoadedSettings::default_execution_mode);
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
@@ -1390,11 +1394,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         (!needs_model_selection).then_some(&config),
         &workdir,
         execution_mode_override
-            .or_else(|| {
-                user_settings
-                    .as_ref()
-                    .and_then(UserSettings::default_execution_mode)
-            })
+            .or(saved_execution_mode)
             .unwrap_or_default(),
         startup_settings_warnings,
     )?;
