@@ -707,7 +707,7 @@ impl Agent {
             return Err(AgentError::Busy);
         }
         plan.approval_pending = false;
-        chat.snapshot.policy.mode = ExecutionMode::Plan;
+        chat.change_execution_mode(ExecutionMode::Plan);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         drop(chats);
@@ -809,7 +809,7 @@ impl Agent {
         snapshot.policy.mode = mode;
         snapshot.policy.revision += 1;
         self.save(&snapshot);
-        chat.snapshot = snapshot;
+        chat.replace_snapshot(snapshot);
         // The approval result or continuation carries the approved plan; no exit notice follows.
         chat.needs_plan_mode_exit_notice = false;
         if let Some(request) = request {
@@ -909,6 +909,11 @@ impl Agent {
                             output_ref: None,
                         }));
                     }
+                    chat.mode_before_plan = super::mode_before_plan_after(
+                        chat.mode_before_plan,
+                        snapshot.policy.mode,
+                        ExecutionMode::Plan,
+                    );
                     snapshot.policy.mode = ExecutionMode::Plan;
                     snapshot.policy.revision += 1;
                     (None, Some(prompts::entered_plan_mode()))

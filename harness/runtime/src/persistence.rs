@@ -3794,6 +3794,7 @@ impl Agent {
                 bookkeeping,
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
+                mode_before_plan: None,
                 active: None,
                 active_run: None,
                 upgrade_wait: None,
@@ -3916,7 +3917,7 @@ impl StagedBranch {
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }
-        chat.snapshot = snapshot;
+        chat.replace_snapshot(snapshot);
         chat.bookkeeping = self.bookkeeping;
         chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
         chat.content_replacements = self.content_replacements;

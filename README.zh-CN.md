@@ -171,7 +171,7 @@ tickloop plugin install --path ./my-plugin
 
 目录配置覆盖同名全局服务。用户服务名可用字母、数字、`_` 和 `-`；仓库中的 `.mcp.json` 不会自动加载。远程地址要求 HTTPS，仅本机回环地址允许 HTTP；旧式 SSE 与 WebSocket 列为暂不支持。可选 `timeout` 是单次工具调用上限，单位毫秒，默认 300000，小于 1000 的值忽略。每个根 Agent 分别运行服务，子 Agent 共用；MCP 服务不是 Tick，不出现在 Monitor 中。
 
-第三方工具默认逐次询问，包括 Auto 模式，服务自称只读也不例外。确认时可只允许一次、在当前目录总是允许该工具或整个服务，或拒绝。Plan 模式不执行它们；Full Access 与显式权限规则保持原有含义。调用发出后超时、取消或断线，可能无法确定是否已执行，重试修改前应先核实结果。资源与 Artifacts 共用 `ListMcpResourcesTool` 和 `ReadMcpResourceTool`。
+没有权限规则时，第三方工具在 Ask 模式下逐次询问；在 Auto 模式下由 Auto 审查判断，不放行时才询问你。服务自称只读不改变这两种处理。确认时可只允许一次、在当前目录总是允许该工具或整个服务，或拒绝。Plan 模式下模型被要求只调用只读的 MCP 工具，调用按进入 Plan 之前的模式处理：之前是 Auto 则交给 Auto 审查，之前是 Full Access 则直接执行，其他情况询问。Full Access 直接执行；显式 Ask 与 Deny 规则仍然优先。调用发出后超时、取消或断线，可能无法确定是否已执行，重试修改前应先核实结果。资源与 Artifacts 共用 `ListMcpResourcesTool` 和 `ReadMcpResourceTool`。
 
 ### Tool Search 与 Codemode
 

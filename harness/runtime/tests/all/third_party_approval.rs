@@ -9,11 +9,19 @@ use tickloop_harness_runtime::{
     mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
 };
 use tickloop_harness_test_support::{
-    ScriptedModel, call, config, mcp_service::McpService, next_event, text,
+    ScriptedModel, auto_classification, call, config, mcp_service::McpService, next_event, text,
 };
 use uuid::Uuid;
 
 async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, String) {
+    provider_with_secrets(server, name, Vec::new()).await
+}
+
+async fn provider_with_secrets(
+    server: &McpService,
+    name: &str,
+    sensitive_values: Vec<serde_json::Value>,
+) -> (Arc<McpToolProvider>, String) {
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MCP_OK"}]}));
     let configs = vec![McpServerConfig {
@@ -21,7 +29,7 @@ async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, Str
         tool_exposure: Vec::new(),
         description: String::new(),
         oauth: Default::default(),
-        sensitive_values: Vec::new(),
+        sensitive_values,
         disabled: false,
         name: name.into(),
         source: "global".into(),
@@ -209,6 +217,10 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                         text("done"),
                     ])),
                 );
+                let reviewer = Arc::new(ScriptedModel::new(vec![text(
+                    &auto_classification(false).to_string(),
+                )]));
+                agent.set_auto_reviewer(reviewer.clone()).await;
                 agent.install_host_tools(provider).unwrap();
                 let dir = tempfile::tempdir().unwrap();
                 let chat = agent.create_chat(dir.path().into()).await.unwrap();
@@ -219,9 +231,11 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                         .await
                         .unwrap();
                 }
-                let should_ask = mode != ExecutionMode::Plan
-                    && (decision == Some(Decision::Ask)
-                        || (decision.is_none() && mode != ExecutionMode::FullAccess));
+                // Plan is entered from Ask here, so third-party calls are decided as in Ask.
+                let should_review = mode == ExecutionMode::Auto && decision.is_none();
+                let should_ask = decision == Some(Decision::Ask)
+                    || (decision.is_none()
+                        && matches!(mode, ExecutionMode::AcceptEdits | ExecutionMode::Plan));
                 let mut events = agent.subscribe();
                 agent.submit(chat, "Read the service".into()).await.unwrap();
                 let mut asked = false;
@@ -271,8 +285,13 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                 }
                 assert_eq!(asked, should_ask, "{mode:?} {decision:?}");
                 assert_eq!(
+                    reviewer.requests.lock().unwrap().len(),
+                    usize::from(should_review),
+                    "{mode:?} {decision:?} {target}"
+                );
+                assert_eq!(
                     server.calls().len(),
-                    usize::from(mode != ExecutionMode::Plan && decision != Some(Decision::Deny))
+                    usize::from(decision != Some(Decision::Deny))
                 );
                 agent.shutdown().await;
             }
@@ -809,4 +828,576 @@ async fn saved_tool_permissions_do_not_move_between_separately_connected_service
         assert!(asked);
         agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn auto_review_decides_unruled_mcp_calls_and_escalates_repeated_rejections() {
+    use tickloop_harness_protocol::PermissionApprovalSource;
+    const SECRET: &str = "fixture-mcp-secret";
+    let server = McpService::start().await;
+    let (provider, tool) = provider_with_secrets(&server, "review", vec![json!(SECRET)]).await;
+    server.set_result(json!({"content":[{"type":"text","text":format!("MCP_OK {SECRET}")}]}));
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("read-1", &tool, json!({"query":"first quarterly figures"})),
+        call("read-2", &tool, json!({"query":"second"})),
+        call("read-3", &tool, json!({"query":"third"})),
+        call("read-4", &tool, json!({"query":"fourth"})),
+        text("done"),
+    ]));
+    let allow = text(&auto_classification(false).to_string());
+    let block = text(&auto_classification(true).to_string());
+    // A rejection takes both review stages; an admission ends after the first.
+    let reviewer = Arc::new(ScriptedModel::new(
+        std::iter::once(allow)
+            .chain(std::iter::repeat_n(block, 6))
+            .collect(),
+    ));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Read the figures".into()).await.unwrap();
+    let mut prompted = Vec::new();
+    let mut rejected = Vec::new();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                assert_eq!(
+                    request.approval_source,
+                    PermissionApprovalSource::AutoReviewer
+                );
+                assert_eq!(request.mcp_server.as_deref(), Some("review"));
+                prompted.push(request.input["query"].clone());
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::ToolCompleted {
+                call_id, result, ..
+            } if result.is_error => rejected.push(call_id),
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(rejected, ["read-2", "read-3"]);
+    assert_eq!(
+        prompted,
+        [json!("fourth")],
+        "the third rejection in a row goes to a person"
+    );
+    assert_eq!(server.calls().len(), 2);
+    let reviews = reviewer.requests.lock().unwrap().clone();
+    assert_eq!(reviews.len(), 7);
+    let first_review = serde_json::to_string(&reviews[0].messages).unwrap();
+    assert!(first_review.contains(&tool));
+    assert!(first_review.contains("first quarterly figures"));
+    let every_request = reviews
+        .iter()
+        .chain(model.requests.lock().unwrap().iter())
+        .map(|request| serde_json::to_string(&request.messages).unwrap())
+        .collect::<String>();
+    assert!(!every_request.contains(SECRET));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unrestricted_host_neither_skips_mcp_confirmation_nor_auto_review() {
+    use tickloop_harness_protocol::{AgentHostOptions, PromptPolicy};
+    let rejection = auto_classification(true).to_string();
+    // A reviewer that never produces a verdict leaves the call to a person.
+    let unusable = "no verdict".to_owned();
+    for (mode, verdict) in [
+        (ExecutionMode::AcceptEdits, &rejection),
+        (ExecutionMode::Auto, &rejection),
+        (ExecutionMode::Auto, &unusable),
+    ] {
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let agent = Agent::new_with_options(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("read", &tool, json!({})),
+                text("done"),
+            ])),
+            AgentHostOptions {
+                prompt_policy: PromptPolicy::Unrestricted,
+                ..AgentHostOptions::embedded_defaults()
+            },
+        );
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(verdict); 8]));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent.set_execution_mode(chat, mode).await.unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Read".into()).await.unwrap();
+        let mut asked = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, false)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let reviews = reviewer.requests.lock().unwrap().len();
+        if mode == ExecutionMode::AcceptEdits {
+            assert!(asked);
+            assert_eq!(reviews, 0);
+        } else if verdict == &rejection {
+            assert!(!asked, "a rejection returns to the model");
+            assert_eq!(reviews, 2);
+        } else {
+            assert!(asked, "an unusable review is escalated to a person");
+            assert!(reviews > 0);
+        }
+        assert!(server.calls().is_empty(), "{mode:?}");
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_ask_runs_mcp_calls_the_auto_review_admits_and_denies_the_rest() {
+    use tickloop_harness_protocol::{AgentHostOptions, PromptPolicy};
+    let admission = auto_classification(false).to_string();
+    for verdict in [admission.clone(), "no verdict".into()] {
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let agent = Agent::new_with_options(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("read", &tool, json!({})),
+                text("done"),
+            ])),
+            AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                ..AgentHostOptions::embedded_defaults()
+            },
+        );
+        agent
+            .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![text(&verdict); 8])))
+            .await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Read".into()).await.unwrap();
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { .. } => panic!("this host cannot ask"),
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            server.calls().len(),
+            usize::from(verdict == admission),
+            "{verdict}"
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn auto_reviews_each_batched_mcp_call_against_the_whole_model_authored_batch() {
+    for admitted in [true, false] {
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "batch",
+                "ExecuteTools",
+                json!({"calls":[
+                    {"name":tool,"arguments":{"query":"BATCH_FIRST"}},
+                    {"name":tool,"arguments":{"query":"BATCH_SECOND"}}
+                ]}),
+            ),
+            text("done"),
+        ]));
+        let verdict = auto_classification(!admitted).to_string();
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(&verdict); 4]));
+        let agent = Agent::new_embedded(config(), model.clone());
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Read the figures".into()).await.unwrap();
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { .. } => {
+                    panic!("Auto review decides these calls")
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(server.calls().len(), if admitted { 2 } else { 0 });
+        let reviews = reviewer.requests.lock().unwrap().clone();
+        assert!(!reviews.is_empty());
+        for review in reviews.iter() {
+            let review = serde_json::to_string(&review.messages).unwrap();
+            assert!(review.contains("Model-authored nested calls"));
+            assert!(review.contains("BATCH_FIRST") && review.contains("BATCH_SECOND"));
+        }
+        let last = serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages)
+            .unwrap();
+        assert_eq!(last.contains("external-code restriction"), !admitted);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
+    for (before_plan, rule_decision, expect_review, expect_ask, expect_call) in [
+        (ExecutionMode::Auto, None, true, false, true),
+        (ExecutionMode::FullAccess, None, false, false, true),
+        (ExecutionMode::AcceptEdits, None, false, true, true),
+        (
+            ExecutionMode::FullAccess,
+            Some(Decision::Ask),
+            false,
+            true,
+            true,
+        ),
+        (
+            ExecutionMode::FullAccess,
+            Some(Decision::Deny),
+            false,
+            false,
+            false,
+        ),
+        (
+            ExecutionMode::Auto,
+            Some(Decision::Deny),
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let label = format!("{before_plan:?} {rule_decision:?}");
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("read", &tool, json!({})),
+                text("done"),
+            ])),
+        );
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(
+            &auto_classification(false).to_string(),
+        )]));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent.set_execution_mode(chat, before_plan).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .unwrap();
+        if let Some(decision) = rule_decision {
+            agent
+                .set_permission_rules(chat, vec![rule("mcp__review", decision)])
+                .await
+                .unwrap();
+        }
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Look it up".into()).await.unwrap();
+        let mut asked = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert!(!asked, "{label}");
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(asked, expect_ask, "{label}");
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            usize::from(expect_review),
+            "{label}"
+        );
+        assert_eq!(server.calls().len(), usize::from(expect_call), "{label}");
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Plan,
+            "{label}"
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("plan", "EnterPlanMode", json!({})),
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    let reviewer = Arc::new(ScriptedModel::new(vec![text(
+        &auto_classification(false).to_string(),
+    )]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Plan the lookup".into()).await.unwrap();
+    let mut prompts = Vec::new();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                prompts.push(request.name.clone());
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(prompts, ["EnterPlanMode"]);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn reentering_plan_forgets_the_mode_an_earlier_plan_was_entered_from() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [
+        ExecutionMode::FullAccess,
+        ExecutionMode::Plan,
+        ExecutionMode::Plan,
+        ExecutionMode::AcceptEdits,
+        ExecutionMode::Plan,
+    ] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    let mut asked = false;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                asked = true;
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(asked, "Plan was last entered from Ask");
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
+}
+
+async fn run_until_idle(
+    agent: &Agent,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    root: tickloop_harness_protocol::ChatId,
+) -> Vec<String> {
+    let mut prompts = Vec::new();
+    loop {
+        let event = next_event(events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } => {
+                prompts.push(request.name.clone());
+                agent
+                    .answer_permission(event.chat_id, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } if event.chat_id == root => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    prompts
+}
+
+#[tokio::test]
+async fn a_plan_entered_from_auto_returns_review_rejections_to_the_model() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("read", &tool, json!({})),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let reviewer = Arc::new(ScriptedModel::new(vec![
+        text(
+            &auto_classification(true).to_string()
+        );
+        2
+    ]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    assert!(run_until_idle(&agent, &mut events, chat).await.is_empty());
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 2);
+    assert!(server.calls().is_empty());
+    let last =
+        serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages).unwrap();
+    assert!(last.contains("external-code restriction"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("delegate", "Subagent", json!({"task":"Look it up"})),
+        call("read", &tool, json!({})),
+        text("child done"),
+        text("parent done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    // Creating the child in Plan is itself reviewed.
+    let reviewer = Arc::new(ScriptedModel::new(vec![text(
+        &auto_classification(false).to_string(),
+    )]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
+        agent.set_execution_mode(parent, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, "Delegate the lookup".into())
+        .await
+        .unwrap();
+    let prompts = run_until_idle(&agent, &mut events, parent).await;
+    assert_eq!(
+        prompts,
+        [tool.as_str()],
+        "the frozen ceiling does not record the earlier mode"
+    );
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn rewinding_into_plan_leaves_the_earlier_mode_unknown() {
+    use tickloop_harness_protocol::RewindMode;
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            text("planned"),
+            text("ran"),
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
+    run_until_idle(&agent, &mut events, chat).await;
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent.submit(chat, "Run".into()).await.unwrap();
+    run_until_idle(&agent, &mut events, chat).await;
+    let plan_prompt = agent.snapshot(chat).await.unwrap().rewind_points()[0].message_id;
+    agent
+        .rewind(chat, plan_prompt, RewindMode::Conversation)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    let prompts = run_until_idle(&agent, &mut events, chat).await;
+    assert_eq!(
+        prompts,
+        [tool.as_str()],
+        "Full Access before the rewind is not Plan's origin"
+    );
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
 }

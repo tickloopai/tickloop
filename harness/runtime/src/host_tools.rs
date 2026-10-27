@@ -31,7 +31,8 @@ pub enum HostToolPermission {
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.
     Confirmation,
-    /// Third-party tools ask by default in Ask and Auto, regardless of server annotations.
+    /// Third-party tools: without a user rule, Ask asks and Auto sends the call to Auto review;
+    /// server annotations never widen this.
     ThirdParty,
 }
 

@@ -223,10 +223,10 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
 }
 
 #[tokio::test]
-async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() {
+async fn third_party_tools_go_to_auto_review_without_trusting_read_only_annotations() {
     use tickloop_harness_protocol::{EventKind, ExecutionMode};
     use tickloop_harness_runtime::{Agent, mcp::McpToolProvider};
-    use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+    use tickloop_harness_test_support::{ScriptedModel, auto_classification, call, config, text};
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"approved result"}]}));
@@ -262,7 +262,14 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
         call("read-1", "mcp__review__read", json!({})),
         text("done"),
     ]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![
+        text(
+            &auto_classification(true).to_string()
+        );
+        2
+    ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.set_auto_reviewer(reviewer.clone()).await;
     agent
         .install_host_tools(Arc::new(McpToolProvider::new(
             connections,
@@ -280,11 +287,14 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
         .submit(chat, "Read from the service".into())
         .await
         .unwrap();
-    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match events.recv().await.unwrap().kind {
-                EventKind::PermissionRequested { request } => break request,
-                EventKind::ToolStarted { .. } => panic!("MCP executed without asking"),
+                EventKind::PermissionRequested { .. } => {
+                    panic!("a rejection returns to the model")
+                }
+                EventKind::ToolStarted { .. } => panic!("MCP executed without review"),
+                EventKind::Completed { .. } => break,
                 _ => {}
             }
         }
@@ -292,27 +302,11 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
     .await
     .unwrap();
     assert!(server.calls().is_empty());
-    agent
-        .answer_permission(chat, approval.id, true)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(
-                events.recv().await.unwrap().kind,
-                EventKind::Completed { .. }
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(server.calls().len(), 1);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 2);
     assert!(
         serde_json::to_string(&model.requests.lock().unwrap()[1].messages)
             .unwrap()
-            .contains("approved result")
+            .contains("external-code restriction")
     );
     agent.shutdown().await;
 }
