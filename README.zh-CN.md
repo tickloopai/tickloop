@@ -61,6 +61,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 
+在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
+
 按键：
 
 - `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。

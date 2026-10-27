@@ -79,8 +79,10 @@ use tickloop_harness::protocol::{
 /// 30.0 adds the display-only event naming the MCP servers a request waits for, which older
 /// readers reject as unknown.
 /// 30.1 carries the context breakdowns of 29.1 and 29.2 onto 30.0.
-pub const PROTOCOL_MAJOR: u16 = 30;
-pub const PROTOCOL_MINOR: u16 = 1;
+/// 31.0 adds imported Auto Environment provenance, which older readers reject as unknown,
+/// and appending custom Auto rules and Environment entries in one permission change.
+pub const PROTOCOL_MAJOR: u16 = 31;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
