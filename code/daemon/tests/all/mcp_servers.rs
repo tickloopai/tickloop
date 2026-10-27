@@ -891,94 +891,6 @@ async fn live_fold_search_describe_execute_with_kimi() {
 }
 
 #[tokio::test]
-#[ignore = "requires an isolated TICKLOOP_CONFIG_DIR with MOONSHOT_CN_API_KEY; calls the billed API"]
-async fn live_codemode_composes_tools_and_resumes_after_confirmation() {
-    let root = std::path::PathBuf::from(
-        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
-    );
-    assert!(root.to_string_lossy().contains(".scratch/plugin-mcp/"));
-    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
-        .get("kimi-cn-api", "kimi-k3")
-        .unwrap();
-    let (agent, local, remote) = configured_agent(
-        &root,
-        model,
-        Arc::new(LocalModelClients::new(Some(root.clone()))),
-    )
-    .await;
-    let path = root.join("settings.json");
-    let mut settings: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for entry in settings["mcpServers"].as_object_mut().unwrap().values_mut() {
-        entry["exposure"] = json!("codemode");
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
-    let chat = agent.create_chat(root.clone()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
-    let mut events = agent.subscribe();
-    agent.submit(chat,"Use Codemode to call tools.mcp__local__probe({}) and tools.mcp__remote__probe({}) exactly once each inside one JavaScript script. Both return MCP CallToolResult objects. Print their text content with text(). Set the script first line to // @options: {\"timeout_ms\":1000}. Each call will be confirmed by the test operator; wait for confirmation. Do not use Bash, search, or any other tools. Finally report the two acceptance markers.".into()).await.unwrap();
-    let mut confirmations = 0;
-    tokio::time::timeout(Duration::from_secs(180), async {
-        loop {
-            match events.recv().await.unwrap().kind {
-                EventKind::PermissionRequested { request } => {
-                    assert_eq!(request.parent_call.as_ref().unwrap().name, "Codemode");
-                    if confirmations == 0 {
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
-                        assert!(
-                            agent
-                                .snapshot(chat)
-                                .await
-                                .unwrap()
-                                .permissions
-                                .iter()
-                                .any(|permission| permission.id == request.id)
-                        );
-                    }
-                    agent
-                        .answer_permission(chat, request.id, true)
-                        .await
-                        .unwrap();
-                    confirmations += 1;
-                }
-                EventKind::Completed { .. } => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("live Codemode run timed out");
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    agent.shutdown().await;
-    let scripts = snapshot
-        .operations
-        .iter()
-        .filter(|operation| operation.name == "Codemode")
-        .collect::<Vec<_>>();
-    assert_eq!(scripts.len(), 1);
-    assert!(
-        !scripts[0].result.as_ref().unwrap().is_error,
-        "{:?}",
-        scripts[0].result
-    );
-    assert_eq!(confirmations, 2);
-    assert_eq!(local.calls().len(), 1);
-    assert_eq!(remote.calls().len(), 1);
-    let result = &scripts[0].result.as_ref().unwrap().content;
-    assert!(
-        result.contains("LOCAL_MCP_OK") && result.contains("HTTP_MCP_OK"),
-        "{result}"
-    );
-    eprintln!(
-        "Live Codemode acceptance passed: kimi-k3; one script; stdio=1; HTTP=1; two confirmations; first confirmation paused beyond timeout; LOCAL_MCP_OK; HTTP_MCP_OK"
-    );
-}
-
-#[tokio::test]
 #[ignore = "requires an isolated TICKLOOP_CONFIG_DIR with ANTHROPIC_API_KEY and OPENAI_API_KEY; calls the billed APIs"]
 async fn live_native_tool_search_with_anthropic_and_openai_across_switches() {
     let root = std::path::PathBuf::from(
@@ -1241,4 +1153,59 @@ async fn live_codex_native_search_calls_mcp_fixture_once() {
     eprintln!(
         "Codex native MCP acceptance passed: gpt-6.1-sol, hosted search, stdio calls=1, Fold calls=0, result=LOCAL_MCP_OK"
     );
+}
+
+#[tokio::test]
+async fn unchanged_worker_requests_reuse_configuration_and_only_changed_settings_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+    tickloop_harness::base::credentials::save_api_key(
+        &root.path().canonicalize().unwrap(),
+        "ANTHROPIC_API_KEY",
+        "fixture",
+    )
+    .unwrap();
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let (agent, _, remote) =
+        configured_agent(root.path(), model, ChosenModels::new(scripted.clone())).await;
+    let chat = agent.create_chat(root.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    scripted.enqueue(text("ready"));
+    complete(&agent, chat, "ready").await;
+    let before = agent.mcp_performance_counts();
+    for _ in 0..2 {
+        scripted.enqueue(text("unchanged"));
+        complete(&agent, chat, "unchanged").await;
+    }
+    scripted.enqueue(call("probe", "mcp__remote__probe", json!({})));
+    scripted.enqueue(text("done"));
+    complete(&agent, chat, "call probe").await;
+    assert_eq!(remote.calls().len(), 1);
+    assert_eq!(agent.mcp_performance_counts(), before);
+    let path = root.path().join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    settings["mcpServers"]["remote"]["description"] = json!("A changed service description");
+    std::fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    scripted.enqueue(text("changed"));
+    complete(&agent, chat, "changed").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while agent.mcp_servers().await.iter().any(|server| {
+            server.state == tickloop_harness::protocol::mcp::McpServerState::Connecting
+        }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        agent.mcp_performance_counts(),
+        (before.0 + 1, before.1 + 1, before.2 + 1)
+    );
+    agent.shutdown().await;
 }

@@ -116,8 +116,6 @@ pub(crate) struct RetainedFold {
     /// The latest record of each answer, input and wait.
     by_id: HashMap<(MetadataKind, Uuid), Kept>,
     content_replacements: Vec<Kept>,
-    /// Every Codemode store change; a load applies those on its chain.
-    codemode_store: Vec<Kept>,
     /// Every goal event, which the conversation shows as its goal lines.
     goal_events: Vec<Kept>,
     /// The latest file history snapshot of each message.
@@ -189,9 +187,6 @@ impl RetainedFold {
             }
             (Retention::Accumulating, Line::ContentReplacement(_)) => {
                 self.content_replacements.push(kept);
-            }
-            (Retention::Accumulating, Line::CodemodeStore(_)) => {
-                self.codemode_store.push(kept);
             }
             (Retention::Accumulating, Line::GoalEvent(_)) => {
                 self.goal_events.push(kept);
@@ -277,9 +272,6 @@ impl RetainedFold {
             }))
             .chain(self.content_replacements.iter().filter(|kept| {
                 matches!(&kept.line, Line::ContentReplacement(entry) if entry.replacements.iter().any(|replacement| self.chain.keeps_tool_result(replacement.tool_use_id())))
-            }))
-            .chain(self.codemode_store.iter().filter(|kept| {
-                matches!(&kept.line, Line::CodemodeStore(entry) if entry.parent_call().is_none_or(|(run, call)| self.chain.keeps_nested_parent(run, call)))
             }))
             .chain(&self.goal_events)
             .chain(

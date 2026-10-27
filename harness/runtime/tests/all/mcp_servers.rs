@@ -162,7 +162,6 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         std::env::vars().collect(),
@@ -862,7 +861,6 @@ for line in sys.stdin:
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         std::env::vars().collect(),
@@ -934,7 +932,6 @@ async fn bearer_scheme_spelling_and_stdio_arguments_do_not_expose_tokens() {
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
-                scripts: false,
             },
             BTreeMap::new(),
             std::env::vars().collect(),
@@ -1677,7 +1674,6 @@ async fn service_instructions_and_summary_redact_secrets_through_the_host_provid
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
-                    scripts: false,
                 },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -1723,7 +1719,6 @@ async fn service_instructions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1768,7 +1763,6 @@ async fn tool_descriptions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1782,7 +1776,7 @@ async fn tool_descriptions_redact_secrets_before_the_length_limit() {
         Some("[redacted]xxxxxxxx")
     );
     assert_eq!(definitions[0].description.chars().count(), 2048);
-    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
+    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold);
     let described = directory
         .describe(&json!({"names":["mcp__notes__probe"]}))
         .unwrap();
@@ -1846,7 +1840,6 @@ async fn discovery_resources_and_failures_redact_server_text() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1863,7 +1856,7 @@ async fn discovery_resources_and_failures_redact_server_text() {
         definitions[0].input_schema["properties"]["query"]["description"],
         "Query [redacted]"
     );
-    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
+    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold);
     let found = directory.search(&json!({"query":"probe"})).unwrap();
     assert_eq!(found["matches"][0]["summary"], "Find [redacted].");
     let described = directory
@@ -1984,7 +1977,6 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2144,7 +2136,6 @@ async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_valida
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
-            scripts: false,
         },
         Default::default(),
         std::env::vars().collect(),
@@ -2279,4 +2270,192 @@ async fn the_first_refresh_waits_for_search_servers_and_reports_unavailable_ones
         }]
     );
     provider.shutdown().await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn unchanged_catalog_reads_reuse_published_work() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
+    let config = http_config("cached", &server);
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let provider =
+        McpToolProvider::new(connections.clone(), Arc::new(move || vec![config.clone()]));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let before = connections.performance_counts();
+    for _ in 0..2 {
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), 1);
+        assert_eq!(provider.discovery_tools().len(), 1);
+        provider.mcp_instructions();
+        connections.statuses();
+    }
+    let after = connections.performance_counts();
+    connections.shutdown().await;
+    assert_eq!(
+        before, after,
+        "reads must not rebuild the catalog or redactor"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "isolated MCP performance scenario; run explicitly in debug and release"]
+async fn mcp_catalog_performance_scenario() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
+    let count = if cfg!(debug_assertions) { 30 } else { 200 };
+    let server = McpService::start().await;
+    let properties: serde_json::Map<String, serde_json::Value> = (0..12).map(|i| (format!("field_{i}"), json!({"type":"string","description":format!("The field number {i} used by the tool, e.g. 700.HK or AAPL.US; see docs for details."),"enum":["a","b","c"]}))).collect();
+    server.set_tools(json!((0..count).map(|i| json!({"name":format!("tool_{i}"),"description":"Get the latest quote of a security; returns price, volume and turnover.","inputSchema":{"type":"object","properties":properties,"required":["field_0"],"additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#"}})).collect::<Vec<_>>()));
+    let environment = [43, 40, 41, 39, 44, 42, 1580, 1581]
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                format!("SECRET_{i}"),
+                (0..n).map(|j| (b'a' + (j % 26) as u8) as char).collect(),
+            )
+        })
+        .collect();
+    let connections =
+        McpConnections::new(HostCapabilities::default(), BTreeMap::new(), environment);
+    let config = Arc::new(std::sync::Mutex::new(http_config("bench", &server)));
+    let source = config.clone();
+    let provider = McpToolProvider::new(
+        connections.clone(),
+        Arc::new(move || vec![source.lock().unwrap().clone()]),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), count);
+        assert_eq!(provider.discovery_tools().len(), count);
+        provider.mcp_instructions();
+        samples.push(started.elapsed());
+    }
+    samples.sort();
+    eprintln!(
+        "MCP benchmark tools={count} preparation_p50={:?} samples={samples:?}",
+        samples[2]
+    );
+    config
+        .lock()
+        .unwrap()
+        .sensitive_values
+        .push(json!("new-credential"));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    settled(&connections).await;
+    let rebuild_us = connections.last_catalog_build_micros();
+    let mut result = json!(
+        (0..50_000)
+            .map(|i| if i % 100 == 0 {
+                "new-credential".repeat(7)
+            } else {
+                "a harmless fixture result with no private content. ".repeat(2)
+            })
+            .collect::<Vec<_>>()
+    );
+    let bytes = result.to_string().len();
+    let started = std::time::Instant::now();
+    connections.benchmark_redact_result("bench", &mut result);
+    let redaction = started.elapsed();
+    assert!(!result.to_string().contains("new-credential"));
+    eprintln!(
+        "MCP benchmark rebuild_us={rebuild_us} result_bytes={bytes} nodes=50000 redaction={redaction:?}"
+    );
+    connections.shutdown().await;
+    assert!(samples[2] <= Duration::from_millis(if cfg!(debug_assertions) { 20 } else { 5 }));
+    if !cfg!(debug_assertions) {
+        assert!(rebuild_us <= 50_000);
+        assert!(redaction <= Duration::from_millis(100));
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    let credentials = Arc::new(InMemoryCredentials::default());
+    let saved = |secret: &str| {
+        tickloop_harness_runtime::mcp::ConnectorCredential {
+        server_url: server.url(),
+        registration: tickloop_harness_connector::ClientRegistration { authorization_server: server.url(), client_id: "fixture".into(), redirect_uri: "http://localhost/callback".into() },
+        resource: None,
+        token: Some(serde_json::from_value(json!({"access_token":secret,"token_type":"Bearer","issuer":server.url(),"expires_at":u64::MAX,"client_id":"fixture","token_endpoint":server.url()})).unwrap()),
+    }
+    };
+    credentials.replace(Some(saved("old-token")));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::from([(
+            "changed".into(),
+            credentials.clone() as Arc<dyn tickloop_harness_runtime::mcp::ConnectorCredentials>,
+        )]),
+        BTreeMap::new(),
+    );
+    let configs = Arc::new(std::sync::Mutex::new(vec![
+        http_config("changed", &server),
+        http_config("unchanged", &server),
+    ]));
+    let source = configs.clone();
+    let provider = McpToolProvider::new(
+        connections.clone(),
+        Arc::new(move || source.lock().unwrap().clone()),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let before = connections.performance_counts();
+    server.set_tools(json!([{"name":"second","inputSchema":{"type":"object"}}]));
+    server.notify_tools_changed();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider
+            .definitions()
+            .iter()
+            .filter(|tool| tool.name.ends_with("__second"))
+            .count()
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let listed = connections.performance_counts();
+    assert_eq!(listed, (before.0 + 2, before.1));
+    configs.lock().unwrap()[0].description = "new description".into();
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    settled(&connections).await;
+    let configured = connections.performance_counts();
+    assert_eq!(configured, (listed.0 + 1, listed.1 + 1));
+    let secret = "new/private+token\"value";
+    let encoded = percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
+        .to_string();
+    let hex: String = secret.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    let escaped = serde_json::to_string(secret).unwrap();
+    server.set_tools(json!([{"name":"second","description":format!("{} {} {} {}", secret, encoded, hex, escaped.trim_matches('"')),"inputSchema":{"type":"object"}}]));
+    credentials.replace(Some(saved(secret)));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    settled(&connections).await;
+    assert_eq!(
+        connections.performance_counts(),
+        (configured.0 + 1, configured.1 + 1)
+    );
+    let definition = provider
+        .definitions()
+        .into_iter()
+        .find(|tool| tool.name == "mcp__changed__second")
+        .unwrap();
+    assert_eq!(
+        definition.description,
+        "[redacted] [redacted] [redacted] [redacted]"
+    );
+    connections.shutdown().await;
 }

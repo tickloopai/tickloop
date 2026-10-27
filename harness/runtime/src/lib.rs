@@ -46,6 +46,7 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
+mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod tick_adapter;
 pub mod tick_stream;
@@ -62,11 +63,6 @@ mod chat_reads;
 mod chat_settings;
 mod chat_title;
 mod citations;
-#[cfg(feature = "codemode")]
-pub mod codemode;
-mod codemode_store;
-#[cfg(feature = "codemode")]
-mod codemode_tool;
 mod compaction;
 mod context;
 mod delegation;
@@ -355,7 +351,7 @@ struct Inner {
     /// Announces a generated Shell description by task, for Shell task subscribers only.
     shell_description_events: broadcast::Sender<Uuid>,
     subagent_registry: Mutex<HashMap<ChatId, Vec<SubagentRegistration>>>,
-    chats: Mutex<HashMap<ChatId, Chat>>,
+    chats: timing::ChatsMutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
     user_shell_events: broadcast::Sender<UserShellRecord>,
     user_shell_cancellations: std::sync::Mutex<HashMap<(ChatId, Uuid), CancellationToken>>,
@@ -449,10 +445,6 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
-    /// What successful Codemode scripts stored, in order; a script loads the changes on the
-    /// current chain.
-    #[serde(default)]
-    codemode_store: Vec<tickloop_harness_transcript::CodemodeStoreEntry>,
 }
 
 /// What a Subagent's Chat takes from its parent's.
@@ -1210,6 +1202,16 @@ impl Agent {
 
     pub(crate) fn shell_runtime(&self) -> Option<Arc<dyn tickloop_harness_tools::ShellRuntime>> {
         self.inner.shells.read().unwrap().clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn mcp_performance_counts(&self) -> (u64, u64, u64) {
+        self.inner
+            .host_tools
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or((0, 0, 0), |provider| provider.mcp_performance_counts())
     }
 
     /// Registers the provider's current tools without refreshing remote directories. Call
@@ -2028,7 +2030,7 @@ impl Agent {
                 shell_descriptions: Mutex::new(HashMap::new()),
                 shell_description_events: broadcast::channel(256).0,
                 subagent_registry: Mutex::new(HashMap::new()),
-                chats: Mutex::new(HashMap::new()),
+                chats: timing::ChatsMutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
                 user_shell_events: broadcast::channel(256).0,
                 user_shell_cancellations: std::sync::Mutex::new(HashMap::new()),
@@ -3048,6 +3050,7 @@ impl Agent {
         let _ = self.inner.events.send(event);
     }
 
+    #[tracing::instrument(skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     async fn model_request(
         &self,
         receipt: &Receipt,
@@ -3089,8 +3092,12 @@ impl Agent {
         let host_tools =
             host_provider_is_confirmed(&self.inner.host_tools).then(|| registry.host_tool_names());
         // After compaction, which may drop earlier notes; boxed to keep the run future small.
+        let timing = timing::Phase::new("announce_host_tool_changes");
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
+        drop(timing);
+        let timing = timing::Phase::new("announce_plan_mode_exit");
         Box::pin(self.announce_plan_mode_exit(receipt)).await?;
+        drop(timing);
         // Only a Chat with a Folder probes the host it runs in.
         let workspace_host = self
             .inner
@@ -3104,6 +3111,7 @@ impl Agent {
                     self.inner.host_tools.read().unwrap().as_deref(),
                 )
             });
+        let timing = timing::Phase::new("announce_guidance");
         Box::pin(
             self.announce_guidance(
                 receipt,
@@ -3113,9 +3121,12 @@ impl Agent {
             ),
         )
         .await?;
+        drop(timing);
         let family_roster = self.family_agents(receipt.chat_id).await?;
         let user_context = self.user_context(receipt.chat_id).await?;
+        let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
+        drop(timing);
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -3582,20 +3593,27 @@ impl Agent {
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
             self.feedback_account_context(&receipt).await?;
             *is_awaiting_model = true;
-            let mut registry = self.prepare_tool_registry(&receipt, &cancel).await?;
-            request.tools = registry.definitions();
-            request.deferred_tools = registry.deferred_definitions();
-            let output = match self
-                .model_request(
-                    &receipt,
-                    request,
-                    &mut registry,
-                    cancel.clone(),
-                    &mut used_calls,
-                )
-                .await
-            {
-                Ok(output) => output,
+            let prepared = timing::request(&receipt, async {
+                let mut registry = self
+                    .prepare_tool_registry(&receipt, &cancel)
+                    .await
+                    .map_err(AgentError::Invalid)?;
+                request.tools = registry.definitions();
+                request.deferred_tools = registry.deferred_definitions();
+                let output = self
+                    .model_request(
+                        &receipt,
+                        request,
+                        &mut registry,
+                        cancel.clone(),
+                        &mut used_calls,
+                    )
+                    .await?;
+                Ok::<_, AgentError>((registry, output))
+            })
+            .await;
+            let (registry, output) = match prepared {
+                Ok(prepared) => prepared,
                 // A handover stopped the request before it reached the vendor, or in a retry
                 // backoff: the Run stops before its model request.
                 Err(AgentError::Model(ModelError::Cancelled))
@@ -4584,8 +4602,6 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
-        #[cfg(feature = "codemode")]
-        let _script_pause = nested_calls::pause_script_clock();
         let nested = nested_calls::is_nested();
         if !nested {
             tool_batch::serialize_permission_prompt(&cancel).await?;
@@ -5492,11 +5508,6 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
         .chain(tool_exposure::fold_definitions())
-        .chain(std::iter::once(tickloop_harness_protocol::ToolDefinition {
-            name: "Codemode".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({}),
-        }))
         .chain(plan::definitions(false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())

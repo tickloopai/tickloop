@@ -875,6 +875,8 @@ impl Agent {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let sent = std::time::Instant::now();
+            let mut first_event = true;
             tokio::pin!(response, deadline);
             loop {
                 let flush_deadline = progress.delta_deadline;
@@ -895,6 +897,10 @@ impl Agent {
                         }
                     }
                     Some(delta) = receiver.recv() => {
+                        if first_event {
+                            first_event = false;
+                            tracing::debug!(chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
+                        }
                         if let Err(error) = self.buffer_model_delta(&context, sequence, delta,
                             &cancel, &mut progress).await {
                             break Err(error);

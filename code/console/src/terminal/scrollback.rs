@@ -26,7 +26,7 @@ const DEFAULT_HEIGHT: usize = 22;
 const RESPONSE_HANG: usize = 5;
 /// Rows of a block's body wrap under its two-space indent.
 const BODY_HANG: usize = 2;
-/// A call a script or batch made lines up under its parent's `⎿` content.
+/// A call a batch made lines up under its parent's `⎿` content.
 const NESTED_INDENT: usize = RESPONSE_HANG;
 const EXPAND_HINT: &str = " (ctrl+o to expand)";
 
@@ -157,8 +157,8 @@ struct ToolCallHeader {
     state: ToolCallState,
     /// What a read or search call adds to the collapsed group it joined.
     collapse: Option<(CollapsedCall, usize)>,
-    /// Columns the call's row and results are moved right: a call a script or batch made sits
-    /// under the call that made it.
+    /// Columns the call's row and results are moved right: a call a batch made sits under the
+    /// call that made it.
     indent: usize,
 }
 
@@ -268,7 +268,7 @@ pub(super) struct Scrollback {
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
-    /// The call each call a script or batch made runs under, by call id.
+    /// The call each call a batch made runs under, by call id.
     nested_parents: HashMap<String, String>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
@@ -3004,7 +3004,7 @@ mod tests {
         scrollback.set_tool_call(
             run,
             "parent",
-            &call_spans("Codemode"),
+            &call_spans("ExecuteTools"),
             ToolCallState::Running,
             None,
         );
@@ -3028,21 +3028,21 @@ mod tests {
         scrollback.append_tool_result("a", &result("first result"), false);
         scrollback.finish_tool_call(run, "a", ToolCallState::Finished);
         scrollback.finish_tool_call(run, "b", ToolCallState::Failed);
-        scrollback.append_tool_result("parent", &result("Script completed"), false);
+        scrollback.append_tool_result("parent", &result("Batch completed"), false);
         scrollback.finish_tool_call(run, "parent", ToolCallState::Finished);
-        scrollback.append_markdown("After the script.", "⏺ ", true);
+        scrollback.append_markdown("After the batch.", "⏺ ", true);
         assert_eq!(
             scrollback.frame(40, 20).lines,
             [
                 "",
-                "⏺ Codemode",
+                "⏺ ExecuteTools",
                 "     ⏺ First",
                 "       ⎿  first result",
                 "     ⏺ Second",
                 "       ⎿  second result",
-                "  ⎿  Script completed",
+                "  ⎿  Batch completed",
                 "",
-                "⏺ After the script.",
+                "⏺ After the batch.",
                 "",
             ]
         );

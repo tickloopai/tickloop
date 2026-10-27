@@ -55,6 +55,7 @@ mod embedded;
 mod ingress;
 mod ipc;
 mod lifecycle;
+mod mcp_configuration;
 mod receipts;
 #[cfg(test)]
 mod status_cost;
@@ -803,7 +804,6 @@ pub async fn build_runtime_with_models(
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
-                scripts: true,
             },
             std::collections::BTreeMap::new(),
             startup_environment.clone(),
@@ -814,8 +814,15 @@ pub async fn build_runtime_with_models(
             tick_plugins::PluginStore::in_config_root(settings.root().expect("settings root"));
         let credential_connections = connections.clone();
         let credential_root = settings.root().expect("settings root").to_owned();
+        let files = std::sync::Mutex::new(mcp_configuration::ConfigurationFiles::default());
         let configuration = Arc::new(move || {
-            let (plugin_servers, mut warnings) = enabled_plugin_mcp_servers(&plugins);
+            let mut files = files.lock().unwrap();
+            if files.unchanged(&credential_root) {
+                return None;
+            }
+            files.paths.clear();
+            let (plugin_servers, mut warnings) =
+                enabled_plugin_mcp_servers(&plugins, &mut files.paths);
             let mut resolved = settings.load().mcp_servers_with_plugins(
                 &folder,
                 &startup_environment,
@@ -851,16 +858,22 @@ pub async fn build_runtime_with_models(
             }
             credential_connections.set_credentials(credentials);
             warnings.extend(resolved.warnings);
-            McpConfiguration {
+            files.remember(&credential_root);
+            Some(McpConfiguration {
                 servers: resolved.servers,
                 warnings,
-            }
+            })
         });
-        connections.reconcile(configuration().servers).await;
-        sources.push(Arc::new(McpToolProvider::with_configuration(
+        let provider = Arc::new(McpToolProvider::with_configuration_updates(
             connections,
             configuration,
-        )));
+        ));
+        tickloop_harness::runtime::host_tools::HostToolProvider::mcp_server_statuses(
+            provider.as_ref(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        sources.push(provider);
     }
     agent
         .install_host_tools(sources)
@@ -870,6 +883,7 @@ pub async fn build_runtime_with_models(
 
 fn enabled_plugin_mcp_servers(
     store: &tick_plugins::PluginStore,
+    paths: &mut Vec<std::path::PathBuf>,
 ) -> (Vec<tickloop_code_settings::mcp::PluginServers>, Vec<String>) {
     let installed = match store.installed() {
         Ok(installed) => installed,
@@ -895,8 +909,35 @@ fn enabled_plugin_mcp_servers(
     for plugin in installed
         .plugins
         .into_iter()
-        .filter(|plugin| plugin.enabled && !plugin.manifest.mcp_servers.is_empty())
+        .filter(|plugin| plugin.enabled)
     {
+        paths.push(plugin.root.join(".mcp.json"));
+        for manifest in [
+            ".tickloop-plugin/plugin.json",
+            ".claude-plugin/plugin.json",
+            "tick-package.json",
+        ] {
+            let path = plugin.root.join(manifest);
+            paths.push(path.clone());
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                let sources = document.get("mcpServers");
+                for source in sources.into_iter().flat_map(|value| {
+                    value
+                        .as_array()
+                        .map(|values| values.iter().collect())
+                        .unwrap_or_else(|| vec![value])
+                }) {
+                    if let Some(relative) = source.as_str() {
+                        paths.push(plugin.root.join(relative));
+                    }
+                }
+            }
+        }
+        if plugin.manifest.mcp_servers.is_empty() {
+            continue;
+        }
         let data_directory = match store.create_data_directory(plugin.name()) {
             Ok(directory) => directory,
             Err(error) => {

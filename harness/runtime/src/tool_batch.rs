@@ -154,6 +154,7 @@ impl Agent {
     }
 
     /// The tools a model request of the Run offers, after refreshing what they depend on.
+    #[tracing::instrument(skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     pub(super) async fn prepare_tool_registry(
         &self,
         receipt: &Receipt,
@@ -161,6 +162,7 @@ impl Agent {
     ) -> Result<ToolRegistry, String> {
         let host_provider = self.inner.host_tools.read().unwrap().clone();
         if let Some(provider) = host_provider {
+            let _timing = crate::timing::Phase::new("refresh");
             let _ = provider.refresh(cancel.clone()).await;
         }
         self.refresh_task_tools_setting()
@@ -172,6 +174,7 @@ impl Agent {
         self.synchronize_remote_skills(receipt).await;
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&receipt.chat_id).unwrap();
+        let _timing = crate::timing::Phase::new("ToolRegistry::for_chat");
         Ok(ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),

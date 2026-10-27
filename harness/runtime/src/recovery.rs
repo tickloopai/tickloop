@@ -221,8 +221,8 @@ fn close_calls(
 
 const MAX_REASON_CHARACTERS: usize = 200;
 
-/// What an interrupted script or batch did, call by call, when it made any calls: their effects
-/// stay, so the model decides how to go on instead of the load running anything again.
+/// What an interrupted batch did, call by call, when it made any calls: their effects stay, so
+/// the model decides how to go on instead of the load running anything again.
 fn interrupted_nested_calls(
     snapshot: &ChatSnapshot,
     parent: &projection::HistoryCall,

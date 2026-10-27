@@ -106,7 +106,7 @@ The product layer over a remote MCP Server that makes "give an address, log in, 
 _Avoid_: integration, app
 
 **Tool Exposure**:
-How an MCP Server's tools reach the model, set per server: direct (listed among the model's tools), search (found and called through Tool Search), codemode (callable only from Codemode scripts), or hidden (not callable). Exposure changes only how tools are reached, never their permissions.
+How an MCP Server's tools reach the model, set per server: direct (listed among the model's tools), search (found and called through Tool Search), or hidden (not callable). Exposure changes only how tools are reached, never their permissions.
 
 **Tool Search**:
 Reaching tools on demand without changing the model's tool list. It uses the model's native search when the model card supports it, and otherwise Fold.
@@ -114,10 +114,6 @@ _Avoid_: deferred loading (that names the native form only), lazy tools
 
 **Fold**:
 The Tool Search form that asks nothing of the model: three fixed tools, SearchTools, DescribeTools and ExecuteTools, find, describe and call the tools, which never enter the tool list. ExecuteTools runs a batch of independent calls.
-
-**Codemode**:
-A tool that runs a script the model writes, in a sandbox with no file, network or timer access; the script reaches the outside only by calling other tools, and only its output returns to the model. Each call in a script is prepared, approved and recorded as if the model had made it directly. Hosts that cannot run scripts do not offer it.
-_Avoid_: sandbox (that names execution services), call plan
 
 ### Loop and Trigger
 

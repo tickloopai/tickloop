@@ -30,24 +30,14 @@ pub enum ToolExposure {
     #[default]
     Search,
     Direct,
-    Codemode,
     Hidden,
 }
 
 impl ToolExposure {
-    pub fn for_host(self, scripts: bool) -> Self {
-        if self == Self::Codemode && !scripts {
-            Self::Search
-        } else {
-            self
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Search => "search",
             Self::Direct => "direct",
-            Self::Codemode => "codemode",
             Self::Hidden => "hidden",
         }
     }

@@ -2,6 +2,8 @@
 mod catalog;
 mod process;
 mod provider;
+mod redaction;
+mod snapshot;
 use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
 pub use provider::{McpConfiguration, McpToolProvider};
@@ -32,7 +34,6 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy, Default)]
 pub struct HostCapabilities {
     pub local_processes: bool,
-    pub scripts: bool,
 }
 
 use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, TokenError};
@@ -84,6 +85,7 @@ struct Connection {
     http: Option<McpHttpClient>,
     changed: Arc<tokio::sync::Notify>,
     tools: RwLock<BTreeMap<String, catalog::Tool>>,
+    snapshot: RwLock<Arc<snapshot::Catalog>>,
     instructions: String,
     /// `None` when the server does not provide resources.
     resources: Option<ResourceDirectory>,
@@ -106,6 +108,15 @@ impl ResourceDirectory {
     }
 }
 struct Entry {
+    redactor: RwLock<Option<Arc<redaction::Redactor>>>,
+    publication: std::sync::Mutex<()>,
+    generation: AtomicU64,
+    secret_generation: AtomicU64,
+    description: RwLock<String>,
+    config_failure: RwLock<Option<String>>,
+    catalog_builds: Arc<AtomicU64>,
+    catalog_micros: Arc<AtomicU64>,
+    redactor_builds: Arc<AtomicU64>,
     config: McpServerConfig,
     token: RwLock<Option<AccessToken>>,
     credential: RwLock<Option<ConnectorCredential>>,
@@ -184,12 +195,32 @@ impl Entry {
             }
         }
         *self.credential.write().unwrap() = credential;
+        let changed = {
+            let _publication = self.publication.lock().unwrap();
+            if let Some(redactor) = redaction::Redactor::new(self) {
+                self.secret_generation.fetch_add(1, Ordering::SeqCst);
+                *self.redactor.write().unwrap() = Some(Arc::new(redactor));
+                self.redactor_builds.fetch_add(1, Ordering::Relaxed);
+                *self.description.write().unwrap() = redact(self, self.config.description.clone());
+                *self.config_failure.write().unwrap() = match &self.config.transport {
+                    McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
+                    _ => None,
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if changed && let Some(connection) = self.connection.read().unwrap().clone() {
+            self.publish_catalog(&connection);
+        }
     }
 }
 struct PreparedMcpCall {
     entry: Arc<Entry>,
     connection: Arc<Connection>,
-    tool: catalog::Tool,
+    tool: Arc<snapshot::Tool>,
+    generation: u64,
     input: Value,
 }
 /// Which unchanged servers a reconcile connects again.
@@ -204,6 +235,9 @@ pub struct McpConnections {
     inner: Arc<Inner>,
 }
 struct Inner {
+    catalog_builds: Arc<AtomicU64>,
+    catalog_micros: Arc<AtomicU64>,
+    redactor_builds: Arc<AtomicU64>,
     capabilities: HostCapabilities,
     credentials: RwLock<BTreeMap<String, Arc<dyn ConnectorCredentials>>>,
     environment: BTreeMap<String, String>,
@@ -225,6 +259,9 @@ impl McpConnections {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                catalog_builds: Arc::new(AtomicU64::new(0)),
+                catalog_micros: Arc::new(AtomicU64::new(0)),
+                redactor_builds: Arc::new(AtomicU64::new(0)),
                 capabilities,
                 credentials: RwLock::new(credentials),
                 environment,
@@ -301,7 +338,9 @@ impl McpConnections {
     }
 
     async fn reconcile_restarting(&self, configs: Vec<McpServerConfig>, restart: Restart<'_>) {
+        let waiting = crate::timing::Phase::new("reconcile_lock_wait");
         let _guard = self.inner.reconcile_lock.lock().await;
+        drop(waiting);
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
@@ -360,6 +399,13 @@ impl McpConnections {
                 .unwrap()
                 .get(&config.name)
                 .cloned();
+            let previous_generation = existing
+                .as_ref()
+                .map_or(0, |entry| entry.generation.load(Ordering::SeqCst));
+            let previous_secrets = existing
+                .as_ref()
+                .map(|entry| entry.credential_secrets.read().unwrap().clone())
+                .unwrap_or_default();
             let entry = if let Some(entry) = existing.filter(|entry| {
                 restart != Restart::Server(config.name.as_str())
                     && entry.config == config
@@ -405,10 +451,19 @@ impl McpConnections {
                     .map(|(_, value)| value.clone())
                     .collect();
                 let entry = Arc::new(Entry {
+                    redactor: RwLock::new(None),
+                    publication: std::sync::Mutex::new(()),
+                    generation: AtomicU64::new(previous_generation),
+                    secret_generation: AtomicU64::new(0),
+                    description: RwLock::new(String::new()),
+                    config_failure: RwLock::new(None),
+                    catalog_builds: self.inner.catalog_builds.clone(),
+                    catalog_micros: self.inner.catalog_micros.clone(),
+                    redactor_builds: self.inner.redactor_builds.clone(),
                     config,
                     token: RwLock::new(None),
                     credential: RwLock::new(None),
-                    credential_secrets: RwLock::new(Vec::new()),
+                    credential_secrets: RwLock::new(previous_secrets),
                     tool_schemas: RwLock::new(BTreeMap::new()),
                     credentials,
                     connector,
@@ -490,6 +545,7 @@ impl McpConnections {
             match result {
                 Ok(Ok((connection, service))) => {
                     let connection = Arc::new(connection);
+                    entry.publish_catalog(&connection);
                     *entry.connection.write().unwrap() = Some(connection.clone());
                     *entry.state.write().unwrap() = McpServerState::Connected;
                     state_changed.notify_waiters();
@@ -518,8 +574,10 @@ impl McpConnections {
                                     *connection.tools.write().unwrap() = tools;
                                     *connection.warnings.write().unwrap() = warnings;
                                     connection.catalog_revision.store(revision, Ordering::SeqCst);
+                                    entry.publish_catalog(&connection);
                                 } else {
                                     connection.tools.write().unwrap().clear();
+                                    entry.publish_catalog(&connection);
                                     *connection.warnings.write().unwrap() = vec!["MCP tools unavailable".into()];
                                 }
                             }
@@ -543,6 +601,8 @@ impl McpConnections {
                                 } else {
                                     warnings.push(RESOURCES_UNAVAILABLE.into());
                                 }
+                                drop(warnings);
+                                entry.publish_metadata(&connection);
                             }
                         }
                     }
@@ -552,42 +612,59 @@ impl McpConnections {
             }
         });
     }
-    fn catalog(&self) -> Vec<(Arc<Entry>, Arc<Connection>, catalog::Tool)> {
+    #[cfg(feature = "test-support")]
+    pub fn performance_counts(&self) -> (u64, u64) {
+        (
+            self.inner.catalog_builds.load(Ordering::Relaxed),
+            self.inner.redactor_builds.load(Ordering::Relaxed),
+        )
+    }
+    #[cfg(feature = "test-support")]
+    pub fn last_catalog_build_micros(&self) -> u64 {
+        self.inner.catalog_micros.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn benchmark_redact_result(&self, server: &str, value: &mut Value) {
+        let entry = self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .get(server)
+            .expect("benchmark server")
+            .clone();
+        redact_value(&entry, value);
+    }
+    fn catalog(&self) -> Vec<(Arc<Entry>, Arc<Connection>, Arc<snapshot::Tool>)> {
+        let _timing = crate::timing::Phase::new("mcp_catalog_read");
+        let entries: Vec<_> = self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         let mut tools = Vec::new();
-        for entry in self.inner.entries.read().unwrap().values() {
+        for entry in entries {
             if *entry.state.read().unwrap() == McpServerState::NeedsLogin {
                 continue;
             }
-            if let Some(connection) = entry.connection.read().unwrap().clone() {
-                if connection.revision.load(Ordering::SeqCst)
-                    != connection.catalog_revision.load(Ordering::SeqCst)
+            let connection = entry.connection.read().unwrap().clone();
+            if let Some(connection) = connection {
+                let snapshot = connection.snapshot.read().unwrap().clone();
+                if connection.revision.load(Ordering::SeqCst) != snapshot.revision
+                    || entry.secret_generation.load(Ordering::SeqCst) != snapshot.secret_generation
                 {
                     continue;
                 }
-                for tool in connection.tools.read().unwrap().values() {
-                    let mut tool = tool.clone();
-                    if redact(entry, tool.definition.name.clone()) != tool.definition.name {
-                        continue;
-                    }
-                    tool.definition.description =
-                        redact_server_text(entry, tool.definition.description);
-                    redact_schema(entry, &mut tool.definition.input_schema);
-                    if tool.definition.input_schema["type"] != "object"
-                        || jsonschema::validator_for(&tool.definition.input_schema).is_err()
-                    {
-                        continue;
-                    }
-                    tools.push((entry.clone(), connection.clone(), tool));
-                }
-            }
-        }
-        let mut counts = BTreeMap::<String, usize>::new();
-        for (_, _, tool) in &tools {
-            *counts.entry(tool.definition.name.clone()).or_default() += 1;
-        }
-        for (entry, _, tool) in &mut tools {
-            if counts[&tool.definition.name] > 1 {
-                tool.definition.name = catalog::hashed_name(&entry.config.name, &tool.original);
+                tools.extend(
+                    snapshot
+                        .tools
+                        .values()
+                        .map(|tool| (entry.clone(), connection.clone(), tool.clone())),
+                );
             }
         }
         tools
@@ -635,21 +712,15 @@ impl McpConnections {
                     }
                 };
                 let failure = match &entry.config.transport {
-                    McpTransport::Failed { reason } => Some(reason.clone()),
+                    McpTransport::Failed { .. } => entry.config_failure.read().unwrap().clone(),
                     _ => entry.failure.read().unwrap().clone(),
                 }
-                .filter(|_| state == McpServerState::Failed)
-                .map(|reason| redact(entry, reason));
+                .filter(|_| state == McpServerState::Failed);
                 McpServerStatus {
                     name: entry.config.name.clone(),
                     source: entry.config.source.clone(),
                     transport,
-                    exposure: entry
-                        .config
-                        .exposure
-                        .for_host(self.inner.capabilities.scripts)
-                        .as_str()
-                        .into(),
+                    exposure: entry.config.exposure.as_str().into(),
                     tools: catalog
                         .iter()
                         .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
@@ -687,29 +758,16 @@ impl McpConnections {
                         .collect(),
                     resources: connection
                         .as_ref()
-                        .and_then(|c| c.resources.as_ref())
-                        .map(|directory| {
-                            redacted_resources(entry, directory.resources.read().unwrap().clone())
-                        })
+                        .map(|connection| entry.current_catalog(connection).resources.clone())
                         .unwrap_or_default(),
                     instructions: connection
                         .as_ref()
-                        .map(|c| redact_server_text(entry, c.instructions.clone()))
+                        .map(|connection| entry.current_catalog(connection).instructions.clone())
                         .unwrap_or_default(),
-                    warnings: match &entry.config.transport {
-                        McpTransport::Failed { reason } => vec![reason.clone()],
-                        _ => connection
-                            .as_ref()
-                            .map(|c| {
-                                c.warnings
-                                    .read()
-                                    .unwrap()
-                                    .iter()
-                                    .map(|warning| redact(entry, warning.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    },
+                    warnings: connection
+                        .as_ref()
+                        .map(|connection| entry.current_catalog(connection).warnings.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect()
@@ -720,15 +778,15 @@ impl McpConnections {
         input: Value,
         cancel: &CancellationToken,
     ) -> Result<PreparedMcpCall, String> {
-        let reconnect = self
+        let mut target = self
             .catalog()
-            .iter()
-            .find(|(entry, _, tool)| {
-                *entry.state.read().unwrap() == McpServerState::Failed
-                    && tool.definition.name == name
-            })
+            .into_iter()
+            .find(|(_, _, tool)| tool.definition.name == name);
+        let reconnect = target
+            .as_ref()
+            .filter(|(entry, _, _)| *entry.state.read().unwrap() == McpServerState::Failed)
             .map(|(entry, _, _)| entry.config.name.clone());
-        if let Some(server) = reconnect {
+        if let Some(server) = &reconnect {
             let configs = self
                 .inner
                 .entries
@@ -743,27 +801,31 @@ impl McpConnections {
                     let notified = self.inner.state_changed.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    if !self.inner.entries.read().unwrap().get(&server).is_some_and(|entry| *entry.state.read().unwrap() == McpServerState::Connecting) {break;}
+                    if !self.inner.entries.read().unwrap().get(server).is_some_and(|entry| *entry.state.read().unwrap() == McpServerState::Connecting) {break;}
                     tokio::select! { _ = cancel.cancelled() => return Err("MCP connection cancelled"), _ = notified => {} }
                 }
                 Ok(())
             }).await.map_err(|_| "MCP connection timed out")??;
         }
-        self.prepare(name, input)
-    }
-    fn prepare(&self, name: &str, input: Value) -> Result<PreparedMcpCall, String> {
-        let target = self
-            .catalog()
-            .into_iter()
-            .find(|(_, _, tool)| tool.definition.name == name);
+        if reconnect.is_some() {
+            target = self
+                .catalog()
+                .into_iter()
+                .find(|(_, _, tool)| tool.definition.name == name);
+        }
         let (entry, connection, tool) = target.ok_or("MCP tool is unavailable")?;
-        if !jsonschema::validator_for(&tool.schema).is_ok_and(|schema| schema.is_valid(&input)) {
+        if tool.exposure == tickloop_harness_protocol::mcp::ToolExposure::Hidden {
+            return Err("MCP tool is unavailable or hidden".into());
+        }
+        if !tool.validator.is_valid(&input) {
             return Err("invalid MCP tool arguments".into());
         }
         if *entry.state.read().unwrap() != McpServerState::Connected {
             return Err("MCP connection is unavailable".into());
         }
+        let generation = connection.snapshot.read().unwrap().generation;
         Ok(PreparedMcpCall {
+            generation,
             entry,
             connection,
             tool,
@@ -787,13 +849,14 @@ impl McpConnections {
         {
             return Err("MCP tool directory changed before dispatch".into());
         }
-        let current = call.connection.tools.read().unwrap();
-        if !current.values().any(|tool| {
-            tool.original == call.tool.original
-                && tool.schema == call.tool.schema
-                && redact_server_text(&call.entry, tool.definition.description.clone())
-                    == call.tool.definition.description
-        }) {
+        let current = call.connection.snapshot.read().unwrap().clone();
+        if current.generation != call.generation
+            || current.secret_generation != call.entry.secret_generation.load(Ordering::SeqCst)
+            || !current
+                .tools
+                .get(&call.tool.definition.name)
+                .is_some_and(|tool| tool.fingerprint == call.tool.fingerprint)
+        {
             return Err("MCP tool changed before dispatch".into());
         }
         Ok(())
@@ -818,6 +881,7 @@ impl McpConnections {
             connection,
             tool,
             input,
+            generation: _,
         } = call;
         if cancel.is_cancelled() || entry.cancel.is_cancelled() {
             return HostCallResult::NotDispatched("MCP call cancelled before dispatch".into());
@@ -825,7 +889,8 @@ impl McpConnections {
         let Some(arguments) = input.as_object() else {
             return HostCallResult::NotDispatched("MCP arguments must be an object".into());
         };
-        let request = CallToolRequestParams::new(tool.original).with_arguments(arguments.clone());
+        let request =
+            CallToolRequestParams::new(tool.original.clone()).with_arguments(arguments.clone());
         let response = tokio::select! {
             _ = cancel.cancelled() => return HostCallResult::OutcomeUnknown("MCP call cancelled after dispatch; do not automatically retry".into()),
             _ = entry.cancel.cancelled() => return HostCallResult::OutcomeUnknown("MCP configuration changed after dispatch".into()),
@@ -848,9 +913,6 @@ impl McpConnections {
                     redact_value(&entry, structured);
                 }
                 redact_value(&entry, &mut value);
-                if value["isError"] != true && crate::nested_calls::is_script() {
-                    crate::nested_calls::capture_script_value(value.clone());
-                }
                 let mut images = Vec::new();
                 let content = if value["isError"] == true {
                     "MCP tool reported an error".into()
@@ -1006,7 +1068,9 @@ impl McpConnections {
         Ok(value)
     }
     pub async fn shutdown(&self) {
+        let waiting = crate::timing::Phase::new("reconcile_lock_wait");
         let _guard = self.inner.reconcile_lock.lock().await;
+        drop(waiting);
         self.inner.closed.store(true, Ordering::SeqCst);
         for entry in self.inner.entries.read().unwrap().values() {
             entry.cancel.cancel();
@@ -1215,6 +1279,7 @@ async fn open(
             http,
             changed,
             tools: RwLock::new(tools),
+            snapshot: RwLock::new(Arc::new(snapshot::Catalog::default())),
             instructions,
             resources,
             warnings: RwLock::new(warnings),
@@ -1337,81 +1402,11 @@ fn redact_server_text(entry: &Entry, content: String) -> String {
 }
 
 fn redact(entry: &Entry, content: String) -> String {
-    let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
-    let mut content = normalizer.normalize(&content).into_owned();
-    let mut secrets = entry.environment_secrets.clone();
-    secrets.extend(entry.credential_secrets.read().unwrap().iter().cloned());
-    secrets.extend(entry.config.sensitive_values.iter().map(|value| {
-        value
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string())
-    }));
-    if let Some(token) = entry.token.read().unwrap().as_ref() {
-        secrets.push(token.secret().to_owned());
-    }
-    if let Some(token) = entry
-        .credential
+    let redactor = entry
+        .redactor
         .read()
         .unwrap()
-        .as_ref()
-        .and_then(|saved| saved.token.as_ref())
-    {
-        secrets.push(token.access_token.clone());
-        secrets.extend(token.refresh_token.clone());
-    }
-    match &entry.config.transport {
-        McpTransport::Http { url, headers } => {
-            for value in headers.values() {
-                secrets.push(value.clone());
-                let mut parts = value.split_whitespace();
-                if parts.next().is_some_and(|scheme| {
-                    scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic")
-                }) && let Some(token) = parts.next()
-                {
-                    secrets.push(token.into());
-                }
-            }
-            if let Ok(url) = reqwest::Url::parse(url) {
-                secrets.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
-            }
-        }
-        McpTransport::Stdio { env, args, .. } => {
-            secrets.extend(env.values().cloned());
-            for argument in args {
-                if let Some((_, value)) = argument.split_once('=') {
-                    secrets.push(value.into());
-                } else if !argument.starts_with('-') {
-                    secrets.push(argument.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-    let mut variants = std::collections::BTreeSet::new();
-    for secret in secrets.into_iter().filter(|secret| !secret.is_empty()) {
-        let secret = normalizer.normalize(&secret).into_owned();
-        variants.insert(secret.clone());
-        let encoded =
-            percent_encoding::utf8_percent_encode(&secret, percent_encoding::NON_ALPHANUMERIC)
-                .to_string();
-        variants.insert(encoded.clone());
-        variants.insert(encoded.replace("%2F", "%2f").replace("%2B", "%2b"));
-        variants.insert(secret.bytes().map(|b| format!("%{b:02X}")).collect());
-        variants.insert(secret.bytes().map(|b| format!("%{b:02x}")).collect());
-        variants.insert(
-            serde_json::to_string(&secret)
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_owned(),
-        );
-    }
-    let mut variants: Vec<_> = variants.into_iter().collect();
-    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    for secret in variants {
-        if !secret.is_empty() {
-            content = content.replace(&secret, "[redacted]");
-        }
-    }
-    content
+        .clone()
+        .expect("redactor initialized before use");
+    redactor.redact(content)
 }

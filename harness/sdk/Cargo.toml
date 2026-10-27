@@ -12,7 +12,6 @@ doctest = false
 
 [features]
 default = []
-codemode = ["engine", "tickloop-harness-runtime/codemode"]
 base = ["dep:tickloop-harness-base"]
 engine = ["base", "policy", "dep:tickloop-harness-runtime", "tools", "model", "transcript", "cron", "artifacts"]
 tools = ["base", "dep:tickloop-harness-tools"]

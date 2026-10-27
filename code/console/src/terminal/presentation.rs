@@ -37,8 +37,7 @@ use tickloop_harness::protocol::{
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
-// A Codemode script and an ExecuteTools batch make calls of their own under their call.
-const CODEMODE_TOOL_NAME: &str = "Codemode";
+// An ExecuteTools batch makes calls of its own under its call.
 const EXECUTE_TOOLS_NAME: &str = "ExecuteTools";
 const SEARCH_TOOLS_NAME: &str = "SearchTools";
 const DESCRIBE_TOOLS_NAME: &str = "DescribeTools";
@@ -665,7 +664,7 @@ impl TranscriptWriter {
         self.text("\n", None);
     }
 
-    /// A call a script or batch made, with its result, indented under the call that made it.
+    /// A call a batch made, with its result, indented under the call that made it.
     fn nested_call(&mut self, operation: &OperationRecord) {
         let hang = RESULT_INDENT + BLOCK_INDENT;
         let dot = match operation.state {
@@ -765,7 +764,6 @@ fn transcript_arguments(name: &str, input: &Value) -> String {
         }
         WRITE_TOOL_NAME | EDIT_TOOL_NAME => field("file_path"),
         SUBAGENT_TOOL_NAME => field("description"),
-        CODEMODE_TOOL_NAME => field("code"),
         _ => match input {
             Value::Object(fields) => fields
                 .iter()
@@ -1105,18 +1103,18 @@ pub(super) struct ToolPresentation {
     detailed: bool,
     events: VecDeque<Event>,
     tick_labels: super::tick_labels::TickLabels,
-    /// Calls a script or batch made, by their row's key.
+    /// Calls a batch made, by their row's key.
     nested: HashMap<String, NestedCall>,
 }
 
-/// A call a script or batch made: the row of the call that made it, and what it calls.
+/// A call a batch made: the row of the call that made it, and what it calls.
 struct NestedCall {
     parent_key: String,
     name: String,
     input: Value,
 }
 
-/// The calls a script or batch made under `call_id` in `run`, in the order they were made.
+/// The calls a batch made under `call_id` in `run`, in the order they were made.
 pub(super) fn nested_operations<'a>(
     snapshot: &'a ChatSnapshot,
     run: Uuid,
@@ -1129,7 +1127,7 @@ pub(super) fn nested_operations<'a>(
 
 /// Whether a call of `name` makes calls of its own that show under its row.
 pub(super) fn makes_nested_calls(name: &str) -> bool {
-    matches!(name, CODEMODE_TOOL_NAME | EXECUTE_TOOLS_NAME)
+    name == EXECUTE_TOOLS_NAME
 }
 
 /// Where a call's result finds what it shows beyond itself.
@@ -1173,7 +1171,7 @@ impl ToolPresentation {
         }
         let display = console.display_profile()?;
         let cwd = console.working_directory()?;
-        // A call a script or batch made without starting, such as one it was denied, still
+        // A call a batch made without starting, such as one it was denied, still
         // shows its row under the call that made it.
         if let EventKind::ToolCompleted {
             call_id, result, ..
@@ -1433,7 +1431,7 @@ impl ToolPresentation {
     }
 
     /// The call of `event` whose parent this presentation has yet to learn: a call no assistant
-    /// message announced while a script or batch of the same Run was announced.
+    /// message announced while a batch of the same Run was announced.
     pub(super) fn nested_call_to_learn<'a>(&self, event: &'a Event) -> Option<&'a str> {
         let call_id = match &event.kind {
             EventKind::ToolStarted { call_id, .. } | EventKind::ToolCompleted { call_id, .. } => {
@@ -1468,7 +1466,7 @@ impl ToolPresentation {
         })
     }
 
-    /// Learns from the recorded operation of a call whether a script or batch made it.
+    /// Learns from the recorded operation of a call whether a batch made it.
     pub(super) fn learn_nested_call(&mut self, event: &Event, operation: &OperationRecord) {
         let Some(parent) = &operation.parent_call_id else {
             return;
@@ -1854,7 +1852,6 @@ pub(super) fn tool_name(name: &str) -> String {
 /// Where a nested call came from, in words rather than the parent's internal call id.
 fn nested_call_origin(request: &PermissionRequest, parent: &ProposedToolCall) -> String {
     match parent.name.as_str() {
-        CODEMODE_TOOL_NAME => "a Codemode script".into(),
         EXECUTE_TOOLS_NAME => {
             let calls = parent.input["calls"]
                 .as_array()
@@ -2033,17 +2030,9 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
 fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let quickstart;
-    let script;
     let described_tools;
     let batched_calls;
     let primary = match name {
-        CODEMODE_TOOL_NAME => {
-            let lines = input["code"]
-                .as_str()
-                .map_or(0, |code| code.lines().count());
-            script = format!("{lines}-line script");
-            Some(script.as_str())
-        }
         "ArtifactRead" if input["action"] == "quickstart" => {
             quickstart = format!(
                 "quickstart {}",
@@ -2653,11 +2642,6 @@ fn compact_result_runs(
         for line in lines {
             rows.row([(line, Some(Role::MutedText))]);
         }
-        return rows.runs;
-    }
-    // A script's result already starts with how it ended.
-    if name == CODEMODE_TOOL_NAME {
-        rows.preview(&result.content, false, body);
         return rows.runs;
     }
     if name == BASH_TOOL_NAME {
@@ -4992,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_permission_context_names_the_batch_position_or_script_instead_of_call_ids() {
+    fn nested_permission_context_names_the_batch_position_instead_of_call_ids() {
         const PARENT_CALL_ID: &str = "call_ba6b11|fc_06ed|7b13";
         let batch = json!({"calls":[
             {"name":"mcp__ui5__get_version_info","arguments":{}},
@@ -5027,14 +5011,6 @@ mod tests {
         assert_eq!(
             permission_context(&request)[1],
             "From an ExecuteTools batch of 3 calls (model-authored; not user authorization)"
-        );
-
-        let parent = request.parent_call.as_mut().unwrap();
-        parent.name = "Codemode".into();
-        parent.input = json!({"code":"await tools.mcp__ui5__run_ui5_linter({dir:'app'})"});
-        assert_eq!(
-            permission_context(&request)[1],
-            "From a Codemode script (model-authored; not user authorization)"
         );
     }
 

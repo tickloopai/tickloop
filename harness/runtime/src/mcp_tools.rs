@@ -336,6 +336,7 @@ pub struct McpHostToolProvider {
     artifact: Arc<ArtifactClient>,
     native: Option<Arc<dyn HostToolProvider>>,
     directory: RwLock<Option<Directory>>,
+    catalog_generation: std::sync::atomic::AtomicU64,
     service_status: RwLock<ArtifactServiceStatus>,
     skill_files: RwLock<BTreeMap<SkillFileKey, String>>,
     publication_admissions: RwLock<HashSet<ArtifactPublicationAdmission>>,
@@ -478,6 +479,7 @@ impl McpHostToolProvider {
             artifact: Arc::new(artifact),
             native,
             directory: RwLock::new(None),
+            catalog_generation: std::sync::atomic::AtomicU64::new(0),
             service_status: RwLock::new(ArtifactServiceStatus::default()),
             skill_files: RwLock::new(BTreeMap::new()),
             publication_admissions: RwLock::new(HashSet::new()),
@@ -599,6 +601,8 @@ impl McpHostToolProvider {
 
     fn clear_directory(&self) {
         *self.directory.write().unwrap() = None;
+        self.catalog_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.skill_files.write().unwrap().clear();
     }
 
@@ -1607,20 +1611,6 @@ impl McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
-        if result.is_error != Some(true) && crate::nested_calls::is_script() {
-            let mut serialized = serde_json::to_string(&result).unwrap_or_default();
-            let mut tokens = vec![current.access_token.clone()];
-            if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
-                tokens.push(latest.access_token);
-            }
-            for token in tokens.into_iter().filter(|token| !token.is_empty()) {
-                let encoded = serde_json::to_string(&token).unwrap();
-                serialized = serialized.replace(&encoded[1..encoded.len() - 1], "[redacted]");
-            }
-            if let Ok(value) = serde_json::from_str(&serialized) {
-                crate::nested_calls::capture_script_value(value);
-            }
-        }
         let mut tool_result = Self::model_result(result, &current.access_token);
         if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
             tool_result.content = tool_result
@@ -1694,6 +1684,21 @@ impl HostToolProvider for McpHostToolProvider {
 
     /// Native tools never take the Artifact names; only the service directory provides them,
     /// together with the provider's own upload, and the provider offers sign-in while signed out.
+    fn catalog_generation(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let native = match &self.native {
+            Some(native) => native.catalog_generation()?,
+            None => 0,
+        };
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        native.hash(&mut hash);
+        self.catalog_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .hash(&mut hash);
+        (self.service_status.read().unwrap().authentication == ArtifactAuthentication::SignedOut)
+            .hash(&mut hash);
+        Some(hash.finish())
+    }
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
             .native
@@ -2023,6 +2028,8 @@ impl HostToolProvider for McpHostToolProvider {
                         Ok(directory) => {
                             status.tool_directory = McpToolDirectory::Available;
                             *self.directory.write().unwrap() = Some(directory);
+                            self.catalog_generation
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         Err(failure) => {
                             status.directory_rejected =

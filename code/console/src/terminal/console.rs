@@ -5341,7 +5341,7 @@ pub(super) enum ConversationPiece {
         spans: Vec<(String, Option<Role>)>,
         state: ToolCallState,
         collapse: Option<CollapsedCall>,
-        /// The row of the script or batch call that made this call.
+        /// The row of the batch call that made this call.
         parent_key: Option<String>,
     },
     /// The result of the call named `call_key`, drawn under the call's own row.

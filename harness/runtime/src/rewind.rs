@@ -417,9 +417,6 @@ pub(super) fn conversation_before(
         })
         .collect();
     candidate.message_runs.split_off(&index);
-    candidate_bookkeeping
-        .codemode_store
-        .retain(|entry| super::codemode_store::is_on_chain(&candidate, entry));
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
     candidate_bookkeeping.message_responses.split_off(&index);

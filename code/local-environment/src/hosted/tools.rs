@@ -1821,6 +1821,9 @@ fn completed(value: Value) -> HostCallResult {
 
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
+    fn catalog_generation(&self) -> Option<u64> {
+        Some(0)
+    }
     fn is_concurrency_safe(&self, name: &str, _input: &Value) -> bool {
         matches!(
             name,

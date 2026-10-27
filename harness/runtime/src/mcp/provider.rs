@@ -15,7 +15,11 @@ pub struct McpConfiguration {
 
 pub struct McpToolProvider {
     connections: McpConnections,
-    configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
+    configuration: Arc<dyn Fn() -> Option<McpConfiguration> + Send + Sync>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    #[cfg(feature = "test-support")]
+    configuration_parses: AtomicU64,
+    current: RwLock<Vec<McpServerConfig>>,
     warnings: RwLock<Vec<String>>,
 }
 impl McpToolProvider {
@@ -36,11 +40,50 @@ impl McpToolProvider {
         connections: McpConnections,
         configuration: Arc<dyn Fn() -> McpConfiguration + Send + Sync>,
     ) -> Self {
+        Self::with_configuration_updates(connections, Arc::new(move || Some(configuration())))
+    }
+
+    /// The host returns `None` when its configuration and credential files are unchanged.
+    pub fn with_configuration_updates(
+        connections: McpConnections,
+        configuration: Arc<dyn Fn() -> Option<McpConfiguration> + Send + Sync>,
+    ) -> Self {
         Self {
             connections,
             configuration,
+            refresh_lock: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "test-support")]
+            configuration_parses: AtomicU64::new(0),
+            current: RwLock::new(Vec::new()),
             warnings: RwLock::new(Vec::new()),
         }
+    }
+
+    async fn update_configuration(&self, restart: Restart<'_>) -> Result<(), String> {
+        let _guard = self.refresh_lock.lock().await;
+        let configuration = self.configuration.clone();
+        let timing = crate::timing::Phase::new("configuration");
+        let configuration = tokio::task::spawn_blocking(move || configuration())
+            .await
+            .map_err(|_| "MCP configuration unavailable")?;
+        drop(timing);
+        let timing = crate::timing::Phase::new("reconcile");
+        if let Some(configuration) = configuration {
+            #[cfg(feature = "test-support")]
+            self.configuration_parses.fetch_add(1, Ordering::Relaxed);
+            *self.current.write().unwrap() = configuration.servers.clone();
+            self.connections
+                .reconcile_restarting(configuration.servers, restart)
+                .await;
+            *self.warnings.write().unwrap() = configuration.warnings;
+        } else if matches!(restart, Restart::Server(_)) {
+            let configs = self.current.read().unwrap().clone();
+            self.connections
+                .reconcile_restarting(configs, restart)
+                .await;
+        }
+        drop(timing);
+        Ok(())
     }
     fn authority(entry: &Entry) -> HostToolAuthority {
         let mut hash = Sha256::new();
@@ -56,6 +99,29 @@ impl McpToolProvider {
 }
 #[async_trait]
 impl HostToolProvider for McpToolProvider {
+    #[cfg(feature = "test-support")]
+    fn mcp_performance_counts(&self) -> (u64, u64, u64) {
+        let (catalog, redactor) = self.connections.performance_counts();
+        (
+            catalog,
+            redactor,
+            self.configuration_parses.load(Ordering::Relaxed),
+        )
+    }
+    fn catalog_generation(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for (name, entry) in self.connections.inner.entries.read().unwrap().iter() {
+            name.hash(&mut hash);
+            (Arc::as_ptr(entry) as usize).hash(&mut hash);
+            entry.generation.load(Ordering::SeqCst).hash(&mut hash);
+            if let Some(connection) = entry.connection.read().unwrap().as_ref() {
+                connection.revision.load(Ordering::SeqCst).hash(&mut hash);
+            }
+            (*entry.state.read().unwrap() == McpServerState::NeedsLogin).hash(&mut hash);
+        }
+        Some(hash.finish())
+    }
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.discovery_tools()
             .into_iter()
@@ -70,24 +136,13 @@ impl HostToolProvider for McpToolProvider {
         self.connections
             .catalog()
             .into_iter()
-            .map(|(entry, _, tool)| {
-                let mut original_schema = tool.schema;
-                redact_schema(&entry, &mut original_schema);
-                let mut annotations = tool.annotations;
-                redact_schema(&entry, &mut annotations);
-                crate::tool_exposure::ExposureTool {
-                    exposure: crate::tool_exposure::effective_exposure(
-                        entry.config.exposure,
-                        &entry.config.tool_exposure,
-                        &tool.original,
-                    )
-                    .for_host(self.connections.inner.capabilities.scripts),
-                    server: entry.config.name.clone(),
-                    original_name: tool.original,
-                    definition: tool.definition,
-                    original_schema,
-                    annotations,
-                }
+            .map(|(entry, _, tool)| crate::tool_exposure::ExposureTool {
+                exposure: tool.exposure,
+                server: entry.config.name.clone(),
+                original_name: tool.original.clone(),
+                definition: tool.definition.clone(),
+                original_schema: tool.original_schema.clone(),
+                annotations: tool.annotations.clone(),
             })
             .collect()
     }
@@ -96,10 +151,14 @@ impl HostToolProvider for McpToolProvider {
         self.connections.unavailable_tool_servers()
     }
 
-    fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
-        let validator =
-            jsonschema::validator_for(schema).map_err(|_| format!("invalid {name} schema"))?;
-        validator
+    fn validate_input(&self, name: &str, _: &Value, input: &Value) -> Result<(), String> {
+        let (_, _, tool) = self
+            .connections
+            .catalog()
+            .into_iter()
+            .find(|(_, _, tool)| tool.definition.name == name)
+            .ok_or("MCP tool unavailable")?;
+        tool.display_validator
             .validate(input)
             .map_err(|_| format!("invalid {name} input"))
     }
@@ -125,30 +184,27 @@ impl HostToolProvider for McpToolProvider {
         if cancel.is_cancelled() {
             return Err("MCP refresh cancelled".into());
         }
-        let configuration = (self.configuration)();
-        self.connections.reconcile(configuration.servers).await;
-        *self.warnings.write().unwrap() = configuration.warnings;
+        self.update_configuration(Restart::Failed).await?;
+        let _timing = crate::timing::Phase::new("wait_for_startup");
         self.connections.wait_for_startup(cancel).await;
         Ok(())
     }
     async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
         if !cancel.is_cancelled() {
-            let configuration = (self.configuration)();
-            self.connections
-                .reconcile_keeping_failures(configuration.servers)
-                .await;
-            *self.warnings.write().unwrap() = configuration.warnings;
+            let _ = self.update_configuration(Restart::Nothing).await;
         }
         self.connections.statuses()
     }
     async fn reconnect_mcp_server(&self, name: &str) -> bool {
-        let configuration = (self.configuration)();
-        let reconnected = self
-            .connections
-            .reconnect(configuration.servers, name)
-            .await;
-        *self.warnings.write().unwrap() = configuration.warnings;
-        reconnected
+        self.update_configuration(Restart::Server(name))
+            .await
+            .is_ok()
+            && self
+                .current
+                .read()
+                .unwrap()
+                .iter()
+                .any(|config| config.name == name)
     }
     fn service_connections(&self) -> Value {
         serde_json::json!({"mcp": {"warnings": *self.warnings.read().unwrap()}})
@@ -166,11 +222,8 @@ impl HostToolProvider for McpToolProvider {
                         &snapshot.name,
                         &snapshot.source,
                         &snapshot.state,
-                        entry
-                            .config
-                            .exposure
-                            .for_host(self.connections.inner.capabilities.scripts),
-                        &redact(entry, entry.config.description.clone()),
+                        entry.config.exposure,
+                        &entry.description.read().unwrap(),
                         &snapshot.instructions,
                     ),
                     server: McpResourceServer {
@@ -233,9 +286,6 @@ impl HostToolProvider for McpToolProvider {
     ) -> Result<PreparedHostCall, String> {
         if cancel.is_cancelled() {
             return Err("MCP call cancelled before preparation".into());
-        }
-        if !self.definitions().iter().any(|tool| tool.name == name) {
-            return Err("MCP tool is unavailable or hidden".into());
         }
         let call = self
             .connections

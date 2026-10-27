@@ -37,8 +37,6 @@ struct AutoPermissionDecision {
 
 #[derive(Clone)]
 enum ToolRoute {
-    #[cfg(feature = "codemode")]
-    Codemode,
     Fold(Arc<crate::tool_exposure::ExposureDirectory>),
     BuiltIn,
     Plan,
@@ -170,7 +168,6 @@ const FOLDER_HOST_TOOLS: [&str; 6] = [
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
-    script_only: std::collections::BTreeSet<String>,
     /// Callable directly, but offered only through the model's native tool search.
     deferred: Vec<ToolDefinition>,
     /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
@@ -205,13 +202,6 @@ impl ToolRegistry {
                 route: ToolRoute::BuiltIn,
             })
             .collect::<Vec<_>>();
-        #[cfg(feature = "codemode")]
-        if policy.scripts {
-            tools.push(RegisteredTool {
-                definition: crate::codemode_tool::definition(),
-                route: ToolRoute::Codemode,
-            });
-        }
         if policy.plan {
             tools.extend(
                 plan::definitions(is_delegated)
@@ -311,7 +301,6 @@ impl ToolRegistry {
             );
         }
         let mut folded = std::collections::BTreeSet::new();
-        let mut script_only = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
             if provider.has_tool_search()
@@ -342,14 +331,6 @@ impl ToolRegistry {
                         })
                     })
                     .collect::<Vec<_>>();
-                script_only.extend(
-                    discovery
-                        .iter()
-                        .filter(|tool| {
-                            tool.exposure == tickloop_harness_protocol::mcp::ToolExposure::Codemode
-                        })
-                        .map(|tool| tool.definition.name.clone()),
-                );
                 let search_support =
                     if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model)
                         .is_some()
@@ -359,7 +340,7 @@ impl ToolRegistry {
                         crate::tool_exposure::SearchSupport::Fold
                     };
                 let directory = Arc::new(
-                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support, true)
+                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support)
                         .with_unavailable_servers(provider.unavailable_tool_servers()),
                 );
                 deferred = directory.deferred_tools();
@@ -403,7 +384,6 @@ impl ToolRegistry {
         Self {
             tools: merge_tick_management(tools),
             folded,
-            script_only,
             deferred,
             offers_web_search: policy.web_search,
         }
@@ -475,18 +455,6 @@ impl ToolRegistry {
             return None;
         }
         self.resolve_nested(name)
-    }
-
-    pub(super) fn script_only(&self, name: &str) -> bool {
-        self.script_only.contains(name)
-    }
-
-    #[cfg(feature = "codemode")]
-    pub(crate) fn script_tools(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .map(|tool| tool.definition.name.clone())
-            .collect()
     }
 
     pub(super) fn resolve_nested(&self, name: &str) -> Option<RegisteredTool> {
@@ -783,8 +751,6 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
-            #[cfg(feature = "codemode")]
-            ToolRoute::Codemode => unreachable!("Codemode executes through nested calls"),
             ToolRoute::Fold(directory) => {
                 let value = match operation.name.as_str() {
                     crate::tool_exposure::SEARCH_TOOLS => directory.search(&operation.input),
@@ -886,20 +852,6 @@ impl Agent {
         invocation: ToolInvocation,
         cancel: CancellationToken,
     ) -> Result<ToolCallOutcome, ToolCallError> {
-        #[cfg(feature = "codemode")]
-        if matches!(
-            invocation.registration.as_ref().map(|tool| &tool.route),
-            Some(ToolRoute::Codemode)
-        ) {
-            return Box::pin(self.execute_codemode(
-                receipt,
-                assistant_message_id,
-                invocation.id,
-                invocation.input,
-                cancel,
-            ))
-            .await;
-        }
         if invocation.name == crate::tool_exposure::EXECUTE_TOOLS
             && matches!(
                 invocation.registration.as_ref().map(|tool| &tool.route),
@@ -2905,12 +2857,7 @@ mod tests {
     /// must be a tool the model can be given.
     #[test]
     fn shipped_skills_name_only_tools_the_agent_offers() {
-        const NOT_TOOLS: [&str; 4] = [
-            "OutcomeUnknown",
-            "TickUpdate",
-            "CallToolResult",
-            "JavaScript",
-        ];
+        const NOT_TOOLS: [&str; 3] = ["OutcomeUnknown", "TickUpdate", "CallToolResult"];
         let tools = built_in_definitions()
             .into_iter()
             .chain(crate::tool_exposure::fold_definitions())

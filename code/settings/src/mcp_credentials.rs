@@ -19,6 +19,7 @@ const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
 // Leave room for the atomic writer's pid and random suffix.
 const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 
+#[derive(Clone)]
 pub struct FileCredentials {
     directory: PrivateDirectory,
     name: String,
@@ -71,6 +72,41 @@ impl FileCredentials {
         })
     }
 
+    fn load_file(&self) -> Result<Option<ConnectorCredential>, CredentialError> {
+        // A missing login must not create directories merely because an Agent connects.
+        if !self
+            .directory
+            .path()
+            .try_exists()
+            .map_err(|_| CredentialError("read"))?
+        {
+            return Ok(None);
+        }
+        self.directory
+            .create()
+            .map_err(|_| CredentialError("read"))?;
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.path("json"))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(CredentialError("read")),
+        };
+        Self::verify_file(&file).map_err(|_| CredentialError("read"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_CREDENTIAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| CredentialError("read"))?;
+        if bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
+            return Err(CredentialError("read"));
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| CredentialError("read"))
+    }
+
     fn path(&self, extension: &str) -> PathBuf {
         self.directory
             .path()
@@ -116,38 +152,10 @@ impl ConnectorCredentials for FileCredentials {
     }
 
     async fn load(&self) -> Result<Option<ConnectorCredential>, CredentialError> {
-        // A missing login must not create directories merely because an Agent connects.
-        if !self
-            .directory
-            .path()
-            .try_exists()
+        let adapter = self.clone();
+        tokio::task::spawn_blocking(move || adapter.load_file())
+            .await
             .map_err(|_| CredentialError("read"))?
-        {
-            return Ok(None);
-        }
-        self.directory
-            .create()
-            .map_err(|_| CredentialError("read"))?;
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path("json"))
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(CredentialError("read")),
-        };
-        Self::verify_file(&file).map_err(|_| CredentialError("read"))?;
-        let mut bytes = Vec::new();
-        file.take(MAX_CREDENTIAL_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| CredentialError("read"))?;
-        if bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
-            return Err(CredentialError("read"));
-        }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| CredentialError("read"))
     }
 
     async fn save(&self, credential: &ConnectorCredential) -> Result<(), CredentialError> {

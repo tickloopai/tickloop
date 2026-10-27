@@ -138,6 +138,7 @@ impl Agent {
         receipt: &Receipt,
         runs_ticks: bool,
     ) -> Result<(), AgentError> {
+        let timing = crate::timing::Phase::new("mcp_instructions");
         let instructions = crate::host_provider_is_confirmed(&self.inner.host_tools).then(|| {
             self.inner
                 .host_tools
@@ -147,6 +148,7 @@ impl Agent {
                 .map(|provider| provider.mcp_instructions())
                 .unwrap_or_default()
         });
+        drop(timing);
         let (snapshot, bookkeeping) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats

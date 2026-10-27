@@ -15,6 +15,27 @@ fn exposure_defaults_to_search_and_preserves_override_order() {
 }
 
 #[test]
+fn unknown_exposure_values_fail_the_server_with_a_warning() {
+    use tickloop_harness::protocol::mcp::McpTransport;
+    let settings = json!({"mcpServers": {
+        "server_wide": {"command":"server","exposure":"bogus"},
+        "per_tool": {"command":"server","toolExposure":{"mail":"bogus","*":"direct"}}
+    }});
+    let resolved = resolve_servers(&settings, Path::new("/work"), &BTreeMap::new());
+    assert!(resolved.servers.iter().all(|server| matches!(
+        &server.transport,
+        McpTransport::Failed { reason } if reason == "invalid tool exposure configuration"
+    )));
+    assert_eq!(
+        resolved.warnings,
+        [
+            "MCP per_tool: invalid tool exposure configuration",
+            "MCP server_wide: invalid tool exposure configuration",
+        ]
+    );
+}
+
+#[test]
 fn directory_overrides_global_and_expands_only_the_startup_environment() {
     let settings = json!({"mcpServers": {
         "local": {"command":"old"},

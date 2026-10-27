@@ -1417,8 +1417,7 @@ fn tool_call_text(
     text
 }
 
-/// The calls a script or batch made, each with its result, under the row of the call that made
-/// them.
+/// The calls a batch made, each with its result, under the row of the call that made them.
 fn append_nested_calls(
     history: &mut PublicHistoryBuilder,
     run: Uuid,

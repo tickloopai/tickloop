@@ -137,8 +137,6 @@ pub enum WaitHosting {
 /// follows its own settings, such as Task tools or web search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolPolicy {
-    /// Whether this host can execute Codemode scripts; also requires the codemode feature.
-    pub scripts: bool,
     pub web_fetch: bool,
     pub web_search: bool,
     pub skills: bool,
@@ -181,7 +179,6 @@ impl ToolPolicy {
     /// Every capability: a local Agent's.
     pub const fn local() -> Self {
         Self {
-            scripts: cfg!(feature = "codemode"),
             web_fetch: true,
             web_search: true,
             skills: true,
@@ -207,7 +204,6 @@ impl ToolPolicy {
     /// Transcript keeps.
     pub const fn durable_chat() -> Self {
         Self {
-            scripts: false,
             web_fetch: true,
             web_search: false,
             skills: true,
@@ -241,7 +237,6 @@ impl ToolPolicy {
     /// WebFetch alone: nothing waits for a person, and nothing outlives the turn.
     pub const fn web_fetch_only() -> Self {
         Self {
-            scripts: false,
             web_fetch: true,
             web_search: false,
             skills: false,

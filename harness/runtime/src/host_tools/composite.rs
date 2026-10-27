@@ -22,38 +22,103 @@ impl IntoHostToolSources for Vec<Arc<dyn HostToolProvider>> {
 
 pub(crate) struct CompositeHostTools {
     sources: Vec<Arc<dyn HostToolProvider>>,
+    index: std::sync::RwLock<Arc<SourceIndex>>,
+}
+#[derive(Default)]
+struct SourceIndex {
+    generations: Vec<Option<u64>>,
+    names: std::collections::BTreeMap<String, Option<usize>>,
+    definitions: Vec<ToolDefinition>,
+    discovery: Vec<crate::tool_exposure::ExposureTool>,
 }
 impl CompositeHostTools {
-    pub(crate) fn combine(
-        mut sources: Vec<Arc<dyn HostToolProvider>>,
-    ) -> Arc<dyn HostToolProvider> {
-        if sources.len() == 1 {
-            return sources.pop().unwrap();
-        }
-        Arc::new(Self { sources })
+    pub(crate) fn combine(sources: Vec<Arc<dyn HostToolProvider>>) -> Arc<dyn HostToolProvider> {
+        let combined = Self {
+            sources,
+            index: std::sync::RwLock::new(Arc::new(SourceIndex::default())),
+        };
+        combined.update_index(true);
+        Arc::new(combined)
     }
-    fn source(&self, name: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
-        let mut matches = self
+    fn update_index(&self, refreshed: bool) -> Arc<SourceIndex> {
+        let generations: Vec<_> = self
             .sources
             .iter()
-            .filter(|source| source.definitions().iter().any(|tool| tool.name == name));
-        let source = matches.next().ok_or("host tool unavailable")?;
-        if matches.next().is_some() {
-            return Err("host tool has conflicting sources".into());
+            .map(|source| source.catalog_generation())
+            .collect();
+        let current = self.index.read().unwrap().clone();
+        if current.generations == generations
+            && !(refreshed && generations.iter().any(Option::is_none))
+        {
+            return current;
         }
-        Ok(source)
+        let mut next = SourceIndex {
+            generations: generations.clone(),
+            ..Default::default()
+        };
+        for (index, source) in self.sources.iter().enumerate() {
+            for definition in source.definitions() {
+                next.names
+                    .entry(definition.name.clone())
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(index));
+                next.definitions.push(definition);
+            }
+            next.discovery.extend(source.discovery_tools());
+        }
+        next.definitions
+            .retain(|tool| next.names[&tool.name].is_some());
+        next.discovery.retain(|tool| {
+            next.names
+                .get(&tool.definition.name)
+                .is_none_or(Option::is_some)
+        });
+        let next = Arc::new(next);
+        let mut index = self.index.write().unwrap();
+        // A concurrent refresh may have published while this index was being assembled.
+        if Arc::ptr_eq(&index, &current)
+            && self
+                .sources
+                .iter()
+                .map(|source| source.catalog_generation())
+                .eq(generations)
+        {
+            *index = next.clone();
+            next
+        } else {
+            index.clone()
+        }
+    }
+    fn source(&self, name: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
+        let index = self.update_index(false);
+        match index.names.get(name) {
+            Some(Some(owner)) => Ok(&self.sources[*owner]),
+            Some(None) => Err("host tool has conflicting sources".into()),
+            None => Err("host tool unavailable".into()),
+        }
     }
     fn authority_source(&self, name: &str) -> Result<Option<&Arc<dyn HostToolProvider>>, String> {
-        let artifact = crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name);
-        let mut matches = self.sources.iter().filter(|source| {
-            source.definitions().iter().any(|tool| tool.name == name)
-                || artifact && source.artifact_client().is_some()
-        });
-        let source = matches.next();
-        if matches.next().is_some() {
-            return Err("host tool has conflicting authorities".into());
+        let index = self.update_index(false);
+        let mut owner = match index.names.get(name) {
+            Some(Some(owner)) => Some(*owner),
+            Some(None) => return Err("host tool has conflicting authorities".into()),
+            None => None,
+        };
+        if crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) {
+            for (candidate, source) in self
+                .sources
+                .iter()
+                .enumerate()
+                .filter(|(_, source)| source.artifact_client().is_some())
+            {
+                let _ = source;
+                if owner.is_some_and(|owner| owner != candidate) {
+                    return Err("host tool has conflicting authorities".into());
+                }
+                owner = Some(candidate);
+            }
         }
-        Ok(source)
+        Ok(owner.map(|owner| &self.sources[owner]))
     }
     fn resource_source(&self, server: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
         let mut matches = self.sources.iter().filter(|source| {
@@ -79,22 +144,18 @@ impl CompositeHostTools {
 }
 #[async_trait]
 impl HostToolProvider for CompositeHostTools {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        let all: Vec<_> = self
-            .sources
-            .iter()
-            .flat_map(|source| source.definitions())
-            .collect();
-        all.iter()
-            .filter(|tool| all.iter().filter(|other| other.name == tool.name).count() == 1)
-            .cloned()
-            .collect()
-    }
-    fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+    #[cfg(feature = "test-support")]
+    fn mcp_performance_counts(&self) -> (u64, u64, u64) {
         self.sources
             .iter()
-            .flat_map(|source| source.discovery_tools())
-            .collect()
+            .map(|source| source.mcp_performance_counts())
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+    }
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.update_index(false).definitions.clone()
+    }
+    fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+        self.update_index(false).discovery.clone()
     }
     fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
         self.sources
@@ -136,6 +197,7 @@ impl HostToolProvider for CompositeHostTools {
         let results =
             futures_util::future::join_all(self.sources.iter().map(|s| s.refresh(cancel.clone())))
                 .await;
+        self.update_index(true);
         results.into_iter().collect()
     }
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {

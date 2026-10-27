@@ -1035,3 +1035,56 @@ async fn composed_host_sources_allow_delegation_without_available_artifacts() {
     );
     agent.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_host_refresh_leaves_other_chat_submission_status_and_stop_responsive() {
+    struct BlockedProvider {
+        entered: tokio::sync::Notify,
+        release: CancellationToken,
+    }
+    #[async_trait]
+    impl HostToolProvider for BlockedProvider {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        async fn refresh(&self, cancel: CancellationToken) -> Result<(), String> {
+            self.entered.notify_one();
+            tokio::select! { _ = self.release.cancelled() => {}, _ = cancel.cancelled() => {} }
+            Ok(())
+        }
+        fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+            HostToolPermission::ReadOnly
+        }
+        async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
+            unreachable!()
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider = Arc::new(BlockedProvider {
+        entered: tokio::sync::Notify::new(),
+        release: CancellationToken::new(),
+    });
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("done"), text("done")])),
+    );
+    agent.install_host_tools(provider.clone()).unwrap();
+    let first = agent.create_chat(root.path().into()).await.unwrap();
+    let second = agent.create_chat(root.path().into()).await.unwrap();
+    agent.submit(first, "wait".into()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        agent.submit(second, "hello".into()).await.unwrap();
+        agent.snapshot(second).await.unwrap();
+        agent.stop(second).await.unwrap();
+    })
+    .await;
+    provider.release.cancel();
+    agent.shutdown().await;
+    responsive.expect("another Chat must remain responsive while refreshing host tools");
+}

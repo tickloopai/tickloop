@@ -54,9 +54,6 @@ pub enum Line {
     /// A Run's durable wait; the latest record of a wait id wins.
     Wait(WaitEntry),
     NestedCall(NestedCallEntry),
-    /// Values a successful Codemode script stored; every one is kept, and a load applies those
-    /// on the loaded conversation chain in order.
-    CodemodeStore(CodemodeStoreEntry),
     /// The retained state of the Chat as of this Line: loading it stands for every retained Line
     /// before it.
     RetainedSnapshot(RetainedSnapshotEntry),
@@ -158,7 +155,6 @@ pub enum MetadataKind {
     Input,
     Wait,
     NestedCall,
-    CodemodeStore,
     RetainedSnapshot,
     #[serde(other)]
     Other,
@@ -185,10 +181,9 @@ impl MetadataKind {
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Goal | Self::ScheduledTasks => Retention::SourceState,
             Self::Response | Self::Input | Self::Wait | Self::NestedCall => Retention::LatestById,
-            Self::FileHistorySnapshot
-            | Self::ContentReplacement
-            | Self::GoalEvent
-            | Self::CodemodeStore => Retention::Accumulating,
+            Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
+                Retention::Accumulating
+            }
             Self::RetainedSnapshot => Retention::Snapshot,
             Self::Other => Retention::Unknown,
         }
@@ -264,7 +259,6 @@ impl Line {
             Self::Input(_) => MetadataKind::Input,
             Self::Wait(_) => MetadataKind::Wait,
             Self::NestedCall(_) => MetadataKind::NestedCall,
-            Self::CodemodeStore(_) => MetadataKind::CodemodeStore,
             Self::RetainedSnapshot(_) => MetadataKind::RetainedSnapshot,
             Self::Unknown(_) => MetadataKind::Other,
         }
@@ -1300,39 +1294,4 @@ mod tests {
 pub struct NestedCallEntry {
     pub chat_id: Uuid,
     pub operation: tickloop_harness_protocol::OperationRecord,
-}
-
-/// What one successful Codemode script changed with `store()`. The Codemode call it belongs to
-/// decides which conversation chains see it. An entry without one holds the whole store at that
-/// point: the values a Branch or a copy under a new Chat id started with, or those a compaction
-/// kept after the calls that stored them left the conversation.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodemodeStoreEntry {
-    pub chat_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(default)]
-    pub set: std::collections::BTreeMap<String, serde_json::Value>,
-    #[serde(default)]
-    pub delete: Vec<String>,
-}
-
-impl CodemodeStoreEntry {
-    /// The Run and Codemode call whose script stored these values; none for a whole store.
-    pub fn parent_call(&self) -> Option<(Uuid, &str)> {
-        self.run_id.zip(self.call_id.as_deref())
-    }
-
-    pub fn apply_to(&self, store: &mut std::collections::BTreeMap<String, serde_json::Value>) {
-        if self.parent_call().is_none() {
-            store.clear();
-        }
-        for key in &self.delete {
-            store.remove(key);
-        }
-        store.extend(self.set.clone());
-    }
 }

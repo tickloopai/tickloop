@@ -105,20 +105,18 @@ Custom rules and group replacements stay independent; users who replace the buil
 
 Review uses the existing frozen rules: the MCP tool name and the model-written input are the proposed action, while server instructions, descriptions, annotations and results stay untrusted data and are redacted of the server's sensitive values before they reach any model. No rule is added or removed: the 82-rule policy and nine inapplicable native entry points above are unchanged. Review is not waived by an Unrestricted host (`--dangerously-skip-permissions`): there a third-party call is still reviewed in Auto and still asks in Ask, and an escalation reaches a person; a host that cannot ask denies what the reviewer does not allow. Resource discovery and reading use ReadOnly admission with the same frozen server authority.
 
-The browser-specific entries above remain inapplicable: connecting an arbitrary MCP browser does not implement the trusted native browser admission paths. Its tools follow ThirdParty admission, so in Auto the general rules (exfiltration, out-of-scope actions and the rest) judge them like any other action. Automated coverage is in `harness/runtime/tests/all/third_party_approval.rs`, the Codemode and MCP server tests and the Console MCP confirmation tests: an admitted call runs without a prompt, a rejected one is not dispatched and the third consecutive rejection asks a person, and batch and script calls carry the whole batch or script. These use a reviewer test double; they prove deterministic routing, persistence and denial boundaries, not semantic acceptance by a real reviewer.
+The browser-specific entries above remain inapplicable: connecting an arbitrary MCP browser does not implement the trusted native browser admission paths. Its tools follow ThirdParty admission, so in Auto the general rules (exfiltration, out-of-scope actions and the rest) judge them like any other action. Automated coverage is in `harness/runtime/tests/all/third_party_approval.rs`, the Fold and MCP server tests and the Console MCP confirmation tests: an admitted call runs without a prompt, a rejected one is not dispatched and the third consecutive rejection asks a person, and batch calls carry the whole batch. These use a reviewer test double; they prove deterministic routing, persistence and denial boundaries, not semantic acceptance by a real reviewer.
 
 Permission history uses the same prepared service identity for matching as admission, and records the original service rule ID and matcher for Allow, Ask and Deny, including tools whose displayed names were hashed.
 
-## Fold, Codemode and nested calls
+## Fold and nested calls
 
 | Tool | Permission and Auto handling | Authorization boundary |
 | --- | --- | --- |
 | SearchTools / DescribeTools | ReadOnly; no review | Discovery respects exposure and the delegated tool ceiling; annotations are reference data only |
-| ExecuteTools / Codemode | No wrapper approval | Each child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
+| ExecuteTools | No wrapper approval | Each independent child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
 
 Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and nine inapplicable entries remain unchanged.
-
-Codemode runs only when the host enables scripts and the independent `codemode` facade feature is compiled. Its sandbox has no direct file, network, timer or module access. The complete script and earlier observed child results enter Auto evidence as model-authored material, never user authorization. Human confirmation pauses the script deadline while other calls can finish. An effective Auto rejection ends the script, preserves the rejection reason and uses the existing denial count; user denial throws an Error that the script may handle. Plan and the frozen/current parent permissions still apply to every child. The wrapper grants no permissions and adds no policy rules: the 82 rules and nine inapplicable entries remain unchanged.
 
 ## Linked worktrees of the Folder's repository
 

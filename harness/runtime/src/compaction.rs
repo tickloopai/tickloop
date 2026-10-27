@@ -78,11 +78,6 @@ impl CompactionLayout {
         let rewrites_existing = !self.keeps_existing_prefix(snapshot.messages.len());
         let mut compacted = snapshot.clone();
         let mut compacted_bookkeeping = bookkeeping.clone();
-        // The calls that stored values may leave the conversation; their values stay.
-        compacted_bookkeeping.codemode_store =
-            super::codemode_store::whole_store(snapshot.id, snapshot, &bookkeeping.codemode_store)
-                .into_iter()
-                .collect();
         compacted_bookkeeping.lifecycle.remember_compacted_leaf(
             bookkeeping
                 .lifecycle

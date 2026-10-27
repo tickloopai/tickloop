@@ -415,7 +415,18 @@ pub(crate) struct HostToolUpgradeCheckpoint {
 
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
+    #[cfg(feature = "test-support")]
+    fn mcp_performance_counts(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition>;
+
+    /// A revision of already-published definitions. Versioned providers must serve cheap reads.
+    /// Unversioned providers are captured only at installation and after refresh, outside Chats.
+    fn catalog_generation(&self) -> Option<u64> {
+        None
+    }
 
     fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
         Vec::new()

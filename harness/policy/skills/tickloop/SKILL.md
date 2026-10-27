@@ -1,11 +1,11 @@
 ---
 name: tickloop
-description: Discover and call connected MCP tools, use Tool Search or Codemode, handle server login or configuration status, or open or operate a Tick, including the programs of installed plugins, or subscribe a Loop to Tick updates. Use it when the user wants to see what an installed plugin shows, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
+description: Discover and call connected MCP tools, use Tool Search, handle server login or configuration status, or open or operate a Tick, including the programs of installed plugins, or subscribe a Loop to Tick updates. Use it when the user wants to see what an installed plugin shows, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
 ---
 
 # Tickloop tools and Ticks
 
-For MCP tools or Codemode, start at section 6. For a Tick program, start at section 1. A plugin can provide either or both; an MCP Server is not a Tick and does not need Tickhost.
+For MCP tools, start at section 6. For a Tick program, start at section 1. A plugin can provide either or both; an MCP Server is not a Tick and does not need Tickhost.
 
 ## 1. Select the Tick and check the host
 
@@ -128,20 +128,8 @@ Choose the discovery path from this request's tools:
 
 - With native Tool Search, use the model's own search, then call the discovered MCP tool directly with its schema. Fold tools are not offered on this path.
 - With Fold, call `SearchTools({"query":"words describing the task"})`: any matching word counts, an exact tool name returns that tool, `mcp__<server>` lists a server's tools, `select:A,B` picks up to 10 tools by name, `+word` requires a word, and `limit` caps ranked matches (default 8, at most 10). When the result lists `unavailable_servers`, a `connecting` server's tools may appear if you search again shortly; do not conclude they do not exist. Then call `DescribeTools({"names":["discovered exact name"]})` with 1–5 names. Use `ExecuteTools({"calls":[{"name":"discovered exact name","arguments":{}}]})` for 1–10 independent calls. Fill arguments from the returned schema. Results stay in submission order; inspect each status. A batch cannot pass results between calls.
-- Direct tools already have their schemas in the tool list. A `codemode` tool is callable only inside section 7's scripts; `hidden` tools cannot be called. Use discovery only when offered; never invent a missing tool or bypass exposure through Bash.
+- Direct tools already have their schemas in the tool list; `hidden` tools cannot be called. Use discovery only when offered; never invent a missing tool or bypass exposure through Bash.
 
-Every MCP call retains its normal permissions, including each call inside a batch or script. Without a user rule, a third-party tool asks in Ask mode and goes to Auto review in Auto mode, which asks the user only when it does not allow the call; read-only annotations change neither. In Plan, call only read-only MCP tools; a call is decided as in the mode Plan was entered from (Auto review after Auto, no confirmation after Full Access, otherwise a confirmation). An `unknown` outcome means a dispatched call may already have acted: inspect the resulting state before considering another mutation, rather than repeating it automatically.
+Every MCP call retains its normal permissions, including each call inside a batch. Without a user rule, a third-party tool asks in Ask mode and goes to Auto review in Auto mode, which asks the user only when it does not allow the call; read-only annotations change neither. In Plan, call only read-only MCP tools; a call is decided as in the mode Plan was entered from (Auto review after Auto, no confirmation after Full Access, otherwise a confirmation). An `unknown` outcome means a dispatched call may already have acted: inspect the resulting state before considering another mutation, rather than repeating it automatically. Loading an interrupted batch reports each call's outcome and does not rerun the batch.
 
 For resources, use `ListMcpResourcesTool` (optionally scoped by `server`) and `ReadMcpResourceTool` (`server`, `uri`). These serve both MCP Servers and Artifacts; use names and URIs returned by the list.
-
-## 7. Compose calls with Codemode
-
-Use the offered `Codemode` tool for dependent calls, filtering or aggregation. Its input is `{"code":"JavaScript async function body"}`. Discover exact tool names and parameter schemas before writing the script. Call `await tools.<identifier>(arguments)`; invalid identifier characters become `_`, and `tools["exact-name"](arguments)` also works. MCP calls return the full, redacted CallToolResult: inspect `content` or `structuredContent` before selecting output. Ordinary tools keep their text results.
-
-Only explicit output reaches the model: `text(value)`, `image(base64DataUrlOrMcpImageBlock)`, `console.log/info/warn/error/debug`, or `return`. `exit()` ends successfully. Await all calls whose results matter. Calls still running at completion are cancelled and may have an unknown outcome.
-
-The sandbox has a 256 MB memory limit and no direct filesystem, network, timers or module loading. Reach external systems through authorized tools. It cannot call Codemode, ExecuteTools, AskUserQuestion, Subagent, Skill, plan controls, family controls, scheduled-task or Goal tools. There is no `models.*` or script-level search helper.
-
-The optional first line `// @options: {"max_output_tokens":10000,"timeout_ms":300000}` controls output and active elapsed time. Human confirmation pauses that timer; each nested call keeps its own approval and appears below the script in the conversation. Tool errors and human denials throw Error; an Auto denial ends the whole script. A user interruption ends the script; dispatched calls may be OutcomeUnknown. Loading interrupted history reports call outcomes and does not rerun the script.
-
-`store(key, value)` keeps a JSON value for later scripts, `store(key, undefined)` deletes it, and `load(key)` returns a copy or `undefined`. Writes persist only on success, including `exit()`; failed scripts discard them. Use small cursors or intermediate data, never credentials. The limits are 262144 UTF-16 characters per JSON value, 1048576 across keys and values, and 4096 keys. Branches have independent stores. Rewind normally selects its path's values; after compaction retains a prefix, rewinding into that prefix may still expose the later values captured at compaction. Recheck stored data in that case.

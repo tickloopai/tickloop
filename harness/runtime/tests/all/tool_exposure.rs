@@ -19,7 +19,7 @@ fn tool(name: &str, description: &str, exposure: ToolExposure) -> ExposureTool {
 
 #[test]
 fn fold_searches_without_changing_definitions_or_revealing_hidden_tools() {
-    let mut directory = ExposureDirectory::new(vec![], SearchSupport::Fold, false);
+    let mut directory = ExposureDirectory::new(vec![], SearchSupport::Fold);
     let before = serde_json::to_vec(&directory.definitions()).unwrap();
     directory = ExposureDirectory::new(
         vec![
@@ -31,7 +31,6 @@ fn fold_searches_without_changing_definitions_or_revealing_hidden_tools() {
             tool("secret", "Send email", ToolExposure::Hidden),
         ],
         SearchSupport::Fold,
-        false,
     );
     assert_eq!(
         serde_json::to_vec(&directory.definitions()).unwrap(),
@@ -86,7 +85,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         oauth: Default::default(),
         sensitive_values: vec![],
         disabled: false,
-        exposure: ToolExposure::Codemode,
+        exposure: ToolExposure::Search,
         tool_exposure: vec![("secret".into(), ToolExposure::Hidden)],
         description: "Office tools".into(),
     }];
@@ -522,7 +521,6 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
             tool("recipient", "Receiver", ToolExposure::Search),
         ],
         SearchSupport::Fold,
-        false,
     );
     for input in [
         json!({}),
@@ -558,7 +556,6 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
     let native = ExposureDirectory::new(
         vec![tool("mail", "Mail", ToolExposure::Search)],
         SearchSupport::Native,
-        false,
     );
     assert!(native.definitions().is_empty());
     assert_eq!(native.deferred_tools().len(), 1);
@@ -624,34 +621,10 @@ fn native_search_offers_original_object_schemas_and_flattened_ones_otherwise() {
     let native = ExposureDirectory::new(
         vec![combined.clone(), rootless.clone()],
         SearchSupport::Native,
-        false,
     );
     let deferred = native.deferred_tools();
     assert_eq!(deferred[0].input_schema, combined.original_schema);
     assert_eq!(deferred[1].input_schema, rootless.definition.input_schema);
-}
-
-#[test]
-fn hosts_without_scripts_discover_codemode_tools_through_search() {
-    let exposure: ToolExposure = serde_json::from_value(json!("codemode")).unwrap();
-    let directory = ExposureDirectory::new(
-        vec![tool("mail", "Send email", exposure)],
-        SearchSupport::Fold,
-        false,
-    );
-    assert_eq!(
-        directory.search(&json!({"query":"email"})).unwrap()["matches"][0]["name"],
-        "mcp__office__mail"
-    );
-    let scripted = ExposureDirectory::new(
-        vec![tool("mail", "Send email", exposure)],
-        SearchSupport::Fold,
-        true,
-    );
-    assert_eq!(
-        scripted.search(&json!({"query":"email"})).unwrap()["matches"][0]["name"],
-        "mcp__office__mail"
-    );
 }
 
 #[tokio::test]
@@ -724,6 +697,184 @@ async fn nested_results_survive_reload_with_parent_links_and_no_reexecution() {
     ));
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_outcome() {
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tickloop_harness_protocol::{
+        Content, Decision, EventKind, ExecutionMode, OperationState, PermissionRule,
+        mcp::{McpServerConfig, McpTransport},
+    };
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams,
+        environment::FolderEnvironment,
+        mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
+        transcript::StorePosition,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, harness::ChosenModels, mcp_service::McpService, next_event,
+        transcripts::InMemoryTranscriptStore,
+    };
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"write","inputSchema":{"type":"object","properties":{}}}]));
+    server.set_result(json!({"content":[{"type":"text","text":"WROTE"}]}));
+    server.set_delay(Duration::from_secs(30));
+    let configs = vec![McpServerConfig {
+        name: "slow".into(),
+        source: "fixture".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        timeout_ms: 60000,
+        oauth: Default::default(),
+        sensitive_values: vec![],
+        disabled: false,
+        exposure: ToolExposure::Search,
+        tool_exposure: vec![],
+        description: String::new(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let make_agent = |store: &Arc<InMemoryTranscriptStore>, model: Arc<ScriptedModel>| {
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store.clone()),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
+                models: ChosenModels::new(model),
+            },
+            HarnessOptions::local(config()),
+        )
+        .unwrap()
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let written = directory.path().join("done.txt");
+    let transcripts = Arc::new(InMemoryTranscriptStore::new());
+    let first = make_agent(
+        &transcripts,
+        Arc::new(ScriptedModel::new(vec![call(
+            "batch",
+            "ExecuteTools",
+            json!({"calls":[
+                {"name":"Write","arguments":{"file_path":written,"content":"x"}},
+                {"name":"mcp__slow__write","arguments":{}},
+                {"name":"Glob","arguments":{"pattern":"*.txt"}}
+            ]}),
+        )])),
+    );
+    first
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || configs.clone()),
+        )))
+        .unwrap();
+    let chat = first.create_chat(directory.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    first
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: tickloop_ids::generate(),
+                decision: Decision::Ask,
+                tool: "Glob".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let mut events = first.subscribe();
+    first.submit(chat, "Run the batch".into()).await.unwrap();
+    let request = loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } if event.chat_id == chat => break request,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(request.parent_call.as_ref().unwrap().call_id, "batch");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = first.snapshot(chat).await.unwrap();
+            let write_completed = snapshot.operations.iter().any(|operation| {
+                operation.name == "Write" && operation.state == OperationState::Completed
+            });
+            if write_completed && !server.calls().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.sync().await.unwrap();
+
+    // The process is gone now: a new holder sees only what the store holds.
+    let crashed = Arc::new(InMemoryTranscriptStore::new());
+    crashed.seed(chat, transcripts.lines(chat), StorePosition(1));
+    let restarted_model = Arc::new(ScriptedModel::new(vec![]));
+    let restarted = make_agent(&crashed, restarted_model.clone());
+    let snapshot = restarted.resume_chat(chat).await.unwrap();
+    let result = snapshot
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == "batch" => Some(format!("{content:?}")),
+            _ => None,
+        })
+        .expect("no result for the batch");
+    assert!(result.contains("interrupted"), "{result}");
+    assert!(result.contains("will not be rerun"), "{result}");
+    for (name, outcome) in [
+        ("Write", "completed"),
+        ("mcp__slow__write", "outcome unknown"),
+        ("Glob", "not executed"),
+    ] {
+        assert!(
+            result
+                .lines()
+                .chain(result.split("\\n"))
+                .any(|line| line.contains(name) && line.contains(outcome)),
+            "{name} {outcome}: {result}"
+        );
+    }
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .filter(|operation| operation.parent_call_id.as_deref() == Some("batch"))
+            .count(),
+        3
+    );
+    assert!(snapshot.permissions.is_empty());
+    assert_eq!(server.calls().len(), 1);
+    assert!(restarted_model.requests.lock().unwrap().is_empty());
+    restarted.shutdown().await;
+    first.shutdown().await;
 }
 
 #[tokio::test]
@@ -1291,192 +1442,6 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
     agent.shutdown().await;
 }
 
-#[cfg(feature = "codemode")]
-#[tokio::test]
-async fn native_models_discover_codemode_schemas_and_call_only_through_scripts() {
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
-    use tickloop_harness_model::cards::ModelCatalog;
-    use tickloop_harness_protocol::{
-        Content, EventKind, ExecutionMode,
-        mcp::{McpServerConfig, McpTransport},
-    };
-    use tickloop_harness_runtime::{
-        Agent,
-        mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
-    };
-    use tickloop_harness_test_support::{
-        ScriptedModel, call, config, mcp_service::McpService, next_event, text,
-    };
-    let original_schema = json!({"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]});
-    let server = McpService::start().await;
-    server.set_tools(json!([
-        {"name":"mail","description":"Send email","inputSchema":original_schema},
-        {"name":"native","inputSchema":{"type":"object"}},
-        {"name":"direct","inputSchema":{"type":"object"}},
-        {"name":"secret","inputSchema":{"type":"object"}}
-    ]));
-    server.set_result(json!({"content":[{"type":"text","text":"SCRIPT_MAIL_OK"}]}));
-    let configs = vec![McpServerConfig {
-        name: "office".into(),
-        source: "global".into(),
-        transport: McpTransport::Http {
-            url: server.url(),
-            headers: BTreeMap::new(),
-        },
-        timeout_ms: 5000,
-        oauth: Default::default(),
-        sensitive_values: vec![],
-        disabled: false,
-        exposure: ToolExposure::Codemode,
-        tool_exposure: vec![
-            ("native".into(), ToolExposure::Search),
-            ("direct".into(), ToolExposure::Direct),
-            ("secret".into(), ToolExposure::Hidden),
-        ],
-        description: "Office tools".into(),
-    }];
-    let connections = McpConnections::new(
-        HostCapabilities {
-            local_processes: false,
-            scripts: true,
-        },
-        BTreeMap::new(),
-        BTreeMap::new(),
-    );
-    connections.reconcile(configs.clone()).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while connections.snapshot()[0].state != McpServerState::Connected {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "find",
-            "SearchTools",
-            json!({"query":"mail native direct secret"}),
-        ),
-        call(
-            "describe",
-            "DescribeTools",
-            json!({"names":["mcp__office__mail","mcp__office__native","mcp__office__direct","mcp__office__secret"]}),
-        ),
-        call(
-            "script",
-            "Codemode",
-            json!({"code":"text(await tools.mcp__office__mail({value: 'hello'}));"}),
-        ),
-        text("done"),
-    ]));
-    let mut native = ModelCatalog::defaults()
-        .get("anthropic-api", "claude-sonnet-5")
-        .unwrap();
-    native.base_url = config().base_url;
-    native.api_key_env.clear();
-    let agent = Agent::new_embedded(native, model.clone());
-    agent
-        .install_host_tools(Arc::new(McpToolProvider::new(
-            connections,
-            Arc::new(move || configs.clone()),
-        )))
-        .unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    let mut events = agent.subscribe();
-    agent
-        .submit(
-            chat,
-            "Discover the mail parameters and send hello through a script".into(),
-        )
-        .await
-        .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    let requests = model.requests.lock().unwrap().clone();
-    agent.shutdown().await;
-    for request in &requests {
-        for name in ["SearchTools", "DescribeTools", "Codemode"] {
-            assert!(
-                request.tools.iter().any(|tool| tool.name == name),
-                "missing {name}"
-            );
-        }
-        for name in ["ExecuteTools", "mcp__office__mail", "mcp__office__secret"] {
-            assert!(
-                request.tools.iter().all(|tool| tool.name != name),
-                "unexpected {name}"
-            );
-        }
-        assert_eq!(
-            request
-                .deferred_tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["mcp__office__native"]
-        );
-        assert_eq!(
-            serde_json::to_vec(&request.tools).unwrap(),
-            serde_json::to_vec(&requests[0].tools).unwrap()
-        );
-    }
-    let tool_result = |request: usize, id: &str| {
-        requests[request]
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .find_map(|block| {
-                if let Content::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = block
-                    && tool_use_id == id
-                {
-                    assert!(!is_error, "{id} failed");
-                    Some(serde_json::from_str::<serde_json::Value>(&content.text()).unwrap())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("missing structured result for {id}"))
-    };
-    let found = tool_result(1, "find");
-    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(found["matches"][0]["name"], "mcp__office__mail");
-    let described = tool_result(2, "describe");
-    assert_eq!(described["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(described["tools"][0]["input_schema"], original_schema);
-    assert_eq!(
-        described["not_found"],
-        json!([
-            "mcp__office__native",
-            "mcp__office__direct",
-            "mcp__office__secret"
-        ])
-    );
-    assert_eq!(server.calls().len(), 1);
-    assert_eq!(
-        server.calls()[0]["params"]["arguments"],
-        json!({"value":"hello"})
-    );
-    assert!(
-        serde_json::to_string(&requests.last().unwrap().messages)
-            .unwrap()
-            .contains("SCRIPT_MAIL_OK")
-    );
-}
-
 fn server_tool(server: &str, name: &str, description: &str) -> ExposureTool {
     let mut tool = tool(name, description, ToolExposure::Search);
     tool.server = server.into();
@@ -1500,7 +1465,6 @@ fn ui5_directory() -> ExposureDirectory {
             server_tool("office", "mail", "Send an email message to a recipient"),
         ],
         SearchSupport::Fold,
-        false,
     )
 }
 
@@ -1560,7 +1524,6 @@ fn queries_made_only_of_unrelated_or_generic_words_match_nothing() {
             "This tool MUST be called once to retrieve UI5 guidelines",
         )],
         SearchSupport::Fold,
-        false,
     );
     assert!(found_names(&guidelines, "this").is_empty());
 }
@@ -1616,7 +1579,6 @@ fn searches_return_eight_matches_by_default_and_at_most_ten() {
             .map(|index| server_tool("ui5", &format!("check_{index}"), "Inspect a UI5 project"))
             .collect(),
         SearchSupport::Fold,
-        false,
     );
     let count = |input: serde_json::Value| {
         directory.search(&input).unwrap()["matches"]
@@ -1642,7 +1604,6 @@ fn words_in_a_tool_name_outrank_the_same_words_in_descriptions() {
             server_tool("docs", "get_version", "Show details"),
         ],
         SearchSupport::Fold,
-        false,
     );
     assert_eq!(
         found_names(&directory, "version"),
@@ -1657,7 +1618,6 @@ fn searches_name_servers_that_cannot_offer_tools_yet() {
     let directory = ExposureDirectory::new(
         vec![server_tool("office", "mail", "Send an email message")],
         SearchSupport::Fold,
-        false,
     )
     .with_unavailable_servers(vec![UnavailableServer {
         name: "ui5".into(),
@@ -1688,7 +1648,6 @@ fn searches_name_servers_that_cannot_offer_tools_yet() {
     let without_unavailable = ExposureDirectory::new(
         vec![server_tool("office", "mail", "Send an email message")],
         SearchSupport::Fold,
-        false,
     );
     assert_eq!(
         serde_json::to_vec(&directory.definitions()).unwrap(),
