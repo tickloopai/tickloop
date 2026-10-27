@@ -8,6 +8,630 @@ use tickloop_harness_runtime::{
 use tickloop_harness_test_support::mcp_service::McpService;
 use tokio_util::sync::CancellationToken;
 
+fn discover_result(versions: &[&str]) -> serde_json::Value {
+    json!({"resultType":"complete","supportedVersions":versions,"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}}})
+}
+
+fn use_stdio(config: &mut McpServerConfig, server: &McpService) {
+    config.transport = McpTransport::Stdio {
+        command: "python3".into(),
+        args: server.stdio_args(),
+        env: BTreeMap::new(),
+        cwd: std::env::temp_dir(),
+    };
+}
+
+#[tokio::test]
+async fn discover_classification_accepts_modern_results_and_retries_supported_versions() {
+    for stdio in [false, true] {
+        for status in [200, 400] {
+            if stdio && status != 200 {
+                continue;
+            }
+            let server = McpService::start().await;
+            server.set_discover_replies(vec![
+                (status, json!({"id":"unrelated","error":{"code":-32022,"message":"use supported version","data":{"supported":["2026-07-28"]}}})),
+                (200, json!({"result":discover_result(&["2026-07-28"])})),
+            ]);
+            server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+            let mut config = http_config("modern", &server);
+            config.sensitive_values.push(json!("2026-07-28"));
+            if stdio {
+                use_stdio(&mut config, &server);
+            }
+            let connections = McpConnections::new(
+                HostCapabilities {
+                    local_processes: true,
+                },
+                BTreeMap::new(),
+                std::env::vars().collect(),
+            );
+            connections.reconcile(vec![config]).await;
+            wait_for_state(&connections, "modern", McpServerState::Connected).await;
+            assert_eq!(connections.statuses()[0].tools.len(), 1);
+            assert_eq!(
+                server
+                    .methods()
+                    .iter()
+                    .filter(|method| *method == "server/discover")
+                    .count(),
+                2
+            );
+            assert!(!server.methods().iter().any(|method| method == "initialize"));
+            connections.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn discover_classification_falls_back_for_legacy_responses_over_http_sse_and_stdio() {
+    let replies = [
+        (
+            400,
+            json!({"id":null,"error":{"code":-32000,"message":"not initialized"}}),
+        ),
+        (400, json!({"error":{"code":-32601,"message":"no method"}})),
+        (
+            500,
+            json!({"error":{"code":-32000,"message":"legacy endpoint"}}),
+        ),
+        (
+            200,
+            json!({"id":"wrong","error":{"code":-32021,"message":"capability required"}}),
+        ),
+        (
+            200,
+            json!({"error":{"code":-32020,"message":"header mismatch"}}),
+        ),
+        (
+            200,
+            json!({"error":{"code":-32022,"message":"old versions","data":{"supported":["2025-06-18"]}}}),
+        ),
+        (
+            200,
+            json!({"error":{"code":-32022,"message":"no versions","data":{"supported":[]}}}),
+        ),
+        (
+            200,
+            json!({"error":{"code":-32022,"message":"invalid versions","data":{"supported":[17]}}}),
+        ),
+        (200, json!({"result":discover_result(&["2099-01-01"])})),
+        (200, json!({"result":{}})),
+        (
+            200,
+            json!({"id":"wrong","result":discover_result(&["2026-07-28"])}),
+        ),
+    ];
+    for (status, reply) in replies {
+        for transport in ["http", "sse", "stdio"] {
+            // The stdio bridge exits on non-2xx, which is separately covered as a closed probe.
+            if transport == "stdio" && status != 200 {
+                continue;
+            }
+            let server = McpService::start().await;
+            server.set_discover_replies(vec![(status, reply.clone())]);
+            if transport == "sse" {
+                server.reject_discover_over_sse();
+            }
+            server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+            let mut config = http_config("legacy", &server);
+            if transport == "stdio" {
+                use_stdio(&mut config, &server);
+            }
+            let connections = McpConnections::new(
+                HostCapabilities {
+                    local_processes: true,
+                },
+                BTreeMap::new(),
+                std::env::vars().collect(),
+            );
+            connections.reconcile(vec![config]).await;
+            wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+            assert_eq!(connections.statuses()[0].tools.len(), 1);
+            assert_eq!(
+                &server.methods()[..3],
+                &["server/discover", "initialize", "notifications/initialized"]
+            );
+            connections.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_modern_versions_fail_without_initialize_or_unbounded_correction() {
+    for versions in [vec!["2099-01-01"], vec!["2026-07-28"]] {
+        let server = McpService::start().await;
+        let reply = json!({"id":"wrong","error":{"code":-32022,"message":"unsupported","data":{"supported":versions}}});
+        server.set_discover_replies(vec![(400, reply.clone()), (200, reply)]);
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections
+            .reconcile(vec![http_config("rejected", &server)])
+            .await;
+        wait_for_state(&connections, "rejected", McpServerState::Failed).await;
+        assert!(
+            connections.statuses()[0]
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("no compatible MCP protocol version")
+        );
+        assert!(!server.methods().iter().any(|method| method == "initialize"));
+        assert!(server.methods().len() <= 2);
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_responses_and_empty_sse_streams_are_legacy() {
+    for sse in [false, true] {
+        for body in ["", "not-json", r#"{"jsonrpc":"2.0","method":"unexpected"}"#] {
+            // An HTTP JSON notification is malformed; an SSE notification may precede a reply.
+            if sse && body.contains("method") {
+                continue;
+            }
+            let server = McpService::start().await;
+            if sse {
+                server.reject_discover_over_sse();
+            }
+            server.set_http_response(
+                "server/discover",
+                200,
+                if sse && !body.is_empty() {
+                    format!("data: {body}\n\n")
+                } else {
+                    body.to_owned()
+                },
+            );
+            let connections = McpConnections::new(
+                HostCapabilities::default(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            connections
+                .reconcile(vec![http_config("legacy", &server)])
+                .await;
+            wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+            assert_eq!(&server.methods()[..2], &["server/discover", "initialize"]);
+            connections.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_probe_deadline_closes_the_actual_post_and_sse_stream() {
+    for sse in [false, true] {
+        let server = McpService::start().await;
+        if sse {
+            server.stall_discover_stream();
+        } else {
+            server.delay_discover(Duration::from_secs(60));
+        }
+        let mut config = http_config("blocked", &server);
+        config.timeout_ms = 6000;
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections.reconcile(vec![config]).await;
+        wait_for_state(&connections, "blocked", McpServerState::Failed).await;
+        assert!(
+            connections.statuses()[0]
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("probe timed out after 2000ms")
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.discover_disconnected())
+            .await
+            .expect("the probe must close its socket before the 6s HTTP timeout");
+        assert_eq!(server.methods(), ["server/discover"]);
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_inflight_discover_without_waiting_for_its_deadline() {
+    let server = McpService::start().await;
+    server.stall_discover_stream();
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![http_config("blocked", &server)])
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), server.discover_started())
+        .await
+        .unwrap();
+    connections.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), server.discover_disconnected())
+        .await
+        .expect("shutdown must close the discover stream before its 10s probe deadline");
+}
+
+#[tokio::test]
+async fn truncated_probe_sse_is_a_network_error_and_never_falls_back() {
+    let server = McpService::start().await;
+    server.reject_discover_over_sse();
+    server.set_http_response("server/discover", 200, "data: {\"jsonrpc\":");
+    server.truncate_discover();
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![http_config("broken", &server)])
+        .await;
+    wait_for_state(&connections, "broken", McpServerState::Failed).await;
+    assert_eq!(server.methods(), ["server/discover"]);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn probe_network_errors_and_timeouts_do_not_fall_back_over_http_but_stdio_close_and_timeout_do()
+ {
+    for stdio in [false, true] {
+        for timeout in [false, true] {
+            let server = McpService::start().await;
+            if timeout {
+                server.delay_discover(Duration::from_secs(60));
+            } else {
+                server.close_discover();
+            }
+            let mut config = http_config("probe", &server);
+            config.timeout_ms = 6000;
+            if stdio {
+                use_stdio(&mut config, &server);
+            }
+            let connections = McpConnections::new(
+                HostCapabilities {
+                    local_processes: true,
+                },
+                BTreeMap::new(),
+                std::env::vars().collect(),
+            );
+            connections.reconcile(vec![config]).await;
+            wait_for_state(
+                &connections,
+                "probe",
+                if stdio {
+                    McpServerState::Connected
+                } else {
+                    McpServerState::Failed
+                },
+            )
+            .await;
+            if stdio {
+                assert_eq!(&server.methods()[..2], &["server/discover", "initialize"]);
+            } else {
+                assert_eq!(server.methods(), ["server/discover"]);
+                if timeout {
+                    assert!(
+                        connections.statuses()[0]
+                            .failure
+                            .as_deref()
+                            .unwrap()
+                            .contains("probe timed out after 2000ms")
+                    );
+                }
+            }
+            connections.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_verdict_survives_reconnect_and_failed_initialize_but_changes_with_configuration() {
+    for stdio in [false, true] {
+        let server = McpService::start().await;
+        server.set_status(500);
+        let mut config = http_config("legacy", &server);
+        if stdio {
+            use_stdio(&mut config, &server);
+        }
+        let connections = McpConnections::new(
+            HostCapabilities {
+                local_processes: true,
+            },
+            BTreeMap::new(),
+            std::env::vars().collect(),
+        );
+        connections.reconcile(vec![config.clone()]).await;
+        wait_for_state(&connections, "legacy", McpServerState::Failed).await;
+        server.set_status(200);
+        connections.reconnect(vec![config.clone()], "legacy").await;
+        wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+        connections.reconnect(vec![config.clone()], "legacy").await;
+        wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+        assert_eq!(
+            server
+                .methods()
+                .iter()
+                .filter(|method| *method == "server/discover")
+                .count(),
+            1
+        );
+        let mut changed = config.clone();
+        changed.description = "new configuration".into();
+        connections.reconnect(vec![changed], "legacy").await;
+        wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+        assert_eq!(
+            server
+                .methods()
+                .iter()
+                .filter(|method| *method == "server/discover")
+                .count(),
+            2
+        );
+        connections.reconnect(vec![config], "legacy").await;
+        wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+        assert_eq!(
+            server
+                .methods()
+                .iter()
+                .filter(|method| *method == "server/discover")
+                .count(),
+            3
+        );
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_initialize_versions_keep_negotiated_headers_and_stdio_routing() {
+    for stdio in [false, true] {
+        for version in ["2025-06-18", "2025-03-26"] {
+            let server = McpService::start().await;
+            server.set_protocol_version(version);
+            let mut config = http_config("legacy", &server);
+            config.sensitive_values.push(json!(version));
+            if stdio {
+                use_stdio(&mut config, &server);
+            }
+            let connections = McpConnections::new(
+                HostCapabilities {
+                    local_processes: true,
+                },
+                BTreeMap::new(),
+                std::env::vars().collect(),
+            );
+            connections.reconcile(vec![config]).await;
+            wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+            let messages = server.messages();
+            assert_eq!(
+                messages[1].0["params"]["protocolVersion"],
+                rmcp::model::ProtocolVersion::LATEST_WITH_INITIALIZE.as_str()
+            );
+            if !stdio {
+                assert!(
+                    messages
+                        .iter()
+                        .skip(2)
+                        .all(|(_, header)| header.as_deref() == Some(version)),
+                    "{messages:?}"
+                );
+            }
+            connections.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifacts_keep_discover_and_the_modern_skills_protocol() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp_tools::McpHostToolProvider};
+    use tickloop_harness_test_support::artifact_service::ArtifactService;
+    let server = ArtifactService::start().await;
+    server
+        .control
+        .skills_enabled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let root = tempfile::tempdir().unwrap();
+    let provider = McpHostToolProvider::new(server.login(root.path()).await, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(!provider.remote_skills().is_empty());
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["body"]["method"] == "server/discover")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["body"]["method"] != "initialize")
+    );
+    for request in requests
+        .iter()
+        .filter(|request| request["body"]["method"].as_str().is_some())
+    {
+        assert!(
+            request["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("mcp-protocol-version: 2026-07-28")
+        );
+    }
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_legacy_discover_rejections_fall_back_and_accept_older_initialize() {
+    for (status, body) in [
+        (
+            400,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Server not initialized"}}"#,
+        ),
+        (
+            400,
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Server not initialized"}}"#,
+        ),
+        (404, ""),
+        (405, "Method not allowed"),
+    ] {
+        let server = McpService::start().await;
+        server.set_http_response("server/discover", status, body);
+        server.set_protocol_version("2025-06-18");
+        server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections
+            .reconcile(vec![http_config("legacy", &server)])
+            .await;
+        wait_for_state(&connections, "legacy", McpServerState::Connected).await;
+        assert_eq!(
+            connections.statuses()[0].tools[0].name,
+            "mcp__legacy__probe"
+        );
+        assert_eq!(
+            &server.methods()[..3],
+            &["server/discover", "initialize", "notifications/initialized"]
+        );
+        server.set_http_response("tools/call", 400, "not initialized");
+        let result = connections
+            .call("mcp__legacy__probe", json!({}), CancellationToken::new())
+            .await
+            .into_tool_result();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            server
+                .methods()
+                .iter()
+                .filter(|method| *method == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            server
+                .methods()
+                .iter()
+                .filter(|method| *method == "tools/call")
+                .count(),
+            1
+        );
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn http_discover_authentication_errors_keep_their_state_and_cause() {
+    for (status, scope, expected_state, category) in [
+        (401, false, McpServerState::NeedsLogin, "MCP login required"),
+        (403, true, McpServerState::NeedsLogin, "MCP scope required"),
+        (403, false, McpServerState::Failed, "MCP connection failed"),
+    ] {
+        let server = McpService::start().await;
+        server.set_http_response("server/discover", status, "sensitive-server-error");
+        if scope {
+            server.set_challenge("Bearer error=\"insufficient_scope\"");
+        }
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections
+            .reconcile(vec![http_config("rejected", &server)])
+            .await;
+        wait_for_state(&connections, "rejected", expected_state.clone()).await;
+        assert_eq!(server.methods(), ["server/discover"]);
+        if expected_state == McpServerState::NeedsLogin {
+            connections.shutdown().await;
+            continue;
+        }
+        let failure = connections.statuses()[0].failure.clone().unwrap();
+        assert!(failure.starts_with(category), "{failure}");
+        assert!(failure.contains(&format!("HTTP {status}")), "{failure}");
+        assert!(!failure.contains("sensitive-server-error"));
+        assert_eq!(server.methods(), ["server/discover"]);
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn http_legacy_fallback_failure_names_both_phases_without_secrets() {
+    let server = McpService::start().await;
+    server.set_http_response(
+        "server/discover",
+        400,
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"secret-token"}}"#,
+    );
+    server.set_http_response("initialize", 405, "secret-token");
+    let mut config = http_config("legacy", &server);
+    config.sensitive_values.push("secret-token".into());
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(vec![config]).await;
+    wait_for_state(&connections, "legacy", McpServerState::Failed).await;
+    let failure = connections.statuses()[0].failure.clone().unwrap();
+    assert!(
+        failure.contains("discover") && failure.contains("HTTP 400"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("initialize") && failure.contains("HTTP 405"),
+        "{failure}"
+    );
+    assert!(!failure.contains("secret-token"));
+    assert_eq!(server.methods(), ["server/discover", "initialize"]);
+    connections.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_initialize_error_redacts_credentials_before_bounding_the_cause() {
+    let server = McpService::start().await;
+    let secret = format!("private credential/{}+token", "x".repeat(240));
+    let encoded =
+        percent_encoding::utf8_percent_encode(&secret, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    server.set_initialize_error(
+        json!({"code":-32602,"message":format!("Denied {secret} {encoded} {}", secret.replace(' ', "\t"))}),
+    );
+    let mut config = http_config("legacy", &server);
+    if let McpTransport::Http { headers, .. } = &mut config.transport {
+        headers.insert("X-Api-Key".into(), secret.clone());
+    }
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(vec![config]).await;
+    wait_for_state(&connections, "legacy", McpServerState::Failed).await;
+    let failure = connections.statuses()[0].failure.clone().unwrap();
+    assert!(
+        failure.contains("legacy initialize failed: MCP server error -32602"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("Denied [redacted] [redacted] [redacted]"),
+        "{failure}"
+    );
+    assert!(
+        !failure.contains("private") && !failure.contains("xxxxx"),
+        "{failure}"
+    );
+    connections.shutdown().await;
+}
+
 #[tokio::test]
 async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over_sse() {
     let server = McpService::start().await;

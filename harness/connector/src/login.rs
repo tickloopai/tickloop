@@ -36,9 +36,9 @@ const CALLBACK_PAGES: CallbackPages = CallbackPages {
     failed: "Authorization failed.",
 };
 
-/// Why a login ended without saving a token. The texts never include server responses or
-/// tokens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+/// Why a login ended without saving a token. The texts never include tokens; only a discovery
+/// failure carries a cause, as one line in which every address is reduced to its origin.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoginError {
     #[error("the login was cancelled")]
     Cancelled,
@@ -53,8 +53,8 @@ pub enum LoginError {
     AuthorizationFailed,
     #[error("the login has already ended")]
     Ended,
-    #[error("the server publishes no usable OAuth authorization server metadata")]
-    Discovery,
+    #[error("the server publishes no usable OAuth authorization server metadata: {0}")]
+    Discovery(String),
     #[error("the authorization server does not support the authorization code flow with S256 PKCE")]
     Unsupported,
     #[error(
@@ -212,7 +212,7 @@ impl Connector {
             ),
         )
         .await?
-        .map_err(|_| LoginError::Discovery)?;
+        .map_err(|error| discovery_failure(&error))?;
         let metadata = cancellable(
             cancellation,
             self.authorization_metadata(&manager, challenge),
@@ -270,23 +270,33 @@ impl Connector {
                 .http
                 .get_bounded(metadata_url)
                 .await
-                .map_err(|_| LoginError::Discovery)?;
+                .map_err(|error| LoginError::Discovery(error_cause(&*error)))?;
             if status != 200 {
-                return Err(LoginError::Discovery);
+                return Err(LoginError::Discovery(format!(
+                    "the configured metadata address answered HTTP {status}"
+                )));
             }
-            return serde_json::from_slice(&body).map_err(|_| LoginError::Discovery);
+            return serde_json::from_slice(&body).map_err(|_| {
+                LoginError::Discovery(
+                    "the configured metadata address did not return authorization server metadata"
+                        .to_owned(),
+                )
+            });
         }
         if let Some(challenge) = challenge {
             self.http
                 .validate_challenge(challenge)
-                .map_err(|_| LoginError::Discovery)?;
+                .map_err(|error| LoginError::Discovery(error_cause(&*error)))?;
         }
         let resolution = manager
             .resolve_metadata_from_challenge(challenge)
             .await
-            .map_err(|_| LoginError::Discovery)?;
+            .map_err(|error| discovery_failure(&error))?;
         if !resolution.source.is_discovered() {
-            return Err(LoginError::Discovery);
+            return Err(LoginError::Discovery(
+                "the server publishes neither protected resource metadata nor authorization server metadata"
+                    .to_owned(),
+            ));
         }
         Ok(resolution.metadata)
     }
@@ -325,7 +335,9 @@ impl Connector {
 
 impl TokenEndpoints {
     fn from_metadata(metadata: &AuthorizationMetadata) -> Result<Self, LoginError> {
-        let token = Url::parse(&metadata.token_endpoint).map_err(|_| LoginError::Discovery)?;
+        let token = Url::parse(&metadata.token_endpoint).map_err(|_| {
+            LoginError::Discovery("the token endpoint is not a valid address".to_owned())
+        })?;
         let issuer = match &metadata.issuer {
             Some(issuer) => issuer.clone(),
             None => token.origin().ascii_serialization(),
@@ -366,6 +378,122 @@ fn authorization_error(error: &AuthError) -> LoginError {
     match error {
         AuthError::RegistrationFailed(_) => LoginError::Registration,
         AuthError::PkceUnsupported | AuthError::InvalidScope(_) => LoginError::Unsupported,
-        _ => LoginError::Discovery,
+        _ => discovery_failure(error),
+    }
+}
+
+fn discovery_failure(error: &AuthError) -> LoginError {
+    let cause = match error {
+        AuthError::MetadataError(message) => redacted_line(message),
+        _ => error_cause(error),
+    };
+    LoginError::Discovery(cause)
+}
+
+/// `error` and its sources as one redacted line, skipping a source its parent already quotes.
+fn error_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut chain = error.to_string();
+    for source in std::iter::successors(error.source(), |source| source.source()) {
+        let message = source.to_string();
+        if !chain.contains(&message) {
+            chain.push_str(": ");
+            chain.push_str(&message);
+        }
+    }
+    redacted_line(&chain)
+}
+
+const MAX_CAUSE_CHARS: usize = 400;
+const CAUSED_BY: &str = "Caused by:";
+const URL_DELIMITERS: &[char] = &['(', ')', '\'', '"', '`', '<', '>', ',', ';'];
+
+/// One line of an error text, without control characters, in which each address keeps only
+/// its origin: a server address may carry a credential in its user information, path or query.
+fn redacted_line(text: &str) -> String {
+    let words: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().strip_prefix(CAUSED_BY).unwrap_or(line).trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(": ")
+        .split_whitespace()
+        .map(redact_addresses)
+        .collect();
+    let line: String = words
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if line.chars().count() <= MAX_CAUSE_CHARS {
+        return line;
+    }
+    let mut truncated: String = line.chars().take(MAX_CAUSE_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
+fn redact_addresses(word: &str) -> String {
+    let Some(separator) = word.find("://") else {
+        return word.to_owned();
+    };
+    let start = word[..separator]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .last()
+        .map_or(separator, |(index, _)| index);
+    let end = word[start..]
+        .find(URL_DELIMITERS)
+        .map_or(word.len(), |index| start + index);
+    let address = word[start..end].trim_end_matches(['.', ':']);
+    let end = start + address.len();
+    let origin = Url::parse(address)
+        .ok()
+        .map(|url| url.origin())
+        .filter(|origin| origin.is_tuple())
+        .map_or_else(
+            || "<address>".to_owned(),
+            |origin| origin.ascii_serialization(),
+        );
+    format!(
+        "{}{origin}{}",
+        &word[..start],
+        redact_addresses(&word[end..])
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_discovery_cause_is_one_line_with_only_the_origins_of_addresses() {
+        let timed_out = "OAuth metadata discovery failed for https://mcp.longbridge.cn/\n  \
+            Caused by: error sending request for url (https://mcp.longbridge.cn/)\n  \
+            Caused by: client error (Connect)\n  Caused by: operation timed out";
+        assert_eq!(
+            redacted_line(timed_out),
+            "OAuth metadata discovery failed for https://mcp.longbridge.cn: error sending \
+             request for url (https://mcp.longbridge.cn): client error (Connect): operation \
+             timed out"
+        );
+        assert_eq!(
+            redacted_line(
+                "resource mismatch: reference 'https://user:pw@mcp.example.test:8443/key/mcp?token=t#f', \
+                 permitted 'mailto:a@b'\u{7}"
+            ),
+            "resource mismatch: reference 'https://mcp.example.test:8443', permitted 'mailto:a@b'"
+        );
+        assert_eq!(
+            redacted_line("expected https://a.test/x,https://b.test/y?k=v and a://"),
+            "expected https://a.test,https://b.test and <address>"
+        );
+        assert_eq!(
+            redacted_line("named “https://a.test/x"),
+            "named “https://a.test"
+        );
+        let long = redacted_line(&"word ".repeat(MAX_CAUSE_CHARS));
+        assert_eq!(long.chars().count(), MAX_CAUSE_CHARS + 1);
+        assert!(long.ends_with('…'));
     }
 }

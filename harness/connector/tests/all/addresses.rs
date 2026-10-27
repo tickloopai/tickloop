@@ -34,13 +34,50 @@ async fn login_never_reads_cross_origin_protected_resource_metadata() {
                 &CancellationToken::new(),
             )
             .await;
-        assert!(matches!(result, Err(LoginError::Discovery)));
+        let Err(LoginError::Discovery(cause)) = result else {
+            panic!("cross-origin metadata was accepted (supplied challenge: {supplied_challenge})");
+        };
+        assert!(
+            cause.contains("protected resource metadata must have the MCP server's origin"),
+            "{cause}"
+        );
         assert!(
             foreign.requests().is_empty(),
             "cross-origin metadata was requested (supplied challenge: {supplied_challenge})"
         );
         assert!(credentials.current().is_none());
     }
+}
+
+#[tokio::test]
+async fn an_unreachable_server_names_the_failure_without_its_path_or_query() {
+    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let connector = Connector::new(
+        &format!("http://127.0.0.1:{closed_port}/secret-path/mcp?key=secret-key"),
+        OAuthSettings::default(),
+        Arc::new(InMemoryCredentials::default()),
+    )
+    .unwrap();
+
+    let Err(error) = connector.start_login(None, &CancellationToken::new()).await else {
+        panic!("a login started without a reachable server");
+    };
+    let message = error.to_string();
+    assert!(
+        message.starts_with("the server publishes no usable OAuth authorization server metadata: "),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("http://127.0.0.1:{closed_port}")),
+        "{message}"
+    );
+    assert!(message.contains("client error (Connect)"), "{message}");
+    assert!(!message.contains("secret"), "{message}");
+    assert!(!message.contains('\n'), "{message}");
 }
 
 /// A remote server's credential whose endpoints, as its metadata could claim, are services on

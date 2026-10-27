@@ -13,7 +13,9 @@ use std::time::Duration;
 use tickloop_harness_base::network::{HttpPolicy, build_http_client, is_loopback};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Through a proxy this covers the tunnel and the TLS handshake as well; a process's first
+/// connection through a local proxy has been seen to take about ten seconds.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 /// Sample targets that choose each client's proxy route: remote addresses may use proxies,
 /// this machine never does.

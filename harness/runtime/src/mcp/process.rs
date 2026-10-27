@@ -21,12 +21,14 @@ pub(super) struct ProcessTransport {
     frame: Vec<u8>,
     redactor: ResponseRedactor,
     directory_requests: DirectoryRequests,
+    probe: super::negotiation::ProbeState,
 }
 impl ProcessTransport {
     pub(super) fn spawn(
         mut command: Command,
         stderr: Stdio,
         redactor: ResponseRedactor,
+        probe: super::negotiation::ProbeState,
     ) -> Result<Self, String> {
         command
             .stdin(Stdio::piped())
@@ -46,6 +48,7 @@ impl ProcessTransport {
             frame: Vec::new(),
             redactor,
             directory_requests: Default::default(),
+            probe,
         })
     }
 }
@@ -64,6 +67,7 @@ impl Transport<RoleClient> for ProcessTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.probe.sending(&item);
         if let ClientJsonRpcMessage::Request(request) = &item
             && matches!(request.request, ClientRequest::ListToolsRequest(_))
         {
@@ -90,7 +94,13 @@ impl Transport<RoleClient> for ProcessTransport {
                 continue;
             }
             let text = std::str::from_utf8(&self.frame).ok()?;
-            let redacted = redact_message(text, &self.redactor, &self.directory_requests).ok()?;
+            let redacted = redact_message(
+                text,
+                &self.redactor,
+                &self.directory_requests,
+                Some(&self.probe),
+            )
+            .ok()?;
             self.frame.clear();
             return serde_json::from_str(&redacted).ok();
         }
