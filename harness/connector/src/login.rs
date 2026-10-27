@@ -276,6 +276,11 @@ impl Connector {
             }
             return serde_json::from_slice(&body).map_err(|_| LoginError::Discovery);
         }
+        if let Some(challenge) = challenge {
+            self.http
+                .validate_challenge(challenge)
+                .map_err(|_| LoginError::Discovery)?;
+        }
         let resolution = manager
             .resolve_metadata_from_challenge(challenge)
             .await

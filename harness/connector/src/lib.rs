@@ -106,12 +106,13 @@ impl Connector {
         }
         let configured_on_this_machine =
             is_loopback(&server_url) || metadata_url.as_ref().is_some_and(is_loopback);
+        let http = http::PolicyClient::new(server_url.clone(), configured_on_this_machine);
         Ok(Self {
             server_url,
             settings,
             metadata_url,
             credentials,
-            http: http::PolicyClient::new(configured_on_this_machine),
+            http,
         })
     }
 }

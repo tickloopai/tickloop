@@ -2,12 +2,46 @@ use std::sync::Arc;
 
 use tick_oauth_test_server::{AuthorizationServer, REVOCATION_PATH, TOKEN_PATH};
 use tickloop_harness_connector::{
-    ClientRegistration, Connector, ConnectorCredential, InMemoryCredentials, Logout, OAuthSettings,
-    OAuthToken, TokenError,
+    ClientRegistration, Connector, ConnectorCredential, InMemoryCredentials, LoginError, Logout,
+    OAuthSettings, OAuthToken, TokenError,
 };
 use tokio_util::sync::CancellationToken;
 
 const REMOTE_SERVER: &str = "https://mcp.example.test/mcp";
+
+#[tokio::test]
+async fn login_never_reads_cross_origin_protected_resource_metadata() {
+    for supplied_challenge in [true, false] {
+        let server = AuthorizationServer::start();
+        let foreign = AuthorizationServer::start();
+        server.edit_metadata(|metadata| metadata["issuer"] = foreign.issuer().into());
+        let credentials = Arc::new(InMemoryCredentials::default());
+        let connector = Connector::new(
+            &server.resource(),
+            OAuthSettings::default(),
+            credentials.clone(),
+        )
+        .unwrap();
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}{}{}\"",
+            foreign.issuer(),
+            tick_oauth_test_server::PROTECTED_RESOURCE_METADATA_PATH,
+            tick_oauth_test_server::RESOURCE_PATH,
+        );
+        let result = connector
+            .start_login(
+                supplied_challenge.then_some(challenge.as_str()),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(LoginError::Discovery)));
+        assert!(
+            foreign.requests().is_empty(),
+            "cross-origin metadata was requested (supplied challenge: {supplied_challenge})"
+        );
+        assert!(credentials.current().is_none());
+    }
+}
 
 /// A remote server's credential whose endpoints, as its metadata could claim, are services on
 /// this machine.
