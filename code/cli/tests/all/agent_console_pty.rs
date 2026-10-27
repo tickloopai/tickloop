@@ -5,6 +5,7 @@ use tickloop_harness::test_support::model_http_support;
 use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 mod artifact_attachment;
+mod auto_import;
 mod auto_review;
 mod bash_background;
 mod command_feedback;
