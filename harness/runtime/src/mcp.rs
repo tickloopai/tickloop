@@ -1,5 +1,6 @@
 //! Agent-owned MCP connections. Hosts supply resolved configuration, credentials and capabilities.
 mod catalog;
+pub(crate) mod negotiation;
 mod process;
 mod provider;
 mod redaction;
@@ -8,7 +9,7 @@ use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
 pub use provider::{McpConfiguration, McpToolProvider};
 use rmcp::{
-    ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient,
+    ClientHandler, RoleClient,
     model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
     service::{NotificationContext, RunningService},
     transport::{
@@ -59,6 +60,7 @@ const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
+#[derive(Clone)]
 struct Handler {
     revision: Arc<AtomicU64>,
     changed: Arc<tokio::sync::Notify>,
@@ -75,7 +77,7 @@ impl ClientHandler for Handler {
         self.resources_changed.notify_one();
     }
     fn get_info(&self) -> ClientConfig {
-        ClientConfig::default()
+        ClientConfig::default().with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
     }
 }
 struct Connection {
@@ -130,6 +132,7 @@ struct Entry {
     /// Why the last connection attempt failed or ended, in our own fixed words.
     failure: RwLock<Option<String>>,
     cancel: CancellationToken,
+    legacy: Arc<AtomicBool>,
 }
 impl Entry {
     fn offers_tools(&self) -> bool {
@@ -406,6 +409,11 @@ impl McpConnections {
                 .as_ref()
                 .map(|entry| entry.credential_secrets.read().unwrap().clone())
                 .unwrap_or_default();
+            let legacy = existing
+                .as_ref()
+                .filter(|entry| entry.config == config)
+                .map(|entry| entry.legacy.clone())
+                .unwrap_or_default();
             let entry = if let Some(entry) = existing.filter(|entry| {
                 restart != Restart::Server(config.name.as_str())
                     && entry.config == config
@@ -451,6 +459,7 @@ impl McpConnections {
                     .map(|(_, value)| value.clone())
                     .collect();
                 let entry = Arc::new(Entry {
+                    legacy,
                     redactor: RwLock::new(None),
                     publication: std::sync::Mutex::new(()),
                     generation: AtomicU64::new(previous_generation),
@@ -1109,6 +1118,75 @@ fn failure_has_category(error: &str, category: &str) -> bool {
         == category
 }
 
+fn stdio_transport(
+    entry: &Arc<Entry>,
+    environment: &BTreeMap<String, String>,
+    stderr_directory: Option<&tickloop_harness_base::private_fs::PrivateDirectory>,
+    probe: &negotiation::ProbeState,
+) -> Result<process::ProcessTransport, String> {
+    let McpTransport::Stdio {
+        command,
+        args,
+        env,
+        cwd,
+    } = &entry.config.transport
+    else {
+        return Err("MCP transport unavailable".into());
+    };
+    let config = &entry.config;
+    let mut process = tokio::process::Command::new(command);
+    process
+        .args(args)
+        .env_clear()
+        .envs(environment)
+        .envs(env)
+        .current_dir(cwd);
+    // Arbitrary stderr bytes cannot be safely redacted across chunk boundaries.
+    let stderr = if !config.sensitive_values.is_empty() {
+        std::process::Stdio::null()
+    } else if let Some(directory) = stderr_directory {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::OpenOptionsExt;
+        directory
+            .create()
+            .map_err(|_| "MCP log directory unavailable")?;
+        let file = directory
+            .path()
+            .join(format!("{:x}.log", Sha256::digest(config.name.as_bytes())));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(file)
+            .map_err(|_| "MCP log file unavailable")?;
+        if !log
+            .metadata()
+            .map_err(|_| "MCP log file unavailable")?
+            .is_file()
+        {
+            return Err("MCP log must be a regular file".into());
+        }
+        std::process::Stdio::from(log)
+    } else {
+        std::process::Stdio::inherit()
+    };
+    let redact_entry = Arc::downgrade(entry);
+    let transport = process::ProcessTransport::spawn(
+        process,
+        stderr,
+        Arc::new(move |value, part| {
+            if let Some(entry) = redact_entry.upgrade() {
+                redact_wire_value(&entry, value, part);
+            } else {
+                *value = Value::Null;
+            }
+        }),
+        probe.clone(),
+    )?;
+    Ok(transport)
+}
+
 async fn open(
     entry: &Arc<Entry>,
     token: Option<String>,
@@ -1126,10 +1204,7 @@ async fn open(
         resource_revision: resource_revision.clone(),
         resources_changed: resources_changed.clone(),
     };
-    let lifecycle = ClientLifecycleMode::Auto {
-        preferred_versions: vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
-        legacy_version: Some(ProtocolVersion::V_2025_11_25),
-    };
+    let probe = negotiation::ProbeState::default();
     let (service, http) = match &config.transport {
         McpTransport::Http { url, headers } => {
             let endpoint = reqwest::Url::parse(url).map_err(|_| "invalid MCP URL")?;
@@ -1140,101 +1215,45 @@ async fn open(
                 Duration::from_millis(config.timeout_ms),
             )?;
             let redact_entry = Arc::downgrade(entry);
-            let http = http.with_redactor(Arc::new(move |value, part| {
-                if let Some(entry) = redact_entry.upgrade() {
-                    redact_wire_value(&entry, value, part);
-                } else {
-                    *value = Value::Null;
-                }
-            }));
+            let http =
+                http.with_probe(probe.clone())
+                    .with_redactor(Arc::new(move |value, part| {
+                        if let Some(entry) = redact_entry.upgrade() {
+                            redact_wire_value(&entry, value, part);
+                        } else {
+                            *value = Value::Null;
+                        }
+                    }));
             let mut options = StreamableHttpClientTransportConfig::with_uri(url.clone())
                 .reinit_on_expired_session(false);
             if let Some(token) = token {
                 options = options.auth_header(token);
             }
-            let transport = StreamableHttpClientTransport::with_client(http.clone(), options);
-            let service = handler
-                .serve_with_lifecycle(transport, lifecycle)
-                .await
-                .map_err(|error| {
-                    let category = if http.insufficient_scope() {
-                        "MCP scope required"
-                    } else if http.unauthorized() {
-                        "MCP login required"
-                    } else {
-                        "MCP connection failed"
-                    };
-                    format!(
-                        "{category}: {}",
-                        redact(
-                            entry,
-                            crate::mcp_http::initialize_failure(&error, &|text| redact(
-                                entry, text
-                            ))
-                        )
-                    )
-                })?;
+            let service = negotiation::connect(entry, handler, &probe, true, || {
+                Ok(StreamableHttpClientTransport::with_client(
+                    http.clone(),
+                    options.clone(),
+                ))
+            })
+            .await
+            .map_err(|cause| {
+                let category = if http.insufficient_scope() {
+                    "MCP scope required"
+                } else if http.unauthorized() {
+                    "MCP login required"
+                } else {
+                    "MCP connection failed"
+                };
+                format!("{category}: {}", redact(entry, cause))
+            })?;
             (service, Some(http))
         }
-        McpTransport::Stdio {
-            command,
-            args,
-            env,
-            cwd,
-        } => {
-            let mut process = tokio::process::Command::new(command);
-            process
-                .args(args)
-                .env_clear()
-                .envs(environment)
-                .envs(env)
-                .current_dir(cwd);
-            // Arbitrary stderr bytes cannot be safely redacted across chunk boundaries.
-            let stderr = if !config.sensitive_values.is_empty() {
-                std::process::Stdio::null()
-            } else if let Some(directory) = stderr_directory {
-                use sha2::{Digest, Sha256};
-                use std::os::unix::fs::OpenOptionsExt;
-                directory
-                    .create()
-                    .map_err(|_| "MCP log directory unavailable")?;
-                let file = directory
-                    .path()
-                    .join(format!("{:x}.log", Sha256::digest(config.name.as_bytes())));
-                let log = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                    .open(file)
-                    .map_err(|_| "MCP log file unavailable")?;
-                if !log
-                    .metadata()
-                    .map_err(|_| "MCP log file unavailable")?
-                    .is_file()
-                {
-                    return Err("MCP log must be a regular file".into());
-                }
-                std::process::Stdio::from(log)
-            } else {
-                std::process::Stdio::inherit()
-            };
-            let redact_entry = Arc::downgrade(entry);
-            let transport = process::ProcessTransport::spawn(
-                process,
-                stderr,
-                Arc::new(move |value, part| {
-                    if let Some(entry) = redact_entry.upgrade() {
-                        redact_wire_value(&entry, value, part);
-                    } else {
-                        *value = Value::Null;
-                    }
-                }),
-            )?;
-            let service = handler
-                .serve_with_lifecycle(transport, lifecycle)
-                .await
-                .map_err(|_| "MCP connection failed")?;
+        McpTransport::Stdio { .. } => {
+            let service = negotiation::connect(entry, handler, &probe, false, || {
+                stdio_transport(entry, environment, stderr_directory, &probe)
+            })
+            .await
+            .map_err(|cause| format!("MCP connection failed: {}", redact(entry, cause)))?;
             (service, None)
         }
         _ => return Err("MCP transport unavailable".into()),

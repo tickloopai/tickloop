@@ -35,10 +35,14 @@ struct State {
     resource_text: String,
     resources_changed: bool,
     discover_error_over_sse: bool,
+    discover_replies: std::collections::VecDeque<(u16, Value)>,
+    discover_delay: std::time::Duration,
+    close_discover: bool,
+    truncate_discover: bool,
     http_responses: std::collections::HashMap<String, (u16, String)>,
     protocol_version: Option<String>,
     initialize_error: Option<Value>,
-    methods: Vec<String>,
+    messages: Vec<(Value, Option<String>)>,
 }
 impl McpService {
     pub async fn start() -> Self {
@@ -67,10 +71,14 @@ impl McpService {
                 resource_text: "resource text".into(),
                 resources_changed: false,
                 discover_error_over_sse: false,
+                discover_replies: Default::default(),
+                discover_delay: std::time::Duration::ZERO,
+                close_discover: false,
+                truncate_discover: false,
                 http_responses: Default::default(),
                 protocol_version: None,
                 initialize_error: None,
-                methods: Vec::new(),
+                messages: Vec::new(),
             })),
             cancel: CancellationToken::new(),
         };
@@ -113,6 +121,7 @@ impl McpService {
                                 let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
                             }
+                            let protocol_version = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("mcp-protocol-version")).map(|(_, value)| value.trim().to_owned()));
                             let authorization = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value.trim().to_owned()));
                             let length = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).and_then(|(_, n)| n.trim().parse::<usize>().ok())).unwrap_or(0);
                             if length > 8 * 1024 * 1024 { return; }
@@ -127,7 +136,8 @@ impl McpService {
                                 let mut state = state.lock().unwrap();
                                 state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
-                                state.methods.push(method.to_owned());
+                                state.messages.push((request.clone(), protocol_version));
+                                if method == "server/discover" && state.close_discover { return; }
                                 let result = match method {
                                     "initialize" => {
                                         let mut capabilities = json!({"tools":{"listChanged":true}});
@@ -145,11 +155,18 @@ impl McpService {
                                 if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()); }
                                 if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"}).to_string()); }
                                 if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
-                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else if method == "initialize" {state.initialize_error.clone()} else {None}, notifications, state.challenge.clone())
+                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if method == "server/discover" {state.discover_delay} else if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else if method == "initialize" {state.initialize_error.clone()} else {None}, notifications, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
                             let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
+                            let (status, response) = if request["method"] == "server/discover"
+                                && let Some((status, mut response)) = state.lock().unwrap().discover_replies.pop_front()
+                            {
+                                response["jsonrpc"] = json!("2.0");
+                                if response.get("id").is_none() { response["id"] = request["id"].clone(); }
+                                (status, response)
+                            } else { (status, response) };
                             let resume_directory = {
                                 let mut state = state.lock().unwrap();
                                 if request["method"] == "tools/list" && std::mem::take(&mut state.resume_directory) {
@@ -167,7 +184,8 @@ impl McpService {
                             } else { (status, "application/json", response.to_string()) };
                             let (status, body) = state.lock().unwrap().http_responses.get(request["method"].as_str().unwrap_or("")).cloned().unwrap_or((status, body));
                             let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
-                            let reply = format!("HTTP/1.1 {status} Fixture\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let body_length = body.len() + if request["method"] == "server/discover" && state.lock().unwrap().truncate_discover { 100 } else { 0 };
+                            let reply = format!("HTTP/1.1 {status} Fixture\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {body_length}\r\nConnection: close\r\n\r\n{body}");
                             let _ = stream.write_all(reply.as_bytes()).await;
                         });
                     }
@@ -217,7 +235,28 @@ impl McpService {
         self.state.lock().unwrap().protocol_version = Some(version.into());
     }
     pub fn methods(&self) -> Vec<String> {
-        self.state.lock().unwrap().methods.clone()
+        self.state
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|(message, _)| message["method"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+    pub fn messages(&self) -> Vec<(Value, Option<String>)> {
+        self.state.lock().unwrap().messages.clone()
+    }
+    pub fn set_discover_replies(&self, replies: Vec<(u16, Value)>) {
+        self.state.lock().unwrap().discover_replies = replies.into();
+    }
+    pub fn delay_discover(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().discover_delay = delay;
+    }
+    pub fn close_discover(&self) {
+        self.state.lock().unwrap().close_discover = true;
+    }
+    pub fn truncate_discover(&self) {
+        self.state.lock().unwrap().truncate_discover = true;
     }
     pub fn resume_tool_directory_once(&self) {
         self.state.lock().unwrap().resume_directory = true;

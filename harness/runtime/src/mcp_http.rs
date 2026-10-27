@@ -15,8 +15,8 @@ use reqwest::{Client, Method, StatusCode, Url, header, redirect::Policy};
 use rmcp::{
     ServiceError,
     model::{
-        ClientJsonRpcMessage, ClientRequest, CustomResult, ErrorCode, ErrorData, JsonRpcError,
-        JsonRpcResponse, ServerJsonRpcMessage, ServerResult,
+        ClientJsonRpcMessage, ClientRequest, CustomResult, ErrorCode, JsonRpcResponse,
+        ProtocolVersion, ServerJsonRpcMessage, ServerResult,
     },
     transport::streamable_http_client::{
         SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
@@ -24,6 +24,7 @@ use rmcp::{
 };
 use sse_stream::{Sse, SseStream};
 
+use crate::mcp::negotiation::ProbeState;
 use tickloop_harness_base::network::{HttpPolicy, build_http_client};
 
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +35,7 @@ const INVALID_RESPONSE: &str = "invalid MCP response";
 const CONNECTION_FAILED: &str = "MCP connection failed";
 const RESOURCE_NOT_FOUND: &str = "MCP resource not found";
 const MAX_URI_CHARS: usize = 200;
+const MAX_ERROR_SOURCE_DEPTH: usize = 8;
 
 /// Why the HTTP exchange under an MCP message failed. Every variant shows only fixed text, so
 /// neither the bearer nor anything the server sent can surface through it.
@@ -132,11 +134,33 @@ fn transport_failure(error: &StreamableHttpError<McpHttpError>) -> String {
             "MCP access forbidden (HTTP 403)".into()
         }
         StreamableHttpError::Client(error) => error.to_string(),
+        StreamableHttpError::Sse(error) => {
+            nested_http_error(error).map_or_else(|| INVALID_RESPONSE.into(), ToString::to_string)
+        }
         StreamableHttpError::UnexpectedServerResponse(_)
         | StreamableHttpError::UnexpectedContentType(_)
         | StreamableHttpError::Deserialize(_) => INVALID_RESPONSE.into(),
         _ => CONNECTION_FAILED.into(),
     }
+}
+
+pub(crate) fn nested_http_error<'a>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a McpHttpError> {
+    for _ in 0..MAX_ERROR_SOURCE_DEPTH {
+        if let Some(cause) = error.downcast_ref::<McpHttpError>() {
+            return Some(cause);
+        }
+        if let Some(cause) = error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+        {
+            error = cause;
+        } else {
+            error = error.source()?;
+        }
+    }
+    None
 }
 
 /// One bounded line: control and invisible formatting characters become spaces and whitespace
@@ -194,6 +218,7 @@ pub(crate) struct McpHttpClient {
     redactor: Option<ResponseRedactor>,
     directory_requests: DirectoryRequests,
     headers: HashMap<HeaderName, HeaderValue>,
+    probe: Option<ProbeState>,
 }
 
 impl McpHttpClient {
@@ -213,6 +238,7 @@ impl McpHttpClient {
             redactor: None,
             directory_requests: Arc::default(),
             headers: HashMap::new(),
+            probe: None,
         })
     }
 
@@ -266,6 +292,26 @@ impl McpHttpClient {
     pub(crate) fn with_redactor(mut self, redactor: ResponseRedactor) -> Self {
         self.redactor = Some(redactor);
         self
+    }
+
+    pub(crate) fn with_probe(mut self, probe: ProbeState) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    fn decode_probe_body(
+        &self,
+        body: &[u8],
+    ) -> Result<ServerJsonRpcMessage, StreamableHttpError<McpHttpError>> {
+        let text =
+            std::str::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
+        let text = if let Some(redact) = &self.redactor {
+            redact_message(text, redact, &self.directory_requests, self.probe.as_ref())
+                .map_err(|_| unexpected("invalid MCP JSON response"))?
+        } else {
+            text.to_owned()
+        };
+        serde_json::from_str(&text).map_err(|_| unexpected("invalid MCP JSON response"))
     }
 
     pub(crate) fn with_artifact_credentials(
@@ -409,11 +455,12 @@ fn sse_stream(
     max_event_bytes: usize,
     redactor: Option<ResponseRedactor>,
     directory_requests: DirectoryRequests,
+    probe: Option<ProbeState>,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let mut event_bytes = 0_usize;
     let mut line_bytes = 0_usize;
     let stream = response.bytes_stream().map(move |chunk| {
-        let chunk = chunk.map_err(|_| io::Error::other("MCP event stream failed"))?;
+        let chunk = chunk.map_err(|error| io::Error::other(McpHttpError::from(error)))?;
         for byte in &chunk {
             event_bytes = event_bytes.saturating_add(1);
             if *byte == b'\n' {
@@ -436,11 +483,12 @@ fn sse_stream(
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
                         event.data = Some(
-                            redact_message(&data, redact, &directory_requests).map_err(|_| {
-                                SseError::Body(Box::new(io::Error::other(
-                                    "invalid MCP event response",
-                                )))
-                            })?,
+                            redact_message(&data, redact, &directory_requests, probe.as_ref())
+                                .map_err(|_| {
+                                    SseError::Body(Box::new(io::Error::other(
+                                        "invalid MCP event response",
+                                    )))
+                                })?,
                         );
                     }
                     for value in [&mut event.id, &mut event.event].into_iter().flatten() {
@@ -459,8 +507,12 @@ pub(crate) fn redact_message(
     text: &str,
     redact: &ResponseRedactor,
     directory_requests: &DirectoryRequests,
+    probe: Option<&ProbeState>,
 ) -> Result<String, serde_json::Error> {
     let mut message: serde_json::Value = serde_json::from_str(text)?;
+    let routing = probe
+        .map(|probe| probe.prepare_response(&mut message))
+        .unwrap_or_default();
     let pending = if message.get("method").is_none() {
         message
             .get("id")
@@ -506,7 +558,11 @@ pub(crate) fn redact_message(
             let protocol_version = (field == "result")
                 .then(|| payload.get("protocolVersion").cloned())
                 .flatten()
-                .filter(|version| matches!(version.as_str(), Some("2026-07-28" | "2025-11-25")));
+                .filter(|version| {
+                    ProtocolVersion::KNOWN_VERSIONS
+                        .iter()
+                        .any(|known| Some(known.as_str()) == version.as_str())
+                });
             let part = if field == "result" && directory_response {
                 ResponsePart::ToolDirectory
             } else {
@@ -518,6 +574,11 @@ pub(crate) fn redact_message(
             {
                 fields.insert("protocolVersion".into(), version);
             }
+        }
+    }
+    for (pointer, version) in routing {
+        if let Some(field) = message.pointer_mut(&pointer) {
+            *field = version;
         }
     }
     // Reject undecodable messages here so SDK diagnostics cannot echo their raw fields.
@@ -570,15 +631,13 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let discover_id = match &message {
-            ClientJsonRpcMessage::Request(request)
-                if session_id.is_none()
-                    && matches!(request.request, ClientRequest::DiscoverRequest(_)) =>
-            {
-                Some(request.id.clone())
-            }
-            _ => None,
-        };
+        let discover = self.probe.is_some()
+            && session_id.is_none()
+            && matches!(&message,
+            ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::DiscoverRequest(_)));
+        if let Some(probe) = &self.probe {
+            probe.sending(&message);
+        }
         let directory_request = match &message {
             ClientJsonRpcMessage::Request(request)
                 if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
@@ -605,38 +664,14 @@ impl StreamableHttpClient for McpHttpClient {
         }
         let response = self.send(request.json(&message)).await?;
         let status = response.status();
-        if let Some(id) = discover_id
-            && matches!(
-                status,
-                StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-            )
-        {
+        if discover && !status.is_success() && !matches!(status.as_u16(), 401 | 403) {
             let body = json_bytes(response).await?;
-            let legacy = match serde_json::from_slice::<serde_json::Value>(&body) {
-                Err(_) => true,
-                Ok(value) => serde_json::from_value::<JsonRpcError>(value).is_ok_and(|error| {
-                    error.id.is_none()
-                        && !matches!(
-                            error.error.code,
-                            ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
-                                | ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
-                                | ErrorCode::HEADER_MISMATCH
-                        )
-                }),
-            };
-            if legacy {
-                // Legacy servers may reject the probe before they can correlate its request id.
-                return Ok(StreamableHttpPostResponse::Json(
-                    ServerJsonRpcMessage::Error(JsonRpcError::new(
-                        Some(id),
-                        ErrorData::new(
-                            ErrorCode::METHOD_NOT_FOUND,
-                            format!("MCP returned HTTP {status}"),
-                            None,
-                        ),
-                    )),
-                    None,
-                ));
+            if let Ok(message @ ServerJsonRpcMessage::Error(_)) = self.decode_probe_body(&body) {
+                self.probe
+                    .as_ref()
+                    .unwrap()
+                    .http_error_response(status.as_u16());
+                return Ok(StreamableHttpPostResponse::Json(message, None));
             }
             return Err(StreamableHttpError::Client(McpHttpError::Status(status)));
         }
@@ -645,6 +680,9 @@ impl StreamableHttpClient for McpHttpClient {
             response.status(),
             StatusCode::ACCEPTED | StatusCode::NO_CONTENT
         ) {
+            if discover {
+                return Err(unexpected("MCP discover returned no response"));
+            }
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         let session_id = response
@@ -665,15 +703,21 @@ impl StreamableHttpClient for McpHttpClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         if content_type.starts_with("text/event-stream") {
-            return Ok(StreamableHttpPostResponse::Sse(
+            let response = StreamableHttpPostResponse::Sse(
                 sse_stream(
                     response,
                     max_sse_event_size,
                     self.redactor.clone(),
                     self.directory_requests.clone(),
+                    self.probe.clone(),
                 ),
                 session_id,
-            ));
+            );
+            if discover {
+                let (message, session_id) = response.expect_initialized::<McpHttpError>().await?;
+                return Ok(StreamableHttpPostResponse::Json(message, session_id));
+            }
+            return Ok(response);
         }
         if !content_type.starts_with("application/json") {
             return Err(unexpected("invalid MCP content type"));
@@ -682,7 +726,7 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(redact) = &self.redactor {
             let text =
                 String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
-            body = redact_message(&text, redact, &self.directory_requests)
+            body = redact_message(&text, redact, &self.directory_requests, self.probe.as_ref())
                 .map_err(|_| unexpected("invalid MCP JSON response"))?
                 .into_bytes();
         }
@@ -701,6 +745,15 @@ impl StreamableHttpClient for McpHttpClient {
             serde_json::from_slice::<ServerJsonRpcMessage>(&body)
         };
         match decoded {
+            Ok(message)
+                if discover
+                    && !matches!(
+                        message,
+                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                    ) =>
+            {
+                Err(unexpected("invalid MCP discover response"))
+            }
             Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
             Err(_) => Err(unexpected("invalid MCP JSON response")),
         }
@@ -759,6 +812,7 @@ impl StreamableHttpClient for McpHttpClient {
             max_sse_event_size,
             self.redactor.clone(),
             self.directory_requests.clone(),
+            self.probe.clone(),
         ))
     }
 
