@@ -3785,6 +3785,7 @@ impl Agent {
                 goal_recorded_tokens: snapshot.goal.as_ref().map_or(0, |goal| goal.tokens_used),
                 loaded_from_history: waits == WaitHosting::Process,
                 goal_clock_ms: 0,
+                cache_prefix: Default::default(),
             },
         );
         if let Some(context) = snapshot

@@ -32,7 +32,8 @@ pub(crate) fn install(root: Option<&Path>) -> Result<(), String> {
     use tracing_subscriber::prelude::*;
     let subscriber = subscriber.with(
         tracing_subscriber::filter::Targets::new()
-            .with_target("tickloop::request_timing", tracing::Level::DEBUG),
+            .with_target("tickloop::request_timing", tracing::Level::DEBUG)
+            .with_target("tickloop::cache_break", tracing::Level::DEBUG),
     );
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|_| "cannot install Agent timing log".into())

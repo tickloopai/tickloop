@@ -117,10 +117,10 @@ Read the latest appended MCP Server Instructions and withdrawal notices, togethe
 | Server state | Action |
 | --- | --- |
 | Connected | Discover tools and inspect their parameters before calling. |
-| Connecting | Continue independent work; an empty search result is not proof the server has no tools. |
+| Connecting | Continue independent work; an empty search result is not proof the server has no tools. Its searchable tools can be found once it connects; its directly listed tools can be called only after they appear in your tool list. |
 | Needs login | Ask the user to log in through `/mcp` or `tickloop mcp login <server>`, then continue once they have. |
 | Needs configuration | Ask the user to fill the plugin's Configure page in `/plugins` or run `tickloop plugin configure <plugin>`. |
-| Failed or unsupported | Report the state and diagnostic; ask the user to manage it in `/mcp`. Adding a server uses `tickloop mcp add`, outside the panel. |
+| Failed or unsupported | Report the state and diagnostic; ask the user to manage it in `/mcp`. A remote server retries a few times on its own; a local one stays stopped until the user reconnects it. Adding a server uses `tickloop mcp add`, outside the panel. |
 
 Service configuration and credentials refresh on the next request. The model does not add or remove servers, edit their configuration, enable plugins or perform login/logout. Never read credential files. When a login does not reach the Agent and the URL uses an environment variable, ask the user to check that the login terminal and the Agent's startup terminal resolve the same address.
 

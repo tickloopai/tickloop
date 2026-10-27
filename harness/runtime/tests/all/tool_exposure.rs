@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::sync::Arc;
 use tickloop_harness_protocol::{ToolDefinition, mcp::ToolExposure};
 use tickloop_harness_runtime::tool_exposure::{ExposureDirectory, ExposureTool, SearchSupport};
 
@@ -6,13 +7,15 @@ fn tool(name: &str, description: &str, exposure: ToolExposure) -> ExposureTool {
     ExposureTool {
         server: "office".into(),
         original_name: name.into(),
-        definition: ToolDefinition {
+        definition: Arc::new(ToolDefinition {
             name: format!("mcp__office__{name}"),
             description: description.into(),
             input_schema: json!({"type":"object","properties":{"recipient":{"type":"string"}},"required":["recipient"]}),
-        },
-        original_schema: json!({"type":"object","properties":{"recipient":{"type":"string"}},"required":["recipient"]}),
-        annotations: json!({"readOnlyHint":true}),
+        }),
+        original_schema: Arc::new(
+            json!({"type":"object","properties":{"recipient":{"type":"string"}},"required":["recipient"]}),
+        ),
+        annotations: Arc::new(json!({"readOnlyHint":true})),
         exposure,
     }
 }
@@ -614,16 +617,17 @@ fn fold_calls_read_as_text_once_a_request_no_longer_offers_fold() {
 #[test]
 fn native_search_offers_original_object_schemas_and_flattened_ones_otherwise() {
     let mut combined = tool("mail", "Mail", ToolExposure::Search);
-    combined.original_schema =
-        json!({"type":"object","properties":{"to":{"anyOf":[{"type":"string"},{"type":"array"}]}}});
+    combined.original_schema = Arc::new(
+        json!({"type":"object","properties":{"to":{"anyOf":[{"type":"string"},{"type":"array"}]}}}),
+    );
     let mut rootless = tool("draft", "Draft", ToolExposure::Search);
-    rootless.original_schema = json!({"anyOf":[{"type":"object"},{"type":"null"}]});
+    rootless.original_schema = Arc::new(json!({"anyOf":[{"type":"object"},{"type":"null"}]}));
     let native = ExposureDirectory::new(
         vec![combined.clone(), rootless.clone()],
         SearchSupport::Native,
     );
     let deferred = native.deferred_tools();
-    assert_eq!(deferred[0].input_schema, combined.original_schema);
+    assert_eq!(deferred[0].input_schema, *combined.original_schema);
     assert_eq!(deferred[1].input_schema, rootless.definition.input_schema);
 }
 
@@ -1445,7 +1449,7 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
 fn server_tool(server: &str, name: &str, description: &str) -> ExposureTool {
     let mut tool = tool(name, description, ToolExposure::Search);
     tool.server = server.into();
-    tool.definition.name = format!("mcp__{server}__{name}");
+    Arc::make_mut(&mut tool.definition).name = format!("mcp__{server}__{name}");
     tool
 }
 

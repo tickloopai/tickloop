@@ -1,5 +1,6 @@
 //! Agent-owned MCP connections. Hosts supply resolved configuration, credentials and capabilities.
 mod catalog;
+mod connection;
 pub(crate) mod negotiation;
 mod process;
 mod provider;
@@ -7,15 +8,11 @@ mod redaction;
 mod snapshot;
 use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
-pub use provider::{McpConfiguration, McpToolProvider};
-use rmcp::{
-    ClientHandler, RoleClient,
-    model::{CallToolRequestParams, ClientConfig, ProtocolVersion},
-    service::{NotificationContext, RunningService},
-    transport::{
-        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
-    },
+use connection::{
+    Attempt, Served, authentication_rejected, connect, reconnect_delay, serve, tool_list_key,
 };
+pub use provider::{McpConfiguration, McpToolProvider};
+use rmcp::{RoleClient, model::CallToolRequestParams};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -53,45 +50,55 @@ pub struct McpServerSnapshot {
     pub warnings: Vec<String>,
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the first request waits, once, for servers that are still starting.
-const STARTUP_WAIT: Duration = Duration::from_secs(10);
+/// How long a Worker's first request waits for the servers still connecting: one deadline,
+/// computed once and shared by every server, including those whose tools are listed directly.
+const STARTUP_GRACE: Duration = Duration::from_secs(2);
+/// How many times a remote server reconnects after one failure before it stays failed.
+const MAX_RECONNECTS: u32 = 5;
+/// How long a connection must stay up before its reconnects count from zero again, so that a
+/// server that connects and drops at once still stops after the capped reconnects.
+const RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How soon before it expires a login is renewed on its open connection.
+const TOKEN_RENEWAL_WINDOW_SECONDS: u64 = 30;
 const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
-#[derive(Clone)]
-struct Handler {
-    revision: Arc<AtomicU64>,
-    changed: Arc<tokio::sync::Notify>,
-    resource_revision: Arc<AtomicU64>,
-    resources_changed: Arc<tokio::sync::Notify>,
-}
-impl ClientHandler for Handler {
-    async fn on_tool_list_changed(&self, _: NotificationContext<RoleClient>) {
-        self.revision.fetch_add(1, Ordering::SeqCst);
-        self.changed.notify_one();
-    }
-    async fn on_resource_list_changed(&self, _: NotificationContext<RoleClient>) {
-        self.resource_revision.fetch_add(1, Ordering::SeqCst);
-        self.resources_changed.notify_one();
-    }
-    fn get_info(&self) -> ClientConfig {
-        ClientConfig::default().with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
-    }
-}
+const CONNECTION_UNAVAILABLE: &str = "MCP connection is unavailable";
+const TOOLS_RELIST_FAILED: &str =
+    "MCP tools could not be listed again; the last listed tools remain";
 struct Connection {
     peer: rmcp::service::Peer<RoleClient>,
     revision: Arc<AtomicU64>,
     catalog_revision: AtomicU64,
     http: Option<McpHttpClient>,
     changed: Arc<tokio::sync::Notify>,
-    tools: RwLock<BTreeMap<String, catalog::Tool>>,
-    snapshot: RwLock<Arc<snapshot::Catalog>>,
     instructions: String,
     /// `None` when the server does not provide resources.
     resources: Option<ResourceDirectory>,
     warnings: RwLock<Vec<String>>,
+    /// Cancelled when a call finds the connection unusable, so that it is opened again.
+    lost: CancellationToken,
+}
+/// The tools a server listed last, kept in memory by server name while it reconnects, renews its
+/// login or fails to list them again, so that its tools do not come and go.
+#[derive(PartialEq)]
+struct ToolList {
+    /// The server's configuration without secret values, and the account it lists tools for.
+    key: [u8; 32],
+    tools: BTreeMap<String, catalog::Tool>,
+    warnings: Vec<String>,
+}
+type ToolLists = Arc<std::sync::Mutex<BTreeMap<String, Arc<ToolList>>>>;
+/// When each server began a connection attempt and when each attempt failed.
+#[cfg(feature = "test-support")]
+type ConnectionLog = Arc<std::sync::Mutex<Vec<(String, ConnectionEvent, tokio::time::Instant)>>>;
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    Attempt,
+    Failure,
 }
 /// The resources a server listed. A server that announces list changes is listed from here while
 /// the directory is current; any other server is asked each time.
@@ -110,6 +117,13 @@ impl ResourceDirectory {
     }
 }
 struct Entry {
+    snapshot: RwLock<Arc<snapshot::Catalog>>,
+    tools: RwLock<Option<Arc<ToolList>>>,
+    tool_lists: ToolLists,
+    tool_list_key: [u8; 32],
+    /// A failed remote server that will connect again after its backoff.
+    reconnecting: AtomicBool,
+    renewing: AtomicBool,
     redactor: RwLock<Option<Arc<redaction::Redactor>>>,
     publication: std::sync::Mutex<()>,
     generation: AtomicU64,
@@ -135,6 +149,64 @@ struct Entry {
     legacy: Arc<AtomicBool>,
 }
 impl Entry {
+    /// Whether its last listed tools reach the model: while it is connected, connecting or
+    /// waiting to reconnect.
+    fn lists_tools(&self) -> bool {
+        match *self.state.read().unwrap() {
+            McpServerState::Connected | McpServerState::Connecting => true,
+            McpServerState::Failed => self.reconnecting.load(Ordering::SeqCst),
+            _ => false,
+        }
+    }
+
+    /// Takes up a fresh listing. An unchanged one keeps the published catalog and its generation.
+    fn adopt_tools(&self, tools: BTreeMap<String, catalog::Tool>, warnings: Vec<String>) {
+        let list = ToolList {
+            key: self.tool_list_key,
+            tools,
+            warnings,
+        };
+        let unchanged = self.tools.read().unwrap().as_deref() == Some(&list)
+            && self.snapshot.read().unwrap().secret_generation
+                == self.secret_generation.load(Ordering::SeqCst);
+        if unchanged {
+            self.publish_metadata();
+            return;
+        }
+        let list = Arc::new(list);
+        *self.tools.write().unwrap() = Some(list.clone());
+        self.tool_lists
+            .lock()
+            .unwrap()
+            .insert(self.config.name.clone(), list);
+        self.publish_catalog();
+    }
+
+    /// Whether a changed saved login can replace the token on the open connection instead of
+    /// connecting again: the same account at the same address, still logged in.
+    fn renews_in_place(&self, credential: Option<&ConnectorCredential>) -> bool {
+        let current = self.credential.read().unwrap();
+        *self.state.read().unwrap() == McpServerState::Connected
+            && self.connector.is_some()
+            && matches!((current.as_ref(), credential), (Some(current), Some(next))
+                if current.server_url == next.server_url
+                    && current.registration == next.registration
+                    && next.token.is_some())
+    }
+
+    fn token_expires_soon(&self) -> bool {
+        self.credential
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|saved| saved.token.as_ref())
+            .is_some_and(|token| {
+                token.expires_at
+                    <= tickloop_harness_base::private_fs::unix_time_milliseconds() / 1000
+                        + TOKEN_RENEWAL_WINDOW_SECONDS
+            })
+    }
+
     fn offers_tools(&self) -> bool {
         use tickloop_harness_protocol::mcp::ToolExposure;
         self.config.exposure != ToolExposure::Hidden
@@ -229,8 +301,8 @@ impl Entry {
             McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
             _ => None,
         };
-        if changed && let Some(connection) = self.connection.read().unwrap().clone() {
-            self.publish_catalog(&connection);
+        if changed {
+            self.publish_catalog();
         }
     }
 }
@@ -244,7 +316,6 @@ struct PreparedMcpCall {
 /// Which unchanged servers a reconcile connects again.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Restart<'a> {
-    Failed,
     Nothing,
     Server(&'a str),
 }
@@ -264,7 +335,12 @@ struct Inner {
     tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     reconcile_lock: tokio::sync::Mutex<()>,
     closed: AtomicBool,
-    startup_waited: AtomicBool,
+    startup_deadline: std::sync::OnceLock<tokio::time::Instant>,
+    /// The servers a first request waits for right now; empty when none is waiting.
+    awaited: tokio::sync::watch::Sender<Vec<String>>,
+    tool_lists: ToolLists,
+    #[cfg(feature = "test-support")]
+    connection_log: ConnectionLog,
     state_changed: Arc<tokio::sync::Notify>,
     local_slots: Arc<tokio::sync::Semaphore>,
     remote_slots: Arc<tokio::sync::Semaphore>,
@@ -288,35 +364,142 @@ impl McpConnections {
                 tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
                 reconcile_lock: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
-                startup_waited: AtomicBool::new(false),
+                startup_deadline: std::sync::OnceLock::new(),
+                awaited: tokio::sync::watch::Sender::new(Vec::new()),
+                tool_lists: Arc::default(),
+                #[cfg(feature = "test-support")]
+                connection_log: Arc::default(),
                 state_changed: Arc::new(tokio::sync::Notify::new()),
                 local_slots: Arc::new(tokio::sync::Semaphore::new(4)),
                 remote_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             }),
         }
     }
-    /// The first request waits, at most once, for servers whose tools reach the model directly
-    /// or through discovery, so that it does not miss a server that is still starting.
+    /// Waits until no server that offers tools is still connecting, at most until the Worker's
+    /// startup deadline: two seconds after its first request began waiting, shared by every
+    /// server and every Chat. Once the deadline has passed, requests do not wait.
     async fn wait_for_startup(&self, cancel: CancellationToken) {
-        if self.inner.startup_waited.swap(true, Ordering::SeqCst) {
+        let deadline = *self
+            .inner
+            .startup_deadline
+            .get_or_init(|| tokio::time::Instant::now() + STARTUP_GRACE);
+        loop {
+            let changed = self.inner.state_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let mut pending = self.connecting_tool_servers();
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                pending.clear();
+            }
+            let waiting = !pending.is_empty();
+            self.inner.awaited.send_if_modified(|awaited| {
+                let modified = *awaited != pending;
+                *awaited = pending;
+                modified
+            });
+            if !waiting {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = changed => {}
+            }
+        }
+    }
+
+    fn connecting_tool_servers(&self) -> Vec<String> {
+        self.inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| {
+                *entry.state.read().unwrap() == McpServerState::Connecting && entry.offers_tools()
+            })
+            .map(|entry| entry.config.name.clone())
+            .collect()
+    }
+
+    /// Every configured server's entry, in name order.
+    fn entries(&self) -> Vec<Arc<Entry>> {
+        self.inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The servers a request is waiting for, as they change.
+    pub fn awaited_servers(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
+        self.inner.awaited.subscribe()
+    }
+
+    /// Renews, on their open connections, the logins that expire within
+    /// [`TOKEN_RENEWAL_WINDOW_SECONDS`].
+    async fn renew_expiring_tokens(&self) {
+        let expiring: Vec<_> = self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| {
+                *entry.state.read().unwrap() == McpServerState::Connected
+                    && entry.connector.is_some()
+                    && entry.token_expires_soon()
+            })
+            .cloned()
+            .collect();
+        for entry in expiring {
+            self.renew_in_place(entry).await;
+        }
+    }
+
+    /// Replaces the token of an open connection with the saved login, renewed first when it
+    /// expires soon; the server's tools stay listed throughout.
+    async fn renew_in_place(&self, entry: Arc<Entry>) {
+        if entry.renewing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let wait = async {
-            loop {
-                let changed = self.inner.state_changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                let pending = self.inner.entries.read().unwrap().values().any(|entry| {
-                    *entry.state.read().unwrap() == McpServerState::Connecting
-                        && entry.offers_tools()
-                });
-                if !pending {
-                    break;
-                }
-                changed.await;
+        let state_changed = self.inner.state_changed.clone();
+        self.inner.tasks.lock().await.spawn(async move {
+            let Some(connector) = &entry.connector else {
+                return;
+            };
+            let token = tokio::select! {
+                _ = entry.cancel.cancelled() => return,
+                token = connector.access_token(&entry.cancel) => token,
+            };
+            if let Some(credentials) = &entry.credentials
+                && let Ok(credential) = credentials.load().await
+            {
+                entry.remember_credential(credential);
             }
-        };
-        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(STARTUP_WAIT, wait) => {} }
+            match token {
+                Ok(token) => {
+                    if let Some(http) = entry
+                        .connection
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|connection| connection.http.as_ref())
+                    {
+                        http.set_token(token.secret());
+                    }
+                    entry.remember_token(token);
+                }
+                Err(TokenError::NeedsLogin) => {
+                    *entry.state.write().unwrap() = McpServerState::NeedsLogin;
+                    state_changed.notify_waiters();
+                }
+                // A later request tries again; the server rejects an expired token meanwhile.
+                Err(_) => {}
+            }
+            entry.renewing.store(false, Ordering::SeqCst);
+        });
     }
 
     pub fn with_stderr_directory(
@@ -333,14 +516,9 @@ impl McpConnections {
         *self.inner.credentials.write().unwrap() = credentials;
     }
 
-    /// Takes up `configs`, connecting changed servers and again those that failed.
+    /// Takes up `configs`, connecting the servers that changed. Failed servers stay failed until
+    /// their configuration or login changes or [`Self::reconnect`] names them.
     pub async fn reconcile(&self, configs: Vec<McpServerConfig>) {
-        self.reconcile_restarting(configs, Restart::Failed).await;
-    }
-
-    /// Takes up `configs` as [`Self::reconcile`] does, but leaves failed servers failed, so that
-    /// reading their state retries nothing.
-    pub async fn reconcile_keeping_failures(&self, configs: Vec<McpServerConfig>) {
         self.reconcile_restarting(configs, Restart::Nothing).await;
     }
 
@@ -438,20 +616,13 @@ impl McpConnections {
             let entry = if let Some(entry) = existing.filter(|entry| {
                 restart != Restart::Server(config.name.as_str())
                     && entry.config == config
-                    && *entry.credential.read().unwrap() == credential
-                    && (restart == Restart::Nothing
-                        || *entry.state.read().unwrap() != McpServerState::Failed)
-                    && !(*entry.state.read().unwrap() == McpServerState::Connected
-                        && credential
-                            .as_ref()
-                            .and_then(|saved| saved.token.as_ref())
-                            .is_some_and(|token| {
-                                token.expires_at
-                                    <= tickloop_harness_base::private_fs::unix_time_milliseconds()
-                                        / 1000
-                                        + 30
-                            }))
+                    && (*entry.credential.read().unwrap() == credential
+                        || entry.renews_in_place(credential.as_ref()))
             }) {
+                if *entry.credential.read().unwrap() != credential {
+                    entry.remember_credential(credential);
+                    self.renew_in_place(entry.clone()).await;
+                }
                 entry
             } else {
                 let state = if config.disabled {
@@ -479,8 +650,23 @@ impl McpConnections {
                     })
                     .map(|(_, value)| value.clone())
                     .collect();
+                let tool_list_key = tool_list_key(&config, credential.as_ref());
+                let cached = self
+                    .inner
+                    .tool_lists
+                    .lock()
+                    .unwrap()
+                    .get(&config.name)
+                    .filter(|list| list.key == tool_list_key)
+                    .cloned();
                 let entry = Arc::new(Entry {
                     legacy,
+                    snapshot: RwLock::new(Arc::new(snapshot::Catalog::default())),
+                    tools: RwLock::new(cached),
+                    tool_lists: self.inner.tool_lists.clone(),
+                    tool_list_key,
+                    reconnecting: AtomicBool::new(false),
+                    renewing: AtomicBool::new(false),
                     redactor: RwLock::new(previous_redactor),
                     publication: std::sync::Mutex::new(()),
                     generation: AtomicU64::new(previous_generation),
@@ -505,12 +691,24 @@ impl McpConnections {
                 });
                 entry.remember_credential(credential);
                 if *entry.state.read().unwrap() == McpServerState::Connecting {
+                    // A remembered tool list is offered while the server connects, unless the new
+                    // secrets already published it.
+                    if entry.snapshot.read().unwrap().secret_generation
+                        != entry.secret_generation.load(Ordering::SeqCst)
+                    {
+                        entry.publish_catalog();
+                    }
                     self.start(entry.clone()).await;
                 }
                 entry
             };
             next.insert(entry.config.name.clone(), entry);
         }
+        self.inner
+            .tool_lists
+            .lock()
+            .unwrap()
+            .retain(|name, _| next.contains_key(name));
         let old = std::mem::replace(&mut *self.inner.entries.write().unwrap(), next);
         for (name, entry) in old {
             if !self
@@ -525,6 +723,10 @@ impl McpConnections {
             }
         }
     }
+    /// Connects `entry` in the background and keeps it connected: a remote server that
+    /// disconnects or fails to connect tries again after 1, 2, 4, 8 and 16 seconds and then stays
+    /// failed, counting from zero again only after a connection stayed up for
+    /// [`RECONNECT_STABLE_AFTER`]; a local program that fails or exits is not started again.
     async fn start(&self, entry: Arc<Entry>) {
         let environment = self.inner.environment.clone();
         let stderr_directory = self.inner.stderr_directory.clone();
@@ -534,113 +736,76 @@ impl McpConnections {
         } else {
             self.inner.remote_slots.clone()
         };
+        #[cfg(feature = "test-support")]
+        let record = {
+            let log = self.inner.connection_log.clone();
+            let name = entry.config.name.clone();
+            move |event| {
+                log.lock()
+                    .unwrap()
+                    .push((name.clone(), event, tokio::time::Instant::now()));
+            }
+        };
         self.inner.tasks.lock().await.spawn(async move {
-            let authenticating = AtomicBool::new(false);
-            let connect = async {
-                let _permit = slots.acquire().await.map_err(|_| "MCP connection cancelled")?;
-                let has_token = entry.has_saved_token();
-                if has_token && let Some(connector) = &entry.connector {
-                    authenticating.store(true, Ordering::SeqCst);
-                    let token = connector.access_token(&entry.cancel).await;
-                    if let Some(credentials) = &entry.credentials {
-                        entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
-                    }
-                    entry.remember_token(token.map_err(|error| match error {
-                        TokenError::NeedsLogin | TokenError::RenewalFailed => "MCP login required",
-                        _ => "MCP credential unavailable",
-                    })?);
-                }
-                authenticating.store(false, Ordering::SeqCst);
-                let token = entry.token.read().unwrap().clone();
-                let opened = open(&entry, token.as_ref().map(|token| token.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
-                if matches!(&opened, Err(error) if failure_has_category(error, "MCP login required"))
-                    && let (Some(connector), Some(token)) = (&entry.connector, token)
-                {
-                    authenticating.store(true, Ordering::SeqCst);
-                    let renewed = connector.renew_rejected(&token, &entry.cancel).await;
-                    if let Some(credentials) = &entry.credentials {
-                        entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
-                    }
-                    let renewed = renewed.map_err(|_| opened.as_ref().err().cloned().unwrap_or_else(|| "MCP login required".into()))?;
-                    entry.remember_token(renewed.clone());
-                    authenticating.store(false, Ordering::SeqCst);
-                    return open(&entry, Some(renewed.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
-                }
-                opened
-            };
-            let result = tokio::select! {
-                _ = entry.cancel.cancelled() => return,
-                result = tokio::time::timeout(CONNECT_TIMEOUT, connect) => result,
-            };
-            match result {
-                Ok(Ok((connection, service))) => {
-                    let connection = Arc::new(connection);
-                    entry.publish_catalog(&connection);
-                    *entry.connection.write().unwrap() = Some(connection.clone());
-                    *entry.state.write().unwrap() = McpServerState::Connected;
-                    state_changed.notify_waiters();
-                    let stop = service.cancellation_token();
-                    let mut waiting = Box::pin(service.waiting());
-                    let resources_changed = connection.resources.as_ref().map(|directory| directory.changed.clone());
-                    loop {
-                        tokio::select! {
-                            _ = entry.cancel.cancelled() => { stop.cancel(); let _ = waiting.await; break; }
-                            _ = &mut waiting => { if *entry.state.read().unwrap() != McpServerState::NeedsLogin { *entry.state.write().unwrap() = McpServerState::Failed; *entry.failure.write().unwrap() = Some(CONNECTION_CLOSED.into()); } state_changed.notify_waiters(); break; }
-                            _ = connection.changed.notified() => {
-                                if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
-                                let revision = connection.revision.load(Ordering::SeqCst);
-                                entry.tool_schemas.write().unwrap().clear();
-                                let tools = tokio::select! {
-                                    _ = entry.cancel.cancelled() => continue,
-                                    tools = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.list_all_tools()) => tools,
-                                };
-                                if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
-                                    authentication_rejected(&entry, http, &entry.cancel).await;
-                                    state_changed.notify_waiters();
-                                }
-                                if let Ok(Ok(tools)) = tools {
-                                    let (mut tools, mut warnings) = catalog::directory(&entry.config, tools);
-                                    entry.restore_tool_schemas(&mut tools, &mut warnings);
-                                    *connection.tools.write().unwrap() = tools;
-                                    *connection.warnings.write().unwrap() = warnings;
-                                    connection.catalog_revision.store(revision, Ordering::SeqCst);
-                                    entry.publish_catalog(&connection);
-                                } else {
-                                    connection.tools.write().unwrap().clear();
-                                    entry.publish_catalog(&connection);
-                                    *connection.warnings.write().unwrap() = vec!["MCP tools unavailable".into()];
-                                }
+            let mut reconnects = 0;
+            loop {
+                #[cfg(feature = "test-support")]
+                record(ConnectionEvent::Attempt);
+                let failure =
+                    match connect(&entry, &slots, &environment, stderr_directory.as_ref()).await {
+                        Attempt::Cancelled => return,
+                        Attempt::NeedsLogin(reason) => {
+                            *entry.failure.write().unwrap() = Some(reason);
+                            *entry.state.write().unwrap() = McpServerState::NeedsLogin;
+                            state_changed.notify_waiters();
+                            return;
+                        }
+                        Attempt::Failed(reason) => reason,
+                        Attempt::Opened(opened) => {
+                            let opened_at = tokio::time::Instant::now();
+                            let served = serve(&entry, opened, &state_changed).await;
+                            if opened_at.elapsed() >= RECONNECT_STABLE_AFTER {
+                                reconnects = 0;
                             }
-                            _ = async { resources_changed.as_ref().unwrap().notified().await }, if resources_changed.is_some() => {
-                                if *entry.state.read().unwrap() != McpServerState::Connected { continue; }
-                                let directory = connection.resources.as_ref().unwrap();
-                                let revision = directory.revision.load(Ordering::SeqCst);
-                                let resources = tokio::select! {
-                                    _ = entry.cancel.cancelled() => continue,
-                                    resources = tokio::time::timeout(REQUEST_TIMEOUT, resource_directory(&connection.peer)) => resources,
-                                };
-                                if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
-                                    authentication_rejected(&entry, http, &entry.cancel).await;
-                                    state_changed.notify_waiters();
-                                }
-                                let mut warnings = connection.warnings.write().unwrap();
-                                warnings.retain(|warning| warning != RESOURCES_UNAVAILABLE);
-                                if let Ok(Ok(resources)) = resources {
-                                    *directory.resources.write().unwrap() = resources;
-                                    directory.loaded_revision.store(revision, Ordering::SeqCst);
-                                } else {
-                                    warnings.push(RESOURCES_UNAVAILABLE.into());
-                                }
-                                drop(warnings);
-                                entry.publish_metadata(&connection);
+                            match served {
+                                Served::Stopped => return,
+                                Served::Closed => CONNECTION_CLOSED.to_owned(),
                             }
                         }
-                    }
-
+                    };
+                *entry.connection.write().unwrap() = None;
+                *entry.failure.write().unwrap() = Some(failure);
+                let retries = matches!(entry.config.transport, McpTransport::Http { .. })
+                    && reconnects < MAX_RECONNECTS;
+                entry.reconnecting.store(retries, Ordering::SeqCst);
+                *entry.state.write().unwrap() = McpServerState::Failed;
+                state_changed.notify_waiters();
+                #[cfg(feature = "test-support")]
+                record(ConnectionEvent::Failure);
+                if !retries {
+                    return;
                 }
-                error => { *entry.failure.write().unwrap() = Some(match &error { Ok(Err(reason)) => reason.clone(), _ => CONNECTION_TIMED_OUT.into() }); *entry.state.write().unwrap() = if (error.is_err() && authenticating.load(Ordering::SeqCst)) || matches!(error, Ok(Err(ref error)) if (failure_has_category(error, "MCP login required") || failure_has_category(error, "MCP scope required")) && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
+                reconnects += 1;
+                tokio::select! {
+                    _ = entry.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(reconnect_delay(reconnects)) => {}
+                }
+                *entry.state.write().unwrap() = McpServerState::Connecting;
+                state_changed.notify_waiters();
             }
         });
+    }
+    /// When the server `name` began each connection attempt and when each one failed.
+    #[cfg(feature = "test-support")]
+    pub fn connection_events(&self, name: &str) -> Vec<(ConnectionEvent, tokio::time::Instant)> {
+        self.inner
+            .connection_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(server, _, _)| server == name)
+            .map(|(_, event, at)| (*event, *at))
+            .collect()
     }
     #[cfg(feature = "test-support")]
     pub fn performance_counts(&self) -> (u64, u64) {
@@ -679,7 +844,8 @@ impl McpConnections {
             .clone();
         redact_value(&entry, value);
     }
-    fn catalog(&self) -> Vec<(Arc<Entry>, Arc<Connection>, Arc<snapshot::Tool>)> {
+    /// The tools of every server whose last listed tools reach the model.
+    fn catalog(&self) -> Vec<(Arc<Entry>, Arc<snapshot::Tool>)> {
         let _timing = crate::timing::Phase::new("mcp_catalog_read");
         let entries: Vec<_> = self
             .inner
@@ -691,24 +857,19 @@ impl McpConnections {
             .collect();
         let mut tools = Vec::new();
         for entry in entries {
-            if *entry.state.read().unwrap() == McpServerState::NeedsLogin {
+            if !entry.lists_tools() {
                 continue;
             }
-            let connection = entry.connection.read().unwrap().clone();
-            if let Some(connection) = connection {
-                let snapshot = connection.snapshot.read().unwrap().clone();
-                if connection.revision.load(Ordering::SeqCst) != snapshot.revision
-                    || entry.secret_generation.load(Ordering::SeqCst) != snapshot.secret_generation
-                {
-                    continue;
-                }
-                tools.extend(
-                    snapshot
-                        .tools
-                        .values()
-                        .map(|tool| (entry.clone(), connection.clone(), tool.clone())),
-                );
+            let snapshot = entry.snapshot.read().unwrap().clone();
+            if entry.secret_generation.load(Ordering::SeqCst) != snapshot.secret_generation {
+                continue;
             }
+            tools.extend(
+                snapshot
+                    .tools
+                    .values()
+                    .map(|tool| (entry.clone(), tool.clone())),
+            );
         }
         tools
     }
@@ -766,8 +927,8 @@ impl McpConnections {
                     exposure: entry.config.exposure.as_str().into(),
                     tools: catalog
                         .iter()
-                        .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
-                        .map(|(_, _, tool)| McpToolSummary {
+                        .filter(|(owner, _)| Arc::ptr_eq(owner, entry))
+                        .map(|(_, tool)| McpToolSummary {
                             name: tool.definition.name.clone(),
                             description: tool.definition.description.clone(),
                         })
@@ -789,95 +950,78 @@ impl McpConnections {
             .unwrap()
             .values()
             .map(|entry| {
-                let connection = entry.connection.read().unwrap();
+                let published = entry.current_catalog();
                 McpServerSnapshot {
                     name: entry.config.name.clone(),
                     source: entry.config.source.clone(),
                     state: entry.state.read().unwrap().clone(),
                     tools: catalog
                         .iter()
-                        .filter(|(owner, _, _)| Arc::ptr_eq(owner, entry))
-                        .map(|(_, _, tool)| tool.definition.clone())
+                        .filter(|(owner, _)| Arc::ptr_eq(owner, entry))
+                        .map(|(_, tool)| (*tool.definition).clone())
                         .collect(),
-                    resources: connection
-                        .as_ref()
-                        .map(|connection| entry.current_catalog(connection).resources.clone())
-                        .unwrap_or_default(),
-                    instructions: connection
-                        .as_ref()
-                        .map(|connection| entry.current_catalog(connection).instructions.clone())
-                        .unwrap_or_default(),
+                    resources: published.resources.clone(),
+                    instructions: published.instructions.clone(),
                     warnings: if let Some(reason) = entry.config_failure.read().unwrap().clone() {
                         vec![reason]
                     } else {
-                        connection
-                            .as_ref()
-                            .map(|connection| entry.current_catalog(connection).warnings.clone())
-                            .unwrap_or_default()
+                        published.warnings.clone()
                     },
                 }
             })
             .collect()
     }
+    /// Resolves a call against the current tools. While the tool's server connects or connects
+    /// again, the call waits for it, at most for the connection timeout and until cancelled.
     async fn prepare_ready(
         &self,
         name: &str,
         input: Value,
         cancel: &CancellationToken,
     ) -> Result<PreparedMcpCall, String> {
-        let mut target = self
-            .catalog()
-            .into_iter()
-            .find(|(_, _, tool)| tool.definition.name == name);
-        let reconnect = target
-            .as_ref()
-            .filter(|(entry, _, _)| *entry.state.read().unwrap() == McpServerState::Failed)
-            .map(|(entry, _, _)| entry.config.name.clone());
-        if let Some(server) = &reconnect {
-            let configs = self
-                .inner
-                .entries
-                .read()
-                .unwrap()
-                .values()
-                .map(|entry| entry.config.clone())
-                .collect();
-            self.reconcile(configs).await;
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let notified = self.inner.state_changed.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    if !self.inner.entries.read().unwrap().get(server).is_some_and(|entry| *entry.state.read().unwrap() == McpServerState::Connecting) {break;}
-                    tokio::select! { _ = cancel.cancelled() => return Err("MCP connection cancelled"), _ = notified => {} }
-                }
-                Ok(())
-            }).await.map_err(|_| "MCP connection timed out")??;
-        }
-        if reconnect.is_some() {
-            target = self
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            let changed = self.inner.state_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (entry, tool) = self
                 .catalog()
                 .into_iter()
-                .find(|(_, _, tool)| tool.definition.name == name);
+                .find(|(_, tool)| tool.definition.name == name)
+                .ok_or("MCP tool is unavailable")?;
+            if tool.exposure == tickloop_harness_protocol::mcp::ToolExposure::Hidden {
+                return Err("MCP tool is unavailable or hidden".into());
+            }
+            if !tool.validator.is_valid(&input) {
+                return Err("invalid MCP tool arguments".into());
+            }
+            let state = entry.state.read().unwrap().clone();
+            let connection = entry
+                .connection
+                .read()
+                .unwrap()
+                .clone()
+                .filter(|connection| !connection.lost.is_cancelled());
+            match (state, connection) {
+                (McpServerState::Connected, Some(connection)) => {
+                    return Ok(PreparedMcpCall {
+                        generation: tool.generation,
+                        entry,
+                        connection,
+                        tool,
+                        input,
+                    });
+                }
+                (McpServerState::Connecting | McpServerState::Connected, _) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err("MCP connection cancelled".into()),
+                        _ = tokio::time::sleep_until(deadline) => return Err(CONNECTION_TIMED_OUT.into()),
+                        _ = changed => {}
+                    }
+                }
+                _ => return Err(CONNECTION_UNAVAILABLE.into()),
+            }
         }
-        let (entry, connection, tool) = target.ok_or("MCP tool is unavailable")?;
-        if tool.exposure == tickloop_harness_protocol::mcp::ToolExposure::Hidden {
-            return Err("MCP tool is unavailable or hidden".into());
-        }
-        if !tool.validator.is_valid(&input) {
-            return Err("invalid MCP tool arguments".into());
-        }
-        if *entry.state.read().unwrap() != McpServerState::Connected {
-            return Err("MCP connection is unavailable".into());
-        }
-        let generation = tool.generation;
-        Ok(PreparedMcpCall {
-            generation,
-            entry,
-            connection,
-            tool,
-            input,
-        })
     }
     fn revalidate(&self, call: &PreparedMcpCall) -> Result<(), String> {
         if call.entry.cancel.is_cancelled()
@@ -891,12 +1035,23 @@ impl McpConnections {
         {
             return Err("MCP configuration changed before dispatch".into());
         }
+        if call.connection.lost.is_cancelled()
+            || !call
+                .entry
+                .connection
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|connection| Arc::ptr_eq(connection, &call.connection))
+        {
+            return Err("MCP connection changed before dispatch".into());
+        }
         if call.connection.revision.load(Ordering::SeqCst)
             != call.connection.catalog_revision.load(Ordering::SeqCst)
         {
             return Err("MCP tool directory changed before dispatch".into());
         }
-        let current = call.connection.snapshot.read().unwrap().clone();
+        let current = call.entry.snapshot.read().unwrap().clone();
         if current.generation != call.generation
             || current.secret_generation != call.entry.secret_generation.load(Ordering::SeqCst)
             || !current
@@ -948,10 +1103,14 @@ impl McpConnections {
             .as_ref()
             .is_some_and(McpHttpClient::unauthorized)
         {
-            authentication_rejected(&entry, connection.http.as_ref().unwrap(), &cancel).await;
+            authentication_rejected(&entry, &connection, &cancel).await;
             self.inner.state_changed.notify_waiters();
-        } else if !matches!(response, Ok(Ok(rmcp::model::CallToolResponse::Complete(_)))) {
+        } else if connection.http.is_some() && matches!(response, Ok(Err(_))) {
+            // A local program's broken pipe ends its connection by itself.
+            entry.reconnecting.store(true, Ordering::SeqCst);
             *entry.state.write().unwrap() = McpServerState::Failed;
+            connection.lost.cancel();
+            self.inner.state_changed.notify_waiters();
         }
         match response {
             Ok(Ok(rmcp::model::CallToolResponse::Complete(result))) => {
@@ -1102,8 +1261,12 @@ impl McpConnections {
             _ = entry.cancel.cancelled() => return Err("MCP resource server changed".into()),
             result = tokio::time::timeout(REQUEST_TIMEOUT, connection.peer.send_request(request)) => result,
         };
-        if let Some(http) = connection.http.as_ref().filter(|http| http.unauthorized()) {
-            authentication_rejected(&entry, http, &cancel).await;
+        if connection
+            .http
+            .as_ref()
+            .is_some_and(McpHttpClient::unauthorized)
+        {
+            authentication_rejected(&entry, &connection, &cancel).await;
             self.inner.state_changed.notify_waiters();
         }
         let response = response
@@ -1126,249 +1289,6 @@ impl McpConnections {
         while tasks.join_next().await.is_some() {}
         self.inner.entries.write().unwrap().clear();
     }
-}
-async fn authentication_rejected(entry: &Entry, http: &McpHttpClient, cancel: &CancellationToken) {
-    let token = entry.token.read().unwrap().clone();
-    let renewed = match (&entry.connector, token) {
-        (Some(connector), Some(token)) if !http.insufficient_scope() => {
-            connector.renew_rejected(&token, cancel).await.is_ok()
-        }
-        _ => false,
-    };
-    if !renewed && let Some(credentials) = &entry.credentials {
-        // Remember invalidation too: a deleted token is not a new login on the next request.
-        if let Ok(credential) = credentials.load().await {
-            entry.remember_credential(credential);
-        }
-    }
-    *entry.state.write().unwrap() = if renewed || entry.connector.is_none() || cancel.is_cancelled()
-    {
-        McpServerState::Failed
-    } else {
-        McpServerState::NeedsLogin
-    };
-}
-
-fn failure_has_category(error: &str, category: &str) -> bool {
-    error
-        .split_once(": ")
-        .map_or(error, |(category, _)| category)
-        == category
-}
-
-fn stdio_transport(
-    entry: &Arc<Entry>,
-    environment: &BTreeMap<String, String>,
-    stderr_directory: Option<&tickloop_harness_base::private_fs::PrivateDirectory>,
-    probe: &negotiation::ProbeState,
-) -> Result<process::ProcessTransport, String> {
-    let McpTransport::Stdio {
-        command,
-        args,
-        env,
-        cwd,
-    } = &entry.config.transport
-    else {
-        return Err("MCP transport unavailable".into());
-    };
-    let config = &entry.config;
-    let mut process = tokio::process::Command::new(command);
-    process
-        .args(args)
-        .env_clear()
-        .envs(environment)
-        .envs(env)
-        .current_dir(cwd);
-    // Arbitrary stderr bytes cannot be safely redacted across chunk boundaries.
-    let stderr = if !config.sensitive_values.is_empty() {
-        std::process::Stdio::null()
-    } else if let Some(directory) = stderr_directory {
-        use sha2::{Digest, Sha256};
-        use std::os::unix::fs::OpenOptionsExt;
-        directory
-            .create()
-            .map_err(|_| "MCP log directory unavailable")?;
-        let file = directory
-            .path()
-            .join(format!("{:x}.log", Sha256::digest(config.name.as_bytes())));
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(file)
-            .map_err(|_| "MCP log file unavailable")?;
-        if !log
-            .metadata()
-            .map_err(|_| "MCP log file unavailable")?
-            .is_file()
-        {
-            return Err("MCP log must be a regular file".into());
-        }
-        std::process::Stdio::from(log)
-    } else {
-        std::process::Stdio::inherit()
-    };
-    let redact_entry = Arc::downgrade(entry);
-    let transport = process::ProcessTransport::spawn(
-        process,
-        stderr,
-        Arc::new(move |value, part| {
-            if let Some(entry) = redact_entry.upgrade() {
-                redact_wire_value(&entry, value, part);
-            } else {
-                *value = Value::Null;
-            }
-        }),
-        probe.clone(),
-    )?;
-    Ok(transport)
-}
-
-async fn open(
-    entry: &Arc<Entry>,
-    token: Option<String>,
-    environment: &BTreeMap<String, String>,
-    stderr_directory: Option<&tickloop_harness_base::private_fs::PrivateDirectory>,
-) -> Result<(Connection, RunningService<RoleClient, Handler>), String> {
-    let config = &entry.config;
-    let changed = Arc::new(tokio::sync::Notify::new());
-    let resources_changed = Arc::new(tokio::sync::Notify::new());
-    let revision = Arc::new(AtomicU64::new(0));
-    let resource_revision = Arc::new(AtomicU64::new(0));
-    let handler = Handler {
-        changed: changed.clone(),
-        revision: revision.clone(),
-        resource_revision: resource_revision.clone(),
-        resources_changed: resources_changed.clone(),
-    };
-    let probe = negotiation::ProbeState::default();
-    let (service, http) = match &config.transport {
-        McpTransport::Http { url, headers } => {
-            let endpoint = reqwest::Url::parse(url).map_err(|_| "invalid MCP URL")?;
-            let http = McpHttpClient::for_server(
-                endpoint,
-                headers,
-                token.clone(),
-                Duration::from_millis(config.timeout_ms),
-            )?;
-            let redact_entry = Arc::downgrade(entry);
-            let http =
-                http.with_probe(probe.clone())
-                    .with_redactor(Arc::new(move |value, part| {
-                        if let Some(entry) = redact_entry.upgrade() {
-                            redact_wire_value(&entry, value, part);
-                        } else {
-                            *value = Value::Null;
-                        }
-                    }));
-            let mut options = StreamableHttpClientTransportConfig::with_uri(url.clone())
-                .reinit_on_expired_session(false);
-            if let Some(token) = token {
-                options = options.auth_header(token);
-            }
-            let service = negotiation::connect(entry, handler, &probe, true, || {
-                Ok(StreamableHttpClientTransport::with_client(
-                    http.clone(),
-                    options.clone(),
-                ))
-            })
-            .await
-            .map_err(|cause| {
-                let category = if http.insufficient_scope() {
-                    "MCP scope required"
-                } else if http.unauthorized() {
-                    "MCP login required"
-                } else {
-                    "MCP connection failed"
-                };
-                format!("{category}: {}", redact(entry, cause))
-            })?;
-            (service, Some(http))
-        }
-        McpTransport::Stdio { .. } => {
-            let service = negotiation::connect(entry, handler, &probe, false, || {
-                stdio_transport(entry, environment, stderr_directory, &probe)
-            })
-            .await
-            .map_err(|cause| format!("MCP connection failed: {}", redact(entry, cause)))?;
-            (service, None)
-        }
-        _ => return Err("MCP transport unavailable".into()),
-    };
-    let capabilities = service
-        .peer()
-        .peer_info()
-        .map(|info| info.capabilities.clone())
-        .unwrap_or_default();
-    let tools = if capabilities.tools.is_some() {
-        entry.tool_schemas.write().unwrap().clear();
-        service.peer().list_all_tools().await.map_err(|_| {
-            if http.as_ref().is_some_and(McpHttpClient::insufficient_scope) {
-                "MCP scope required"
-            } else if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
-                "MCP login required"
-            } else {
-                "MCP tools unavailable"
-            }
-        })?
-    } else {
-        Vec::new()
-    };
-    let resources = match &capabilities.resources {
-        Some(capability) => {
-            let loaded_revision = resource_revision.load(Ordering::SeqCst);
-            let resources = resource_directory(service.peer()).await.map_err(|_| {
-                if http.as_ref().is_some_and(McpHttpClient::insufficient_scope) {
-                    "MCP scope required"
-                } else if http.as_ref().is_some_and(McpHttpClient::unauthorized) {
-                    "MCP login required"
-                } else {
-                    RESOURCES_UNAVAILABLE
-                }
-            })?;
-            Some(ResourceDirectory {
-                follows_notifications: capability.list_changed == Some(true),
-                changed: resources_changed,
-                revision: resource_revision,
-                loaded_revision: AtomicU64::new(loaded_revision),
-                resources: RwLock::new(resources),
-            })
-        }
-        None => None,
-    };
-    let (mut tools, mut warnings) = catalog::directory(config, tools);
-    entry.restore_tool_schemas(&mut tools, &mut warnings);
-    let instructions = service
-        .peer()
-        .peer_info()
-        .and_then(|info| info.instructions.clone())
-        .unwrap_or_default();
-    Ok((
-        Connection {
-            peer: service.peer().clone(),
-            revision,
-            catalog_revision: AtomicU64::new(0),
-            http,
-            changed,
-            tools: RwLock::new(tools),
-            snapshot: RwLock::new(Arc::new(snapshot::Catalog::default())),
-            instructions,
-            resources,
-            warnings: RwLock::new(warnings),
-        },
-        service,
-    ))
-}
-async fn resource_directory(
-    peer: &rmcp::service::Peer<RoleClient>,
-) -> Result<Vec<Value>, rmcp::ServiceError> {
-    Ok(peer
-        .list_all_resources()
-        .await?
-        .into_iter()
-        .filter_map(|resource| serde_json::to_value(resource).ok())
-        .collect())
 }
 fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {
     for resource in &mut resources {

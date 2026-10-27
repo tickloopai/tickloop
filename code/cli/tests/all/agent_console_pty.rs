@@ -14,6 +14,7 @@ mod family_messaging;
 mod family_navigation;
 mod hosted_monitor;
 mod interrupted_prompt;
+mod mcp_startup_wait;
 mod monitor_width;
 mod nested_family;
 mod other_tickhost;

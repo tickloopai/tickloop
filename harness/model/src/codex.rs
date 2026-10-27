@@ -90,7 +90,7 @@ impl CodexModelClient {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(debug_assertions, any(test, feature = "test-support")))]
     pub(crate) fn with_loopback_test_auth(
         mut self,
         state_dir: &Path,

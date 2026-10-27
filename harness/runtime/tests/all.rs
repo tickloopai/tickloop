@@ -49,6 +49,9 @@ mod interleaved_context;
 #[path = "all/mcp_approval.rs"]
 mod mcp_approval;
 
+#[path = "all/mcp_startup.rs"]
+mod mcp_startup;
+
 #[path = "all/mcp_resources.rs"]
 mod mcp_resources;
 
@@ -85,3 +88,6 @@ mod third_party_approval;
 
 #[path = "all/tool_exposure.rs"]
 mod tool_exposure;
+
+#[path = "all/tool_list_stability.rs"]
+mod tool_list_stability;

@@ -308,7 +308,7 @@ impl HostToolProvider for SearchCatalog {
         self.tools
             .iter()
             .filter(|tool| tool.exposure != ToolExposure::Hidden)
-            .map(|tool| tool.definition.clone())
+            .map(|tool| (*tool.definition).clone())
             .collect()
     }
 
@@ -347,9 +347,9 @@ fn exposure_tool(server: &str, name: &str, exposure: ToolExposure) -> ExposureTo
     ExposureTool {
         server: server.into(),
         original_name: name.into(),
-        definition: definition(&full_name, &format!("{name} for {server}")),
-        original_schema: json!({"type": "object"}),
-        annotations: json!({}),
+        definition: Arc::new(definition(&full_name, &format!("{name} for {server}"))),
+        original_schema: Arc::new(json!({"type": "object"})),
+        annotations: Arc::new(json!({})),
         exposure,
     }
 }

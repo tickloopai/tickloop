@@ -168,7 +168,7 @@ impl Agent {
                     .map(|tool| {
                         let definition = match mode {
                             ToolSearchMode::Native => tool.deferred_definition(),
-                            ToolSearchMode::SearchTools => tool.definition.clone(),
+                            ToolSearchMode::SearchTools => (*tool.definition).clone(),
                         };
                         (tool.server.clone(), definition)
                     })

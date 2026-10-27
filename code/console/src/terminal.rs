@@ -177,6 +177,8 @@ const USER_SHELL_PREVIEW_LINES: usize = 5;
 const ANIMATION_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(32);
 /// The activity shown while a run works without an in-progress todo.
 const WORKING_ACTIVITY: &str = "Working";
+/// The activity shown while a run's request waits for MCP servers that are still connecting.
+const AWAITED_MCP_SERVERS_ACTIVITY: &str = "Waiting for MCP servers";
 const STOPPED_NOTICE: &str =
     "Stopped. Queued messages were discarded; send your next message to resume receiving Triggers.";
 
@@ -1901,6 +1903,8 @@ async fn interact_with_herdr(
     let mut idle_interruptible_chat = None;
     // A replayed or restored run has no known start; only a live Started event begins this clock.
     let mut observed_run_starts = HashMap::new();
+    // The MCP servers each run's request waits for; a run is absent while it does not wait.
+    let mut awaited_mcp_servers: HashMap<uuid::Uuid, Vec<String>> = HashMap::new();
     let mut cached_activity_status: Option<(uuid::Uuid, String)> = None;
     let mut menu_outcome: Option<MenuOutcome> = None;
     let mut menu_commands = VecDeque::new();
@@ -1991,6 +1995,7 @@ async fn interact_with_herdr(
     }
     loop {
         observed_run_starts.retain(|run, _| pending.contains_key(run));
+        awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
         menus.set_new_agent_directory(global.projection().dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
@@ -2382,7 +2387,17 @@ async fn interact_with_herdr(
                 } else if directed_summaries.contains(chat) || run_is_working {
                     let working = RunningActivity {
                         chat_id: chat,
-                        label: WORKING_ACTIVITY.to_owned(),
+                        label: running_receipt
+                            .and_then(|receipt| awaited_mcp_servers.get(&receipt.run_id.uuid()))
+                            .map_or_else(
+                                || WORKING_ACTIVITY.to_owned(),
+                                |servers| {
+                                    format!(
+                                        "{AWAITED_MCP_SERVERS_ACTIVITY}: {}",
+                                        safe_text(&servers.join(", "))
+                                    )
+                                },
+                            ),
                         started_at: running_receipt.and_then(|receipt| {
                             observed_run_starts.get(&receipt.run_id.uuid()).copied()
                         }),
@@ -4340,6 +4355,19 @@ async fn interact_with_herdr(
                         EventKind::QuestionAsked { request } => menus.note_request(event.chat_id.into(), request.id),
                         _ => {}
                     }
+                    match &event.kind {
+                        EventKind::WaitingForMcpServers { servers } if !servers.is_empty() => {
+                            awaited_mcp_servers.insert(event.run_id.uuid(), servers.clone());
+                        }
+                        EventKind::WaitingForMcpServers { .. }
+                        | EventKind::ResponseStarted { .. }
+                        | EventKind::Completed { .. }
+                        | EventKind::Failed(_)
+                        | EventKind::Interrupted => {
+                            awaited_mcp_servers.remove(&event.run_id.uuid());
+                        }
+                        _ => {}
+                    }
                     transcript_refresh_due |= Some(event.chat_id) == selected_chat;
                 }
                 match event {
@@ -4631,7 +4659,7 @@ async fn interact_with_herdr(
                                 outln!(console, "Queued input joined run {}.", into_run_id.public());
                             }
                         },
-                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } | EventKind::ToolUseStarted { .. } => {},
+                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } | EventKind::ToolUseStarted { .. } | EventKind::WaitingForMcpServers { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
                         EventKind::Started => {
                             pending.entry(event.run_id.into()).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
