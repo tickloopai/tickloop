@@ -15,10 +15,12 @@
 //! not take effect and the problem is returned as a warning instead of being silently dropped
 //! (users need to know when persistent Deny/Ask rules stop applying).
 
+mod execution_mode;
 pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
 mod store;
+pub use execution_mode::parse_execution_mode;
 pub use tickloop_harness::policy::{AutoSettings, ProjectRuleChanges};
 pub mod new_chat;
 pub mod skills;
@@ -376,21 +378,28 @@ impl LoadedSettings {
         None
     }
 
+    /// The saved `defaultMode`, read like `--mode`. A value without a Tickloop mode is reported and
+    /// left out, so new Chats start in the default mode rather than refusing to start.
     pub fn default_execution_mode(&mut self) -> Option<ExecutionMode> {
         let value = self.settings.get(DEFAULT_MODE_KEY)?.clone();
-        if let Ok(mode) = serde_json::from_value(value.clone()) {
-            return Some(mode);
+        let name = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        match parse_execution_mode(&name) {
+            Ok((mode, warning)) => {
+                if let Some(warning) = warning {
+                    self.warn(format!("`{DEFAULT_MODE_KEY}`: {warning}"));
+                }
+                Some(mode)
+            }
+            Err(error) => {
+                self.warn(format!(
+                    "`{DEFAULT_MODE_KEY}`: {error}; using {}",
+                    ExecutionMode::default()
+                ));
+                None
+            }
         }
-        let legacy = value.as_str();
-        let mode = match legacy {
-            Some("default" | "manual") => ExecutionMode::AcceptEdits,
-            Some("dontAsk" | "bypass") => ExecutionMode::Plan,
-            _ => ExecutionMode::Plan,
-        };
-        self.warn(format!(
-            "`{DEFAULT_MODE_KEY}` has unsupported value {value}; using {mode} conservatively"
-        ));
-        Some(mode)
     }
 
     pub fn is_working_directory_trusted(&mut self, project: &Path) -> bool {
@@ -830,10 +839,6 @@ impl UserSettings {
 
     pub fn context_window_tokens(&self) -> Option<usize> {
         self.load().context_window_tokens()
-    }
-
-    pub fn default_execution_mode(&self) -> Option<ExecutionMode> {
-        self.load().default_execution_mode()
     }
 
     pub fn is_working_directory_trusted(&self, project: &Path) -> bool {
