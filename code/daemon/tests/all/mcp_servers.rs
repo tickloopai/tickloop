@@ -1178,6 +1178,6 @@ async fn live_model_calls_logged_in_notion_search_without_recording_content() {
         "Notion search did not succeed; response content omitted"
     );
     eprintln!(
-        "Live Notion acceptance passed: model=claude-sonnet-5; tool={tool}; calls=1; success=true; response content not recorded"
+        "Live Notion acceptance passed: model=claude-sonnet-5; path=native; tool={tool}; calls=1; success=true; response content not recorded"
     );
 }

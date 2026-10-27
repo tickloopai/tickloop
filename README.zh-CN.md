@@ -56,6 +56,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/resume`、`/clear` | 重新打开以前的对话；开始新对话 |
 | `/permissions`、`/settings` | 设置 Agent 可以自行做多少事；其他偏好 |
 | `/ticks`、`/plugins` | 安装并登录 Tick；管理其他插件 |
+| `/mcp` | 查看 MCP 服务，管理登录及当前目录的启用状态 |
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 

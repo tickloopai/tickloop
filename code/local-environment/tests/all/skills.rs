@@ -102,7 +102,7 @@ fn builtin_name_is_reserved_and_a_broken_skill_only_adds_a_warning() {
     let expansion = registry.expand("tickloop", "", SkillCaller::User).unwrap();
 
     assert!(matches!(expansion.source, SkillSource::BuiltIn));
-    assert!(expansion.content.contains("Tickloop Ticks"));
+    assert!(expansion.content.contains("Tickloop tools and Ticks"));
     assert_eq!(registry.warnings().len(), 2);
 }
 

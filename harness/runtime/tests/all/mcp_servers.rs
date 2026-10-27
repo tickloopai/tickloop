@@ -1986,3 +1986,106 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     assert_ne!(connections.statuses()[0].state, McpServerState::Failed);
     connections.shutdown().await;
 }
+
+#[tokio::test]
+async fn schema_metadata_reaches_mcp_approval_while_invalid_arguments_never_dispatch() {
+    use tickloop_harness_protocol::{EventKind, ExecutionMode, mcp::ToolExposure};
+    use tickloop_harness_runtime::{Agent, mcp::McpToolProvider};
+    use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+
+    for exposure in [ToolExposure::Direct, ToolExposure::Search] {
+        let server = McpService::start().await;
+        server.set_tools(json!([{
+            "name":"search",
+            "inputSchema":{
+                "$schema":"https://json-schema.org/draft/2020-12/schema",
+                "title":"Search input",
+                "type":"object",
+                "properties":{"query":{"type":"string","pattern":"^allowed$","maxLength":7}},
+                "required":["query"],
+                "additionalProperties":false
+            }
+        }]));
+        server.set_result(json!({"content":[{"type":"text","text":"APPROVED_SEARCH"}]}));
+        let mut configuration = http_config("schema", &server);
+        configuration.exposure = exposure;
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections.reconcile(vec![configuration.clone()]).await;
+        wait_for_state(&connections, "schema", McpServerState::Connected).await;
+        let invoke = |id, query| {
+            let arguments = json!({"query":query});
+            if exposure == ToolExposure::Direct {
+                call(id, "mcp__schema__search", arguments)
+            } else {
+                call(
+                    id,
+                    "ExecuteTools",
+                    json!({"calls":[{"name":"mcp__schema__search","arguments":arguments}]}),
+                )
+            }
+        };
+        let model = Arc::new(ScriptedModel::new(vec![
+            invoke("invalid", "blocked"),
+            invoke("valid", "allowed"),
+            text("done"),
+        ]));
+        let agent = Agent::new_embedded(config(), model.clone());
+        agent
+            .install_host_tools(Arc::new(McpToolProvider::new(
+                connections,
+                Arc::new(move || vec![configuration.clone()]),
+            )))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, "Search the service once with valid arguments".into())
+            .await
+            .unwrap();
+        let mut approvals = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap().kind {
+                    EventKind::PermissionRequested { request } => {
+                        assert_eq!(request.name, "mcp__schema__search");
+                        assert_eq!(request.input, json!({"query":"allowed"}));
+                        assert!(server.calls().is_empty());
+                        agent
+                            .answer_permission(chat, request.id, true)
+                            .await
+                            .unwrap();
+                        approvals += 1;
+                    }
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        agent.shutdown().await;
+        assert_eq!(
+            approvals, 1,
+            "{exposure:?}: valid schema never reached approval"
+        );
+        assert_eq!(server.calls().len(), 1);
+        assert_eq!(
+            server.calls()[0]["params"]["arguments"],
+            json!({"query":"allowed"})
+        );
+        let requests = model.requests.lock().unwrap();
+        let final_messages = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(final_messages.contains("APPROVED_SEARCH"));
+        assert!(final_messages.contains("invalid"));
+    }
+}
