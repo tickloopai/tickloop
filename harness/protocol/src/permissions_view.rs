@@ -58,6 +58,7 @@ pub struct PermissionsView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PermissionRuleSource {
+    LaunchArguments,
     ChatSession,
     ProjectUser,
     ProjectConstraint,

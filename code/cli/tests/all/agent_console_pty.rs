@@ -1621,6 +1621,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
             daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: other_launch,
                 initial: None,
                 origin: None,
@@ -2218,6 +2219,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
             daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial: Some(UserInput::Shell {
                     command: "printf 'B independent output\\n'".into(),
@@ -2503,6 +2505,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
                 daemon_epoch: client.daemon_epoch(),
                 command_id: uuid::Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: Some(UserInput::Shell {
                         command: "printf 'B independent image peer\\n'".into(),
@@ -3537,6 +3540,7 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
             daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial,
                 origin: None,
@@ -3789,6 +3793,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
             daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial,
                 origin: None,

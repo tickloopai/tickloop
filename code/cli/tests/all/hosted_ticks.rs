@@ -932,6 +932,7 @@ for line in sys.stdin:
                         daemon_epoch: epoch,
                         command_id: Uuid::new_v4(),
                         command: AgentCommand::Create {
+                            launch_rules: Vec::new(),
                             launch,
                             initial: None,
                             origin: None,

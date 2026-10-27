@@ -4098,3 +4098,222 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
         "the staged mode replaces the startup acceptEdits mode before the first input runs"
     );
 }
+
+#[test]
+fn launch_tool_rules_parse_aliases_and_reject_malformed_rules_before_startup() {
+    for flag in [
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+    ] {
+        let output = support::fixture_cli::command()
+            .args([
+                flag,
+                "Bash(git:*) Edit,mcp__server__tool",
+                "Bash(git log:*)",
+                flag,
+                "WebFetch(domain:example.com)",
+                "--help",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for invalid in [
+            "Bash(git:*",
+            "Bash()",
+            "Edit(foo)",
+            "mcp__",
+            "Bash(git:*))",
+            "Bash(git:*)(rm:*)",
+            "",
+        ] {
+            let output = support::fixture_cli::command()
+                .args([flag, invalid, "--help"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "accepted {invalid:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("invalid permission rule"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn launch_tool_rules_reach_only_the_new_agent_without_changing_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    trust_working_directory(&config_root, directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        for name in ["allowed", "denied", "another-agent"] {
+            for body in [
+                tool_stream("Bash", json!({"command":format!("ln -s missing {name}")})),
+                messages_stream("Finished checking the rule."),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+            }
+        }
+    });
+    let warmup = run_with_config(directory.path(), &[], "/exit\n").await;
+    assert!(warmup.status.success());
+    let before = std::fs::read(config_root.join("settings.json")).unwrap();
+    for (mut flags, name, allowed) in [
+        (vec!["--allowedTools", "Bash(ln:*)"], "allowed", true),
+        (
+            vec!["--allowed-tools", "Bash(ln:*)", "--disallowedTools", "Bash"],
+            "denied",
+            false,
+        ),
+        (vec![], "another-agent", false),
+    ] {
+        flags.push("--deny-on-prompt");
+        let output = run_with_config(directory.path(), &flags, "Create the requested link\n").await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            directory.path().join(name).symlink_metadata().is_ok(),
+            allowed,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read(config_root.join("settings.json")).unwrap(),
+            before
+        );
+    }
+    server.await.unwrap();
+}
+
+#[test]
+fn launch_tool_rules_cannot_be_silently_ignored_when_attaching_or_resuming() {
+    let directory = tempfile::tempdir().unwrap();
+    for selector in ["--continue", "--resume", "--chat-id"] {
+        let mut command = support::fixture_cli::command();
+        command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
+        command.args(["--disallowedTools", "Bash", selector]);
+        if selector == "--chat-id" {
+            command.arg("00000000-0000-0000-0000-000000000003");
+        }
+        let output = command.stdin(Stdio::null()).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("launch tool rules require a new Agent"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn launch_tool_rules_preserve_quoted_and_escaped_shell_parentheses() {
+    for rule in [
+        r#"Bash(echo '(')"#,
+        r#"Bash(echo ')')"#,
+        r#"Bash(echo \()"#,
+        r#"Bash(echo \))"#,
+        r#"Bash(echo "(")"#,
+        r#"Bash(echo '\)')"#,
+        r#"Bash(echo "$(printf ")")")"#,
+        r#"Bash(echo "`printf ")"`")"#,
+    ] {
+        let output = support::fixture_cli::command()
+            .args(["--allowedTools", rule, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{rule}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_tool_rules_are_additive_and_leave_unnamed_tools_on_the_normal_path() {
+    let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
+    std::fs::write(
+        directory.path().join("source.txt"),
+        "unnamed read succeeded",
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (index, body) in [
+            tool_stream("Read", json!({"file_path":"source.txt"})),
+            tool_stream(
+                "Write",
+                json!({"file_path":"report.txt", "content":"unnamed edit succeeded"}),
+            ),
+            messages_stream("Normal tool paths remain available."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = body.replace("tool-fixture", &format!("tool-{index}"));
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let output = run_with_config(
+        directory.path(),
+        &["--allowedTools", "Bash(git:*)", "--deny-on-prompt"],
+        "Read source.txt and write report.txt\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.await.unwrap();
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("unnamed read succeeded")
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
+        "unnamed edit succeeded"
+    );
+}

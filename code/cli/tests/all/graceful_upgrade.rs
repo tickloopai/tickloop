@@ -208,6 +208,7 @@ pub(crate) async fn run_probe(old_source: &Path, new_source: &Path) {
     let creation = command(
         epoch,
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch,
             initial: None,
             origin: None,

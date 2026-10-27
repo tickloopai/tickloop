@@ -218,6 +218,7 @@ impl RuleScope {
 
 fn source_label(source: PermissionRuleSource) -> &'static str {
     match source {
+        PermissionRuleSource::LaunchArguments => "Launch arguments",
         PermissionRuleSource::ChatSession => "Chat session",
         PermissionRuleSource::ProjectUser => "Project rule",
         PermissionRuleSource::ProjectConstraint => "Project constraint",

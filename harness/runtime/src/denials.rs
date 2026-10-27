@@ -338,6 +338,12 @@ fn matching_rule_summaries(
                 .iter()
                 .map(|rule| (DenialRuleSource::ProjectConstraint, rule)),
         )
+        .chain(
+            policy
+                .launch_rules
+                .iter()
+                .map(|rule| (DenialRuleSource::LaunchArguments, rule)),
+        )
         .chain(policy.rules.iter().map(|rule| {
             (
                 if rule.persistent {

@@ -45,7 +45,9 @@ use tickloop_harness::protocol::{
     TickSubscriptionChange, TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
-use tickloop_harness::tools::permissions::{canonical_directory, rule_views, validate_rule};
+use tickloop_harness::tools::permissions::{
+    canonical_directory, launch_rule_views, rule_views, validate_rule,
+};
 
 /// Why a New Agent Permissions change was not applied. Nothing was written or staged.
 pub(super) enum DraftPermissionsError {
@@ -310,6 +312,7 @@ struct Inner {
     display: Mutex<DisplayState>,
     disconnected: Mutex<Option<String>>,
     draft: Mutex<NewAgentDraft>,
+    launch_rules: Mutex<Vec<PermissionRule>>,
     first_create: Mutex<Option<FirstCreateState>>,
     /// The View's settings, sharing its transient Providers; New Agent defaults save through it.
     user_settings: Mutex<Option<tickloop_code_settings::UserSettings>>,
@@ -638,6 +641,7 @@ impl ConsoleExecution {
                 }),
                 disconnected: Mutex::new(None),
                 draft: Mutex::new(NewAgentDraft::default()),
+                launch_rules: Mutex::new(Vec::new()),
                 first_create: Mutex::new(None),
                 user_settings: Mutex::new(None),
                 default_model: Mutex::new(None),
@@ -1881,6 +1885,7 @@ impl ConsoleExecution {
     ) -> Result<(Uuid, ExecutionRef), DraftCreationError> {
         match outcome {
             CommandOutcome::Completed(CommandResult::Created { snapshot, .. }) => {
+                self.inner.launch_rules.lock().unwrap().clear();
                 let chat = snapshot.conversation.id;
                 let execution = snapshot.execution;
                 self.inner.cache_snapshot(snapshot, None);
@@ -2014,10 +2019,12 @@ impl ConsoleExecution {
         } else {
             None
         };
+        let launch_rules = self.inner.launch_rules.lock().unwrap().clone();
         self.send(
             epoch,
             command_id,
             AgentCommand::Create {
+                launch_rules,
                 launch,
                 initial: None,
                 origin,
@@ -2317,6 +2324,10 @@ impl ConsoleExecution {
             Err(error) => Err(invalid(&error)),
         }
     }
+    pub(super) fn use_launch_rules(&self, rules: Vec<PermissionRule>) {
+        *self.inner.launch_rules.lock().unwrap() = rules;
+    }
+
     /// Shares the View's settings, so New Agent defaults use its transient Providers and saves.
     pub(super) fn use_user_settings(&self, settings: Option<tickloop_code_settings::UserSettings>) {
         *self.inner.user_settings.lock().unwrap() = settings;
@@ -2394,7 +2405,13 @@ impl ConsoleExecution {
                 &[],
                 &[],
                 &[],
-            ),
+            )
+            .into_iter()
+            .chain(launch_rule_views(
+                &self.inner.launch_rules.lock().unwrap(),
+                configuration.execution_mode,
+            ))
+            .collect(),
             working_directory: project.clone(),
             additional_directories: configuration.additional_directories,
             warnings,
@@ -2652,9 +2669,11 @@ impl ConsoleExecution {
         launch: LaunchSpec,
         initial: Option<UserInput>,
     ) -> Result<(Uuid, Option<Receipt>), AccessError> {
+        let launch_rules = self.inner.launch_rules.lock().unwrap().clone();
         let result = self
             .command(
                 AgentCommand::Create {
+                    launch_rules,
                     launch,
                     initial,
                     origin: self.origin(),
@@ -2670,6 +2689,7 @@ impl ConsoleExecution {
         else {
             return Err(unexpected());
         };
+        self.inner.launch_rules.lock().unwrap().clear();
         let chat = snapshot.conversation.id;
         let execution = snapshot.execution;
         self.inner.cache_snapshot(snapshot, None);
@@ -4641,6 +4661,7 @@ mod tests {
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(workdir),
                 initial: Some(UserInput::Shell {
                     command: "printf created".into(),
@@ -5812,6 +5833,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: None,
                     origin: None,

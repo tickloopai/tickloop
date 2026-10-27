@@ -98,6 +98,9 @@ pub struct PermissionRule {
 pub struct PermissionPolicy {
     pub mode: ExecutionMode,
     pub rules: Vec<PermissionRule>,
+    /// Rules supplied only for this Agent launch; never restored from history.
+    #[serde(skip)]
+    pub launch_rules: Vec<PermissionRule>,
     #[serde(default)]
     pub project_constraints: Vec<PermissionRule>,
     #[serde(default)]

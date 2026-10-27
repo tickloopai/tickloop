@@ -222,6 +222,7 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
                     daemon_epoch: access.daemon_epoch(),
                     command_id: uuid::Uuid::new_v4(),
                     command: AgentCommand::Create {
+                        launch_rules: Vec::new(),
                         launch,
                         initial: None,
                         origin: None,

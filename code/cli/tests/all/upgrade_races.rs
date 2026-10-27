@@ -112,6 +112,7 @@ impl Scenario {
             .execute(command(
                 client.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: None,
                     origin: None,

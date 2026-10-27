@@ -91,3 +91,6 @@ mod tool_exposure;
 
 #[path = "all/tool_list_stability.rs"]
 mod tool_list_stability;
+
+#[path = "all/launch_rules.rs"]
+mod launch_rules;
