@@ -2330,15 +2330,11 @@ async fn service_instructions_and_summary_redact_secrets_through_the_host_provid
             let messages = provider.mcp_instructions();
             assert_eq!(messages.len(), 1);
             let text = &messages[0].text;
-            assert!(text.contains("status: Connected"));
+            // A connected server with instructions needs no status line; its description is not
+            // repeated next to them.
+            assert_eq!(messages[0].status, None);
             assert!(!text.contains("fixture-private-key"));
-            assert!(text.ends_with("Use [redacted]\nDetails [redacted]"));
-            let summary = if description.is_empty() {
-                "Use [redacted]"
-            } else {
-                "Configured [redacted]"
-            };
-            assert!(text.contains(&format!("summary: {summary}.")));
+            assert_eq!(text, "Use [redacted]\nDetails [redacted]");
             provider.shutdown().await;
         }
     }
@@ -2373,12 +2369,8 @@ async fn service_instructions_redact_secrets_before_the_length_limit() {
     provider.refresh(CancellationToken::new()).await.unwrap();
     let messages = provider.mcp_instructions();
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].text.contains("status: Connected"));
-    let instructions = messages[0]
-        .text
-        .split_once("(untrusted data):\n")
-        .unwrap()
-        .1;
+    assert_eq!(messages[0].status, None);
+    let instructions = &messages[0].text;
     assert_eq!(
         instructions.strip_prefix(&prefix),
         Some("[redacted]xxxxxxxx")

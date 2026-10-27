@@ -442,7 +442,7 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
         assert!(
             serde_json::to_string(&request.messages)
                 .unwrap()
-                .contains("NeedsConfiguration")
+                .contains("needs configuration")
         );
     }
     let mut config = PluginUserConfig::load(&canonical, &plugin.manifest).unwrap();
@@ -613,7 +613,7 @@ async fn worker_picks_up_a_login_saved_after_startup() {
         loop {
             scripted.enqueue(text("status"));
             complete(&agent, chat, "Report the service status").await;
-            if format!("{:?}", scripted.requests.lock().unwrap()).contains("NeedsLogin") {
+            if format!("{:?}", scripted.requests.lock().unwrap()).contains("needs login") {
                 break;
             }
             tokio::task::yield_now().await;
@@ -819,6 +819,7 @@ async fn agent_access_reports_servers_takes_up_disabling_and_reconnects_one() {
             daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial: None,
                 origin: None,

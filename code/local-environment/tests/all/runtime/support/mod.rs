@@ -48,7 +48,9 @@ pub fn guidance_in_effect(request: &ModelRequest, name: &str) -> bool {
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            tickloop_harness::protocol::Content::Text { text } => Some(text),
+            tickloop_harness::protocol::Content::Text { text } => {
+                Some(text.trim_start_matches("<system-reminder>\n"))
+            }
             _ => None,
         })
     {

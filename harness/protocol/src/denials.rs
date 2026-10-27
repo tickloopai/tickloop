@@ -33,6 +33,7 @@ pub struct DisplaySummary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenialRuleSource {
+    LaunchArguments,
     ChatSession,
     ProjectUser,
     ProjectConstraint,

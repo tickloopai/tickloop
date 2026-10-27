@@ -370,6 +370,7 @@ impl Agent {
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,
                     user_context: Default::default(),
+                    environment: Default::default(),
                     announced_date: None,
                     auto_denials: saved.auto_denials.clone(),
                     denial_window: saved.denial_window.clone(),

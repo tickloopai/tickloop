@@ -15,10 +15,13 @@
 //! not take effect and the problem is returned as a warning instead of being silently dropped
 //! (users need to know when persistent Deny/Ask rules stop applying).
 
+pub mod claude_auto_import;
+mod execution_mode;
 pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
 mod store;
+pub use execution_mode::parse_execution_mode;
 pub use tickloop_harness::policy::{AutoSettings, ProjectRuleChanges};
 pub mod new_chat;
 pub mod skills;
@@ -395,21 +398,28 @@ impl LoadedSettings {
         None
     }
 
+    /// The saved `defaultMode`, read like `--mode`. A value without a Tickloop mode is reported and
+    /// left out, so new Chats start in the default mode rather than refusing to start.
     pub fn default_execution_mode(&mut self) -> Option<ExecutionMode> {
         let value = self.settings.get(DEFAULT_MODE_KEY)?.clone();
-        if let Ok(mode) = serde_json::from_value(value.clone()) {
-            return Some(mode);
+        let name = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        match parse_execution_mode(&name) {
+            Ok((mode, warning)) => {
+                if let Some(warning) = warning {
+                    self.warn(format!("`{DEFAULT_MODE_KEY}`: {warning}"));
+                }
+                Some(mode)
+            }
+            Err(error) => {
+                self.warn(format!(
+                    "`{DEFAULT_MODE_KEY}`: {error}; using {}",
+                    ExecutionMode::default()
+                ));
+                None
+            }
         }
-        let legacy = value.as_str();
-        let mode = match legacy {
-            Some("default" | "manual") => ExecutionMode::AcceptEdits,
-            Some("dontAsk" | "bypass") => ExecutionMode::Plan,
-            _ => ExecutionMode::Plan,
-        };
-        self.warn(format!(
-            "`{DEFAULT_MODE_KEY}` has unsupported value {value}; using {mode} conservatively"
-        ));
-        Some(mode)
     }
 
     pub fn is_working_directory_trusted(&mut self, project: &Path) -> bool {
@@ -562,6 +572,85 @@ impl LoadedSettings {
             self.warn(problem);
         }
         rules
+    }
+
+    pub fn additional_directories(
+        &mut self,
+        folder: &Path,
+    ) -> tickloop_harness::protocol::AdditionalDirectorySources {
+        use tickloop_harness::protocol::AdditionalDirectorySource;
+        let mut directories = Default::default();
+        self.read_additional_directories(
+            folder,
+            self.settings.get(PERMISSIONS_KEY).cloned(),
+            PERMISSIONS_KEY,
+            AdditionalDirectorySource::UserSettings,
+            &mut directories,
+        );
+        let key = project_key(folder);
+        let project = self
+            .settings
+            .get(PROJECTS_KEY)
+            .and_then(|projects| projects.get(&key));
+        let permissions = project
+            .and_then(|project| project.get(PERMISSIONS_KEY))
+            .cloned();
+        self.read_additional_directories(
+            folder,
+            permissions,
+            &format!("{PROJECTS_KEY}[{key:?}].{PERMISSIONS_KEY}"),
+            AdditionalDirectorySource::DirectorySettings,
+            &mut directories,
+        );
+        directories
+    }
+
+    fn read_additional_directories(
+        &mut self,
+        folder: &Path,
+        permissions: Option<Value>,
+        location: &str,
+        source: tickloop_harness::protocol::AdditionalDirectorySource,
+        directories: &mut tickloop_harness::protocol::AdditionalDirectorySources,
+    ) {
+        let Some(permissions) = permissions else {
+            return;
+        };
+        let Some(permissions) = permissions.as_object() else {
+            // Project permission rules already report a malformed shared permissions object.
+            if source == tickloop_harness::protocol::AdditionalDirectorySource::UserSettings {
+                self.warn(format!(
+                    "`{location}` is not an object; additional directories skipped"
+                ));
+            }
+            return;
+        };
+        let Some(value) = permissions.get("additionalDirectories") else {
+            return;
+        };
+        let location = format!("{location}.additionalDirectories");
+        let Some(paths) = value.as_array() else {
+            self.warn(format!("`{location}` is not an array; skipped"));
+            return;
+        };
+        for value in paths {
+            let Some(path) = value.as_str().filter(|path| !path.is_empty()) else {
+                self.warn(format!(
+                    "`{location}` contains an invalid directory path; skipped"
+                ));
+                continue;
+            };
+            let path = folder.join(path);
+            match tickloop_harness::tools::permissions::canonical_directory(path.clone()) {
+                Ok(directory) => {
+                    directories.entry(directory).or_default().insert(source);
+                }
+                Err(reason) => self.warn(format!(
+                    "additional directory {}: {reason}; skipped",
+                    path.display()
+                )),
+            }
+        }
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -774,10 +863,6 @@ impl UserSettings {
 
     pub fn context_window_tokens(&self) -> Option<usize> {
         self.load().context_window_tokens()
-    }
-
-    pub fn default_execution_mode(&self) -> Option<ExecutionMode> {
-        self.load().default_execution_mode()
     }
 
     pub fn is_working_directory_trusted(&self, project: &Path) -> bool {

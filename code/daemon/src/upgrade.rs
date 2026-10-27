@@ -867,6 +867,7 @@ mod tests {
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(workdir),
                 initial: None,
                 origin: None,

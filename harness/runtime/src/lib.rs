@@ -72,6 +72,7 @@ mod denials;
 mod directed_summary;
 mod durable_queue;
 pub mod environment;
+mod environment_info;
 mod event_sources;
 mod feedback_inbox;
 #[cfg(test)]
@@ -416,6 +417,8 @@ struct Inner {
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
+    #[serde(default)]
+    additional_directory_sources: tickloop_harness_protocol::AdditionalDirectorySources,
     /// What the Chat's own work vouches for, as its Transcript keeps it.
     provenance: tickloop_harness_transcript::ProvenanceEntry,
     #[serde(default)]
@@ -451,6 +454,7 @@ struct ChatBookkeeping {
 
 /// What a Subagent's Chat takes from its parent's.
 struct InheritedChat {
+    additional_directory_sources: tickloop_harness_protocol::AdditionalDirectorySources,
     metadata: DelegationMetadata,
     parent: ChatSnapshot,
     client: Arc<dyn ModelClient>,
@@ -522,6 +526,9 @@ struct Chat {
     /// Claude Code's user context: the instruction files and the date, read at the first
     /// conversation request and kept until compaction or until the Chat loads again.
     user_context: OnceLock<String>,
+    /// Claude Code's environment section, read once at the Chat's first conversation request in
+    /// this process and kept, unlike the user context, through compaction.
+    environment: OnceLock<environment_info::ChatEnvironment>,
     /// The date the model was last told, by the user context or a date change note; `None` until
     /// the user context is read.
     announced_date: Option<String>,
@@ -2249,6 +2256,29 @@ impl Agent {
             .await
     }
 
+    /// Creates a root Chat with rules that last only for this launch and its descendants.
+    pub async fn create_chat_with_launch_rules(
+        &self,
+        folder: PathBuf,
+        rules: Vec<PermissionRule>,
+    ) -> Result<ChatId, AgentError> {
+        for rule in &rules {
+            tickloop_harness_tools::permissions::validate_rule(rule)
+                .map_err(|reason| AgentError::Invalid(reason.into()))?;
+            if rule.persistent
+                || rule.loop_id.is_some()
+                || !matches!(rule.decision, Decision::Allow | Decision::Deny)
+            {
+                return Err(AgentError::Invalid(
+                    "launch rules must be nonpersistent allow or deny rules for the whole Chat"
+                        .into(),
+                ));
+            }
+        }
+        self.create_chat_with_delegation(tickloop_ids::generate().into(), Some(folder), None, rules)
+            .await
+    }
+
     /// A new Chat without a Folder, in an Agent without an Execution Environment.
     pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
         self.create_chat_with_id(tickloop_ids::generate().into(), None)
@@ -2272,7 +2302,8 @@ impl Agent {
         id: ChatId,
         folder: Option<PathBuf>,
     ) -> Result<ChatId, AgentError> {
-        self.create_chat_with_delegation(id, folder, None).await
+        self.create_chat_with_delegation(id, folder, None, Vec::new())
+            .await
     }
 
     /// The canonical Folder of a new Chat. Chats have a Folder exactly when the Agent has an
@@ -2305,6 +2336,7 @@ impl Agent {
         id: ChatId,
         folder: Option<PathBuf>,
         inherited: Option<InheritedChat>,
+        launch_rules: Vec<PermissionRule>,
     ) -> Result<ChatId, AgentError> {
         let _upgrade = self.inner.upgrade_gate.read().await;
         let folder = self.admit_folder(folder)?;
@@ -2324,6 +2356,7 @@ impl Agent {
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style, user_context, announced_date) = if let Some(InheritedChat {
+            additional_directory_sources,
             metadata,
             parent,
             client,
@@ -2332,6 +2365,7 @@ impl Agent {
             announced_date,
         }) = inherited
         {
+            bookkeeping.additional_directory_sources = additional_directory_sources;
             snapshot.model = parent.model;
             snapshot.reasoning_effort = parent.reasoning_effort;
             snapshot.thinking_enabled = parent.thinking_enabled;
@@ -2346,6 +2380,7 @@ impl Agent {
             (client, output_style, user_context, announced_date)
         } else {
             let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+            snapshot.policy.launch_rules = launch_rules;
             (client, output_style, OnceLock::new(), None)
         };
         if let SearchDefaults::Fixed(config) = &self.inner.search {
@@ -3153,15 +3188,7 @@ impl Agent {
                 )
             });
         let timing = timing::Phase::new("announce_guidance");
-        Box::pin(
-            self.announce_guidance(
-                receipt,
-                workspace_host
-                    .as_ref()
-                    .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks),
-            ),
-        )
-        .await?;
+        Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
         let family_roster = self.family_agents(receipt.chat_id).await?;
         let user_context = self.user_context(receipt.chat_id).await?;
@@ -4894,10 +4921,12 @@ impl Agent {
             Ok(path)
         };
         let folder = canonical(folder)?;
-        let additional = additional
+        let mut additional = additional
             .into_iter()
             .map(canonical)
             .collect::<Result<Vec<_>, _>>()?;
+        additional.sort();
+        additional.dedup();
         self.require_working_directory_trust(&folder)?;
         let _settings_gate = self.inner.settings_writes.lock().await;
         let saved = self.load_user_settings(Some(folder.clone())).await?;
@@ -4914,6 +4943,17 @@ impl Agent {
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
+        }
+        chat.bookkeeping
+            .additional_directory_sources
+            .retain(|path, _| additional.contains(path));
+        for path in &additional {
+            chat.bookkeeping
+                .additional_directory_sources
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    [tickloop_harness_protocol::AdditionalDirectorySource::Session].into()
+                });
         }
         chat.snapshot.additional_directories = additional;
         if directory_changed {
@@ -5708,6 +5748,7 @@ impl NewChat {
             user_cancelled_runs: HashSet::new(),
             output_style,
             user_context,
+            environment: OnceLock::new(),
             announced_date,
             auto_denials: auto_mode::DenialTracking::default(),
             denial_window: denials::DenialWindow::default(),

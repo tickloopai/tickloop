@@ -169,7 +169,7 @@ impl PreparedDelegation {
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
-        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Delegation is limited to three levels below main; history rewrites are unavailable.".into(),
+        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Chat and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Delegation is limited to three levels below main; history rewrites are unavailable.".into(),
         input_schema: json!({"type":"object","properties":{
             "task":{"type":"string","minLength":1},
             "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
@@ -450,6 +450,7 @@ pub(super) fn effective_policy(
             };
             for rules in [
                 &ancestor_policy.rules,
+                &ancestor_policy.launch_rules,
                 &ancestor_policy.project_constraints,
                 &ancestor_policy.managed_constraints,
             ] {
@@ -1111,6 +1112,7 @@ impl Agent {
                     let mut policy = snapshot.policy.clone();
                     for rules in [
                         &mut policy.rules,
+                        &mut policy.launch_rules,
                         &mut policy.project_constraints,
                         &mut policy.managed_constraints,
                     ] {
@@ -1244,6 +1246,9 @@ impl Agent {
                             registration.child_chat_id,
                             folder,
                             Some(super::InheritedChat {
+                                additional_directory_sources: bookkeeping
+                                    .additional_directory_sources
+                                    .clone(),
                                 metadata: metadata.clone(),
                                 parent: snapshot,
                                 client,
@@ -1251,6 +1256,7 @@ impl Agent {
                                 user_context,
                                 announced_date,
                             }),
+                            Vec::new(),
                         )
                         .await
                         .map_err(|error| error.to_string())?;

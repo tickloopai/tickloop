@@ -9,6 +9,7 @@ pub const USER_CONTEXT_OPENING: &str =
     "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n";
 const INSTRUCTIONS_CONTEXT_KEY: &str = "claudeMd";
 const CURRENT_DATE_CONTEXT_KEY: &str = "currentDate";
+const GIT_STATUS_CONTEXT_KEY: &str = "gitStatus";
 const CONTEXT_RELEVANCE_NOTE: &str = "IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.";
 
 /// Claude Code's `date_change` reminder, appended to the conversation when the user's date moved
@@ -48,8 +49,13 @@ pub struct InstructionFile {
 }
 
 /// The context message placed before the conversation: the instruction files with content, in
-/// load order with the lowest priority first, then `current_date` as `YYYY-MM-DD`.
-pub fn user_context_message(files: &[InstructionFile], current_date: &str) -> String {
+/// load order with the lowest priority first, then `current_date` as `YYYY-MM-DD`, then in a git
+/// repository Claude Code's git status snapshot taken when the message was built.
+pub fn user_context_message(
+    files: &[InstructionFile],
+    current_date: &str,
+    git_status: Option<&str>,
+) -> String {
     let contents = files
         .iter()
         .filter_map(|file| {
@@ -73,6 +79,9 @@ pub fn user_context_message(files: &[InstructionFile], current_date: &str) -> St
     entries.push(format!(
         "# {CURRENT_DATE_CONTEXT_KEY}\nToday's date is {current_date}."
     ));
+    if let Some(git_status) = git_status {
+        entries.push(format!("# {GIT_STATUS_CONTEXT_KEY}\n{git_status}"));
+    }
     format!(
         "{USER_CONTEXT_OPENING}{}\n\n      {CONTEXT_RELEVANCE_NOTE}\n</system-reminder>\n",
         entries.join("\n")
@@ -108,6 +117,7 @@ mod tests {
                 file("/repo/CLAUDE.local.md", InstructionScope::Local, "Mine."),
             ],
             "2026-10-26",
+            None,
         );
         assert_eq!(
             message,
@@ -118,13 +128,28 @@ mod tests {
     #[test]
     fn without_instructions_the_message_carries_only_the_date() {
         let expected = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-10-26.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n";
-        assert_eq!(user_context_message(&[], "2026-10-26"), expected);
+        assert_eq!(user_context_message(&[], "2026-10-26", None), expected);
         assert_eq!(
             user_context_message(
                 &[file("/repo/AGENTS.md", InstructionScope::Project, " \n")],
-                "2026-10-26"
+                "2026-10-26",
+                None
             ),
             expected
         );
+    }
+
+    #[test]
+    fn a_git_status_snapshot_follows_the_date() {
+        let message = user_context_message(
+            &[],
+            "2026-10-26",
+            Some(
+                "This is the git status at the start of the conversation.\n\nCurrent branch: main",
+            ),
+        );
+        assert!(message.contains(
+            "# currentDate\nToday's date is 2026-10-26.\n# gitStatus\nThis is the git status at the start of the conversation.\n\nCurrent branch: main\n\n      IMPORTANT"
+        ));
     }
 }

@@ -175,6 +175,7 @@ impl Agent {
             last_model_run: None,
         };
         let mut bookkeeping = ChatBookkeeping {
+            additional_directory_sources: source.bookkeeping.additional_directory_sources.clone(),
             continued_message_ids: source.bookkeeping.continued_message_ids.clone(),
             citation_sources: tickloop_harness_transcript::CitationSourcesEntry {
                 chat_id: child_chat_id.into(),
@@ -295,6 +296,7 @@ impl Agent {
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,
                 user_context: Default::default(),
+                environment: Default::default(),
                 announced_date: None,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 branch_reservation: None,

@@ -34,6 +34,7 @@ async fn embedded_caller_can_answer_the_original_request_and_observe_the_result(
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(PathBuf::from(directory.path())),
                 initial: Some(UserInput::Text {
                     text: "Prepare a report".into(),
@@ -159,6 +160,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: Some(UserInput::Text {
                     text: "Pick cadence".into(),
@@ -275,6 +277,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: None,
                 origin: None,
@@ -387,6 +390,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: Some(UserInput::Text {
                     text: "Read the external source".into(),
@@ -480,6 +484,7 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: None,
                 origin: None,
@@ -573,6 +578,7 @@ async fn embedded_directory_observation_reports_a_new_execution_after_its_snapsh
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: None,
                 origin: None,
@@ -632,6 +638,7 @@ async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                     initial,
                     origin: None,
@@ -685,6 +692,7 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
         daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command: AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: LaunchSpec::embedded(PathBuf::from(directory.path())),
             initial: Some(UserInput::Skill {
                 name: name.into(),
@@ -746,6 +754,7 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
     };
     let created = access
         .execute(envelope(AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: LaunchSpec::embedded(directory.path().into()),
             initial: None,
             origin: None,
@@ -814,6 +823,7 @@ async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
         command,
     };
     let create = || AgentCommand::Create {
+        launch_rules: Vec::new(),
         launch: LaunchSpec::embedded(directory.path().into()),
         initial: None,
         origin: None,
@@ -898,6 +908,7 @@ async fn search_connection_check_uses_selected_agent_credentials_and_cancels_wit
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial: None,
                 origin: None,

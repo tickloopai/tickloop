@@ -96,6 +96,12 @@ pub struct AutoEnvironmentChange {
 #[serde(rename_all = "snake_case")]
 pub enum AutoEnvironmentEntrySource {
     Manual,
+    Imported {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<std::path::PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        imported_at_ms: Option<u64>,
+    },
     Generated {
         batch: Uuid,
         generated_at_ms: u64,
@@ -108,6 +114,19 @@ impl std::fmt::Display for AutoEnvironmentEntrySource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Manual => formatter.write_str("Manual"),
+            Self::Imported {
+                file,
+                imported_at_ms,
+            } => {
+                formatter.write_str("Imported from Claude Code")?;
+                if let Some(file) = file {
+                    write!(formatter, " · {}", file.display())?;
+                }
+                if let Some(time) = imported_at_ms {
+                    write!(formatter, " · at {time}")?;
+                }
+                Ok(())
+            }
             Self::Unknown => formatter.write_str("Historical source unknown"),
             Self::Generated {
                 generated_at_ms,
@@ -124,6 +143,14 @@ impl std::fmt::Display for AutoEnvironmentEntrySource {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AutoRuleChange {
+    Append {
+        #[serde(default)]
+        soft_allow: Vec<String>,
+        #[serde(default)]
+        soft_deny: Vec<String>,
+        #[serde(default)]
+        environment_entries: Vec<AutoEnvironmentEntry>,
+    },
     UpdateEnvironmentEntry {
         previous: AutoEnvironmentEntry,
         text: String,
@@ -172,6 +199,37 @@ impl AutoRuleSettings {
             .as_millis()
             .min(u64::MAX as u128) as u64;
         match change {
+            AutoRuleChange::Append {
+                soft_allow,
+                soft_deny,
+                mut environment_entries,
+            } => {
+                if !environment_entries.is_empty() && self.environment_replacement.is_some() {
+                    return Err(
+                        "Restore or migrate the legacy Environment before adding entries".into(),
+                    );
+                }
+                for (kind, texts) in [
+                    (AutoRuleKind::SoftAllow, soft_allow),
+                    (AutoRuleKind::SoftDeny, soft_deny),
+                ] {
+                    self.group_mut(kind)
+                        .custom
+                        .extend(texts.into_iter().map(|text| CustomAutoRule {
+                            id: tickloop_ids::generate().to_string(),
+                            text,
+                        }));
+                }
+                for entry in &mut environment_entries {
+                    entry.confirmed_at_ms = confirmed_at_ms;
+                    if let AutoEnvironmentEntrySource::Imported { imported_at_ms, .. } =
+                        &mut entry.source
+                    {
+                        *imported_at_ms = Some(confirmed_at_ms);
+                    }
+                }
+                self.environment_entries.extend(environment_entries);
+            }
             AutoRuleChange::UpdateEnvironmentEntry {
                 previous,
                 text,

@@ -43,6 +43,249 @@ fn product_async_agent_command() -> tokio::process::Command {
 }
 
 #[test]
+fn launch_additional_directories_resolve_deduplicate_and_warn() {
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("project");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    let config_root = directory.path().join("config");
+    support::cli_runtime::adopt(&config_root);
+    let mut child = support::fixture_cli::command()
+        .args(["--working-directory-is-trusted", "--no-session-persistence"])
+        .args(["--add-dir", "../shared", "--add-dir", "../shared/."])
+        .args(["--add-dir", "../missing", "--cwd"])
+        .arg(&folder)
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/cwd\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let shared = shared.canonicalize().unwrap();
+    assert_eq!(
+        stdout
+            .matches(&format!("Additional directory: {}", shared.display()))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("missing") && stderr.contains("skipped"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn additional_directories_merge_user_partitions_launch_and_session_with_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("project");
+    let shared = directory.path().join("shared");
+    let partition = directory.path().join("partition");
+    let session = directory.path().join("session");
+    let forbidden = directory.path().join("repository-grant");
+    let config_root = directory.path().join("config");
+    for path in [
+        &folder,
+        &shared,
+        &partition,
+        &session,
+        &forbidden,
+        &config_root,
+    ] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let settings = json!({
+        "permissions": {"additionalDirectories": ["../shared", "../missing", 42]},
+        "projects": {
+            folder.canonicalize().unwrap().to_string_lossy().as_ref(): {
+                "permissions": {"additionalDirectories": ["../shared/.", "../partition"]}
+            },
+            directory.path().canonicalize().unwrap().to_string_lossy().as_ref(): {
+                "permissions": {"additionalDirectories": [forbidden]}
+            }
+        }
+    });
+    std::fs::write(
+        config_root.join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    for name in [".tickloop", ".claude"] {
+        std::fs::create_dir(folder.join(name)).unwrap();
+        std::fs::write(
+            folder.join(name).join("settings.json"),
+            serde_json::to_vec(&json!({
+                "permissions": {"additionalDirectories": [forbidden]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    support::cli_runtime::adopt(&config_root);
+    let mut child = support::fixture_cli::command()
+        .args([
+            "--working-directory-is-trusted",
+            "--no-session-persistence",
+            "--mode",
+            "acceptEdits",
+        ])
+        .args(["--add-dir", "../shared", "--add-dir", "../shared/."])
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .current_dir(&folder)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"!true\n/add-dir ../session\n/add-dir ../session/.\n/cwd\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let listing = stdout.rsplit_once("Working directory:").unwrap().1;
+    for path in [&shared, &partition, &session] {
+        assert_eq!(
+            listing
+                .matches(&format!(
+                    "Additional directory: {}",
+                    path.canonicalize().unwrap().display()
+                ))
+                .count(),
+            1,
+            "{listing}"
+        );
+    }
+    assert!(!listing.contains("repository-grant"), "{listing}");
+    for source in [
+        "user settings",
+        "directory settings",
+        "launch argument",
+        "session",
+    ] {
+        assert!(
+            listing.contains(source),
+            "missing source {source}: {listing}"
+        );
+    }
+    assert!(
+        stdout.contains("missing") || stderr.contains("missing"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(config_root.join("settings.json")).unwrap())
+            .unwrap(),
+        settings
+    );
+}
+
+#[test]
+fn new_agent_directory_changes_use_the_current_partition_without_draft_duplicates() {
+    for commands in [
+        b"/cwd ../second\n/add-dir ../session\n/add-dir ../session/.\n/cwd\n!true\n/cwd\n/exit\n"
+            .as_slice(),
+        b"/add-dir ../session\n/cwd ../second\n/add-dir ../session/.\n/cwd\n!true\n/cwd\n/exit\n"
+            .as_slice(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let first_shared = temp.path().join("first-shared");
+        let second_shared = temp.path().join("second-shared");
+        let launch = temp.path().join("launch");
+        let session = temp.path().join("session");
+        let root = temp.path().join("config");
+        for path in [
+            &first,
+            &second,
+            &first_shared,
+            &second_shared,
+            &launch,
+            &session,
+            &root,
+        ] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(root.join("settings.json"), serde_json::to_vec(&json!({
+        "projects": {
+            first.canonicalize().unwrap().to_str().unwrap(): {"permissions": {"additionalDirectories": ["../first-shared"]}},
+            second.canonicalize().unwrap().to_str().unwrap(): {"permissions": {"additionalDirectories": ["../second-shared"]}}
+        }
+    })).unwrap()).unwrap();
+        support::cli_runtime::adopt(&root);
+        let mut child = support::fixture_cli::command()
+            .args([
+                "--working-directory-is-trusted",
+                "--no-session-persistence",
+                "--mode",
+                "acceptEdits",
+                "--add-dir",
+                "../launch",
+            ])
+            .env("TICKLOOP_CONFIG_DIR", &root)
+            .current_dir(&first)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(commands).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listings = stdout
+            .rsplit("Working directory:")
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(listings.len(), 2, "{stdout}");
+        for listing in listings {
+            assert!(
+                !listing.contains("first-shared"),
+                "old partition must not be granted: {listing}"
+            );
+            for path in [&second_shared, &launch, &session] {
+                assert_eq!(
+                    listing
+                        .matches(&format!(
+                            "Additional directory: {}",
+                            path.canonicalize().unwrap().display()
+                        ))
+                        .count(),
+                    1,
+                    "{listing}"
+                );
+            }
+            assert!(
+                listing.contains("directory settings")
+                    && listing.contains("launch argument")
+                    && listing.contains("session"),
+                "{listing}"
+            );
+        }
+    }
+}
+
+#[test]
 fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
@@ -287,6 +530,198 @@ async fn product_terminal_defaults_to_auto_and_explains_legacy_mode_names() {
     assert!(transcript.contains("replaced by Ask"), "{transcript}");
     assert!(transcript.contains("--deny-on-prompt"), "{transcript}");
     assert!(transcript.contains("external isolation"), "{transcript}");
+}
+
+async fn report_startup_execution_mode(
+    config_root: &std::path::Path,
+    workdir: &std::path::Path,
+    flags: &[&str],
+) -> std::process::Output {
+    let mut child = product_async_agent_command()
+        .env("TICKLOOP_CONFIG_DIR", config_root)
+        .arg("--cwd")
+        .arg(workdir)
+        .arg("--no-session-persistence")
+        .args(flags)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A launch refused while parsing arguments may close stdin before this write.
+    let _ = stdin.write_all(b"/mode\n").await;
+    drop(stdin);
+    child.wait_with_output().await.unwrap()
+}
+
+#[tokio::test]
+async fn permission_mode_flag_accepts_claude_code_mode_names_like_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    for (flag, value, shown) in [
+        ("--permission-mode", "acceptEdits", "Ask"),
+        ("--permission-mode", "auto", "Auto"),
+        ("--permission-mode", "plan", "Plan"),
+        ("--permission-mode", "default", "Ask"),
+        ("--mode", "plan", "Plan"),
+    ] {
+        let output =
+            report_startup_execution_mode(&config_root, directory.path(), &[flag, value]).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{flag} {value}: {stderr}");
+        assert!(
+            stdout.contains(&format!("Execution mode: {shown}")),
+            "{flag} {value}: {stdout}"
+        );
+        assert_eq!(
+            stderr.contains("`default` is deprecated and maps to Ask"),
+            value == "default",
+            "{flag} {value}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mode_and_permission_mode_must_agree_when_both_are_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    let conflict = report_startup_execution_mode(
+        &config_root,
+        directory.path(),
+        &["--mode", "plan", "--permission-mode", "auto"],
+    )
+    .await;
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        stderr.contains("--mode plan and --permission-mode auto"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&conflict.stdout).contains("Execution mode:"));
+
+    let agreeing = report_startup_execution_mode(
+        &config_root,
+        directory.path(),
+        &["--permission-mode", "plan", "--mode", "plan"],
+    )
+    .await;
+    assert!(
+        agreeing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agreeing.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&agreeing.stdout);
+    assert!(stdout.contains("Execution mode: Plan"), "{stdout}");
+}
+
+#[tokio::test]
+async fn claude_code_modes_without_a_tickloop_mode_refuse_launch_with_the_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    for (flag, value, replacement) in [
+        ("--permission-mode", "dontAsk", "use --deny-on-prompt"),
+        (
+            "--permission-mode",
+            "bypassPermissions",
+            "use --dangerously-skip-permissions",
+        ),
+        ("--mode", "dontAsk", "use --deny-on-prompt"),
+        (
+            "--mode",
+            "bypassPermissions",
+            "use --dangerously-skip-permissions",
+        ),
+        ("--mode", "bypass", "use --dangerously-skip-permissions"),
+        (
+            "--permission-mode",
+            "bypass",
+            "use --dangerously-skip-permissions",
+        ),
+    ] {
+        let output =
+            report_startup_execution_mode(&config_root, directory.path(), &[flag, value]).await;
+        assert!(!output.status.success(), "{flag} {value}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("`{value}`")) && stderr.contains(replacement),
+            "{flag} {value}: {stderr}"
+        );
+        if replacement.contains("skip-permissions") {
+            assert!(stderr.contains("external isolation"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn help_lists_mode_and_permission_mode() {
+    let help = support::fixture_cli::command()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("[--mode | --permission-mode acceptEdits|auto|plan]"),
+        "{help}"
+    );
+}
+
+#[tokio::test]
+async fn default_mode_setting_takes_the_launch_flag_names_and_falls_back_to_auto_with_the_replacement()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    std::fs::create_dir_all(&config_root).unwrap();
+    for (value, shown, warning) in [
+        ("acceptEdits", "Ask", None),
+        ("auto", "Auto", None),
+        ("plan", "Plan", None),
+        (
+            "default",
+            "Ask",
+            Some("`default` is deprecated and maps to Ask"),
+        ),
+        ("dontAsk", "Auto", Some("use --deny-on-prompt")),
+        (
+            "bypassPermissions",
+            "Auto",
+            Some("use --dangerously-skip-permissions"),
+        ),
+        ("bypass", "Auto", Some("use --dangerously-skip-permissions")),
+    ] {
+        std::fs::write(
+            config_root.join("settings.json"),
+            json!({ "defaultMode": value }).to_string(),
+        )
+        .unwrap();
+        let output = report_startup_execution_mode(&config_root, directory.path(), &[]).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{value}: {stderr}");
+        assert!(
+            stdout.contains(&format!("Execution mode: {shown}")),
+            "{value}: {stdout}"
+        );
+        let reported = format!("{stdout}{stderr}");
+        match warning {
+            Some(warning) => {
+                assert!(
+                    reported.contains("defaultMode") && reported.contains(warning),
+                    "{value}: {reported}"
+                );
+                if shown == "Auto" {
+                    assert!(reported.contains("using Auto"), "{value}: {reported}");
+                }
+            }
+            None => assert!(!reported.contains("defaultMode"), "{value}: {reported}"),
+        }
+    }
 }
 
 #[test]
@@ -1215,9 +1650,11 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
             (
                 "user",
                 concat!(
+                    "<system-reminder>\n",
                     "Host notice: host tools available in this conversation now: ArtifactLogin, TickCall, TickDescribe, TickManage, TickRead. ",
                     "Earlier statements in this conversation about tool availability may be outdated. ",
-                    "This notice comes from the host, not the user, and does not authorize any new work."
+                    "This notice comes from the host, not the user, and does not authorize any new work.",
+                    "\n</system-reminder>"
                 ),
             ),
         ],
@@ -1645,6 +2082,62 @@ async fn terminal_can_choose_accept_edits_with_an_explicit_write_rule_before_the
             .contains("Execution mode: Ask")
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn launch_additional_directory_is_writable_by_the_first_agent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
+    let shared = tempfile::tempdir().unwrap();
+    let target = shared.path().join("report.txt");
+    let target_for_model = target.clone();
+    let server = tokio::spawn(async move {
+        for body in [
+            tool_stream(
+                "Write",
+                json!({"file_path": target_for_model, "content": "launch directory report"}),
+            ),
+            messages_stream("Report saved."),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            respond_with(&mut socket, &body).await;
+        }
+    });
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run_with_config(
+        directory.path(),
+        &[
+            "--no-session-persistence",
+            "--deny-on-prompt",
+            "--add-dir",
+            shared.path().to_str().unwrap(),
+        ],
+        "Write the report\n",
+    )
+    .await;
+    server.abort();
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{transcript}");
+    assert_eq!(
+        std::fs::read_to_string(target).ok().as_deref(),
+        Some("launch directory report"),
+        "{transcript}"
+    );
 }
 
 #[tokio::test]
@@ -2786,31 +3279,26 @@ async fn model_control_sequences_cannot_change_terminal_state() {
     server.await.unwrap();
 }
 
-/// The user context leads the request; the tickloop guidance follows the first prompt, whose run
-/// loaded it, and stays there.
+/// The user context leads the request and the conversation follows it; the tickloop guidance is
+/// listed for the model to load, never injected on its own.
 fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[(&str, &str)]) {
     const USER_CONTEXT: usize = 0;
-    const REFERENCE: usize = 2;
     let messages = request["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), expected_messages.len() + 2);
+    assert_eq!(messages.len(), expected_messages.len() + 1);
     assert!(
         messages[USER_CONTEXT]["content"][0]["text"]
             .as_str()
             .unwrap()
             .starts_with(tickloop_harness::policy::instructions::USER_CONTEXT_OPENING)
     );
-    assert_eq!(messages[REFERENCE]["role"], "user");
-    let reference = messages[REFERENCE]["content"].as_array().unwrap();
-    assert_eq!(reference.len(), 1);
-    assert_eq!(reference[0]["type"], "text");
-    assert!(reference[0]["text"].as_str().unwrap().starts_with(
-        "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop tools and Ticks\n"
-    ));
+    assert!(
+        !request
+            .to_string()
+            .contains("Reference guidance from tickloop")
+    );
     let conversation = messages
         .iter()
-        .enumerate()
-        .filter(|(index, _)| ![USER_CONTEXT, REFERENCE].contains(index))
-        .map(|(_, message)| message)
+        .skip(USER_CONTEXT + 1)
         .map(|message| {
             let content = message["content"].as_array().unwrap();
             assert_eq!(content.len(), 1);
@@ -3907,5 +4395,224 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
         snapshot.policy.mode,
         tickloop_harness::protocol::ExecutionMode::Auto,
         "the staged mode replaces the startup acceptEdits mode before the first input runs"
+    );
+}
+
+#[test]
+fn launch_tool_rules_parse_aliases_and_reject_malformed_rules_before_startup() {
+    for flag in [
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+    ] {
+        let output = support::fixture_cli::command()
+            .args([
+                flag,
+                "Bash(git:*) Edit,mcp__server__tool",
+                "Bash(git log:*)",
+                flag,
+                "WebFetch(domain:example.com)",
+                "--help",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for invalid in [
+            "Bash(git:*",
+            "Bash()",
+            "Edit(foo)",
+            "mcp__",
+            "Bash(git:*))",
+            "Bash(git:*)(rm:*)",
+            "",
+        ] {
+            let output = support::fixture_cli::command()
+                .args([flag, invalid, "--help"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "accepted {invalid:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("invalid permission rule"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn launch_tool_rules_reach_only_the_new_agent_without_changing_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    trust_working_directory(&config_root, directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        for name in ["allowed", "denied", "another-agent"] {
+            for body in [
+                tool_stream("Bash", json!({"command":format!("ln -s missing {name}")})),
+                messages_stream("Finished checking the rule."),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+            }
+        }
+    });
+    let warmup = run_with_config(directory.path(), &[], "/exit\n").await;
+    assert!(warmup.status.success());
+    let before = std::fs::read(config_root.join("settings.json")).unwrap();
+    for (mut flags, name, allowed) in [
+        (vec!["--allowedTools", "Bash(ln:*)"], "allowed", true),
+        (
+            vec!["--allowed-tools", "Bash(ln:*)", "--disallowedTools", "Bash"],
+            "denied",
+            false,
+        ),
+        (vec![], "another-agent", false),
+    ] {
+        flags.push("--deny-on-prompt");
+        let output = run_with_config(directory.path(), &flags, "Create the requested link\n").await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            directory.path().join(name).symlink_metadata().is_ok(),
+            allowed,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read(config_root.join("settings.json")).unwrap(),
+            before
+        );
+    }
+    server.await.unwrap();
+}
+
+#[test]
+fn launch_tool_rules_cannot_be_silently_ignored_when_attaching_or_resuming() {
+    let directory = tempfile::tempdir().unwrap();
+    for selector in ["--continue", "--resume", "--chat-id"] {
+        let mut command = support::fixture_cli::command();
+        command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"));
+        command.args(["--disallowedTools", "Bash", selector]);
+        if selector == "--chat-id" {
+            command.arg("00000000-0000-0000-0000-000000000003");
+        }
+        let output = command.stdin(Stdio::null()).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("launch tool rules require a new Agent"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn launch_tool_rules_preserve_quoted_and_escaped_shell_parentheses() {
+    for rule in [
+        r#"Bash(echo '(')"#,
+        r#"Bash(echo ')')"#,
+        r#"Bash(echo \()"#,
+        r#"Bash(echo \))"#,
+        r#"Bash(echo "(")"#,
+        r#"Bash(echo '\)')"#,
+        r#"Bash(echo "$(printf ")")")"#,
+        r#"Bash(echo "`printf ")"`")"#,
+    ] {
+        let output = support::fixture_cli::command()
+            .args(["--allowedTools", rule, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{rule}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_tool_rules_are_additive_and_leave_unnamed_tools_on_the_normal_path() {
+    let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
+    std::fs::write(
+        directory.path().join("source.txt"),
+        "unnamed read succeeded",
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (index, body) in [
+            tool_stream("Read", json!({"file_path":"source.txt"})),
+            tool_stream(
+                "Write",
+                json!({"file_path":"report.txt", "content":"unnamed edit succeeded"}),
+            ),
+            messages_stream("Normal tool paths remain available."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = body.replace("tool-fixture", &format!("tool-{index}"));
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let output = run_with_config(
+        directory.path(),
+        &["--allowedTools", "Bash(git:*)", "--deny-on-prompt"],
+        "Read source.txt and write report.txt\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.await.unwrap();
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("unnamed read succeeded")
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
+        "unnamed edit succeeded"
     );
 }

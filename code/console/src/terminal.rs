@@ -8,7 +8,9 @@ use std::{
 
 use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
 
-use tickloop_code_settings::{LoadedSettings, UserSettings, config_root_directory};
+use tickloop_code_settings::{
+    LoadedSettings, UserSettings, config_root_directory, parse_execution_mode,
+};
 use tickloop_harness::tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
@@ -53,6 +55,7 @@ mod input_history;
 mod input_view;
 #[cfg(test)]
 mod late_receipt_tests;
+mod launch_rules;
 mod list_row;
 mod login;
 mod loop_view_text;
@@ -610,29 +613,6 @@ fn should_dismiss_menu_before_dispatch(command: &str) -> bool {
         && !is_branch_command(command)
 }
 
-fn parse_execution_mode(value: &str) -> Result<(ExecutionMode, Option<&'static str>), String> {
-    match value.trim() {
-        "ask" | "acceptEdits" | "accept-edits" => Ok((ExecutionMode::AcceptEdits, None)),
-        "auto" => Ok((ExecutionMode::Auto, None)),
-        "fullAccess" | "full-access" => Ok((ExecutionMode::FullAccess, None)),
-        "plan" => Ok((ExecutionMode::Plan, None)),
-        "manual" => Ok((
-            ExecutionMode::AcceptEdits,
-            Some("`manual` was replaced by Ask; use `ask`"),
-        )),
-        "default" => Ok((
-            ExecutionMode::AcceptEdits,
-            Some("`default` is deprecated and maps to Ask; use `ask`"),
-        )),
-        "dontAsk" => Err("`dontAsk` was replaced by the --deny-on-prompt launch policy".into()),
-        "bypass" => Err(
-            "`bypass` was replaced by --dangerously-skip-permissions and requires external isolation"
-                .into(),
-        ),
-        _ => Err("choose auto, ask, fullAccess or plan".into()),
-    }
-}
-
 fn startup_directory_needs_trust(
     settings: Option<&UserSettings>,
     workdir: &std::path::Path,
@@ -860,7 +840,9 @@ pub fn print_help() {
 fn help_text() -> String {
     let guidance = r#"Tickloop
 Usage: tickloop [--cwd DIRECTORY]
-       [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
+       [--add-dir PATH]
+       [--mode | --permission-mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
+       [--allowedTools RULES] [--disallowedTools RULES]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
@@ -881,8 +863,10 @@ plugin manages the plugins without a Tick program the same way, manages marketpl
 mcp lists the MCP servers an Agent here would have without starting any, adds or removes your own servers in the global settings or, with --dir, this directory's, and logs in to or out of a remote server.
 
 The working directory must exist; omitting --cwd uses the current directory.
+--permission-mode is the same as --mode; give one, or both with the same mode. Claude Code's dontAsk and bypassPermissions are --deny-on-prompt and --dangerously-skip-permissions here. defaultMode in settings.json takes the same names.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
 Starting without -c or -r opens a new Chat.
+--allowedTools / --allowed-tools and --disallowedTools / --disallowed-tools add temporary allow/deny rules to the new Agent and its Subagents. Repeat flags or separate rules with spaces or commas; quote command patterns, e.g. --allowedTools "Bash(git:*) Edit". /permissions shows these read-only Launch arguments. They are not saved and expire on restart; they cannot be combined with --continue, --resume or --chat-id. Deny, Ask, sensitive paths and Auto filtering still apply. --deny-on-prompt rejects operations that need human approval.
 -c, --continue resumes the most recent Chat in this directory.
 -r, --resume [CHAT] resumes the given Chat, or opens the Chat picker when CHAT is omitted.
 --fork-session copies the resumed conversation into a new Chat; use it with -c or -r.
@@ -994,8 +978,10 @@ pub fn recover_view_handoff(arguments: &[std::ffi::OsString]) -> Result<bool, St
 pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let launch_arguments = arguments.collect::<Vec<_>>();
     let mut arguments = launch_arguments.clone().into_iter().peekable();
-    let mut execution_mode_override = None;
+    let mut mode_flag = None;
+    let mut permission_mode_flag = None;
     let mut prompt_policy = PromptPolicy::Interactive;
+    let mut launch_rules = Vec::new();
     let mut deny_on_prompt = false;
     let mut unrestricted = false;
     let mut caller_managed_trust = false;
@@ -1005,6 +991,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let mut view_handoff_path = None;
     let mut fork_session = false;
     let mut session_persistence = true;
+    let mut additional_directories = Vec::new();
     let mut workdir = std::env::current_dir()
         .map_err(|_| "cannot read the current directory; use an accessible directory".to_owned())?;
     while let Some(argument) = arguments.next() {
@@ -1027,15 +1014,36 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             "--auto-reviewer-config" | "--permission-checker-config" => {
                 return Err("Independent Auto reviewer configuration has moved to /permissions → Auto mode. Remove this startup flag and choose LLM or Judgment there.".into());
             }
-            "--mode" => {
+            "--mode" | "--permission-mode" => {
                 let value = arguments
                     .next()
-                    .ok_or("--mode requires acceptEdits, auto or plan")?;
-                let (mode, warning) = parse_execution_mode(&value)?;
+                    .ok_or_else(|| format!("{argument} requires acceptEdits, auto or plan"))?;
+                let (mode, warning) =
+                    parse_execution_mode(&value).map_err(|error| safe_text(&error))?;
                 if let Some(warning) = warning {
                     eprintln!("Warning: {warning}");
                 }
-                execution_mode_override = Some(mode);
+                let given = Some((value, mode));
+                if argument == "--mode" {
+                    mode_flag = given;
+                } else {
+                    permission_mode_flag = given;
+                }
+            }
+            "--allowedTools" | "--allowed-tools" | "--disallowedTools" | "--disallowed-tools" => {
+                let value = arguments
+                    .next_if(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{argument} requires permission rules"))?;
+                let decision = if matches!(argument.as_str(), "--allowedTools" | "--allowed-tools")
+                {
+                    tickloop_harness::protocol::Decision::Allow
+                } else {
+                    tickloop_harness::protocol::Decision::Deny
+                };
+                launch_rules.extend(launch_rules::parse(&value, decision)?);
+                while let Some(value) = arguments.next_if(|value| !value.starts_with('-')) {
+                    launch_rules.extend(launch_rules::parse(&value, decision)?);
+                }
             }
             "--deny-on-prompt" => {
                 deny_on_prompt = true;
@@ -1046,6 +1054,13 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                 prompt_policy = PromptPolicy::Unrestricted;
             }
             "--working-directory-is-trusted" => caller_managed_trust = true,
+            "--add-dir" => {
+                let path = arguments
+                    .next_if(|value| !value.starts_with("--"))
+                    .filter(|value| !value.is_empty())
+                    .ok_or("--add-dir requires a directory path")?;
+                additional_directories.push(PathBuf::from(path));
+            }
             "--cwd" => {
                 workdir = PathBuf::from(arguments.next().ok_or("--cwd requires a directory path")?)
             }
@@ -1080,6 +1095,20 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             }
         }
     }
+    let execution_mode_override = match (mode_flag, permission_mode_flag) {
+        (Some((mode_value, mode)), Some((permission_value, permission_mode)))
+            if mode != permission_mode =>
+        {
+            return Err(format!(
+                "--mode {} and --permission-mode {} name different execution modes; give only one",
+                safe_text(&mode_value),
+                safe_text(&permission_value)
+            ));
+        }
+        (mode_flag, permission_mode_flag) => {
+            mode_flag.or(permission_mode_flag).map(|(_, mode)| mode)
+        }
+    };
     let view_handoff = view_handoff_path
         .as_deref()
         .map(view_upgrade::read_handoff)
@@ -1091,6 +1120,15 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         fork_session = false;
     }
     let resumes_saved_chat = continue_recent || resume.is_some();
+    if !launch_rules.is_empty() && (resumes_saved_chat || exact_chat.is_some()) {
+        if view_handoff.is_none() {
+            return Err(
+                "launch tool rules require a new Agent; omit --continue, --resume and --chat-id"
+                    .into(),
+            );
+        }
+        launch_rules.clear();
+    }
     if fork_session && !resumes_saved_chat {
         return Err("--fork-session can only be used with --continue or --resume".into());
     }
@@ -1137,6 +1175,18 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     workdir = workdir
         .canonicalize()
         .map_err(|error| format!("cannot resolve working directory: {error}"))?;
+    additional_directories = additional_directories.into_iter().filter_map(|path| {
+        let path = workdir.join(path);
+        match path.canonicalize().ok().filter(|path| path.is_dir()) {
+            Some(path) => Some(path),
+            None => {
+                eprintln!("Warning: additional directory {} is unavailable or not a directory; skipped", safe_text(&path.to_string_lossy()));
+                None
+            }
+        }
+    }).collect();
+    additional_directories.sort();
+    additional_directories.dedup();
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let config_root = config_root_directory().map(normalize_state_root);
     // Use the canonicalized root like `Agent::open`, so settings warnings reported at startup match
@@ -1196,7 +1246,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .and_then(LoadedSettings::monitor_width);
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
+        settings.additional_directories(&workdir);
     }
+    let saved_execution_mode = saved_settings
+        .as_mut()
+        .and_then(LoadedSettings::default_execution_mode);
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
@@ -1250,6 +1304,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
         folder: workdir.clone(),
+        additional_directories,
         config_root: config_root.clone(),
         model: Some(config.clone()),
         host_options,
@@ -1294,6 +1349,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         };
         Agent::connected(client, launch, view_host)
     };
+    agent.use_launch_rules(launch_rules);
     if (resumes_saved_chat || exact_chat.is_some())
         && !agent.saves_chats()
         && view_handoff.is_none()
@@ -1383,7 +1439,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .filter(|_| agent.saves_chats())
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
     console.configure_image_cache(image_cache_root.as_deref())?;
-    console.set_input_context(None, &workdir, &[])?;
+    let draft = agent
+        .configuration(ConfigTarget::NewDraft)
+        .await
+        .map_err(|error| error.to_string())?;
+    console.set_input_context(None, &workdir, &draft.additional_directories)?;
     let needs_model_selection =
         interactive_terminal && matches!(startup, StartupChat::New) && !model_selected;
     initialize_startup_console(
@@ -1391,11 +1451,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         (!needs_model_selection).then_some(&config),
         &workdir,
         execution_mode_override
-            .or_else(|| {
-                user_settings
-                    .as_ref()
-                    .and_then(UserSettings::default_execution_mode)
-            })
+            .or(saved_execution_mode)
             .unwrap_or_default(),
         startup_settings_warnings,
     )?;
@@ -1951,6 +2007,7 @@ async fn interact_with_herdr(
     let mut restored_view_path = None;
     if let Some(handoff) = view_handoff {
         global.restore_upgrade_navigation(handoff.selection.navigation);
+        agent.set_new_agent_directory(global.projection().dispatch_directory);
         overview_active = handoff.selection.overview;
         agent.restore_upgrade_configuration(handoff.selection.configuration)?;
         if overview_active {
@@ -1962,7 +2019,15 @@ async fn interact_with_herdr(
         }
         console.restore_upgrade(handoff.console)?;
         if selected_chat.is_none() {
-            console.set_input_context(None, &global.projection().dispatch_directory, &[])?;
+            let draft = agent
+                .configuration(ConfigTarget::NewDraft)
+                .await
+                .map_err(|error| error.to_string())?;
+            console.set_input_context(
+                None,
+                &global.projection().dispatch_directory,
+                &draft.additional_directories,
+            )?;
         }
         restored_view_path = Some(handoff.source_path);
         ui_selected = selected_chat;
@@ -1999,7 +2064,9 @@ async fn interact_with_herdr(
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
-        menus.set_new_agent_directory(global.projection().dispatch_directory);
+        let dispatch_directory = global.projection().dispatch_directory;
+        menus.set_new_agent_directory(dispatch_directory.clone());
+        agent.set_new_agent_directory(dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
             agent
                 .display_chat(selected_chat.map(Into::into))
@@ -2509,6 +2576,11 @@ async fn interact_with_herdr(
                 console.set_footer_items(Vec::new())?;
                 console.set_provider_failure(None)?;
                 if let Ok(draft) = draft {
+                    console.set_input_context(
+                        None,
+                        &global.projection().dispatch_directory,
+                        &draft.additional_directories,
+                    )?;
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         if menus.model_setup_pending() {
@@ -4035,8 +4107,7 @@ async fn interact_with_herdr(
                                 match stage_draft_directories(agent,&mut global,&line).await {
                                     Ok((directory,additional)) => {
                                         console.set_input_context(None,&directory,&additional)?;
-                                        outln!(console, "Working directory: {}",safe_text(&directory.to_string_lossy()));
-                                        for directory in additional {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                        show_directory_listing(console, agent, ConfigTarget::NewDraft, &directory, &additional).await?;
                                     },
                                     Err(error) => outln!(console, "Cannot update directories: {}",safe_text(&error)),
                                 }
@@ -4048,8 +4119,7 @@ async fn interact_with_herdr(
                                 continue;
                             };
                             if line=="/cwd" {
-                                outln!(console, "Working directory: {}",safe_text(&folder.to_string_lossy()));
-                                for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                show_directory_listing(console, agent, ConfigTarget::Agent(chat.into()), &folder, &snapshot.additional_directories).await?;
                                 continue;
                             }
                             if let Some(path) = line.strip_prefix("/cwd ") { folder = folder.join(path.trim()); }
@@ -4057,8 +4127,7 @@ async fn interact_with_herdr(
                             match agent.set_directories(chat.into(),folder,snapshot.additional_directories).await {
                                 Ok(()) => {
                                     let snapshot = agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
-                                    outln!(console, "Working directory: {}",safe_text(&shown_folder(snapshot.folder.as_deref()).to_string_lossy()));
-                                    for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                    show_directory_listing(console, agent, ConfigTarget::Agent(chat.into()), shown_folder(snapshot.folder.as_deref()), &snapshot.additional_directories).await?;
                                     show_settings_warnings(console, agent.user_settings_warnings(chat.into()))?;
                                 },
                                 Err(error) => outln!(console, "Cannot update directories: {}",safe_text(&error.to_string())),
@@ -6463,7 +6532,8 @@ async fn ensure_chat(
     };
     *selected = Some(id.into());
     console.select_created_chat(id, &startup_banner)?;
-    console.set_input_context(Some(id), workdir, &[])?;
+    let status = agent.status(id).await.map_err(|error| error.to_string())?;
+    console.set_input_context(Some(id), workdir, &status.additional_directories)?;
     agent
         .display_chat(Some(id))
         .await
@@ -7196,6 +7266,34 @@ fn stage_draft_rule(
     Ok(staged_message)
 }
 
+async fn show_directory_listing(
+    console: &Console,
+    agent: &Agent,
+    target: ConfigTarget,
+    folder: &std::path::Path,
+    additional: &[PathBuf],
+) -> Result<(), String> {
+    let sources = agent.directory_sources(target, folder).await;
+    outln!(
+        console,
+        "Working directory: {}",
+        safe_text(&folder.to_string_lossy())
+    );
+    for directory in additional {
+        let source = sources
+            .as_ref()
+            .map(|sources| permissions_surface::directory_source_label(sources, directory))
+            .unwrap_or_else(|_| "source unavailable".into());
+        outln!(
+            console,
+            "Additional directory: {} · {}",
+            safe_text(&directory.to_string_lossy()),
+            source
+        );
+    }
+    Ok(())
+}
+
 /// `/cwd PATH` and `/add-dir PATH` on the New Agent: the directory new Agents start in and the
 /// extra directories the first input's Agent receives, resolved against the dispatch directory.
 async fn stage_draft_directories(
@@ -7211,35 +7309,41 @@ async fn stage_draft_directories(
             .filter(|path| path.is_dir())
             .ok_or_else(|| format!("{} is not a directory", path.display()))
     };
-    let mut additional = agent
-        .configuration(ConfigTarget::NewDraft)
-        .await
-        .map_err(|error| error.to_string())?
-        .additional_directories;
-    let directory = if let Some(path) = line.strip_prefix("/cwd ") {
+    if let Some(path) = line.strip_prefix("/cwd ") {
         let directory = resolve(path)?;
         global
             .interpret(crate::agent_console::Intent::DispatchDirectory(
                 directory.clone(),
             ))
             .map_err(|error| error.to_string())?;
-        directory
-    } else {
-        if let Some(path) = line.strip_prefix("/add-dir ") {
-            additional.push(resolve(path)?);
-            agent
-                .change_configuration(
-                    ConfigTarget::NewDraft,
-                    ConfigurationChange::Directories {
-                        folder: directory.clone(),
-                        additional: additional.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        directory
-    };
+        agent.set_new_agent_directory(directory.clone());
+        let additional = agent
+            .configuration(ConfigTarget::NewDraft)
+            .await
+            .map_err(|error| error.to_string())?
+            .additional_directories;
+        return Ok((directory, additional));
+    }
+    let mut additional = agent
+        .configuration(ConfigTarget::NewDraft)
+        .await
+        .map_err(|error| error.to_string())?
+        .additional_directories;
+    if let Some(path) = line.strip_prefix("/add-dir ") {
+        additional.push(resolve(path)?);
+        additional.sort();
+        additional.dedup();
+        agent
+            .change_configuration(
+                ConfigTarget::NewDraft,
+                ConfigurationChange::Directories {
+                    folder: directory.clone(),
+                    additional: additional.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok((directory, additional))
 }
 

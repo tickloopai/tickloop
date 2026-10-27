@@ -210,7 +210,7 @@ impl Agent {
             .user_context
             .get()
             .cloned()
-            .unwrap_or_else(|| user_context_message(instruction_files, current_date));
+            .unwrap_or_else(|| user_context_message(instruction_files, current_date, None));
         Ok(ContextParts {
             system_prompt: self.conversation_system_message(
                 chat,
@@ -257,6 +257,10 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::Guidance(GuidanceNote::McpInstructions { server, .. }) => {
                 format!("MCP server instructions · {server}")
             }
+            HostNote::Guidance(GuidanceNote::McpServers { servers }) => format!(
+                "MCP server instructions · {}",
+                servers.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
             HostNote::Guidance(GuidanceNote::Withdrawn { .. }) => "Withdrawn guidance".into(),
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),

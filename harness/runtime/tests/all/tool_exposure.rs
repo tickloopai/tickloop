@@ -214,7 +214,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
             .find(|message| {
                 serde_json::to_string(message)
                     .unwrap()
-                    .contains("MCP server: office")
+                    .contains("## office\\n")
             })
             .unwrap();
         assert!(

@@ -769,6 +769,7 @@ impl EmbeddedAgentAccess {
                 ))
             }
             AgentCommand::Create {
+                launch_rules,
                 launch,
                 initial,
                 origin,
@@ -780,6 +781,11 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?;
                 }
                 let chat = if let Some(chat) = launch.exact_chat {
+                    if !launch_rules.is_empty() {
+                        return Err(AccessError::invalid(
+                            "launch tool rules require a new Agent",
+                        ));
+                    }
                     self.inner
                         .agent
                         .restore_empty_chat(chat.into(), launch.folder.clone())
@@ -787,14 +793,20 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?;
                     chat
                 } else {
-                    (self
-                        .inner
+                    self.inner
                         .agent
-                        .create_chat(launch.folder.clone())
+                        .create_chat_with_launch_rules(launch.folder.clone(), launch_rules)
                         .await
-                        .map_err(agent_access_error)?)
-                    .uuid()
+                        .map_err(agent_access_error)?
+                        .uuid()
                 };
+                if !launch.additional_directories.is_empty() {
+                    self.inner
+                        .agent
+                        .add_launch_directories(chat.into(), launch.additional_directories.clone())
+                        .await
+                        .map_err(agent_access_error)?;
+                }
                 let execution = self.register(chat, launch.clone()).await;
                 self.inner
                     .receipts

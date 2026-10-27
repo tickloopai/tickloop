@@ -2,6 +2,9 @@
 
 #[path = "all/auto_compact_settings.rs"]
 mod auto_compact_settings;
+#[path = "all/claude_auto_import.rs"]
+mod claude_auto_import;
+
 #[path = "all/builtin_catalog.rs"]
 mod builtin_catalog;
 #[path = "all/builtin_skills.rs"]
@@ -32,3 +35,6 @@ mod mcp_servers;
 
 #[path = "all/mcp_credentials.rs"]
 mod mcp_credentials;
+
+#[path = "all/additional_directories.rs"]
+mod additional_directories;

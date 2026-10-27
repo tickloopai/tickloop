@@ -1401,3 +1401,49 @@ async fn rewinding_into_plan_leaves_the_earlier_mode_unknown() {
     assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn launch_server_rules_match_resolved_mcp_names_and_preserve_deny_priority() {
+    for server_name in [
+        "review",
+        "a_service_name_long_enough_to_require_hashing_the_complete_model_tool_name",
+    ] {
+        for denied in [false, true] {
+            let server = McpService::start().await;
+            let (provider, tool) = provider(&server, server_name).await;
+            let model = Arc::new(ScriptedModel::new(vec![
+                call("read", &tool, json!({})),
+                text("done"),
+            ]));
+            let agent = Agent::new_embedded(config(), model);
+            agent.install_host_tools(provider).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut rules = vec![rule(&format!("mcp__{server_name}"), Decision::Allow)];
+            if denied {
+                rules.push(rule(&tool, Decision::Deny));
+            }
+            let chat = agent
+                .create_chat_with_launch_rules(directory.path().into(), rules)
+                .await
+                .unwrap();
+            agent
+                .set_execution_mode(chat, ExecutionMode::Auto)
+                .await
+                .unwrap();
+            let mut events = agent.subscribe();
+            agent.submit(chat, "Read the service".into()).await.unwrap();
+            loop {
+                match next_event(&mut events).await.kind {
+                    EventKind::PermissionRequested { .. } => {
+                        panic!("launch MCP rule should decide the call")
+                    }
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(server.calls().len(), usize::from(!denied));
+            agent.shutdown().await;
+        }
+    }
+}

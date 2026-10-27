@@ -447,8 +447,12 @@ pub enum GuidanceNote {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
     },
-    /// The instructions an MCP server gave when the host connected to it.
+    /// The instructions an MCP server gave when the host connected to it, as notes before one
+    /// note announced every changed server.
     McpInstructions { server: String, digest: String },
+    /// The instructions and states of the MCP servers one note announced, each with the digest
+    /// of what it said.
+    McpServers { servers: BTreeMap<String, String> },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]

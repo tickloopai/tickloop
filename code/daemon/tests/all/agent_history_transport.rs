@@ -301,6 +301,7 @@ async fn repeated_legal_images_case(
         .execute(envelope(
             epoch,
             AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().to_path_buf()),
                 initial: None,
                 origin: None,
@@ -529,6 +530,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
         .execute(envelope(
             epoch,
             AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().to_path_buf()),
                 initial: None,
                 origin: None,

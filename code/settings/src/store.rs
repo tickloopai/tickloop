@@ -62,6 +62,9 @@ impl SettingsStore for UserSettings {
         let has_read_error = saved.read_error.is_some();
         let mut snapshot = SettingsSnapshot {
             project: project_settings,
+            additional_directories: project
+                .map(|folder| saved.additional_directories(folder))
+                .unwrap_or_default(),
             model: saved.clone().model(),
             task_tools_enabled: saved.task_tools_enabled(),
             execution_mode: saved.default_execution_mode(),

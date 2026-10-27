@@ -162,7 +162,7 @@ async fn overview_falls_back_to_a_short_prompt_without_renaming_the_root_main() 
         ])),
     );
     let access = EmbeddedAgentAccess::new(core.clone());
-    access.execute(CommandEnvelope { daemon_epoch:access.daemon_epoch(), command_id:uuid::Uuid::new_v4(), command:AgentCommand::Create { launch:LaunchSpec::embedded(directory.path().into()), initial:Some(UserInput::Text { text:"Investigate the first problem\nand keep this very long original user instruction out of the title column while preserving all of its details in the conversation".into(), contexts:vec![], paths:vec![] }), origin:None } }).await.unwrap();
+    access.execute(CommandEnvelope { daemon_epoch:access.daemon_epoch(), command_id:uuid::Uuid::new_v4(), command:AgentCommand::Create { launch_rules: Vec::new(), launch:LaunchSpec::embedded(directory.path().into()), initial:Some(UserInput::Text { text:"Investigate the first problem\nand keep this very long original user instruction out of the title column while preserving all of its details in the conversation".into(), contexts:vec![], paths:vec![] }), origin:None } }).await.unwrap();
     let observation = access
         .observe(ObservationRequest::Overview {
             filter: AgentFilter::default(),

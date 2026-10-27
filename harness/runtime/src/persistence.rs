@@ -2988,6 +2988,7 @@ impl Agent {
     ) {
         // A record never carries the host's rules: every load fills in the ones it then has.
         delegation.ceiling.policy.host_rules.clear();
+        delegation.ceiling.policy.launch_rules.clear();
         if let Some(recorder) = &self.inner.recorder {
             recorder.outbox.enqueue(
                 child_id,
@@ -3638,6 +3639,7 @@ impl Agent {
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
         if let Some(delegation) = &mut snapshot.delegation {
             self.apply_host_rules(&mut delegation.ceiling.policy);
+            delegation.ceiling.policy.launch_rules.clear();
             folder = delegation.ceiling.folder.clone();
             let ceiling = delegation.ceiling.clone();
             snapshot.folder = folder.clone();
@@ -3778,6 +3780,7 @@ impl Agent {
                 user_cancelled_runs: HashSet::new(),
                 output_style,
                 user_context: Default::default(),
+                environment: Default::default(),
                 announced_date: None,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,

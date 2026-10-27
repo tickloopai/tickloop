@@ -183,11 +183,9 @@ pub(super) enum Hold {
 impl Hold {
     fn reason(self) -> &'static str {
         match self {
-            Self::Paused => {
-                "this Chat's Loop has paused receiving; it resumes when the Chat is continued"
-            }
-            Self::Busy => "this Chat's Loop takes it once its current turn ends",
-            Self::PlanReview => "this Chat's Loop waits for its plan to be reviewed",
+            Self::Paused => "this Chat has paused receiving; it resumes when the Chat is continued",
+            Self::Busy => "this Chat takes it once its current turn ends",
+            Self::PlanReview => "this Chat waits for its plan to be reviewed",
             Self::PlanMode => "Plan mode holds it back",
             Self::LinkUnavailable => "the artifact link's account is unavailable",
             Self::Delivered => "this Chat already took an update the delivery carries",

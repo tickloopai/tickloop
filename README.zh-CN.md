@@ -43,6 +43,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 然后在 Monitor 中对 Counter 按 Enter，输入 `+` 再按 Enter：Agent 会收到新的计数并作出回应。
 
+为新 Agent 添加临时工具规则，可运行 `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`，也支持别名 `--allowed-tools` 和 `--disallowed-tools`。参数可重复，规则以空格或逗号分隔。这些参数不能与 `--continue`、`--resume` 或 `--chat-id` 同用。`/permissions` 中这些规则标为只读的 **Launch arguments（启动参数）**，只作用于该 Agent 及其 Subagent，重启后失效，不写入设置，也不影响其他 Agent。Deny、Ask 和敏感路径检查仍优先；宽泛的 Bash allow 仍需 Auto 审查。加上 `--deny-on-prompt`，需要人工确认的操作将直接拒绝。
+
 ## 日常使用
 
 | 命令 | 作用 |
@@ -60,6 +62,12 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/context` | 按类别查看上下文占用，以及工具搜索能找到多少 MCP 工具；`/context all` 列出每一项 |
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
+
+用 `tickloop --add-dir ../shared --add-dir /path/to/docs` 为这次启动创建的 Agent 添加目录，或在 Chat 中使用 `/add-dir PATH`。要让新 Agent 默认包含这些目录，在用户自己的 `settings.json` 中写 `"permissions": {"additionalDirectories": ["../shared"]}`；同一字段也可放在 `projects["/项目绝对路径"]` 下，仅对这个工作目录精确生效，并与全局列表合并。相对路径按启动工作目录（指定时为 `--cwd`）解析，不可用的目录会警告并跳过。
+
+这些来源合并到 Chat 现有的附加目录中并去重，支持读取、编辑和 `@` 文件提及；敏感文件检查和显式 Ask/Deny 规则仍然生效。`/cwd` 会显示每个目录的来源。仓库设置不能添加目录，`--add-dir` 与 `/add-dir` 也不会把目录写入设置。
+
+在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
 
 按键：
 

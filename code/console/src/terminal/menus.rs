@@ -3877,6 +3877,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: None,
                     origin: None,
@@ -3983,6 +3984,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: None,
                     origin: None,
@@ -4086,6 +4088,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: None,
                     origin: None,
@@ -4192,6 +4195,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: None,
                     origin: None,

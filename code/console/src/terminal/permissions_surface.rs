@@ -1,5 +1,10 @@
 use std::path::PathBuf;
 
+mod auto_import;
+use auto_import::AutoImportDraft;
+
+const AUTO_IMPORT_ROW: usize = 6;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_harness::tools::{WEB_FETCH_TOOL_NAME, permissions::is_supported_rule_content};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -213,6 +218,7 @@ impl RuleScope {
 
 fn source_label(source: PermissionRuleSource) -> &'static str {
     match source {
+        PermissionRuleSource::LaunchArguments => "Launch arguments",
         PermissionRuleSource::ChatSession => "Chat session",
         PermissionRuleSource::ProjectUser => "Project rule",
         PermissionRuleSource::ProjectConstraint => "Project constraint",
@@ -474,6 +480,7 @@ impl RuleDraft {
 }
 
 enum Focus {
+    AutoImport(AutoImportDraft),
     AutoSetup(super::auto_setup_surface::AutoSetupSurface),
     List,
     Search(Editor),
@@ -584,6 +591,7 @@ pub(super) struct PermissionsContent {
     pub(super) rules: Vec<PermissionRuleView>,
     pub(super) working_directory: PathBuf,
     pub(super) additional_directories: Vec<PathBuf>,
+    pub(super) additional_directory_sources: tickloop_harness::protocol::AdditionalDirectorySources,
     pub(super) warnings: Vec<String>,
 }
 
@@ -612,6 +620,7 @@ impl From<PermissionsView> for PermissionsPage {
                 rules: view.rules,
                 working_directory: view.working_directory,
                 additional_directories: view.additional_directories,
+                additional_directory_sources: view.additional_directory_sources,
                 warnings: view.warnings,
             },
         }
@@ -823,6 +832,13 @@ impl PermissionsSurface {
 
     pub(super) fn conflict(&mut self, view: impl Into<PermissionsPage>) {
         self.set_page(view);
+        if let Focus::AutoImport(draft) = &mut self.focus {
+            self.message = Some(match draft.refresh(&self.view.auto_rule_settings) {
+                Ok(()) => "Permissions changed elsewhere; preview refreshed. Review before confirming again".into(),
+                Err(error) => error,
+            });
+            return;
+        }
         if let Focus::AutoPreview {
             change:
                 PermissionChange::ChangeAutoRules {
@@ -963,7 +979,7 @@ impl PermissionsSurface {
 
     fn row_count(&self) -> usize {
         if self.page == Page::Auto {
-            return 6;
+            return AUTO_IMPORT_ROW + 1;
         }
         1 + if self.page == Page::Directories {
             self.directory_rows().len()
@@ -1037,6 +1053,19 @@ impl PermissionsSurface {
             2 => self.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftAllow)),
             3 => self.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftDeny)),
             4 => self.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::HardDeny)),
+            AUTO_IMPORT_ROW => {
+                if let Some(reason) = self.read_only {
+                    self.message = Some(format!("Read-only: {reason}"));
+                } else {
+                    match AutoImportDraft::from_user_settings(&self.view.auto_rule_settings) {
+                        Ok(draft) => {
+                            self.message = None;
+                            self.focus = Focus::AutoImport(draft);
+                        }
+                        Err(error) => self.message = Some(error),
+                    }
+                }
+            }
             _ => {
                 self.focus = Focus::AutoEnvironment {
                     selected: 0,
@@ -1294,6 +1323,7 @@ impl PermissionsSurface {
                 | Focus::AutoDraft(_)
                 | Focus::AutoPreview { .. }
                 | Focus::AutoSetup(_)
+                | Focus::AutoImport(_)
         );
         if editing
             || matches!(
@@ -1327,6 +1357,37 @@ impl PermissionsSurface {
         }
         let focus = std::mem::replace(&mut self.focus, Focus::List);
         match focus {
+            Focus::AutoImport(mut draft) => {
+                let mut effect = PermissionsEffect::None;
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        self.message = Some("Import cancelled; nothing applied".into());
+                        return effect;
+                    }
+                    (KeyCode::Enter, _) => match draft.change(&self.view.auto_rule_settings) {
+                        Ok(change) => {
+                            effect = PermissionsEffect::Apply(PermissionChange::ChangeAutoRules {
+                                change,
+                            })
+                        }
+                        Err(error) => self.message = Some(error),
+                    },
+                    (KeyCode::Char(' '), KeyModifiers::NONE) => draft.toggle(),
+                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) => draft.move_selection(true),
+                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                    | (KeyCode::Char('p'), KeyModifiers::CONTROL) => draft.move_selection(false),
+                    (KeyCode::PageDown, _) => {
+                        draft.scroll = Some(self.detail_scroll.saturating_add(8))
+                    }
+                    (KeyCode::PageUp, _) => {
+                        draft.scroll = Some(self.detail_scroll.saturating_sub(8))
+                    }
+                    _ => {}
+                }
+                self.focus = Focus::AutoImport(draft);
+                effect
+            }
             Focus::AutoSetup(mut setup) => {
                 use super::auto_setup_surface::SetupEffect;
                 let effect = setup.key(key);
@@ -1996,6 +2057,7 @@ impl PermissionsSurface {
                 "Environment  ",
                 environment_source_label(&self.view.auto_policy.environment.source),
             ));
+            rows.push(plain_row("Import from Claude Code"));
             let footer = "enter configure · esc back";
             return ListContent {
                 intro: body,
@@ -2043,7 +2105,13 @@ impl PermissionsSurface {
             for path in self.directory_rows() {
                 let mut row = RoleLine::default();
                 row.push_matching(&path.display().to_string(), None, &self.query);
-                row.push(" · additional", Some(Role::MutedText));
+                row.push(
+                    format!(
+                        " · {}",
+                        directory_source_label(&self.view.additional_directory_sources, &path)
+                    ),
+                    Some(Role::MutedText),
+                );
                 rows.push(row);
             }
         } else {
@@ -2130,6 +2198,10 @@ impl PermissionsSurface {
 
     fn styled_detail(&self, width: usize, height: usize, body: &mut Vec<RoleLine>) -> &'static str {
         match &self.focus {
+            Focus::AutoImport(draft) => {
+                body.extend(draft.lines());
+                "j/k select · space toggle · enter save · pgup/pgdn scroll · esc cancel"
+            }
             Focus::AutoSetup(setup) => {
                 body.push(plain_row(format!(
                     "Directory: {}",
@@ -2575,6 +2647,15 @@ impl PermissionsSurface {
         }
         let max_scroll = rows.len().saturating_sub(body_height);
         let start = match &self.focus {
+            Focus::AutoImport(draft) => draft
+                .scroll
+                .unwrap_or_else(|| {
+                    rows.iter()
+                        .position(|line| line.fill == Some(Role::Selection))
+                        .unwrap_or_default()
+                        .saturating_sub(body_height.saturating_sub(2))
+                })
+                .min(max_scroll),
             Focus::Detail => self.detail_scroll.min(max_scroll),
             Focus::AutoRuleDetail { scroll, .. } | Focus::AutoPreview { scroll, .. } => {
                 (*scroll).min(max_scroll)
@@ -2871,6 +2952,23 @@ pub(super) fn edit_text(editor: &mut Editor, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+pub(super) fn directory_source_label(
+    sources: &tickloop_harness::protocol::AdditionalDirectorySources,
+    path: &std::path::Path,
+) -> String {
+    sources
+        .get(path)
+        .filter(|sources| !sources.is_empty())
+        .map(|sources| {
+            sources
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "session".into())
 }
 
 #[cfg(test)]

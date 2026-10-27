@@ -45,7 +45,9 @@ use tickloop_harness::protocol::{
     TickSubscriptionChange, TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
-use tickloop_harness::tools::permissions::{canonical_directory, rule_views, validate_rule};
+use tickloop_harness::tools::permissions::{
+    canonical_directory, launch_rule_views, rule_views, validate_rule,
+};
 
 /// Why a New Agent Permissions change was not applied. Nothing was written or staged.
 pub(super) enum DraftPermissionsError {
@@ -310,10 +312,12 @@ struct Inner {
     display: Mutex<DisplayState>,
     disconnected: Mutex<Option<String>>,
     draft: Mutex<NewAgentDraft>,
+    launch_rules: Mutex<Vec<PermissionRule>>,
     first_create: Mutex<Option<FirstCreateState>>,
     /// The View's settings, sharing its transient Providers; New Agent defaults save through it.
     user_settings: Mutex<Option<tickloop_code_settings::UserSettings>>,
     default_model: Mutex<Option<ModelConfig>>,
+    new_agent_directory: Mutex<Option<PathBuf>>,
     /// Inputs whose acceptance is unknown, by execution; no further input goes there until the
     /// receipt resolves.
     unconfirmed_inputs: Mutex<HashMap<ExecutionRef, (Uuid, Uuid)>>,
@@ -638,9 +642,11 @@ impl ConsoleExecution {
                 }),
                 disconnected: Mutex::new(None),
                 draft: Mutex::new(NewAgentDraft::default()),
+                launch_rules: Mutex::new(Vec::new()),
                 first_create: Mutex::new(None),
                 user_settings: Mutex::new(None),
                 default_model: Mutex::new(None),
+                new_agent_directory: Mutex::new(None),
                 unconfirmed_inputs: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 in_process_access: None,
@@ -1881,6 +1887,7 @@ impl ConsoleExecution {
     ) -> Result<(Uuid, ExecutionRef), DraftCreationError> {
         match outcome {
             CommandOutcome::Completed(CommandResult::Created { snapshot, .. }) => {
+                self.inner.launch_rules.lock().unwrap().clear();
                 let chat = snapshot.conversation.id;
                 let execution = snapshot.execution;
                 self.inner.cache_snapshot(snapshot, None);
@@ -2014,10 +2021,12 @@ impl ConsoleExecution {
         } else {
             None
         };
+        let launch_rules = self.inner.launch_rules.lock().unwrap().clone();
         self.send(
             epoch,
             command_id,
             AgentCommand::Create {
+                launch_rules,
                 launch,
                 initial: None,
                 origin,
@@ -2041,10 +2050,9 @@ impl ConsoleExecution {
                 configuration.task_tools_enabled = enabled;
                 Ok(configuration)
             }
-            ConfigTarget::NewDraft => {
-                let base = self.new_agent_defaults();
-                Ok(self.inner.draft.lock().unwrap().configuration(base))
-            }
+            ConfigTarget::NewDraft => Ok(self
+                .new_agent_configuration(&self.effective_launch().folder)
+                .0),
         }
     }
     pub(super) async fn provider_credentials(
@@ -2317,6 +2325,10 @@ impl ConsoleExecution {
             Err(error) => Err(invalid(&error)),
         }
     }
+    pub(super) fn use_launch_rules(&self, rules: Vec<PermissionRule>) {
+        *self.inner.launch_rules.lock().unwrap() = rules;
+    }
+
     /// Shares the View's settings, so New Agent defaults use its transient Providers and saves.
     pub(super) fn use_user_settings(&self, settings: Option<tickloop_code_settings::UserSettings>) {
         *self.inner.user_settings.lock().unwrap() = settings;
@@ -2330,13 +2342,45 @@ impl ConsoleExecution {
         *self.inner.default_model.lock().unwrap() =
             Some(tickloop_harness::model::cards::model_for_persistent_selection(config));
     }
-    /// The View's launch with the model its latest confirmed selection made the default.
+    pub(super) fn set_new_agent_directory(&self, folder: PathBuf) {
+        let previous = self.effective_launch().folder;
+        if previous == folder {
+            return;
+        }
+        let mut saved = self.user_settings().map(|settings| settings.load());
+        let previous_defaults = self.initial_directory_sources(&previous, saved.as_mut());
+        let next_defaults = self.initial_directory_sources(&folder, saved.as_mut());
+        self.inner
+            .draft
+            .lock()
+            .unwrap()
+            .rebase_directories(&previous_defaults, &next_defaults);
+        *self.inner.new_agent_directory.lock().unwrap() = Some(folder);
+    }
+
+    /// The View's launch with its current New Agent directory and confirmed model selection.
     fn effective_launch(&self) -> LaunchSpec {
         let mut launch = self.inner.launch.clone();
+        if let Some(folder) = self.inner.new_agent_directory.lock().unwrap().clone() {
+            launch.folder = folder;
+        }
         if let Some(model) = self.inner.default_model.lock().unwrap().clone() {
             launch.model = Some(model);
         }
         launch
+    }
+    pub(super) async fn directory_sources(
+        &self,
+        target: ConfigTarget,
+        folder: &Path,
+    ) -> Result<tickloop_harness::protocol::AdditionalDirectorySources, AccessError> {
+        if let ConfigTarget::Agent(chat) = target {
+            return Ok(self
+                .permissions_view(chat)
+                .await?
+                .additional_directory_sources);
+        }
+        Ok(self.new_agent_configuration(folder).1)
     }
     /// The New Agent's Permissions view for `project`: saved project rules and Auto policy read
     /// without an Agent, with the staged mode, session rules and directories. A settings file
@@ -2345,8 +2389,8 @@ impl ConsoleExecution {
         &self,
         project: &Path,
     ) -> Result<PermissionsPage, AccessError> {
-        let configuration = self.configuration(ConfigTarget::NewDraft).await?;
         let project = rule_project(project)?;
+        let (configuration, additional_directory_sources) = self.new_agent_configuration(&project);
         let storage =
             |error: tickloop_code_settings::SettingsError| AccessError::storage(error.to_string());
         let settings = self.user_settings();
@@ -2394,9 +2438,16 @@ impl ConsoleExecution {
                 &[],
                 &[],
                 &[],
-            ),
+            )
+            .into_iter()
+            .chain(launch_rule_views(
+                &self.inner.launch_rules.lock().unwrap(),
+                configuration.execution_mode,
+            ))
+            .collect(),
             working_directory: project.clone(),
             additional_directories: configuration.additional_directories,
+            additional_directory_sources,
             warnings,
         };
         Ok(PermissionsPage {
@@ -2624,15 +2675,43 @@ impl ConsoleExecution {
         .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
         .map(|_| ())
     }
+    fn initial_directory_sources(
+        &self,
+        folder: &Path,
+        saved: Option<&mut tickloop_code_settings::LoadedSettings>,
+    ) -> tickloop_harness::protocol::AdditionalDirectorySources {
+        use tickloop_harness::protocol::AdditionalDirectorySource;
+        let mut sources = saved
+            .map(|saved| saved.additional_directories(folder))
+            .unwrap_or_default();
+        for path in &self.inner.launch.additional_directories {
+            if let Ok(path) = canonical_directory(folder.join(path)) {
+                sources
+                    .entry(path)
+                    .or_default()
+                    .insert(AdditionalDirectorySource::LaunchArgument);
+            }
+        }
+        sources
+    }
+
     /// What the worker of the first Create starts with, read the way it will read it.
-    fn new_agent_defaults(&self) -> AgentConfiguration {
+    fn new_agent_configuration(
+        &self,
+        folder: &Path,
+    ) -> (
+        AgentConfiguration,
+        tickloop_harness::protocol::AdditionalDirectorySources,
+    ) {
+        use tickloop_harness::protocol::AdditionalDirectorySource;
         let launch = &self.effective_launch();
         let model = tickloop_harness::model::cards::model_for_persistent_selection(
             tickloop_harness::model::cards::launch_model(launch.model.as_ref()),
         );
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
-        AgentConfiguration {
+        let mut sources = self.initial_directory_sources(folder, saved.as_mut());
+        let base = AgentConfiguration {
             search_config: saved.as_mut().map_or_else(
                 tickloop_harness::protocol::SearchConfig::enabled_default,
                 |saved| saved.search_config(),
@@ -2643,18 +2722,28 @@ impl ConsoleExecution {
             thinking_enabled: defaults.thinking_enabled,
             task_tools_enabled: defaults.task_tools_enabled,
             execution_mode: defaults.execution_mode,
-            additional_directories: Vec::new(),
+            additional_directories: sources.keys().cloned().collect(),
             delegated: false,
+        };
+        let configuration = self.inner.draft.lock().unwrap().configuration(base);
+        sources.retain(|path, _| configuration.additional_directories.contains(path));
+        for path in &configuration.additional_directories {
+            sources
+                .entry(path.clone())
+                .or_insert_with(|| [AdditionalDirectorySource::Session].into());
         }
+        (configuration, sources)
     }
     pub(super) async fn create(
         &self,
         launch: LaunchSpec,
         initial: Option<UserInput>,
     ) -> Result<(Uuid, Option<Receipt>), AccessError> {
+        let launch_rules = self.inner.launch_rules.lock().unwrap().clone();
         let result = self
             .command(
                 AgentCommand::Create {
+                    launch_rules,
                     launch,
                     initial,
                     origin: self.origin(),
@@ -2670,6 +2759,7 @@ impl ConsoleExecution {
         else {
             return Err(unexpected());
         };
+        self.inner.launch_rules.lock().unwrap().clear();
         let chat = snapshot.conversation.id;
         let execution = snapshot.execution;
         self.inner.cache_snapshot(snapshot, None);
@@ -4641,6 +4731,7 @@ mod tests {
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(workdir),
                 initial: Some(UserInput::Shell {
                     command: "printf created".into(),
@@ -5812,6 +5903,7 @@ mod tests {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: None,
                     origin: None,
