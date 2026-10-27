@@ -904,7 +904,9 @@ mod tests {
             }) && frame.contains(expected)
         });
         fixture.send(b"\r");
-        while !directory.path().join("submitted").exists() {
+        while !std::fs::read_to_string(directory.path().join("submitted"))
+            .is_ok_and(|submitted| submitted == expected)
+        {
             assert!(Instant::now() < deadline, "{}", fixture.raw_output());
             thread::sleep(Duration::from_millis(5));
         }

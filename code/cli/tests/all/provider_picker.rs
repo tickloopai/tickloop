@@ -214,6 +214,37 @@ impl Terminal {
         panic!("terminal did not show expected {label} frame; latest:\n{last_frame}");
     }
 
+    fn wait_for_completed_shell_input(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            if let Some(end) = output.rfind("\x1b[?2026l")
+                && let Some(start) = output[..end].rfind("\x1b[?2026h")
+            {
+                let completed = &output[start..end];
+                let cursor_visible = completed.rfind("\x1b[?25h").is_some_and(|shown| {
+                    completed
+                        .rfind("\x1b[?25l")
+                        .is_none_or(|hidden| shown > hidden)
+                });
+                let frame = screen::visible_screen(&output[..end], self.columns, self.rows);
+                if cursor_visible
+                    && frame.contains("(No output)")
+                    && !frame.contains("Shell running")
+                    && frame.lines().any(|line| line.trim() == "❯")
+                {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Shell input did not resume: {}",
+                screen::visible_screen(&output, self.columns, self.rows)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn visible_output(&self) -> String {
         self.output.lock().unwrap().clone()
     }
@@ -855,6 +886,7 @@ fn model_selected_for_shell_created_chat_is_saved_and_restart_skips_setup() {
         thread::sleep(Duration::from_millis(10));
     };
     assert!(!root.join("state/settings.json").exists());
+    terminal.wait_for_completed_shell_input();
 
     let mark = terminal.mark();
     terminal.send(b"/model\r");
@@ -913,6 +945,7 @@ fn overview_dispatch_requires_setup_even_when_a_historical_chat_is_selected() {
         assert!(Instant::now() < deadline, "local Shell did not finish");
         thread::sleep(Duration::from_millis(10));
     };
+    original.wait_for_completed_shell_input();
     original.exit();
     // Keep this fixture's daemon alive: the next View resumes an existing Chat,
     // not one registered by that View's first-run setup state.
@@ -1011,6 +1044,7 @@ fn shell_before_model_setup_does_not_allow_a_prompt_to_bypass_setup() {
     };
     assert!(shell_chat.last_model_run.is_none());
     assert!(shell_chat.request_usage.entries().is_empty());
+    terminal.wait_for_completed_shell_input();
 
     let mark = terminal.mark();
     terminal.send(b"/compact\r");
@@ -1064,6 +1098,7 @@ fn branch_of_shell_chat_before_model_setup_still_requires_model_selection() {
     };
     assert!(source.last_model_run.is_none());
     assert!(source.request_usage.entries().is_empty());
+    terminal.wait_for_completed_shell_input();
 
     let mark = terminal.mark();
     terminal.send(b"/branch pending-model-setup\r");
