@@ -738,8 +738,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 28);
-        assert_eq!(builtin_commands().len(), 44);
+        assert_eq!(completion.candidates().len(), 29);
+        assert_eq!(builtin_commands().len(), 45);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -760,6 +760,7 @@ mod tests {
             "/plugins",
             "/ticks",
             "/mcp",
+            "/context",
         ] {
             assert!(command_names(&completion).contains(&command));
         }
