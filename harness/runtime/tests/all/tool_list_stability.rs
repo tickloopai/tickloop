@@ -780,3 +780,116 @@ async fn every_listed_group_is_sorted_by_name_whatever_the_registration_order() 
         "registration and connection order changed the tools"
     );
 }
+
+/// Host tools that record every question the host asks about one of their tools.
+struct RecordingHostTools {
+    names: std::sync::Mutex<Vec<&'static str>>,
+    permission: HostToolPermission,
+    label: &'static str,
+    consulted: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingHostTools {
+    fn new(names: Vec<&'static str>, permission: HostToolPermission, label: &'static str) -> Self {
+        Self {
+            names: std::sync::Mutex::new(names),
+            permission,
+            label,
+            consulted: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, question: &str, name: &str) {
+        self.consulted
+            .lock()
+            .unwrap()
+            .push(format!("{question} {name}"));
+    }
+}
+
+#[async_trait]
+impl HostToolProvider for RecordingHostTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        NamedHostTools(self.names.lock().unwrap().clone()).definitions()
+    }
+
+    fn permission(&self, _: ChatId, name: &str, _: &Value) -> HostToolPermission {
+        self.record("permission", name);
+        self.permission
+    }
+
+    fn tool_authorities(
+        &self,
+        name: &str,
+    ) -> Result<std::collections::BTreeSet<tickloop_harness_protocol::HostToolAuthority>, String>
+    {
+        self.record("authorities", name);
+        Ok(Default::default())
+    }
+
+    fn call_authority(
+        &self,
+        name: &str,
+        _: &Value,
+    ) -> Result<Option<tickloop_harness_protocol::HostToolAuthority>, String> {
+        self.record("call authority", name);
+        Ok(None)
+    }
+
+    async fn execute(&self, _: ChatId, name: &str, _: Value, _: CancellationToken) -> ToolResult {
+        self.record("execute", name);
+        ToolResult {
+            content: self.label.into(),
+            is_error: false,
+            output_ref: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_source_that_keeps_a_shared_tool_name_alone_decides_its_permission_and_authority() {
+    use tickloop_harness_test_support::{call, config, text};
+    let first = Arc::new(RecordingHostTools::new(
+        vec!["memo"],
+        HostToolPermission::ReadOnly,
+        "FIRST_SOURCE",
+    ));
+    let second = Arc::new(RecordingHostTools::new(
+        vec!["note"],
+        HostToolPermission::Confirmation,
+        "SECOND_SOURCE",
+    ));
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("memo", "memo", json!({})),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(vec![
+            first.clone() as Arc<dyn HostToolProvider>,
+            second.clone() as Arc<dyn HostToolProvider>,
+        ])
+        .unwrap();
+    // Installing refuses a name two sources offer; a source may start offering one later.
+    *second.names.lock().unwrap() = vec!["memo", "note"];
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_turn(&agent, chat, "Write a memo"),
+    )
+    .await
+    .expect("the kept source's read-only permission needs no confirmation");
+    agent.shutdown().await;
+    let consulted = first.consulted.lock().unwrap().clone();
+    assert!(
+        consulted.contains(&"permission memo".to_owned())
+            && consulted.contains(&"execute memo".to_owned()),
+        "{consulted:?}"
+    );
+    let ignored = second.consulted.lock().unwrap().clone();
+    assert!(
+        ignored.iter().all(|question| !question.ends_with(" memo")),
+        "the source whose tool was ignored is never asked about it: {ignored:?}"
+    );
+}

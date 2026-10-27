@@ -56,8 +56,9 @@ impl CompositeHostTools {
             generations: generations.clone(),
             ..Default::default()
         };
-        // A name two sources offer keeps the first source's tool, so a source that starts
-        // offering it later never takes it away from the tools already listed.
+        // A name two sources offer keeps the tool of the source installed earlier, which alone
+        // answers its calls, permission and authority. The rule depends on the fixed source order
+        // only, never on which source began offering the name first.
         for (index, source) in self.sources.iter().enumerate() {
             for definition in source.definitions() {
                 if let Some(owner) = next.names.get(&definition.name) {
@@ -65,7 +66,7 @@ impl CompositeHostTools {
                         tool = %definition.name,
                         kept_source = owner,
                         ignored_source = index,
-                        "two host tool sources offer the same tool name; keeping the first"
+                        "two host tool sources offer the same tool name; keeping the earlier source's tool"
                     );
                     continue;
                 }
