@@ -64,6 +64,9 @@ pub(super) enum Glyph {
     ContextPartial,
     ContextFree,
     ContextReserved,
+    /// A proportion bar's filled and empty cells, such as the tool search pool's.
+    BarFilled,
+    BarEmpty,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -132,6 +135,8 @@ impl DisplayProfile {
             Glyph::ContextPartial => "⛀",
             Glyph::ContextFree => "⛶",
             Glyph::ContextReserved => "⛝",
+            Glyph::BarFilled => "█",
+            Glyph::BarEmpty => "░",
         }
     }
 
@@ -331,6 +336,8 @@ mod tests {
             Glyph::ContextPartial,
             Glyph::ContextFree,
             Glyph::ContextReserved,
+            Glyph::BarFilled,
+            Glyph::BarEmpty,
         ] {
             assert_eq!(
                 unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
