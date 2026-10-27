@@ -291,6 +291,47 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
     assert_eq!(second["text"]["format"]["strict"], true);
 }
 
+/// `gpt-5.6-terra` seals each reasoning item again in its terminal response (seen 2026-10-27).
+#[tokio::test]
+async fn reasoning_sealed_again_at_completion_keeps_the_terminal_sealing() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let streamed =
+        json!({"type":"reasoning","id":"rs-test","summary":[],"encrypted_content":"streamed-seal"});
+    let terminal =
+        json!({"type":"reasoning","id":"rs-test","summary":[],"encrypted_content":"terminal-seal"});
+    let answer = json!({"type":"message","id":"msg-test","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Done"}]});
+    let mut body = stream(vec![streamed, answer.clone()]);
+    let terminal_output = json!([terminal, answer]).to_string();
+    let streamed_output = json!([
+        {"type":"reasoning","id":"rs-test","summary":[],"encrypted_content":"streamed-seal"},
+        answer
+    ])
+    .to_string();
+    let completed = body.rfind(&streamed_output).unwrap();
+    body.replace_range(
+        completed..completed + streamed_output.len(),
+        &terminal_output,
+    );
+    let (endpoint, _) = model_http_support::serve_responses(vec![(200, body)]).await;
+    let configuration = config(
+        &root,
+        endpoint.trim_end_matches("/anthropic").to_owned() + "/v1",
+        "gpt-5.6-terra",
+    );
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&configuration)
+        .unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    let output = client
+        .complete(request(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&output.content[0], Content::ProtocolData { value, .. } if value["encrypted_content"] == "terminal-seal")
+    );
+}
+
 async fn directory_server(
     status: u16,
     body: String,

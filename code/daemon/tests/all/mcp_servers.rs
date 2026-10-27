@@ -878,3 +878,91 @@ async fn live_fold_search_describe_execute_with_kimi() {
         "Live Fold acceptance passed: model=kimi-k3; SearchTools, DescribeTools, ExecuteTools; stdio=1; HTTP=1; LOCAL_MCP_OK; HTTP_MCP_OK"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated TICKLOOP_CONFIG_DIR with ANTHROPIC_API_KEY and OPENAI_API_KEY; calls the billed APIs"]
+async fn live_native_tool_search_with_anthropic_and_openai_across_switches() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    );
+    let catalog = tickloop_harness::model::cards::ModelCatalog::defaults();
+    let anthropic = catalog.get("anthropic-api", "claude-sonnet-5").unwrap();
+    let openai = catalog.get("openai-api", "gpt-5.6-terra").unwrap();
+    let (agent, local, remote) = configured_agent(
+        &root,
+        anthropic.clone(),
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    )
+    .await;
+    let path = root.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in settings["mcpServers"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("exposure");
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if agent.mcp_servers().await.iter().all(|server| {
+                server.state == tickloop_harness::protocol::mcp::McpServerState::Connected
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = "Use your tool search to find the acceptance marker probe tools of the local and the remote MCP servers, call each probe exactly once, and reply with both returned markers. Use no shell, scripts, web or other tools.";
+    let again = "Use your tool search to find the acceptance marker probe tools of the local and the remote MCP servers, call each probe exactly once, and reply with both returned markers. Use no shell, scripts, web or other tools. Markers can change between checks, so call both probes again now even though you called them before.";
+    // Returning to Claude may reuse the tools it discovered earlier without searching again.
+    let turns = [
+        (&anthropic, first, Some("server_tool_use"), 1),
+        (&openai, again, Some("tool_search_call"), 2),
+        (&anthropic, again, None, 3),
+    ];
+    for (model, prompt, record, calls) in turns {
+        agent.set_model(chat, model.clone()).await.unwrap();
+        complete(&agent, chat, prompt).await;
+        assert_eq!(local.calls().len(), calls, "{} local calls", model.model);
+        assert_eq!(remote.calls().len(), calls, "{} remote calls", model.model);
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        let latest = snapshot
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| {
+                !serde_json::to_string(message)
+                    .unwrap()
+                    .contains("Use your tool search")
+            })
+            .map(|message| serde_json::to_string(message).unwrap())
+            .collect::<String>();
+        if let Some(record) = record {
+            assert!(latest.contains(record), "{} left no {record}", model.model);
+        }
+        assert!(latest.contains("LOCAL_MCP_OK") && latest.contains("HTTP_MCP_OK"));
+        assert!(
+            !snapshot.operations.iter().any(|operation| [
+                "SearchTools",
+                "DescribeTools",
+                "ExecuteTools"
+            ]
+            .contains(&operation.name.as_str())),
+            "{} used Fold",
+            model.model
+        );
+        eprintln!(
+            "Live native tool search turn passed: model={}; search records in turn: server_tool_use={} tool_search_call={}; stdio={calls}; HTTP={calls}",
+            model.model,
+            latest.contains("server_tool_use"),
+            latest.contains("tool_search_call")
+        );
+    }
+    agent.shutdown().await;
+}

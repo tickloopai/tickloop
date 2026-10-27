@@ -274,15 +274,17 @@ impl ResponsesStream {
         }
     }
 
+    /// OpenAI seals reasoning again in the terminal response, whose sealing the output keeps.
     fn same_item(&self, left: &Value, right: &Value) -> bool {
-        if !self.rotating_item_ids {
-            return left == right;
-        }
         let stable_fields = |item: &Value| {
             let mut item = item.clone();
             if let Some(object) = item.as_object_mut() {
-                object.remove("id");
-                object.remove("encrypted_content");
+                if self.rotating_item_ids {
+                    object.remove("id");
+                }
+                if self.rotating_item_ids || object.get("type") == Some(&json!("reasoning")) {
+                    object.remove("encrypted_content");
+                }
             }
             item
         };
