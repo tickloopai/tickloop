@@ -115,7 +115,7 @@ const CONFIRM_PROMPT: &str = "Write a confirmed note with a script.";
 const CONFIRM_REPLY: &str = "CONFIRM-REPLY";
 
 fn shows_script_confirmation(frame: &str) -> bool {
-    frame.contains("From Codemode call") && frame.contains("WebFetch")
+    frame.contains("From a Codemode script") && frame.contains("WebFetch")
 }
 
 async fn a_pending_script_confirmation_outlives_its_view(fixture: &PrivateFixture) {

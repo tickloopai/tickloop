@@ -480,6 +480,10 @@ struct Chat {
     /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
     /// plan, so the next request owes the model the exited-plan-mode notice.
     needs_plan_mode_exit_notice: bool,
+    /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
+    /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
+    /// it unknown.
+    mode_before_plan: Option<ExecutionMode>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     upgrade_wait: Option<Receipt>,
@@ -753,17 +757,21 @@ fn host_tool_decision(
     configured: Option<tickloop_harness_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     execution_mode: ExecutionMode,
+    mode_before_plan: Option<ExecutionMode>,
     has_human_input: bool,
 ) -> Decision {
     if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
-        return if execution_mode == ExecutionMode::Plan {
-            Decision::Deny
-        } else if let Some(rule) = configured {
-            Decision::from(rule.decision)
-        } else if execution_mode == ExecutionMode::FullAccess {
-            Decision::Allow
-        } else {
-            Decision::Ask
+        // As in Claude Code, Plan decides third-party calls as the mode it was entered from; an
+        // unknown one is treated as Ask.
+        let mode = match execution_mode {
+            ExecutionMode::Plan => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
+            mode => mode,
+        };
+        return match (configured, mode) {
+            (Some(rule), _) => Decision::from(rule.decision),
+            (None, ExecutionMode::FullAccess) => Decision::Allow,
+            (None, ExecutionMode::Auto) => Decision::Check,
+            (None, _) => Decision::Ask,
         };
     }
     let is_allowed_by_host = configured.is_some_and(|matched| {
@@ -853,7 +861,36 @@ fn host_tool_decision(
     })
 }
 
+/// The mode Plan was entered from once the mode changes from `from` to `to`: known only while in
+/// Plan, and kept while Plan is entered again.
+fn mode_before_plan_after(
+    remembered: Option<ExecutionMode>,
+    from: ExecutionMode,
+    to: ExecutionMode,
+) -> Option<ExecutionMode> {
+    match (from, to) {
+        (_, ExecutionMode::AcceptEdits | ExecutionMode::Auto | ExecutionMode::FullAccess) => None,
+        (ExecutionMode::Plan, ExecutionMode::Plan) => remembered,
+        (from, ExecutionMode::Plan) => Some(from),
+    }
+}
+
 impl Chat {
+    /// Changes the execution mode, remembering the mode Plan is entered from.
+    fn change_execution_mode(&mut self, mode: ExecutionMode) {
+        self.mode_before_plan =
+            mode_before_plan_after(self.mode_before_plan, self.snapshot.policy.mode, mode);
+        self.snapshot.policy.mode = mode;
+    }
+
+    /// Replaces the snapshot, forgetting the mode Plan was entered from if the mode changes.
+    fn replace_snapshot(&mut self, snapshot: ChatSnapshot) {
+        if snapshot.policy.mode != self.snapshot.policy.mode {
+            self.mode_before_plan = None;
+        }
+        self.snapshot = snapshot;
+    }
+
     fn has_human_input_for_run(&self, run: RunId) -> bool {
         approval_context::originals_for_active_chain(&self.snapshot, &self.bookkeeping)
             .is_ok_and(|inputs| inputs.iter().any(|input| input.run_id == run))
@@ -1483,12 +1520,8 @@ impl Agent {
                     "Auto reviewer settings are unavailable ({error}); review this action manually."
                 );
                 if emit_permission {
-                    self.emit_permission_check(
-                        receipt,
-                        self.apply_prompt_policy(Decision::Ask),
-                        reason.clone(),
-                    )
-                    .await;
+                    self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                        .await;
                 }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
@@ -1504,12 +1537,8 @@ impl Agent {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
-                self.emit_permission_check(
-                    receipt,
-                    self.apply_prompt_policy(Decision::Ask),
-                    reason.clone(),
-                )
-                .await;
+                self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                    .await;
             }
             return Ok(approval_assessment::ApprovalAssessment::missing_context(
                 operation,
@@ -1536,12 +1565,8 @@ impl Agent {
             Err(approval_context::ApprovalContextError::MissingOriginalUserInput) => {
                 let reason = "Original user authorization for this Loop is unavailable; review this action manually.".to_owned();
                 if emit_permission {
-                    self.emit_permission_check(
-                        receipt,
-                        self.apply_prompt_policy(Decision::Ask),
-                        reason.clone(),
-                    )
-                    .await;
+                    self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                        .await;
                 }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
@@ -1766,16 +1791,12 @@ impl Agent {
         let (decision, reason) = match review {
             AutoReview::Allow => (Decision::Allow, "Auto policy allowed the operation".into()),
             AutoReview::Block { reason, .. } => (Decision::Deny, reason.clone()),
-            AutoReview::Ask { reason, .. } => {
-                (self.apply_prompt_policy(Decision::Ask), reason.clone())
-            }
+            AutoReview::Ask { reason, .. } => (self.review_escalation(), reason.clone()),
             AutoReview::ContextLimit => (
-                self.apply_prompt_policy(Decision::Ask),
+                self.review_escalation(),
                 auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into(),
             ),
-            AutoReview::Unavailable { message } => {
-                (self.apply_prompt_policy(Decision::Ask), message.clone())
-            }
+            AutoReview::Unavailable { message } => (self.review_escalation(), message.clone()),
         };
         self.emit_permission_check(receipt, decision, reason).await;
     }
@@ -2107,20 +2128,31 @@ impl Agent {
         }
     }
 
-    /// `apply_prompt_policy`, except that an Ask the user explicitly required still asks under
-    /// an Unrestricted host.
-    fn apply_prompt_policy_with_explicit_ask(
+    /// `apply_prompt_policy`, except that an Unrestricted host cannot waive a person or a reviewer
+    /// that an explicit Ask rule or the tool's own permission class requires.
+    fn apply_prompt_policy_keeping_required_approval(
         &self,
         decision: Decision,
-        is_explicit_ask: bool,
+        is_approval_required: bool,
     ) -> Decision {
-        if is_explicit_ask
-            && decision == Decision::Ask
+        if is_approval_required
+            && matches!(decision, Decision::Ask | Decision::Check)
             && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
         {
-            Decision::Ask
+            decision
         } else {
             self.apply_prompt_policy(decision)
+        }
+    }
+
+    /// Where an Auto review that does not admit a call sends it: to a person, or to a denial on a
+    /// host that cannot ask. Review runs under an Unrestricted host only for calls that host
+    /// cannot waive, so their escalation still reaches a person.
+    fn review_escalation(&self) -> Decision {
+        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+            Decision::Deny
+        } else {
+            Decision::Ask
         }
     }
 
@@ -2291,6 +2323,7 @@ impl Agent {
                 bookkeeping,
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
+                mode_before_plan: None,
                 active: None,
                 active_run: None,
                 upgrade_wait: None,
@@ -4712,7 +4745,7 @@ impl Agent {
             (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
             _ => {}
         }
-        chat.snapshot.policy.mode = mode;
+        chat.change_execution_mode(mode);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         drop(chats);

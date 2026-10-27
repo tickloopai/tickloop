@@ -503,7 +503,11 @@ pub(super) fn host_authority(
         mcp_server,
     } = host_call;
     let policy = effective_policy(chats, receipt)?;
-    let decide = |policy: &tickloop_harness_protocol::PermissionPolicy, loop_id, session, human| {
+    let decide = |policy: &tickloop_harness_protocol::PermissionPolicy,
+                  mode_before_plan,
+                  loop_id,
+                  session,
+                  human| {
         let explicit = match mcp_server {
             Some(server) => policy.explicit_mcp_rule_match(
                 &operation.name,
@@ -515,7 +519,7 @@ pub(super) fn host_authority(
             None => policy.explicit_rule_match(&operation.name, permission_input, loop_id, session),
         };
         (
-            host_tool_decision(explicit, permission, policy.mode, human),
+            host_tool_decision(explicit, permission, policy.mode, mode_before_plan, human),
             explicit.is_some_and(|matched| {
                 matched.decision
                     == tickloop_harness_tools::permissions::ExplicitPermissionDecision::Ask
@@ -525,6 +529,7 @@ pub(super) fn host_authority(
     let own = &chats[&receipt.chat_id];
     let (mut decision, mut explicit_ask) = decide(
         &own.snapshot.policy,
+        own.mode_before_plan,
         receipt.loop_id.into(),
         session,
         permission == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
@@ -551,12 +556,18 @@ pub(super) fn host_authority(
         )
         .map_err(|error| error.to_string())?;
         let inherited_session = sessions.evaluate(owner, &session_operation).decision;
-        for (ancestor_policy, session) in [
-            (&delegation.ceiling.policy, None),
-            (&parent.snapshot.policy, inherited_session),
+        // The frozen ceiling does not record the mode its Plan was entered from.
+        for (ancestor_policy, mode_before_plan, session) in [
+            (&delegation.ceiling.policy, None, None),
+            (
+                &parent.snapshot.policy,
+                parent.mode_before_plan,
+                inherited_session,
+            ),
         ] {
             let (ancestor_decision, ancestor_ask) = decide(
                 ancestor_policy,
+                mode_before_plan,
                 delegation.parent_loop_id.into(),
                 session,
                 false,

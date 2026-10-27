@@ -236,7 +236,7 @@ async fn plugin_mcp_tools_use_install_names_deduplicate_and_stop_on_the_next_req
     scripted.enqueue(call("alpha", "mcp__plugin_alpha_shared__probe", json!({})));
     scripted.enqueue(text("done"));
     agent
-        .set_execution_mode(chat, ExecutionMode::Auto)
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     let mut events = agent.subscribe();
@@ -481,7 +481,7 @@ async fn plugin_user_config_gates_connections_and_never_reaches_model_or_transcr
     ));
     scripted.enqueue(text("done"));
     agent
-        .set_execution_mode(chat, ExecutionMode::Auto)
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     let mut events = agent.subscribe();
@@ -670,7 +670,7 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     .await
     .expect("the Worker did not observe the saved login");
     agent
-        .set_execution_mode(chat, ExecutionMode::Auto)
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
     scripted.enqueue(call("probe", "mcp__remote__probe", json!({})));

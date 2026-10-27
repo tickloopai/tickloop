@@ -31,7 +31,8 @@ pub enum HostToolPermission {
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.
     Confirmation,
-    /// Third-party tools ask by default in Ask and Auto, regardless of server annotations.
+    /// Third-party tools: without a user rule, Ask asks and Auto sends the call to Auto review;
+    /// server annotations never widen this.
     ThirdParty,
 }
 
@@ -417,6 +418,11 @@ pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
+        Vec::new()
+    }
+
+    /// Servers whose discoverable tools are missing because they are not connected.
+    fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
         Vec::new()
     }
 

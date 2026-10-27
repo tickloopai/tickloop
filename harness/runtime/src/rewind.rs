@@ -252,7 +252,7 @@ impl Agent {
             .range(index..first_reply)
             .any(|(_, note)| *note == HostNote::PlanModeExit);
         candidate_bookkeeping.citation_sources = chat.bookkeeping.citation_sources.clone();
-        chat.snapshot = candidate;
+        chat.replace_snapshot(candidate);
         chat.bookkeeping = candidate_bookkeeping;
         self.inner.ledger_changes.send_replace(());
         self.emit_conversation_rewound(chat, message_id);

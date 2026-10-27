@@ -358,11 +358,10 @@ impl ToolRegistry {
                     } else {
                         crate::tool_exposure::SearchSupport::Fold
                     };
-                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
-                    discovery,
-                    search_support,
-                    true,
-                ));
+                let directory = Arc::new(
+                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support, true)
+                        .with_unavailable_servers(provider.unavailable_tool_servers()),
+                );
                 deferred = directory.deferred_tools();
                 folded.extend(
                     directory
@@ -1492,7 +1491,7 @@ impl Agent {
             };
             let prompts_unavailable = decision == Decision::Ask
                 && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
-            let mut decision = self.apply_prompt_policy_with_explicit_ask(
+            let mut decision = self.apply_prompt_policy_keeping_required_approval(
                 decision,
                 explicit_ask
                     || matches!(
@@ -2086,7 +2085,8 @@ impl Agent {
                     let bypassed_by_unrestricted_host = !explicit_ask
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision = self.apply_prompt_policy_with_explicit_ask(decision, explicit_ask);
+                    decision =
+                        self.apply_prompt_policy_keeping_required_approval(decision, explicit_ask);
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
@@ -2564,7 +2564,7 @@ impl Agent {
         match assessment.verdict.clone() {
             AutoReview::Allow => decision = Decision::Allow,
             AutoReview::Ask { reason, .. } => {
-                decision = self.apply_prompt_policy(Decision::Ask);
+                decision = self.review_escalation();
                 approval_reason = Some(reason.clone());
                 if decision == Decision::Deny {
                     auto_denial_message = Some(reason);
@@ -2614,7 +2614,7 @@ impl Agent {
                 approval_reason = Some(auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into());
             }
             AutoReview::Unavailable { message } => {
-                decision = self.apply_prompt_policy(Decision::Ask);
+                decision = self.review_escalation();
                 approval_reason = Some(message.clone());
                 if decision == Decision::Deny {
                     auto_denial_message = Some(message);

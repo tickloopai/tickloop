@@ -9,6 +9,47 @@ use tickloop_harness_test_support::mcp_service::McpService;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over_sse() {
+    let server = McpService::start().await;
+    server.reject_discover_over_sse();
+    server.set_tools(json!([{"name":"say.hello","inputSchema":{"type":"object"}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
+            sensitive_values: Vec::new(),
+            disabled: false,
+            name: "legacy".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: BTreeMap::new(),
+            },
+            oauth: Default::default(),
+            timeout_ms: 300_000,
+        }])
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state == McpServerState::Connecting {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = connections.snapshot();
+    connections.shutdown().await;
+    assert_eq!(snapshot[0].state, McpServerState::Connected);
+    assert_eq!(snapshot[0].tools.len(), 1);
+    assert_eq!(snapshot[0].tools[0].name, "mcp__legacy__say_hello");
+}
+
+#[tokio::test]
 async fn http_connection_discovers_and_calls_the_original_tool() {
     let server = McpService::start().await;
     server.set_tools(
@@ -182,10 +223,10 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
 }
 
 #[tokio::test]
-async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() {
+async fn third_party_tools_go_to_auto_review_without_trusting_read_only_annotations() {
     use tickloop_harness_protocol::{EventKind, ExecutionMode};
     use tickloop_harness_runtime::{Agent, mcp::McpToolProvider};
-    use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+    use tickloop_harness_test_support::{ScriptedModel, auto_classification, call, config, text};
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"approved result"}]}));
@@ -221,7 +262,14 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
         call("read-1", "mcp__review__read", json!({})),
         text("done"),
     ]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![
+        text(
+            &auto_classification(true).to_string()
+        );
+        2
+    ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.set_auto_reviewer(reviewer.clone()).await;
     agent
         .install_host_tools(Arc::new(McpToolProvider::new(
             connections,
@@ -239,11 +287,14 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
         .submit(chat, "Read from the service".into())
         .await
         .unwrap();
-    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match events.recv().await.unwrap().kind {
-                EventKind::PermissionRequested { request } => break request,
-                EventKind::ToolStarted { .. } => panic!("MCP executed without asking"),
+                EventKind::PermissionRequested { .. } => {
+                    panic!("a rejection returns to the model")
+                }
+                EventKind::ToolStarted { .. } => panic!("MCP executed without review"),
+                EventKind::Completed { .. } => break,
                 _ => {}
             }
         }
@@ -251,27 +302,11 @@ async fn third_party_tools_ask_in_auto_without_trusting_read_only_annotations() 
     .await
     .unwrap();
     assert!(server.calls().is_empty());
-    agent
-        .answer_permission(chat, approval.id, true)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(
-                events.recv().await.unwrap().kind,
-                EventKind::Completed { .. }
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(server.calls().len(), 1);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 2);
     assert!(
         serde_json::to_string(&model.requests.lock().unwrap()[1].messages)
             .unwrap()
-            .contains("approved result")
+            .contains("external-code restriction")
     );
     agent.shutdown().await;
 }
@@ -1829,7 +1864,7 @@ async fn discovery_resources_and_failures_redact_server_text() {
         "Query [redacted]"
     );
     let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
-    let found = directory.search(&json!({"queries":["probe"]})).unwrap();
+    let found = directory.search(&json!({"query":"probe"})).unwrap();
     assert_eq!(found["matches"][0]["summary"], "Find [redacted].");
     let described = directory
         .describe(&json!({"names":["mcp__notes__probe"]}))
@@ -2176,4 +2211,72 @@ async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_valida
         !logged.contains("839271"),
         "SDK logging exposed a sensitive schema constraint"
     );
+}
+
+#[tokio::test]
+async fn the_first_refresh_waits_for_search_servers_and_reports_unavailable_ones() {
+    use tickloop_harness_protocol::mcp::ToolExposure;
+    use tickloop_harness_runtime::{
+        host_tools::HostToolProvider, mcp::McpToolProvider, tool_exposure::UnavailableServer,
+    };
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"get_version_info","description":"Get version information for UI5","inputSchema":{"type":"object"}}]));
+    server.set_directory_delay(Duration::from_millis(500));
+    let mut config = http_config("ui5", &server);
+    config.exposure = ToolExposure::Search;
+    let mut broken = config.clone();
+    broken.name = "broken".into();
+    broken.transport = McpTransport::Failed {
+        reason: "missing command".into(),
+    };
+    let mut hidden = broken.clone();
+    hidden.name = "hidden".into();
+    hidden.exposure = ToolExposure::Hidden;
+    let provider = McpToolProvider::new(
+        McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        Arc::new(move || vec![config.clone(), broken.clone(), hidden.clone()]),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider
+            .discovery_tools()
+            .iter()
+            .map(|tool| tool.definition.name.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp__ui5__get_version_info"]
+    );
+    assert_eq!(
+        provider.unavailable_tool_servers(),
+        [UnavailableServer {
+            name: "broken".into(),
+            state: McpServerState::Failed,
+        }]
+    );
+    provider.shutdown().await;
+
+    let slow = McpService::start().await;
+    slow.set_directory_delay(Duration::from_secs(30));
+    let mut config = http_config("ui5", &slow);
+    config.exposure = ToolExposure::Search;
+    let provider = McpToolProvider::new(
+        McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        Arc::new(move || vec![config.clone()]),
+    );
+    provider.mcp_server_statuses(CancellationToken::new()).await;
+    assert_eq!(
+        provider.unavailable_tool_servers(),
+        [UnavailableServer {
+            name: "ui5".into(),
+            state: McpServerState::Connecting,
+        }]
+    );
+    provider.shutdown().await;
 }

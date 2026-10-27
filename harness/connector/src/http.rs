@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Url, redirect::Policy};
 use rmcp::transport::{
     OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRequest,
+    auth::WWWAuthenticateParams,
 };
 use std::time::Duration;
 use tickloop_harness_base::network::{HttpPolicy, build_http_client, is_loopback};
@@ -25,6 +26,8 @@ enum RefusedRequest {
     Address,
     #[error("the response is larger than allowed")]
     TooLarge,
+    #[error("protected resource metadata must have the MCP server's origin")]
+    CrossOriginMetadata,
 }
 
 /// `url` may be configured: https, or http to this machine, without user information.
@@ -35,6 +38,7 @@ pub(crate) fn is_allowed_address(url: &Url) -> bool {
 
 #[derive(Clone)]
 pub(crate) struct PolicyClient {
+    server_url: Url,
     remote: Client,
     loopback: Client,
     reaches_this_machine: bool,
@@ -43,7 +47,7 @@ pub(crate) struct PolicyClient {
 impl PolicyClient {
     /// `reaches_this_machine` when a configured address is on this machine; otherwise every
     /// request must go to a remote https address.
-    pub(crate) fn new(reaches_this_machine: bool) -> Self {
+    pub(crate) fn new(server_url: Url, reaches_this_machine: bool) -> Self {
         let build = |target: &str| {
             let mut policy = HttpPolicy::new(Policy::none());
             policy.timeout = Some(HTTP_TIMEOUT);
@@ -53,10 +57,21 @@ impl PolicyClient {
                 .0
         };
         Self {
+            server_url,
             remote: build(REMOTE_ROUTE),
             loopback: build(THIS_MACHINE_ROUTE),
             reaches_this_machine,
         }
+    }
+
+    pub(crate) fn validate_challenge(&self, challenge: &str) -> Result<(), OAuthHttpClientError> {
+        // rmcp 3.8 permits cross-origin resource metadata; retain the host's stricter policy.
+        let metadata =
+            WWWAuthenticateParams::parse(challenge, &self.server_url).resource_metadata_url;
+        if metadata.is_some_and(|url| url.origin() != self.server_url.origin()) {
+            return Err(Box::new(RefusedRequest::CrossOriginMetadata));
+        }
+        Ok(())
     }
 
     fn permits(&self, url: &Url) -> bool {
@@ -119,6 +134,16 @@ impl OAuthHttpClient for PolicyClient {
             let client = self.permitted_client(&url)?;
             let request = reqwest::Request::try_from(request)?;
             let response = client.execute(request).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                for challenge in response
+                    .headers()
+                    .get_all(reqwest::header::WWW_AUTHENTICATE)
+                {
+                    if let Ok(challenge) = challenge.to_str() {
+                        self.validate_challenge(challenge)?;
+                    }
+                }
+            }
             let mut builder = http::Response::builder()
                 .status(response.status())
                 .version(response.version());
@@ -143,7 +168,7 @@ mod tests {
     async fn a_remote_servers_login_never_requests_this_machine() {
         let local = AuthorizationServer::start();
         let metadata = Url::parse(&format!("{}{METADATA_PATH}", local.issuer())).unwrap();
-        let remote_login = PolicyClient::new(false);
+        let remote_login = PolicyClient::new(Url::parse(REMOTE_ROUTE).unwrap(), false);
 
         assert!(remote_login.get_bounded(&metadata).await.is_err());
         assert!(remote_login.client_for(metadata.as_str()).is_none());
@@ -160,7 +185,7 @@ mod tests {
         );
         assert!(local.requests().is_empty());
 
-        let local_login = PolicyClient::new(true);
+        let local_login = PolicyClient::new(Url::parse(local.issuer()).unwrap(), true);
         let (status, _) = local_login.get_bounded(&metadata).await.unwrap();
         assert_eq!(status, 200);
     }

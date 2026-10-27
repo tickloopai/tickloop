@@ -23,7 +23,7 @@ pub(super) const DELEGATED_PLAN_MODE_REMINDER: &str = "# Plan mode
 
 Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received (for example, to make edits). Your delegated authorization stays in Plan mode, and you do not submit plans for approval.
 
-Instead, research the task with read-only tools and answer it comprehensively in your final reply: your findings, or the approach you recommend with the files to change, the existing code to reuse and how to verify it. Your parent Agent writes the plan and submits it for the user's approval. Use AskUserQuestion if you need to ask the user clarifying questions; if you do, ask all of them before proceeding.";
+Instead, research the task with read-only tools (call only read-only MCP tools) and answer it comprehensively in your final reply: your findings, or the approach you recommend with the files to change, the existing code to reuse and how to verify it. Your parent Agent writes the plan and submits it for the user's approval. Use AskUserQuestion if you need to ask the user clarifying questions; if you do, ask all of them before proceeding.";
 
 pub(super) fn enter_plan_mode_description() -> String {
     format!(
@@ -256,7 +256,7 @@ Plan mode is active. The user indicated that they do not want you to execute yet
 
 ## Plan File Info:
 {plan_file_info}
-You should build your plan incrementally by writing to or editing this file. This is the only filesystem file you may edit. You may also present your research or plan in an Artifact through {ARTIFACT_EDIT_TOOL}, subject to the host's permission checks. All other actions must be READ-ONLY.
+You should build your plan incrementally by writing to or editing this file. This is the only filesystem file you may edit. You may also present your research or plan in an Artifact through {ARTIFACT_EDIT_TOOL}, subject to the host's permission checks. All other actions must be READ-ONLY; call only read-only MCP tools.
 
 ## Iterative Planning Workflow
 
@@ -321,6 +321,7 @@ mod tests {
         ));
         for reminder in [missing, existing] {
             assert!(reminder.contains("This is the only filesystem file you may edit."));
+            assert!(reminder.contains("call only read-only MCP tools."));
             assert!(reminder.contains(
                 "ArtifactEdit may create or revise an Artifact while staying in Plan mode."
             ));
@@ -337,6 +338,7 @@ mod tests {
     fn a_delegated_child_reports_its_plan_instead_of_submitting_it() {
         assert!(DELEGATED_PLAN_MODE_REMINDER.contains("you MUST NOT make any edits"));
         assert!(DELEGATED_PLAN_MODE_REMINDER.contains("in your final reply"));
+        assert!(DELEGATED_PLAN_MODE_REMINDER.contains("call only read-only MCP tools"));
         assert!(!DELEGATED_PLAN_MODE_REMINDER.contains(EXIT_PLAN_MODE_TOOL_NAME));
         assert!(!DELEGATED_PLAN_MODE_REMINDER.contains("plan file"));
     }

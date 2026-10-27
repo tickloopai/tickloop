@@ -792,3 +792,26 @@ async fn planned_upgrade_keeps_individual_task_and_subscription_pauses() {
     );
     successor.shutdown().await;
 }
+
+#[tokio::test]
+async fn planned_upgrade_keeps_the_mode_plan_was_entered_from() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![text("ready")])));
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
+        original.set_execution_mode(chat, mode).await.unwrap();
+    }
+    complete(&original, chat, "set up").await;
+    let checkpoint = prepare(&original).await;
+    let successor = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    successor
+        .restore_upgrade(serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        successor.inner.chats.lock().await[&chat].mode_before_plan,
+        Some(ExecutionMode::FullAccess)
+    );
+    original.shutdown_for_upgrade().await;
+    successor.shutdown().await;
+}
