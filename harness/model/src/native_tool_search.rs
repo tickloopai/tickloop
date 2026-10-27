@@ -11,10 +11,13 @@ use crate::ModelError;
 
 pub(crate) const MESSAGES_SEARCH_TOOL: &str = "tool_search_tool_bm25";
 const MESSAGES_SEARCH_TOOL_TYPE: &str = "tool_search_tool_bm25_20251119";
-const MESSAGES_SEARCH_CALL: &str = "server_tool_use";
-const MESSAGES_SEARCH_RESULT: &str = "tool_search_tool_result";
-const RESPONSES_SEARCH_CALL: &str = "tool_search_call";
-const RESPONSES_SEARCH_OUTPUT: &str = "tool_search_output";
+pub(crate) const MESSAGES_SEARCH_CALL: &str = "server_tool_use";
+pub(crate) const MESSAGES_SEARCH_RESULT: &str = "tool_search_tool_result";
+const RESPONSES_SEARCH_TOOL_TYPE: &str = "tool_search";
+pub(crate) const RESPONSES_SEARCH_CALL: &str = "tool_search_call";
+pub(crate) const RESPONSES_SEARCH_OUTPUT: &str = "tool_search_output";
+/// Tickloop asks Responses for hosted search only, never for searches the client runs.
+pub(crate) const RESPONSES_HOSTED_EXECUTION: &str = "server";
 /// Responses loads each found function into a namespace its later calls must name again.
 pub(crate) const RESPONSES_CALL_NAMESPACE: &str = "_tickloop_function_namespace";
 
@@ -93,7 +96,7 @@ pub(crate) fn readable_text(value: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn as_text(value: &Value) -> Vec<Content> {
+pub(crate) fn readable_content(value: &Value) -> Vec<Content> {
     readable_text(value)
         .map(|text| Content::Text { text })
         .into_iter()
@@ -130,22 +133,16 @@ pub(crate) fn messages_replay(mut value: Value, deferred: &[ToolDefinition]) -> 
     value
 }
 
-pub(crate) fn responses_tools(tools: Vec<ToolDefinition>, deferred: Vec<ToolDefinition>) -> Value {
-    let function = |tool: ToolDefinition, deferred: bool| {
-        let mut function = json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema});
-        if deferred {
-            function["defer_loading"] = json!(true);
-        }
-        function
-    };
-    let has_deferred = !deferred.is_empty();
-    let mut encoded: Vec<_> = tools
-        .into_iter()
-        .map(|tool| function(tool, false))
-        .collect();
-    if has_deferred {
-        encoded.push(json!({"type": "tool_search"}));
-        encoded.extend(deferred.into_iter().map(|tool| function(tool, true)));
+pub(crate) fn responses_tools(tools: &[ToolDefinition], deferred: &[ToolDefinition]) -> Value {
+    let function = |tool: &ToolDefinition| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema});
+    let mut encoded: Vec<_> = tools.iter().map(function).collect();
+    if !deferred.is_empty() {
+        encoded.push(json!({"type": RESPONSES_SEARCH_TOOL_TYPE}));
+        encoded.extend(deferred.iter().map(|tool| {
+            let mut tool = function(tool);
+            tool["defer_loading"] = json!(true);
+            tool
+        }));
     }
     json!(encoded)
 }

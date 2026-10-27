@@ -3057,6 +3057,13 @@ impl Agent {
             request.tools = registry.definitions();
             request.deferred_tools = registry.deferred_definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
+            if !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_exposure::EXECUTE_TOOLS)
+            {
+                tool_exposure::fold_history_as_text(&mut request.messages);
+            }
             match chat.tools.chat_directory() {
                 Some(chat_directory) => {
                     let replacements = tool_results::enforce_tool_result_budget(

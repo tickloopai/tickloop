@@ -59,13 +59,6 @@ pub(super) fn encode_request(
                         input.push(assistant_text_item(text, None));
                     }
                 }
-                Content::ToolUse { ref id, .. } if namespaces.contains_key(id) => {
-                    push_user_parts(&mut input, &mut user_parts);
-                    let namespace = namespaces.remove(id);
-                    let mut call = input_item(message.role, content)?;
-                    call["namespace"] = namespace.unwrap_or_default();
-                    input.push(call);
-                }
                 Content::Text { text } if message.role == Role::Assistant => {
                     input.push(assistant_text_item(text, assistant_phase.take()));
                 }
@@ -77,7 +70,15 @@ pub(super) fn encode_request(
                 }
                 other => {
                     push_user_parts(&mut input, &mut user_parts);
-                    input.push(input_item(message.role, other)?);
+                    let mut item = input_item(message.role, other)?;
+                    if item["type"] == "function_call"
+                        && let Some(namespace) = item["call_id"]
+                            .as_str()
+                            .and_then(|call_id| namespaces.remove(call_id))
+                    {
+                        item["namespace"] = namespace;
+                    }
+                    input.push(item);
                 }
             }
         }
@@ -98,7 +99,8 @@ pub(super) fn encode_request(
         }});
     }
     if !request.tools.is_empty() || offers_search {
-        body["tools"] = native_tool_search::responses_tools(request.tools, request.deferred_tools);
+        body["tools"] =
+            native_tool_search::responses_tools(&request.tools, &request.deferred_tools);
     }
     if let Some(format) = request.structured_output {
         body["text"] = json!({
@@ -557,8 +559,10 @@ impl ResponsesStream {
                             protocol: Protocol::Responses,
                             value: item.clone(),
                         }),
-                        "tool_search_call" | "tool_search_output"
-                            if item["execution"] == "server" =>
+                        native_tool_search::RESPONSES_SEARCH_CALL
+                        | native_tool_search::RESPONSES_SEARCH_OUTPUT
+                            if item["execution"]
+                                == native_tool_search::RESPONSES_HOSTED_EXECUTION =>
                         {
                             content.push(Content::ProtocolData {
                                 protocol: Protocol::Responses,

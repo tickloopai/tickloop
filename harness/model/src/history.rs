@@ -64,7 +64,7 @@ fn project_block(block: Content, compatible: bool, target: &ModelConfig) -> Vec<
         }
         Content::ProtocolData { protocol, value } if !compatible || protocol != target.protocol => {
             if crate::native_tool_search::is_record(protocol, &value) {
-                crate::native_tool_search::as_text(&value)
+                crate::native_tool_search::readable_content(&value)
             } else if protocol == Protocol::Responses && value["type"] == "reasoning" {
                 [
                     (&value["summary"], "summary_text"),

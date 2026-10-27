@@ -549,6 +549,73 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
 }
 
 #[test]
+fn fold_calls_read_as_text_once_a_request_no_longer_offers_fold() {
+    use tickloop_harness_protocol::{Content, Message, Role};
+    use tickloop_harness_runtime::tool_exposure::{EXECUTE_TOOLS, fold_history_as_text};
+    let history = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::ToolUse {
+                    id: "batch".into(),
+                    name: EXECUTE_TOOLS.into(),
+                    input: json!({"calls":[{"name":"mcp__office__mail","arguments":{}}]}),
+                },
+                Content::ToolUse {
+                    id: "read".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path":"notes.md"}),
+                },
+            ],
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                Content::ToolResult {
+                    tool_use_id: "batch".into(),
+                    content: "MAIL_OK".into(),
+                    is_error: false,
+                },
+                Content::ToolResult {
+                    tool_use_id: "read".into(),
+                    content: "notes".into(),
+                    is_error: false,
+                },
+            ],
+        },
+    ];
+    let mut converted = history.clone();
+    fold_history_as_text(&mut converted);
+    let Content::Text { text } = &converted[0].content[0] else {
+        panic!("the Fold call stayed a tool call: {:?}", converted[0]);
+    };
+    assert!(text.contains(EXECUTE_TOOLS) && text.contains("mcp__office__mail"));
+    assert_eq!(converted[0].content[1], history[0].content[1]);
+    assert_eq!(converted[1].content[0], history[1].content[1]);
+    assert!(matches!(&converted[1].content[1], Content::Text { text } if text.contains("MAIL_OK")));
+    let mut again = converted.clone();
+    fold_history_as_text(&mut again);
+    assert_eq!(again, converted);
+}
+
+#[test]
+fn native_search_offers_original_object_schemas_and_flattened_ones_otherwise() {
+    let mut combined = tool("mail", "Mail", ToolExposure::Search);
+    combined.original_schema =
+        json!({"type":"object","properties":{"to":{"anyOf":[{"type":"string"},{"type":"array"}]}}});
+    let mut rootless = tool("draft", "Draft", ToolExposure::Search);
+    rootless.original_schema = json!({"anyOf":[{"type":"object"},{"type":"null"}]});
+    let native = ExposureDirectory::new(
+        vec![combined.clone(), rootless.clone()],
+        SearchSupport::Native,
+        false,
+    );
+    let deferred = native.deferred_tools();
+    assert_eq!(deferred[0].input_schema, combined.original_schema);
+    assert_eq!(deferred[1].input_schema, rootless.definition.input_schema);
+}
+
+#[test]
 fn hosts_without_scripts_discover_codemode_tools_through_search() {
     let exposure: ToolExposure = serde_json::from_value(json!("codemode")).unwrap();
     let directory = ExposureDirectory::new(
@@ -1182,7 +1249,7 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
             _ => {}
         }
     }
-    let requests = model.requests.lock().unwrap();
+    let requests = model.requests.lock().unwrap().clone();
     let fold_tools = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS];
     let native_requests = &requests[..requests.len() - 1];
     for native_request in native_requests {
@@ -1206,7 +1273,6 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
     for name in fold_tools {
         assert!(folded.tools.iter().any(|tool| tool.name == name), "{name}");
     }
-    drop(requests);
     assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
 }

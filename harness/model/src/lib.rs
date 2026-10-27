@@ -1692,7 +1692,7 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
                 } if native_tool_search::is_record(Protocol::Messages, &value) => {
                     if request.deferred_tools.is_empty() {
                         content.extend(
-                            native_tool_search::as_text(&value)
+                            native_tool_search::readable_content(&value)
                                 .iter()
                                 .map(messages_content),
                         );
@@ -1800,12 +1800,9 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
                 "type": "json_schema",
                 "schema": format.schema
             });
-            if !request.tools.is_empty() || !request.deferred_tools.is_empty() {
-                body["tools"] =
-                    native_tool_search::messages_tools(&request.tools, &request.deferred_tools);
-            }
         }
-    } else if !request.tools.is_empty() || !request.deferred_tools.is_empty() {
+    }
+    if !request.tools.is_empty() || !request.deferred_tools.is_empty() {
         body["tools"] = native_tool_search::messages_tools(&request.tools, &request.deferred_tools);
     }
     Ok(body)
@@ -1997,7 +1994,7 @@ impl MessagesStream {
                         });
                         Content::ToolUse { id, name, input }
                     }
-                    "server_tool_use"
+                    native_tool_search::MESSAGES_SEARCH_CALL
                         if block["name"] == native_tool_search::MESSAGES_SEARCH_TOOL
                             && block["id"].as_str().is_some_and(|id| !id.is_empty()) =>
                     {
@@ -2006,10 +2003,18 @@ impl MessagesStream {
                             value: block.clone(),
                         }
                     }
-                    "tool_search_tool_result" => Content::ProtocolData {
-                        protocol: Protocol::Messages,
-                        value: block.clone(),
-                    },
+                    native_tool_search::MESSAGES_SEARCH_RESULT
+                        if self.content.iter().any(|earlier| {
+                            matches!(earlier, Content::ProtocolData { value, .. }
+                                if value["type"] == native_tool_search::MESSAGES_SEARCH_CALL
+                                    && value["id"] == block["tool_use_id"])
+                        }) =>
+                    {
+                        Content::ProtocolData {
+                            protocol: Protocol::Messages,
+                            value: block.clone(),
+                        }
+                    }
                     _ => return Err(invalid_response("unsupported content block type")),
                 };
                 self.current = Some(PendingBlock {
@@ -2046,7 +2051,7 @@ impl MessagesStream {
                             .push_str(required_string(delta, "partial_json")?);
                     }
                     (Content::ProtocolData { value, .. }, "input_json_delta")
-                        if value["type"] == "server_tool_use" =>
+                        if value["type"] == native_tool_search::MESSAGES_SEARCH_CALL =>
                     {
                         current
                             .partial_json
