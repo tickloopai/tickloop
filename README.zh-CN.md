@@ -146,7 +146,7 @@ tickloop plugin install --path ./my-plugin
 
 MCP 工具默认采用 `exposure: "search"`：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
 
-本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。
+本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。`store(key, value)` 与 `load(key)` 在同一对话的后续脚本之间保留小量 JSON 值（如分页游标）；只有脚本成功时保存，Rewind 后或在 Branch 中，脚本只看到自己路径上保存的值。脚本运行中 Agent 进程退出时不会重跑：载入的历史列出脚本里每次调用的结局。对话中脚本内的每次调用显示在它的 Codemode 调用之下，ctrl+o 可查看整段脚本。
 
 `/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。在 `/mcp` 中登录时显示链接，本机时打开浏览器；浏览器在其他机器上时，把跳转后的地址粘贴到输入框；Esc 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
