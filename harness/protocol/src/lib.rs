@@ -135,8 +135,8 @@ pub use model::{
 };
 pub use model_availability::{AccountModelDirectory, DirectorySemantics, ModelAvailability};
 pub use model_card::{
-    Adapter, ModelCard, ModelPatch, ProviderPatch, TemperatureControl, ThinkingBudgets,
-    ThinkingControl, ThinkingOffEncoding,
+    Adapter, ModelCard, ModelPatch, NativeToolSearch, ProviderPatch, TemperatureControl,
+    ThinkingBudgets, ThinkingControl, ThinkingOffEncoding,
 };
 pub use monitor::{MonitorMember, MonitorMembership};
 pub use permissions::{Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope};

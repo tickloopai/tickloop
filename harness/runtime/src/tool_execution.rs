@@ -37,6 +37,8 @@ struct AutoPermissionDecision {
 
 #[derive(Clone)]
 enum ToolRoute {
+    #[cfg(feature = "codemode")]
+    Codemode,
     Fold(Arc<crate::tool_exposure::ExposureDirectory>),
     BuiltIn,
     Plan,
@@ -169,6 +171,8 @@ pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
     script_only: std::collections::BTreeSet<String>,
+    /// Callable directly, but offered only through the model's native tool search.
+    deferred: Vec<ToolDefinition>,
     /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
     offers_web_search: bool,
 }
@@ -201,6 +205,13 @@ impl ToolRegistry {
                 route: ToolRoute::BuiltIn,
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "codemode")]
+        if policy.scripts {
+            tools.push(RegisteredTool {
+                definition: crate::codemode_tool::definition(),
+                route: ToolRoute::Codemode,
+            });
+        }
         if policy.plan {
             tools.extend(
                 plan::definitions(is_delegated)
@@ -301,6 +312,7 @@ impl ToolRegistry {
         }
         let mut folded = std::collections::BTreeSet::new();
         let mut script_only = std::collections::BTreeSet::new();
+        let mut deferred = Vec::new();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
             if provider.has_tool_search()
                 || provider
@@ -338,25 +350,39 @@ impl ToolRegistry {
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
+                let search_support =
+                    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model)
+                        .is_some()
+                    {
+                        crate::tool_exposure::SearchSupport::Native
+                    } else {
+                        crate::tool_exposure::SearchSupport::Fold
+                    };
+                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
+                    discovery,
+                    search_support,
+                    true,
+                ));
+                deferred = directory.deferred_tools();
                 folded.extend(
-                    discovery
-                        .iter()
+                    directory
+                        .tools()
                         .filter(|tool| {
                             tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
+                                && !deferred
+                                    .iter()
+                                    .any(|deferred| deferred.name == tool.definition.name)
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
-                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
-                    discovery,
-                    crate::tool_exposure::SearchSupport::Fold,
-                    true,
-                ));
-                tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
-                    |definition| RegisteredTool {
-                        definition,
-                        route: ToolRoute::Fold(directory.clone()),
-                    },
-                ));
+                if matches!(search_support, crate::tool_exposure::SearchSupport::Fold) {
+                    tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
+                        |definition| RegisteredTool {
+                            definition,
+                            route: ToolRoute::Fold(directory.clone()),
+                        },
+                    ));
+                }
             }
             tools.extend(
                 provider
@@ -378,16 +404,25 @@ impl ToolRegistry {
             tools: merge_tick_management(tools),
             folded,
             script_only,
+            deferred,
             offers_web_search: policy.web_search,
         }
+    }
+
+    fn is_listed(&self, name: &str) -> bool {
+        !self.folded.contains(name) && !self.deferred.iter().any(|tool| tool.name == name)
     }
 
     pub(super) fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| !self.folded.contains(&tool.definition.name))
+            .filter(|tool| self.is_listed(&tool.definition.name))
             .map(|tool| tool.definition.clone())
             .collect()
+    }
+
+    pub(super) fn deferred_definitions(&self) -> Vec<ToolDefinition> {
+        self.deferred.clone()
     }
 
     pub(super) fn refresh(&mut self, chat: &Chat) {
@@ -424,7 +459,7 @@ impl ToolRegistry {
     pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tools
             .iter()
-            .filter(|tool| !self.folded.contains(&tool.definition.name))
+            .filter(|tool| self.is_listed(&tool.definition.name))
             .filter(|tool| {
                 matches!(
                     tool.route,
@@ -444,6 +479,14 @@ impl ToolRegistry {
 
     pub(super) fn script_only(&self, name: &str) -> bool {
         self.script_only.contains(name)
+    }
+
+    #[cfg(feature = "codemode")]
+    pub(crate) fn script_tools(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|tool| tool.definition.name.clone())
+            .collect()
     }
 
     pub(super) fn resolve_nested(&self, name: &str) -> Option<RegisteredTool> {
@@ -740,6 +783,8 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            #[cfg(feature = "codemode")]
+            ToolRoute::Codemode => unreachable!("Codemode executes through nested calls"),
             ToolRoute::Fold(directory) => {
                 let value = match operation.name.as_str() {
                     crate::tool_exposure::SEARCH_TOOLS => directory.search(&operation.input),
@@ -841,6 +886,20 @@ impl Agent {
         invocation: ToolInvocation,
         cancel: CancellationToken,
     ) -> Result<ToolCallOutcome, ToolCallError> {
+        #[cfg(feature = "codemode")]
+        if matches!(
+            invocation.registration.as_ref().map(|tool| &tool.route),
+            Some(ToolRoute::Codemode)
+        ) {
+            return Box::pin(self.execute_codemode(
+                receipt,
+                assistant_message_id,
+                invocation.id,
+                invocation.input,
+                cancel,
+            ))
+            .await;
+        }
         if invocation.name == crate::tool_exposure::EXECUTE_TOOLS
             && matches!(
                 invocation.registration.as_ref().map(|tool| &tool.route),
@@ -2597,7 +2656,7 @@ impl Agent {
                             None,
                         )
                         .finish(receipt.chat_id, operation);
-                        crate::nested_calls::stop_after_denial();
+                        crate::nested_calls::stop_after_denial(&reason);
                         return Err(ToolCallError::denied(reason, record));
                     }
                     Some(warning) if kind == AutoBlockKind::SoftDeny => {
@@ -2638,7 +2697,11 @@ impl Agent {
                 .push_str(&format!("\n{warning}"));
         }
         if decision == Decision::Deny && matches!(assessment.verdict, AutoReview::Block { .. }) {
-            crate::nested_calls::stop_after_denial();
+            crate::nested_calls::stop_after_denial(
+                auto_denial_message
+                    .as_deref()
+                    .unwrap_or("Auto review rejected the call"),
+            );
         }
         Ok(AutoPermissionDecision {
             decision,

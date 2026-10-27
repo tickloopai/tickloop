@@ -58,6 +58,7 @@ async fn model_factory_reads_saved_key_for_each_request() {
         .client(&config)
         .unwrap();
     let request = || ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,

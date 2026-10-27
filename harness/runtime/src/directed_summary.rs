@@ -429,6 +429,7 @@ fn summary_request(
         }],
     });
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages,
         tools: Vec::new(),

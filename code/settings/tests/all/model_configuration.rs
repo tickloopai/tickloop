@@ -35,6 +35,7 @@ fn custom_provider(id: &str) -> ProviderDefinition {
             thinking_budgets: None,
             temperature_control: None,
             thinking_off: None,
+            native_tool_search: None,
         }],
     }
 }

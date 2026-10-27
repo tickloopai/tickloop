@@ -50,6 +50,7 @@ pub mod history;
 mod image_limits;
 mod kimi;
 mod model_clients;
+pub mod native_tool_search;
 use model_clients::PrivateProvenance;
 pub use model_clients::{HttpModelClients, LocalModelClients, ModelClients};
 mod provider_directory;
@@ -204,6 +205,9 @@ pub struct ModelRequest {
     pub history_sources: Vec<Option<PrivateHistorySource>>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    /// Tools the model reaches only through its card's native tool search; a request may carry
+    /// them only when the card offers one.
+    pub deferred_tools: Vec<ToolDefinition>,
     pub structured_output: Option<StructuredOutput>,
     /// Sampling temperature, serialized only when the model card and adapter permit it.
     pub temperature: Option<f32>,
@@ -1010,6 +1014,7 @@ impl HttpModelClient {
         cancel: CancellationToken,
         context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
+        native_tool_search::check_request(&self.config, &request)?;
         let mut request = without_unsupported_images(&self.config, request);
         image_limits::limit_images_per_request(&mut request.messages);
         let image_free_request = image_limits::image_free_copy(&request);
@@ -1678,18 +1683,32 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     let mut messages = Vec::new();
     let mut system = Vec::new();
     for message in request.messages {
-        if message
-            .content
-            .iter()
-            .any(|content| matches!(content, Content::ProtocolData { .. }))
-        {
-            return Err(ModelError::Configuration("history contains protocol-specific content that needs migration before using Messages".into()));
+        let mut content = Vec::with_capacity(message.content.len());
+        for block in message.content {
+            match block {
+                Content::ProtocolData {
+                    protocol: Protocol::Messages,
+                    value,
+                } if native_tool_search::is_record(Protocol::Messages, &value) => {
+                    if request.deferred_tools.is_empty() {
+                        content.extend(
+                            native_tool_search::readable_content(&value)
+                                .iter()
+                                .map(messages_content),
+                        );
+                    } else {
+                        content.push(native_tool_search::messages_replay(
+                            value,
+                            &request.deferred_tools,
+                        ));
+                    }
+                }
+                Content::ProtocolData { .. } => {
+                    return Err(ModelError::Configuration("history contains protocol-specific content that needs migration before using Messages".into()));
+                }
+                block => content.push(messages_content(&block)),
+            }
         }
-        let content = message
-            .content
-            .iter()
-            .map(messages_content)
-            .collect::<Vec<_>>();
         if message.role == Role::System {
             system.extend(content);
         } else {
@@ -1781,12 +1800,10 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
                 "type": "json_schema",
                 "schema": format.schema
             });
-            if !request.tools.is_empty() {
-                body["tools"] = messages_tools(&request.tools);
-            }
         }
-    } else if !request.tools.is_empty() {
-        body["tools"] = messages_tools(&request.tools);
+    }
+    if !request.tools.is_empty() || !request.deferred_tools.is_empty() {
+        body["tools"] = native_tool_search::messages_tools(&request.tools, &request.deferred_tools);
     }
     Ok(body)
 }
@@ -1836,19 +1853,6 @@ fn finish_structured_response(
         Some(policy) => policy.validate_output(output),
         None => Ok(output),
     }
-}
-
-fn messages_tools(tools: &[ToolDefinition]) -> Value {
-    json!(
-        tools
-            .iter()
-            .map(|tool| json!({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            }))
-            .collect::<Vec<_>>()
-    )
 }
 
 fn messages_content(content: &Content) -> Value {
@@ -1990,6 +1994,27 @@ impl MessagesStream {
                         });
                         Content::ToolUse { id, name, input }
                     }
+                    native_tool_search::MESSAGES_SEARCH_CALL
+                        if block["name"] == native_tool_search::MESSAGES_SEARCH_TOOL
+                            && block["id"].as_str().is_some_and(|id| !id.is_empty()) =>
+                    {
+                        Content::ProtocolData {
+                            protocol: Protocol::Messages,
+                            value: block.clone(),
+                        }
+                    }
+                    native_tool_search::MESSAGES_SEARCH_RESULT
+                        if self.content.iter().any(|earlier| {
+                            matches!(earlier, Content::ProtocolData { value, .. }
+                                if value["type"] == native_tool_search::MESSAGES_SEARCH_CALL
+                                    && value["id"] == block["tool_use_id"])
+                        }) =>
+                    {
+                        Content::ProtocolData {
+                            protocol: Protocol::Messages,
+                            value: block.clone(),
+                        }
+                    }
                     _ => return Err(invalid_response("unsupported content block type")),
                 };
                 self.current = Some(PendingBlock {
@@ -2025,6 +2050,13 @@ impl MessagesStream {
                             .partial_json
                             .push_str(required_string(delta, "partial_json")?);
                     }
+                    (Content::ProtocolData { value, .. }, "input_json_delta")
+                        if value["type"] == native_tool_search::MESSAGES_SEARCH_CALL =>
+                    {
+                        current
+                            .partial_json
+                            .push_str(required_string(delta, "partial_json")?);
+                    }
                     _ => return Err(invalid_response("content delta does not match its block")),
                 }
             }
@@ -2046,6 +2078,14 @@ impl MessagesStream {
                     if !input.is_object() {
                         return Err(invalid_response("tool input must be an object"));
                     }
+                }
+                if let Content::ProtocolData { value, .. } = &mut current.content
+                    && !current.partial_json.is_empty()
+                {
+                    value["input"] = serde_json::from_str(&current.partial_json)
+                        .ok()
+                        .filter(Value::is_object)
+                        .ok_or_else(|| invalid_response("tool search input is invalid JSON"))?;
                 }
                 self.content.push(current.content);
             }
@@ -2445,6 +2485,7 @@ mod tests {
 
     fn structured_request() -> ModelRequest {
         ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: vec![Message {
                 role: Role::User,
@@ -2965,6 +3006,7 @@ mod tests {
                 Duration::from_secs(3),
                 client.complete(
                     ModelRequest {
+                        deferred_tools: Vec::new(),
                         history_sources: Vec::new(),
                         messages: vec![],
                         tools: vec![],
@@ -3007,6 +3049,7 @@ mod tests {
         let error = client
             .complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: Vec::new(),
                     messages: vec![],
                     tools: vec![],

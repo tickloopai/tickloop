@@ -86,6 +86,7 @@ async fn complete(
     let result = client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![],
                 tools: vec![],

@@ -69,6 +69,7 @@ impl Agent {
             let _done = job.done.drop_guard();
             let _upgrade = agent.inner.upgrade_gate.read().await;
             let request = ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     Message {

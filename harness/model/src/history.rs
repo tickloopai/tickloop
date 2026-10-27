@@ -63,7 +63,9 @@ fn project_block(block: Content, compatible: bool, target: &ModelConfig) -> Vec<
             readable_text(thinking)
         }
         Content::ProtocolData { protocol, value } if !compatible || protocol != target.protocol => {
-            if protocol == Protocol::Responses && value["type"] == "reasoning" {
+            if crate::native_tool_search::is_record(protocol, &value) {
+                crate::native_tool_search::readable_content(&value)
+            } else if protocol == Protocol::Responses && value["type"] == "reasoning" {
                 [
                     (&value["summary"], "summary_text"),
                     (&value["content"], "reasoning_text"),
@@ -205,6 +207,7 @@ mod tests {
 
     fn request(messages: Vec<Message>, source: Option<PrivateHistorySource>) -> ModelRequest {
         ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: messages.iter().map(|_| source.clone()).collect(),
             messages,
             tools: Vec::new(),

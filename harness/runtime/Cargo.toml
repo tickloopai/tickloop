@@ -11,6 +11,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
 percent-encoding = "2"
 base64 = "0.22"
 async-trait = "0.1"
@@ -58,5 +59,6 @@ tokio-tungstenite = { version = "0.27", default-features = false, features = ["c
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [features]
+codemode = ["dep:rquickjs"]
 # Exposes test-only Trigger controls and the in-memory Execution Environment to host tests.
 test-support = []

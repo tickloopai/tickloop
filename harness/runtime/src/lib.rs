@@ -62,6 +62,10 @@ mod chat_reads;
 mod chat_settings;
 mod chat_title;
 mod citations;
+#[cfg(feature = "codemode")]
+pub mod codemode;
+#[cfg(feature = "codemode")]
+mod codemode_tool;
 mod compaction;
 mod context;
 mod delegation;
@@ -3055,7 +3059,15 @@ impl Agent {
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             registry.refresh(chat);
             request.tools = registry.definitions();
+            request.deferred_tools = registry.deferred_definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
+            if !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_exposure::EXECUTE_TOOLS)
+            {
+                tool_exposure::fold_history_as_text(&mut request.messages);
+            }
             match chat.tools.chat_directory() {
                 Some(chat_directory) => {
                     let replacements = tool_results::enforce_tool_result_budget(
@@ -3142,6 +3154,7 @@ impl Agent {
         let available_tools = request
             .tools
             .iter()
+            .chain(&request.deferred_tools)
             .map(|tool| tool.name.clone())
             .collect::<HashSet<_>>();
         let mut recovered_text = String::new();
@@ -3513,6 +3526,7 @@ impl Agent {
             *is_awaiting_model = true;
             let mut registry = self.prepare_tool_registry(&receipt, &cancel).await?;
             request.tools = registry.definitions();
+            request.deferred_tools = registry.deferred_definitions();
             let output = match self
                 .model_request(
                     &receipt,
@@ -3770,6 +3784,7 @@ impl Agent {
         let (messages, history_sources) =
             context::model_history(chat).map_err(|error| error.to_string())?;
         Ok(ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources,
             messages,
             tools: self.tool_definitions(chat),
@@ -4445,6 +4460,7 @@ impl Agent {
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources,
                 messages,
                 tools: self.tool_definitions(&candidate),
@@ -4498,6 +4514,7 @@ impl Agent {
             approval_reason: prompt.reason,
             approval_source: prompt.source,
         };
+        nested_calls::register_permission(request.id);
         self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
             .await
     }
@@ -4509,6 +4526,8 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        #[cfg(feature = "codemode")]
+        let _script_pause = nested_calls::pause_script_clock();
         let nested = nested_calls::is_nested();
         if !nested {
             tool_batch::serialize_permission_prompt(&cancel).await?;
@@ -5415,6 +5434,11 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
         .chain(tool_exposure::fold_definitions())
+        .chain(std::iter::once(tickloop_harness_protocol::ToolDefinition {
+            name: "Codemode".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }))
         .chain(plan::definitions(false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())

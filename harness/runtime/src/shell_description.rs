@@ -37,6 +37,7 @@ impl Agent {
             chat.client.clone()
         };
         let request = ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: vec![
                 Message {

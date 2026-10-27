@@ -31,6 +31,7 @@ async fn reports_authentication_and_rate_limits_without_echoing_credentials() {
         let error = client
             .complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Hello")],
                     tools: vec![],
@@ -88,6 +89,7 @@ async fn cancelled_requests_do_not_produce_a_completed_response() {
     let result = client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Hello")],
                 tools: vec![],
@@ -158,6 +160,7 @@ async fn incomplete_or_duplicate_tool_streams_never_return_executable_calls() {
             client
                 .complete(
                     ModelRequest {
+                        deferred_tools: Vec::new(),
                         history_sources: Vec::new(),
                         messages: vec![message(Role::User, "Read notes")],
                         tools: vec![],
@@ -202,6 +205,7 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
     let output = client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Read notes")],
                 tools: tools.clone(),
@@ -255,6 +259,7 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
     client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     message(Role::User, "Read notes"),
@@ -302,6 +307,7 @@ async fn tool_results_serialize_to_the_anthropic_string_or_block_array_shape() {
     client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     message(Role::User, "Read both"),
@@ -390,6 +396,7 @@ async fn messages_rejects_noncomplete_stop_reasons_even_with_complete_content_bl
             let error = client
                 .complete(
                     ModelRequest {
+                        deferred_tools: Vec::new(),
                         history_sources: Vec::new(),
                         messages: vec![message(Role::User, "Continue")],
                         tools: vec![],
@@ -486,6 +493,7 @@ async fn streams_messages_with_multiround_history_and_actual_cumulative_usage() 
     let output = client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     message(Role::System, "Be helpful."),
@@ -563,6 +571,7 @@ async fn messages_rejects_invalid_cache_usage_counters() {
         let error = client
             .complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Hello")],
                     tools: vec![],
@@ -606,6 +615,7 @@ async fn messages_sends_image_blocks_in_the_anthropic_shape() {
     client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
@@ -657,6 +667,7 @@ async fn messages_nests_tool_result_images_in_the_tool_result_content_array() {
     client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     message(Role::User, "Read the chart"),
