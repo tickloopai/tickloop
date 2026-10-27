@@ -289,6 +289,178 @@ async fn product_terminal_defaults_to_auto_and_explains_legacy_mode_names() {
     assert!(transcript.contains("external isolation"), "{transcript}");
 }
 
+async fn report_startup_execution_mode(
+    config_root: &std::path::Path,
+    workdir: &std::path::Path,
+    flags: &[&str],
+) -> std::process::Output {
+    let mut child = product_async_agent_command()
+        .env("TICKLOOP_CONFIG_DIR", config_root)
+        .arg("--cwd")
+        .arg(workdir)
+        .arg("--no-session-persistence")
+        .args(flags)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A launch refused while parsing arguments may close stdin before this write.
+    let _ = stdin.write_all(b"/mode\n").await;
+    drop(stdin);
+    child.wait_with_output().await.unwrap()
+}
+
+#[tokio::test]
+async fn permission_mode_flag_accepts_claude_code_mode_names_like_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    for (flag, value, shown) in [
+        ("--permission-mode", "acceptEdits", "Ask"),
+        ("--permission-mode", "auto", "Auto"),
+        ("--permission-mode", "plan", "Plan"),
+        ("--permission-mode", "default", "Ask"),
+        ("--mode", "plan", "Plan"),
+    ] {
+        let output =
+            report_startup_execution_mode(&config_root, directory.path(), &[flag, value]).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{flag} {value}: {stderr}");
+        assert!(
+            stdout.contains(&format!("Execution mode: {shown}")),
+            "{flag} {value}: {stdout}"
+        );
+        assert_eq!(
+            stderr.contains("`default` is deprecated and maps to Ask"),
+            value == "default",
+            "{flag} {value}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mode_and_permission_mode_must_agree_when_both_are_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    let conflict = report_startup_execution_mode(
+        &config_root,
+        directory.path(),
+        &["--mode", "plan", "--permission-mode", "auto"],
+    )
+    .await;
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        stderr.contains("--mode plan and --permission-mode auto"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&conflict.stdout).contains("Execution mode:"));
+
+    let agreeing = report_startup_execution_mode(
+        &config_root,
+        directory.path(),
+        &["--permission-mode", "plan", "--mode", "plan"],
+    )
+    .await;
+    assert!(
+        agreeing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agreeing.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&agreeing.stdout);
+    assert!(stdout.contains("Execution mode: Plan"), "{stdout}");
+}
+
+#[tokio::test]
+async fn claude_code_modes_without_a_tickloop_mode_refuse_launch_with_the_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    for (flag, value, replacement) in [
+        ("--permission-mode", "dontAsk", "use --deny-on-prompt"),
+        (
+            "--permission-mode",
+            "bypassPermissions",
+            "use --dangerously-skip-permissions",
+        ),
+        ("--mode", "bypass", "use --dangerously-skip-permissions"),
+    ] {
+        let output =
+            report_startup_execution_mode(&config_root, directory.path(), &[flag, value]).await;
+        assert!(!output.status.success(), "{flag} {value}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("`{value}`")) && stderr.contains(replacement),
+            "{flag} {value}: {stderr}"
+        );
+        if replacement.contains("skip-permissions") {
+            assert!(stderr.contains("external isolation"), "{stderr}");
+        }
+    }
+
+    let help = report_startup_execution_mode(&config_root, directory.path(), &["--help"]).await;
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--permission-mode"), "{help}");
+    assert!(help.contains("--mode"), "{help}");
+}
+
+#[tokio::test]
+async fn default_mode_setting_takes_the_launch_flag_names_and_falls_back_to_auto_with_the_replacement()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    support::cli_runtime::adopt(&config_root);
+    std::fs::create_dir_all(&config_root).unwrap();
+    for (value, shown, warning) in [
+        ("acceptEdits", "Ask", None),
+        ("auto", "Auto", None),
+        ("plan", "Plan", None),
+        (
+            "default",
+            "Ask",
+            Some("`default` is deprecated and maps to Ask"),
+        ),
+        ("dontAsk", "Auto", Some("use --deny-on-prompt")),
+        (
+            "bypassPermissions",
+            "Auto",
+            Some("use --dangerously-skip-permissions"),
+        ),
+        ("bypass", "Auto", Some("use --dangerously-skip-permissions")),
+    ] {
+        std::fs::write(
+            config_root.join("settings.json"),
+            json!({ "defaultMode": value }).to_string(),
+        )
+        .unwrap();
+        let output = report_startup_execution_mode(&config_root, directory.path(), &[]).await;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{value}: {stderr}");
+        assert!(
+            stdout.contains(&format!("Execution mode: {shown}")),
+            "{value}: {stdout}"
+        );
+        let reported = format!("{stdout}{stderr}");
+        match warning {
+            Some(warning) => {
+                assert!(
+                    reported.contains("defaultMode") && reported.contains(warning),
+                    "{value}: {reported}"
+                );
+                if shown == "Auto" {
+                    assert!(reported.contains("using Auto"), "{value}: {reported}");
+                }
+            }
+            None => assert!(!reported.contains("defaultMode"), "{value}: {reported}"),
+        }
+    }
+}
+
 #[test]
 fn advanced_prompt_policies_are_explicit_mutually_exclusive_and_warn_when_unrestricted() {
     let directory = tempfile::tempdir().unwrap();
