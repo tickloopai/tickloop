@@ -15,6 +15,7 @@
 //! not take effect and the problem is returned as a warning instead of being silently dropped
 //! (users need to know when persistent Deny/Ask rules stop applying).
 
+pub mod claude_auto_import;
 mod execution_mode;
 pub mod instructions;
 pub mod loop_skill;

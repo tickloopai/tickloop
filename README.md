@@ -61,6 +61,8 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
+In `/permissions` → Auto mode, you can preview and select a one-time import of custom Auto rules. Built-in rules stay in place; imported rules do not override explicit Ask or Deny. Use `space` to toggle entries, `enter` to save and `esc` to cancel without changes.
+
 Keys:
 
 - `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.
