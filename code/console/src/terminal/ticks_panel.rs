@@ -35,7 +35,7 @@ use super::{
     display::{DisplayProfile, Glyph},
     editor::{Editor, EditorCommand},
     list_row::ListRow,
-    permissions_surface::{edit_text, editor_window, tab_header_line},
+    permissions_surface::{edit_text, editor_window, filtered_list_step, tab_header_line},
     safe_line,
     style::{Role, RoleLine},
 };
@@ -849,19 +849,20 @@ impl TicksPanel {
     }
 
     fn filter_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        if let Some(down) = filtered_list_step(key) {
+            self.selected[MARKETPLACE_PAGE] = step(
+                self.selected[MARKETPLACE_PAGE],
+                self.entry_count(MARKETPLACE_PAGE),
+                down,
+            );
+            return TicksPanelEffect::None;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.filtering = false
             }
             (KeyCode::Char('g'), KeyModifiers::CONTROL) => return TicksPanelEffect::EditFilter,
             (KeyCode::Enter, _) => return self.open_selected(),
-            (KeyCode::Char('n' | 'p'), KeyModifiers::CONTROL) => {
-                self.selected[MARKETPLACE_PAGE] = step(
-                    self.selected[MARKETPLACE_PAGE],
-                    self.entry_count(MARKETPLACE_PAGE),
-                    key.code == KeyCode::Char('n'),
-                );
-            }
             _ => {
                 let previous = self.filter.draft().to_owned();
                 edit_text(&mut self.filter, key);
@@ -1878,7 +1879,7 @@ impl TicksPanel {
     fn package_hints(&self) -> Vec<(String, u8)> {
         let mut hints = if self.filtering && self.page == MARKETPLACE_PAGE {
             vec![
-                ("ctrl+n/p select".into(), 8),
+                ("↑/↓ select".into(), 8),
                 ("ctrl+g editor".into(), 3),
                 ("esc leave filter".into(), 9),
             ]
@@ -3225,5 +3226,34 @@ mod tests {
             })),
         });
         assert!(text(&mut panel).contains("Updated Tick alpha@tickloop from 0.3.0 to 0.2.0"));
+    }
+
+    #[test]
+    fn arrows_move_the_selection_while_the_filter_keeps_j_and_k_as_text() {
+        let mut panel = loaded_panel();
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Char('/'));
+        for character in "package".chars() {
+            press(&mut panel, KeyCode::Char(character));
+        }
+        let selected_name = |panel: &mut TicksPanel| {
+            let rows = selected(panel);
+            rows[0]
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(selected_name(&mut panel), "alpha");
+        press(&mut panel, KeyCode::Down);
+        assert_eq!(selected_name(&mut panel), "sample");
+        press(&mut panel, KeyCode::Up);
+        assert_eq!(selected_name(&mut panel), "alpha");
+        assert_eq!(panel.filter_text(), "package");
+        let shown = text(&mut panel);
+        assert!(shown.contains("↑/↓ select"), "{shown}");
+        press(&mut panel, KeyCode::Char('j'));
+        press(&mut panel, KeyCode::Char('k'));
+        assert_eq!(panel.filter_text(), "packagejk");
     }
 }
