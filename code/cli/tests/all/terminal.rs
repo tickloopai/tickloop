@@ -387,7 +387,18 @@ async fn claude_code_modes_without_a_tickloop_mode_refuse_launch_with_the_replac
             "bypassPermissions",
             "use --dangerously-skip-permissions",
         ),
+        ("--mode", "dontAsk", "use --deny-on-prompt"),
+        (
+            "--mode",
+            "bypassPermissions",
+            "use --dangerously-skip-permissions",
+        ),
         ("--mode", "bypass", "use --dangerously-skip-permissions"),
+        (
+            "--permission-mode",
+            "bypass",
+            "use --dangerously-skip-permissions",
+        ),
     ] {
         let output =
             report_startup_execution_mode(&config_root, directory.path(), &[flag, value]).await;
@@ -401,11 +412,20 @@ async fn claude_code_modes_without_a_tickloop_mode_refuse_launch_with_the_replac
             assert!(stderr.contains("external isolation"), "{stderr}");
         }
     }
+}
 
-    let help = report_startup_execution_mode(&config_root, directory.path(), &["--help"]).await;
+#[test]
+fn help_lists_mode_and_permission_mode() {
+    let help = support::fixture_cli::command()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
     let help = String::from_utf8_lossy(&help.stdout);
-    assert!(help.contains("--permission-mode"), "{help}");
-    assert!(help.contains("--mode"), "{help}");
+    assert!(
+        help.contains("[--mode | --permission-mode acceptEdits|auto|plan]"),
+        "{help}"
+    );
 }
 
 #[tokio::test]

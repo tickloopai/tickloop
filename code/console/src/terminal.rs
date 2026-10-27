@@ -1011,7 +1011,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{argument} requires acceptEdits, auto or plan"))?;
-                let (mode, warning) = parse_execution_mode(&value)?;
+                let (mode, warning) =
+                    parse_execution_mode(&value).map_err(|error| safe_text(&error))?;
                 if let Some(warning) = warning {
                     eprintln!("Warning: {warning}");
                 }

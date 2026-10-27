@@ -26,7 +26,7 @@ pub fn parse_execution_mode(value: &str) -> Result<(ExecutionMode, Option<&'stat
             "`{name}` is not an execution mode in Tickloop; use --dangerously-skip-permissions, which requires external isolation"
         )),
         name => Err(format!(
-            "`{name}` is not an execution mode; choose auto, ask, fullAccess or plan"
+            "`{name}` is not an execution mode; choose acceptEdits, auto, plan or fullAccess"
         )),
     }
 }
