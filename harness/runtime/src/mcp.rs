@@ -57,6 +57,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_GRACE: Duration = Duration::from_secs(2);
 /// How many times a remote server reconnects after one failure before it stays failed.
 const MAX_RECONNECTS: u32 = 5;
+/// How long a connection must stay up before its reconnects count from zero again, so that a
+/// server that connects and drops at once still stops after the capped reconnects.
+const RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(60);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
@@ -737,7 +740,8 @@ impl McpConnections {
     }
     /// Connects `entry` in the background and keeps it connected: a remote server that
     /// disconnects or fails to connect tries again after 1, 2, 4, 8 and 16 seconds and then stays
-    /// failed; a local program that fails or exits is not started again.
+    /// failed, counting from zero again only after a connection stayed up for
+    /// [`RECONNECT_STABLE_AFTER`]; a local program that fails or exits is not started again.
     async fn start(&self, entry: Arc<Entry>) {
         let environment = self.inner.environment.clone();
         let stderr_directory = self.inner.stderr_directory.clone();
@@ -772,8 +776,12 @@ impl McpConnections {
                         }
                         Attempt::Failed(reason) => reason,
                         Attempt::Opened(opened) => {
-                            reconnects = 0;
-                            match serve(&entry, opened, &state_changed).await {
+                            let opened_at = tokio::time::Instant::now();
+                            let served = serve(&entry, opened, &state_changed).await;
+                            if opened_at.elapsed() >= RECONNECT_STABLE_AFTER {
+                                reconnects = 0;
+                            }
+                            match served {
                                 Served::Stopped => return,
                                 Served::Closed => CONNECTION_CLOSED.to_owned(),
                             }

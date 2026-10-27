@@ -607,7 +607,7 @@ async fn a_remote_server_reconnects_on_the_backoff_schedule_then_stays_failed() 
 
 #[cfg(feature = "test-support")]
 #[tokio::test(start_paused = true)]
-async fn a_successful_connection_restarts_the_backoff() {
+async fn a_connection_that_stays_up_restarts_the_backoff() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
     server.set_status(500);
@@ -631,18 +631,64 @@ async fn a_successful_connection_restarts_the_backoff() {
     }
     server.set_status(200);
     wait_for_connection_state(&connections, McpServerState::Connected).await;
-    server.set_status(404);
-    let _ = connections
-        .call("mcp__remote__quote", json!({}), CancellationToken::new())
-        .await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    drop_connection(&connections, &server, "remote").await;
     while backoffs(&connections, "remote").len() < 3 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
         backoffs(&connections, "remote"),
         [1, 2, 1].map(Duration::from_secs),
-        "after a successful connection the backoff starts again at one second"
+        "after a connection that stayed up for a minute the backoff starts again at one second"
     );
+    connections.shutdown().await;
+}
+
+#[cfg(feature = "test-support")]
+/// Drops the open connection of `name` through a call the server answers with 404, then lets the
+/// server answer again so that the next attempt connects.
+async fn drop_connection(connections: &McpConnections, server: &McpService, name: &str) {
+    server.set_status(404);
+    let _ = connections
+        .call(&format!("mcp__{name}__quote"), json!({}), CancellationToken::new())
+        .await;
+    server.set_status(200);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(start_paused = true)]
+async fn a_server_that_drops_right_after_connecting_stops_after_the_capped_reconnects() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile_keeping_failures(vec![http_server("remote", &server, ToolExposure::Search)])
+        .await;
+    let mut drops = 0;
+    while drops < 10 {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while connections.statuses()[0].state != McpServerState::Connected
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if connections.statuses()[0].state != McpServerState::Connected {
+            break;
+        }
+        drop_connection(&connections, &server, "remote").await;
+        drops += 1;
+    }
+    assert_eq!(
+        backoffs(&connections, "remote"),
+        [1, 2, 4, 8, 16].map(Duration::from_secs),
+        "connections that drop at once never restart the backoff"
+    );
+    assert_eq!(drops, 6, "the first connection and five reconnects");
+    assert_eq!(connections.statuses()[0].state, McpServerState::Failed);
     connections.shutdown().await;
 }
 
