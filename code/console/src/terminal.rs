@@ -24,6 +24,7 @@ mod clipboard_hint;
 mod completed_tasks;
 mod completion;
 mod console;
+mod context_view;
 mod conversation;
 #[cfg(test)]
 mod conversation_layout_tests;
@@ -416,6 +417,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/details"
                 | "/diff"
                 | "/status"
+                | "/context"
                 | "/artifacts"
                 | "/plugins"
                 | "/ticks"
@@ -3775,6 +3777,29 @@ async fn interact_with_herdr(
                                     outln!(console, "Prompt suggestions: On · {diagnostic}");
                                 } else { outln!(console, "Prompt suggestions: Off"); }
                             } else {outln!(console,"No Chat is selected.");}
+                        },
+                        command if command.split_whitespace().next() == Some("/context") => {
+                            let mut arguments = command.split_whitespace().skip(1);
+                            let expanded = match (arguments.next(), arguments.next()) {
+                                (None, _) => false,
+                                (Some(context_view::EXPAND_ARGUMENT), None) => true,
+                                _ => { outln!(console, "Usage: /context [{}]", context_view::EXPAND_ARGUMENT); continue; }
+                            };
+                            let Some(chat)=selected_chat else { outln!(console,"No Chat is selected."); continue; };
+                            match (agent.context_breakdown(chat.into()).await, agent.status(chat.into()).await) {
+                                (Ok(breakdown), Ok(status)) => {
+                                    let home = std::env::home_dir();
+                                    let view = context_view::ContextView {
+                                        breakdown: &breakdown,
+                                        model_name: settings::model_name(&status.model),
+                                        model_id: &status.model.model,
+                                        home: home.as_deref(),
+                                        expanded,
+                                    };
+                                    console.write_roles(&view.runs(console.conversation_width()?, console.display_profile()?))?;
+                                },
+                                (Err(error), _) | (_, Err(error)) => outln!(console,"Cannot read context usage: {}",safe_text(&error.to_string())),
+                            }
                         },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat.map(Into::into),false).await {
                             Ok(picker) => menus.conversations(console,picker)?,

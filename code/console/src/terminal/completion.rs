@@ -189,6 +189,12 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
+        command: "/context",
+        arguments: "[all]",
+        description: "Show context usage by category and the tool search pool; all lists every item.",
+        menu_group: Some(CommandGroup::Conversation),
+    },
+    CommandSpec {
         command: "/clear",
         arguments: "",
         description: "Starts a New Agent from your next input; this Agent keeps running.",
