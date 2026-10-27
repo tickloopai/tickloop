@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     CODEX_RESPONSES_URL, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest,
     ModelRequestContext, ModelRequestStage, ModelResponseRejection, consume_sse_response,
-    image_outside_user_message, is_context_limit_error, request_transport_error, responses,
-    validate_reasoning_effort,
+    image_outside_user_message, is_context_limit_error, native_tool_search,
+    request_transport_error, responses, validate_reasoning_effort,
 };
 use crate::{
     ModelConfigExt,
@@ -410,6 +410,8 @@ fn encode_request(
     validate_reasoning_effort(config, request.reasoning_effort)?;
     let mut request = super::without_unsupported_images(config, request);
     super::image_limits::limit_images_per_request(&mut request.messages);
+    let offers_search = !request.deferred_tools.is_empty();
+    let mut namespaces = HashMap::new();
     let mut instructions = Vec::new();
     let mut input = Vec::new();
     let mut seen_non_system = false;
@@ -472,6 +474,27 @@ fn encode_request(
                 {
                     assistant_phase = Some(super::required_string(&value, "phase")?.to_owned());
                 }
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value,
+                } if native_tool_search::is_record(Protocol::Responses, &value) => {
+                    if value["type"] == native_tool_search::RESPONSES_CALL_NAMESPACE {
+                        if offers_search {
+                            let id = super::required_string(&value, "call_id")?;
+                            namespaces.insert(
+                                normalize_codex_id(
+                                    id.split('|').next().unwrap_or_default(),
+                                    "call",
+                                ),
+                                value["namespace"].clone(),
+                            );
+                        }
+                    } else if offers_search {
+                        input.push(value);
+                    } else if let Some(text) = native_tool_search::readable_text(&value) {
+                        input.push(responses::assistant_text_item(text, None));
+                    }
+                }
                 Content::ToolUse {
                     id,
                     name,
@@ -503,6 +526,9 @@ fn encode_request(
                     let mut item = json!({"type":"function_call","call_id":call_id,"name":name,"arguments":arguments.to_string()});
                     if let Some(raw_item_id) = raw_item_id.filter(|_| item_origin == Some(origin)) {
                         item["id"] = json!(normalize_codex_id(raw_item_id, "fc"));
+                    }
+                    if let Some(namespace) = namespaces.remove(&call_id) {
+                        item["namespace"] = namespace;
                     }
                     input.push(item);
                 }
@@ -575,7 +601,7 @@ fn encode_request(
         body["temperature"] = json!(temperature);
     }
     if let Some(format) = request.structured_output {
-        if !request.tools.is_empty() || format.name.trim().is_empty() {
+        if !request.tools.is_empty() || offers_search || format.name.trim().is_empty() {
             return Err(ModelError::Configuration(
                 "Codex structured output requires a named JSON schema without executable tools"
                     .into(),
@@ -584,20 +610,15 @@ fn encode_request(
         let instructions = body["instructions"].as_str().unwrap().to_owned();
         body["instructions"] = json!(format!("{instructions}\n\n{}", format.prompt()));
         body["parallel_tool_calls"] = json!(false);
-    } else if !request.tools.is_empty() {
-        body["tools"] = json!(
-            request
-                .tools
-                .into_iter()
-                .map(|tool| json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                    "strict": null,
-                }))
-                .collect::<Vec<_>>()
-        );
+    } else if !request.tools.is_empty() || offers_search {
+        let mut tools =
+            native_tool_search::responses_tools(&request.tools, &request.deferred_tools);
+        for tool in tools.as_array_mut().unwrap() {
+            if tool["type"] == "function" {
+                tool["strict"] = Value::Null;
+            }
+        }
+        body["tools"] = tools;
     }
     if let Some(effort) = request.reasoning_effort {
         body["reasoning"] = json!({

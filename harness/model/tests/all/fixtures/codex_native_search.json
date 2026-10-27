@@ -1,0 +1,52 @@
+[
+  {
+    "arguments": {
+      "paths": [
+        "mcp__weather__get_weather"
+      ]
+    },
+    "call_id": null,
+    "execution": "server",
+    "id": "tsc_probe",
+    "status": "completed",
+    "type": "tool_search_call"
+  },
+  {
+    "call_id": null,
+    "execution": "server",
+    "id": "tso_probe",
+    "status": "completed",
+    "tools": [
+      {
+        "defer_loading": true,
+        "description": "Get current weather for a city",
+        "name": "mcp__weather__get_weather",
+        "output_schema": null,
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        },
+        "strict": true,
+        "type": "function"
+      }
+    ],
+    "type": "tool_search_output"
+  },
+  {
+    "type": "function_call",
+    "id": "fc_probe",
+    "call_id": "call_probe",
+    "name": "mcp__weather__get_weather",
+    "arguments": "{\"city\":\"Paris\"}",
+    "namespace": "mcp__weather__get_weather",
+    "status": "completed"
+  }
+]

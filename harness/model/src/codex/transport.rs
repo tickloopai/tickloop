@@ -450,6 +450,7 @@ fn continuation_body(body: &Value, previous: &Continuation) -> Option<Value> {
 
 fn response_items(output: &ModelOutput) -> Vec<Value> {
     let mut items = Vec::new();
+    let mut namespaces = HashMap::new();
     for content in &output.content {
         match content {
             Content::Text { text } => {
@@ -465,6 +466,18 @@ fn response_items(output: &ModelOutput) -> Vec<Value> {
                     .remove(super::CODEX_ORIGIN_FIELD);
                 items.push(item);
             }
+            Content::ProtocolData {
+                protocol: Protocol::Responses,
+                value,
+            } if crate::native_tool_search::is_record(Protocol::Responses, value) => {
+                if value["type"] == crate::native_tool_search::RESPONSES_CALL_NAMESPACE {
+                    if let Some(id) = value["call_id"].as_str() {
+                        namespaces.insert(id.to_owned(), value["namespace"].clone());
+                    }
+                } else {
+                    items.push(value.clone());
+                }
+            }
             Content::ToolUse { id, name, input } => {
                 let (call_id, item_id) = id
                     .split_once('|')
@@ -472,6 +485,9 @@ fn response_items(output: &ModelOutput) -> Vec<Value> {
                 let mut item = json!({"type":"function_call","call_id":normalize_codex_id(call_id, "call"),"name":name,"arguments":input.to_string()});
                 if let Some(item_id) = item_id {
                     item["id"] = json!(normalize_codex_id(item_id, "fc"));
+                }
+                if let Some(namespace) = namespaces.remove(id) {
+                    item["namespace"] = namespace;
                 }
                 items.push(item);
             }

@@ -16,7 +16,7 @@ const WEATHER: &str = "mcp__weather__get_weather";
 const INVOICES: &str = "mcp__billing__list_invoices";
 
 #[test]
-fn only_verified_official_api_models_offer_native_tool_search() {
+fn only_verified_official_models_offer_native_tool_search() {
     let catalog = ModelCatalog::defaults();
     catalog.validate().unwrap();
     for provider in &catalog.providers {
@@ -24,6 +24,7 @@ fn only_verified_official_api_models_offer_native_tool_search() {
             let expected = match provider.id.as_str() {
                 "anthropic-api" => Some(NativeToolSearch::Anthropic),
                 "openai-api" => Some(NativeToolSearch::OpenAi),
+                "openai-codex" if model.id == "gpt-6.1-sol" => Some(NativeToolSearch::OpenAi),
                 _ => None,
             };
             assert_eq!(
@@ -536,4 +537,202 @@ async fn openai_defers_functions_behind_hosted_search_and_round_trips_their_name
         input[3],
         json!({"type":"function_call","call_id":"call_1","name":WEATHER,"arguments":"{\"city\":\"Paris\"}"})
     );
+}
+
+#[tokio::test]
+async fn codex_native_search_replays_namespace_and_projects_history_across_models() {
+    use tickloop_harness_model::codex_test_support::{
+        LoopbackCodexClient, serve_scripted_responses, state_with_credentials,
+    };
+    let (_directory, root) = state_with_credentials();
+    let config = ModelCatalog::defaults()
+        .get("openai-codex", "gpt-6.1-sol")
+        .unwrap();
+    let (endpoint, captured) = serve_scripted_responses(vec![
+        (200, codex_search_then_call()),
+        (200, responses_text()),
+        (200, responses_text()),
+        (200, responses_text()),
+    ])
+    .await;
+    let client =
+        LoopbackCodexClient::new(config.clone(), &root, endpoint.as_str()).into_fixture_client();
+    let run = |request| {
+        let (events, _) = mpsc::unbounded_channel();
+        client.complete(request, events, CancellationToken::new())
+    };
+    let first = run(request(
+        vec![(user("Weather in Paris?"), None)],
+        &[WEATHER, INVOICES],
+    ))
+    .await
+    .unwrap();
+    let (call_id, name, arguments) = first
+        .content
+        .iter()
+        .find_map(|content| match content {
+            Content::ToolUse { id, name, input } => Some((id.clone(), name, input)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(name, WEATHER);
+    assert_eq!(arguments, &json!({"city":"Paris"}));
+    let conversation = vec![
+        (user("Weather in Paris?"), None),
+        (
+            Message {
+                role: Role::Assistant,
+                content: first.content.clone(),
+            },
+            first.private_source.clone(),
+        ),
+        (
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    tool_use_id: call_id,
+                    content: "Sunny, 21C".into(),
+                    is_error: false,
+                }],
+            },
+            None,
+        ),
+    ];
+    let original = conversation.clone();
+    run(request(conversation.clone(), &[WEATHER, INVOICES]))
+        .await
+        .unwrap();
+    run(request(conversation.clone(), &[])).await.unwrap();
+    let (fold_endpoint, mut fold_wire) = serve_responses(vec![(200, chat_text())]).await;
+    let fold = catalog_model(&root, "deepseek-api", "deepseek-flash", fold_endpoint);
+    complete(&fold, &root, request(conversation.clone(), &[])).await;
+    let foreign = fold_wire.recv().await.unwrap().1.to_string();
+    assert!(foreign.contains("Searched tools for"));
+    assert!(!foreign.contains("tool_search_call") && !foreign.contains("namespace"));
+    run(request(conversation.clone(), &[WEATHER, INVOICES]))
+        .await
+        .unwrap();
+    assert_eq!(conversation, original);
+    let wires = captured.await.unwrap();
+    assert_eq!(wires[0]["tools"][1], json!({"type":"tool_search"}));
+    assert_eq!(wires[0]["tools"][2]["defer_loading"], true);
+    assert_eq!(wires[0]["tools"][3]["defer_loading"], true);
+    assert_eq!(wires[0]["store"], false);
+    let input = wires[1]["input"].as_array().unwrap();
+    assert_eq!(input[1]["type"], "tool_search_call");
+    assert_eq!(input[2]["type"], "tool_search_output");
+    assert_eq!(input[3]["namespace"], WEATHER);
+    assert_eq!(input[3]["call_id"], input[4]["call_id"]);
+    assert_eq!(input[3]["id"], "fc_probe");
+    assert_eq!(wires[1]["input"], wires[3]["input"]);
+    assert_eq!(wires[0]["tools"], wires[1]["tools"]);
+    let without_search = wires[2].to_string();
+    assert!(without_search.contains("Searched tools for"));
+    assert!(!without_search.contains("tool_search_call") && !without_search.contains("namespace"));
+}
+
+// Terminal items observed from gpt-6.1-sol's Codex SSE response on 2026-10-27;
+// identifiers are replaced, and framing is reconstructed from those items.
+fn codex_search_then_call() -> String {
+    let output: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/codex_native_search.json")).unwrap();
+    responses_stream(
+        &output
+            .into_iter()
+            .map(|done| {
+                let mut added = done.clone();
+                added["status"] = json!("in_progress");
+                if added["type"] == "function_call" {
+                    added["arguments"] = json!("");
+                }
+                if added["type"] == "tool_search_call" {
+                    added["arguments"] = json!({});
+                }
+                (added, done)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[tokio::test]
+async fn codex_native_search_websocket_continuation_keeps_loaded_tools() {
+    use futures_util::StreamExt;
+    use tickloop_harness_model::codex_test_support::{
+        LoopbackCodexClient, send_ws_stream, state_with_credentials,
+    };
+    let (_directory, root) = state_with_credentials();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut frames = Vec::new();
+        for reply in [codex_search_then_call(), responses_text()] {
+            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            frames.push(serde_json::from_str::<Value>(&frame).unwrap());
+            send_ws_stream(&mut socket, &reply).await;
+        }
+        send.send(frames).unwrap();
+    });
+    let config = ModelCatalog::defaults()
+        .get("openai-codex", "gpt-6.1-sol")
+        .unwrap();
+    let client = LoopbackCodexClient::new(config, &root, &endpoint)
+        .with_websocket()
+        .into_fixture_client();
+    let chat = uuid::Uuid::new_v4().into();
+    let (events, _) = mpsc::unbounded_channel();
+    let mut conversation = vec![(user("Weather in Paris?"), None)];
+    let first = client
+        .complete_for_chat(
+            chat,
+            request(conversation.clone(), &[WEATHER]),
+            events.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let call_id = first
+        .content
+        .iter()
+        .find_map(|content| match content {
+            Content::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    conversation.push((
+        Message {
+            role: Role::Assistant,
+            content: first.content,
+        },
+        first.private_source,
+    ));
+    conversation.push((
+        Message {
+            role: Role::User,
+            content: vec![Content::ToolResult {
+                tool_use_id: call_id,
+                content: "Sunny".into(),
+                is_error: false,
+            }],
+        },
+        None,
+    ));
+    client
+        .complete_for_chat(
+            chat,
+            request(conversation, &[WEATHER]),
+            events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    client.close_chat(chat).await;
+    let frames = receive.await.unwrap();
+    assert_eq!(frames[1]["previous_response_id"], "resp-1");
+    assert_eq!(frames[1]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(frames[1]["input"][0]["type"], "function_call_output");
+    assert_eq!(frames[1]["input"][0]["call_id"], "call_probe");
+    assert_eq!(frames[0]["tools"], frames[1]["tools"]);
 }

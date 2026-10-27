@@ -1181,3 +1181,64 @@ async fn live_model_calls_logged_in_notion_search_without_recording_content() {
         "Live Notion acceptance passed: model=claude-sonnet-5; path=native; tool={tool}; calls=1; success=true; response content not recorded"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a private temporary TICKLOOP_CONFIG_DIR with Codex subscription credentials; consumes subscription usage"]
+async fn live_codex_native_search_calls_mcp_fixture_once() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(
+        root.ends_with("codex-native-config"),
+        "use a temporary codex-native-config directory"
+    );
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("openai-codex", "gpt-6.1-sol")
+        .unwrap();
+    let (agent, local, remote) = configured_agent(
+        &root,
+        model,
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    )
+    .await;
+    let path = root.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in settings["mcpServers"].as_object_mut().unwrap().values_mut() {
+        entry["exposure"] = json!("search");
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if agent.mcp_servers().await.iter().all(|server| {
+                server.state == tickloop_harness::protocol::mcp::McpServerState::Connected
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    complete(&agent, chat, "Use native tool search to find the local MCP server's acceptance marker probe, call it exactly once, and reply with the returned marker. Do not call the remote server or any other tools.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    assert_eq!(local.calls().len(), 1);
+    assert!(remote.calls().is_empty());
+    assert!(snapshot.operations.iter().all(|operation| {
+        !["SearchTools", "DescribeTools", "ExecuteTools"].contains(&operation.name.as_str())
+    }));
+    let messages = serde_json::to_string(&snapshot.messages).unwrap();
+    assert!(messages.contains("tool_search_call") && messages.contains("tool_search_output"));
+    assert!(messages.contains("LOCAL_MCP_OK"));
+    eprintln!(
+        "Codex native MCP acceptance passed: gpt-6.1-sol, hosted search, stdio calls=1, Fold calls=0, result=LOCAL_MCP_OK"
+    );
+}
