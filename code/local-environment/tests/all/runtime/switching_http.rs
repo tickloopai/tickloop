@@ -588,13 +588,13 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     finish_turn(&resumed, chat.uuid(), "Return to A").await;
     let a_requests = a_requests.await.unwrap();
     let b_requests = b_requests.await.unwrap();
-    let stable_prefix = &a_requests[1].1["messages"].as_array().unwrap()[..2];
+    let stable_prefix = &a_requests[1].1["messages"].as_array().unwrap()[..3];
     assert_eq!(
         stable_prefix,
-        &a_requests[2].1["messages"].as_array().unwrap()[..2]
+        &a_requests[2].1["messages"].as_array().unwrap()[..3]
     );
     assert_eq!(
-        stable_prefix[1]["content"][0]["signature"],
+        stable_prefix[2]["content"][0]["signature"],
         "original-signed-block"
     );
     for (_, body) in &b_requests {

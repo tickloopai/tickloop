@@ -14,8 +14,7 @@ use async_trait::async_trait;
 use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness::protocol::{
     BranchRequest, ChatId, Content, DirectedSummaryRequest, EventKind, LoopState, Message,
-    ModelIdentity, PauseReason, Protocol, Receipt, Receiving, RewindMode, Role, SummaryDirection,
-    Usage,
+    ModelIdentity, PauseReason, Protocol, Receipt, Receiving, RewindMode, SummaryDirection, Usage,
 };
 use tickloop_harness::runtime::Agent;
 use tickloop_harness::test_support::shell_ticks::ShellTick;
@@ -314,7 +313,7 @@ async fn rewind_keeps_the_loop_and_its_subscriptions_across_restarts() {
     let sent = request
         .messages
         .iter()
-        .filter(|message| message.role != Role::System)
+        .filter(|message| tickloop_harness::test_support::is_conversation(message))
         .map(message_text)
         .collect::<Vec<_>>();
     assert_eq!(sent.first().map(String::as_str), Some("first goal"));
@@ -415,7 +414,7 @@ async fn subscriptions_survive_restart_after_compaction() {
             .conversation_messages()
             .unwrap()
             .into_iter()
-            .filter(|message| message.role != Role::System)
+            .filter(tickloop_harness::test_support::is_conversation)
             .collect::<Vec<_>>();
         agent.shutdown().await;
         drop(agent);
@@ -436,7 +435,7 @@ async fn subscriptions_survive_restart_after_compaction() {
             .last_conversation_request()
             .messages
             .into_iter()
-            .filter(|message| message.role != Role::System)
+            .filter(tickloop_harness::test_support::is_conversation)
             .collect::<Vec<_>>();
         assert!(
             sent.iter().all(|message| !message.content.is_empty()),

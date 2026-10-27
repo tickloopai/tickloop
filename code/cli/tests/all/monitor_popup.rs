@@ -25,26 +25,45 @@ const KEYS_TICK: &str = include_str!("../support/keys_tick.py");
 /// The Tickloop state one test's commands use: settings, the generated plugin, and a home.
 struct State {
     directory: tempfile::TempDir,
+    config: PathBuf,
+    uses_default_root: bool,
 }
 
 impl State {
     fn new() -> Self {
+        Self::with_root(false)
+    }
+
+    fn with_root(uses_default_root: bool) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tms")
             .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
-        std::fs::create_dir(directory.path().join("config")).unwrap();
         std::fs::create_dir(directory.path().join("home")).unwrap();
-        std::fs::write(
-            directory.path().join("config/settings.json"),
-            PRESERVED_SETTINGS,
-        )
-        .unwrap();
-        Self { directory }
+        let config = directory.path().join(if uses_default_root {
+            "home/.tickloop"
+        } else {
+            "config"
+        });
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join("settings.json"), PRESERVED_SETTINGS).unwrap();
+        Self {
+            directory,
+            config,
+            uses_default_root,
+        }
     }
 
     fn config(&self) -> PathBuf {
-        self.directory.path().join("config")
+        self.config.clone()
+    }
+
+    fn plugin_id(&self) -> String {
+        if self.uses_default_root {
+            PLUGIN_ID.into()
+        } else {
+            support::herdr::popup_plugin_id(&self.config())
+        }
     }
 
     fn settings(&self) -> String {
@@ -85,7 +104,9 @@ impl State {
         command.env("PATH", "/usr/bin:/bin");
         command.env("HOME", self.directory.path().join("home"));
         command.env("TERM", "xterm-256color");
-        command.env("TICKLOOP_CONFIG_DIR", self.config());
+        if !self.uses_default_root {
+            command.env("TICKLOOP_CONFIG_DIR", self.config());
+        }
         let mut child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
         let output = capture(pty.master.try_clone_reader().unwrap());
@@ -108,15 +129,17 @@ impl State {
     }
 
     fn run_without_terminal(&self, change: &str, herdr: &PrivateHerdr) -> Finished {
-        let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
+        command
             .args(self.command(change, herdr))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.directory.path().join("home"))
-            .env("TICKLOOP_CONFIG_DIR", self.config())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(Stdio::null());
+        if !self.uses_default_root {
+            command.env("TICKLOOP_CONFIG_DIR", self.config());
+        }
+        let output = command.output().unwrap();
         Finished {
             succeeded: output.status.success(),
             output: format!(
@@ -135,7 +158,7 @@ struct Finished {
 }
 
 fn assert_our_plugin(herdr: &PrivateHerdr, state: &State) {
-    let plugins = herdr.plugins();
+    let plugins = herdr.plugins_with_id(&state.plugin_id());
     assert_eq!(plugins.len(), 1, "{plugins:?}");
     let plugin = &plugins[0];
     assert_eq!(
@@ -181,7 +204,10 @@ fn popup_install_and_remove_change_only_tickloops_plugin_after_an_explicit_yes()
         assert!(!cancelled.succeeded, "{answer:?}: {cancelled:?}");
         assert!(cancelled.output.contains(INSTALL_PROMPT), "{cancelled:?}");
         assert!(cancelled.output.contains("cancelled"), "{cancelled:?}");
-        assert!(herdr.plugins().is_empty(), "{answer:?} links nothing");
+        assert!(
+            herdr.plugins_with_id(&state.plugin_id()).is_empty(),
+            "{answer:?} links nothing"
+        );
         assert_eq!(state.settings(), PRESERVED_SETTINGS, "{answer:?}");
         assert!(
             !state.config().join(PLUGIN_DIRECTORY).exists(),
@@ -189,13 +215,13 @@ fn popup_install_and_remove_change_only_tickloops_plugin_after_an_explicit_yes()
         );
     }
 
-    let foreign = herdr.link_foreign_plugin();
+    let foreign = herdr.link_other_plugin(&state.plugin_id());
     for change in ["install", "remove"] {
         let refused = state.run_in_terminal(change, &herdr, b"y\r");
         assert!(!refused.succeeded, "{change}: {refused:?}");
         assert!(!refused.output.contains("[y/N]"), "{change} asks nothing");
-        assert!(refused.output.contains(PLUGIN_ID), "{refused:?}");
-        let plugins = herdr.plugins();
+        assert!(refused.output.contains(&state.plugin_id()), "{refused:?}");
+        let plugins = herdr.plugins_with_id(&state.plugin_id());
         assert_eq!(plugins.len(), 1);
         assert_eq!(
             plugins[0]["plugin_root"],
@@ -205,7 +231,7 @@ fn popup_install_and_remove_change_only_tickloops_plugin_after_an_explicit_yes()
         assert_eq!(state.settings(), PRESERVED_SETTINGS);
     }
     herdr
-        .request("plugin.unlink", json!({"plugin_id": PLUGIN_ID}))
+        .request("plugin.unlink", json!({"plugin_id": state.plugin_id()}))
         .unwrap();
     let absent = state.run_in_terminal("remove", &herdr, b"y\r");
     assert!(!absent.succeeded, "nothing to remove: {absent:?}");
@@ -240,10 +266,14 @@ fn popup_install_and_remove_change_only_tickloops_plugin_after_an_explicit_yes()
 
     let removed = state.run_in_terminal("remove", &herdr, b"y\r");
     assert!(removed.succeeded, "{removed:?}");
-    for fact in [PLUGIN_ID, "full screen", "running Ticks keep running"] {
+    for fact in [
+        state.plugin_id().as_str(),
+        "full screen",
+        "running Ticks keep running",
+    ] {
         assert!(removed.output.contains(fact), "{fact}: {removed:?}");
     }
-    assert!(herdr.plugins().is_empty());
+    assert!(herdr.plugins_with_id(&state.plugin_id()).is_empty());
     assert_eq!(
         state.settings_value(),
         json!({"prefersReducedMotion": true, "monitorPopup": "disabled"})
@@ -387,7 +417,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         herdr.request(
             "plugin.pane.open",
             json!({
-                "plugin_id": PLUGIN_ID,
+                "plugin_id": state.plugin_id(),
                 "entrypoint": "attach",
                 "env": {"TICKLOOP_MONITOR_ATTACH": serde_json::to_string(grant).unwrap()},
             }),
@@ -512,7 +542,7 @@ fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
     let opened = herdr.request(
         "plugin.pane.open",
         json!({
-            "plugin_id": PLUGIN_ID,
+            "plugin_id": state.plugin_id(),
             "entrypoint": "attach",
             "env": {"TICKLOOP_MONITOR_ATTACH": serde_json::to_string(&unreachable).unwrap()},
         }),
@@ -537,4 +567,126 @@ fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
     wait_until("the attach process exits", || {
         popup_attach_processes(&herdr).is_empty().then_some(())
     });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_configuration_roots_float_their_own_ticks_in_one_herdr_session() {
+    let herdr = PrivateHerdr::start();
+    let states = [State::with_root(true), State::new()];
+    assert_eq!(states[0].plugin_id(), "tickloop.monitor");
+    assert_ne!(states[0].plugin_id(), states[1].plugin_id());
+    for state in &states {
+        let installed = state.run_in_terminal("install", &herdr, b"y\r");
+        assert!(installed.succeeded, "{installed:?}");
+        assert!(
+            installed.output.contains(&state.plugin_id()),
+            "{installed:?}"
+        );
+        assert_our_plugin(&herdr, state);
+    }
+    let original = herdr.plugins_with_id(&states[0].plugin_id());
+    let refreshed = states[1].run_in_terminal("install", &herdr, b"y\r");
+    assert!(refreshed.succeeded, "{refreshed:?}");
+    assert_eq!(herdr.plugins_with_id(&states[0].plugin_id()), original);
+    herdr.create_workspace();
+    let mut client = HerdrClient::attach(&herdr);
+    client.shows("tickloop-test");
+    let mut ticks = Vec::new();
+    for state in &states {
+        let config = state.config();
+        let controller = HostController::new(
+            &config,
+            tickhost::paths::HostPaths::of_config_root(Some(&config)),
+            Uuid::new_v4(),
+            support::hosted::executable_in(&config),
+            support::hosted::IDLE_TIMEOUT,
+        );
+        let owner = tickhost::host::TickOwner {
+            root: "fixture-root".into(),
+            chat: Uuid::new_v4(),
+        };
+        let script = config.join("keys.py");
+        std::fs::write(&script, KEYS_TICK).unwrap();
+        let opened = controller
+            .open(tickhost::host::OpenRequest {
+                operation: Uuid::new_v4(),
+                owner: owner.clone(),
+                owner_revision: 0,
+                adapter: tickhost::host::TickAdapter::Protocol,
+                command: support::hosted::python_program(&script, &[]),
+                cwd: config,
+                environment: support::hosted::tick_environment(),
+                title: None,
+            })
+            .await
+            .unwrap();
+        ticks.push((controller, owner, opened));
+    }
+    assert_ne!(ticks[0].2.business_pid, ticks[1].2.business_pid);
+    for (index, (state, (controller, owner, opened))) in states.iter().zip(&ticks).enumerate() {
+        let grant = controller
+            .allow_view(owner, &opened.instance)
+            .await
+            .unwrap();
+        herdr
+            .request(
+                "plugin.pane.open",
+                json!({
+                    "plugin_id": state.plugin_id(), "entrypoint": "attach",
+                    "env": {"TICKLOOP_MONITOR_ATTACH": serde_json::to_string(&grant).unwrap()},
+                }),
+            )
+            .unwrap();
+        let shown = client.shows("keys");
+        assert!(shown.contains("┌Tickloop"), "{shown}");
+        client.send(if index == 0 { b"x" } else { b"y" });
+        client.shows(if index == 0 { "keys 78" } else { "keys 79" });
+        for (other_index, (host, tick_owner, tick)) in ticks.iter().enumerate() {
+            let listed = row(&host.list(tick_owner, None).await.unwrap(), tick);
+            assert_eq!(listed["views"], usize::from(index == other_index));
+            assert_eq!(listed["business_pid"], tick.business_pid);
+        }
+        client.send(b"\x1b");
+        wait_until("the root's popup closes", || {
+            (!client.screen().contains("┌Tickloop")).then_some(())
+        });
+        wait_until("the root's attach exits", || {
+            popup_attach_processes(&herdr).is_empty().then_some(())
+        });
+    }
+    let removed = states[1].run_in_terminal("remove", &herdr, b"y\r");
+    assert!(removed.succeeded, "{removed:?}");
+    assert!(
+        removed.output.contains(&states[1].plugin_id()),
+        "{removed:?}"
+    );
+    assert!(herdr.plugins_with_id(&states[1].plugin_id()).is_empty());
+    assert_eq!(herdr.plugins_with_id(&states[0].plugin_id()), original);
+    assert_eq!(states[0].settings_value()["monitorPopup"], "enabled");
+    assert_eq!(states[1].settings_value()["monitorPopup"], "disabled");
+    let (controller, owner, opened) = &ticks[0];
+    let grant = controller
+        .allow_view(owner, &opened.instance)
+        .await
+        .unwrap();
+    herdr
+        .request(
+            "plugin.pane.open",
+            json!({
+                "plugin_id": states[0].plugin_id(), "entrypoint": "attach",
+                "env": {"TICKLOOP_MONITOR_ATTACH": serde_json::to_string(&grant).unwrap()},
+            }),
+        )
+        .unwrap();
+    client.shows("keys 78");
+    client.send(b"\x1b");
+    wait_until("the remaining popup closes", || {
+        popup_attach_processes(&herdr).is_empty().then_some(())
+    });
+    for (controller, owner, opened) in ticks {
+        controller
+            .close(Uuid::new_v4(), &owner, &opened.instance)
+            .await
+            .unwrap();
+    }
 }

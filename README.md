@@ -69,6 +69,20 @@ Keys:
 - In the Monitor, `enter` opens a Tick and `esc` hides it again; the program keeps running.
 - To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
+Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
+
+## Instructions
+
+The agent follows standing instructions from Markdown files, read in this order (later files weigh more):
+
+1. Your own instructions for every project: `~/.tickloop/AGENTS.md`. Without it, `~/.claude/CLAUDE.md` and `~/.claude/rules/*.md` are used instead.
+2. Each directory from the top of the filesystem down to the working directory: its `AGENTS.md`, or, in a directory without one, its `CLAUDE.md`, `.claude/CLAUDE.md` and `.claude/rules/*.md`. An `AGENTS.md` in a parent folder therefore applies to every project below it.
+3. A directory's `CLAUDE.local.md`, your private notes that stay out of Git, is always read.
+
+To keep a directory's `CLAUDE.md` from being read, put an `AGENTS.md` there; an empty one is enough. Likewise, any `~/.tickloop/AGENTS.md`, even an empty one, keeps `~/.claude` from being read. A rule file with `paths` in its frontmatter is left out. Write `@path` to bring in another file (`@docs/style.md`, `@~/notes.md`); a project's files can only bring in files inside the working directory, while your own instructions can bring in any file. Files are read when a conversation starts and again after `/compact`.
+
+To reuse instructions written for another tool, bring them in from `~/.tickloop/AGENTS.md` (for example `@~/.codex/AGENTS.md`), or add an `AGENTS.md` to the project that brings in its existing file (for example `@GEMINI.md`).
+
 ## Ticks
 
 A Tick is a live program the agent can open, watch and act on, such as a market data feed or a document reader. Ticks are installed like plugins and share their marketplaces and storage, but you manage them on their own: open `/ticks` to find, install and log in to them, or use the command line:
@@ -114,7 +128,7 @@ tickloop plugin uninstall NAME --keep-data  # keeps plugin data too
 
 The built-in marketplaces are `tickloop` and `claude-plugins-official`. They cannot be removed; the Git marketplace downloads on first use. Install with just `NAME` when its source is unambiguous; if several marketplaces offer it, the command lists candidates (or uses the source of an existing installation). To switch an installed name to another marketplace, uninstall it first. A plugin from a Git marketplace whose Tick program shows only once installed is installed by `tickloop plugin`, then reported and managed as a Tick.
 
-Register other sources from the command line; `/ticks` and `/plugins` both read them:
+Register other sources on the **Marketplaces** page of `/plugins` or from the command line; `/ticks` and `/plugins` both read them:
 
 ```sh
 tickloop plugin marketplace add OWNER/REPO
@@ -135,6 +149,8 @@ tickloop plugin install --path ./my-plugin
 Local-path installations are updated only by running `install --path` again, even at the same version; `update` and the panels do not update them. `validate` reports the manifest, components and path warnings; installation additionally checks the file tree. A failed installation leaves the previous installation intact. If a plugin is marked unusable, reinstall it from its original source; an unusable plugin whose kind cannot be read is listed in both `/ticks` and `/plugins`.
 
 `/plugins` works like `/ticks`: Installed and Available pages, `Enter` for actions (enable/disable, update) or to install, `/` to filter, and `x` twice to uninstall. Installed rows also show unsupported components. A failed marketplace has its own error row, summarized in at most three lines; other sources and Installed remain usable.
+
+The third page of `/plugins`, **Marketplaces**, does what `tickloop plugin marketplace` does. Each row shows the name, source, when it was last updated and whether it is built in; a marketplace that cannot be read shows its error under its row. `a` opens a one-line field that takes the same sources as `marketplace add`; `Enter` adds, `Ctrl+G` opens an editor and `Esc` cancels. `Enter` on a row reads that marketplace again, like `marketplace update NAME`. `x` twice on the same row within 3 seconds removes it and keeps the plugins installed from it; the built-in marketplaces cannot be removed. Adding, updating and removing run in the background, and the Available page follows. `/ticks` has no Marketplaces page and points to `/plugins`.
 
 Type `/` to discover user-invocable Skills for the current folder, including built-in, user, project and enabled plugin and Tick Skills. The Skills group shows each name, description and source; use `Ctrl+N` / `Ctrl+P` to select, then `Enter` or `Tab` to complete. Completion refreshes when Skills or plugins change. Invoke `/plugin:skill [ARGUMENTS]`, or `/skill [ARGUMENTS]` when that short name is unique. Ambiguous short names list the full names to use; exact names win, and built-in commands always take precedence. Each invocation displays a `Skill · name · source` row, preserved when reopening history.
 

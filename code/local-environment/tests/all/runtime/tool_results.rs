@@ -49,7 +49,7 @@ fn conversation(request: &ModelRequest) -> Vec<String> {
     request
         .messages
         .iter()
-        .filter(|message| message.role != Role::System)
+        .filter(|message| tickloop_harness::test_support::is_conversation(message))
         .map(|message| serde_json::to_string(message).unwrap())
         .collect()
 }

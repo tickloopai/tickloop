@@ -20,8 +20,9 @@ pub use kind::PluginKind;
 pub use login::{LoggedOut, log_out, start_login};
 pub use marketplace::MarketplaceSource;
 pub use marketplaces::{
-    MarketplaceOffer, PluginRequest, install_from, installed_status, plugin_http, read_marketplace,
-    read_marketplaces, source_label, unavailable_reason,
+    MarketplaceOffer, PluginRequest, add_marketplace, install_from, installed_status,
+    marketplace_registration, marketplace_state, plugin_count, plugin_http, read_marketplace,
+    read_marketplaces, remove_marketplace, source_label, unavailable_reason, update_marketplace,
 };
 pub use tick_oauth::{DeviceLogin, LoginError};
 

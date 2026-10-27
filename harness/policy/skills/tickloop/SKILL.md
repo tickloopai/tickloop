@@ -57,7 +57,7 @@ A Tick whose data source refuses its login ends with an authorization diagnostic
 
 ### Show it to the user
 
-The user opens a Tick from its Monitor row: Enter or a click shows a view of the same running process, inside Herdr in Tickloop's popup and otherwise full screen in their terminal. Esc hides the view and the Tick keeps running; Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the program. A background Shell row opens the same kind of view, with its description, command, directory, status and live output. The first time inside Herdr, Monitor offers once to register the popup plugin. Say where to find the Tick rather than promising a window.
+The user opens a Tick from its Monitor row: Enter or a click shows a view of the same running process, inside Herdr in Tickloop's popup and otherwise full screen in their terminal. Esc hides the view and the Tick keeps running; Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the program. A background Shell row opens the same kind of view, with its description, command, directory, status and live output. The first time inside Herdr, Monitor offers once to register the popup plugin for the current configuration root; released and development roots can each have their own plugin in the same Herdr session. Say where to find the Tick rather than promising a window.
 
 ### Read, operate, close or reopen
 

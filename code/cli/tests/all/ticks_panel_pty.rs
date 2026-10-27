@@ -29,6 +29,7 @@ const CONTROL_N: &[u8] = b"\x0e";
 const CONTROL_P: &[u8] = b"\x10";
 pub(crate) const ESCAPE: &[u8] = b"\x1b";
 const TAB: &[u8] = b"\t";
+const BACK_TAB: &[u8] = b"\x1b[Z";
 pub(crate) struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
@@ -867,7 +868,7 @@ fn available_plugins_install_from_each_marketplace_despite_another_marketplace_e
             && dialog_text(frame).contains("Its manifest calls it Notebook")
     });
     terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter"));
-    terminal.press(TAB, "installed alias metadata", |frame| {
+    terminal.press(BACK_TAB, "installed alias metadata", |frame| {
         frame.contains("manifest name: Notebook")
             && row_shows(frame, "notes", "team · enabled · 1.0.0 · no login needed")
             && !dialog(frame).contains("cannot read marketplace")
@@ -1014,7 +1015,7 @@ fn available_status_distinguishes_marketplace_ownership_and_broken_plugins() {
             .contains("cannot install unsupported@first: npm sources are not supported yet")
     });
     terminal.press(ESCAPE, "leave filter", |frame| frame.contains("/ filter"));
-    terminal.press(TAB, "installed owner", |frame| {
+    terminal.press(BACK_TAB, "installed owner", |frame| {
         frame.contains("[Installed]")
     });
     terminal.press(b"\r", "repair action", |frame| frame.contains("❯ Update"));

@@ -916,7 +916,7 @@ mod child_result_tests {
     use std::sync::Arc;
 
     use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-    use tickloop_harness_protocol::{Content, Role, SUBAGENT_TOOL_NAME};
+    use tickloop_harness_protocol::{Content, SUBAGENT_TOOL_NAME};
     use tickloop_harness_test_support::routed::{has_tool_result, tool_result};
     use tickloop_harness_test_support::{ScriptedModel, call, config, text};
     use tokio::sync::mpsc::UnboundedSender;
@@ -953,7 +953,7 @@ mod child_result_tests {
             let is_child = request
                 .messages
                 .iter()
-                .find(|message| message.role != Role::System)
+                .find(|message| tickloop_harness_test_support::is_conversation(message))
                 .is_some_and(|message| {
                     matches!(message.content.first(), Some(Content::Text { text }) if text.starts_with("<agent-message>"))
                 });

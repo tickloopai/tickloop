@@ -29,7 +29,9 @@ pub const SHORT_TEMP_ROOT: &str = "/tmp";
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
 use tickloop_harness_model::*;
-use tickloop_harness_protocol::{Content, InputModality, ModelConfig, Protocol, Role, Usage};
+use tickloop_harness_protocol::{
+    Content, InputModality, Message, ModelConfig, Protocol, Role, Usage,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -140,6 +142,18 @@ impl ModelClient for ScriptedModel {
             stop_reason: "end_turn".into(),
         })
     }
+}
+
+/// Whether `message` is the user context message that leads every conversation request.
+pub fn is_user_context(message: &Message) -> bool {
+    message.role == Role::User
+        && matches!(message.content.as_slice(), [Content::Text { text }]
+            if text.starts_with(tickloop_harness_policy::instructions::USER_CONTEXT_OPENING))
+}
+
+/// Whether `message` is part of the conversation: neither the system prompt nor the user context.
+pub fn is_conversation(message: &Message) -> bool {
+    message.role != Role::System && !is_user_context(message)
 }
 
 pub fn config() -> ModelConfig {

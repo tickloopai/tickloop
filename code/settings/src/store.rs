@@ -152,4 +152,11 @@ impl SettingsStore for UserSettings {
     > {
         crate::loop_skill::LoopFiles::new(folder, self.root()).instructions()
     }
+
+    fn instruction_files(
+        &self,
+        folder: Option<&Path>,
+    ) -> Vec<tickloop_harness::policy::instructions::InstructionFile> {
+        crate::instructions::instruction_files(folder, self.root(), self.home_directory())
+    }
 }

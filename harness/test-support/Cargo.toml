@@ -19,6 +19,7 @@ regex = "1"
 serde_json = "1"
 # The tests of every Agent crate reach the model's test-only seams through this crate.
 tickloop-harness-model = { path = "../model", features = ["test-support"] }
+tickloop-harness-policy = { path = "../policy" }
 tickloop-harness-protocol = { path = "../protocol" }
 # The in-memory Transcript store implements the runtime's TranscriptStore seam.
 tickloop-harness-runtime = { path = "../runtime", features = ["test-support"] }

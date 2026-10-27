@@ -52,6 +52,37 @@ impl Agent {
     /// Claude Code's `plan_mode_exit` attachment: the first request after the user left Plan mode
     /// without approving a plan tells the model once that plan mode ended. A Chat back in Plan by
     /// then drops the notice.
+    /// Claude Code's `date_change` attachment: once the user's date moves past the one the model
+    /// was last told, a note at the end of the conversation tells it the new date, leaving the
+    /// user context and every earlier message unchanged for the prompt cache.
+    pub(super) async fn announce_date_change(&self, receipt: &Receipt) -> Result<(), AgentError> {
+        let current_date = self.current_date();
+        let (snapshot, bookkeeping) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            let is_stale = chat
+                .announced_date
+                .as_ref()
+                .is_some_and(|announced| *announced != current_date);
+            if chat.active_run != Some(receipt.run_id) || !is_stale {
+                return Ok(());
+            }
+            append_note(
+                &mut chat.snapshot,
+                receipt,
+                tickloop_harness_policy::instructions::date_change_message(&current_date),
+                HostNote::DateChange(current_date.clone()),
+            );
+            chat.announced_date = Some(current_date);
+            (chat.snapshot.clone(), chat.bookkeeping.clone())
+        };
+        self.checkpoint_transcript(&snapshot, &bookkeeping)
+            .await
+            .map_err(AgentError::Storage)
+    }
+
     pub(super) async fn announce_plan_mode_exit(
         &self,
         receipt: &Receipt,

@@ -15,6 +15,14 @@ use uuid::Uuid;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 pub const PLUGIN_ID: &str = "tickloop.monitor";
+/// Expected id for a non-default private configuration root.
+pub fn popup_plugin_id(root: &Path) -> String {
+    format!(
+        "{PLUGIN_ID}.{}",
+        tick_packages::config_root_runtime_key(root).unwrap()
+    )
+}
+
 pub const HERDR_CONFIG: &str = r#"onboarding = false
 [terminal]
 default_shell = "/bin/sh"
@@ -140,22 +148,12 @@ impl PrivateHerdr {
         created["root_pane"]["pane_id"].as_str().unwrap().to_owned()
     }
 
-    /// The plugins this server lists under Tickloop's plugin id.
-    pub fn plugins(&self) -> Vec<Value> {
-        self.plugins_with_id(PLUGIN_ID)
-    }
-
     pub fn plugins_with_id(&self, id: &str) -> Vec<Value> {
         self.request("plugin.list", json!({"plugin_id": id}))
             .unwrap()["plugins"]
             .as_array()
             .unwrap()
             .clone()
-    }
-
-    /// Links a plugin Tickloop did not write under Tickloop's plugin id.
-    pub fn link_foreign_plugin(&self) -> PathBuf {
-        self.link_other_plugin(PLUGIN_ID)
     }
 
     /// Links a minimal plugin Tickloop did not write under `id` and returns its root.

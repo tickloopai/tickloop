@@ -13,7 +13,7 @@ use tickloop_harness_artifacts::ClaimedFeedback;
 use tickloop_harness_model::ModelRequest;
 use tickloop_harness_protocol::{
     AgentHostOptions, ChatId, Content, EventSourceBinding, ExecutionMode, LoopId, LoopState,
-    PromptPolicy, Role,
+    PromptPolicy,
 };
 use tickloop_harness_runtime::transcript::{StorePosition, TranscriptStore};
 use tickloop_harness_runtime::{
@@ -400,7 +400,7 @@ fn is_member(request: &ModelRequest) -> bool {
     request
         .messages
         .iter()
-        .find(|message| message.role != Role::System)
+        .find(|message| tickloop_harness_test_support::is_conversation(message))
         .and_then(|message| message.content.first())
         .is_some_and(
             |content| matches!(content, Content::Text { text } if text.starts_with("<agent-message>")),

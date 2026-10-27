@@ -4,12 +4,14 @@
 
 use tick_packages::{CURRENT_TARGET, Marketplace, validate_package_name};
 use tick_plugins::{
-    Installation, InstalledPlugins, MarketplacePlugin, MarketplacePluginSource,
+    Installation, InstalledPlugins, MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource,
     MarketplaceRegistration, MarketplaceSource as PluginMarketplaceSource, PluginError,
     PluginStore, TICKLOOP_MARKETPLACE, validate_plugin_name,
 };
 
 use crate::{HttpClient, HttpRequest, MarketplaceSource};
+
+const SHORT_COMMIT_LENGTH: usize = 12;
 
 /// A plugin named on the command line: `NAME` or `NAME@MARKETPLACE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,82 @@ pub fn source_label(source: &PluginMarketplaceSource) -> String {
     }
 }
 
+/// Whether the marketplace `registration` is built in, and when it was last read.
+pub fn marketplace_state(registration: &MarketplaceRegistration) -> String {
+    let fetched = match (&registration.refreshed_at, &registration.commit) {
+        _ if registration.name == TICKLOOP_MARKETPLACE => "read on every use".to_owned(),
+        (None, _) => "not fetched yet".to_owned(),
+        (Some(at), None) => format!("updated {at}"),
+        (Some(at), Some(commit)) => format!(
+            "updated {at} at {}",
+            &commit[..commit.len().min(SHORT_COMMIT_LENGTH)]
+        ),
+    };
+    if registration.builtin {
+        format!("built in; {fetched}")
+    } else {
+        fetched
+    }
+}
+
+pub fn plugin_count(count: usize) -> String {
+    match count {
+        1 => "1 plugin".to_owned(),
+        count => format!("{count} plugins"),
+    }
+}
+
+pub fn marketplace_registration(
+    store: &PluginStore,
+    name: &str,
+) -> Result<MarketplaceRegistration, String> {
+    store
+        .marketplaces()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|registration| registration.name == name)
+        .ok_or_else(|| format!("marketplace {name} is not registered"))
+}
+
+/// Registers the marketplace `text` names: a local path, a Git URL, an HTTPS marketplace file or
+/// `OWNER/REPO[#REF]`.
+pub async fn add_marketplace(
+    http: &'static HttpClient,
+    store: &PluginStore,
+    text: &str,
+) -> Result<MarketplaceCatalog, String> {
+    let source = PluginMarketplaceSource::parse(text).map_err(|error| error.to_string())?;
+    store
+        .add_marketplace(&source, &plugin_http(http))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Reads the registered marketplace `name` afresh.
+pub async fn update_marketplace(
+    http: &'static HttpClient,
+    store: &PluginStore,
+    name: &str,
+) -> Result<Vec<MarketplacePlugin>, String> {
+    let registration = marketplace_registration(store, name)?;
+    read_marketplace(http, store, &registration, true).await
+}
+
+/// Unregisters the marketplace `name`; the plugins installed from it stay, and their IDs are
+/// returned.
+pub fn remove_marketplace(store: &PluginStore, name: &str) -> Result<Vec<String>, String> {
+    store
+        .remove_marketplace(name)
+        .map_err(|error| error.to_string())?;
+    let installed = store.installed().map_err(|error| error.to_string())?;
+    Ok(installed
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.marketplace == name)
+        .map(|plugin| plugin.id())
+        .collect())
+}
+
 /// Why `plugin` cannot be installed, if it cannot.
 pub fn unavailable_reason(plugin: &MarketplacePlugin) -> Option<String> {
     match &plugin.source {
@@ -133,7 +211,7 @@ fn tick_marketplace_plugins(marketplace: Marketplace) -> Vec<MarketplacePlugin> 
 }
 
 /// Reads every registered marketplace, each on its own, so one that cannot be read leaves the
-/// others.
+/// others; each offer carries its registration as the read left it.
 pub async fn read_marketplaces(
     http: &'static HttpClient,
     store: &PluginStore,
@@ -146,6 +224,15 @@ pub async fn read_marketplaces(
             registration,
             plugins,
         });
+    }
+    let current = store.marketplaces().map_err(|error| error.to_string())?;
+    for offer in &mut offers {
+        if let Some(registration) = current
+            .iter()
+            .find(|registration| registration.name == offer.registration.name)
+        {
+            offer.registration = registration.clone();
+        }
     }
     Ok(offers)
 }

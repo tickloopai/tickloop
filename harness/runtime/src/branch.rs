@@ -298,6 +298,8 @@ impl Agent {
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,
+                user_context: Default::default(),
+                announced_date: None,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 branch_reservation: None,
                 goal_recorded_tokens: 0,
