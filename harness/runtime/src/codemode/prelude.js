@@ -39,24 +39,40 @@
         if (name !== null) tools[identifier] = tools[name];
         else Object.defineProperty(tools, identifier, {get() {throw new Error("Ambiguous tool identifier; use tools['original-name']");}});
     }
+    // The script shares this realm and may replace builtins, so store state lives in
+    // prototype-free records reached only through syntax and functions captured here; the host
+    // checks the reported writes again.
+    const ownKeys = Object.keys;
     const MAX_STORE_VALUE_CHARS = 262144;
     const MAX_STORE_TOTAL_CHARS = 1048576;
+    const MAX_STORE_KEYS = 4096;
     const STORE_HINT = "store() is for small state such as IDs, cursors or summaries; keep large data in variables or write it to a file with a tool.";
-    const stored = new Map();
-    for (const [key, value] of Object.entries(parse(storeJson))) stored.set(key, stringify(value));
-    const writes = new Map();
+    const stored = Object.create(null);
+    const writes = Object.create(null);
+    const initialStore = parse(storeJson);
     let storedChars = 0;
-    for (const [key, json] of stored) storedChars += key.length + json.length;
+    let storedKeys = 0;
+    const initialKeys = ownKeys(initialStore);
+    for (let index = 0; index < initialKeys.length; index++) {
+        const key = initialKeys[index];
+        stored[key] = initialStore[key];
+        storedChars += key.length + stored[key].length;
+        storedKeys++;
+    }
     function checkKey(name, key) {
         if (typeof key !== "string") throw new TypeError(name + "() key must be a string");
     }
     function store(key, value) {
         checkKey("store", key);
-        const previous = stored.has(key) ? key.length + stored.get(key).length : 0;
+        const exists = key in stored;
+        const previous = exists ? key.length + stored[key].length : 0;
         if (value === undefined) {
-            stored.delete(key);
-            storedChars -= previous;
-            writes.set(key, undefined);
+            if (exists) {
+                delete stored[key];
+                storedChars -= previous;
+                storedKeys--;
+            }
+            writes[key] = undefined;
             return;
         }
         let json;
@@ -69,20 +85,30 @@
         if (next > MAX_STORE_TOTAL_CHARS) {
             throw new RangeError("store is full: keys and values would exceed " + MAX_STORE_TOTAL_CHARS + " characters of JSON. Delete keys with store(key, undefined). " + STORE_HINT);
         }
-        stored.set(key, json);
+        if (!exists && storedKeys >= MAX_STORE_KEYS) {
+            throw new RangeError("store is full: it holds at most " + MAX_STORE_KEYS + " keys. Delete keys with store(key, undefined). " + STORE_HINT);
+        }
+        if (!exists) storedKeys++;
+        stored[key] = json;
         storedChars = next;
-        writes.set(key, json);
+        writes[key] = json;
     }
     function load(key) {
         checkKey("load", key);
-        const json = stored.get(key);
-        return json === undefined ? undefined : parse(json);
+        return key in stored ? parse(stored[key]) : undefined;
     }
     function succeed() {
-        const entries = [];
-        for (const [key, json] of writes) entries.push(json === undefined ? [key] : [key, json]);
+        let report = "[";
+        let separator = "";
+        const keys = ownKeys(writes);
+        for (let index = 0; index < keys.length; index++) {
+            const key = keys[index];
+            const json = writes[key];
+            report += separator + "[" + stringify(key) + (json === undefined ? "" : "," + stringify(json)) + "]";
+            separator = ",";
+        }
         finished = true;
-        done(null, stringify(entries));
+        done(null, report + "]");
     }
     const text = value => { if (!finished) output(typeof value === "string" ? value : String(stringify(value))); };
     const console = Object.create(null);

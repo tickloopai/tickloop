@@ -97,7 +97,63 @@ async fn store_limits_count_key_and_json_characters() {
         result.output,
         "RangeError,TypeError,TypeError,TypeError,RangeError"
     );
-    assert!(result.store_writes.delete.contains("fill0"));
+    assert!(!result.store_writes.set.contains_key("fill0"));
+    assert!(
+        result.store_writes.delete.is_empty(),
+        "keys created and deleted in one script leave no write"
+    );
     assert!(result.store_writes.set.contains_key("over"));
     assert!(!result.store_writes.set.contains_key("big"));
+}
+
+#[tokio::test]
+async fn tampered_builtins_cannot_bypass_store_limits() {
+    let seed = BTreeMap::from([("seed".to_owned(), json!("kept"))]);
+    for source in [
+        r#"
+        Map.prototype.has = () => true;
+        Map.prototype.get = () => "x".repeat(1048576);
+        for (let index = 0; index < 5; index++) store("fill" + index, "x".repeat(262100));
+        "#,
+        r#"
+        Map.prototype.has = () => true;
+        Map.prototype.get = () => "";
+        for (let index = 0; index < 5000; index++) store("k" + index, index);
+        "#,
+    ] {
+        let result = run(
+            source,
+            Options {
+                store: seed.clone(),
+                ..Default::default()
+            },
+            vec![],
+            |_, _, _| async { unreachable!() },
+        )
+        .await;
+        assert!(result.error.is_some(), "{source}");
+        assert_eq!(result.store_writes, StoreWrites::default(), "{source}");
+    }
+    let result = run(
+        r#"
+        Array.prototype.toJSON = function () { return [["huge", JSON.stringify("x".repeat(300000))]]; };
+        Object.defineProperty(Array.prototype, Symbol.iterator, {value: function* () { yield "injected"; }});
+        store("small", 1);
+        "#,
+        Options {
+            store: seed,
+            ..Default::default()
+        },
+        vec![],
+        |_, _, _| async { unreachable!() },
+    )
+    .await;
+    assert_eq!(result.error, None);
+    assert_eq!(
+        result.store_writes,
+        StoreWrites {
+            set: BTreeMap::from([("small".to_owned(), json!(1))]),
+            delete: BTreeSet::new(),
+        }
+    );
 }
