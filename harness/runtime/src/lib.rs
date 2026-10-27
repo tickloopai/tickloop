@@ -480,6 +480,9 @@ struct Chat {
     /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
     /// plan, so the next request owes the model the exited-plan-mode notice.
     needs_plan_mode_exit_notice: bool,
+    /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from in this process. A load,
+    /// rewind or branch switch that changes the mode leaves it unknown.
+    mode_before_plan: Option<ExecutionMode>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     upgrade_wait: Option<Receipt>,
@@ -753,19 +756,20 @@ fn host_tool_decision(
     configured: Option<tickloop_harness_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     execution_mode: ExecutionMode,
+    mode_before_plan: Option<ExecutionMode>,
     has_human_input: bool,
 ) -> Decision {
     if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
-        return if execution_mode == ExecutionMode::Plan {
-            Decision::Deny
-        } else if let Some(rule) = configured {
-            Decision::from(rule.decision)
-        } else {
-            match execution_mode {
-                ExecutionMode::FullAccess => Decision::Allow,
-                ExecutionMode::Auto => Decision::Check,
-                _ => Decision::Ask,
-            }
+        // As in Claude Code, Plan decides third-party calls as the mode it was entered from.
+        let mode = match execution_mode {
+            ExecutionMode::Plan => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
+            mode => mode,
+        };
+        return match (configured, mode) {
+            (Some(rule), _) => Decision::from(rule.decision),
+            (None, ExecutionMode::FullAccess) => Decision::Allow,
+            (None, ExecutionMode::Auto) => Decision::Check,
+            (None, _) => Decision::Ask,
         };
     }
     let is_allowed_by_host = configured.is_some_and(|matched| {
@@ -856,6 +860,26 @@ fn host_tool_decision(
 }
 
 impl Chat {
+    /// Changes the execution mode, remembering the mode Plan is entered from.
+    fn change_execution_mode(&mut self, mode: ExecutionMode) {
+        self.mode_before_plan = match (self.snapshot.policy.mode, mode) {
+            (_, ExecutionMode::AcceptEdits | ExecutionMode::Auto | ExecutionMode::FullAccess) => {
+                None
+            }
+            (ExecutionMode::Plan, ExecutionMode::Plan) => self.mode_before_plan,
+            (current, ExecutionMode::Plan) => Some(current),
+        };
+        self.snapshot.policy.mode = mode;
+    }
+
+    /// Replaces the snapshot, forgetting the mode Plan was entered from if the mode changes.
+    fn replace_snapshot(&mut self, snapshot: ChatSnapshot) {
+        if snapshot.policy.mode != self.snapshot.policy.mode {
+            self.mode_before_plan = None;
+        }
+        self.snapshot = snapshot;
+    }
+
     fn has_human_input_for_run(&self, run: RunId) -> bool {
         approval_context::originals_for_active_chain(&self.snapshot, &self.bookkeeping)
             .is_ok_and(|inputs| inputs.iter().any(|input| input.run_id == run))
@@ -2288,6 +2312,7 @@ impl Agent {
                 bookkeeping,
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
+                mode_before_plan: None,
                 active: None,
                 active_run: None,
                 upgrade_wait: None,
@@ -4709,7 +4734,7 @@ impl Agent {
             (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
             _ => {}
         }
-        chat.snapshot.policy.mode = mode;
+        chat.change_execution_mode(mode);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         drop(chats);

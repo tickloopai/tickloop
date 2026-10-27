@@ -231,11 +231,11 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                         .await
                         .unwrap();
                 }
+                // Plan is entered from Ask here, so third-party calls are decided as in Ask.
                 let should_review = mode == ExecutionMode::Auto && decision.is_none();
-                let should_ask = mode != ExecutionMode::Plan
-                    && (decision == Some(Decision::Ask)
-                        || (decision.is_none()
-                            && !matches!(mode, ExecutionMode::FullAccess | ExecutionMode::Auto)));
+                let should_ask = decision == Some(Decision::Ask)
+                    || (decision.is_none()
+                        && matches!(mode, ExecutionMode::AcceptEdits | ExecutionMode::Plan));
                 let mut events = agent.subscribe();
                 agent.submit(chat, "Read the service".into()).await.unwrap();
                 let mut asked = false;
@@ -291,7 +291,7 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                 );
                 assert_eq!(
                     server.calls().len(),
-                    usize::from(mode != ExecutionMode::Plan && decision != Some(Decision::Deny))
+                    usize::from(decision != Some(Decision::Deny))
                 );
                 agent.shutdown().await;
             }
@@ -1072,4 +1072,189 @@ async fn auto_reviews_each_batched_mcp_call_against_the_whole_model_authored_bat
         assert_eq!(last.contains("external-code restriction"), !admitted);
         agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
+    for (before_plan, rule_decision, expect_review, expect_ask, expect_call) in [
+        (ExecutionMode::Auto, None, true, false, true),
+        (ExecutionMode::FullAccess, None, false, false, true),
+        (ExecutionMode::AcceptEdits, None, false, true, true),
+        (
+            ExecutionMode::FullAccess,
+            Some(Decision::Ask),
+            false,
+            true,
+            true,
+        ),
+        (
+            ExecutionMode::FullAccess,
+            Some(Decision::Deny),
+            false,
+            false,
+            false,
+        ),
+        (
+            ExecutionMode::Auto,
+            Some(Decision::Deny),
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let label = format!("{before_plan:?} {rule_decision:?}");
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("read", &tool, json!({})),
+                text("done"),
+            ])),
+        );
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(
+            &auto_classification(false).to_string(),
+        )]));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent.set_execution_mode(chat, before_plan).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .unwrap();
+        if let Some(decision) = rule_decision {
+            agent
+                .set_permission_rules(chat, vec![rule("mcp__review", decision)])
+                .await
+                .unwrap();
+        }
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Look it up".into()).await.unwrap();
+        let mut asked = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert!(!asked, "{label}");
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(asked, expect_ask, "{label}");
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            usize::from(expect_review),
+            "{label}"
+        );
+        assert_eq!(server.calls().len(), usize::from(expect_call), "{label}");
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Plan,
+            "{label}"
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("plan", "EnterPlanMode", json!({})),
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    let reviewer = Arc::new(ScriptedModel::new(vec![text(
+        &auto_classification(false).to_string(),
+    )]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Plan the lookup".into()).await.unwrap();
+    let mut prompts = Vec::new();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                prompts.push(request.name.clone());
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(prompts, ["EnterPlanMode"]);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn reentering_plan_forgets_the_mode_an_earlier_plan_was_entered_from() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [
+        ExecutionMode::FullAccess,
+        ExecutionMode::Plan,
+        ExecutionMode::Plan,
+        ExecutionMode::AcceptEdits,
+        ExecutionMode::Plan,
+    ] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    let mut asked = false;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                asked = true;
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(asked, "Plan was last entered from Ask");
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
 }
