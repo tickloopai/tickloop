@@ -201,15 +201,15 @@ impl Entry {
                 self.secret_generation.fetch_add(1, Ordering::SeqCst);
                 *self.redactor.write().unwrap() = Some(Arc::new(redactor));
                 self.redactor_builds.fetch_add(1, Ordering::Relaxed);
-                *self.description.write().unwrap() = redact(self, self.config.description.clone());
-                *self.config_failure.write().unwrap() = match &self.config.transport {
-                    McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
-                    _ => None,
-                };
                 true
             } else {
                 false
             }
+        };
+        *self.description.write().unwrap() = redact(self, self.config.description.clone());
+        *self.config_failure.write().unwrap() = match &self.config.transport {
+            McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
+            _ => None,
         };
         if changed && let Some(connection) = self.connection.read().unwrap().clone() {
             self.publish_catalog(&connection);
@@ -399,6 +399,12 @@ impl McpConnections {
                 .unwrap()
                 .get(&config.name)
                 .cloned();
+            let previous_redactor = existing
+                .as_ref()
+                .and_then(|entry| entry.redactor.read().unwrap().clone());
+            let previous_secret_generation = existing
+                .as_ref()
+                .map_or(0, |entry| entry.secret_generation.load(Ordering::SeqCst));
             let previous_generation = existing
                 .as_ref()
                 .map_or(0, |entry| entry.generation.load(Ordering::SeqCst));
@@ -451,10 +457,10 @@ impl McpConnections {
                     .map(|(_, value)| value.clone())
                     .collect();
                 let entry = Arc::new(Entry {
-                    redactor: RwLock::new(None),
+                    redactor: RwLock::new(previous_redactor),
                     publication: std::sync::Mutex::new(()),
                     generation: AtomicU64::new(previous_generation),
-                    secret_generation: AtomicU64::new(0),
+                    secret_generation: AtomicU64::new(previous_secret_generation),
                     description: RwLock::new(String::new()),
                     config_failure: RwLock::new(None),
                     catalog_builds: self.inner.catalog_builds.clone(),

@@ -3050,7 +3050,7 @@ impl Agent {
         let _ = self.inner.events.send(event);
     }
 
-    #[tracing::instrument(skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
+    #[tracing::instrument(target = "tickloop::request_timing", skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     async fn model_request(
         &self,
         receipt: &Receipt,

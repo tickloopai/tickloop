@@ -2384,6 +2384,8 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    let unchanged = McpService::start().await;
+    unchanged.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let saved = |secret: &str| {
         tickloop_harness_runtime::mcp::ConnectorCredential {
@@ -2404,7 +2406,7 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     );
     let configs = Arc::new(std::sync::Mutex::new(vec![
         http_config("changed", &server),
-        http_config("unchanged", &server),
+        http_config("unchanged", &unchanged),
     ]));
     let source = configs.clone();
     let provider = McpToolProvider::new(
@@ -2415,13 +2417,14 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     let before = connections.performance_counts();
     server.set_tools(json!([{"name":"second","inputSchema":{"type":"object"}}]));
     server.notify_tools_changed();
+    assert!(matches!(connections.call("mcp__changed__probe", json!({}), CancellationToken::new()).await, HostCallResult::Completed(_)));
     tokio::time::timeout(Duration::from_secs(5), async {
         while provider
             .definitions()
             .iter()
             .filter(|tool| tool.name.ends_with("__second"))
             .count()
-            != 2
+            != 1
         {
             tokio::task::yield_now().await;
         }
@@ -2429,12 +2432,12 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     .await
     .unwrap();
     let listed = connections.performance_counts();
-    assert_eq!(listed, (before.0 + 2, before.1));
+    assert_eq!(listed, (before.0 + 1, before.1));
     configs.lock().unwrap()[0].description = "new description".into();
     provider.refresh(CancellationToken::new()).await.unwrap();
     settled(&connections).await;
     let configured = connections.performance_counts();
-    assert_eq!(configured, (listed.0 + 1, listed.1 + 1));
+    assert_eq!(configured, (listed.0 + 1, listed.1));
     let secret = "new/private+token\"value";
     let encoded = percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
         .to_string();

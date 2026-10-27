@@ -845,6 +845,7 @@ impl Agent {
                         );
                     }
                 }
+                crate::timing::dispatched();
                 match model_context {
                     Some(model_context) => {
                         client
@@ -899,7 +900,7 @@ impl Agent {
                     Some(delta) = receiver.recv() => {
                         if first_event {
                             first_event = false;
-                            tracing::debug!(chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
+                            tracing::debug!(target: "tickloop::request_timing", chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
                         }
                         if let Err(error) = self.buffer_model_delta(&context, sequence, delta,
                             &cancel, &mut progress).await {

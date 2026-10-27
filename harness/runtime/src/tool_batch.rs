@@ -154,7 +154,7 @@ impl Agent {
     }
 
     /// The tools a model request of the Run offers, after refreshing what they depend on.
-    #[tracing::instrument(skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
+    #[tracing::instrument(target = "tickloop::request_timing", skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     pub(super) async fn prepare_tool_registry(
         &self,
         receipt: &Receipt,
