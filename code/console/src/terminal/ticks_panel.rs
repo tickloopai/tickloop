@@ -34,7 +34,7 @@ use super::{
     conversation_picker::{ConversationPickerFrame, compact_line, ellipsize, fit_hint},
     display::{DisplayProfile, Glyph},
     editor::{Editor, EditorCommand},
-    list_row::ListRow,
+    list_row::{ListRow, push_details},
     permissions_surface::{edit_text, editor_window, filtered_list_step, tab_header_line},
     safe_line,
     style::{Role, RoleLine},
@@ -1434,6 +1434,11 @@ impl TicksPanel {
     fn list_rows(&self, width: usize, display: DisplayProfile) -> Vec<(usize, Vec<RoleLine>)> {
         let glyph = display.glyph(Glyph::ProtocolTick);
         let selected = self.selected[self.page];
+        let filter = if self.page == MARKETPLACE_PAGE {
+            self.filter.draft()
+        } else {
+            ""
+        };
         let row = |index: usize, name: &str, details: String, glyph_role: Role| {
             let separate_details = glyph.width() + name.width() + details.width() + 3 > width;
             let mut lines = ListRow {
@@ -1450,13 +1455,21 @@ impl TicksPanel {
                 subscription: None,
                 bar_columns: None,
             }
-            .lines(width);
+            .lines_matching(width, filter);
             if separate_details {
-                lines.extend(
-                    wrap_text(&details, width.saturating_sub(2).max(1))
-                        .into_iter()
-                        .map(|line| RoleLine::role(format!("  {line}"), Role::MutedText)),
-                );
+                // The source leads the details, so only their first line can hold its match.
+                for (number, text) in wrap_text(&details, width.saturating_sub(2).max(1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut line = RoleLine::role("  ", Role::MutedText);
+                    if number == 0 {
+                        push_details(&mut line, &text, Role::MutedText, filter);
+                    } else {
+                        line.push(text, Some(Role::MutedText));
+                    }
+                    lines.push(line);
+                }
             }
             lines
         };
@@ -1608,8 +1621,19 @@ impl TicksPanel {
             let index = rows.len();
             let lines = marketplace_error_lines(marketplace, error, width)
                 .into_iter()
-                .map(|line| {
-                    let line = RoleLine::role(line, Role::Error);
+                .enumerate()
+                .map(|(number, text)| {
+                    let mut line = RoleLine::default();
+                    // The filter matched the marketplace's name, which only the first line holds.
+                    match text.strip_prefix(MARKETPLACE_ERROR_LEAD) {
+                        Some(rest) if number == 0 => {
+                            let name_end = rest.find(": ").unwrap_or(rest.len());
+                            line.push(MARKETPLACE_ERROR_LEAD, Some(Role::Error));
+                            line.push_matching(&rest[..name_end], Some(Role::Error), filter);
+                            line.push(&rest[name_end..], Some(Role::Error));
+                        }
+                        _ => line.push(text, Some(Role::Error)),
+                    }
                     if index == selected {
                         line.filled(Role::Selection)
                     } else {
@@ -1940,9 +1964,11 @@ impl TicksPanel {
 
 /// Why the marketplace `name` cannot be read, wrapped at `width` in at most
 /// [`MARKETPLACE_ERROR_ROWS`] rows.
+const MARKETPLACE_ERROR_LEAD: &str = "cannot read marketplace ";
+
 fn marketplace_error_lines(name: &str, error: &str, width: usize) -> Vec<String> {
     let mut text = wrap_text(
-        &safe_line(&format!("cannot read marketplace {name}: {error}")),
+        &safe_line(&format!("{MARKETPLACE_ERROR_LEAD}{name}: {error}")),
         width.max(1),
     );
     if text.len() > MARKETPLACE_ERROR_ROWS {
@@ -3255,5 +3281,105 @@ mod tests {
         press(&mut panel, KeyCode::Char('j'));
         press(&mut panel, KeyCode::Char('k'));
         assert_eq!(panel.filter_text(), "packagejk");
+    }
+
+    /// The loaded panel's Available page filtered by `filter`, with sample described as
+    /// `sample_description`.
+    fn filtered_panel(filter: &str, sample_description: &str) -> TicksPanel {
+        let mut panel = loaded_panel();
+        let mut offers = marketplace(&[("alpha", "2.0.0", true), ("sample", "1.0.0", true)]);
+        offers[0].plugins.as_mut().unwrap()[1].description = Some(sample_description.into());
+        panel.apply(marketplace_result(Ok(offers)));
+        press(&mut panel, KeyCode::Tab);
+        press(&mut panel, KeyCode::Char('/'));
+        for character in filter.chars() {
+            press(&mut panel, KeyCode::Char(character));
+        }
+        panel
+    }
+
+    /// The text of every span drawn as a filter match at `width`.
+    fn matches_at(panel: &mut TicksPanel, width: usize) -> Vec<String> {
+        panel
+            .frame(width, HEIGHT, DisplayProfile::default())
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.role == Some(Role::FilterMatch))
+            .map(|span| span.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_filter_emphasizes_its_matches_in_names_and_descriptions_ignoring_case() {
+        let mut panel = filtered_panel("ALP", "The sample package");
+        assert_eq!(matches_at(&mut panel, WIDTH), ["alp", "alp"]);
+        let mut panel = filtered_panel("package", "The sample package");
+        assert_eq!(matches_at(&mut panel, WIDTH), ["package", "package"]);
+        let mut panel = filtered_panel("Sample Pack", "The sample package");
+        assert_eq!(matches_at(&mut panel, WIDTH), ["sample pack"]);
+    }
+
+    #[test]
+    fn the_filter_emphasizes_the_marketplace_but_not_the_version_or_state_beside_it() {
+        let mut panel = filtered_panel("tickloop", "Installed tickloop helper");
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("tickloop · 1.0.0 · not installed"),
+            "{shown}"
+        );
+        assert_eq!(
+            matches_at(&mut panel, WIDTH),
+            ["tickloop", "tickloop", "tickloop"],
+            "{shown}"
+        );
+        let mut panel = filtered_panel("install", "Installs everything");
+        assert_eq!(matches_at(&mut panel, WIDTH), ["Install"]);
+    }
+
+    #[test]
+    fn a_match_cut_off_by_the_row_width_leaves_the_row_intact() {
+        let description = "The sample package that reads every shared drive";
+        let mut panel = filtered_panel("drive", description);
+        let width = 40;
+        let lines = panel.frame(width, HEIGHT, DisplayProfile::default()).lines;
+        assert!(lines.iter().all(|line| line.text().width() <= width));
+        let sample = lines
+            .iter()
+            .find(|line| line.text().contains("sample · The sample"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(sample.text().ends_with('…'), "{}", sample.text());
+        assert!(matches_at(&mut panel, width).is_empty());
+        assert_eq!(matches_at(&mut panel, 120), ["drive"]);
+    }
+
+    #[test]
+    fn the_filter_emphasizes_wide_characters_whole() {
+        let mut panel = filtered_panel("云盘", "读取团队云盘的插件");
+        assert_eq!(matches_at(&mut panel, WIDTH), ["云盘"]);
+        let lines = frame(&mut panel);
+        assert!(lines.iter().all(|line| line.text().width() <= WIDTH));
+    }
+
+    #[test]
+    fn the_selected_row_keeps_its_match_bold_and_underlined_on_the_selection() {
+        let mut panel = filtered_panel("sample", "The sample package");
+        let selected = frame(&mut panel)
+            .into_iter()
+            .find(|line| line.fill == Some(Role::Selection))
+            .expect("a selected row");
+        assert!(selected.text().contains("sample"), "{}", selected.text());
+        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+        let resolved = selected.resolve(theme, WIDTH);
+        let matched = resolved
+            .spans
+            .iter()
+            .find(|span| span.text == "sample")
+            .expect("the match keeps its own span");
+        assert!(matched.style.bold && matched.style.underline);
+        assert_eq!(
+            matched.style.background,
+            theme.style(Role::Selection).background
+        );
     }
 }

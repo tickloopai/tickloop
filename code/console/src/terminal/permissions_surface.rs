@@ -2041,7 +2041,8 @@ impl PermissionsSurface {
         )];
         if self.page == Page::Directories {
             for path in self.directory_rows() {
-                let mut row = plain_row(path.display().to_string());
+                let mut row = RoleLine::default();
+                row.push_matching(&path.display().to_string(), None, &self.query);
                 row.push(" · additional", Some(Role::MutedText));
                 rows.push(row);
             }
@@ -2052,20 +2053,17 @@ impl PermissionsSurface {
                 .filter_map(|index| self.view.rules.get(*index))
             {
                 let rule = &entry.rule;
-                let matcher = rule
-                    .specifier
-                    .as_ref()
-                    .map(|content| {
-                        if rule.tool == WEB_FETCH_TOOL_NAME {
-                            content.clone()
-                        } else {
-                            format!("shell: {content}")
-                        }
-                    })
-                    .or_else(|| rule.input.as_ref().map(|input| format!("exact: {input}")))
-                    .unwrap_or_else(|| "whole tool".into());
-                let mut row = RoleLine::role(&rule.tool, Role::Strong);
-                row.push(format!(" · {matcher}"), Some(Role::Text));
+                // The search reads the tool and the matcher's content, not its label.
+                let (label, content) = match (&rule.specifier, &rule.input) {
+                    (Some(content), _) if rule.tool == WEB_FETCH_TOOL_NAME => ("", content.clone()),
+                    (Some(content), _) => ("shell: ", content.clone()),
+                    (None, Some(input)) => ("exact: ", input.to_string()),
+                    (None, None) => ("whole tool", String::new()),
+                };
+                let mut row = RoleLine::default();
+                row.push_matching(&rule.tool, Some(Role::Strong), &self.query);
+                row.push(format!(" · {label}"), Some(Role::Text));
+                row.push_matching(&content, Some(Role::Text), &self.query);
                 row.push(
                     format!(
                         " · {} · {}{}",
@@ -2491,7 +2489,8 @@ impl PermissionsSurface {
                 plain_row("Restore group defaults")
             } else {
                 let rule = &rules[index - 1];
-                let mut row = RoleLine::role(&rule.text, Role::Text);
+                let mut row = RoleLine::default();
+                row.push_matching(&rule.text, Some(Role::Text), &group.query);
                 row.push(
                     format!(" · {}", auto_source_label(&rule.source)),
                     Some(Role::MutedText),
@@ -3109,5 +3108,22 @@ mod tests {
         assert_eq!((surface.selected, draft(&surface)), (1, "zebra".into()));
         type_text(&mut surface, "jk");
         assert_eq!((surface.selected, draft(&surface)), (0, "zebrajk".into()));
+    }
+
+    #[tokio::test]
+    async fn the_auto_group_search_emphasizes_its_matches_in_the_rules() {
+        let mut surface = zebra_surface().await;
+        surface.open_auto();
+        surface.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftDeny));
+        press(&mut surface, KeyCode::Char('/'));
+        type_text(&mut surface, "STRIPE");
+        let matched = surface
+            .styled_lines(100, 30)
+            .iter()
+            .flat_map(|line| line.spans.clone())
+            .filter(|span| span.role == Some(Role::FilterMatch))
+            .map(|span| span.text)
+            .collect::<Vec<_>>();
+        assert_eq!(matched, ["stripe"]);
     }
 }
