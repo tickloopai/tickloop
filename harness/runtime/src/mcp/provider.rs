@@ -230,14 +230,15 @@ impl HostToolProvider for McpToolProvider {
                 }
                 let instructions = entry.current_catalog().instructions.clone();
                 Some(McpServerInstructions {
-                    text: crate::tool_exposure::server_message(
+                    status: crate::tool_exposure::server_status(
                         &entry.config.name,
                         &entry.config.source,
                         &state,
                         entry.config.exposure,
                         &entry.description.read().unwrap(),
-                        &instructions,
+                        !instructions.is_empty(),
                     ),
+                    text: instructions,
                     server: McpResourceServer {
                         name: entry.config.name.clone(),
                         authority: Self::authority(entry),

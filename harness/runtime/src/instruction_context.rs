@@ -1,5 +1,5 @@
 //! The user context message, which leads each conversation request as Claude Code's does: the
-//! instruction files and the date in the user's time zone.
+//! instruction files, the date in the user's time zone and, in a git repository, the git status.
 
 use tickloop_harness_policy::instructions::{InstructionFile, user_context_message};
 use tickloop_harness_protocol::{ChatId, Content, Message, Role};
@@ -21,11 +21,32 @@ impl Agent {
         }
         let files = self.instruction_files(chat_id).await?;
         let current_date = self.current_date();
-        let text = user_context_message(&files, &current_date);
+        let folder = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            chat.snapshot.folder.clone()
+        };
+        let (environment, git_status) = match folder.filter(|folder| folder.is_dir()) {
+            Some(folder) => tokio::task::spawn_blocking(move || {
+                (
+                    Some(crate::environment_info::ChatEnvironment::capture(&folder)),
+                    crate::environment_info::git_status(&folder),
+                )
+            })
+            .await
+            .map_err(|error| {
+                AgentError::Invalid(format!("reading the environment failed: {error}"))
+            })?,
+            None => (None, None),
+        };
+        let text = user_context_message(&files, &current_date, git_status.as_deref());
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if chat.user_context.get().is_none() {
             chat.announced_date = Some(current_date);
+        }
+        if let Some(environment) = environment {
+            let _ = chat.environment.set(environment);
         }
         Ok(context_message(
             chat.user_context.get_or_init(|| text).clone(),

@@ -401,10 +401,15 @@ pub struct McpResourceServer {
     pub third_party: bool,
 }
 
-/// The instructions an MCP server gave when the host connected to it for an account.
+/// What the model learns about an MCP server: the instructions it gave when the host connected to
+/// it for an account, and its state when that needs the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerInstructions {
     pub server: McpResourceServer,
+    /// One line on the server's state, such as how the user logs in to it; `None` when the tool
+    /// list already says enough.
+    pub status: Option<String>,
+    /// The instructions the server gave, untrusted; empty when it gave none.
     pub text: String,
 }
 

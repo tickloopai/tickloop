@@ -564,7 +564,10 @@ fn is_user_prompt(message: &Value) -> bool {
         .as_str()
         .or_else(|| message["content"][0]["text"].as_str());
     message["role"] == "user"
-        && !text.is_some_and(|text| text.starts_with("Reference guidance from "))
+        && !text.is_some_and(|text| {
+            text.trim_start_matches("<system-reminder>\n")
+                .starts_with("Reference guidance from ")
+        })
 }
 fn family_panel_has_viewing_row(frame: &str) -> bool {
     frame

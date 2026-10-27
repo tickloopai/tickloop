@@ -102,6 +102,9 @@ impl ChatSnapshot {
                 HostNote::Guidance(GuidanceNote::McpInstructions { server, digest }) => {
                     visible.mcp_servers.insert(server.clone(), digest.clone());
                 }
+                HostNote::Guidance(GuidanceNote::McpServers { servers }) => {
+                    visible.mcp_servers.extend(servers.clone());
+                }
                 HostNote::Guidance(GuidanceNote::Withdrawn {
                     skills,
                     mcp_servers,

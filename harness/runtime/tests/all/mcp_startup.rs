@@ -212,13 +212,19 @@ fn deferred_names(request: &ModelRequest) -> Vec<String> {
 
 /// The host notes that describe the MCP server `name`, in conversation order.
 fn server_notes(request: &ModelRequest, name: &str) -> Vec<String> {
-    let opening = format!("MCP server: {name};");
+    let status_line = format!("\n- {name}: ");
+    let heading = format!("\n## {name}\n");
     request
         .messages
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|content| match content {
-            Content::Text { text } if text.contains(&opening) => Some(text.clone()),
+            Content::Text { text }
+                if text.contains("# MCP Server Instructions")
+                    && (text.contains(&status_line) || text.contains(&heading)) =>
+            {
+                Some(text.clone())
+            }
             _ => None,
         })
         .collect()
@@ -278,10 +284,7 @@ async fn a_search_server_connecting_after_the_grace_is_found_from_the_next_reque
     );
     let connecting = server_notes(first, "late");
     assert_eq!(connecting.len(), 1, "{connecting:?}");
-    assert!(
-        connecting[0].contains("status: Connecting"),
-        "{connecting:?}"
-    );
+    assert!(connecting[0].contains(": connecting;"), "{connecting:?}");
 
     fixture.wait_for("late", McpServerState::Connected).await;
     let second_run = fixture.run("find the quote tool").await;
@@ -296,7 +299,7 @@ async fn a_search_server_connecting_after_the_grace_is_found_from_the_next_reque
     assert_eq!(notes[0], connecting[0], "the earlier note is not rewritten");
     assert!(
         notes.len() == 2
-            && notes[1].contains("status: Connected")
+            && notes[1].contains(": connected;")
             && notes[1].contains("can now be found"),
         "{notes:?}"
     );
@@ -338,8 +341,8 @@ async fn a_direct_server_connecting_after_the_grace_is_listed_from_the_next_run(
     let notes = server_notes(next_run, "late");
     assert!(
         notes.len() == 2
-            && notes[0].contains("status: Connecting")
-            && notes[1].contains("status: Connected")
+            && notes[0].contains(": connecting;")
+            && notes[1].contains(": connected;")
             && notes[1].contains("can be called once they appear in your tool list"),
         "{notes:?}"
     );
@@ -439,7 +442,7 @@ async fn failed_servers_do_not_hold_the_first_request_and_are_reported_failed() 
     for name in ["down", "missing"] {
         let notes = server_notes(first, name);
         assert!(
-            notes.len() == 1 && notes[0].contains("status: Failed"),
+            notes.len() == 1 && notes[0].contains(": failed;"),
             "{name}: {notes:?}"
         );
     }

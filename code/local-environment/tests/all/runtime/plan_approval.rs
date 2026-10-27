@@ -661,7 +661,7 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     let notice = requests[2].messages.last().unwrap();
     assert_eq!(notice.role, Role::User);
     assert!(
-        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("## Exited Plan Mode\n\n") && text.ends_with(&format!("The plan file is located at {plan_file} if you need to reference it.")))
+        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.ends_with(&format!("The plan file is located at {plan_file} if you need to reference it.\n</system-reminder>")))
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(

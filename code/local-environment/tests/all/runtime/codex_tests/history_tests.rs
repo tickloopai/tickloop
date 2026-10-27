@@ -586,7 +586,15 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
         source_requests[0]["prompt_cache_key"],
         source.uuid().to_string()
     );
-    assert!(source_requests[1]["input"].to_string().contains("opaque"));
+    // A later Run keeps the same instructions, so it continues the earlier response, whose
+    // reasoning the service keeps, instead of sending the history again.
+    assert_eq!(source_requests[1]["previous_response_id"], "resp-1");
+    assert_eq!(
+        source_requests[1]["input"].as_array().unwrap().len(),
+        1,
+        "{}",
+        source_requests[1]["input"]
+    );
     assert!(
         source_requests[2]["input"]
             .to_string()

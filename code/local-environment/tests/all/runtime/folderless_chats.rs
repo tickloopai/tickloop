@@ -163,9 +163,10 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
     );
     let prompt = system_prompt(&requests[0]);
     for section in [
-        "# Ticks, Loops, and workspace displays",
+        "# Doing tasks",
+        "# Executing actions with care",
+        "# Using your tools",
         "# Subagent communication",
-        "# Agent daemon lifecycle",
     ] {
         assert!(prompt.contains(section), "{section}");
     }

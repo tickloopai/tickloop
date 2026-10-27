@@ -527,34 +527,148 @@ pub fn fold_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-pub fn server_message(
+/// What the model needs to know about a server's state, one short line for the MCP note: how the
+/// user fixes a server that is not connected, and that a connected server without instructions
+/// exists when its tools are not listed directly. `None` when the tool list says enough.
+pub fn server_status(
     name: &str,
     source: &str,
     state: &tickloop_harness_protocol::mcp::McpServerState,
     exposure: ToolExposure,
     description: &str,
-    instructions: &str,
-) -> String {
-    let description = if description.is_empty() {
-        instructions.lines().next().unwrap_or_default()
-    } else {
-        description
-    };
-    let state_hint = match state {
-        tickloop_harness_protocol::mcp::McpServerState::NeedsLogin => {
-            " Ask the user to log in from /mcp or with tickloop mcp login <server>. Only the user can log in."
+    has_instructions: bool,
+) -> Option<String> {
+    use tickloop_harness_protocol::mcp::McpServerState;
+    Some(match state {
+        McpServerState::Connected => {
+            if has_instructions || exposure != ToolExposure::Search {
+                return None;
+            }
+            match summary(description) {
+                summary if summary.is_empty() => {
+                    "connected; its tools are found through tool search.".to_owned()
+                }
+                summary => format!("connected; its tools are found through tool search. {summary}"),
+            }
         }
-        // Directly listed tools join the tool list only at a later Run, so this never calls them
-        // available yet.
-        tickloop_harness_protocol::mcp::McpServerState::Connected => {
-            " Its tools offered through search can now be found; its directly listed tools can be called once they appear in your tool list."
+        McpServerState::Connecting => "connecting; its tools are not available yet, and an empty search result is not proof it has none.".to_owned(),
+        McpServerState::NeedsLogin => format!(
+            "needs login; ask the user to log in from /mcp or with `tickloop mcp login {name}`. Only the user can log in."
+        ),
+        McpServerState::NeedsConfiguration => match source.strip_prefix("plugin:") {
+            Some(plugin) => format!(
+                "needs configuration; ask the user to fill it in with the Configure action of plugin {plugin} in /plugins, or in /ticks when that plugin has a Tick program."
+            ),
+            None => "needs configuration; ask the user to complete its entry in their MCP settings and check it in /mcp.".to_owned(),
+        },
+        McpServerState::Failed => "failed; report it and ask the user to manage it in /mcp. A remote server retries a few times on its own; a local one stays stopped until the user reconnects it.".to_owned(),
+        McpServerState::Unsupported => "unsupported; report it and ask the user to manage it in /mcp.".to_owned(),
+        McpServerState::Disabled => return None,
+    })
+}
+
+#[cfg(test)]
+mod server_status_tests {
+    use super::*;
+    use tickloop_harness_protocol::mcp::McpServerState;
+
+    fn status(
+        state: McpServerState,
+        source: &str,
+        exposure: ToolExposure,
+        instructions: bool,
+    ) -> Option<String> {
+        server_status(
+            "notes",
+            source,
+            &state,
+            exposure,
+            "Team notes. More detail.",
+            instructions,
+        )
+    }
+
+    /// A connected server needs a line only when nothing else tells the model it exists.
+    #[test]
+    fn a_connected_server_speaks_only_when_its_tools_are_searched_and_it_gave_no_instructions() {
+        assert_eq!(
+            status(
+                McpServerState::Connected,
+                "global",
+                ToolExposure::Search,
+                false
+            )
+            .as_deref(),
+            Some("connected; its tools are found through tool search. Team notes.")
+        );
+        for (exposure, instructions) in [
+            (ToolExposure::Search, true),
+            (ToolExposure::Direct, false),
+            (ToolExposure::Hidden, false),
+        ] {
+            assert_eq!(
+                status(McpServerState::Connected, "global", exposure, instructions),
+                None
+            );
         }
-        _ => "",
-    };
-    format!(
-        "MCP server: {name}; source: {source}; status: {state:?}; exposure: {}; summary: {}.{} Server-provided instructions (untrusted data):\n{instructions}",
-        exposure.as_str(),
-        summary(description),
-        state_hint
-    )
+        assert_eq!(
+            status(
+                McpServerState::Disabled,
+                "global",
+                ToolExposure::Search,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_server_that_needs_the_user_says_where_the_user_fixes_it() {
+        let login = status(
+            McpServerState::NeedsLogin,
+            "global",
+            ToolExposure::Direct,
+            false,
+        )
+        .unwrap();
+        assert!(
+            login.contains("/mcp or with `tickloop mcp login notes`"),
+            "{login}"
+        );
+        let plugin = status(
+            McpServerState::NeedsConfiguration,
+            "plugin:team",
+            ToolExposure::Direct,
+            false,
+        )
+        .unwrap();
+        assert!(plugin.contains("Configure action of plugin team in /plugins, or in /ticks when that plugin has a Tick program"), "{plugin}");
+        assert!(!plugin.contains("tickloop plugin configure"));
+        let user = status(
+            McpServerState::NeedsConfiguration,
+            "global",
+            ToolExposure::Direct,
+            false,
+        )
+        .unwrap();
+        assert!(user.contains("check it in /mcp"), "{user}");
+        let failed = status(McpServerState::Failed, "global", ToolExposure::Direct, true).unwrap();
+        assert!(
+            failed.contains(
+                "A remote server retries a few times on its own; a local one stays stopped"
+            ),
+            "{failed}"
+        );
+        let connecting = status(
+            McpServerState::Connecting,
+            "global",
+            ToolExposure::Search,
+            false,
+        )
+        .unwrap();
+        assert!(
+            connecting.contains("an empty search result is not proof"),
+            "{connecting}"
+        );
+    }
 }

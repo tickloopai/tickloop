@@ -102,7 +102,7 @@ fn builtin_name_is_reserved_and_a_broken_skill_only_adds_a_warning() {
     let expansion = registry.expand("tickloop", "", SkillCaller::User).unwrap();
 
     assert!(matches!(expansion.source, SkillSource::BuiltIn));
-    assert!(expansion.content.contains("Tickloop tools and Ticks"));
+    assert!(expansion.content.contains("# Ticks\n\nA Tick is"));
     assert_eq!(registry.warnings().len(), 2);
 }
 
@@ -247,14 +247,14 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
         assert!(skill_tool.description.contains("tickloop"));
         let first = serde_json::to_string(&requests[0].messages).unwrap();
         assert!(!first.contains(
-            "Use the installed host tools as the authority for targets and capabilities"
+            "an installed multiplexer command or a repository name is not proof of the environment"
         ));
         let second = serde_json::to_string(&requests[1].messages).unwrap();
         assert!(second.contains(
-            "Use the installed host tools as the authority for targets and capabilities"
+            "an installed multiplexer command or a repository name is not proof of the environment"
         ));
         assert!(second.contains("Launching skill: tickloop"));
-        let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Use the installed host tools as the authority for targets and capabilities")))).unwrap();
+        let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("an installed multiplexer command or a repository name is not proof of the environment")))).unwrap();
         assert_eq!(guidance.role, tickloop_harness::protocol::Role::User);
         assert!(
             serde_json::to_string(guidance)
@@ -440,10 +440,9 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
 
     let requests = model.requests.lock().unwrap();
     let messages = serde_json::to_string(&requests[0].messages).unwrap();
-    assert!(
-        messages
-            .contains("Use the installed host tools as the authority for targets and capabilities")
-    );
+    assert!(messages.contains(
+        "an installed multiplexer command or a repository name is not proof of the environment"
+    ));
     assert!(messages.contains("/tickloop show the current Workspace"));
     let [.., prompt, guidance] = requests[0].messages.as_slice() else {
         panic!("the request carries the prompt and the guidance it invoked");
@@ -454,7 +453,7 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
     ));
     assert!(matches!(
         guidance.content.as_slice(),
-        [Content::Text { text }] if text.starts_with("Reference guidance from tickloop")
+        [Content::Text { text }] if text.trim_start_matches("<system-reminder>\n").starts_with("Reference guidance from tickloop")
     ));
 }
 
@@ -489,11 +488,9 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
 
     assert_eq!(snapshot.invoked_skills.len(), 1);
     assert_eq!(snapshot.invoked_skills[0].name, "tickloop");
-    assert!(
-        snapshot.invoked_skills[0]
-            .content
-            .contains("Use the installed host tools as the authority for targets and capabilities")
-    );
+    assert!(snapshot.invoked_skills[0].content.contains(
+        "an installed multiplexer command or a repository name is not proof of the environment"
+    ));
 }
 
 #[tokio::test]
@@ -605,9 +602,12 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            Content::Text { text } if text.contains("RESTORE_GUIDE_") => {
-                Some(text.split_once("\n\n").unwrap().1)
-            }
+            Content::Text { text } if text.contains("RESTORE_GUIDE_") => Some(
+                text.split_once("\n\n")
+                    .unwrap()
+                    .1
+                    .trim_end_matches("\n</system-reminder>"),
+            ),
             _ => None,
         })
         .collect::<Vec<_>>();
