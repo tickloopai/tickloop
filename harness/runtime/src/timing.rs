@@ -86,9 +86,12 @@ impl<T> ChatsMutex<T> {
     pub(crate) fn new(value: T) -> Self {
         Self(tokio::sync::Mutex::new(value))
     }
-    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, T> {
-        let _timing = Phase::new("chats_lock_wait");
-        self.0.lock().await
+    pub(crate) fn lock(&self) -> impl std::future::Future<Output = tokio::sync::MutexGuard<'_, T>> {
+        // Keep instrumentation out of the large futures that hosts await on small stacks.
+        Box::pin(async {
+            let _timing = Phase::new("chats_lock_wait");
+            self.0.lock().await
+        })
     }
 }
 impl<T> std::ops::Deref for ChatsMutex<T> {

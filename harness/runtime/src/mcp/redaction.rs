@@ -88,7 +88,11 @@ impl Redactor {
                     .to_owned(),
             );
         }
-        let matcher = aho_corasick::AhoCorasick::new(variants).expect("valid secret patterns");
+        // OAuth tokens are long; avoid determinizing their encoded variants on rotation.
+        let matcher = aho_corasick::AhoCorasick::builder()
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .build(variants)
+            .expect("valid secret patterns");
         Some(Self { secrets, matcher })
     }
     pub(super) fn redact(&self, content: String) -> String {

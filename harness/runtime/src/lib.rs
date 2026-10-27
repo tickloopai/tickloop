@@ -1214,6 +1214,29 @@ impl Agent {
             .map_or((0, 0, 0), |provider| provider.mcp_performance_counts())
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn benchmark_host_tool_preparation(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<usize, AgentError> {
+        let provider = self.inner.host_tools.read().unwrap().clone();
+        if let Some(provider) = &provider {
+            provider
+                .refresh(CancellationToken::new())
+                .await
+                .map_err(AgentError::Invalid)?;
+        }
+        let count = {
+            let chats = self.inner.chats.lock().await;
+            self.tool_definitions(chats.get(&chat_id).ok_or(AgentError::NotFound)?)
+                .len()
+        };
+        if let Some(provider) = provider {
+            provider.mcp_instructions();
+        }
+        Ok(count)
+    }
+
     /// Registers the provider's current tools without refreshing remote directories. Call
     /// [`crate::host_tools::HostToolProvider::refresh`] to observe discovery failures.
     pub fn install_host_tools(
@@ -3593,7 +3616,7 @@ impl Agent {
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
             self.feedback_account_context(&receipt).await?;
             *is_awaiting_model = true;
-            let prepared = timing::request(&receipt, async {
+            let prepared = Box::pin(timing::request(&receipt, async {
                 let mut registry = self
                     .prepare_tool_registry(&receipt, &cancel)
                     .await
@@ -3610,7 +3633,7 @@ impl Agent {
                     )
                     .await?;
                 Ok::<_, AgentError>((registry, output))
-            })
+            }))
             .await;
             let (registry, output) = match prepared {
                 Ok(prepared) => prepared,

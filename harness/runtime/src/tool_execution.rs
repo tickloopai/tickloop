@@ -344,14 +344,14 @@ impl ToolRegistry {
                         .with_unavailable_servers(provider.unavailable_tool_servers()),
                 );
                 deferred = directory.deferred_tools();
+                let deferred_names: HashSet<_> =
+                    deferred.iter().map(|tool| tool.name.as_str()).collect();
                 folded.extend(
                     directory
                         .tools()
                         .filter(|tool| {
                             tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
-                                && !deferred
-                                    .iter()
-                                    .any(|deferred| deferred.name == tool.definition.name)
+                                && !deferred_names.contains(tool.definition.name.as_str())
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );

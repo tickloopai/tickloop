@@ -801,6 +801,8 @@ impl Agent {
         let request_cancel = cancel.child_token();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut progress = RequestProgress::default();
+        let sent = std::time::Instant::now();
+        let mut first_event = true;
         // The scope destroys the actual request future before the receiver is closed and drained.
         let mut result = {
             let response = async {
@@ -876,8 +878,6 @@ impl Agent {
                     None => std::future::pending::<()>().await,
                 }
             };
-            let sent = std::time::Instant::now();
-            let mut first_event = true;
             tokio::pin!(response, deadline);
             loop {
                 let flush_deadline = progress.delta_deadline;
@@ -913,6 +913,10 @@ impl Agent {
         request_cancel.cancel();
         receiver.close();
         while let Ok(delta) = receiver.try_recv() {
+            if first_event {
+                first_event = false;
+                tracing::debug!(target: "tickloop::request_timing", chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
+            }
             if let Err(error) = self
                 .buffer_model_delta(&context, sequence, delta, &cancel, &mut progress)
                 .await

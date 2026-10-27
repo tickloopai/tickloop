@@ -195,6 +195,21 @@ impl Entry {
             }
         }
         *self.credential.write().unwrap() = credential;
+        self.refresh_redactor();
+    }
+
+    fn remember_token(&self, token: AccessToken) {
+        let secret = token.secret().to_owned();
+        let mut secrets = self.credential_secrets.write().unwrap();
+        if !secrets.contains(&secret) {
+            secrets.push(secret);
+        }
+        drop(secrets);
+        *self.token.write().unwrap() = Some(token);
+        self.refresh_redactor();
+    }
+
+    fn refresh_redactor(&self) {
         let changed = {
             let _publication = self.publication.lock().unwrap();
             if let Some(redactor) = redaction::Redactor::new(self) {
@@ -521,7 +536,7 @@ impl McpConnections {
                     if let Some(credentials) = &entry.credentials {
                         entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
                     }
-                    *entry.token.write().unwrap() = Some(token.map_err(|error| match error {
+                    entry.remember_token(token.map_err(|error| match error {
                         TokenError::NeedsLogin | TokenError::RenewalFailed => "MCP login required",
                         _ => "MCP credential unavailable",
                     })?);
@@ -538,7 +553,7 @@ impl McpConnections {
                         entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
                     }
                     let renewed = renewed.map_err(|_| "MCP login required")?;
-                    *entry.token.write().unwrap() = Some(renewed.clone());
+                    entry.remember_token(renewed.clone());
                     authenticating.store(false, Ordering::SeqCst);
                     return open(&entry, Some(renewed.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
                 }
@@ -628,6 +643,19 @@ impl McpConnections {
     #[cfg(feature = "test-support")]
     pub fn last_catalog_build_micros(&self) -> u64 {
         self.inner.catalog_micros.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn benchmark_remember_credential(&self, server: &str, credential: ConnectorCredential) {
+        let entry = self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .get(server)
+            .expect("benchmark server")
+            .clone();
+        entry.remember_credential(Some(credential));
     }
 
     #[cfg(feature = "test-support")]
@@ -770,10 +798,14 @@ impl McpConnections {
                         .as_ref()
                         .map(|connection| entry.current_catalog(connection).instructions.clone())
                         .unwrap_or_default(),
-                    warnings: connection
-                        .as_ref()
-                        .map(|connection| entry.current_catalog(connection).warnings.clone())
-                        .unwrap_or_default(),
+                    warnings: if let Some(reason) = entry.config_failure.read().unwrap().clone() {
+                        vec![reason]
+                    } else {
+                        connection
+                            .as_ref()
+                            .map(|connection| entry.current_catalog(connection).warnings.clone())
+                            .unwrap_or_default()
+                    },
                 }
             })
             .collect()
@@ -829,7 +861,7 @@ impl McpConnections {
         if *entry.state.read().unwrap() != McpServerState::Connected {
             return Err("MCP connection is unavailable".into());
         }
-        let generation = connection.snapshot.read().unwrap().generation;
+        let generation = tool.generation;
         Ok(PreparedMcpCall {
             generation,
             entry,

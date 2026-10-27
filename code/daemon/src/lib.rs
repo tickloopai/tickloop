@@ -822,6 +822,7 @@ pub async fn build_runtime_with_models(
             if files.unchanged(&credential_root) {
                 return None;
             }
+            let before = files.revision(&credential_root);
             files.paths.clear();
             let (plugin_servers, mut warnings) =
                 enabled_plugin_mcp_servers(&plugins, &mut files.paths);
@@ -860,7 +861,7 @@ pub async fn build_runtime_with_models(
             }
             credential_connections.set_credentials(credentials);
             warnings.extend(resolved.warnings);
-            files.remember(&credential_root);
+            files.remember(&credential_root, before);
             Some(McpConfiguration {
                 servers: resolved.servers,
                 warnings,

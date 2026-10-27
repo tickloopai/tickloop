@@ -600,9 +600,12 @@ impl McpHostToolProvider {
     }
 
     fn clear_directory(&self) {
-        *self.directory.write().unwrap() = None;
-        self.catalog_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let previous = self.directory.write().unwrap().take();
+        if previous.is_some() {
+            self.catalog_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(previous);
         self.skill_files.write().unwrap().clear();
     }
 
@@ -2027,9 +2030,18 @@ impl HostToolProvider for McpHostToolProvider {
                     match directory {
                         Ok(directory) => {
                             status.tool_directory = McpToolDirectory::Available;
-                            *self.directory.write().unwrap() = Some(directory);
-                            self.catalog_generation
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let previous = {
+                                let mut current = self.directory.write().unwrap();
+                                if current.as_ref().is_none_or(|current| {
+                                    current.fingerprint != directory.fingerprint
+                                        || current.credential_key != directory.credential_key
+                                }) {
+                                    self.catalog_generation
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                current.replace(directory)
+                            };
+                            drop(previous);
                         }
                         Err(failure) => {
                             status.directory_rejected =

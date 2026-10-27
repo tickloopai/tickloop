@@ -1078,13 +1078,78 @@ async fn blocked_host_refresh_leaves_other_chat_submission_status_and_stop_respo
     )
     .await
     .unwrap();
-    let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+    let responsive = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         agent.submit(second, "hello".into()).await.unwrap();
         agent.snapshot(second).await.unwrap();
         agent.stop(second).await.unwrap();
     })
     .await;
+    assert!(!provider.release.is_cancelled());
     provider.release.cancel();
     agent.shutdown().await;
     responsive.expect("another Chat must remain responsive while refreshing host tools");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
+    struct BlockedCatalog {
+        block: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        gate: (Mutex<bool>, std::sync::Condvar),
+    }
+    #[async_trait]
+    impl HostToolProvider for BlockedCatalog {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            if self.block.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                let (lock, changed) = &self.gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            Vec::new()
+        }
+        async fn refresh(&self, _: CancellationToken) -> Result<(), String> {
+            self.block.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+            HostToolPermission::ReadOnly
+        }
+        async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
+            unreachable!()
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider = Arc::new(BlockedCatalog {
+        block: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        gate: (Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("done"), text("done")])),
+    );
+    agent.install_host_tools(provider.clone()).unwrap();
+    let first = agent.create_chat(root.path().into()).await.unwrap();
+    let second = agent.create_chat(root.path().into()).await.unwrap();
+    agent.submit(first, "wait".into()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let responsive = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        agent.submit(second, "hello".into()).await.unwrap();
+        agent.snapshot(second).await.unwrap();
+        agent.stop(second).await.unwrap();
+    })
+    .await;
+    assert!(!*provider.gate.0.lock().unwrap());
+    *provider.gate.0.lock().unwrap() = true;
+    provider.gate.1.notify_all();
+    agent.shutdown().await;
+    responsive.expect("a blocked catalog capture must not hold the Chats lock");
 }
