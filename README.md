@@ -69,6 +69,8 @@ Keys:
 - In the Monitor, `enter` opens a Tick and `esc` hides it again; the program keeps running.
 - To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
+Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
+
 ## Ticks
 
 A Tick is a live program the agent can open, watch and act on, such as a market data feed or a document reader. Ticks are installed like plugins and share their marketplaces and storage, but you manage them on their own: open `/ticks` to find, install and log in to them, or use the command line:

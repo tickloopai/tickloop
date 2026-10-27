@@ -5,7 +5,7 @@
 //! one-time view grant `plugin.pane.open` passes in `TICKLOOP_MONITOR_ATTACH`. Herdr copies a
 //! manifest when it links a plugin and silently replaces a linked plugin that has the same id, so
 //! a plugin under our id counts as ours only when Herdr reports our own directory as its root.
-//! Every tickloop build shares that directory, so ours may still run another build's attach
+//! Builds using the same configuration root share that directory, so ours may run another build's attach
 //! client, which need not speak this build's Tickhost protocol; it is registered again first.
 //! Herdr 0.9 opens a popup in front of the session's current client and cannot target one: with
 //! several clients on one session it may appear where Herdr places it.
@@ -30,7 +30,7 @@ use tickloop_harness::base::private_fs::{
 };
 use tickloop_harness::protocol::{ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedViewGrant};
 
-pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
+const DEFAULT_PLUGIN_ID: &str = "tickloop.monitor";
 const PLUGIN_NAME: &str = "Tickloop Monitor";
 const PANE_ID: &str = "attach";
 const PANE_TITLE: &str = "Tickloop";
@@ -135,6 +135,8 @@ struct RegisteredPlugin {
 /// executable's attach client and nothing else.
 pub(crate) struct PopupPlugin {
     state_root: PathBuf,
+    id: String,
+    name: String,
     pane: RegisteredPane,
 }
 
@@ -152,8 +154,17 @@ impl PopupPlugin {
     }
 
     fn new(state_root: &Path, executable: String) -> Self {
+        let (id, name) = match tick_packages::config_root_runtime_key(state_root) {
+            None => (DEFAULT_PLUGIN_ID.to_owned(), PLUGIN_NAME.to_owned()),
+            Some(key) => (
+                format!("{DEFAULT_PLUGIN_ID}.{key}"),
+                format!("{PLUGIN_NAME} ({})", state_root.display()),
+            ),
+        };
         Self {
             state_root: state_root.to_path_buf(),
+            id,
+            name,
             pane: RegisteredPane {
                 id: PANE_ID.into(),
                 title: PANE_TITLE.into(),
@@ -165,6 +176,10 @@ impl PopupPlugin {
                     .collect(),
             },
         }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 
     /// The plugin directory with symbolic links resolved, as Herdr reports a plugin root.
@@ -183,8 +198,8 @@ impl PopupPlugin {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            r#"id = "{PLUGIN_ID}"
-name = "{PLUGIN_NAME}"
+            r#"id = "{id}"
+name = {name}
 version = "{version}"
 min_herdr_version = "{MIN_HERDR_VERSION}"
 platforms = ["macos", "linux"]
@@ -197,6 +212,8 @@ width = "{POPUP_SIZE}"
 height = "{POPUP_SIZE}"
 command = [{command}]
 "#,
+            id = self.id,
+            name = toml_basic_string(&self.name),
             version = env!("CARGO_PKG_VERSION")
         )
     }
@@ -222,7 +239,7 @@ command = [{command}]
     fn readiness(&self, registered: Vec<RegisteredPlugin>) -> PopupReadiness {
         match registered
             .into_iter()
-            .find(|registered| registered.plugin_id == PLUGIN_ID)
+            .find(|registered| registered.plugin_id == self.id)
         {
             None => PopupReadiness::NotInstalled,
             Some(registered) if registered.plugin_root != self.directory() => {
@@ -293,7 +310,7 @@ impl HerdrSession {
 
     pub(crate) async fn readiness(&self, plugin: &PopupPlugin) -> Result<PopupReadiness, String> {
         let listed = self
-            .request("plugin.list", json!({"plugin_id": PLUGIN_ID}))
+            .request("plugin.list", json!({"plugin_id": plugin.id()}))
             .await?;
         let registered = serde_json::from_value(listed["plugins"].clone())
             .map_err(|error| format!("cannot read Herdr's plugin list: {error}"))?;
@@ -303,7 +320,7 @@ impl HerdrSession {
     /// Refuses when another plugin holds our id; it is never replaced.
     pub(crate) async fn refuse_foreign(&self, plugin: &PopupPlugin) -> Result<(), String> {
         match self.readiness(plugin).await? {
-            PopupReadiness::Foreign { root } => Err(foreign_plugin(&root)),
+            PopupReadiness::Foreign { root } => Err(foreign_plugin(plugin.id(), &root)),
             _ => Ok(()),
         }
     }
@@ -313,10 +330,11 @@ impl HerdrSession {
         match self.readiness(plugin).await? {
             PopupReadiness::Ready | PopupReadiness::Disabled | PopupReadiness::Outdated => Ok(()),
             PopupReadiness::NotInstalled => Err(format!(
-                "{} has no Tickloop popup plugin {PLUGIN_ID}",
-                self.socket.display()
+                "{} has no Tickloop popup plugin {}",
+                self.socket.display(),
+                plugin.id()
             )),
-            PopupReadiness::Foreign { root } => Err(foreign_plugin(&root)),
+            PopupReadiness::Foreign { root } => Err(foreign_plugin(plugin.id(), &root)),
         }
     }
 
@@ -338,13 +356,14 @@ impl HerdrSession {
         if !registered
             .is_ok_and(|registered| plugin.readiness(vec![registered]) == PopupReadiness::Ready)
         {
-            self.request(PLUGIN_UNLINK, json!({"plugin_id": PLUGIN_ID}))
+            self.request(PLUGIN_UNLINK, json!({"plugin_id": plugin.id()}))
                 .await?;
             settings
                 .save_monitor_popup(MonitorPopup::Disabled)
                 .map_err(|error| format!("undid a mismatched registration but cannot set monitorPopup to disabled: {error}"))?;
             return Err(format!(
-                "Herdr registered {PLUGIN_ID} differently from what Tickloop wrote; the registration was undone and monitorPopup set to disabled"
+                "Herdr registered {} differently from what Tickloop wrote; the registration was undone and monitorPopup set to disabled",
+                plugin.id()
             ));
         }
         settings
@@ -363,11 +382,12 @@ impl HerdrSession {
     ) -> Result<(), String> {
         self.require_ours(plugin).await?;
         let unlinked = self
-            .request(PLUGIN_UNLINK, json!({"plugin_id": PLUGIN_ID}))
+            .request(PLUGIN_UNLINK, json!({"plugin_id": plugin.id()}))
             .await?;
         if unlinked["removed"] != true {
             return Err(format!(
-                "Herdr did not remove {PLUGIN_ID}; monitorPopup is unchanged"
+                "Herdr did not remove {}; monitorPopup is unchanged",
+                plugin.id()
             ));
         }
         settings
@@ -379,12 +399,16 @@ impl HerdrSession {
 
     /// Floats the hosted Tick `grant` names in our popup: its attach client shows the same
     /// process until the user closes it.
-    pub(crate) async fn float(&self, grant: &HostedViewGrant) -> Result<(), FloatError> {
+    pub(crate) async fn float(
+        &self,
+        plugin: &PopupPlugin,
+        grant: &HostedViewGrant,
+    ) -> Result<(), FloatError> {
         let grant = serde_json::to_string(grant).map_err(|_| FloatError::Refused)?;
         self.api
             .request(
                 PLUGIN_PANE_OPEN,
-                json!({"plugin_id": PLUGIN_ID, "entrypoint": PANE_ID, "env": {ATTACH_ENVIRONMENT: grant}}),
+                json!({"plugin_id": plugin.id(), "entrypoint": PANE_ID, "env": {ATTACH_ENVIRONMENT: grant}}),
                 CancellationToken::new(),
             )
             .await
@@ -416,9 +440,9 @@ impl From<HostError> for FloatError {
     }
 }
 
-fn foreign_plugin(root: &Path) -> String {
+fn foreign_plugin(id: &str, root: &Path) -> String {
     format!(
-        "{PLUGIN_ID} in this Herdr session comes from {}, not from Tickloop; it is never replaced or removed",
+        "{id} in this Herdr session comes from {}, not from Tickloop; it is never replaced or removed",
         root.display()
     )
 }
@@ -426,6 +450,40 @@ fn foreign_plugin(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_roots_have_distinct_stable_popup_ids() {
+        let home = std::env::home_dir().unwrap();
+        let default = PopupPlugin::new(&home.join(".tickloop"), "/bin/tickloop".into());
+        assert!(
+            default
+                .manifest()
+                .starts_with("id = \"tickloop.monitor\"\n")
+        );
+        assert_eq!(
+            default.directory(),
+            home.canonicalize()
+                .unwrap()
+                .join(".tickloop/herdr-popup-plugin")
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("development");
+        let first = PopupPlugin::new(&root, "/bin/tickloop".into()).manifest();
+        assert_ne!(first.lines().next(), default.manifest().lines().next());
+        std::fs::create_dir(&root).unwrap();
+        let rebuilt = PopupPlugin::new(&root, "/new/tickloop".into()).manifest();
+        assert_eq!(first.lines().next(), rebuilt.lines().next());
+        let other =
+            PopupPlugin::new(&directory.path().join("other"), "/bin/tickloop".into()).manifest();
+        assert_ne!(first.lines().next(), other.lines().next());
+        assert!(first.contains(&format!("name = \"Tickloop Monitor ({})\"", root.display())));
+
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let aliased = PopupPlugin::new(&alias, "/bin/tickloop".into()).manifest();
+        assert_eq!(first.lines().next(), aliased.lines().next());
+    }
 
     #[test]
     fn only_a_refusal_before_dispatch_counts_as_nothing_opened() {
@@ -486,7 +544,7 @@ mod tests {
         let plugin = PopupPlugin::new(Path::new("/state"), "/opt/tick \"loop\"/tickloop".into());
         let manifest = plugin.manifest();
         for line in [
-            "id = \"tickloop.monitor\"",
+            "id = \"tickloop.monitor.7ac1387d11b1e002\"",
             "min_herdr_version = \"0.9.0\"",
             "id = \"attach\"",
             "placement = \"popup\"",
@@ -507,7 +565,7 @@ mod tests {
     {
         let plugin = PopupPlugin::new(Path::new("/state"), "/bin/tickloop".into());
         let registered = |root: &str| RegisteredPlugin {
-            plugin_id: PLUGIN_ID.into(),
+            plugin_id: plugin.id().into(),
             plugin_root: root.into(),
             enabled: true,
             panes: vec![RegisteredPane {

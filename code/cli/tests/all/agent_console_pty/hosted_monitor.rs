@@ -619,7 +619,13 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_with_automatic_re
             Some(client.screen())
                 .filter(|screen| screen.contains("┌Tickloop") && screen.contains("keys"))
         });
-        assert_eq!(herdr.plugins().len(), 1, "only Tickloop's plugin is linked");
+        assert_eq!(
+            herdr
+                .plugins_with_id(&support::herdr::popup_plugin_id(&fixture.path("config")))
+                .len(),
+            1,
+            "only Tickloop's plugin is linked"
+        );
         let others = herdr.plugins_with_id(OTHER_PLUGIN_ID);
         assert_eq!(
             (
@@ -702,13 +708,14 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_with_automatic_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() {
     use std::os::unix::fs::PermissionsExt;
-    use support::herdr::{HerdrClient, PLUGIN_ID, PrivateHerdr, wait_until};
+    use support::herdr::{HerdrClient, PrivateHerdr, wait_until};
     let herdr = PrivateHerdr::start();
     let pane = herdr.create_workspace();
     let mut client = HerdrClient::attach(&herdr);
     let fixture = PrivateFixture::new();
     let socket = herdr.socket();
     let result = AssertUnwindSafe(async {
+        let plugin_id = support::herdr::popup_plugin_id(&fixture.path("config"));
         let other_tickloop = fixture.path("other-build/tickloop");
         std::fs::create_dir_all(other_tickloop.parent().unwrap()).unwrap();
         std::fs::write(
@@ -728,7 +735,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         std::fs::write(
             plugin.join("herdr-plugin.toml"),
             format!(
-                "id = \"{PLUGIN_ID}\"\nname = \"Tickloop Monitor\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\nplatforms = [\"macos\", \"linux\"]\n\n[[panes]]\nid = \"attach\"\ntitle = \"Tickloop\"\nplacement = \"popup\"\nwidth = \"85%\"\nheight = \"85%\"\ncommand = [{:?}, \"monitor\", \"attach\"]\n",
+                "id = \"{plugin_id}\"\nname = \"Tickloop Monitor\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\nplatforms = [\"macos\", \"linux\"]\n\n[[panes]]\nid = \"attach\"\ntitle = \"Tickloop\"\nplacement = \"popup\"\nwidth = \"85%\"\nheight = \"85%\"\ncommand = [{:?}, \"monitor\", \"attach\"]\n",
                 other_tickloop.to_str().unwrap()
             ),
         )
@@ -761,7 +768,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
             Some(client.screen())
                 .filter(|screen| screen.contains("┌Tickloop") && screen.contains("keys"))
         });
-        let plugins = herdr.plugins();
+        let plugins = herdr.plugins_with_id(&support::herdr::popup_plugin_id(&fixture.path("config")));
         assert_eq!(plugins.len(), 1, "{plugins:?}");
         assert_eq!(plugins[0]["plugin_root"], json!(plugin));
         assert_ne!(
@@ -824,16 +831,20 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
             "opening never asks for confirmation: {back}"
         );
         assert!(
-            herdr.plugins().is_empty(),
+            herdr
+                .plugins_with_id(&support::herdr::popup_plugin_id(&fixture.path("config")))
+                .is_empty(),
             "an explicitly disabled popup is not enabled"
         );
 
-        let foreign = herdr.link_foreign_plugin();
+        let foreign =
+            herdr.link_other_plugin(&support::herdr::popup_plugin_id(&fixture.path("config")));
         view.send(b"\r");
         terminal_shows(&view, "size 100x32").await;
         view.send(CLOSE);
         back_in_monitor_quietly(&view).await;
-        let plugins = herdr.plugins();
+        let plugins =
+            herdr.plugins_with_id(&support::herdr::popup_plugin_id(&fixture.path("config")));
         assert_eq!(
             (plugins.len(), plugins[0]["plugin_root"].as_str()),
             (1, foreign.to_str()),
