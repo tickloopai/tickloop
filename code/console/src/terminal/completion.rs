@@ -507,6 +507,9 @@ impl Completion {
         let Some((token_start, token_end)) = command_token(draft, cursor) else {
             return;
         };
+        if draft[token_start + 1..token_end].contains('/') {
+            return;
+        }
 
         let query = &draft[token_start + 1..cursor];
 
@@ -564,19 +567,20 @@ impl Completion {
     /// Whether a submitted line invokes a command or Skill; any other line is sent unchanged as a
     /// message. A known command or Skill runs even when a path of the same name exists. An unknown
     /// name stays a command, reported as unknown, only while it could name one and is not an
-    /// existing path: `/Users/me/notes`, `/notes.txt` and `/tmp` are messages.
+    /// existing path: `/Users/me/notes`, `/notes.txt` and `/tmp` are messages. A bare `/` is a
+    /// command.
     pub(super) fn is_command_input(&self, line: &str) -> bool {
         let Some(command) = line.trim_start().strip_prefix('/') else {
             return false;
         };
         let name = command.split_whitespace().next().unwrap_or_default();
-        self.knows_command(name)
+        name.is_empty()
+            || self.knows_command(name)
             || (name.chars().all(is_command_name_character) && !Path::new("/").join(name).exists())
     }
 
     fn knows_command(&self, name: &str) -> bool {
-        name.is_empty()
-            || COMMANDS.iter().any(|spec| &spec.command[1..] == name)
+        COMMANDS.iter().any(|spec| &spec.command[1..] == name)
             || self.skills.iter().any(|skill| {
                 let skill_name = &skill.command[1..];
                 skill_name == name
@@ -1118,8 +1122,8 @@ mod tests {
         completion.set_skills(Arc::from([skill("/review")]));
 
         for line in [
-            "/Users/griffin/tickloopai/references/codex",
-            "/Users/griffin/tickloopai/references/codex explain its slash dispatch",
+            "/Users/me/references/codex",
+            "/Users/me/references/codex explain its slash dispatch",
             "  /plugins/README.md what is this",
             "/review/",
             "/tmp",
@@ -1145,7 +1149,9 @@ mod tests {
         assert!(!completion.is_open());
         completion.update("/plugins/");
         assert!(!completion.is_open());
-        completion.update("/Users/griffin/tickloopai");
+        completion.update("/Users/me/references");
+        assert!(!completion.is_open());
+        completion.update_at("/rev/notes", "/rev".len(), CommandScope::Root);
         assert!(!completion.is_open());
     }
 

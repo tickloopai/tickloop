@@ -136,7 +136,7 @@ impl State {
         }
         if self
             .completion
-            .is_command_input(&self.paste_blocks.source_text(self.editor.draft()))
+            .is_command_input(self.paste_blocks.source_text(self.editor.draft()))
         {
             self.hold_status(
                 "Wait for images and local messages before running a command; draft kept",

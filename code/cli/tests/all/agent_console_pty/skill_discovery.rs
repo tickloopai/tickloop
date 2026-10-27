@@ -293,16 +293,13 @@ async fn run_path_messages(fixture: &PrivateFixture) {
         |frame| frame.contains("Read the folder path"),
     )
     .await;
-    view.send(b"/tmp is where the logs go\r");
+    let root_path_message = "/tmp is where the logs go";
+    view.send(format!("{root_path_message}\r").as_bytes());
     let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        request["messages"]
-            .to_string()
-            .contains("/tmp is where the logs go")
-    );
+    assert!(request["messages"].to_string().contains(root_path_message));
     view.wait_for("an existing root path is a message in the Chat", |frame| {
         frame.contains("Read the root path")
     })
