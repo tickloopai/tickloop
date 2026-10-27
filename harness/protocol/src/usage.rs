@@ -476,6 +476,23 @@ impl RequestUsageLedger {
         Ok(())
     }
 
+    /// Adds streamed output text: its bytes, and its tokens when the process counts tokens.
+    pub fn add_context_output(
+        &mut self,
+        sequence: RequestSequence,
+        text: &str,
+    ) -> Result<(), LedgerError> {
+        let tokens = crate::context_token_counter().map(|counter| counter.text_tokens(text));
+        if let Some(measurement) = &mut self.in_flight(sequence)?.context_measurement {
+            measurement.streamed_output_bytes =
+                measurement.streamed_output_bytes.saturating_add(text.len());
+            if let Some(tokens) = tokens {
+                measurement.add_streamed_output_tokens(tokens);
+            }
+        }
+        Ok(())
+    }
+
     pub fn summary(&self) -> UsageSummary {
         let mut summary = UsageSummary {
             request_count: self.entries.len(),

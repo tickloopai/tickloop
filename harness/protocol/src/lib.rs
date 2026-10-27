@@ -70,7 +70,9 @@ pub use chat::{
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_usage::{
-    ContextMeasurement, ESTIMATED_CONTEXT_BYTES_PER_TOKEN, serialized_context_bytes,
+    ContextMeasurement, ContextTokenCounter, ESTIMATED_CONTEXT_BYTES_PER_TOKEN,
+    context_token_counter, current_context_tokens, estimated_image_tokens, message_content_tokens,
+    serialized_context_bytes, set_context_token_counter,
 };
 pub use denials::{
     AUTO_REJECTION_PREFIX, ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult,
