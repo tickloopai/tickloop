@@ -266,6 +266,11 @@ impl ContextView<'_> {
                 compact_count(window)
             )));
         }
+        if breakdown.host_tools_pending {
+            lines.push(muted(
+                "Before the first message: Tick, Artifact and MCP tools join when the Agent starts and are not counted.".into(),
+            ));
+        }
         let basis = if breakdown.calibrated {
             "scaled to the context total the service last reported"
         } else {

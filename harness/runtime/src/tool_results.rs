@@ -63,18 +63,23 @@ const FALLBACK_NAME_ATTEMPTS: usize = 8;
 const FALLBACK_STEM: &str = "tool-result";
 
 impl Agent {
+    /// Tools that reach no Folder, which bind no Execution Environment and create no directory.
+    pub(super) fn folderless_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
+        Arc::new(
+            Tools::folderless(self.inner.tool_policy.folderless_reach)
+                .with_search_configuration(
+                    snapshot.search_config.clone(),
+                    self.inner.config_root.clone(),
+                )
+                .with_search_provider_factory(self.inner.search_provider_factory.clone()),
+        )
+    }
+
     /// Each family owns one private temporary root; children share it without widening
     /// access to other families in the same project. A Chat without a Folder has no directory.
     pub(super) fn create_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
         if snapshot.folder.is_none() {
-            return Arc::new(
-                Tools::folderless(self.inner.tool_policy.folderless_reach)
-                    .with_search_configuration(
-                        snapshot.search_config.clone(),
-                        self.inner.config_root.clone(),
-                    )
-                    .with_search_provider_factory(self.inner.search_provider_factory.clone()),
-            );
+            return self.folderless_chat_tools(snapshot);
         }
         let chat_id = snapshot.id;
         let family_id = snapshot

@@ -2024,6 +2024,21 @@ impl AgentAccess for EmbeddedAgentAccess {
                 },
                 None,
             )),
+            ObservationRequest::DraftContextBreakdown { launch, draft } => Ok(Observation::single(
+                ObservationValue::ContextBreakdown(Box::new(
+                    self.inner
+                        .agent
+                        .draft_context_breakdown(Some(launch.folder), *draft)
+                        .await
+                        .map_err(agent_access_error)?,
+                )),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
             ObservationRequest::OtherTickhost => Ok(Observation::single(
                 ObservationValue::OtherTickhost(None),
                 Cursor {

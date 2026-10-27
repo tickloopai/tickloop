@@ -23,7 +23,7 @@ use tickloop_code_access::{
     Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
     PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion, TranscriptRef,
 };
-use tickloop_harness::protocol::OtherTickhost;
+use tickloop_harness::protocol::{ContextBreakdown, ContextDraft, OtherTickhost};
 use tickloop_harness::protocol::{chat_display_title, chat_has_work, chat_preview};
 
 #[async_trait]
@@ -65,6 +65,16 @@ pub trait WorkerFactory: Send + Sync {
     /// Stops the running Tickhost of another build on the user's word.
     async fn replace_tickhost(&self) -> Result<(), AccessError> {
         Ok(())
+    }
+    /// The context breakdown of a New Agent `launch` would start, counted without starting it.
+    async fn draft_context_breakdown(
+        &self,
+        _launch: &LaunchSpec,
+        _draft: ContextDraft,
+    ) -> Result<ContextBreakdown, AccessError> {
+        Err(AccessError::unavailable(
+            "this daemon cannot count a New Agent's context",
+        ))
     }
 }
 
@@ -816,6 +826,16 @@ impl AgentAccess for DaemonServer {
             }
             ObservationRequest::OtherTickhost => Ok(Observation::single(
                 ObservationValue::OtherTickhost(self.inner.factory.other_tickhost().await?),
+                self.cursor(),
+                None,
+            )),
+            ObservationRequest::DraftContextBreakdown { launch, draft } => Ok(Observation::single(
+                ObservationValue::ContextBreakdown(Box::new(
+                    self.inner
+                        .factory
+                        .draft_context_breakdown(&launch, *draft)
+                        .await?,
+                )),
                 self.cursor(),
                 None,
             )),

@@ -19,16 +19,16 @@ use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
 use tickloop_harness::protocol::{
     AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
-    CommandSnapshot, ContextBreakdown, DirectedSummaryDraft, DirectedSummaryRequest, Event,
-    ExecutionMode, HostedMember, HostedViewGrant, InputContext, LoopState, LoopTriggerNotice,
-    Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord, PendingCommand,
-    PendingInput, PermissionChange, PermissionPolicy, PermissionRequest, PermissionRule,
-    PermissionScope, PermissionsRevision, PermissionsView, ProviderCredentialScope, ProviderPatch,
-    QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
-    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult,
-    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
-    TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery,
-    UserShellReceipt, UserShellRecord,
+    CommandSnapshot, ContextBreakdown, ContextDraft, DirectedSummaryDraft, DirectedSummaryRequest,
+    Event, ExecutionMode, HostedMember, HostedViewGrant, InputContext, LoopState,
+    LoopTriggerNotice, Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord,
+    PendingCommand, PendingInput, PermissionChange, PermissionPolicy, PermissionRequest,
+    PermissionRule, PermissionScope, PermissionsRevision, PermissionsView, ProviderCredentialScope,
+    ProviderPatch, QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt,
+    RequestUsageLedger, RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig,
+    SearchTestResult, ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection,
+    TakenBackPrompt, TaskNotification, TickSubscriptionChange, TickSubscriptionStatus,
+    ToolCallRecovery, UserShellReceipt, UserShellRecord,
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
@@ -75,8 +75,9 @@ use tickloop_harness::protocol::{
 /// 28.5 adds the status of the Agent's MCP servers and reconnecting one of them.
 /// 29.0 adds the model card's native tool search, which older readers reject as unknown.
 /// 29.1 adds reading the Chat's context breakdown, as `/context` shows it.
+/// 29.2 adds the context breakdown of a New Agent before its first message.
 pub const PROTOCOL_MAJOR: u16 = 29;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -704,6 +705,12 @@ pub enum ObservationRequest {
     /// something; the daemon replaces one that runs nothing at once.
     OtherTickhost,
     RuntimeVersion,
+    /// What the first request of a New Agent `launch` would start would hold, as `/context`
+    /// shows it before that Agent exists; nothing is created or connected.
+    DraftContextBreakdown {
+        launch: Box<LaunchSpec>,
+        draft: Box<ContextDraft>,
+    },
 }
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user

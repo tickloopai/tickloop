@@ -43,6 +43,14 @@ impl Agent {
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.snapshot.folder.clone()
         };
+        self.instruction_files_in(folder).await
+    }
+
+    /// The instruction files a Chat working in `folder` reads, read on a blocking thread.
+    pub(super) async fn instruction_files_in(
+        &self,
+        folder: Option<std::path::PathBuf>,
+    ) -> Result<Vec<InstructionFile>, AgentError> {
         let settings = self.inner.settings.clone();
         tokio::task::spawn_blocking(move || {
             settings

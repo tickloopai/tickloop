@@ -584,3 +584,42 @@ async fn host_notes_keep_their_labels_after_compaction() {
     assert_eq!(item_tokens(&breakdown.messages, USER_MESSAGES), 1 + 3);
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_draft_counts_its_first_request_without_creating_a_chat() {
+    let (agent, existing, directory) = agent_with_catalog().await;
+    let chats_before = agent.inner.chats.lock().await.len();
+    let breakdown = agent
+        .draft_context_breakdown(
+            Some(directory.path().into()),
+            tickloop_harness_protocol::ContextDraft {
+                model: tickloop_harness_test_support::config_with_window(200_000),
+                execution_mode: tickloop_harness_protocol::ExecutionMode::Plan,
+                search_config: None,
+                task_tools_enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.inner.chats.lock().await.len(),
+        chats_before,
+        "no Chat is created"
+    );
+    assert!(!breakdown.calibrated);
+    assert_eq!(breakdown.used_tokens, category_sum(&breakdown));
+    assert_eq!(category(&breakdown, ContextCategory::Messages), 0);
+    assert!(category(&breakdown, ContextCategory::SystemPrompt) > 0);
+    assert!(category(&breakdown, ContextCategory::InstructionFiles) > 0);
+    assert!(
+        breakdown
+            .system_tools
+            .iter()
+            .any(|tool| tool.name == "ExitPlanMode")
+    );
+    let pool = breakdown.tool_search.unwrap();
+    assert_eq!(pool.tool_count(), 2, "the catalog the host offers now");
+    assert!(breakdown.free_tokens.is_some() && breakdown.autocompact_buffer_tokens.is_some());
+    let _ = existing;
+    agent.shutdown().await;
+}

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mcp::McpServerState;
+use crate::{ExecutionMode, ModelConfig, SearchConfig};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextBreakdown {
@@ -35,6 +36,10 @@ pub struct ContextBreakdown {
     pub host_notes: Vec<ContextItem>,
     /// Present when the Chat reaches MCP tools through tool search.
     pub tool_search: Option<ToolSearchPool>,
+    /// Counted before the Agent started: the host's Tick, Artifact and MCP tools join when it
+    /// does and are not counted, and its MCP servers have not connected yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_tools_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,4 +114,14 @@ pub enum ToolSearchMode {
 pub struct UnavailableToolServer {
     pub name: String,
     pub state: McpServerState,
+}
+
+/// What a New Agent would start its first request with, for `/context` before that request: the
+/// draft's model and settings, which the Agent's own defaults would otherwise choose.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextDraft {
+    pub model: ModelConfig,
+    pub execution_mode: ExecutionMode,
+    pub search_config: Option<SearchConfig>,
+    pub task_tools_enabled: bool,
 }

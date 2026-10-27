@@ -3357,6 +3357,41 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    /// The context the New Agent's first request in `folder` would hold, with the draft's model;
+    /// `None` while the draft has no model to start with.
+    pub(super) async fn draft_context_breakdown(
+        &self,
+        folder: PathBuf,
+    ) -> Result<Option<(ContextBreakdown, ModelConfig)>, AccessError> {
+        let configuration = self.configuration(ConfigTarget::NewDraft).await?;
+        if configuration.model.model.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        let draft = tickloop_harness::protocol::ContextDraft {
+            model: configuration.model.clone(),
+            execution_mode: configuration.execution_mode,
+            search_config: configuration.search_config,
+            task_tools_enabled: configuration.task_tools_enabled,
+        };
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::DraftContextBreakdown {
+                launch: Box::new(launch),
+                draft: Box::new(draft),
+            })
+            .await?
+            .initial
+        {
+            ObservationValue::ContextBreakdown(breakdown) => {
+                Ok(Some((*breakdown, configuration.model)))
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
     /// The running Tickhost of another build the daemon keeps until the user replaces it.
     pub(super) async fn other_tickhost(
         &self,
@@ -4946,6 +4981,40 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_before_the_first_message_counts_the_draft_without_creating_an_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_runtime, access, terminal) = recording_terminal(directory.path());
+        stage_plan(&terminal).await;
+        let (breakdown, model) = terminal
+            .draft_context_breakdown(directory.path().into())
+            .await
+            .unwrap()
+            .expect("the draft has a model");
+        assert_eq!(
+            model.model,
+            tickloop_harness::test_support::persisted_config().model
+        );
+        assert!(!breakdown.calibrated);
+        let categories = breakdown
+            .categories
+            .iter()
+            .map(|usage| usage.category)
+            .collect::<Vec<_>>();
+        assert!(categories.contains(&tickloop_harness::protocol::ContextCategory::SystemPrompt));
+        assert!(categories.contains(&tickloop_harness::protocol::ContextCategory::SystemTools));
+        assert!(!categories.contains(&tickloop_harness::protocol::ContextCategory::Messages));
+        assert_eq!(
+            breakdown.used_tokens,
+            breakdown
+                .categories
+                .iter()
+                .map(|usage| usage.tokens)
+                .sum::<u64>()
+        );
+        assert_eq!(creates(&access), 0, "counting creates no Agent");
     }
 
     #[tokio::test]

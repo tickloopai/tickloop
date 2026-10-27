@@ -724,6 +724,15 @@ fn observation_requests_keep_their_recorded_wire() {
             },
             ObservationRequest::OtherTickhost,
             ObservationRequest::RuntimeVersion,
+            ObservationRequest::DraftContextBreakdown {
+                launch: Box::new(launch_spec()),
+                draft: Box::new(tickloop_harness::protocol::ContextDraft {
+                    model: model_config(),
+                    execution_mode: ExecutionMode::Plan,
+                    search_config: None,
+                    task_tools_enabled: true,
+                }),
+            },
         ],
     );
 }
@@ -942,6 +951,7 @@ fn context_breakdown() -> ContextBreakdown {
                 state: McpServerState::NeedsLogin,
             }],
         }),
+        host_tools_pending: true,
     }
 }
 

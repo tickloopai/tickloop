@@ -65,6 +65,7 @@ fn breakdown() -> ContextBreakdown {
                 state: McpServerState::NeedsLogin,
             }],
         }),
+        host_tools_pending: false,
     }
 }
 
@@ -473,4 +474,19 @@ fn context_all_bars_each_tool_against_the_largest_and_sums_up_the_rest() {
         "    └ tool49  ████░░░░░░░░░░░░░░░░░░░░  ~110 tokens"
     );
     assert_eq!(lines[51], "    … 10 more (~550 tokens)");
+}
+
+#[test]
+fn a_count_before_the_first_message_says_what_it_leaves_out() {
+    let mut draft = breakdown();
+    draft.calibrated = false;
+    draft.host_tools_pending = true;
+    let lines = texts(&render(&draft, 120, false));
+    assert!(lines.contains(
+        &"Before the first message: Tick, Artifact and MCP tools join when the Agent starts and are not counted."
+            .to_owned()
+    ));
+    assert!(lines.contains(
+        &"Estimated with o200k_base · no request has measured this context yet".to_owned()
+    ));
 }

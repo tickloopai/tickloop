@@ -51,6 +51,7 @@ mod chunked;
 pub mod daemon_control;
 mod daemon_management;
 mod daemon_server;
+mod draft_context;
 mod embedded;
 mod ingress;
 mod ipc;
@@ -160,6 +161,13 @@ impl WorkerFactory for ProcessWorkerFactory {
         routes: &[(tickloop_code_access::ExecutionRef, Arc<dyn AgentAccess>)],
     ) -> tickloop_code_access::RuntimeVersion {
         self.version(routes).await
+    }
+    async fn draft_context_breakdown(
+        &self,
+        launch: &LaunchSpec,
+        draft: tickloop_harness::protocol::ContextDraft,
+    ) -> Result<tickloop_harness::protocol::ContextBreakdown, AccessError> {
+        draft_context::breakdown(launch, draft).await
     }
     async fn start(
         &self,

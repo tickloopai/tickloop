@@ -11,9 +11,9 @@ use tickloop_harness_policy::skills::SKILL_TOOL_NAME;
 use tickloop_harness_protocol::mcp::ToolExposure;
 use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, CompactionMarker, Content, ContextBreakdown, ContextCategory,
-    ContextCategoryUsage, ContextItem, ContextTokenCounter, ContextToolServer, GuidanceNote,
-    HostNote, Message, ModelRequestKind, Role, ToolDefinition, ToolSearchMode, ToolSearchPool,
-    UnavailableToolServer, message_content_tokens,
+    ContextCategoryUsage, ContextDraft, ContextItem, ContextTokenCounter, ContextToolServer,
+    GuidanceNote, HostNote, Message, ModelRequestKind, Role, ToolDefinition, ToolSearchMode,
+    ToolSearchPool, UnavailableToolServer, message_content_tokens,
 };
 
 use crate::tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS, SearchSupport};
@@ -44,6 +44,70 @@ impl Agent {
         })
         .await
         .map_err(|error| AgentError::Invalid(format!("counting context failed: {error}")))
+    }
+
+    /// What the first request of a New Agent working in `folder` would hold, before the Agent
+    /// exists: the draft's model and settings, no messages. It creates no Chat, writes nothing
+    /// and connects nothing; the tools are those this Agent's host offers now.
+    pub async fn draft_context_breakdown(
+        &self,
+        folder: Option<PathBuf>,
+        draft: ContextDraft,
+    ) -> Result<ContextBreakdown, AgentError> {
+        let instruction_files = self.instruction_files_in(folder.clone()).await?;
+        let current_date = self.current_date();
+        let settings = self.load_user_settings(folder.clone()).await?;
+        let chat = self.draft_chat(folder, draft, settings);
+        let parts = self.context_parts(&chat, &[], &instruction_files, &current_date)?;
+        tokio::task::spawn_blocking(move || {
+            parts.count(&*tickloop_harness_model::context_tokens::TOKEN_COUNTER)
+        })
+        .await
+        .map_err(|error| AgentError::Invalid(format!("counting context failed: {error}")))
+    }
+
+    /// A Chat value as creating one for `draft` would start it, registered nowhere.
+    fn draft_chat(
+        &self,
+        folder: Option<PathBuf>,
+        draft: ContextDraft,
+        mut settings: Option<tickloop_harness_policy::settings::SettingsSnapshot>,
+    ) -> Chat {
+        let mut snapshot =
+            crate::empty_snapshot(tickloop_ids::generate().into(), folder, draft.model);
+        let defaults = tickloop_harness_policy::new_chat::new_chat_settings(
+            settings.as_mut(),
+            &self.inner.host_options,
+            &snapshot.model,
+        );
+        snapshot.policy.mode = draft.execution_mode;
+        snapshot.search_config = draft.search_config;
+        snapshot.task_tools_enabled = draft.task_tools_enabled;
+        snapshot.context_window_tokens = defaults.context_window_tokens;
+        if let crate::SearchDefaults::Fixed(config) = &self.inner.search {
+            snapshot.search_config = config.clone();
+        }
+        let client = self
+            .inner
+            .selected_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .client
+            .clone();
+        crate::NewChat {
+            tools: self.folderless_chat_tools(&snapshot),
+            skills: self.discover_skills(snapshot.folder.as_deref()),
+            output_style: settings
+                .map(|settings| settings.output_style)
+                .unwrap_or_default(),
+            snapshot,
+            bookkeeping: Default::default(),
+            client,
+            user_context: Default::default(),
+            announced_date: None,
+            file_history: None,
+        }
+        .into_chat()
     }
 
     fn context_parts(
@@ -420,6 +484,7 @@ impl ContextParts {
             .collect(),
             host_notes: items(split.notes.into_iter().collect()),
             tool_search,
+            host_tools_pending: false,
         }
     }
 }
