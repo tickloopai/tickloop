@@ -880,14 +880,13 @@ impl Agent {
             .snapshot
             .operations
             .len();
-        let outcome = self
-            .execute_registered_call_inner(
-                receipt,
-                assistant_message_id,
-                invocation,
-                cancel.clone(),
-            )
-            .await;
+        let outcome = Box::pin(self.execute_registered_call_inner(
+            receipt,
+            assistant_message_id,
+            invocation,
+            cancel.clone(),
+        ))
+        .await;
         let command_state = if is_shell {
             self.command_state_for_call(receipt, &call_id).await
         } else {
