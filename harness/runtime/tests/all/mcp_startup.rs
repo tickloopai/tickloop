@@ -517,10 +517,16 @@ async fn a_local_server_that_exits_starts_once_until_reconnected() {
         fixture.run(&format!("request {request}")).await;
     }
     assert_eq!(fixture.requests().len(), 10);
-    assert_eq!(started(), 1, "requests never start a failed program again");
+    // The one connection attempt starts the program for the discover probe, and once more for
+    // the legacy initialize after the program closed during the probe.
+    assert_eq!(started(), 2, "requests never start a failed program again");
     fixture.agent.reconnect_mcp_server("exits").await.unwrap();
     fixture.wait_for("exits", McpServerState::Failed).await;
-    assert_eq!(started(), 2, "reconnecting starts it once more");
+    assert_eq!(
+        started(),
+        3,
+        "reconnecting starts it once more, straight to the remembered legacy initialize"
+    );
     fixture.shutdown().await;
 }
 
