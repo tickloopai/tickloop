@@ -69,6 +69,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - 在 Monitor 中 `enter` 打开 Tick，`esc` 再隐藏；程序会继续运行。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
 
+Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop` 继续使用 `tickloop.monitor` 和 `~/.tickloop/herdr-popup-plugin`；其他根（包括 `make dev` 的 `~/.tickloop-dev`）使用 `tickloop.monitor.<root-key>`，目录仍为 `<配置根>/herdr-popup-plugin`，显示名包含根路径。稳定的 root key 与 daemon、Tickhost 共用，两套插件可在同一 Herdr 会话共存。每个根首次使用时接受 Monitor 的注册提示，或执行 `tickloop monitor popup install --herdr-socket SOCKET`；`remove` 只移除当前根的插件。默认根已有注册无需重做。
+
 ## Tick
 
 Tick 是 Agent 可以打开、盯着并操作的实时程序，比如行情源或文档阅读器。Tick 和插件一样安装，共用 marketplace 和存储，但单独管理：用 `/ticks` 查找、安装和登录 Tick，或在命令行中操作：

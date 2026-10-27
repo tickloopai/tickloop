@@ -383,7 +383,7 @@ impl HerdrPopup {
             .attach_hosted_tick(ctx.chat, instance.clone())
             .await
             .map_err(|_| NotFloated::Unavailable)?;
-        Ok(self.herdr.float(&grant).await?)
+        Ok(self.herdr.float(&self.plugin, &grant).await?)
     }
 }
 
