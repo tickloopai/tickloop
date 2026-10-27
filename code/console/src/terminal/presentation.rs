@@ -1288,8 +1288,10 @@ impl ToolPresentation {
                         &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                         if status.denied() {
                             ToolCallState::Failed
-                        } else {
+                        } else if self.was_started(event, call_id) {
                             ToolCallState::Running
+                        } else {
+                            ToolCallState::Queued
                         },
                         None,
                     )?;

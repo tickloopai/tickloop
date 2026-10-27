@@ -215,6 +215,16 @@ async fn a_cancelled_auto_classifier_does_not_deny_and_keeps_reported_usage() {
     ));
     assert!(checker.dropped.load(Ordering::SeqCst));
     assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    let started = events
+        .try_recv()
+        .expect("the reviewer start remains observable even when it is cancelled");
+    assert!(matches!(
+        started.kind,
+        tickloop_harness_protocol::EventKind::ApprovalReviewStarted {
+            reviewer: tickloop_harness_protocol::ApprovalReviewerKind::Llm,
+            ..
+        }
+    ));
     assert!(events.try_recv().is_err());
     let snapshot = agent.snapshot(receipt.chat_id).await.unwrap();
     assert_eq!(snapshot.request_usage.entries().len(), 1);

@@ -674,3 +674,41 @@ fn a_final_denial_marks_the_header_failed_without_waiting_for_tool_completed() {
         "{header:?}"
     );
 }
+
+#[test]
+fn reviewing_and_allowed_calls_remain_queued_until_tool_started() {
+    let console = Console::test_interactive_for_chat(Uuid::nil());
+    let mut tools = ToolPresentation::new(false);
+    present(
+        &mut tools,
+        &console,
+        &event(EventKind::AssistantMessageCommitted {
+            message_id: Uuid::new_v4(),
+            tool_calls: vec![tickloop_harness::protocol::ProposedToolCall {
+                call_id: "call".into(),
+                name: "Bash".into(),
+                input: json!({"command":"printf ok"}),
+            }],
+        }),
+    );
+    for kind in [
+        EventKind::ApprovalReviewStarted {
+            call_id: "call".into(),
+            reviewer: ApprovalReviewerKind::Llm,
+        },
+        permission("call").kind,
+        EventKind::ApprovalRecorded {
+            record: Box::new(record("call", ApprovalPath::Human, ApprovalResult::Allow)),
+        },
+    ] {
+        present(&mut tools, &console, &event(kind));
+        let text = console.test_conversation_text();
+        assert!(text.contains("Queued"), "{text}");
+    }
+    present(
+        &mut tools,
+        &console,
+        &started("call", "Bash", json!({"command":"printf ok"})),
+    );
+    assert!(!console.test_conversation_text().contains("Queued"));
+}
