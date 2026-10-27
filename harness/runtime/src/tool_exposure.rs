@@ -11,6 +11,12 @@ const MAX_SEARCH_MATCHES: usize = 10;
 const MAX_SUMMARY_CHARACTERS: usize = 160;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+/// English filler plus the words that describe every entry of an MCP tool catalog: they would
+/// otherwise let a query like "ui5 mcp tools" match every server's tools.
+const SEARCH_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on",
+    "or", "that", "the", "this", "to", "with", "mcp", "server", "tool",
+];
 
 #[derive(Clone, Copy)]
 pub enum SearchSupport {
@@ -244,8 +250,27 @@ fn tokens(text: &str) -> Vec<String> {
     separated
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .map(str::to_lowercase)
+        .map(|term| singular(&term.to_lowercase()))
+        .filter(|term| !SEARCH_STOP_WORDS.contains(&term.as_str()))
         .collect()
+}
+
+/// Naive singular form, so `tools` matches `tool` and `searches` matches `search`.
+fn singular(term: &str) -> String {
+    let length = term.chars().count();
+    if length > 4 && term.ends_with("ies") {
+        format!("{}y", &term[..term.len() - 3])
+    } else if length > 4
+        && ["ches", "shes", "sses", "xes", "zes"]
+            .iter()
+            .any(|suffix| term.ends_with(suffix))
+    {
+        term[..term.len() - 2].to_owned()
+    } else if length > 3 && term.ends_with('s') && !term.ends_with("ss") {
+        term[..term.len() - 1].to_owned()
+    } else {
+        term.to_owned()
+    }
 }
 
 fn summary(text: &str) -> String {

@@ -1460,3 +1460,79 @@ async fn native_models_discover_codemode_schemas_and_call_only_through_scripts()
             .contains("SCRIPT_MAIL_OK")
     );
 }
+
+fn server_tool(server: &str, name: &str, description: &str) -> ExposureTool {
+    let mut tool = tool(name, description, ToolExposure::Search);
+    tool.server = server.into();
+    tool.definition.name = format!("mcp__{server}__{name}");
+    tool
+}
+
+fn ui5_directory() -> ExposureDirectory {
+    ExposureDirectory::new(
+        vec![
+            server_tool(
+                "ui5",
+                "get_version_info",
+                "Get version information for UI5 (OpenUI5 or SAPUI5)",
+            ),
+            server_tool(
+                "ui5",
+                "run_ui5_linter",
+                "Run the UI5 linter on a UI5 project and report findings",
+            ),
+            server_tool("office", "mail", "Send an email message to a recipient"),
+        ],
+        SearchSupport::Fold,
+        false,
+    )
+}
+
+fn found_names(directory: &ExposureDirectory, query: &str) -> Vec<String> {
+    directory.search(&json!({"queries":[query]})).unwrap()["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|found| found["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn multi_word_queries_find_tools_matching_any_meaningful_word() {
+    let directory = ui5_directory();
+    for query in [
+        "ui5 tools",
+        "UI5 version",
+        "UI5 versions",
+        "get version info",
+        "ui5 mcp server tools",
+    ] {
+        let names = found_names(&directory, query);
+        assert!(
+            names.iter().any(|name| name.starts_with("mcp__ui5__")),
+            "{query:?} found {names:?}"
+        );
+        assert!(
+            !names.contains(&"mcp__office__mail".to_owned()),
+            "{query:?} found {names:?}"
+        );
+    }
+    assert_eq!(
+        found_names(&directory, "UI5 version")[0],
+        "mcp__ui5__get_version_info"
+    );
+}
+
+#[test]
+fn queries_made_only_of_unrelated_or_generic_words_match_nothing() {
+    let directory = ui5_directory();
+    for query in [
+        "weather forecast",
+        "mcp server tools",
+        "the tool for a server",
+    ] {
+        let found = directory.search(&json!({"queries":[query]})).unwrap();
+        assert_eq!(found["matches"], json!([]), "{query:?}");
+        assert!(found["note"].is_string());
+    }
+}
