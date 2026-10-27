@@ -169,6 +169,8 @@ pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
     script_only: std::collections::BTreeSet<String>,
+    /// Callable directly, but offered only through the model's native tool search.
+    deferred: Vec<ToolDefinition>,
     /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
     offers_web_search: bool,
 }
@@ -301,6 +303,7 @@ impl ToolRegistry {
         }
         let mut folded = std::collections::BTreeSet::new();
         let mut script_only = std::collections::BTreeSet::new();
+        let mut deferred = Vec::new();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
             if provider.has_tool_search()
                 || provider
@@ -338,25 +341,39 @@ impl ToolRegistry {
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
+                let search_support =
+                    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model)
+                        .is_some()
+                    {
+                        crate::tool_exposure::SearchSupport::Native
+                    } else {
+                        crate::tool_exposure::SearchSupport::Fold
+                    };
+                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
+                    discovery,
+                    search_support,
+                    true,
+                ));
+                deferred = directory.deferred_tools();
                 folded.extend(
-                    discovery
-                        .iter()
+                    directory
+                        .tools()
                         .filter(|tool| {
                             tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
+                                && !deferred
+                                    .iter()
+                                    .any(|deferred| deferred.name == tool.definition.name)
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
-                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
-                    discovery,
-                    crate::tool_exposure::SearchSupport::Fold,
-                    true,
-                ));
-                tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
-                    |definition| RegisteredTool {
-                        definition,
-                        route: ToolRoute::Fold(directory.clone()),
-                    },
-                ));
+                if matches!(search_support, crate::tool_exposure::SearchSupport::Fold) {
+                    tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
+                        |definition| RegisteredTool {
+                            definition,
+                            route: ToolRoute::Fold(directory.clone()),
+                        },
+                    ));
+                }
             }
             tools.extend(
                 provider
@@ -378,16 +395,25 @@ impl ToolRegistry {
             tools: merge_tick_management(tools),
             folded,
             script_only,
+            deferred,
             offers_web_search: policy.web_search,
         }
+    }
+
+    fn is_listed(&self, name: &str) -> bool {
+        !self.folded.contains(name) && !self.deferred.iter().any(|tool| tool.name == name)
     }
 
     pub(super) fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| !self.folded.contains(&tool.definition.name))
+            .filter(|tool| self.is_listed(&tool.definition.name))
             .map(|tool| tool.definition.clone())
             .collect()
+    }
+
+    pub(super) fn deferred_definitions(&self) -> Vec<ToolDefinition> {
+        self.deferred.clone()
     }
 
     pub(super) fn refresh(&mut self, chat: &Chat) {
@@ -424,7 +450,7 @@ impl ToolRegistry {
     pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tools
             .iter()
-            .filter(|tool| !self.folded.contains(&tool.definition.name))
+            .filter(|tool| self.is_listed(&tool.definition.name))
             .filter(|tool| {
                 matches!(
                     tool.route,

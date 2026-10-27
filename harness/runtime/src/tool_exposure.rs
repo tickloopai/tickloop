@@ -57,16 +57,24 @@ impl ExposureDirectory {
         definitions
     }
 
+    /// Native search reads the original schema, as DescribeTools would show it.
     pub fn deferred_tools(&self) -> Vec<ToolDefinition> {
         if matches!(self.search_support, SearchSupport::Native) {
             self.tools
                 .iter()
                 .filter(|tool| tool.exposure == ToolExposure::Search)
-                .map(|tool| tool.definition.clone())
+                .map(|tool| ToolDefinition {
+                    input_schema: tool.original_schema.clone(),
+                    ..tool.definition.clone()
+                })
                 .collect()
         } else {
             Vec::new()
         }
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = &ExposureTool> {
+        self.tools.iter()
     }
 
     pub fn exposure(&self, name: &str) -> Option<ToolExposure> {
