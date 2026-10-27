@@ -234,7 +234,7 @@ impl ModelCatalog {
                     ));
                 }
                 if let Some(search) = model.native_tool_search.flatten()
-                    && search.adapter() != model.adapter
+                    && !crate::native_tool_search::supports_adapter(search, model.adapter)
                 {
                     return Err(format!(
                         "{location}.native_tool_search: {search:?} tool search needs the {:?} adapter",

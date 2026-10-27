@@ -103,6 +103,7 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
   - id: gpt-6.1-sol
+    native_tool_search: openai
     display_name: "GPT-6.1 Sol"
     adapter: "codex_responses"
     max_output_tokens: 128000

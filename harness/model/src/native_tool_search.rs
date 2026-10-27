@@ -5,7 +5,9 @@
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use tickloop_harness_protocol::{Content, ModelConfig, NativeToolSearch, Protocol, ToolDefinition};
+use tickloop_harness_protocol::{
+    Adapter, Content, ModelConfig, NativeToolSearch, Protocol, ToolDefinition,
+};
 
 use crate::ModelError;
 
@@ -25,7 +27,12 @@ pub(crate) const RESPONSES_CALL_NAMESPACE: &str = "_tickloop_function_namespace"
 pub fn offered(config: &ModelConfig) -> Option<NativeToolSearch> {
     crate::cards::model_card(config)
         .and_then(|card| card.native_tool_search.flatten())
-        .filter(|search| search.adapter() == config.adapter())
+        .filter(|search| supports_adapter(*search, config.adapter()))
+}
+
+pub(crate) fn supports_adapter(search: NativeToolSearch, adapter: Adapter) -> bool {
+    search.adapter() == adapter
+        || search == NativeToolSearch::OpenAi && adapter == Adapter::CodexResponses
 }
 
 pub(crate) fn check_request(
