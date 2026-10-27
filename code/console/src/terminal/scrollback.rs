@@ -670,13 +670,35 @@ impl Scrollback {
     /// Draws a call's result under the call's own row and the result rows it already has, so
     /// parallel calls each keep their results. A result of a collapsed read or search shows only
     /// in the detailed transcript; one whose call is not shown goes to the end.
+    #[cfg(test)]
     pub(super) fn append_tool_result(
         &mut self,
         call_id: &str,
         runs: &[(String, Option<Role>)],
         clip_summary: bool,
     ) {
-        if let Some(previous) = self.tool_result_lines.remove(call_id) {
+        self.write_tool_result(call_id, runs, clip_summary, &[], false);
+    }
+
+    pub(super) fn set_tool_result(
+        &mut self,
+        call_id: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        clipped_rows: &[usize],
+    ) {
+        self.write_tool_result(call_id, runs, clip_summary, clipped_rows, true);
+    }
+
+    fn write_tool_result(
+        &mut self,
+        call_id: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        clipped_rows: &[usize],
+        replace: bool,
+    ) {
+        if replace && let Some(previous) = self.tool_result_lines.remove(call_id) {
             self.hide_lines(previous);
         }
         let Some(header) = self.tool_call_headers.get(call_id) else {
@@ -693,8 +715,8 @@ impl Scrollback {
         let indent = header.indent;
         let mut result = Scrollback::new();
         result.append_response(runs);
-        for (line, style) in result.lines.iter().zip(&mut result.line_styles) {
-            if super::approval_status::clips_line(line) {
+        for index in clipped_rows {
+            if let Some(style) = result.line_styles.get_mut(*index) {
                 style.clipped = Some(Role::MutedText);
             }
         }

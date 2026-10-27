@@ -3521,6 +3521,22 @@ impl Console {
             call_key: call_key.to_owned(),
             runs: runs.to_vec(),
             clip_summary,
+            clipped_rows: Vec::new(),
+        }])
+    }
+
+    pub(super) fn write_approved_tool_result(
+        &self,
+        call_key: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        approval: Option<&super::approval_status::ApprovalStatus>,
+    ) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::ToolResult {
+            call_key: call_key.to_owned(),
+            runs: runs.to_vec(),
+            clip_summary,
+            clipped_rows: approval.map_or_else(Vec::new, |approval| approval.clipped_rows(runs)),
         }])
     }
 
@@ -5364,6 +5380,7 @@ pub(super) enum ConversationPiece {
         call_key: String,
         runs: Vec<(String, Option<Role>)>,
         clip_summary: bool,
+        clipped_rows: Vec<usize>,
     },
 }
 
@@ -5416,13 +5433,18 @@ impl ConversationPiece {
             }
             Self::ToolApproval { call_key, runs } => {
                 scrollback.expand_tool_call(call_key);
-                scrollback.append_tool_result(call_key, runs, false);
+                let rows = runs
+                    .iter()
+                    .map(|(text, _)| text.chars().filter(|character| *character == '\n').count())
+                    .sum::<usize>();
+                scrollback.set_tool_result(call_key, runs, false, &(0..rows).collect::<Vec<_>>());
             }
             Self::ToolResult {
                 call_key,
                 runs,
                 clip_summary,
-            } => scrollback.append_tool_result(call_key, runs, *clip_summary),
+                clipped_rows,
+            } => scrollback.set_tool_result(call_key, runs, *clip_summary, clipped_rows),
             Self::Response(runs) => scrollback.append_response(runs),
             Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),

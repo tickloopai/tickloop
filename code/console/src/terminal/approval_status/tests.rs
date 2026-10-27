@@ -467,3 +467,169 @@ fn final_batch_summary_preserves_not_executed_and_unknown_outcomes() {
         "1 completed, 1 denied, 1 failed, 1 not executed, 1 unknown"
     );
 }
+
+#[test]
+fn noninteractive_permissions_still_reach_the_original_prompt_handler() {
+    let console = Console::test_for_chat(Uuid::nil());
+    for name in ["Bash", "ExitPlanMode"] {
+        let mut tools = ToolPresentation::new(true);
+        let mut request = permission("call");
+        if let EventKind::PermissionRequested { request } = &mut request.kind {
+            request.name = name.into();
+        }
+        assert!(
+            !tools
+                .present_event(&console, &request, &CallFacts::default())
+                .unwrap(),
+            "{name} must retain its original permission/workflow handler"
+        );
+    }
+}
+
+#[test]
+fn live_permissions_restore_waiting_rows_after_their_events_are_evicted() {
+    let mut snapshot = snapshot();
+    snapshot.messages = serde_json::from_value(json!([
+        {"role":"assistant","content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":"printf ok"}}]}
+    ])).unwrap();
+    snapshot.message_runs = [(0, Uuid::from_u128(1).into())].into();
+    let EventKind::PermissionRequested { request } = permission("call").kind else {
+        unreachable!()
+    };
+    snapshot.permissions.push(request);
+    assert!(snapshot.events.is_empty());
+    let console = Console::test_interactive_for_chat(Uuid::nil());
+    workflows::write_public_history(&console, &snapshot).unwrap();
+    let text = console.test_conversation_text();
+    assert!(text.contains("Waiting for your approval…"), "{text}");
+    assert!(
+        text.contains("Auto review asked you: The scope needs your confirmation"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Auto review (Jev)") && !text.contains("Auto review (LLM)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn terminating_a_run_replaces_waiting_child_and_parent_without_a_tool_result() {
+    for human in [false, true] {
+        for ending in [
+            EventKind::Interrupted,
+            EventKind::Failed("lost execution".into()),
+        ] {
+            let console = Console::test_interactive_for_chat(Uuid::nil());
+            let mut tools = ToolPresentation::new(false);
+            present(
+                &mut tools,
+                &console,
+                &started("batch", "ExecuteTools", json!({"calls":[{}]})),
+            );
+            let start = started("call", "mcp__fixture__write", json!({}));
+            tools.learn_nested_call(&start, &nested("call", None));
+            present(&mut tools, &console, &start);
+            present(
+                &mut tools,
+                &console,
+                &event(EventKind::ApprovalReviewStarted {
+                    call_id: "call".into(),
+                    reviewer: ApprovalReviewerKind::Llm,
+                }),
+            );
+            if human {
+                present(&mut tools, &console, &permission("call"));
+            }
+            let label = if matches!(ending, EventKind::Interrupted) {
+                "Interrupted"
+            } else {
+                "Failed"
+            };
+            present(&mut tools, &console, &event(ending));
+            let text = console.test_conversation_text();
+            assert!(
+                !text.contains("Waiting for your approval") && !text.contains("Auto review (LLM)…"),
+                "{text}"
+            );
+            assert_eq!(text.matches(label).count(), 2, "{text}");
+            if human {
+                assert!(text.contains("The scope needs your confirmation"), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn detailed_failed_results_do_not_claim_completion_or_add_direct_labels() {
+    for path in [ApprovalPath::AutoLlm, ApprovalPath::Direct] {
+        let mut tools = ToolPresentation::new(true);
+        tools.record(&started("call", "Bash", json!({"command":"false"})));
+        tools.record(&event(EventKind::ApprovalRecorded {
+            record: Box::new(record("call", path, ApprovalResult::Allow)),
+        }));
+        let text = tools.render_event(&completed("call", true)).unwrap();
+        assert!(text.contains("Failed"), "{text}");
+        assert!(!text.contains("Completed"), "{text}");
+        assert_eq!(
+            text.contains("Allowed by Auto review"),
+            path == ApprovalPath::AutoLlm,
+            "{text}"
+        );
+        if path == ApprovalPath::Direct {
+            assert!(!text.contains('↳'), "{text}");
+        }
+    }
+}
+
+#[test]
+fn technical_unavailability_and_admission_failure_do_not_blame_the_reviewer() {
+    for (category, path, label) in [
+        (
+            DenialCategory::NoHuman,
+            ApprovalPath::AutoLlm,
+            "Approval unavailable:",
+        ),
+        (
+            DenialCategory::FinalAdmission,
+            ApprovalPath::Human,
+            "Not executed:",
+        ),
+    ] {
+        let mut record = record("call", path, ApprovalResult::Deny);
+        record.denial_category = Some(category);
+        let status = ApprovalStatus::Settled(Box::new(record));
+        let text = presentation::joined(&status.decorate(result_runs("Failed", "⎿"), "⎿"));
+        assert!(text.contains(label), "{text}");
+        assert!(!text.contains("Denied by"), "{text}");
+    }
+}
+
+#[test]
+fn ordinary_output_with_an_approval_like_prefix_keeps_wrapping() {
+    let console = Console::test_interactive_for_chat(Uuid::nil());
+    let mut tools = ToolPresentation::new(false);
+    present(
+        &mut tools,
+        &console,
+        &started("call", "Bash", json!({"command":"printf log"})),
+    );
+    present(
+        &mut tools,
+        &console,
+        &event(EventKind::ApprovalRecorded {
+            record: Box::new(record("call", ApprovalPath::Direct, ApprovalResult::Allow)),
+        }),
+    );
+    let result = event(EventKind::ToolCompleted {
+        call_id: "call".into(),
+        result: ToolResult {
+            content: format!("Safety check {} END-OF-LOG", "x".repeat(145)),
+            is_error: false,
+            output_ref: None,
+        },
+        sources: Vec::new(),
+    });
+    present(&mut tools, &console, &result);
+    let text = console.test_conversation_text();
+    assert!(text.contains("END-OF-LOG"), "{text}");
+}

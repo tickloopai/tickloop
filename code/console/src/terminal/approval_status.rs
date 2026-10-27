@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use tickloop_harness::protocol::{
-    ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, ChatSnapshot, Event,
-    EventKind, PermissionApprovalSource,
+    ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, ChatSnapshot,
+    DenialCategory, Event, EventKind, PermissionApprovalSource,
 };
 use uuid::Uuid;
 
@@ -37,7 +37,29 @@ impl ToolApprovals {
                 ApprovalStatus::Settled(Box::new(record.clone())),
             );
         }
+        for request in &snapshot.permissions {
+            if let Some(run) = request.execution.run_id() {
+                let key = (run.uuid(), request.execution.call_key());
+                let reviewer = approvals.reviewers.get(&key).copied();
+                approvals.states.insert(
+                    key,
+                    ApprovalStatus::Waiting {
+                        source: request.approval_source,
+                        reason: request.approval_reason.clone(),
+                        reviewer,
+                    },
+                );
+            }
+        }
         approvals
+    }
+
+    pub(super) fn pending_calls(&self, run: Uuid) -> Vec<(String, ApprovalStatus)> {
+        self.states
+            .iter()
+            .filter(|((id, _), state)| *id == run && state.pending_label().is_some())
+            .map(|((_, call), state)| (call.clone(), state.clone()))
+            .collect()
     }
 
     pub(super) fn get(&self, run: Uuid, call: &str) -> Option<&ApprovalStatus> {
@@ -154,22 +176,51 @@ impl ApprovalStatus {
     }
 
     pub(super) fn result_label(&self) -> Option<String> {
-        self.pending_label().or_else(|| match self {
-            Self::Settled(record) if record.outcome == ApprovalResult::Deny => match record.path {
+        self.pending_label().or_else(|| {
+            let Self::Settled(record) = self else {
+                return None;
+            };
+            if record.outcome != ApprovalResult::Deny {
+                return None;
+            }
+            let reason = single_line(&record.reason);
+            match record.denial_category {
+                Some(DenialCategory::NoHuman) => {
+                    return Some(format!("Approval unavailable: {reason}"));
+                }
+                Some(DenialCategory::FinalAdmission) => {
+                    return Some(format!("Not executed: {reason}"));
+                }
+                _ => {}
+            }
+            match record.path {
                 ApprovalPath::AutoJev | ApprovalPath::AutoLlm => Some(format!(
-                    "Denied by Auto review ({}): {}",
+                    "Denied by Auto review ({}): {reason}",
                     if record.path == ApprovalPath::AutoJev {
                         "Jev"
                     } else {
                         "LLM"
-                    },
-                    single_line(&record.reason)
+                    }
                 )),
                 ApprovalPath::Human => Some("Denied by you".into()),
                 ApprovalPath::Direct => None,
-            },
-            _ => None,
+            }
         })
+    }
+
+    pub(super) fn clipped_rows(&self, runs: &[(String, Option<Role>)]) -> Vec<usize> {
+        let rows = runs
+            .iter()
+            .map(|(text, _)| text.chars().filter(|character| *character == '\n').count())
+            .sum::<usize>();
+        let mut clipped = Vec::new();
+        if self.result_label().is_some() {
+            clipped.push(0);
+        }
+        if self.human_context().is_some() && rows > 0 {
+            clipped.push(rows - 1);
+        }
+        clipped
     }
 
     pub(super) fn allowed_label(&self) -> Option<&'static str> {
@@ -203,22 +254,6 @@ impl ApprovalStatus {
 
 pub(super) fn result_runs(text: &str, glyph: &str) -> RoleRuns {
     vec![(format!("  {glyph}  {text}\n"), Some(Role::MutedText))]
-}
-
-pub(super) fn clips_line(text: &str) -> bool {
-    [
-        "Denied by Auto review (",
-        "Auto review (",
-        "Auto review asked you",
-        "Explicit Ask",
-        "Permission policy",
-        "Safety check",
-    ]
-    .iter()
-    .any(|prefix| {
-        text.trim_start_matches([' ', '⎿', '↳', '└'])
-            .starts_with(prefix)
-    })
 }
 
 #[cfg(test)]

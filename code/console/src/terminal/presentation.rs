@@ -1229,6 +1229,14 @@ impl ToolPresentation {
         event: &Event,
         facts: &CallFacts,
     ) -> Result<bool, String> {
+        let ended_pending = if matches!(
+            event.kind,
+            EventKind::Completed { .. } | EventKind::Interrupted | EventKind::Failed(_)
+        ) {
+            self.approvals.pending_calls(event.run_id.into())
+        } else {
+            Vec::new()
+        };
         self.record(event);
         if matches!(
             event.kind,
@@ -1240,6 +1248,28 @@ impl ToolPresentation {
         }
         let display = console.display_profile()?;
         let cwd = console.working_directory()?;
+        for (call_id, approval) in ended_pending {
+            let (label, state) = match event.kind {
+                EventKind::Failed(_) => ("Failed", ToolCallState::Failed),
+                EventKind::Interrupted => ("Interrupted", ToolCallState::Stopped),
+                _ => ("Not executed", ToolCallState::Stopped),
+            };
+            let key = tool_call_key(event.run_id.into(), &call_id);
+            let mut runs = result_runs(label, display.glyph(Glyph::ToolResult));
+            if let Some(context) = approval.human_context() {
+                runs.push((format!("     {context}\n"), Some(Role::MutedText)));
+            }
+            console.write_tool_approval(&key, &runs)?;
+            console.finish_tool_call(event.run_id.into(), Some((&key, state)))?;
+            if let Some(nested) = self.nested.get(&key) {
+                console.write_tool_result(
+                    &nested.parent_key,
+                    &result_runs(label, display.glyph(Glyph::ToolResult)),
+                    false,
+                )?;
+                console.finish_tool_call(event.run_id.into(), Some((&nested.parent_key, state)))?;
+            }
+        }
         if let Some(call_id) = approval_event_call(event) {
             if let Some(status) = self.approvals.get(event.run_id.into(), call_id) {
                 let runs = status.decorate(Vec::new(), display.glyph(Glyph::ToolResult));
@@ -1263,7 +1293,8 @@ impl ToolPresentation {
                 console.write_tool_approval(&key, &runs)?;
                 self.present_parent_status(console, event, call_id, display)?;
             }
-            return Ok(true);
+            return Ok(console.is_interactive()
+                || !matches!(event.kind, EventKind::PermissionRequested { .. }));
         }
         // A call a batch made without starting, such as one it was denied, still
         // shows its row under the call that made it.
@@ -1427,7 +1458,12 @@ impl ToolPresentation {
                     }
                     _ => {}
                 }
-                console.write_tool_result(&key, &rendered, state == ToolCallState::Warning)?
+                console.write_approved_tool_result(
+                    &key,
+                    &rendered,
+                    state == ToolCallState::Warning,
+                    self.approvals.get(event.run_id.into(), call_id),
+                )?
             }
             _ => console.write_roles(&rendered)?,
         }
@@ -1716,9 +1752,10 @@ impl ToolPresentation {
             if let EventKind::ToolCompleted { call_id, .. } = &event.kind
                 && let Some(approval) = self.approvals.get(event.run_id.into(), call_id)
             {
-                return Some(
-                    joined(&approval.decorate(result_runs("Completed", "↳"), "↳")) + &detail,
-                );
+                let approval_lines = approval.decorate(Vec::new(), "↳");
+                if !approval_lines.is_empty() {
+                    return Some(detail + &joined(&approval_lines));
+                }
             }
             return Some(detail);
         }

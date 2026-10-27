@@ -1426,6 +1426,11 @@ fn append_public_message(
                 match run_id {
                     Some(run) => history.pieces.push(ConversationPiece::ToolResult {
                         call_key: presentation::tool_call_key(run.into(), tool_use_id),
+                        clipped_rows: super::approval_status::ToolApprovals::from_snapshot(
+                            history.chat,
+                        )
+                        .get(run.into(), tool_use_id)
+                        .map_or_else(Vec::new, |approval| approval.clipped_rows(&runs)),
                         runs,
                         clip_summary: presentation::goal_completion_rejection_reason(
                             name,
@@ -1515,6 +1520,8 @@ fn append_nested_calls(
             }
             history.pieces.push(ConversationPiece::ToolResult {
                 call_key,
+                clipped_rows: approval
+                    .map_or_else(Vec::new, |approval| approval.clipped_rows(&runs)),
                 runs,
                 clip_summary: false,
             });
@@ -1522,6 +1529,7 @@ fn append_nested_calls(
             history.pieces.push(ConversationPiece::ToolResult {
                 call_key,
                 runs: approval.decorate(Vec::new(), display.glyph(Glyph::ToolResult)),
+                clipped_rows: vec![0, 1],
                 clip_summary: false,
             });
         }
@@ -1540,6 +1548,7 @@ fn append_nested_calls(
         history.pieces.push(ConversationPiece::ToolResult {
             call_key: parent_key,
             runs: super::approval_status::result_runs(&summary, display.glyph(Glyph::ToolResult)),
+            clipped_rows: Vec::new(),
             clip_summary: false,
         });
     }
