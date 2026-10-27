@@ -266,8 +266,9 @@ fn probe_targets(servers: &[McpServerStatus], scope: ProbeScope) -> Vec<String> 
 }
 
 /// Shows in `listing`, which comes from the configuration, the state of each server connected
-/// for the panel: connecting while that runs, then how it ended. A server that can no longer run
-/// is forgotten.
+/// for the panel: connecting while that runs, then how it ended. The exposure stays the
+/// configuration's, which `e` may have changed since the connection. A server that can no longer
+/// run is forgotten.
 fn show_probes(listing: &mut McpListing, probes: &mut BTreeMap<String, Probe>) {
     probes.retain(|name, _| {
         listing
@@ -281,7 +282,13 @@ fn show_probes(listing: &mut McpListing, probes: &mut BTreeMap<String, Probe>) {
         };
         match &probe.status {
             None => {}
-            Some(Ok(status)) => *server = status.clone(),
+            Some(Ok(status)) => {
+                let exposure = std::mem::take(&mut server.exposure);
+                *server = McpServerStatus {
+                    exposure,
+                    ..status.clone()
+                };
+            }
             Some(Err(error)) => {
                 server.state = McpServerState::Failed;
                 server.failure = Some(error.clone());
@@ -798,6 +805,26 @@ mod tests {
         assert!(
             !probes.contains_key("off"),
             "a server that can no longer run is forgotten"
+        );
+    }
+
+    #[test]
+    fn a_connection_made_for_the_panel_keeps_the_exposure_chosen_since() {
+        let connected = configured("remote", "http", McpServerState::Connected);
+        let mut probes = BTreeMap::from([(
+            "remote".to_owned(),
+            Probe {
+                run: 1,
+                status: Some(Ok(connected)),
+            },
+        )]);
+        let mut changed = configured("remote", "http", McpServerState::Connecting);
+        changed.exposure = "direct".into();
+        let mut shown = listing(vec![changed]);
+        show_probes(&mut shown, &mut probes);
+        assert_eq!(
+            (&shown.servers[0].state, shown.servers[0].exposure.as_str()),
+            (&McpServerState::Connected, "direct")
         );
     }
 }
