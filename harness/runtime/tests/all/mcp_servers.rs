@@ -9,6 +9,47 @@ use tickloop_harness_test_support::mcp_service::McpService;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over_sse() {
+    let server = McpService::start().await;
+    server.reject_discover_over_sse();
+    server.set_tools(json!([{"name":"say.hello","inputSchema":{"type":"object"}}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
+            sensitive_values: Vec::new(),
+            disabled: false,
+            name: "legacy".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: BTreeMap::new(),
+            },
+            oauth: Default::default(),
+            timeout_ms: 300_000,
+        }])
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state == McpServerState::Connecting {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = connections.snapshot();
+    connections.shutdown().await;
+    assert_eq!(snapshot[0].state, McpServerState::Connected);
+    assert_eq!(snapshot[0].tools.len(), 1);
+    assert_eq!(snapshot[0].tools[0].name, "mcp__legacy__say_hello");
+}
+
+#[tokio::test]
 async fn http_connection_discovers_and_calls_the_original_tool() {
     let server = McpService::start().await;
     server.set_tools(

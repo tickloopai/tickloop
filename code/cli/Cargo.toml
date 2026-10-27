@@ -56,7 +56,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 portable-pty = "0.9"
 regex = "1"
-rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
+rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 sha2 = "0.10"

@@ -34,6 +34,7 @@ struct State {
     resources: Value,
     resource_text: String,
     resources_changed: bool,
+    discover_error_over_sse: bool,
 }
 impl McpService {
     pub async fn start() -> Self {
@@ -61,6 +62,7 @@ impl McpService {
                 resources: json!([{"uri":"fixture://text","name":"text"}]),
                 resource_text: "resource text".into(),
                 resources_changed: false,
+                discover_error_over_sse: false,
             })),
             cancel: CancellationToken::new(),
         };
@@ -150,7 +152,7 @@ impl McpService {
                                 (200, "text/event-stream", "id: directory-cut\nretry: 0\n\n".into())
                             } else if request.get("id").is_none() {
                                 (202, "application/json", String::new())
-                            } else if !notifications.is_empty() {
+                            } else if !notifications.is_empty() || (request["method"] == "server/discover" && state.lock().unwrap().discover_error_over_sse) {
                                 let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
                                 (status, "text/event-stream", format!("{events}data: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
@@ -187,6 +189,9 @@ impl McpService {
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
+    }
+    pub fn reject_discover_over_sse(&self) {
+        self.state.lock().unwrap().discover_error_over_sse = true;
     }
     pub fn resume_tool_directory_once(&self) {
         self.state.lock().unwrap().resume_directory = true;
