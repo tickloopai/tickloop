@@ -51,6 +51,8 @@ pub struct McpServerSnapshot {
     pub warnings: Vec<String>,
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the first request waits, once, for servers that are still starting.
+const STARTUP_WAIT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
@@ -119,6 +121,16 @@ struct Entry {
     cancel: CancellationToken,
 }
 impl Entry {
+    fn offers_tools(&self) -> bool {
+        use tickloop_harness_protocol::mcp::ToolExposure;
+        self.config.exposure != ToolExposure::Hidden
+            || self
+                .config
+                .tool_exposure
+                .iter()
+                .any(|(_, exposure)| *exposure != ToolExposure::Hidden)
+    }
+
     fn restore_tool_schemas(
         &self,
         tools: &mut BTreeMap<String, catalog::Tool>,
@@ -200,7 +212,7 @@ struct Inner {
     tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     reconcile_lock: tokio::sync::Mutex<()>,
     closed: AtomicBool,
-    direct_waited: AtomicBool,
+    startup_waited: AtomicBool,
     state_changed: Arc<tokio::sync::Notify>,
     local_slots: Arc<tokio::sync::Semaphore>,
     remote_slots: Arc<tokio::sync::Semaphore>,
@@ -221,16 +233,17 @@ impl McpConnections {
                 tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
                 reconcile_lock: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
-                direct_waited: AtomicBool::new(false),
+                startup_waited: AtomicBool::new(false),
                 state_changed: Arc::new(tokio::sync::Notify::new()),
                 local_slots: Arc::new(tokio::sync::Semaphore::new(4)),
                 remote_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             }),
         }
     }
-    async fn wait_for_direct(&self, cancel: CancellationToken) {
-        use tickloop_harness_protocol::mcp::ToolExposure;
-        if self.inner.direct_waited.swap(true, Ordering::SeqCst) {
+    /// The first request waits, at most once, for servers whose tools reach the model directly
+    /// or through discovery, so that it does not miss a server that is still starting.
+    async fn wait_for_startup(&self, cancel: CancellationToken) {
+        if self.inner.startup_waited.swap(true, Ordering::SeqCst) {
             return;
         }
         let wait = async {
@@ -240,12 +253,7 @@ impl McpConnections {
                 changed.as_mut().enable();
                 let pending = self.inner.entries.read().unwrap().values().any(|entry| {
                     *entry.state.read().unwrap() == McpServerState::Connecting
-                        && (entry.config.exposure == ToolExposure::Direct
-                            || entry
-                                .config
-                                .tool_exposure
-                                .iter()
-                                .any(|(_, exposure)| *exposure == ToolExposure::Direct))
+                        && entry.offers_tools()
                 });
                 if !pending {
                     break;
@@ -253,7 +261,7 @@ impl McpConnections {
                 changed.await;
             }
         };
-        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(Duration::from_secs(10), wait) => {} }
+        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(STARTUP_WAIT, wait) => {} }
     }
 
     pub fn with_stderr_directory(
@@ -584,6 +592,30 @@ impl McpConnections {
         }
         tools
     }
+    /// Servers that would offer tools but are starting, failed or waiting for login.
+    pub fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
+        self.inner
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.offers_tools())
+            .filter_map(|entry| {
+                let state = entry.state.read().unwrap().clone();
+                matches!(
+                    state,
+                    McpServerState::Connecting
+                        | McpServerState::Failed
+                        | McpServerState::NeedsLogin
+                )
+                .then(|| crate::tool_exposure::UnavailableServer {
+                    name: entry.config.name.clone(),
+                    state,
+                })
+            })
+            .collect()
+    }
+
     /// What a View shows of each server, in name order.
     pub fn statuses(&self) -> Vec<McpServerStatus> {
         let catalog = self.catalog();

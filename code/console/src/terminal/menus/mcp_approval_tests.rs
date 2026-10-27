@@ -164,7 +164,7 @@ async fn nested_file_change_confirmation_shows_the_entire_parent_batch() {
                 "ExecuteTools",
                 json!({"calls":[
                     {"name":"Write","arguments":{"file_path":project.join("note.txt"),"content":"first operation"}},
-                    {"name":"SearchTools","arguments":{"queries":["second-operation-marker"]}}
+                    {"name":"SearchTools","arguments":{"query":"second-operation-marker"}}
                 ]}),
             ),
             text("done"),
@@ -211,7 +211,11 @@ async fn nested_file_change_confirmation_shows_the_entire_parent_batch() {
         .unwrap();
     let menu = console.menu_snapshot(request.id).unwrap().unwrap();
     let context = menu.context.join("\n");
-    assert!(context.contains("batch-context"));
+    assert!(
+        context.contains("From ExecuteTools, call 1 of 2"),
+        "{context}"
+    );
+    assert!(!context.contains("batch-context"), "{context}");
     assert!(context.contains("second-operation-marker"));
     core.shutdown().await;
 }

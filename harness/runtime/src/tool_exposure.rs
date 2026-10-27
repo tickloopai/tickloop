@@ -1,16 +1,32 @@
 //! Pure projection and discovery of the tools a directory makes available.
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use tickloop_harness_protocol::{Content, Message, ToolDefinition, mcp::ToolExposure};
+use tickloop_harness_protocol::{
+    Content, Message, ToolDefinition,
+    mcp::{McpServerState, ToolExposure},
+};
 
 pub const SEARCH_TOOLS: &str = "SearchTools";
 pub const DESCRIBE_TOOLS: &str = "DescribeTools";
 pub const EXECUTE_TOOLS: &str = "ExecuteTools";
 const MAX_DISCOVERY_INPUTS: usize = 5;
+const DEFAULT_SEARCH_MATCHES: usize = 8;
 const MAX_SEARCH_MATCHES: usize = 10;
 const MAX_SUMMARY_CHARACTERS: usize = 160;
+const SELECT_PREFIX: &str = "select:";
+const SERVER_PREFIX: &str = "mcp__";
+const REQUIRED_PREFIX: char = '+';
+const NO_MATCH_NOTE: &str = "No tool matched.";
+const NAME_WEIGHT: f64 = 2.0;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+/// English filler plus the words that describe every entry of an MCP tool catalog: they would
+/// otherwise let a query like "ui5 mcp tools" match every server's tools.
+const SEARCH_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on",
+    "or", "that", "the", "this", "to", "with", "mcp", "server", "tool",
+];
 
 #[derive(Clone, Copy)]
 pub enum SearchSupport {
@@ -28,9 +44,17 @@ pub struct ExposureTool {
     pub exposure: ToolExposure,
 }
 
+/// A server whose tools discovery cannot offer right now, so a search can say why it is missing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnavailableServer {
+    pub name: String,
+    pub state: McpServerState,
+}
+
 pub struct ExposureDirectory {
     tools: Vec<ExposureTool>,
     search_support: SearchSupport,
+    unavailable_servers: Vec<UnavailableServer>,
 }
 
 impl ExposureDirectory {
@@ -41,7 +65,13 @@ impl ExposureDirectory {
         Self {
             tools,
             search_support,
+            unavailable_servers: Vec::new(),
         }
+    }
+
+    pub fn with_unavailable_servers(mut self, servers: Vec<UnavailableServer>) -> Self {
+        self.unavailable_servers = servers;
+        self
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -106,7 +136,19 @@ impl ExposureDirectory {
     }
 
     pub fn search(&self, input: &Value) -> Result<Value, String> {
-        let queries = strings(input, "queries")?;
+        let query = input["query"]
+            .as_str()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or("query must be a non-empty string")?;
+        let limit = match &input["limit"] {
+            Value::Null => DEFAULT_SEARCH_MATCHES,
+            limit => limit
+                .as_u64()
+                .filter(|limit| *limit > 0)
+                .ok_or("limit must be a positive integer")?
+                .min(MAX_SEARCH_MATCHES as u64) as usize,
+        };
         let tools: Vec<_> = self
             .tools
             .iter()
@@ -116,82 +158,104 @@ impl ExposureDirectory {
                         && tool.exposure == ToolExposure::Search)
             })
             .collect();
-        let documents: Vec<_> = tools
-            .iter()
-            .map(|tool| {
-                let properties = tool.original_schema["properties"]
-                    .as_object()
-                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>().join(" "))
-                    .unwrap_or_default();
-                tokens(&format!(
-                    "{} {} {} {} {}",
-                    tool.definition.name,
-                    tool.original_name,
-                    tool.definition.description,
-                    tool.server,
-                    properties
-                ))
-            })
-            .collect();
-        let average = (documents.iter().map(Vec::len).sum::<usize>() as f64
-            / documents.len().max(1) as f64)
-            .max(1.0);
-        let mut matches = Vec::new();
-        let mut seen = BTreeSet::new();
-        for query in queries {
-            let query_tokens: BTreeSet<_> = tokens(query).into_iter().collect();
-            let mut ranked: Vec<_> = tools
-                .iter()
-                .zip(&documents)
-                .filter_map(|(tool, document)| {
-                    let exact = tool.definition.name == query || tool.original_name == query;
-                    let mut frequencies = BTreeMap::new();
-                    for term in document {
-                        *frequencies.entry(term).or_insert(0usize) += 1;
-                    }
-                    let score: f64 = query_tokens
-                        .iter()
-                        .map(|term| {
-                            let count = frequencies.get(term).copied().unwrap_or_default() as f64;
-                            if count == 0.0 {
-                                return 0.0;
-                            }
-                            let containing = documents
-                                .iter()
-                                .filter(|document| document.contains(term))
-                                .count() as f64;
-                            let idf = (1.0
-                                + (documents.len() as f64 - containing + 0.5) / (containing + 0.5))
-                                .ln();
-                            idf * count * (BM25_K1 + 1.0)
-                                / (count
-                                    + BM25_K1
-                                        * (1.0 - BM25_B + BM25_B * document.len() as f64 / average))
-                        })
-                        .sum();
-                    (exact || score > 0.0).then_some((exact, score, *tool))
-                })
+        let mut not_found = Vec::new();
+        let found = if let Some(names) = query.strip_prefix(SELECT_PREFIX) {
+            let names: Vec<_> = names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
                 .collect();
-            ranked.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| b.1.total_cmp(&a.1))
-                    .then_with(|| a.2.definition.name.cmp(&b.2.definition.name))
-            });
-            for (_, _, tool) in ranked.into_iter().take(MAX_SEARCH_MATCHES) {
-                if seen.insert(&tool.definition.name) {
-                    matches.push(json!({"name":tool.definition.name,"server":tool.server,
-                        "summary":summary(&tool.definition.description),
-                        "required":tool.original_schema.get("required").cloned().unwrap_or(json!([]))}));
+            if !(1..=MAX_SEARCH_MATCHES).contains(&names.len()) {
+                return Err(format!(
+                    "select: takes 1–{MAX_SEARCH_MATCHES} exact tool names"
+                ));
+            }
+            let mut selected: Vec<&ExposureTool> = Vec::new();
+            for name in names {
+                if selected.iter().any(|tool| tool.definition.name == name)
+                    || not_found.contains(&name)
+                {
+                    continue;
+                }
+                match tools.iter().find(|tool| tool.definition.name == name) {
+                    Some(tool) => selected.push(tool),
+                    None => not_found.push(name),
                 }
             }
-        }
+            selected
+        } else {
+            let exact: Vec<_> = tools
+                .iter()
+                .copied()
+                .filter(|tool| tool.definition.name == query || tool.original_name == query)
+                .collect();
+            let server_tools: Vec<_> = query
+                .strip_prefix(SERVER_PREFIX)
+                .map(|server| server.trim_end_matches('_'))
+                .filter(|server| !server.is_empty() && !server.contains(char::is_whitespace))
+                .map(|server| {
+                    let prefix = format!("{SERVER_PREFIX}{server}__");
+                    tools
+                        .iter()
+                        .copied()
+                        .filter(|tool| tool.definition.name.starts_with(&prefix))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !exact.is_empty() {
+                exact
+            } else if !server_tools.is_empty() {
+                server_tools
+            } else {
+                ranked(&tools, query).into_iter().take(limit).collect()
+            }
+        };
+        let matches: Vec<_> = found
+            .iter()
+            .map(|tool| {
+                json!({"name":tool.definition.name,"server":tool.server,
+                    "summary":summary(&tool.definition.description),
+                    "required":tool.original_schema.get("required").cloned().unwrap_or(json!([]))})
+            })
+            .collect();
         let mut output = json!({"matches":matches});
-        if matches.is_empty() {
-            output["note"] = json!(
-                "No tool matched. Try another wording or an exact tool name; check the MCP server status for unavailable services."
-            );
+        if !not_found.is_empty() {
+            output["not_found"] = json!(not_found);
+        }
+        if !self.unavailable_servers.is_empty() {
+            output["unavailable_servers"] = json!(self.unavailable_servers);
+        }
+        if let Some(note) = self.search_note(matches.is_empty()) {
+            output["note"] = json!(note);
         }
         Ok(output)
+    }
+
+    fn search_note(&self, nothing_matched: bool) -> Option<String> {
+        let unavailable = (!self.unavailable_servers.is_empty()).then(|| {
+            let servers = self
+                .unavailable_servers
+                .iter()
+                .map(|server| {
+                    format!(
+                        "{} ({})",
+                        server.name,
+                        json!(server.state).as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "These MCP servers cannot offer tools right now: {servers}. Search again shortly for a connecting server; check the MCP server status for the others."
+            )
+        });
+        match (nothing_matched, unavailable) {
+            (true, Some(unavailable)) => Some(format!("{NO_MATCH_NOTE} {unavailable}")),
+            (true, None) => Some(format!(
+                "{NO_MATCH_NOTE} Try another wording or an exact tool name; check the MCP server status for unavailable services."
+            )),
+            (false, unavailable) => unavailable,
+        }
     }
 
     pub fn describe(&self, input: &Value) -> Result<Value, String> {
@@ -231,6 +295,116 @@ fn strings<'a>(input: &'a Value, field: &str) -> Result<Vec<&'a str>, String> {
         .collect()
 }
 
+/// Tools matching any query word, best first; a `+word` must match. Words in a tool's name and
+/// server weigh more than the same words in its description and parameter names.
+fn ranked<'a>(tools: &[&'a ExposureTool], query: &str) -> Vec<&'a ExposureTool> {
+    let mut terms = BTreeSet::new();
+    let mut required = BTreeSet::new();
+    for word in query.split_whitespace() {
+        let (is_required, word) = match word.strip_prefix(REQUIRED_PREFIX) {
+            Some(word) => (true, word),
+            None => (false, word),
+        };
+        for term in tokens(word) {
+            if is_required {
+                required.insert(term.clone());
+            }
+            terms.insert(term);
+        }
+    }
+    let names = Bm25Field::new(tools.iter().map(|tool| {
+        tokens(&format!(
+            "{} {} {}",
+            tool.definition.name, tool.original_name, tool.server
+        ))
+    }));
+    let descriptions = Bm25Field::new(tools.iter().map(|tool| {
+        let properties = tool.original_schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        tokens(&format!("{} {properties}", tool.definition.description))
+    }));
+    let mut ranked: Vec<_> = tools
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            required
+                .iter()
+                .all(|term| names.contains(*index, term) || descriptions.contains(*index, term))
+        })
+        .map(|(index, tool)| {
+            let score =
+                NAME_WEIGHT * names.score(index, &terms) + descriptions.score(index, &terms);
+            (score, *tool)
+        })
+        .filter(|(score, _)| *score > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.definition.name.cmp(&b.1.definition.name))
+    });
+    ranked.into_iter().map(|(_, tool)| tool).collect()
+}
+
+/// One searchable field of every tool, scored with Okapi BM25.
+struct Bm25Field {
+    frequencies: Vec<BTreeMap<String, usize>>,
+    lengths: Vec<usize>,
+    average_length: f64,
+}
+
+impl Bm25Field {
+    fn new(documents: impl Iterator<Item = Vec<String>>) -> Self {
+        let mut frequencies = Vec::new();
+        let mut lengths = Vec::new();
+        for document in documents {
+            lengths.push(document.len());
+            let mut counts = BTreeMap::new();
+            for term in document {
+                *counts.entry(term).or_insert(0) += 1;
+            }
+            frequencies.push(counts);
+        }
+        let average_length =
+            (lengths.iter().sum::<usize>() as f64 / lengths.len().max(1) as f64).max(1.0);
+        Self {
+            frequencies,
+            lengths,
+            average_length,
+        }
+    }
+
+    fn contains(&self, document: usize, term: &str) -> bool {
+        self.frequencies[document].contains_key(term)
+    }
+
+    fn score(&self, document: usize, terms: &BTreeSet<String>) -> f64 {
+        let total = self.frequencies.len() as f64;
+        terms
+            .iter()
+            .map(|term| {
+                let count = self.frequencies[document]
+                    .get(term)
+                    .copied()
+                    .unwrap_or_default() as f64;
+                if count == 0.0 {
+                    return 0.0;
+                }
+                let containing = self
+                    .frequencies
+                    .iter()
+                    .filter(|counts| counts.contains_key(term))
+                    .count() as f64;
+                let idf = (1.0 + (total - containing + 0.5) / (containing + 0.5)).ln();
+                let length_ratio = self.lengths[document] as f64 / self.average_length;
+                idf * count * (BM25_K1 + 1.0)
+                    / (count + BM25_K1 * (1.0 - BM25_B + BM25_B * length_ratio))
+            })
+            .sum()
+    }
+}
+
 fn tokens(text: &str) -> Vec<String> {
     let mut separated = String::new();
     let mut previous_lowercase = false;
@@ -244,8 +418,31 @@ fn tokens(text: &str) -> Vec<String> {
     separated
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .map(str::to_lowercase)
+        .filter_map(|term| {
+            let term = term.to_lowercase();
+            let singular = singular(&term);
+            let is_stop_word = |word: &str| SEARCH_STOP_WORDS.contains(&word);
+            (!is_stop_word(&term) && !is_stop_word(&singular)).then_some(singular)
+        })
         .collect()
+}
+
+/// Naive singular form, so `tools` matches `tool` and `searches` matches `search`.
+fn singular(term: &str) -> String {
+    let length = term.chars().count();
+    if length > 4 && term.ends_with("ies") {
+        format!("{}y", &term[..term.len() - 3])
+    } else if length > 4
+        && ["ches", "shes", "sses", "xes", "zes"]
+            .iter()
+            .any(|suffix| term.ends_with(suffix))
+    {
+        term[..term.len() - 2].to_owned()
+    } else if length > 3 && term.ends_with('s') && !term.ends_with("ss") {
+        term[..term.len() - 1].to_owned()
+    } else {
+        term.to_owned()
+    }
 }
 
 fn summary(text: &str) -> String {
@@ -337,7 +534,7 @@ pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinitio
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools using 1–5 search queries or exact tool names. Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["queries"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
         ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]

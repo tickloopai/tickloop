@@ -358,11 +358,10 @@ impl ToolRegistry {
                     } else {
                         crate::tool_exposure::SearchSupport::Fold
                     };
-                let directory = Arc::new(crate::tool_exposure::ExposureDirectory::new(
-                    discovery,
-                    search_support,
-                    true,
-                ));
+                let directory = Arc::new(
+                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support, true)
+                        .with_unavailable_servers(provider.unavailable_tool_servers()),
+                );
                 deferred = directory.deferred_tools();
                 folded.extend(
                     directory
