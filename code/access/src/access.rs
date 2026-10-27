@@ -83,8 +83,10 @@ use tickloop_harness::protocol::{
 /// and appending custom Auto rules and Environment entries in one permission change.
 /// 32.0 adds launch-argument permission rule sources and optional launch rules and additional
 /// directories on Create.
+/// 32.1 adds the automatic compaction line to the Chat status and the `autoCompactWindow` cap
+/// to the live Chat snapshot.
 pub const PROTOCOL_MAJOR: u16 = 32;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
