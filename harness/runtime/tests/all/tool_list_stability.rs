@@ -671,3 +671,112 @@ async fn a_tool_name_two_sources_offer_keeps_the_first_sources_tool() {
         .unwrap();
     assert_eq!(memo_result, "FIRST_SOURCE");
 }
+
+/// Where a listed tool belongs, in the order the groups are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ListedGroup {
+    BuiltIn,
+    Runtime,
+    McpResources,
+    Fold,
+    HostTools,
+}
+
+fn listed_group(name: &str) -> ListedGroup {
+    let is_built_in = tickloop_harness_tools::Tools::definitions()
+        .iter()
+        .any(|definition| definition.name == name);
+    match name {
+        _ if is_built_in => ListedGroup::BuiltIn,
+        "ListMcpResourcesTool" | "ReadMcpResourceTool" => ListedGroup::McpResources,
+        "SearchTools" | "DescribeTools" | "ExecuteTools" => ListedGroup::Fold,
+        _ if name.starts_with("mcp__") || ["memo", "aardvark"].contains(&name) => {
+            ListedGroup::HostTools
+        }
+        _ => ListedGroup::Runtime,
+    }
+}
+
+#[tokio::test]
+async fn every_listed_group_is_sorted_by_name_whatever_the_registration_order() {
+    let alpha = McpService::start().await;
+    alpha.set_tools(json!([
+        {"name":"zap","inputSchema":{"type":"object"}},
+        {"name":"lookup","inputSchema":{"type":"object"}},
+    ]));
+    let beta = McpService::start().await;
+    beta.set_tools(json!([{"name":"fetch","inputSchema":{"type":"object"}}]));
+    let mut listed = Vec::new();
+    for is_reversed in [false, true] {
+        let connections = new_connections();
+        let mut configs = vec![
+            server_config("alpha", &alpha, ToolExposure::Direct),
+            server_config("beta", &beta, ToolExposure::Search),
+        ];
+        if is_reversed {
+            configs.reverse();
+        }
+        for connected in 1..=configs.len() {
+            connect(&connections, &configs[..connected]).await;
+        }
+        let configs = Arc::new(RwLock::new(configs));
+        let mut sources = vec![
+            mcp_provider(connections, &configs),
+            Arc::new(NamedHostTools(vec!["memo", "aardvark"])) as Arc<dyn HostToolProvider>,
+        ];
+        if is_reversed {
+            sources.reverse();
+        }
+        let model = Arc::new(ScriptedModel::new(vec![
+            tickloop_harness_test_support::text("done"),
+        ]));
+        let agent = Agent::new_embedded(tickloop_harness_test_support::config(), model.clone());
+        agent.install_host_tools(sources).unwrap();
+        let (chat, _directory) = full_access_chat(&agent).await;
+        run_turn(&agent, chat, "List your tools").await;
+        let request = model.requests.lock().unwrap()[0].clone();
+        listed.push(tool_bytes(&request));
+        let names: Vec<String> = tool_names(&request.tools)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        agent.shutdown().await;
+
+        let keys: Vec<_> = names
+            .iter()
+            .map(|name| (listed_group(name), name.as_str()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "each group in order, sorted by name inside");
+        let group = |wanted| {
+            keys.iter()
+                .filter(|(group, _)| *group == wanted)
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+        };
+        assert!(group(ListedGroup::BuiltIn).len() > 1, "{names:?}");
+        assert!(group(ListedGroup::Runtime).len() > 1, "{names:?}");
+        assert_eq!(
+            group(ListedGroup::McpResources),
+            ["ListMcpResourcesTool", "ReadMcpResourceTool"]
+        );
+        assert_eq!(
+            group(ListedGroup::Fold),
+            ["DescribeTools", "ExecuteTools", "SearchTools"]
+        );
+        assert_eq!(
+            group(ListedGroup::HostTools),
+            [
+                "aardvark",
+                "mcp__alpha__lookup",
+                "mcp__alpha__zap",
+                "memo"
+            ]
+        );
+    }
+    assert!(
+        listed[0] == listed[1],
+        "registration and connection order changed the tools"
+    );
+}

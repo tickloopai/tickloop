@@ -149,11 +149,12 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
 }
 
 /// Where a tool goes in the listed tools, which keep this order so the vendor's prompt cache
-/// prefix does not depend on which host source or server came first: the built-in and runtime
-/// tools in their fixed order, the MCP resource tools, the Fold tools, then every host tool
-/// sorted by name.
+/// prefix depends on neither registration order nor which host source or server came first: the
+/// built-in tools, the runtime tools, the MCP resource tools, the Fold tools, then every host tool,
+/// each group sorted by name.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ListingGroup {
+    BuiltIn,
     Runtime,
     McpResources,
     Fold,
@@ -162,6 +163,7 @@ pub(crate) enum ListingGroup {
 
 fn listing_group(route: &ToolRoute) -> ListingGroup {
     match route {
+        ToolRoute::BuiltIn => ListingGroup::BuiltIn,
         ToolRoute::McpResource(_) => ListingGroup::McpResources,
         ToolRoute::Fold(_) => ListingGroup::Fold,
         ToolRoute::Host(_) | ToolRoute::TickManage(Some(_)) => ListingGroup::HostTools,
@@ -172,14 +174,9 @@ fn listing_group(route: &ToolRoute) -> ListingGroup {
 
 fn sort_for_listing(tools: &mut [RegisteredTool]) {
     tools.sort_by(|first, second| {
-        let group = listing_group(&first.route);
-        group.cmp(&listing_group(&second.route)).then_with(|| {
-            if group == ListingGroup::HostTools {
-                first.definition.name.cmp(&second.definition.name)
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
+        listing_group(&first.route)
+            .cmp(&listing_group(&second.route))
+            .then_with(|| first.definition.name.cmp(&second.definition.name))
     });
 }
 
@@ -187,7 +184,7 @@ fn sort_for_listing(tools: &mut [RegisteredTool]) {
 /// go as servers connect, disconnect and list again.
 fn is_held(tool: &RegisteredTool) -> bool {
     match listing_group(&tool.route) {
-        ListingGroup::Runtime => false,
+        ListingGroup::BuiltIn | ListingGroup::Runtime => false,
         ListingGroup::McpResources | ListingGroup::Fold => true,
         ListingGroup::HostTools => tool
             .definition
@@ -569,6 +566,7 @@ impl ToolRegistry {
                 definition,
                 route: ToolRoute::BuiltIn,
             });
+            sort_for_listing(&mut self.tools);
         }
         if let Some(tool) = self
             .tools
