@@ -266,3 +266,60 @@ async fn actual_cli_short_skill_collisions_are_refused_before_creation_and_in_ch
         std::panic::resume_unwind(panic);
     }
 }
+
+async fn run_path_messages(fixture: &PrivateFixture) {
+    install_design_plugin(fixture, "canvas");
+    let (base_url, mut requests) = model_http_support::serve_responses(vec![
+        (200, chat_reply(None, "Read the folder path")),
+        (200, chat_reply(None, "Read the root path")),
+    ])
+    .await;
+    fixture.set_chat_model(&base_url);
+    let folder_message = format!("{} what is in it", fixture.path("work").display());
+    let mut view = PtyView::launch(fixture, &[], &[], true);
+    view.wait_for("new input ready", new_input_is_visible).await;
+    view.send(folder_message.as_bytes());
+    view.wait_for_editor("the path message is in the input", Some(&folder_message))
+        .await;
+    assert!(!view.frame().contains("/canvas:frontend-design"));
+    view.send(b"\r");
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request["messages"].to_string().contains(&folder_message));
+    view.wait_for(
+        "a leading folder path starts the Agent as a message",
+        |frame| frame.contains("Read the folder path"),
+    )
+    .await;
+    let root_path_message = "/tmp is where the logs go";
+    view.send(format!("{root_path_message}\r").as_bytes());
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request["messages"].to_string().contains(root_path_message));
+    view.wait_for("an existing root path is a message in the Chat", |frame| {
+        frame.contains("Read the root path")
+    })
+    .await;
+    view.send(b"/nosuchskill\r");
+    view.wait_for("a well-formed unknown name is still reported", |frame| {
+        frame.contains("Unknown or unavailable Skill")
+    })
+    .await;
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_sends_input_starting_with_a_path_as_a_message() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(run_path_messages(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

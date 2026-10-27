@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use tickloop_code_settings::skills::SkillRegistry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -507,6 +507,9 @@ impl Completion {
         let Some((token_start, token_end)) = command_token(draft, cursor) else {
             return;
         };
+        if draft[token_start + 1..token_end].contains('/') {
+            return;
+        }
 
         let query = &draft[token_start + 1..cursor];
 
@@ -559,6 +562,32 @@ impl Completion {
             self.token_start = token_start;
             self.token_end = token_end;
         }
+    }
+
+    /// Whether a submitted line invokes a command or Skill; any other line is sent unchanged as a
+    /// message. A known command or Skill runs even when a path of the same name exists. An unknown
+    /// name stays a command, reported as unknown, only while it could name one and is not an
+    /// existing path: `/Users/me/notes`, `/notes.txt` and `/tmp` are messages. A bare `/` is a
+    /// command.
+    pub(super) fn is_command_input(&self, line: &str) -> bool {
+        let Some(command) = line.trim_start().strip_prefix('/') else {
+            return false;
+        };
+        let name = command.split_whitespace().next().unwrap_or_default();
+        name.is_empty()
+            || self.knows_command(name)
+            || (name.chars().all(is_command_name_character) && !Path::new("/").join(name).exists())
+    }
+
+    fn knows_command(&self, name: &str) -> bool {
+        COMMANDS.iter().any(|spec| &spec.command[1..] == name)
+            || self.skills.iter().any(|skill| {
+                let skill_name = &skill.command[1..];
+                skill_name == name
+                    || skill_name
+                        .split_once(':')
+                        .is_some_and(|(_, bare)| bare == name)
+            })
     }
 
     pub(super) fn dismiss(&mut self) {
@@ -655,6 +684,12 @@ impl Completion {
         draft.push_str(suffix);
         CompletionAction::ReplaceDraft { draft, cursor }
     }
+}
+
+/// Command, Skill and plugin names hold lowercase letters, digits and `-`, and a plugin Skill is
+/// `plugin:skill`; a path such as `/Users/me/notes` can name none of them.
+fn is_command_name_character(character: char) -> bool {
+    character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '-' | ':')
 }
 
 fn command_token(draft: &str, cursor: usize) -> Option<(usize, usize)> {
@@ -1037,6 +1072,86 @@ mod tests {
         completion.update("@src/main.rs");
         assert!(!completion.is_open());
         completion.update("!git status");
+        assert!(!completion.is_open());
+    }
+
+    fn skill(command: &str) -> CompletionCandidate {
+        CompletionCandidate {
+            command: command.into(),
+            arguments: "[ARGUMENTS]".into(),
+            description: String::new(),
+            menu_group: Some(CommandGroup::Skills),
+        }
+    }
+
+    #[test]
+    fn known_commands_and_skills_run_even_when_a_same_named_path_exists() {
+        let mut completion = Completion::default();
+        completion.set_skills(Arc::from([
+            skill("/canvas:frontend-design"),
+            skill("/tmp"),
+            skill("/tools:usr"),
+        ]));
+
+        for line in [
+            "/",
+            "/plugins",
+            "/help advanced",
+            "/frontend-design make a page",
+            "/canvas:frontend-design make a page",
+            "/tmp clean up",
+            "/usr",
+            "/tools:usr",
+        ] {
+            assert!(completion.is_command_input(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_well_formed_unknown_name_that_is_not_a_path_stays_a_command_to_report() {
+        let completion = Completion::default();
+
+        assert!(completion.is_command_input("/nosuchskill"));
+        assert!(completion.is_command_input("/nosuchskill with arguments"));
+        assert!(completion.is_command_input("/no-such:skill"));
+    }
+
+    #[test]
+    fn a_path_or_a_name_no_command_can_have_is_a_message() {
+        let mut completion = Completion::default();
+        completion.set_skills(Arc::from([skill("/review")]));
+
+        for line in [
+            "/Users/me/references/codex",
+            "/Users/me/references/codex explain its slash dispatch",
+            "  /plugins/README.md what is this",
+            "/review/",
+            "/tmp",
+            "/usr is read-only, why?",
+            "/Users",
+            "/notes.txt summarize",
+            "/foo_bar",
+            "/研究 this",
+            "看看 /review",
+        ] {
+            assert!(!completion.is_command_input(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_typed_name_holding_a_slash_offers_no_candidates() {
+        let mut completion = Completion::default();
+        completion.set_skills(Arc::from([skill("/review")]));
+
+        completion.update("/review");
+        assert!(completion.is_open());
+        completion.update("/review/");
+        assert!(!completion.is_open());
+        completion.update("/plugins/");
+        assert!(!completion.is_open());
+        completion.update("/Users/me/references");
+        assert!(!completion.is_open());
+        completion.update_at("/rev/notes", "/rev".len(), CommandScope::Root);
         assert!(!completion.is_open());
     }
 

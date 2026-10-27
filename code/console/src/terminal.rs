@@ -456,9 +456,9 @@ fn command_timing(command: &str) -> CommandTiming {
 
 /// How a typed input waits while a turn works: as a message, or as a command for after the turn;
 /// any other command runs at once.
-fn waiting_input_kind(line: &str) -> Option<QueuedInputKind> {
+fn waiting_input_kind(line: &str, is_command: bool) -> Option<QueuedInputKind> {
     let input = line.trim();
-    if !input.starts_with('/') {
+    if !is_command {
         Some(QueuedInputKind::Message)
     } else if command_timing(input) == CommandTiming::AfterTurn {
         Some(QueuedInputKind::Command)
@@ -2881,7 +2881,7 @@ async fn interact_with_herdr(
                 // Opening the overview, navigating, restoring or any other View action may show
                 // the conversation again, so a merged-input block only spans uninterrupted events.
                 merged_echoes.close_all();
-                if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {family_target: None, text:input,..}) if !input.trim_start().starts_with('/')) {
+                if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {family_target: None, text:input,..}) if !console.is_command_input(input)?) {
                     merged_echoes.next_submission_block();
                 }
                 let line = match line {
@@ -3438,6 +3438,7 @@ async fn interact_with_herdr(
                         }
                         _ => unreachable!(),
                     };
+                    let is_command = console.is_command_input(&line)?;
                     if let Some(id) = active_login {
                         if matches!(line.trim(), "cancel" | "/cancel" | "/exit") {
                             close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
@@ -3544,7 +3545,7 @@ async fn interact_with_herdr(
                             report_refused_input(console,&usage,&mut failed);
                             continue;
                         }
-                        let input=if let Some(skill)=line.trim().strip_prefix('/') {
+                        let input=if is_command && let Some(skill)=line.trim().strip_prefix('/') {
                             let (name,arguments)=skill.split_once(' ').unwrap_or((skill,""));
                             UserInput::Skill {name:name.into(),arguments:arguments.into()}
                         } else {
@@ -3626,12 +3627,12 @@ async fn interact_with_herdr(
                     // Retrying an unchanged draft checks its receipt without another optimistic echo
                     // or queue entry. While a turn works, an input for a later turn waits in the queue,
                     // as Claude Code lists it, and shows as sent only once a turn takes it.
-                    let waiting_kind=(retry_of.is_none() && is_user_prompt && selected_chat.is_some_and(|chat|input_waits(chat,&pending,&foreground_shells))).then(||waiting_input_kind(&line)).flatten();
+                    let waiting_kind=(retry_of.is_none() && is_user_prompt && selected_chat.is_some_and(|chat|input_waits(chat,&pending,&foreground_shells))).then(||waiting_input_kind(&line,is_command)).flatten();
                     let mut queue_entry=match waiting_kind {Some(kind)=>console.queue_submitted_input(kind,&line)?,None=>None};
                     let mut echo=if retry_of.is_none() && queue_entry.is_none() {console.record_input(&line)?} else {None};
                     let record_after_chat = is_user_prompt
                         && selected_chat.is_none()
-                        && !line.trim_start().starts_with('/');
+                        && !is_command;
                     if is_user_prompt
                         && !record_after_chat
                         && !is_branch_command(line.trim())
@@ -3642,7 +3643,7 @@ async fn interact_with_herdr(
                     let original_input = line;
                     let line = original_input.trim().to_owned();
                     if is_user_prompt
-                        && line.starts_with('/')
+                        && is_command
                         && command_timing(&line) == CommandTiming::AfterTurn
                         && let Some(chat) = selected_chat
                     {
@@ -3686,7 +3687,7 @@ async fn interact_with_herdr(
                             echo=console.record_input(&original_input)?;
                         }
                     }
-                    if !interactive && let Some(menu_id)=menus.id() && !line.starts_with('/') {
+                    if !interactive && let Some(menu_id)=menus.id() && !is_command {
                         let selection=if line.eq_ignore_ascii_case("cancel") {Some(None)} else {line.parse::<usize>().ok().and_then(|number|number.checked_sub(1)).map(Some)};
                         if let Some(index)=selection {
                             match menus.choose(agent,console,menu_id,index,None).await {
@@ -3696,7 +3697,7 @@ async fn interact_with_herdr(
                         } else {outln!(console,"Enter an option number or cancel; no selection was applied.");}
                         continue;
                     }
-                    if should_dismiss_menu_before_dispatch(&line) {menus.dismiss(console)?;}
+                    if is_command && should_dismiss_menu_before_dispatch(&line) {menus.dismiss(console)?;}
                     match line.as_str() {
                         "/exit" => return view_exit(interactive, failed),
                         "/help" | "/" if interactive => menus.help(console,None)?,
@@ -4113,7 +4114,7 @@ async fn interact_with_herdr(
                                 Err(error) => outln!(console, "{}", safe_text(&error)),
                             }
                         },
-                        _ if line.starts_with('/') => {
+                        _ if is_command => {
                             if let Some(usage) = completion::unhandled_builtin_usage(&line) {
                                 console.restore_rejected_prompt(restored_contexts,&usage)?;
                                 console.hold_status(&usage)?;

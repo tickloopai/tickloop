@@ -34,6 +34,7 @@ impl State {
         Self::with_root(false)
     }
 
+    /// The default root is named explicitly: a debug build left unset uses `~/.tickloop-dev`.
     fn with_root(uses_default_root: bool) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tms")
@@ -104,9 +105,7 @@ impl State {
         command.env("PATH", "/usr/bin:/bin");
         command.env("HOME", self.directory.path().join("home"));
         command.env("TERM", "xterm-256color");
-        if !self.uses_default_root {
-            command.env("TICKLOOP_CONFIG_DIR", self.config());
-        }
+        command.env("TICKLOOP_CONFIG_DIR", self.config());
         let mut child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
         let output = capture(pty.master.try_clone_reader().unwrap());
@@ -135,10 +134,8 @@ impl State {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.directory.path().join("home"))
+            .env("TICKLOOP_CONFIG_DIR", self.config())
             .stdin(Stdio::null());
-        if !self.uses_default_root {
-            command.env("TICKLOOP_CONFIG_DIR", self.config());
-        }
         let output = command.output().unwrap();
         Finished {
             succeeded: output.status.success(),

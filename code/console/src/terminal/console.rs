@@ -1758,6 +1758,12 @@ impl Console {
             .forget_requested_subscription(subscription);
         Ok(())
     }
+    /// Whether a submitted line invokes a command or Skill rather than being sent as a message.
+    pub(super) fn is_command_input(&self, line: &str) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.refresh_skill_candidates();
+        Ok(state.completion.is_command_input(line))
+    }
     pub(super) fn monitor_has_entries(&self) -> Result<bool, String> {
         Ok(self
             .state
@@ -4094,6 +4100,7 @@ impl Console {
         } else {
             let display = state.display;
             let links = state.image_links().in_text(chat, line);
+            let is_command = state.completion.is_command_input(line);
             let Some(cached) = state.view_cache.get_mut(&Some(chat)) else {
                 return Ok(None);
             };
@@ -4101,7 +4108,7 @@ impl Console {
             if cached.echoed_inputs.contains(&input) {
                 return Ok(None);
             }
-            let echo = append_input_echo(&mut cached.scrollback, line, display, &links);
+            let echo = append_input_echo(&mut cached.scrollback, line, display, &links, is_command);
             if echo.is_some() {
                 cached.echoed_inputs.insert(input);
             }
@@ -5523,15 +5530,15 @@ fn append_input_echo(
     line: &str,
     display: DisplayProfile,
     links: &[(std::ops::Range<usize>, hyperlink::Hyperlink)],
+    is_command: bool,
 ) -> Option<InputEcho> {
-    let input = line.trim();
-    if input.is_empty() {
+    if line.trim().is_empty() {
         return None;
     }
     let (fill, spans) = input_spans(line, display, links);
     let first_line = append_input_spans(scrollback, &spans, fill);
     let echo = scrollback.mark_input(first_line..scrollback.line_count() - 1);
-    if !input.starts_with('/') {
+    if !is_command {
         scrollback.note_message(tickloop_ids::generate().to_string());
         if scrollback.auto_scroll() {
             scrollback.scroll(ScrollAction::Last);
@@ -5698,7 +5705,8 @@ impl State {
             .chat
             .map(|chat| self.image_links().in_text(chat, line))
             .unwrap_or_default();
-        let echo = append_input_echo(&mut self.scrollback, line, self.display, &links);
+        let is_command = self.completion.is_command_input(line);
+        let echo = append_input_echo(&mut self.scrollback, line, self.display, &links, is_command);
         if self.captures_creation_prefix()
             && let Some(echo) = echo
         {
@@ -5752,7 +5760,14 @@ impl State {
                 match entry {
                     CreationPrefixEntry::Input { text, .. } => {
                         let links = self.image_links().in_text(chat, text);
-                        append_input_echo(&mut self.scrollback, text, self.display, &links);
+                        let is_command = self.completion.is_command_input(text);
+                        append_input_echo(
+                            &mut self.scrollback,
+                            text,
+                            self.display,
+                            &links,
+                            is_command,
+                        );
                     }
                     CreationPrefixEntry::Output(piece) => {
                         piece.append_to(&mut self.scrollback, self.display);
@@ -7203,6 +7218,7 @@ impl State {
                     self.display.glyph(Glyph::Prompt),
                     content_columns,
                     footer_start,
+                    |text| self.completion.is_command_input(text),
                 )?;
                 let text = format!(
                     "{} {}",
@@ -8732,6 +8748,7 @@ impl State {
                             self.display.glyph(Glyph::Prompt),
                             content_columns,
                             body_rows,
+                            |text| self.completion.is_command_input(text),
                         )
                         .is_some(),
             );
@@ -9069,7 +9086,8 @@ impl State {
                     };
                     // A queued message names ctrl+enter under itself, as Claude Code does.
                     empty_input_hint.as_str()
-                } else if self.can_send_now() && !self.editor.draft().trim_start().starts_with('/')
+                } else if self.can_send_now()
+                    && !self.completion.is_command_input(self.editor.draft())
                 {
                     "enter queue · ctrl+enter send now · ctrl+g editor · ctrl+c clear"
                 } else {
@@ -13191,7 +13209,7 @@ impl State {
                     return None;
                 }
                 if self.active_delayed_submission.is_some()
-                    && source_text.trim_start().starts_with('/')
+                    && self.completion.is_command_input(&source_text)
                 {
                     self.hold_status("Message dispatch is finishing; command draft kept");
                     return None;
@@ -13247,7 +13265,7 @@ impl State {
                         .delayed_submissions
                         .iter()
                         .any(|entry| entry.chat == self.chat)
-                        && (!source_text.trim_start().starts_with('/')
+                        && (!self.completion.is_command_input(&source_text)
                             || self.active_delayed_submission.is_some()))
                 {
                     self.freeze_delayed_submission(file_references, family_target);

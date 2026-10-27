@@ -27,6 +27,8 @@ make package   # build a release archive into dist/
 
 `make dev` copies this checkout's build into `target/dev-runs/` and registers it as a development runtime. It uses a separate configuration root, `~/.tickloop-dev` (override only with `TICKLOOP_DEV_CONFIG_DIR`), ignoring inherited `TICKLOOP_CONFIG_DIR` and `TICKLOOP_TICK_RUNTIME_DIR`. After a successful build it stops only that root's daemon and Tickhost before launching the new programs. The released `tickloop` keeps running independently. On first use it seeds `settings.json` (including permissions), model-provider entries from `.env`, and `auth/{openai-codex-credentials,github-copilot,minimax-cn,minimax-global,kimi-code-oauth,xai-oauth,google-oauth}.json` from `~/.tickloop`, with owner-only permissions. Plugins, Tick packages, plugin credentials, conversations, history, tasks and caches are never copied; an existing dev root is never reseeded. Model API keys can go in a `.env` file at the repository root (ignored by Git), for example `DEEPSEEK_API_KEY=...`.
 
+A debug build run directly, such as `./target/debug/tickloop` or `cargo run`, also defaults to `~/.tickloop-dev` when `TICKLOOP_CONFIG_DIR` is unset or empty, so it never joins the released daemon of `~/.tickloop`; a release build keeps `~/.tickloop`, and `TICKLOOP_CONFIG_DIR` overrides either. Unlike `make dev`, it neither seeds that root nor runs from a copy of the build.
+
 `ENV` picks the Tickloop Cloud the agent talks to. `make dev` always sets the agent's `TICKLOOP_ARTIFACT_ORIGIN`, which also gives the Accounts issuer and the MCP endpoint, replacing any value from `.env` or your shell, and prints the choice before it builds:
 
 ```sh
