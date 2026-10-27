@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::display::{DisplayProfile, Glyph};
 use super::presentation::compact_count;
+use super::safe_line;
 use super::style::Role;
 
 pub(super) const EXPAND_ARGUMENT: &str = "all";
@@ -64,6 +65,13 @@ impl ContextView<'_> {
         if !self.expanded {
             lines.push(Vec::new());
             lines.push(muted(format!("/context {EXPAND_ARGUMENT} to expand")));
+        }
+        // Server, tool, Skill and file names come from outside: none may move the cursor,
+        // colour the terminal or start a line of its own.
+        for line in &mut lines {
+            for (text, _) in line.iter_mut() {
+                *text = safe_line(text);
+            }
         }
         lines
     }
@@ -418,10 +426,11 @@ impl ContextView<'_> {
                     .iter()
                     .map(|server| server.name.as_str()),
             )
-            .map(UnicodeWidthStr::width)
+            .map(|name| safe_line(name).width())
             .max()
             .unwrap_or(0);
         let padded = |name: &str| {
+            let name = safe_line(name);
             format!(
                 "  {name}{}   ",
                 " ".repeat(name_width.saturating_sub(name.width()))

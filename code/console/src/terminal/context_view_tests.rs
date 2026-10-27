@@ -291,3 +291,31 @@ fn context_all_sums_up_what_a_long_section_leaves_out() {
     assert_eq!(section[50], "… 10 more (1k tokens)");
     assert!(section[51].is_empty());
 }
+
+#[test]
+fn names_from_servers_and_files_cannot_control_the_terminal() {
+    let mut hostile = breakdown();
+    let tool = item("mcp__evil__\u{1b}[31mred\nnext", 100);
+    hostile.mcp_tools = vec![ContextToolServer {
+        server: "evil\u{1b}[2J".into(),
+        tools: vec![tool.clone()],
+    }];
+    hostile.tool_search.as_mut().unwrap().servers[0]
+        .tools
+        .push(tool);
+    hostile.tool_search.as_mut().unwrap().unavailable_servers[0].name = "bad\rname".into();
+    hostile.instruction_files[0].name = "/work/\u{7}AGENTS.md".into();
+    for expanded in [false, true] {
+        let lines = texts(&render(&hostile, 120, expanded));
+        for line in &lines {
+            assert!(
+                !line.chars().any(char::is_control),
+                "no raw control character reaches the terminal: {line:?}"
+            );
+        }
+        if expanded {
+            assert!(lines.contains(&"  └ mcp__evil__\\u{1b}[31mred\\nnext: 100 tokens".to_owned()));
+            assert!(lines.contains(&"  evil\\u{1b}[2J".to_owned()));
+        }
+    }
+}
