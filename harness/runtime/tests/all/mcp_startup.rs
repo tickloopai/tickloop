@@ -604,6 +604,7 @@ async fn a_remote_server_reconnects_on_the_backoff_schedule_then_stays_failed() 
 #[cfg(feature = "test-support")]
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_stays_up_restarts_the_backoff() {
+    let _ticker = Ticker::start();
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
     server.set_status(500);
@@ -658,6 +659,9 @@ async fn drop_connection(connections: &McpConnections, server: &McpService, name
 #[cfg(feature = "test-support")]
 #[tokio::test(start_paused = true)]
 async fn a_server_that_drops_right_after_connecting_stops_after_the_capped_reconnects() {
+    // Without it paused time could jump past a call's timeout while the loopback server answers,
+    // keeping a connection up long enough to restart the backoff.
+    let _ticker = Ticker::start();
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
     let connections = McpConnections::new(
