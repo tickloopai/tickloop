@@ -1,6 +1,6 @@
 //! Runs the work `/mcp` asks for. The Agent's Worker reports its servers and reconnects one;
-//! turning a server off or on, and logins, happen here as in `tickloop mcp`, and the Worker takes
-//! them up from its next request. A login runs in two tasks: one finds the authorization link the
+//! turning a server off or on, changing its exposure, and logins happen here as in
+//! `tickloop mcp`, and the Worker takes them up from its next request. A login runs in two tasks: one finds the authorization link the
 //! panel shows, and one waits for the browser's callback or the address the user pastes.
 
 use std::{
@@ -11,9 +11,14 @@ use std::{
 
 use tickloop_code_settings::{
     UserSettings,
-    mcp::{check_authorization_link, configured_servers, configured_statuses, login_connector},
+    mcp::{
+        DIRECTORY_SOURCE, GLOBAL_SOURCE, McpLayer, PLUGIN_SOURCE_PREFIX, check_authorization_link,
+        configured_servers, configured_statuses, login_connector,
+    },
 };
-use tickloop_harness::{base::oauth_callback::CallbackPaste, connector::PendingLogin};
+use tickloop_harness::{
+    base::oauth_callback::CallbackPaste, connector::PendingLogin, protocol::mcp::ToolExposure,
+};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -238,6 +243,30 @@ pub(super) fn start(
                 )
             });
         }
+        McpRequest::SetExposure {
+            name,
+            source,
+            exposure,
+        } => {
+            let root = root.to_owned();
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking({
+                    let name = name.clone();
+                    move || save_exposure(&root, &directory, &source, &name, exposure)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                (
+                    panel,
+                    McpResult::ExposureSet {
+                        name,
+                        exposure,
+                        result,
+                    },
+                )
+            });
+        }
         McpRequest::LogIn { name, attempt } => {
             let cancel = CancellationToken::new();
             tasks.logins.insert(
@@ -322,6 +351,33 @@ pub(super) fn start(
     Ok(())
 }
 
+/// Saves the exposure of the server `name` where `source` says it is configured: in that user
+/// layer, or, for a plugin server, as the override in the global settings.
+fn save_exposure(
+    root: &Path,
+    directory: &Path,
+    source: &str,
+    name: &str,
+    exposure: ToolExposure,
+) -> Result<(), String> {
+    let settings = UserSettings::in_root(root);
+    let layer = match source {
+        GLOBAL_SOURCE => McpLayer::Global,
+        DIRECTORY_SOURCE => McpLayer::Directory(directory.to_owned()),
+        _ if source.starts_with(PLUGIN_SOURCE_PREFIX) => {
+            return settings
+                .set_plugin_mcp_server_exposure(name, exposure)
+                .map_err(|error| error.to_string());
+        }
+        _ => return Err(format!("{name} is not configured in the settings")),
+    };
+    match settings.set_mcp_server_exposure(&layer, name, exposure) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("{name} is no longer configured there")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Hands a finished task's result to its panel and reads the servers again after a change. When
 /// the panel is gone, the outcome of an operation still reaches the user in the conversation.
 pub(super) fn finish(
@@ -358,6 +414,7 @@ pub(super) fn finish(
         &result,
         McpResult::Reconnected { result: Ok(()), .. }
             | McpResult::DisabledSet { result: Ok(()), .. }
+            | McpResult::ExposureSet { result: Ok(()), .. }
             | McpResult::LoginEnded { result: Ok(()), .. }
             | McpResult::LoggedOut { result: Ok(_), .. }
     );
