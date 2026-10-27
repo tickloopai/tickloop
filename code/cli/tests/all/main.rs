@@ -17,6 +17,7 @@ mod graceful_upgrade;
 mod hosted_bounds;
 mod hosted_ticks;
 mod marketplace_commands;
+mod marketplaces_panel_pty;
 mod monitor_attach;
 mod monitor_popup;
 mod monitor_pty;

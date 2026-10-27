@@ -9,13 +9,12 @@ use tick_plugins::{
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
-    PluginKind, PluginRequest, install_from, installed_status, plugin_http, read_marketplace,
-    read_marketplaces, source_label, unavailable_reason,
+    PluginKind, PluginRequest, install_from, installed_status, marketplace_state, plugin_count,
+    plugin_http, read_marketplace, read_marketplaces, source_label, unavailable_reason,
 };
 
 use super::plugin_command::{other_kind, print_table, report, report_notes};
 
-const SHORT_COMMIT_LENGTH: usize = 12;
 const NO_MARKETPLACE_READ: &str = "no marketplace could be read";
 const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::package_http::client;
 
@@ -84,13 +83,6 @@ fn report_updated_marketplace(name: &str, count: usize) {
     );
 }
 
-fn plugin_count(count: usize) -> String {
-    match count {
-        1 => "1 plugin".to_owned(),
-        count => format!("{count} plugins"),
-    }
-}
-
 pub(super) fn list_marketplaces(store: &PluginStore) -> Result<(), String> {
     let rows = store
         .marketplaces()
@@ -108,36 +100,9 @@ pub(super) fn list_marketplaces(store: &PluginStore) -> Result<(), String> {
     Ok(())
 }
 
-fn marketplace_state(registration: &MarketplaceRegistration) -> String {
-    let fetched = match (&registration.refreshed_at, &registration.commit) {
-        _ if registration.name == TICKLOOP_MARKETPLACE => "read on every use".to_owned(),
-        (None, _) => "not fetched yet".to_owned(),
-        (Some(at), None) => format!("updated {at}"),
-        (Some(at), Some(commit)) => format!("updated {at} at {}", short_commit(commit)),
-    };
-    if registration.builtin {
-        format!("built in; {fetched}")
-    } else {
-        fetched
-    }
-}
-
-fn short_commit(commit: &str) -> &str {
-    &commit[..commit.len().min(SHORT_COMMIT_LENGTH)]
-}
-
 pub(super) fn remove_marketplace(store: &PluginStore, name: &str) -> Result<(), String> {
-    store
-        .remove_marketplace(name)
-        .map_err(|error| error.to_string())?;
+    let remaining = tickloop_tick_installer::remove_marketplace(store, name)?;
     println!("Removed marketplace {name}.");
-    let installed = store.installed().map_err(|error| error.to_string())?;
-    let remaining = installed
-        .plugins
-        .iter()
-        .filter(|plugin| plugin.marketplace == name)
-        .map(|plugin| plugin.id())
-        .collect::<Vec<_>>();
     if !remaining.is_empty() {
         println!(
             "Its plugins stay installed: {}; tickloop plugin uninstall removes one.",

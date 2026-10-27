@@ -5,10 +5,10 @@
 
 use std::{collections::HashMap, future::Future, path::Path};
 
-use tick_plugins::PluginStore;
+use tick_plugins::{MarketplaceSource, PluginStore};
 use tickloop_tick_installer::{
-    DeviceLogin, LoggedOut, LoginError, install_from, needs_no_login, read_marketplace,
-    read_marketplaces, start_login,
+    DeviceLogin, LoggedOut, LoginError, install_from, needs_no_login, plugin_http,
+    read_marketplace, read_marketplaces, remove_marketplace, start_login,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -321,6 +321,60 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                 (panel, TickPackageResult::Logout { name, result })
             });
         }
+        TickPackageRequest::AddMarketplace(source) => {
+            tasks.spawn(async move {
+                let result = async {
+                    let parsed =
+                        MarketplaceSource::parse(&source).map_err(|error| error.to_string())?;
+                    store
+                        .add_marketplace(&parsed, &plugin_http(HTTP))
+                        .await
+                        .map(Box::new)
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                (
+                    panel,
+                    TickPackageResult::MarketplaceAdded {
+                        source: safe_line(&source),
+                        result,
+                    },
+                )
+            });
+        }
+        TickPackageRequest::UpdateMarketplace(name) => {
+            tasks.spawn(async move {
+                let result = async {
+                    let registration = store
+                        .marketplaces()
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .find(|registration| registration.name == name)
+                        .ok_or_else(|| format!("marketplace {name} is not registered"))?;
+                    read_marketplace(HTTP, &store, &registration, true)
+                        .await
+                        .map(|plugins| plugins.len())
+                }
+                .await;
+                (
+                    panel,
+                    TickPackageResult::MarketplaceUpdated { name, result },
+                )
+            });
+        }
+        TickPackageRequest::RemoveMarketplace(name) => {
+            tasks.spawn(async move {
+                let result = blocking({
+                    let name = name.clone();
+                    move || remove_marketplace(&store, &name)
+                })
+                .await;
+                (
+                    panel,
+                    TickPackageResult::MarketplaceRemoved { name, result },
+                )
+            });
+        }
         TickPackageRequest::RefreshLogin(name) => {
             // Numbered now, for the case where the package went away meanwhile and the list is
             // read instead.
@@ -373,6 +427,9 @@ pub(super) fn finish(
     let changed_marketplace = matches!(
         &result,
         TickPackageResult::Installation { result: Ok(_), .. }
+            | TickPackageResult::MarketplaceAdded { result: Ok(_), .. }
+            | TickPackageResult::MarketplaceUpdated { result: Ok(_), .. }
+            | TickPackageResult::MarketplaceRemoved { result: Ok(_), .. }
     );
     let changed_packages = matches!(
         &result,
