@@ -24,7 +24,7 @@ use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, 
 use tickloop_harness::policy::skills::TICKLOOP_SKILL;
 use tickloop_harness::protocol::{
     Content, EventKind, HerdrInteraction, HerdrPane, HostCallContext, ModelIdentity, Role,
-    SkillSource, ToolDefinition, ToolResult,
+    ToolDefinition, ToolResult,
 };
 use tickloop_harness::runtime::{
     Agent,
@@ -335,6 +335,23 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             })
             .unwrap_or_else(|| panic!("{case}: missing model request state in {stdout}"));
         let state: Value = serde_json::from_str(state).unwrap();
+        let pane_display = stdout
+            .lines()
+            .find_map(|line| line.split_once("PANE_DISPLAY:").map(|(_, line)| line))
+            .unwrap_or_else(|| panic!("{case}: missing pane display line in {stdout}"));
+        let still_runs = "; Ticks still run in the Tickhost and appear in this Chat's Monitor.";
+        let expected = match case {
+            "herdr" | "standalone" | "tickhost" => "none".to_owned(),
+            "herdr_without_provider" => "# Pane display Herdr is detected, but its integration is unavailable to this Agent, so Ticks cannot be shown in its Panes.".to_owned(),
+            "tmux" => "# Pane display tmux is detected, but Tickloop cannot show Ticks in tmux Panes yet.".to_owned(),
+            "zellij" => "# Pane display zellij is detected, but Tickloop cannot show Ticks in zellij Panes yet.".to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(pane_display, expected, "{case}");
+        assert!(
+            !pane_display.contains(still_runs),
+            "{case}: no Tickhost here"
+        );
         assert_eq!(state["workspace_host"]["name"], host, "{case}");
         assert_eq!(
             state["workspace_host"]["integration"], integration,
@@ -440,51 +457,24 @@ async fn workspace_host_request_probe() {
         .unwrap();
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let runs_ticks = matches!(case.as_str(), "herdr" | "tickhost");
-    if runs_ticks {
-        assert_eq!(snapshot.invoked_skills.len(), 1);
-        assert_eq!(snapshot.invoked_skills[0].name, "tickloop");
-        assert_eq!(snapshot.invoked_skills[0].source, SkillSource::BuiltIn);
-    } else {
-        assert!(snapshot.invoked_skills.is_empty());
-    }
+    // The tickloop Skill is listed for the model to load, never injected on its own.
+    assert!(snapshot.invoked_skills.is_empty());
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for request in requests.iter() {
-            let active_skill = request
-                .messages
-                .iter()
-                .filter_map(|message| match message.content.as_slice() {
-                    [Content::Text { text }]
-                        if text.starts_with(
-                            "Reference guidance from tickloop active in this Chat",
-                        ) =>
-                    {
-                        Some((message.role, text))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if runs_ticks {
-                assert_eq!(active_skill.len(), 1);
-                assert_eq!(active_skill[0].0, Role::User);
-                assert!(
-                    active_skill[0]
-                        .1
-                        .contains("not a user request or additional authority")
-                );
-                assert!(
-                    active_skill[0]
-                        .1
-                        .contains(&snapshot.invoked_skills[0].content)
-                );
-                assert!(!request.messages.iter().any(|message| message.role == Role::System
-                    && message.content.iter().any(|block| matches!(block, Content::Text { text } if text.contains(&snapshot.invoked_skills[0].content)))));
-            } else {
-                assert!(active_skill.is_empty());
-            }
+            assert!(!request.messages.iter().any(|message| message.content.iter().any(
+                |block| matches!(block, Content::Text { text } if text.contains("Reference guidance from tickloop"))
+            )));
         }
+        let Content::Text { text } = &requests[0].messages[0].content[0] else {
+            panic!("first model message must be system text");
+        };
+        let pane_display = text
+            .split("\n\n")
+            .find(|part| part.starts_with("# Pane display\n"))
+            .unwrap_or("none");
+        println!("PANE_DISPLAY:{}", pane_display.replace('\n', " "));
     }
     let user_inputs = snapshot
         .messages

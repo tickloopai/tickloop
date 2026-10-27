@@ -879,7 +879,7 @@ async fn remote_skill_arguments_do_not_absorb_resource_reads_and_identical_repea
             .rev()
             .find_map(|block| match block {
                 Content::Text { text }
-                    if text.starts_with(
+                    if text.trim_start_matches("<system-reminder>\n").starts_with(
                         "Reference guidance from tickloop-artifacts:artifact-design",
                     ) =>
                 {
@@ -2181,14 +2181,22 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
     ] {
         assert!(tool_names(&requests[0]).contains(&name), "{name}");
     }
-    let prompt = serde_json::to_string(&requests[0].messages).unwrap();
-    assert!(prompt.contains("Tool absence is not evidence of being signed out"));
-    assert!(
-        prompt.contains("Operate artifacts with ArtifactRead, ArtifactEdit and ArtifactComment")
-    );
-    assert!(prompt.contains("authentication is signed_out, call ArtifactLogin"));
-    assert!(prompt.contains("Tickloop Artifacts' own MCP server instructions"));
-    assert!(!prompt.contains("use ArtifactEdit to create the matching type"));
+    // Signed in, the Artifact tools and the service's own instructions carry the guidance; the
+    // system prompt teaches no Artifact usage.
+    let prompt = serde_json::to_string(&requests[0].messages[0]).unwrap();
+    for absent in [
+        "ArtifactRead",
+        "ArtifactLogin",
+        "use ArtifactEdit to create the matching type",
+    ] {
+        assert!(!prompt.contains(absent), "{absent}");
+    }
+    let edit = requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "ArtifactEdit")
+        .unwrap();
+    assert!(edit.description.contains("one picture per Slide"));
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["TickCall", "TickRead"] {
         let definition = requests[0]
@@ -4249,7 +4257,11 @@ fn host_notices(request: &ModelRequest) -> Vec<String> {
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            Content::Text { text } if text.starts_with(HOST_NOTICE) => Some(text.clone()),
+            Content::Text { text } => text
+                .strip_prefix("<system-reminder>\n")
+                .and_then(|text| text.strip_suffix("\n</system-reminder>"))
+                .filter(|text| text.starts_with(HOST_NOTICE))
+                .map(str::to_owned),
             _ => None,
         })
         .collect()
@@ -4829,7 +4841,7 @@ async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
                 .flat_map(|message| &message.content)
                 .find_map(|block| match block {
                     Content::Text { text }
-                        if text.starts_with(
+                        if text.trim_start_matches("<system-reminder>\n").starts_with(
                             "Reference guidance from tickloop-artifacts:artifact-design",
                         ) =>
                     {
@@ -4891,7 +4903,7 @@ async fn remote_resource_requested_after_compaction_returns_complete_content_wit
                 .flat_map(|message| &message.content)
                 .find_map(|block| match block {
                     Content::Text { text }
-                        if text.starts_with(
+                        if text.trim_start_matches("<system-reminder>\n").starts_with(
                             "Reference guidance from tickloop-artifacts:artifact-design",
                         ) =>
                     {
@@ -6614,7 +6626,16 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         "signed_in"
     );
     assert!(prompt.contains("# Web search is disabled"));
-    assert!(prompt.contains("# Artifacts"));
+    assert!(!prompt.contains("# Artifacts"));
+    let edit = requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "ArtifactEdit")
+        .unwrap();
+    assert!(
+        edit.description.contains("separate small patches"),
+        "a Chat without a Folder paces its writing"
+    );
     for absent in [
         "workdir",
         "family_temp_directory",

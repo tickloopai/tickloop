@@ -44,7 +44,7 @@ use tickloop_harness_protocol::{
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ALREADY_SUBSCRIBED: &str =
     "this Chat already subscribes to this Tick; s cycles its subscription";
-const NO_SUBSCRIBING_LOOP: &str = "this Chat's Loop cannot take its Tick Updates now";
+const NO_SUBSCRIBING_LOOP: &str = "this Chat cannot take its Tick Updates now";
 
 use crate::tick_tools::TICK_MANAGE;
 const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::High;
@@ -64,7 +64,7 @@ const MAX_HEADER_TEXT_BYTES: usize = 128;
 const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (an extension Tick's query tool through TickCall, a Shell's output file through Read) or TickRead.";
 const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; TickRead returns its current screen, and output that scrolled past between periods cannot be recovered.";
 const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
-const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with the Chat is its subscription and brings each @tickloop feedback request to the Chat's Loop. An artifact the Chat creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
+const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with the Chat is its subscription and brings each @tickloop feedback request to the Chat. An artifact the Chat creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
 
 /// The source condition of a Tick the user sends with Send Update: it is still one of the
 /// Chat's Monitor members, and no plan waits for review.
@@ -106,7 +106,7 @@ fn validate(subscriptions: &[TickSubscription]) -> Result<(), String> {
     for subscription in subscriptions {
         check_frequency(&subscription.instance, subscription.frequency)?;
         if !instances.insert(subscription.instance.clone()) {
-            return Err("a Loop holds at most one Tick Subscription per Tick Instance".into());
+            return Err("a Chat holds at most one Tick Subscription per Tick Instance".into());
         }
     }
     Ok(())
@@ -167,14 +167,14 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: TICK_MANAGE.into(),
         description: format!(
-            "Manage Tick subscriptions of the current Loop. action=subscribe requires tick_instance_id and optionally frequency ({periods}; default {}). A Shell Tick is immediate and takes no frequency. An artifact uses its association rather than a subscription. action=unsubscribe requires subscription, the subscription id. A quiet period delivers nothing; state updates merge to the latest value. Opening or reading a Tick never subscribes automatically.",
+            "Manage this Chat's Tick subscriptions. action=subscribe requires tick_instance_id and optionally frequency ({periods}; default {}). A Shell Tick is immediate and takes no frequency. An artifact uses its association rather than a subscription. action=unsubscribe requires subscription, the subscription id. A quiet period delivers nothing; state updates merge to the latest value. Opening or reading a Tick never subscribes automatically. Report that observation started only when the result says ready: true; for ready: false, inspect the returned link instead of subscribing again.",
             DEFAULT_FREQUENCY.name()
         ),
         input_schema: json!({"type":"object","properties":{
             "action":{"type":"string","enum":["subscribe","unsubscribe"]},
-            "tick_instance_id":{"type":"string","minLength":3,"description":"Required for subscribe."},
-            "frequency":{"type":"string","enum":frequencies,"description":"Optional for subscribe; not accepted for unsubscribe."},
-            "subscription":{"type":"string","minLength":1,"description":"Required for unsubscribe: the subscription id a subscribe returned."}
+            "tick_instance_id":{"type":"string","minLength":3,"description":"Required by subscribe: a hosted: identity or a shell: task."},
+            "frequency":{"type":"string","enum":frequencies,"description":"Optional for subscribe."},
+            "subscription":{"type":"string","minLength":1,"description":"Required by unsubscribe: the subscription id a subscribe returned."}
         },"required":["action"],"additionalProperties":false}),
     }]
 }
@@ -1743,7 +1743,7 @@ impl Agent {
         // Subscribing is no consent to continue a paused Loop.
         if !is_receiving {
             answer["note"] = json!(
-                "this Chat's Loop has paused receiving: the subscription watches its Tick and delivers the latest update once the Chat is continued"
+                "this Chat has paused receiving: the subscription watches its Tick and delivers the latest update once the Chat is continued"
             );
         } else if !ready {
             answer["link"] = json!(format!("{link:?}"));
@@ -2446,7 +2446,7 @@ impl Agent {
             self.tick_deliveries()
                 .item_bindings(chat_id, &chat.snapshot.chat_loop, items)
                 .map_err(|_| {
-                    AgentError::Invalid("Tick watch is no longer admitted for this Loop".into())
+                    AgentError::Invalid("Tick watch is no longer admitted for this Chat".into())
                 })?
         };
         let port = self

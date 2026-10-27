@@ -1215,9 +1215,11 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
             (
                 "user",
                 concat!(
+                    "<system-reminder>\n",
                     "Host notice: host tools available in this conversation now: ArtifactLogin, TickCall, TickDescribe, TickManage, TickRead. ",
                     "Earlier statements in this conversation about tool availability may be outdated. ",
-                    "This notice comes from the host, not the user, and does not authorize any new work."
+                    "This notice comes from the host, not the user, and does not authorize any new work.",
+                    "\n</system-reminder>"
                 ),
             ),
         ],
@@ -2786,31 +2788,26 @@ async fn model_control_sequences_cannot_change_terminal_state() {
     server.await.unwrap();
 }
 
-/// The user context leads the request; the tickloop guidance follows the first prompt, whose run
-/// loaded it, and stays there.
+/// The user context leads the request and the conversation follows it; the tickloop guidance is
+/// listed for the model to load, never injected on its own.
 fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[(&str, &str)]) {
     const USER_CONTEXT: usize = 0;
-    const REFERENCE: usize = 2;
     let messages = request["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), expected_messages.len() + 2);
+    assert_eq!(messages.len(), expected_messages.len() + 1);
     assert!(
         messages[USER_CONTEXT]["content"][0]["text"]
             .as_str()
             .unwrap()
             .starts_with(tickloop_harness::policy::instructions::USER_CONTEXT_OPENING)
     );
-    assert_eq!(messages[REFERENCE]["role"], "user");
-    let reference = messages[REFERENCE]["content"].as_array().unwrap();
-    assert_eq!(reference.len(), 1);
-    assert_eq!(reference[0]["type"], "text");
-    assert!(reference[0]["text"].as_str().unwrap().starts_with(
-        "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop tools and Ticks\n"
-    ));
+    assert!(
+        !request
+            .to_string()
+            .contains("Reference guidance from tickloop")
+    );
     let conversation = messages
         .iter()
-        .enumerate()
-        .filter(|(index, _)| ![USER_CONTEXT, REFERENCE].contains(index))
-        .map(|(_, message)| message)
+        .skip(USER_CONTEXT + 1)
         .map(|message| {
             let content = message["content"].as_array().unwrap();
             assert_eq!(content.len(), 1);

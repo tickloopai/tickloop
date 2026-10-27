@@ -16,6 +16,8 @@ mod busy_inputs;
 mod live_context;
 #[path = "all/permission_claims.rs"]
 mod permission_claims;
+#[path = "all/prompt_render.rs"]
+mod prompt_render;
 #[path = "all/streaming_snapshot.rs"]
 mod streaming_snapshot;
 #[path = "all/tick_tool_approval.rs"]

@@ -380,7 +380,7 @@ fn the_loop_skill_teaches_the_three_forms_with_the_scheduling_tools() {
         "the task id",
         "runs a last time 7 days after it was created and is then deleted",
         "Both a fixed-interval and a self-paced loop run a last time 7 days after they were created and are then deleted",
-        "Pausing the Loop does not extend that limit",
+        "Pausing this Chat does not extend that limit",
         "CronDelete",
         "`x` on its row in the Monitor",
         "Then run it once now",

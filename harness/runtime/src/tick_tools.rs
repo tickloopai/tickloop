@@ -226,7 +226,7 @@ fn tick_manage_description(views: bool) -> String {
         "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol always does. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
     ];
     if views {
-        parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions.".into());
+        parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus; pass one only when the user asks for a place. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions. A view status other than shown may have left a Pane behind: inspect it with ReadWorkspace before retrying, and never create a duplicate view.".into());
     }
     parts.push(format!(
         "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
@@ -242,7 +242,7 @@ fn tick_manage_description(views: bool) -> String {
     );
     parts.push("reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".into());
     parts.push(format!(
-        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance{}. Use the tickloop Skill for guidance.",
+        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance{}. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load the tickloop Skill and that plugin's <package>:usage Skill.",
         if views {
             ", whether a Herdr Pane shows it and where"
         } else {
@@ -490,7 +490,7 @@ fn placement_schema(actions: &[Form], views: bool) -> Value {
     let mut properties = json!({"type":{"type":"string","enum":types}});
     let description = if views {
         properties["type"]["description"] = json!(
-            "hidden shows the Tick nowhere; current_tab places it beside the View carrying this input; pane places it beside pane_id; new_tab opens a new Tab. move takes only current_tab or pane."
+            "hidden shows the Tick nowhere; current_tab places it beside the View carrying this input, which \"this Tab\", \"your Tab\" and \"next to you\" mean; pane places it beside pane_id; new_tab opens a new Tab. move takes only current_tab or pane."
         );
         properties["direction"] = json!({"type":"string","enum":PLACEMENT_DIRECTIONS,"description":format!("{} Defaults to right.", usage("direction", &forms))});
         properties["pane_id"] = json!({"type":"string","minLength":1,"description":format!("{} A Pane in the selected Workspace, from ReadWorkspace.", usage("pane_id", &forms))});

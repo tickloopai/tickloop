@@ -3778,6 +3778,7 @@ impl Agent {
                 user_cancelled_runs: HashSet::new(),
                 output_style,
                 user_context: Default::default(),
+                environment: Default::default(),
                 announced_date: None,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,

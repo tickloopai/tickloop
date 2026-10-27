@@ -130,14 +130,19 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
                         }
                     }
                 } else {
-                    properties.insert(key.clone(), value.clone());
+                    merge_property(&mut properties, key, value);
                 }
             }
         }
     }
+    let names = actions
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
     properties.insert(
         "action".into(),
-        serde_json::json!({"type":"string","enum":actions}),
+        serde_json::json!({"type":"string","enum":actions,"description":format!("One of {names}; each takes the fields whose description names it.")}),
     );
     definition.input_schema = serde_json::json!({"type":"object","properties":properties,"required":["action"],"additionalProperties":false});
     definition.description = descriptions.join(" ");
@@ -147,6 +152,26 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
         route: ToolRoute::TickManage(provider),
     });
     tools
+}
+
+/// Adds one variant's field to the merged TickManage fields. A field both variants take keeps the
+/// later variant's schema, as before, and both descriptions, so it names every action it serves.
+fn merge_property(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    let mut merged = value.clone();
+    if let Some(earlier) = properties.get(key)
+        && let (Some(first), Some(second)) = (
+            earlier["description"].as_str(),
+            value["description"].as_str(),
+        )
+        && first != second
+    {
+        merged["description"] = format!("{first} {second}").into();
+    }
+    properties.insert(key.to_owned(), merged);
 }
 
 fn listing_group(route: &ToolRoute) -> ListingGroup {
@@ -443,7 +468,7 @@ impl ToolRegistry {
                             })
                     })
                     .map(|definition| RegisteredTool {
-                        definition,
+                        definition: crate::mcp_tools::chat_definition(definition, has_folder),
                         route: ToolRoute::Host(provider.clone()),
                     }),
             );
@@ -3023,14 +3048,9 @@ mod tests {
             .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
             .filter(is_compound_name)
             .collect::<HashSet<_>>();
-        assert!(named.is_superset(&HashSet::from([
-            "TickManage",
-            "TickRead",
-            "ArtifactRead",
-            "ArtifactEdit",
-            "ArtifactLogin",
-            "ArtifactUpload",
-        ])));
+        assert!(named.is_superset(&HashSet::from(
+            ["TickManage", "TaskStop", "ScheduleWakeup",]
+        )));
         for word in named {
             assert!(
                 tools.contains(word) || NOT_TOOLS.contains(&word),

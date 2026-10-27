@@ -103,8 +103,9 @@ async fn agent_websocket_reuses_chat_connection_for_tools_and_continuation() {
     assert_eq!(frames[0]["prompt_cache_key"], chat.uuid().to_string());
     assert_eq!(frames[0]["store"], false);
     assert_eq!(frames[1]["previous_response_id"], "resp-tools");
-    assert!(frames[2]["previous_response_id"].is_null());
-    assert_ne!(frames[1]["instructions"], frames[2]["instructions"]);
+    // The next Run keeps the same instructions, so it continues the last response too.
+    assert_eq!(frames[2]["previous_response_id"], "ws-tools");
+    assert_eq!(frames[1]["instructions"], frames[2]["instructions"]);
     assert!(
         frames[1]["input"]
             .as_array()

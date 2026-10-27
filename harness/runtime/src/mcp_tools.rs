@@ -75,8 +75,22 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
 /// The service is busy with this Slides artifact's other uploads; a later upload may succeed.
 const UPLOAD_BUSY_STATUS: u16 = 429;
-const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc, page or slides; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload become available automatically.";
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc, page or slides (a PPT, deck or presentation means slides); it starts sign-in and returns a link and code: give the user both, and do not write local files instead. After the user approves, ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload become available automatically.";
+/// What the host adds to the service's own ArtifactEdit description.
+const ARTIFACT_EDIT_NOTE: &str = " A slides artifact's PPTX download holds one picture per Slide, so its text cannot be edited there.";
+/// What the host adds to the service's own ArtifactComment description.
+const ARTIFACT_COMMENT_NOTE: &str = " Each @tickloop feedback request on an artifact associated with this Chat (one it created, or one the user linked to it) arrives here and in the user's other linked Agents. The association grants no extra permissions.";
+/// How a Chat without a Folder writes Docs and Slides, so the user sees them fill in.
+const FOLDERLESS_WRITING_PACE: &str = " In this chat, write Docs and Slides in small steps: first create a small skeleton (a title, one placeholder heading per section and a line saying “待写”), then fill one section at a time with separate small patches, telling the user briefly what you are about to write before each edit. A page supports whole-page replacement only: deliver a readable first version, then iterate with replacements.";
 const ARTIFACT_UPLOAD_DESCRIPTION: &str = "Upload a local image file to a Slides artifact so its Slides can show it. Tickloop reads the file at file_path and sends it; its contents never reach you. PNG, JPEG, GIF, WebP or SVG, at most 5 MiB (an SVG at most 2 MiB); a file outside the workspace needs the user's approval. The result gives asset_id, ref (asset:<asset_id>), content_type, bytes, width and height (null when unknown); show the image in a Slide as <img src=\"<ref>\" alt=\"...\">. Upload each file once; a refused upload stores nothing, and after an unknown outcome read the Slides with ArtifactRead to see its images before uploading again.";
+
+/// A host tool as a Chat offers it: one without a Folder also hears how to pace its writing.
+pub(crate) fn chat_definition(mut definition: ToolDefinition, has_folder: bool) -> ToolDefinition {
+    if !has_folder && definition.name == ARTIFACT_EDIT_TOOL {
+        definition.description.push_str(FOLDERLESS_WRITING_PACE);
+    }
+    definition
+}
 
 pub(crate) fn login_definition() -> ToolDefinition {
     ToolDefinition {
@@ -856,13 +870,19 @@ impl McpHostToolProvider {
             } else {
                 HostToolPermission::Reviewable
             };
+            let host_note = match name {
+                ARTIFACT_EDIT_TOOL => ARTIFACT_EDIT_NOTE,
+                ARTIFACT_COMMENT_TOOL => ARTIFACT_COMMENT_NOTE,
+                _ => "",
+            };
             mapped.push(DiscoveredTool {
                 definition: ToolDefinition {
                     name: name.to_owned(),
                     description: tool
                         .description
                         .as_ref()
-                        .map_or_else(|| name.to_owned(), ToString::to_string),
+                        .map_or_else(|| name.to_owned(), ToString::to_string)
+                        + host_note,
                     input_schema: schema,
                 },
                 permission,
@@ -1858,6 +1878,7 @@ impl HostToolProvider for McpHostToolProvider {
                     },
                     third_party: false,
                 },
+                status: None,
                 text,
             })
             .into_iter()
@@ -2462,5 +2483,52 @@ mod upgrade_tests {
         );
         assert!(restored.directory.read().unwrap().is_none());
         assert!(restored.skill_files.read().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chat_definition_tests {
+    use super::*;
+
+    fn edit() -> ToolDefinition {
+        ToolDefinition {
+            name: ARTIFACT_EDIT_TOOL.into(),
+            description: "Write Tickloop Artifacts.".into(),
+            input_schema: json!({"type":"object"}),
+        }
+    }
+
+    /// Only a Chat without a Folder writes Docs and Slides at the pace its viewer watches; the
+    /// other tools keep their text.
+    #[test]
+    fn only_a_folderless_chat_hears_how_to_pace_artifact_writing() {
+        assert_eq!(chat_definition(edit(), true), edit());
+        let folderless = chat_definition(edit(), false);
+        assert!(folderless.description.ends_with(FOLDERLESS_WRITING_PACE));
+        assert!(folderless.description.contains("separate small patches"));
+        assert!(
+            folderless
+                .description
+                .contains("whole-page replacement only")
+        );
+        assert_eq!(
+            chat_definition(upload_definition(), false),
+            upload_definition()
+        );
+    }
+
+    /// Signed out, ArtifactLogin alone carries what an artifact request means.
+    #[test]
+    fn the_login_tool_routes_artifact_requests_while_signed_out() {
+        let login = login_definition().description;
+        for current in [
+            "when the user wants a doc, page or slides",
+            "a PPT, deck or presentation means slides",
+            "give the user both, and do not write local files instead",
+        ] {
+            assert!(login.contains(current), "{current}");
+        }
+        assert!(ARTIFACT_EDIT_NOTE.contains("one picture per Slide, so its text cannot be edited"));
+        assert!(ARTIFACT_COMMENT_NOTE.contains("in the user's other linked Agents"));
     }
 }

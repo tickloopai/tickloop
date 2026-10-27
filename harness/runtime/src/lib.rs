@@ -72,6 +72,7 @@ mod denials;
 mod directed_summary;
 mod durable_queue;
 pub mod environment;
+mod environment_info;
 mod event_sources;
 mod feedback_inbox;
 #[cfg(test)]
@@ -522,6 +523,9 @@ struct Chat {
     /// Claude Code's user context: the instruction files and the date, read at the first
     /// conversation request and kept until compaction or until the Chat loads again.
     user_context: OnceLock<String>,
+    /// Claude Code's environment section, read once at the Chat's first conversation request in
+    /// this process and kept, unlike the user context, through compaction.
+    environment: OnceLock<environment_info::ChatEnvironment>,
     /// The date the model was last told, by the user context or a date change note; `None` until
     /// the user context is read.
     announced_date: Option<String>,
@@ -3151,15 +3155,7 @@ impl Agent {
                 )
             });
         let timing = timing::Phase::new("announce_guidance");
-        Box::pin(
-            self.announce_guidance(
-                receipt,
-                workspace_host
-                    .as_ref()
-                    .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks),
-            ),
-        )
-        .await?;
+        Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
         let family_roster = self.family_agents(receipt.chat_id).await?;
         let user_context = self.user_context(receipt.chat_id).await?;
@@ -5706,6 +5702,7 @@ impl NewChat {
             user_cancelled_runs: HashSet::new(),
             output_style,
             user_context,
+            environment: OnceLock::new(),
             announced_date,
             auto_denials: auto_mode::DenialTracking::default(),
             denial_window: denials::DenialWindow::default(),
