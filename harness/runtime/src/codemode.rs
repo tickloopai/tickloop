@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     rc::Rc,
     sync::{Arc, Mutex, mpsc},
@@ -86,6 +87,8 @@ pub struct Options {
     pub output_directory: Option<std::path::PathBuf>,
     /// A host may lower the sandbox budget; values above 256 MB are capped.
     pub memory_limit_bytes: usize,
+    /// The values `load()` returns when the script starts.
+    pub store: BTreeMap<String, Value>,
 }
 
 impl Default for Options {
@@ -94,6 +97,7 @@ impl Default for Options {
             control: Control::default(),
             output_directory: None,
             memory_limit_bytes: MEMORY_LIMIT,
+            store: BTreeMap::new(),
         }
     }
 }
@@ -104,6 +108,46 @@ pub struct Outcome {
     pub error: Option<String>,
     pub full_output_path: Option<std::path::PathBuf>,
     pub images: Vec<tickloop_harness_protocol::Image>,
+    /// What `store()` changed; empty unless the script succeeded.
+    pub store_writes: StoreWrites,
+}
+
+/// The keys a successful script set and the keys it deleted with `store(key, undefined)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoreWrites {
+    pub set: BTreeMap<String, Value>,
+    pub delete: BTreeSet<String>,
+}
+
+impl StoreWrites {
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.delete.is_empty()
+    }
+    pub fn apply_to(&self, store: &mut BTreeMap<String, Value>) {
+        for key in &self.delete {
+            store.remove(key);
+        }
+        store.extend(self.set.clone());
+    }
+    /// The writes the prelude reports: `[key, json]` sets a key and `[key]` deletes it.
+    fn parse(json: &str) -> Result<Self, String> {
+        let entries: Vec<Vec<String>> =
+            serde_json::from_str(json).map_err(|error| error.to_string())?;
+        let mut writes = Self::default();
+        for entry in entries {
+            match entry.as_slice() {
+                [key] => {
+                    writes.delete.insert(key.clone());
+                }
+                [key, value] => {
+                    let value = serde_json::from_str(value).map_err(|error| error.to_string())?;
+                    writes.set.insert(key.clone(), value);
+                }
+                _ => return Err("malformed store write".into()),
+            }
+        }
+        Ok(writes)
+    }
 }
 
 #[derive(Default)]
@@ -169,6 +213,7 @@ where
         .min(memory_limit / 4);
     let output_directory = options.output_directory;
     let control = options.control;
+    let store = serde_json::to_string(&options.store).unwrap();
     let _cancel_on_drop = control.cancel.clone().drop_guard();
     let worker_control = control.clone();
     let (requests, mut incoming) = tokio::sync::mpsc::channel(MAX_CONCURRENT_CALLS);
@@ -178,6 +223,7 @@ where
         execute(
             source,
             tools,
+            store,
             requests,
             completed,
             worker_control,
@@ -197,6 +243,7 @@ where
                 let settled = tokio::time::timeout(SETTLEMENT_TIMEOUT, async { while pending.next().await.is_some() {} }).await;
                 let mut outcome = result.unwrap_or_else(|error| Outcome {error:Some(error.to_string()), ..Default::default()});
                 if settled.is_err() { outcome.error.get_or_insert_with(|| "Tool callbacks did not settle after cancellation; their outcomes are unknown".into()); }
+                if outcome.error.is_some() { outcome.store_writes = StoreWrites::default(); }
                 return outcome;
             },
             Some(request) = incoming.recv() => {
@@ -208,9 +255,11 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute(
     source: String,
     tools: Vec<String>,
+    store: String,
     requests: tokio::sync::mpsc::Sender<Call>,
     completed: mpsc::Receiver<(u32, Result<Value, String>)>,
     control: Control,
@@ -262,11 +311,26 @@ fn execute(
                     })
                 })?;
                 let done_state = state.clone();
-                let done = Function::new(ctx.clone(), move |error: Option<String>| {
-                    let mut state = done_state.borrow_mut();
-                    state.outcome.error = error;
-                    state.finished = true;
-                })?;
+                let done = Function::new(
+                    ctx.clone(),
+                    move |error: Option<String>, writes: Option<String>| {
+                        let mut state = done_state.borrow_mut();
+                        match writes.as_deref().map(StoreWrites::parse).transpose() {
+                            Ok(writes) if error.is_none() => {
+                                state.outcome.store_writes = writes.unwrap_or_default();
+                            }
+                            Ok(_) => {}
+                            Err(invalid) => {
+                                state.outcome.error =
+                                    Some(format!("Invalid store writes: {invalid}"));
+                                state.finished = true;
+                                return;
+                            }
+                        }
+                        state.outcome.error = error;
+                        state.finished = true;
+                    },
+                )?;
                 let image_state = state.clone();
                 let image =
                     Function::new(ctx.clone(), move |json: String| -> rquickjs::Result<()> {
@@ -343,6 +407,7 @@ fn execute(
                     done,
                     serde_json::to_string(&tools).unwrap(),
                     MAX_CONCURRENT_CALLS,
+                    store,
                 ))?;
                 let run: Function = bridge.get("run")?;
                 let constructor: Function = ctx.eval("(async function() {}).constructor")?;
