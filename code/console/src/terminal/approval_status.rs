@@ -121,7 +121,7 @@ impl ApprovalStatus {
         matches!(self, Self::Settled(record) if record.outcome == ApprovalResult::Allow && matches!(record.path, ApprovalPath::AutoJev | ApprovalPath::AutoLlm))
     }
 
-    fn human_context(&self) -> Option<String> {
+    pub(super) fn human_context(&self) -> Option<String> {
         let (source, reason, reviewer) = match self {
             Self::Waiting {
                 source,
@@ -153,8 +153,8 @@ impl ApprovalStatus {
         })
     }
 
-    pub(super) fn decorate(&self, mut runs: RoleRuns, glyph: &str) -> RoleRuns {
-        let replacement = self.pending_label().or_else(|| match self {
+    pub(super) fn result_label(&self) -> Option<String> {
+        self.pending_label().or_else(|| match self {
             Self::Settled(record) if record.outcome == ApprovalResult::Deny => match record.path {
                 ApprovalPath::AutoJev | ApprovalPath::AutoLlm => Some(format!(
                     "Denied by Auto review ({}): {}",
@@ -169,49 +169,35 @@ impl ApprovalStatus {
                 ApprovalPath::Direct => None,
             },
             _ => None,
-        });
-        if let Some(text) = replacement {
+        })
+    }
+
+    pub(super) fn allowed_label(&self) -> Option<&'static str> {
+        let Self::Settled(record) = self else {
+            return None;
+        };
+        if record.outcome != ApprovalResult::Allow {
+            return None;
+        }
+        match record.path {
+            ApprovalPath::AutoJev => Some("Allowed by Auto review (Jev)"),
+            ApprovalPath::AutoLlm => Some("Allowed by Auto review (LLM)"),
+            ApprovalPath::Human => Some("Approved by you"),
+            ApprovalPath::Direct => None,
+        }
+    }
+
+    pub(super) fn decorate(&self, mut runs: RoleRuns, glyph: &str) -> RoleRuns {
+        if let Some(text) = self.result_label() {
             runs = result_runs(&text, glyph);
-        } else if let Self::Settled(record) = self {
-            let label = match record.path {
-                ApprovalPath::AutoJev => Some("Auto-approved (Jev)"),
-                ApprovalPath::AutoLlm => Some("Auto-approved (LLM)"),
-                ApprovalPath::Human => Some("Approved by you"),
-                ApprovalPath::Direct => None,
-            };
-            if let Some(label) = label {
-                if runs.is_empty() {
-                    runs = result_runs("Running…", glyph);
-                }
-                insert_at_first_newline(
-                    &mut runs,
-                    vec![(format!(" · {label}"), Some(Role::MutedText))],
-                );
-            }
+        }
+        if let Some(label) = self.allowed_label() {
+            runs.extend(result_runs(label, glyph));
         }
         if let Some(context) = self.human_context() {
-            insert_at_first_newline(
-                &mut runs,
-                vec![(format!("\n     {context}"), Some(Role::MutedText))],
-            );
+            runs.push((format!("     {context}\n"), Some(Role::MutedText)));
         }
         runs
-    }
-}
-
-fn insert_at_first_newline(runs: &mut RoleRuns, addition: RoleRuns) {
-    if let Some((index, offset)) = runs
-        .iter()
-        .enumerate()
-        .find_map(|(index, (text, _))| text.find('\n').map(|offset| (index, offset)))
-    {
-        let (text, role) = &mut runs[index];
-        let rest = text.split_off(offset);
-        let role = *role;
-        runs.splice(
-            index + 1..index + 1,
-            addition.into_iter().chain([(rest, role)]),
-        );
     }
 }
 

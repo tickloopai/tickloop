@@ -514,6 +514,7 @@ fn block_message_id(id: &ConversationBlockId, snapshot: &ChatSnapshot) -> Option
 
 /// One row under a `⎿` result connector, painted with `fill` across the row.
 struct ResultLine {
+    connector: bool,
     spans: Vec<(String, Option<Role>)>,
     fill: Option<Role>,
 }
@@ -521,6 +522,7 @@ struct ResultLine {
 impl ResultLine {
     fn new(text: impl Into<String>, role: Option<Role>) -> Self {
         Self {
+            connector: false,
             spans: vec![(text.into(), role)],
             fill: None,
         }
@@ -528,6 +530,7 @@ impl ResultLine {
 
     fn filled(text: impl Into<String>, fill: Role) -> Self {
         Self {
+            connector: false,
             spans: vec![(text.into(), None)],
             fill: Some(fill),
         }
@@ -547,25 +550,23 @@ fn approval_result_lines(
     let Some(approval) = approval else {
         return lines;
     };
-    if matches!(approval, ApprovalStatus::Settled(record) if record.path == tickloop_harness::protocol::ApprovalPath::Direct)
-    {
-        return lines;
+    if let Some(label) = approval.result_label() {
+        let line = ResultLine::new(label, Some(Role::MutedText));
+        if lines.is_empty() {
+            lines.push(line);
+        } else {
+            lines[0] = line;
+        }
     }
-    let first = if lines.is_empty() {
-        Vec::new()
-    } else {
-        let mut runs = lines.remove(0).spans;
-        runs.push(("\n".into(), None));
-        runs
-    };
-    let decorated = approval.decorate(first, "");
-    let text = joined(&decorated);
-    let mut result = text
-        .lines()
-        .map(|line| ResultLine::new(line.trim_start(), Some(Role::MutedText)))
-        .collect::<Vec<_>>();
-    result.append(&mut lines);
-    result
+    if let Some(label) = approval.allowed_label() {
+        let mut line = ResultLine::new(label, Some(Role::MutedText));
+        line.connector = true;
+        lines.push(line);
+    }
+    if let Some(context) = approval.human_context() {
+        lines.push(ResultLine::new(context, Some(Role::MutedText)));
+    }
+    lines
 }
 
 struct TranscriptWriter {
@@ -776,7 +777,7 @@ impl TranscriptWriter {
     fn result_indented(&mut self, indent: usize, lines: Vec<ResultLine>) {
         let hang = indent + RESULT_INDENT;
         for (index, line) in lines.into_iter().enumerate() {
-            let lead = if index == 0 {
+            let lead = if index == 0 || line.connector {
                 format!(
                     "{}  {}  ",
                     " ".repeat(indent),
@@ -874,6 +875,7 @@ fn web_search_failure_lines(name: &str, content: &str) -> Option<Vec<ResultLine>
                 notes.push(note);
             }
             WebSearchSuggestion::ChangeProvider { command } => lines.push(ResultLine {
+                connector: false,
                 spans: vec![
                     ("• Choose another search provider: ".into(), None),
                     (safe_text(&command), Some(Role::Accent)),
@@ -944,6 +946,7 @@ fn transcript_result_lines(
         }
         READ_TOOL_NAME if !content.starts_with("<system-reminder>") => {
             return vec![ResultLine {
+                connector: false,
                 spans: vec![
                     ("Read ".into(), None),
                     (content.lines().count().to_string(), Some(Role::Strong)),

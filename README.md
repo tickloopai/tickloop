@@ -191,7 +191,7 @@ MCP tools default to `exposure: "search"`. Models whose cards support native Too
 
 If the Agent's process exits while an `ExecuteTools` batch runs, the batch is not run again: the loaded history lists what each of its calls did. In the conversation, each call a batch makes shows under its `ExecuteTools` call.
 
-Tool result rows show an Auto review in progress, a wait for your approval, and the final reviewer or your approval. Directly allowed calls have no approval label. Human approvals keep an extra line explaining why you were asked; denied calls show who denied them. ExecuteTools labels each nested call and summarizes the batch. Reopened conversations restore labels for the approval records still retained.
+Tool result rows show an Auto review in progress or a wait for your approval. Once allowed, a separate muted line below the result names the Auto reviewer or says “Approved by you”. Directly allowed calls have no approval label. Human approvals keep an extra line explaining why you were asked; denied calls show who denied them. ExecuteTools labels each nested call and summarizes the batch. Reopened conversations restore labels for the approval records still retained.
 
 ### Manage servers and log in
 

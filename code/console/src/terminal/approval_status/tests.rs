@@ -84,12 +84,12 @@ fn ordinary_tool_rows_show_each_final_approval_and_direct_stays_unlabelled() {
         (
             ApprovalPath::AutoJev,
             ApprovalResult::Allow,
-            "Auto-approved (Jev)",
+            "Allowed by Auto review (Jev)",
         ),
         (
             ApprovalPath::AutoLlm,
             ApprovalResult::Allow,
-            "Auto-approved (LLM)",
+            "Allowed by Auto review (LLM)",
         ),
         (
             ApprovalPath::Human,
@@ -135,11 +135,21 @@ fn ordinary_tool_rows_show_each_final_approval_and_direct_stays_unlabelled() {
         assert!(text.contains("Bash"), "{text}");
         if label.is_empty() {
             assert!(
-                !text.contains("approved") && !text.contains("Approved"),
+                !text.contains("approved")
+                    && !text.contains("Approved")
+                    && !text.contains("Allowed by"),
                 "{text}"
             );
         } else {
             assert_eq!(text.matches(label).count(), 1, "{text}");
+            if outcome == ApprovalResult::Allow {
+                assert!(
+                    text.lines()
+                        .any(|line| line.trim() == format!("⎿  {label}")),
+                    "{text}"
+                );
+                assert!(!text.contains(&format!(" · {label}")), "{text}");
+            }
         }
         if path == ApprovalPath::Human {
             assert_eq!(
@@ -197,8 +207,8 @@ fn snapshot() -> ChatSnapshot {
 #[test]
 fn retained_approval_records_restore_ordinary_tool_labels_and_human_reason() {
     for (path, label) in [
-        (ApprovalPath::AutoJev, "Auto-approved (Jev)"),
-        (ApprovalPath::AutoLlm, "Auto-approved (LLM)"),
+        (ApprovalPath::AutoJev, "Allowed by Auto review (Jev)"),
+        (ApprovalPath::AutoLlm, "Allowed by Auto review (LLM)"),
         (ApprovalPath::Human, "Approved by you"),
         (ApprovalPath::Direct, ""),
     ] {
@@ -234,7 +244,9 @@ fn retained_approval_records_restore_ordinary_tool_labels_and_human_reason() {
             }
             if path == ApprovalPath::Direct {
                 assert!(
-                    !text.contains("approved") && !text.contains("Approved"),
+                    !text.contains("approved")
+                        && !text.contains("Approved")
+                        && !text.contains("Allowed by"),
                     "{text}"
                 );
             }
@@ -291,7 +303,11 @@ fn nested_calls_label_each_child_and_update_parent_wait_and_summary() {
     }
     present(&mut tools, &console, &completed("batch", false));
     let text = console.test_conversation_text();
-    assert_eq!(text.matches("Auto-approved (Jev)").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("Allowed by Auto review (Jev)").count(),
+        1,
+        "{text}"
+    );
     assert_eq!(text.matches("Denied by you").count(), 1, "{text}");
     assert_eq!(
         text.matches("2 completed, 1 denied · 1 auto-approved")
@@ -416,7 +432,11 @@ fn retained_records_label_nested_history_and_keep_one_parent_summary() {
         )
         .plain_text(150),
     ] {
-        assert_eq!(text.matches("Auto-approved (Jev)").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("Allowed by Auto review (Jev)").count(),
+            1,
+            "{text}"
+        );
         assert_eq!(text.matches("Denied by you").count(), 1, "{text}");
         assert_eq!(
             text.matches("1 completed, 1 denied · 1 auto-approved")
