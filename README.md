@@ -61,6 +61,10 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
+Use `tickloop --add-dir ../shared --add-dir /path/to/docs` to add directories for Agents created by this launch, or `/add-dir PATH` within a Chat. For new Agents to include them by default, put `"permissions": {"additionalDirectories": ["../shared"]}` in your own `settings.json`. The same field under `projects["/absolute/project/path"]` applies only to that exact working directory and adds to the global list. Relative paths resolve from the launch working directory (`--cwd` when supplied); unavailable paths are warned about and skipped.
+
+These sources merge into the Chat's existing additional directories, with duplicates removed. They support reads, edits and `@` file mentions; sensitive-file checks and explicit Ask/Deny rules still apply. `/cwd` shows each directory's sources. Repository settings cannot add directories, and `--add-dir` and `/add-dir` do not write them to settings.
+
 Keys:
 
 - `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.

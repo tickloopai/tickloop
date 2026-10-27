@@ -584,6 +584,7 @@ pub(super) struct PermissionsContent {
     pub(super) rules: Vec<PermissionRuleView>,
     pub(super) working_directory: PathBuf,
     pub(super) additional_directories: Vec<PathBuf>,
+    pub(super) additional_directory_sources: tickloop_harness::protocol::AdditionalDirectorySources,
     pub(super) warnings: Vec<String>,
 }
 
@@ -612,6 +613,7 @@ impl From<PermissionsView> for PermissionsPage {
                 rules: view.rules,
                 working_directory: view.working_directory,
                 additional_directories: view.additional_directories,
+                additional_directory_sources: view.additional_directory_sources,
                 warnings: view.warnings,
             },
         }
@@ -2043,7 +2045,13 @@ impl PermissionsSurface {
             for path in self.directory_rows() {
                 let mut row = RoleLine::default();
                 row.push_matching(&path.display().to_string(), None, &self.query);
-                row.push(" · additional", Some(Role::MutedText));
+                row.push(
+                    format!(
+                        " · {}",
+                        directory_source_label(&self.view.additional_directory_sources, &path)
+                    ),
+                    Some(Role::MutedText),
+                );
                 rows.push(row);
             }
         } else {
@@ -2871,6 +2879,23 @@ pub(super) fn edit_text(editor: &mut Editor, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+pub(super) fn directory_source_label(
+    sources: &tickloop_harness::protocol::AdditionalDirectorySources,
+    path: &std::path::Path,
+) -> String {
+    sources
+        .get(path)
+        .filter(|sources| !sources.is_empty())
+        .map(|sources| {
+            sources
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "session".into())
 }
 
 #[cfg(test)]

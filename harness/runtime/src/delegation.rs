@@ -1244,6 +1244,9 @@ impl Agent {
                             registration.child_chat_id,
                             folder,
                             Some(super::InheritedChat {
+                                additional_directory_sources: bookkeeping
+                                    .additional_directory_sources
+                                    .clone(),
                                 metadata: metadata.clone(),
                                 parent: snapshot,
                                 client,

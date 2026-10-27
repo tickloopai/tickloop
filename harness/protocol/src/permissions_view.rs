@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -7,6 +10,28 @@ use crate::{
     ApiKeyStatus, AutoPolicy, AutoReviewerHealth, AutoReviewerPreference, AutoRuleChange,
     AutoRuleSettings, AutoSettingsRevision, ChatId, ExecutionMode, PermissionRule,
 };
+
+pub type AdditionalDirectorySources = BTreeMap<PathBuf, BTreeSet<AdditionalDirectorySource>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditionalDirectorySource {
+    UserSettings,
+    DirectorySettings,
+    LaunchArgument,
+    Session,
+}
+
+impl std::fmt::Display for AdditionalDirectorySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UserSettings => "user settings",
+            Self::DirectorySettings => "directory settings",
+            Self::LaunchArgument => "launch argument",
+            Self::Session => "session",
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionsRevision {
@@ -53,6 +78,8 @@ pub struct PermissionsView {
     pub rules: Vec<PermissionRuleView>,
     pub working_directory: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional_directory_sources: AdditionalDirectorySources,
     pub warnings: Vec<String>,
 }
 

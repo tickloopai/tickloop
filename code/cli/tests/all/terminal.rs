@@ -43,6 +43,249 @@ fn product_async_agent_command() -> tokio::process::Command {
 }
 
 #[test]
+fn launch_additional_directories_resolve_deduplicate_and_warn() {
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("project");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    let config_root = directory.path().join("config");
+    support::cli_runtime::adopt(&config_root);
+    let mut child = support::fixture_cli::command()
+        .args(["--working-directory-is-trusted", "--no-session-persistence"])
+        .args(["--add-dir", "../shared", "--add-dir", "../shared/."])
+        .args(["--add-dir", "../missing", "--cwd"])
+        .arg(&folder)
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/cwd\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let shared = shared.canonicalize().unwrap();
+    assert_eq!(
+        stdout
+            .matches(&format!("Additional directory: {}", shared.display()))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("missing") && stderr.contains("skipped"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn additional_directories_merge_user_partitions_launch_and_session_with_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("project");
+    let shared = directory.path().join("shared");
+    let partition = directory.path().join("partition");
+    let session = directory.path().join("session");
+    let forbidden = directory.path().join("repository-grant");
+    let config_root = directory.path().join("config");
+    for path in [
+        &folder,
+        &shared,
+        &partition,
+        &session,
+        &forbidden,
+        &config_root,
+    ] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let settings = json!({
+        "permissions": {"additionalDirectories": ["../shared", "../missing", 42]},
+        "projects": {
+            folder.canonicalize().unwrap().to_string_lossy().as_ref(): {
+                "permissions": {"additionalDirectories": ["../shared/.", "../partition"]}
+            },
+            directory.path().canonicalize().unwrap().to_string_lossy().as_ref(): {
+                "permissions": {"additionalDirectories": [forbidden]}
+            }
+        }
+    });
+    std::fs::write(
+        config_root.join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    for name in [".tickloop", ".claude"] {
+        std::fs::create_dir(folder.join(name)).unwrap();
+        std::fs::write(
+            folder.join(name).join("settings.json"),
+            serde_json::to_vec(&json!({
+                "permissions": {"additionalDirectories": [forbidden]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    support::cli_runtime::adopt(&config_root);
+    let mut child = support::fixture_cli::command()
+        .args([
+            "--working-directory-is-trusted",
+            "--no-session-persistence",
+            "--mode",
+            "acceptEdits",
+        ])
+        .args(["--add-dir", "../shared", "--add-dir", "../shared/."])
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .current_dir(&folder)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"!true\n/add-dir ../session\n/add-dir ../session/.\n/cwd\n/exit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    let listing = stdout.rsplit_once("Working directory:").unwrap().1;
+    for path in [&shared, &partition, &session] {
+        assert_eq!(
+            listing
+                .matches(&format!(
+                    "Additional directory: {}",
+                    path.canonicalize().unwrap().display()
+                ))
+                .count(),
+            1,
+            "{listing}"
+        );
+    }
+    assert!(!listing.contains("repository-grant"), "{listing}");
+    for source in [
+        "user settings",
+        "directory settings",
+        "launch argument",
+        "session",
+    ] {
+        assert!(
+            listing.contains(source),
+            "missing source {source}: {listing}"
+        );
+    }
+    assert!(
+        stdout.contains("missing") || stderr.contains("missing"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(config_root.join("settings.json")).unwrap())
+            .unwrap(),
+        settings
+    );
+}
+
+#[test]
+fn new_agent_directory_changes_use_the_current_partition_without_draft_duplicates() {
+    for commands in [
+        b"/cwd ../second\n/add-dir ../session\n/add-dir ../session/.\n/cwd\n!true\n/cwd\n/exit\n"
+            .as_slice(),
+        b"/add-dir ../session\n/cwd ../second\n/add-dir ../session/.\n/cwd\n!true\n/cwd\n/exit\n"
+            .as_slice(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let first_shared = temp.path().join("first-shared");
+        let second_shared = temp.path().join("second-shared");
+        let launch = temp.path().join("launch");
+        let session = temp.path().join("session");
+        let root = temp.path().join("config");
+        for path in [
+            &first,
+            &second,
+            &first_shared,
+            &second_shared,
+            &launch,
+            &session,
+            &root,
+        ] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(root.join("settings.json"), serde_json::to_vec(&json!({
+        "projects": {
+            first.canonicalize().unwrap().to_str().unwrap(): {"permissions": {"additionalDirectories": ["../first-shared"]}},
+            second.canonicalize().unwrap().to_str().unwrap(): {"permissions": {"additionalDirectories": ["../second-shared"]}}
+        }
+    })).unwrap()).unwrap();
+        support::cli_runtime::adopt(&root);
+        let mut child = support::fixture_cli::command()
+            .args([
+                "--working-directory-is-trusted",
+                "--no-session-persistence",
+                "--mode",
+                "acceptEdits",
+                "--add-dir",
+                "../launch",
+            ])
+            .env("TICKLOOP_CONFIG_DIR", &root)
+            .current_dir(&first)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(commands).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listings = stdout
+            .rsplit("Working directory:")
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(listings.len(), 2, "{stdout}");
+        for listing in listings {
+            assert!(
+                !listing.contains("first-shared"),
+                "old partition must not be granted: {listing}"
+            );
+            for path in [&second_shared, &launch, &session] {
+                assert_eq!(
+                    listing
+                        .matches(&format!(
+                            "Additional directory: {}",
+                            path.canonicalize().unwrap().display()
+                        ))
+                        .count(),
+                    1,
+                    "{listing}"
+                );
+            }
+            assert!(
+                listing.contains("directory settings")
+                    && listing.contains("launch argument")
+                    && listing.contains("session"),
+                "{listing}"
+            );
+        }
+    }
+}
+
+#[test]
 fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
@@ -1647,6 +1890,62 @@ async fn terminal_can_choose_accept_edits_with_an_explicit_write_rule_before_the
             .contains("Execution mode: Ask")
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn launch_additional_directory_is_writable_by_the_first_agent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    support::cli_runtime::adopt(&directory.path().join("config-root"));
+    let shared = tempfile::tempdir().unwrap();
+    let target = shared.path().join("report.txt");
+    let target_for_model = target.clone();
+    let server = tokio::spawn(async move {
+        for body in [
+            tool_stream(
+                "Write",
+                json!({"file_path": target_for_model, "content": "launch directory report"}),
+            ),
+            messages_stream("Report saved."),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            respond_with(&mut socket, &body).await;
+        }
+    });
+    std::fs::write(
+        directory.path().join("model.json"),
+        serde_json::to_vec(&json!({
+            "name":"fixture", "protocol":"messages", "base_url":format!("http://{address}"),
+            "model":"fixture", "api_key_env":"", "max_output_tokens":256
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run_with_config(
+        directory.path(),
+        &[
+            "--no-session-persistence",
+            "--deny-on-prompt",
+            "--add-dir",
+            shared.path().to_str().unwrap(),
+        ],
+        "Write the report\n",
+    )
+    .await;
+    server.abort();
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{transcript}");
+    assert_eq!(
+        std::fs::read_to_string(target).ok().as_deref(),
+        Some("launch directory report"),
+        "{transcript}"
+    );
 }
 
 #[tokio::test]

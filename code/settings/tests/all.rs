@@ -30,3 +30,6 @@ mod mcp_servers;
 
 #[path = "all/mcp_credentials.rs"]
 mod mcp_credentials;
+
+#[path = "all/additional_directories.rs"]
+mod additional_directories;
