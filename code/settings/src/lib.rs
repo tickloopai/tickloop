@@ -555,6 +555,85 @@ impl LoadedSettings {
         rules
     }
 
+    pub fn additional_directories(
+        &mut self,
+        folder: &Path,
+    ) -> tickloop_harness::protocol::AdditionalDirectorySources {
+        use tickloop_harness::protocol::AdditionalDirectorySource;
+        let mut directories = Default::default();
+        self.read_additional_directories(
+            folder,
+            self.settings.get(PERMISSIONS_KEY).cloned(),
+            PERMISSIONS_KEY,
+            AdditionalDirectorySource::UserSettings,
+            &mut directories,
+        );
+        let key = project_key(folder);
+        let project = self
+            .settings
+            .get(PROJECTS_KEY)
+            .and_then(|projects| projects.get(&key));
+        let permissions = project
+            .and_then(|project| project.get(PERMISSIONS_KEY))
+            .cloned();
+        self.read_additional_directories(
+            folder,
+            permissions,
+            &format!("{PROJECTS_KEY}[{key:?}].{PERMISSIONS_KEY}"),
+            AdditionalDirectorySource::DirectorySettings,
+            &mut directories,
+        );
+        directories
+    }
+
+    fn read_additional_directories(
+        &mut self,
+        folder: &Path,
+        permissions: Option<Value>,
+        location: &str,
+        source: tickloop_harness::protocol::AdditionalDirectorySource,
+        directories: &mut tickloop_harness::protocol::AdditionalDirectorySources,
+    ) {
+        let Some(permissions) = permissions else {
+            return;
+        };
+        let Some(permissions) = permissions.as_object() else {
+            // Project permission rules already report a malformed shared permissions object.
+            if source == tickloop_harness::protocol::AdditionalDirectorySource::UserSettings {
+                self.warn(format!(
+                    "`{location}` is not an object; additional directories skipped"
+                ));
+            }
+            return;
+        };
+        let Some(value) = permissions.get("additionalDirectories") else {
+            return;
+        };
+        let location = format!("{location}.additionalDirectories");
+        let Some(paths) = value.as_array() else {
+            self.warn(format!("`{location}` is not an array; skipped"));
+            return;
+        };
+        for value in paths {
+            let Some(path) = value.as_str().filter(|path| !path.is_empty()) else {
+                self.warn(format!(
+                    "`{location}` contains an invalid directory path; skipped"
+                ));
+                continue;
+            };
+            let path = folder.join(path);
+            match tickloop_harness::tools::permissions::canonical_directory(path.clone()) {
+                Ok(directory) => {
+                    directories.entry(directory).or_default().insert(source);
+                }
+                Err(reason) => self.warn(format!(
+                    "additional directory {}: {reason}; skipped",
+                    path.display()
+                )),
+            }
+        }
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }

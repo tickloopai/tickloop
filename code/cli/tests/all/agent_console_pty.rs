@@ -4580,3 +4580,81 @@ async fn actual_cli_a_busy_skill_waits_as_a_command_barrier() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test]
+async fn startup_additional_directories_offer_mentions_before_the_first_input() {
+    for from_settings in [false, true] {
+        let fixture = PrivateFixture::new();
+        let result = AssertUnwindSafe(async {
+            let shared = fixture.path("shared");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::write(shared.join("startup-note.txt"), "STARTUP-SHARED-NOTE").unwrap();
+            if from_settings {
+                std::fs::write(
+                    fixture.path("config/settings.json"),
+                    serde_json::to_vec(&json!({
+                        "permissions": {"additionalDirectories": ["../shared"]}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let (base_url, mut requests) = model_http_support::serve_responses(vec![(
+                200,
+                chat_reply(None, "Shared note received."),
+            )])
+            .await;
+            fixture.set_chat_model(&base_url);
+            let flags = if from_settings {
+                vec![]
+            } else {
+                vec!["--add-dir", "../shared"]
+            };
+            let mut view = PtyView::start_with_flags(&fixture, &flags);
+            view.wait_for("new Agent input ready", new_input_is_visible)
+                .await;
+            view.send(format!("Read @{}/startup-n", shared.display()).as_bytes());
+            view.wait_for(
+                "startup additional directory offers a file candidate",
+                |frame| frame.contains("startup-note.txt"),
+            )
+            .await;
+            view.send(b"\t please");
+            view.wait_for("shared file mention accepted", |frame| {
+                let composer = composer_line(frame);
+                composer.contains("startup-note.txt") && composer.contains("please")
+            })
+            .await;
+            view.send(b"\r");
+            let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "first input did not reach the model: {error}; {}",
+                        view.frame()
+                    )
+                })
+                .unwrap();
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| {
+                        is_user_prompt(message)
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains("STARTUP-SHARED-NOTE"))
+                    }),
+                "accepted file content must reach the first request: {request}"
+            );
+            view.close().await;
+        })
+        .catch_unwind()
+        .await;
+        fixture.shutdown().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}

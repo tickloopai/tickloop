@@ -117,6 +117,16 @@ impl Agent {
         snapshot.context_window_tokens = defaults.context_window_tokens;
         snapshot.reasoning_effort = defaults.reasoning_effort;
         snapshot.thinking_enabled = defaults.thinking_enabled;
+        for (directory, sources) in &saved.additional_directories {
+            if !snapshot.additional_directories.contains(directory) {
+                snapshot.additional_directories.push(directory.clone());
+            }
+            bookkeeping
+                .additional_directory_sources
+                .entry(directory.clone())
+                .or_default()
+                .extend(sources);
+        }
         let output_style = saved.output_style;
         self.replace_persistent_rules(snapshot, bookkeeping, saved);
         output_style

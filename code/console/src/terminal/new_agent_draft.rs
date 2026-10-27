@@ -216,6 +216,30 @@ impl NewAgentDraft {
         Ok(())
     }
 
+    pub(super) fn rebase_directories(
+        &mut self,
+        previous: &tickloop_harness::protocol::AdditionalDirectorySources,
+        next: &tickloop_harness::protocol::AdditionalDirectorySources,
+    ) {
+        let Some(staged) = self.additional_directories.as_mut() else {
+            return;
+        };
+        let mut directories = next
+            .keys()
+            .filter(|path| !previous.contains_key(*path) || staged.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        directories.extend(
+            staged
+                .iter()
+                .filter(|path| !previous.contains_key(*path))
+                .cloned(),
+        );
+        directories.sort();
+        directories.dedup();
+        *staged = directories;
+    }
+
     /// Stages a session or persistent rule; removing works on rules staged in this draft.
     pub(super) fn stage_rule_change(
         &mut self,

@@ -839,6 +839,7 @@ pub fn print_help() {
 fn help_text() -> String {
     let guidance = r#"Tickloop
 Usage: tickloop [--cwd DIRECTORY]
+       [--add-dir PATH]
        [--mode | --permission-mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--allowedTools RULES] [--disallowedTools RULES]
        [--working-directory-is-trusted]
@@ -989,6 +990,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let mut view_handoff_path = None;
     let mut fork_session = false;
     let mut session_persistence = true;
+    let mut additional_directories = Vec::new();
     let mut workdir = std::env::current_dir()
         .map_err(|_| "cannot read the current directory; use an accessible directory".to_owned())?;
     while let Some(argument) = arguments.next() {
@@ -1051,6 +1053,13 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                 prompt_policy = PromptPolicy::Unrestricted;
             }
             "--working-directory-is-trusted" => caller_managed_trust = true,
+            "--add-dir" => {
+                let path = arguments
+                    .next_if(|value| !value.starts_with("--"))
+                    .filter(|value| !value.is_empty())
+                    .ok_or("--add-dir requires a directory path")?;
+                additional_directories.push(PathBuf::from(path));
+            }
             "--cwd" => {
                 workdir = PathBuf::from(arguments.next().ok_or("--cwd requires a directory path")?)
             }
@@ -1165,6 +1174,18 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     workdir = workdir
         .canonicalize()
         .map_err(|error| format!("cannot resolve working directory: {error}"))?;
+    additional_directories = additional_directories.into_iter().filter_map(|path| {
+        let path = workdir.join(path);
+        match path.canonicalize().ok().filter(|path| path.is_dir()) {
+            Some(path) => Some(path),
+            None => {
+                eprintln!("Warning: additional directory {} is unavailable or not a directory; skipped", safe_text(&path.to_string_lossy()));
+                None
+            }
+        }
+    }).collect();
+    additional_directories.sort();
+    additional_directories.dedup();
     let interactive_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let config_root = config_root_directory().map(normalize_state_root);
     // Use the canonicalized root like `Agent::open`, so settings warnings reported at startup match
@@ -1224,6 +1245,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .and_then(LoadedSettings::monitor_width);
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
+        settings.additional_directories(&workdir);
     }
     let saved_execution_mode = saved_settings
         .as_mut()
@@ -1281,6 +1303,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
         folder: workdir.clone(),
+        additional_directories,
         config_root: config_root.clone(),
         model: Some(config.clone()),
         host_options,
@@ -1415,7 +1438,11 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .filter(|_| agent.saves_chats())
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
     console.configure_image_cache(image_cache_root.as_deref())?;
-    console.set_input_context(None, &workdir, &[])?;
+    let draft = agent
+        .configuration(ConfigTarget::NewDraft)
+        .await
+        .map_err(|error| error.to_string())?;
+    console.set_input_context(None, &workdir, &draft.additional_directories)?;
     let needs_model_selection =
         interactive_terminal && matches!(startup, StartupChat::New) && !model_selected;
     initialize_startup_console(
@@ -1978,6 +2005,7 @@ async fn interact_with_herdr(
     let mut restored_view_path = None;
     if let Some(handoff) = view_handoff {
         global.restore_upgrade_navigation(handoff.selection.navigation);
+        agent.set_new_agent_directory(global.projection().dispatch_directory);
         overview_active = handoff.selection.overview;
         agent.restore_upgrade_configuration(handoff.selection.configuration)?;
         if overview_active {
@@ -1989,7 +2017,15 @@ async fn interact_with_herdr(
         }
         console.restore_upgrade(handoff.console)?;
         if selected_chat.is_none() {
-            console.set_input_context(None, &global.projection().dispatch_directory, &[])?;
+            let draft = agent
+                .configuration(ConfigTarget::NewDraft)
+                .await
+                .map_err(|error| error.to_string())?;
+            console.set_input_context(
+                None,
+                &global.projection().dispatch_directory,
+                &draft.additional_directories,
+            )?;
         }
         restored_view_path = Some(handoff.source_path);
         ui_selected = selected_chat;
@@ -2026,7 +2062,9 @@ async fn interact_with_herdr(
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
-        menus.set_new_agent_directory(global.projection().dispatch_directory);
+        let dispatch_directory = global.projection().dispatch_directory;
+        menus.set_new_agent_directory(dispatch_directory.clone());
+        agent.set_new_agent_directory(dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
             agent
                 .display_chat(selected_chat.map(Into::into))
@@ -2533,6 +2571,11 @@ async fn interact_with_herdr(
                 console.set_footer_items(Vec::new())?;
                 console.set_provider_failure(None)?;
                 if let Ok(draft) = draft {
+                    console.set_input_context(
+                        None,
+                        &global.projection().dispatch_directory,
+                        &draft.additional_directories,
+                    )?;
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         if menus.model_setup_pending() {
@@ -4059,8 +4102,7 @@ async fn interact_with_herdr(
                                 match stage_draft_directories(agent,&mut global,&line).await {
                                     Ok((directory,additional)) => {
                                         console.set_input_context(None,&directory,&additional)?;
-                                        outln!(console, "Working directory: {}",safe_text(&directory.to_string_lossy()));
-                                        for directory in additional {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                        show_directory_listing(console, agent, ConfigTarget::NewDraft, &directory, &additional).await?;
                                     },
                                     Err(error) => outln!(console, "Cannot update directories: {}",safe_text(&error)),
                                 }
@@ -4072,8 +4114,7 @@ async fn interact_with_herdr(
                                 continue;
                             };
                             if line=="/cwd" {
-                                outln!(console, "Working directory: {}",safe_text(&folder.to_string_lossy()));
-                                for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                show_directory_listing(console, agent, ConfigTarget::Agent(chat.into()), &folder, &snapshot.additional_directories).await?;
                                 continue;
                             }
                             if let Some(path) = line.strip_prefix("/cwd ") { folder = folder.join(path.trim()); }
@@ -4081,8 +4122,7 @@ async fn interact_with_herdr(
                             match agent.set_directories(chat.into(),folder,snapshot.additional_directories).await {
                                 Ok(()) => {
                                     let snapshot = agent.snapshot(chat.into()).await.map_err(|error|error.to_string())?;
-                                    outln!(console, "Working directory: {}",safe_text(&shown_folder(snapshot.folder.as_deref()).to_string_lossy()));
-                                    for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
+                                    show_directory_listing(console, agent, ConfigTarget::Agent(chat.into()), shown_folder(snapshot.folder.as_deref()), &snapshot.additional_directories).await?;
                                     show_settings_warnings(console, agent.user_settings_warnings(chat.into()))?;
                                 },
                                 Err(error) => outln!(console, "Cannot update directories: {}",safe_text(&error.to_string())),
@@ -6487,7 +6527,8 @@ async fn ensure_chat(
     };
     *selected = Some(id.into());
     console.select_created_chat(id, &startup_banner)?;
-    console.set_input_context(Some(id), workdir, &[])?;
+    let status = agent.status(id).await.map_err(|error| error.to_string())?;
+    console.set_input_context(Some(id), workdir, &status.additional_directories)?;
     agent
         .display_chat(Some(id))
         .await
@@ -7220,6 +7261,34 @@ fn stage_draft_rule(
     Ok(staged_message)
 }
 
+async fn show_directory_listing(
+    console: &Console,
+    agent: &Agent,
+    target: ConfigTarget,
+    folder: &std::path::Path,
+    additional: &[PathBuf],
+) -> Result<(), String> {
+    let sources = agent.directory_sources(target, folder).await;
+    outln!(
+        console,
+        "Working directory: {}",
+        safe_text(&folder.to_string_lossy())
+    );
+    for directory in additional {
+        let source = sources
+            .as_ref()
+            .map(|sources| permissions_surface::directory_source_label(sources, directory))
+            .unwrap_or_else(|_| "source unavailable".into());
+        outln!(
+            console,
+            "Additional directory: {} · {}",
+            safe_text(&directory.to_string_lossy()),
+            source
+        );
+    }
+    Ok(())
+}
+
 /// `/cwd PATH` and `/add-dir PATH` on the New Agent: the directory new Agents start in and the
 /// extra directories the first input's Agent receives, resolved against the dispatch directory.
 async fn stage_draft_directories(
@@ -7235,35 +7304,41 @@ async fn stage_draft_directories(
             .filter(|path| path.is_dir())
             .ok_or_else(|| format!("{} is not a directory", path.display()))
     };
-    let mut additional = agent
-        .configuration(ConfigTarget::NewDraft)
-        .await
-        .map_err(|error| error.to_string())?
-        .additional_directories;
-    let directory = if let Some(path) = line.strip_prefix("/cwd ") {
+    if let Some(path) = line.strip_prefix("/cwd ") {
         let directory = resolve(path)?;
         global
             .interpret(crate::agent_console::Intent::DispatchDirectory(
                 directory.clone(),
             ))
             .map_err(|error| error.to_string())?;
-        directory
-    } else {
-        if let Some(path) = line.strip_prefix("/add-dir ") {
-            additional.push(resolve(path)?);
-            agent
-                .change_configuration(
-                    ConfigTarget::NewDraft,
-                    ConfigurationChange::Directories {
-                        folder: directory.clone(),
-                        additional: additional.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        directory
-    };
+        agent.set_new_agent_directory(directory.clone());
+        let additional = agent
+            .configuration(ConfigTarget::NewDraft)
+            .await
+            .map_err(|error| error.to_string())?
+            .additional_directories;
+        return Ok((directory, additional));
+    }
+    let mut additional = agent
+        .configuration(ConfigTarget::NewDraft)
+        .await
+        .map_err(|error| error.to_string())?
+        .additional_directories;
+    if let Some(path) = line.strip_prefix("/add-dir ") {
+        additional.push(resolve(path)?);
+        additional.sort();
+        additional.dedup();
+        agent
+            .change_configuration(
+                ConfigTarget::NewDraft,
+                ConfigurationChange::Directories {
+                    folder: directory.clone(),
+                    additional: additional.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok((directory, additional))
 }
 

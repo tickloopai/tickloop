@@ -432,6 +432,7 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
 
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
+        additional_directories: Vec::new(),
         folder: "/work/project".into(),
         config_root: Some("/home/user/.tickloop".into()),
         model: Some(model_config()),

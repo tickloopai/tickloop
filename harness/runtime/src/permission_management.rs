@@ -23,6 +23,54 @@ pub enum PermissionChangeError {
 }
 
 impl Agent {
+    pub async fn add_launch_directories(
+        &self,
+        chat_id: ChatId,
+        directories: Vec<PathBuf>,
+    ) -> Result<(), AgentError> {
+        self.require_root_chat(chat_id, "add launch directories")
+            .await?;
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let folder = require_folder(&chat.snapshot)?.to_path_buf();
+        let mut changed = false;
+        for path in directories {
+            let path = folder.join(path);
+            match canonical_directory(path.clone()) {
+                Ok(path) => {
+                    if !chat.snapshot.additional_directories.contains(&path) {
+                        chat.snapshot.additional_directories.push(path.clone());
+                    }
+                    changed |= chat
+                        .bookkeeping
+                        .additional_directory_sources
+                        .entry(path)
+                        .or_default()
+                        .insert(
+                            tickloop_harness_protocol::AdditionalDirectorySource::LaunchArgument,
+                        );
+                }
+                Err(reason) => self
+                    .inner
+                    .settings_warnings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(chat_id)
+                    .or_default()
+                    .push(format!(
+                        "additional directory {}: {reason}; skipped",
+                        path.display()
+                    )),
+            }
+        }
+        if changed {
+            chat.snapshot.policy.revision += 1;
+        }
+        self.save(&chat.snapshot);
+        Ok(())
+    }
+
     pub async fn permissions_view(&self, chat_id: ChatId) -> Result<PermissionsView, AgentError> {
         let _settings_gate = self.inner.settings_writes.lock().await;
         self.permissions_view_locked(chat_id).await
@@ -193,6 +241,11 @@ impl Agent {
                         "directory is already configured".into(),
                     ));
                 }
+                chat.bookkeeping
+                    .additional_directory_sources
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(tickloop_harness_protocol::AdditionalDirectorySource::Session);
                 chat.snapshot.additional_directories.push(path);
                 chat.snapshot.policy.revision += 1;
                 self.save(&chat.snapshot);
@@ -226,6 +279,7 @@ impl Agent {
                         "directory is not configured".into(),
                     ));
                 }
+                chat.bookkeeping.additional_directory_sources.remove(&path);
                 chat.snapshot.policy.revision += 1;
                 self.save(&chat.snapshot);
             }
@@ -424,6 +478,7 @@ fn view_from_snapshot(
         rules,
         working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),
+        additional_directory_sources: bookkeeping.additional_directory_sources.clone(),
         warnings,
     }
 }

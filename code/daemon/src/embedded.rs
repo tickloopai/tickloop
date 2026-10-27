@@ -800,6 +800,13 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?
                         .uuid()
                 };
+                if !launch.additional_directories.is_empty() {
+                    self.inner
+                        .agent
+                        .add_launch_directories(chat.into(), launch.additional_directories.clone())
+                        .await
+                        .map_err(agent_access_error)?;
+                }
                 let execution = self.register(chat, launch.clone()).await;
                 self.inner
                     .receipts

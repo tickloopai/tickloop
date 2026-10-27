@@ -25,6 +25,7 @@ pub struct ProjectSettings {
 
 #[derive(Clone, Debug)]
 pub struct SettingsSnapshot {
+    pub additional_directories: tickloop_harness_protocol::AdditionalDirectorySources,
     pub project: ProjectSettings,
     pub model: Option<ModelConfig>,
     pub task_tools_enabled: bool,
@@ -46,6 +47,7 @@ impl Default for SettingsSnapshot {
     fn default() -> Self {
         Self {
             project: ProjectSettings::default(),
+            additional_directories: BTreeMap::new(),
             model: None,
             task_tools_enabled: false,
             execution_mode: None,

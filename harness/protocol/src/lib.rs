@@ -148,8 +148,9 @@ pub use model_card::{
 pub use monitor::{MonitorMember, MonitorMembership};
 pub use permissions::{Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope};
 pub use permissions_view::{
-    PermissionChange, PermissionRuleScope, PermissionRuleSource, PermissionRuleView,
-    PermissionsRevision, PermissionsView, SessionPermissionDenial, WorkspaceScope,
+    AdditionalDirectorySource, AdditionalDirectorySources, PermissionChange, PermissionRuleScope,
+    PermissionRuleSource, PermissionRuleView, PermissionsRevision, PermissionsView,
+    SessionPermissionDenial, WorkspaceScope,
 };
 pub use plan::{Plan, Progress, TodoItem, TodoStatus};
 pub use projection::{HistoryCall, InvalidConversation};

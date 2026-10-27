@@ -417,6 +417,8 @@ struct Inner {
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
+    #[serde(default)]
+    additional_directory_sources: tickloop_harness_protocol::AdditionalDirectorySources,
     /// What the Chat's own work vouches for, as its Transcript keeps it.
     provenance: tickloop_harness_transcript::ProvenanceEntry,
     #[serde(default)]
@@ -452,6 +454,7 @@ struct ChatBookkeeping {
 
 /// What a Subagent's Chat takes from its parent's.
 struct InheritedChat {
+    additional_directory_sources: tickloop_harness_protocol::AdditionalDirectorySources,
     metadata: DelegationMetadata,
     parent: ChatSnapshot,
     client: Arc<dyn ModelClient>,
@@ -2352,6 +2355,7 @@ impl Agent {
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style, user_context, announced_date) = if let Some(InheritedChat {
+            additional_directory_sources,
             metadata,
             parent,
             client,
@@ -2360,6 +2364,7 @@ impl Agent {
             announced_date,
         }) = inherited
         {
+            bookkeeping.additional_directory_sources = additional_directory_sources;
             snapshot.model = parent.model;
             snapshot.reasoning_effort = parent.reasoning_effort;
             snapshot.thinking_enabled = parent.thinking_enabled;
@@ -4914,10 +4919,12 @@ impl Agent {
             Ok(path)
         };
         let folder = canonical(folder)?;
-        let additional = additional
+        let mut additional = additional
             .into_iter()
             .map(canonical)
             .collect::<Result<Vec<_>, _>>()?;
+        additional.sort();
+        additional.dedup();
         self.require_working_directory_trust(&folder)?;
         let _settings_gate = self.inner.settings_writes.lock().await;
         let saved = self.load_user_settings(Some(folder.clone())).await?;
@@ -4934,6 +4941,17 @@ impl Agent {
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
+        }
+        chat.bookkeeping
+            .additional_directory_sources
+            .retain(|path, _| additional.contains(path));
+        for path in &additional {
+            chat.bookkeeping
+                .additional_directory_sources
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    [tickloop_harness_protocol::AdditionalDirectorySource::Session].into()
+                });
         }
         chat.snapshot.additional_directories = additional;
         if directory_changed {

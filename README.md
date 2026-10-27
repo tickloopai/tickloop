@@ -63,6 +63,10 @@ To add temporary tool rules for a new Agent, run `tickloop --allowedTools "Bash(
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
+Use `tickloop --add-dir ../shared --add-dir /path/to/docs` to add directories for Agents created by this launch, or `/add-dir PATH` within a Chat. For new Agents to include them by default, put `"permissions": {"additionalDirectories": ["../shared"]}` in your own `settings.json`. The same field under `projects["/absolute/project/path"]` applies only to that exact working directory and adds to the global list. Relative paths resolve from the launch working directory (`--cwd` when supplied); unavailable paths are warned about and skipped.
+
+These sources merge into the Chat's existing additional directories, with duplicates removed. They support reads, edits and `@` file mentions; sensitive-file checks and explicit Ask/Deny rules still apply. `/cwd` shows each directory's sources. Repository settings cannot add directories, and `--add-dir` and `/add-dir` do not write them to settings.
+
 In `/permissions` → Auto mode, you can preview and select a one-time import of custom Auto rules. Built-in rules stay in place; imported rules do not override explicit Ask or Deny. Use `space` to toggle entries, `enter` to save and `esc` to cancel without changes.
 
 Keys:

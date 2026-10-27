@@ -174,6 +174,7 @@ impl Agent {
             last_model_run: None,
         };
         let mut bookkeeping = ChatBookkeeping {
+            additional_directory_sources: source.bookkeeping.additional_directory_sources.clone(),
             continued_message_ids: source.bookkeeping.continued_message_ids.clone(),
             citation_sources: tickloop_harness_transcript::CitationSourcesEntry {
                 chat_id: child_chat_id.into(),
