@@ -42,6 +42,10 @@ impl LoopbackCodexClient {
         Self(self.0.with_loopback_test_websocket())
     }
 
+    /// Like every loopback login helper (`CodexAuth::new_for_loopback_test` and the others), this
+    /// exists only in debug builds, so a release build never accepts a loopback login origin. The
+    /// test suites that call these helpers run in debug builds; a release build with `test-support`
+    /// (the MCP benchmark) does not call them.
     #[cfg(debug_assertions)]
     pub fn with_oauth_origin(self, state_dir: &Path, origin: &str) -> Self {
         Self(self.0.with_loopback_test_auth(state_dir, origin).unwrap())
