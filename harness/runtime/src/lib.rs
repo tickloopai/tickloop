@@ -64,6 +64,7 @@ mod chat_title;
 mod citations;
 #[cfg(feature = "codemode")]
 pub mod codemode;
+mod codemode_store;
 #[cfg(feature = "codemode")]
 mod codemode_tool;
 mod compaction;
@@ -448,6 +449,10 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
+    /// What successful Codemode scripts stored, in order; a script loads the changes on the
+    /// current chain.
+    #[serde(default)]
+    codemode_store: Vec<tickloop_harness_transcript::CodemodeStoreEntry>,
 }
 
 /// What a Subagent's Chat takes from its parent's.

@@ -26,6 +26,8 @@ const DEFAULT_HEIGHT: usize = 22;
 const RESPONSE_HANG: usize = 5;
 /// Rows of a block's body wrap under its two-space indent.
 const BODY_HANG: usize = 2;
+/// A call a script or batch made lines up under its parent's `⎿` content.
+const NESTED_INDENT: usize = RESPONSE_HANG;
 const EXPAND_HINT: &str = " (ctrl+o to expand)";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +157,9 @@ struct ToolCallHeader {
     state: ToolCallState,
     /// What a read or search call adds to the collapsed group it joined.
     collapse: Option<(CollapsedCall, usize)>,
+    /// Columns the call's row and results are moved right: a call a script or batch made sits
+    /// under the call that made it.
+    indent: usize,
 }
 
 /// A call that reads or searches. Consecutive ones share one collapsed row, as Claude Code's
@@ -263,6 +268,8 @@ pub(super) struct Scrollback {
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
+    /// The call each call a script or batch made runs under, by call id.
+    nested_parents: HashMap<String, String>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
     model_retries: BTreeMap<(Uuid, ModelRequestKind), ModelRetryNotice>,
@@ -300,6 +307,7 @@ impl Default for Scrollback {
             foreground_command_hint_lines: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
+            nested_parents: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
             model_retries: BTreeMap::new(),
@@ -648,6 +656,7 @@ impl Scrollback {
             return;
         }
         let at = header.results_end;
+        let indent = header.indent;
         let mut result = Scrollback::new();
         result.append_response(runs);
         if clip_summary {
@@ -656,6 +665,18 @@ impl Scrollback {
         if result.lines.last().is_some_and(String::is_empty) && result.lines.len() > 1 {
             result.lines.pop();
             result.line_styles.pop();
+        }
+        if indent > 0 {
+            for (line, style) in result.lines.iter_mut().zip(&mut result.line_styles) {
+                line.insert_str(0, &" ".repeat(indent));
+                for (range, _) in &mut style.marks {
+                    *range = range.start + indent..range.end + indent;
+                }
+                for (range, _) in &mut style.links {
+                    *range = range.start + indent..range.end + indent;
+                }
+                style.hang += indent;
+            }
         }
         self.insert_lines(at, result.lines, result.line_styles);
     }
@@ -882,21 +903,35 @@ impl Scrollback {
         state: ToolCallState,
         collapse: Option<CollapsedCall>,
     ) {
-        let existing = self
-            .tool_call_headers
+        let existing = self.tool_call_headers.get(call_id).map(|header| {
+            (
+                header.line,
+                header.results_end,
+                header.collapse.clone(),
+                header.indent,
+            )
+        });
+        let nested_under = self
+            .nested_parents
             .get(call_id)
-            .map(|header| (header.line, header.results_end, header.collapse.clone()));
-        let (header_line, results_end, collapse) = match existing {
-            Some(existing) => existing,
-            None => match collapse {
+            .and_then(|parent| self.tool_call_headers.get(parent))
+            .filter(|parent| parent.collapse.is_none())
+            .map(|parent| (parent.results_end, parent.indent + NESTED_INDENT));
+        let (header_line, results_end, collapse, indent) = match (existing, nested_under) {
+            (Some(existing), _) => existing,
+            (None, Some((at, indent))) => {
+                let line = self.insert_nested_header(call_id, at);
+                (line, line + 1, None, indent)
+            }
+            (None, None) => match collapse {
                 Some(call) => {
                     let group = self.open_group.unwrap_or_else(|| self.start_group(spans));
                     let line = self.groups[group].line;
-                    (line, line + 1, Some((call, group)))
+                    (line, line + 1, Some((call, group)), 0)
                 }
                 None => {
                     let line = self.start_block_line();
-                    (line, line + 1, None)
+                    (line, line + 1, None, 0)
                 }
             },
         };
@@ -909,6 +944,7 @@ impl Scrollback {
                 spans: spans.to_vec(),
                 state,
                 collapse: collapse.clone(),
+                indent,
             },
         );
         if let Some((_, group)) = collapse {
@@ -918,13 +954,18 @@ impl Scrollback {
         }
         // The first styled span is the call's `⏺`; its colour follows the state.
         let dot = spans.iter().position(|(_, role)| role.is_some());
-        let header_spans: Vec<_> = spans
-            .iter()
-            .map(|(text, role)| (text.trim_matches('\n'), *role))
+        let indentation = " ".repeat(indent);
+        let header_spans: Vec<_> = std::iter::once((indentation.as_str(), None))
+            .filter(|_| indent > 0)
+            .chain(
+                spans
+                    .iter()
+                    .map(|(text, role)| (text.trim_matches('\n'), *role)),
+            )
             .chain(std::iter::once((state.suffix(), Some(Role::MutedText))))
             .enumerate()
             .map(|(index, (text, role))| {
-                let role = if Some(index) == dot {
+                let role = if dot.map(|dot| dot + usize::from(indent > 0)) == Some(index) {
                     Some(state.dot_role())
                 } else {
                     role
@@ -940,6 +981,35 @@ impl Scrollback {
         } else {
             self.running_tool_calls.remove(call_id);
         }
+    }
+
+    /// Records that `call_id` runs under `parent`, so its row goes under the parent's row.
+    pub(super) fn nest_tool_call(&mut self, call_id: &str, parent: &str) {
+        self.nested_parents
+            .insert(call_id.to_owned(), parent.to_owned());
+    }
+
+    /// Inserts the row of a nested call at `at`, the end of its parent's rows. The calls before
+    /// it under the same parent keep their own results above it.
+    fn insert_nested_header(&mut self, call_id: &str, at: usize) -> usize {
+        let parent = self.nested_parents.get(call_id).cloned();
+        let siblings: Vec<String> = self
+            .tool_call_headers
+            .iter()
+            .filter(|(id, header)| {
+                header.results_end == at
+                    && Some(id.as_str()) != parent.as_deref()
+                    && self.nested_parents.get(id.as_str()) == parent.as_ref()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.insert_lines(at, vec![String::new()], vec![LineStyle::default()]);
+        for sibling in siblings {
+            if let Some(header) = self.tool_call_headers.get_mut(&sibling) {
+                header.results_end = at;
+            }
+        }
+        at
     }
 
     /// Starts a block of one line, set later, and returns the line.
@@ -2923,6 +2993,57 @@ mod tests {
             scrollback.frame(30, 10).lines[3..],
             ["❯ !sleep 1", "  ⎿  Running…", ""],
             "a running command's output sits under its echo"
+        );
+    }
+
+    #[test]
+    fn nested_calls_stay_under_their_parent_before_its_result() {
+        let run = Uuid::from_u128(1);
+        let mut scrollback = Scrollback::new();
+        scrollback.set_tool_call(
+            run,
+            "parent",
+            &call_spans("Codemode"),
+            ToolCallState::Running,
+            None,
+        );
+        scrollback.nest_tool_call("a", "parent");
+        scrollback.set_tool_call(
+            run,
+            "a",
+            &call_spans("First"),
+            ToolCallState::Running,
+            Some(CollapsedCall::Search),
+        );
+        scrollback.nest_tool_call("b", "parent");
+        scrollback.set_tool_call(
+            run,
+            "b",
+            &call_spans("Second"),
+            ToolCallState::Running,
+            None,
+        );
+        scrollback.append_tool_result("b", &result("second result"), false);
+        scrollback.append_tool_result("a", &result("first result"), false);
+        scrollback.finish_tool_call(run, "a", ToolCallState::Finished);
+        scrollback.finish_tool_call(run, "b", ToolCallState::Failed);
+        scrollback.append_tool_result("parent", &result("Script completed"), false);
+        scrollback.finish_tool_call(run, "parent", ToolCallState::Finished);
+        scrollback.append_markdown("After the script.", "⏺ ", true);
+        assert_eq!(
+            scrollback.frame(40, 20).lines,
+            [
+                "",
+                "⏺ Codemode",
+                "     ⏺ First",
+                "       ⎿  first result",
+                "     ⏺ Second",
+                "       ⎿  second result",
+                "  ⎿  Script completed",
+                "",
+                "⏺ After the script.",
+                "",
+            ]
         );
     }
 

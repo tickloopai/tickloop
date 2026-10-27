@@ -678,6 +678,15 @@ impl ChatRecorder {
                 custom_title: title.to_owned(),
             }),
         ];
+        lines.extend(
+            super::codemode_store::whole_store(
+                child_chat_id,
+                source,
+                &source_bookkeeping.codemode_store,
+            )
+            .into_iter()
+            .map(Line::CodemodeStore),
+        );
         if !source_bookkeeping.citation_sources.sources.is_empty() {
             lines.push(Line::CitationSources(
                 tickloop_harness_transcript::CitationSourcesEntry {
@@ -788,6 +797,16 @@ impl ChatRecorder {
             ));
         }
         lines.extend(compaction_lines);
+        // After the boundary, so a load that skips what came before it still finds them.
+        if compacted_bookkeeping.codemode_store != chat.bookkeeping.codemode_store {
+            lines.extend(
+                compacted_bookkeeping
+                    .codemode_store
+                    .iter()
+                    .cloned()
+                    .map(Line::CodemodeStore),
+            );
+        }
         lines.extend(renamed_snapshots.iter().filter_map(|renamed| {
             Some(Line::FileHistorySnapshot(FileHistorySnapshotEntry {
                 message_id: renamed.message_id,
@@ -2405,6 +2424,25 @@ fn recover_transcript(
         }
     }
     snapshot.operations.extend(nested.into_values());
+    bookkeeping.codemode_store = loaded
+        .lifecycle
+        .iter()
+        .filter_map(|line| match line {
+            Line::CodemodeStore(entry)
+                if entry.chat_id == source_chat_id
+                    && super::codemode_store::is_on_chain(&snapshot, entry) =>
+            {
+                Some(entry.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if chat_id != source_chat_id {
+        bookkeeping.codemode_store =
+            super::codemode_store::whole_store(chat_id, &snapshot, &bookkeeping.codemode_store)
+                .into_iter()
+                .collect();
+    }
 
     recover_snapshot_for_resume(
         snapshot,
@@ -3442,6 +3480,14 @@ impl Agent {
         if family.is_some() {
             waited_calls.extend(super::family_load::family_call_ids(&restored.messages));
         }
+        // Calls a script or batch made may have taken effect: their parent stays, and the load
+        // reports it as interrupted with each call's outcome.
+        waited_calls.extend(loaded.lifecycle.iter().filter_map(|line| match line {
+            Line::NestedCall(entry) if entry.chat_id == source_chat_id => {
+                entry.operation.parent_call_id.clone()
+            }
+            _ => None,
+        }));
         let removed = unrecoverable_assistant_messages(&restored.messages, &waited_calls);
         let mut recovered = recover_transcript(
             chat_id,
@@ -3682,6 +3728,9 @@ impl Agent {
                 // the new file exceeds 5MB, loading does not skip them along with the content
                 // before the boundary.
                 recorder.enqueue_sync(&snapshot, &bookkeeping);
+                for entry in &bookkeeping.codemode_store {
+                    self.record_chat_metadata(chat_id, Line::CodemodeStore(entry.clone()));
+                }
                 // Following Claude Code's `processResumedConversation`: re-record all of the source
                 // Chat's replacement decisions under the new chatId; the replacement text still
                 // points to the externalized files in the source Chat's directory.

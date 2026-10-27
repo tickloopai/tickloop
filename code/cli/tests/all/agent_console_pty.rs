@@ -7,6 +7,7 @@ use tickloop_harness::test_support::screen::SELECTED_MARK;
 mod artifact_attachment;
 mod auto_review;
 mod bash_background;
+mod codemode_nesting;
 mod command_feedback;
 mod daemon_shutdown;
 mod dialog_parity;

@@ -3596,6 +3596,16 @@ impl Console {
         Ok(())
     }
 
+    /// Puts the row of `call_key`, once written, under the row of `parent_key`.
+    pub(super) fn nest_tool_call(&self, call_key: &str, parent_key: &str) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .scrollback
+            .nest_tool_call(call_key, parent_key);
+        Ok(())
+    }
+
     /// Ends one call or the remaining calls of the originating Run.
     /// Records one call's final display state, or finishes the run's remaining calls.
     pub(super) fn finish_tool_call(
@@ -5324,6 +5334,8 @@ pub(super) enum ConversationPiece {
         spans: Vec<(String, Option<Role>)>,
         state: ToolCallState,
         collapse: Option<CollapsedCall>,
+        /// The row of the script or batch call that made this call.
+        parent_key: Option<String>,
     },
     /// The result of the call named `call_key`, drawn under the call's own row.
     ToolResult {
@@ -5372,8 +5384,14 @@ impl ConversationPiece {
                 spans,
                 state,
                 collapse,
+                parent_key,
                 ..
-            } => scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone()),
+            } => {
+                if let Some(parent) = parent_key {
+                    scrollback.nest_tool_call(call_key, parent);
+                }
+                scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone());
+            }
             Self::ToolResult {
                 call_key,
                 runs,
