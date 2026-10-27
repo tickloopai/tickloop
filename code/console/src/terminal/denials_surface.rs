@@ -410,6 +410,12 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
             record.reason
         ),
     ));
+    if let Some(reason) = &record.human_reason {
+        lines.push(detail_entry(
+            DetailGroup::Review,
+            format!("Human approval requested: {reason}"),
+        ));
+    }
     if let Some(source) = record.approval_source {
         lines.push(detail_entry(
             DetailGroup::Review,
@@ -815,6 +821,7 @@ mod tests {
 
     fn record(outcome: ApprovalResult) -> ApprovalRecord {
         ApprovalRecord {
+            human_reason: None,
             id: Uuid::new_v4(),
             chat_id: Uuid::new_v4().into(),
             loop_id: Uuid::new_v4().into(),

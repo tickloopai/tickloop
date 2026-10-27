@@ -1,0 +1,13 @@
+{
+  "parent_call_id": "batch",
+  "parent_call_index": 2,
+  "id": "00000000-0000-0000-0000-000000000001",
+  "loop_id": "00000000-0000-0000-0000-000000000002",
+  "run_id": "00000000-0000-0000-0000-000000000003",
+  "call_id": "child",
+  "name": "Bash",
+  "input": {},
+  "file_change": null,
+  "state": "Proposed",
+  "result": null
+}

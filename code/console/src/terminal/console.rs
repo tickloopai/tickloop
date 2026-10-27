@@ -3524,6 +3524,17 @@ impl Console {
         }])
     }
 
+    pub(super) fn write_tool_approval(
+        &self,
+        call_key: &str,
+        runs: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::ToolApproval {
+            call_key: call_key.to_owned(),
+            runs: runs.to_vec(),
+        }])
+    }
+
     /// Writes assistant reply text, shown as Markdown in the conversation.
     /// Non-interactive output receives the Markdown source.
     pub(super) fn write_markdown(&self, text: &str, starts_message: bool) -> Result<(), String> {
@@ -5344,6 +5355,10 @@ pub(super) enum ConversationPiece {
         /// The row of the batch call that made this call.
         parent_key: Option<String>,
     },
+    ToolApproval {
+        call_key: String,
+        runs: Vec<(String, Option<Role>)>,
+    },
     /// The result of the call named `call_key`, drawn under the call's own row.
     ToolResult {
         call_key: String,
@@ -5399,6 +5414,10 @@ impl ConversationPiece {
                 }
                 scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone());
             }
+            Self::ToolApproval { call_key, runs } => {
+                scrollback.expand_tool_call(call_key);
+                scrollback.append_tool_result(call_key, runs, false);
+            }
             Self::ToolResult {
                 call_key,
                 runs,
@@ -5438,7 +5457,10 @@ impl ConversationPiece {
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text.as_str().into(),
-            Self::Response(runs) | Self::Body(runs) | Self::ToolResult { runs, .. } => {
+            Self::Response(runs)
+            | Self::Body(runs)
+            | Self::ToolResult { runs, .. }
+            | Self::ToolApproval { runs, .. } => {
                 runs.iter().map(|(text, _)| text.as_str()).collect()
             }
         }

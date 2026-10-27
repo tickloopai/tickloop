@@ -191,6 +191,8 @@ MCP tools default to `exposure: "search"`. Models whose cards support native Too
 
 If the Agent's process exits while an `ExecuteTools` batch runs, the batch is not run again: the loaded history lists what each of its calls did. In the conversation, each call a batch makes shows under its `ExecuteTools` call.
 
+Tool result rows show an Auto review in progress, a wait for your approval, and the final reviewer or your approval. Directly allowed calls have no approval label. Human approvals keep an extra line explaining why you were asked; denied calls show who denied them. ExecuteTools labels each nested call and summarizes the batch. Reopened conversations restore labels for the approval records still retained.
+
 ### Manage servers and log in
 
 `/mcp` shows the Agent's servers grouped as global, this directory and each plugin, with transport, state (connected, connecting, failed, needs login, needs configuration, disabled, not supported yet), tool count and exposure. Enter on a server shows its tools, logs in again or out, reconnects it, or turns it off or on in this directory, plugin servers included (`projects[<directory>].disabledMcpServers`). Use `j`/`k` or `Ctrl+N`/`Ctrl+P` to select, `Enter` for actions, `r` to refresh and `Esc` to go back. Add and remove services with `tickloop mcp add` and `remove`; the panel manages existing entries. A login in `/mcp` shows a link and can open a browser locally; on a remote host, open it on your own computer and paste the full callback address back into the panel. `Esc` or `Ctrl+C` cancels. `/plugins` shows how many MCP servers an installed plugin carries and whether one needs a login.

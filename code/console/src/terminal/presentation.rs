@@ -15,6 +15,7 @@ use tickloop_ui::markdown;
 
 use super::{
     agent_messaging::{self, AgentColors, AgentInput, AgentMessage},
+    approval_status::{ApprovalStatus, ToolApprovals, result_runs},
     console::Console,
     conversation::{
         AssistantState, ConversationBlockId, ConversationBlockKind, ConversationBlockMetadata,
@@ -146,6 +147,8 @@ impl MessageGroups {
                 self.replies.entry(run.into()).or_default().1 = true;
                 format!("tool:{call_id}")
             }
+            EventKind::ApprovalReviewStarted { call_id, .. } => format!("tool:{call_id}"),
+            EventKind::ApprovalRecorded { record } => format!("tool:{}", record.call_id),
             EventKind::PermissionRequested { request } => {
                 format!("tool:{}", request.execution.call_key())
             }
@@ -175,6 +178,7 @@ pub(super) fn transcript_document(
     image_links: &ImageLinks,
     colors: &AgentColors,
 ) -> TranscriptDocument {
+    let approvals = ToolApprovals::from_snapshot(snapshot);
     let blocks = project_conversation(snapshot).blocks;
     let results = blocks
         .iter()
@@ -340,7 +344,7 @@ pub(super) fn transcript_document(
                 writer.tool_call(dot, name, &arguments);
                 if let Some(run) = exchange.run_id {
                     for operation in nested_operations(snapshot, run, &exchange.call_id) {
-                        writer.nested_call(operation);
+                        writer.nested_call(operation, approvals.get(run, &operation.call_id));
                     }
                 }
                 if let (Some(result), Some((content, is_error))) = (result, content) {
@@ -352,13 +356,42 @@ pub(super) fn transcript_document(
                     let report = launch
                         .as_ref()
                         .and_then(|launch| agent_messaging::subagent_report(snapshot, launch));
-                    writer.result(transcript_result_lines(
+                    let mut lines = transcript_result_lines(
                         name,
                         Some(input),
                         content,
                         is_error,
                         elapsed,
                         report.as_ref(),
+                    );
+                    if let Some(run) = exchange.run_id {
+                        if name == EXECUTE_TOOLS_NAME
+                            && let Some(summary) = settled_batch_summary(content, &approvals, run)
+                                .or_else(|| {
+                                    snapshot_batch_summary(
+                                        snapshot,
+                                        run,
+                                        &exchange.call_id,
+                                        Some(input),
+                                    )
+                                })
+                        {
+                            lines.insert(0, ResultLine::new(summary, Some(Role::MutedText)));
+                        }
+                        lines = approval_result_lines(lines, approvals.get(run, &exchange.call_id));
+                    }
+                    writer.result(lines);
+                } else if let Some(run) = exchange.run_id {
+                    let mut lines = Vec::new();
+                    if name == EXECUTE_TOOLS_NAME
+                        && let Some(summary) =
+                            snapshot_batch_summary(snapshot, run, &exchange.call_id, Some(input))
+                    {
+                        lines.push(ResultLine::new(summary, Some(Role::MutedText)));
+                    }
+                    writer.result(approval_result_lines(
+                        lines,
+                        approvals.get(run, &exchange.call_id),
                     ));
                 }
             }
@@ -505,6 +538,34 @@ fn text_lines(text: &str, role: Option<Role>) -> Vec<ResultLine> {
     text.lines()
         .map(|line| ResultLine::new(line, role))
         .collect()
+}
+
+fn approval_result_lines(
+    mut lines: Vec<ResultLine>,
+    approval: Option<&ApprovalStatus>,
+) -> Vec<ResultLine> {
+    let Some(approval) = approval else {
+        return lines;
+    };
+    if matches!(approval, ApprovalStatus::Settled(record) if record.path == tickloop_harness::protocol::ApprovalPath::Direct)
+    {
+        return lines;
+    }
+    let first = if lines.is_empty() {
+        Vec::new()
+    } else {
+        let mut runs = lines.remove(0).spans;
+        runs.push(("\n".into(), None));
+        runs
+    };
+    let decorated = approval.decorate(first, "");
+    let text = joined(&decorated);
+    let mut result = text
+        .lines()
+        .map(|line| ResultLine::new(line.trim_start(), Some(Role::MutedText)))
+        .collect::<Vec<_>>();
+    result.append(&mut lines);
+    result
 }
 
 struct TranscriptWriter {
@@ -665,7 +726,7 @@ impl TranscriptWriter {
     }
 
     /// A call a batch made, with its result, indented under the call that made it.
-    fn nested_call(&mut self, operation: &OperationRecord) {
+    fn nested_call(&mut self, operation: &OperationRecord, approval: Option<&ApprovalStatus>) {
         let hang = RESULT_INDENT + BLOCK_INDENT;
         let dot = match operation.state {
             OperationState::Completed => Role::Success,
@@ -691,6 +752,7 @@ impl TranscriptWriter {
         }
         self.text("\n", None);
         let Some(result) = &operation.result else {
+            self.result_indented(RESULT_INDENT, approval_result_lines(Vec::new(), approval));
             return;
         };
         let lines = transcript_result_lines(
@@ -701,7 +763,7 @@ impl TranscriptWriter {
             None,
             None,
         );
-        self.result_indented(RESULT_INDENT, lines);
+        self.result_indented(RESULT_INDENT, approval_result_lines(lines, approval));
     }
 
     /// Rows under a `⎿` connector, every row and its wrapped continuation indented to the
@@ -1105,11 +1167,15 @@ pub(super) struct ToolPresentation {
     tick_labels: super::tick_labels::TickLabels,
     /// Calls a batch made, by their row's key.
     nested: HashMap<String, NestedCall>,
+    approvals: ToolApprovals,
 }
 
 /// A call a batch made: the row of the call that made it, and what it calls.
 struct NestedCall {
     parent_key: String,
+    parent: String,
+    ordinal: usize,
+    result: Option<ToolResult>,
     name: String,
     input: Value,
 }
@@ -1171,6 +1237,31 @@ impl ToolPresentation {
         }
         let display = console.display_profile()?;
         let cwd = console.working_directory()?;
+        if let Some(call_id) = approval_event_call(event) {
+            if let Some(status) = self.approvals.get(event.run_id.into(), call_id) {
+                let runs = status.decorate(Vec::new(), display.glyph(Glyph::ToolResult));
+                if runs.is_empty() {
+                    return Ok(true);
+                }
+                let key = tool_call_key(event.run_id.into(), call_id);
+                let (name, input) = self.started_call(event, call_id);
+                if let Some(input) = input {
+                    if let Some(nested) = self.nested.get(&key) {
+                        console.nest_tool_call(&key, &nested.parent_key)?;
+                    }
+                    console.write_tool_call(
+                        event.run_id.into(),
+                        &key,
+                        &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
+                        ToolCallState::Running,
+                        None,
+                    )?;
+                }
+                console.write_tool_approval(&key, &runs)?;
+                self.present_parent_status(console, event, call_id, display)?;
+            }
+            return Ok(true);
+        }
         // A call a batch made without starting, such as one it was denied, still
         // shows its row under the call that made it.
         if let EventKind::ToolCompleted {
@@ -1354,7 +1445,56 @@ impl ToolPresentation {
         {
             console.flash_tick_use(&tool_call_key(event.run_id.into(), call_id), instance)?;
         }
+        if let EventKind::ToolCompleted { call_id, .. } = &event.kind {
+            self.present_parent_status(console, event, call_id, display)?;
+        }
         Ok(true)
+    }
+
+    fn present_parent_status(
+        &self,
+        console: &Console,
+        event: &Event,
+        call_id: &str,
+        display: DisplayProfile,
+    ) -> Result<(), String> {
+        let key = tool_call_key(event.run_id.into(), call_id);
+        if let Some(nested) = self.nested.get(&key)
+            && let Some(summary) = self.batch_summary(event, &nested.parent)
+        {
+            console.write_tool_result(
+                &nested.parent_key,
+                &result_runs(&summary, display.glyph(Glyph::ToolResult)),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn batch_summary(&self, event: &Event, parent: &str) -> Option<String> {
+        let parent_key = tool_call_key(event.run_id.into(), parent);
+        let mut calls = self
+            .nested
+            .iter()
+            .filter(|(_, nested)| nested.parent_key == parent_key)
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|(_, nested)| nested.ordinal);
+        let total = self
+            .started_call(event, parent)
+            .1
+            .and_then(|input| input["calls"].as_array())
+            .map_or(calls.len(), Vec::len);
+        batch_summary(
+            calls.iter().map(|(key, nested)| {
+                let call_id = key.split_once(":tool:").map_or("", |(_, call)| call);
+                (
+                    nested.ordinal,
+                    self.approvals.get(event.run_id.into(), call_id),
+                    nested.result.as_ref(),
+                )
+            }),
+            total,
+        )
     }
 
     /// How a call joins a collapsed group; detailed output shows every call on its own.
@@ -1423,6 +1563,7 @@ impl ToolPresentation {
             events: VecDeque::new(),
             tick_labels: super::tick_labels::TickLabels::default(),
             nested: HashMap::new(),
+            approvals: ToolApprovals::default(),
         }
     }
 
@@ -1434,6 +1575,14 @@ impl ToolPresentation {
     /// message announced while a batch of the same Run was announced.
     pub(super) fn nested_call_to_learn<'a>(&self, event: &'a Event) -> Option<&'a str> {
         let call_id = match &event.kind {
+            EventKind::ApprovalReviewStarted { call_id, .. } => call_id.as_str(),
+            EventKind::ApprovalRecorded { record } => record.call_id.as_str(),
+            EventKind::PermissionRequested { request } => match &request.execution {
+                tickloop_harness::protocol::PermissionExecution::ToolCall { call_id, .. } => {
+                    call_id.as_str()
+                }
+                _ => return None,
+            },
             EventKind::ToolStarted { call_id, .. } | EventKind::ToolCompleted { call_id, .. } => {
                 call_id.as_str()
             }
@@ -1443,7 +1592,7 @@ impl ToolPresentation {
             .nested
             .contains_key(&tool_call_key(event.run_id.into(), call_id))
         {
-            return None;
+            return matches!(event.kind, EventKind::ToolCompleted { .. }).then_some(call_id);
         }
         let mut makes_nested = false;
         for recorded in &self.events {
@@ -1471,24 +1620,60 @@ impl ToolPresentation {
         let Some(parent) = &operation.parent_call_id else {
             return;
         };
+        let key = tool_call_key(event.run_id.into(), &operation.call_id);
+        let ordinal = operation.parent_call_index.unwrap_or_else(|| {
+            self.nested
+                .get(&key)
+                .map_or(self.nested.len(), |nested| nested.ordinal)
+        });
         self.nested.insert(
-            tool_call_key(event.run_id.into(), &operation.call_id),
+            key,
             NestedCall {
                 parent_key: tool_call_key(event.run_id.into(), parent),
+                parent: parent.clone(),
+                ordinal,
+                result: operation.result.clone(),
                 name: operation.name.clone(),
                 input: operation.input.clone(),
             },
         );
     }
 
+    pub(super) fn restore_snapshot(&mut self, snapshot: &ChatSnapshot) {
+        self.restore(&snapshot.conversation_events());
+        self.approvals = ToolApprovals::from_snapshot(snapshot);
+        for operation in &snapshot.operations {
+            let event = Event {
+                sequence: 0,
+                chat_id: snapshot.id,
+                loop_id: operation.loop_id,
+                run_id: operation.run_id,
+                kind: EventKind::Started,
+            };
+            self.learn_nested_call(&event, operation);
+        }
+    }
+
     pub(super) fn restore(&mut self, events: &[Event]) {
         self.events.clear();
+        self.nested.clear();
+        self.approvals = ToolApprovals::default();
         for event in events {
             self.record(event);
         }
     }
 
     pub(super) fn record(&mut self, event: &Event) {
+        self.approvals.record(event);
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
+            && let Some(nested) = self
+                .nested
+                .get_mut(&tool_call_key(event.run_id.into(), call_id))
+        {
+            nested.result = Some(result.clone());
+        }
         if matches!(
             event.kind,
             EventKind::AssistantMessageCommitted { .. }
@@ -1524,7 +1709,15 @@ impl ToolPresentation {
                 EventKind::ToolCompleted { call_id, .. } => self.started_call(event, call_id).0,
                 _ => "tool",
             };
-            return detailed_event(event, name);
+            let detail = detailed_event(event, name)?;
+            if let EventKind::ToolCompleted { call_id, .. } = &event.kind
+                && let Some(approval) = self.approvals.get(event.run_id.into(), call_id)
+            {
+                return Some(
+                    joined(&approval.decorate(result_runs("Completed", "↳"), "↳")) + &detail,
+                );
+            }
+            return Some(detail);
         }
         // A background command's end reaches the conversation as its task notification.
         match &event.kind {
@@ -1582,14 +1775,27 @@ impl ToolPresentation {
                 call_id, result, ..
             } => {
                 let (name, input) = self.started_call(event, call_id);
-                compact_result_runs(
-                    name,
-                    input,
-                    result,
-                    display.glyph(Glyph::ToolResult),
-                    cwd,
-                    facts,
-                )
+                let runs = if name == EXECUTE_TOOLS_NAME {
+                    settled_batch_summary(&result.content, &self.approvals, event.run_id.into())
+                        .or_else(|| self.batch_summary(event, call_id))
+                        .map(|summary| result_runs(&summary, display.glyph(Glyph::ToolResult)))
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| {
+                    compact_result_runs(
+                        name,
+                        input,
+                        result,
+                        display.glyph(Glyph::ToolResult),
+                        cwd,
+                        facts,
+                    )
+                });
+                match self.approvals.get(event.run_id.into(), call_id) {
+                    Some(approval) => approval.decorate(runs, display.glyph(Glyph::ToolResult)),
+                    None => runs,
+                }
             }
             _ => vec![(self.render_event(event)?, Some(Role::MutedText))],
         })
@@ -1644,6 +1850,132 @@ impl ToolPresentation {
         }
         text
     }
+}
+
+fn approval_event_call(event: &Event) -> Option<&str> {
+    match &event.kind {
+        EventKind::ApprovalReviewStarted { call_id, .. } => Some(call_id),
+        EventKind::ApprovalRecorded { record } => Some(&record.call_id),
+        EventKind::PermissionRequested { request } => match &request.execution {
+            tickloop_harness::protocol::PermissionExecution::ToolCall { call_id, .. } => {
+                Some(call_id)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn batch_summary<'a>(
+    calls: impl Iterator<Item = (usize, Option<&'a ApprovalStatus>, Option<&'a ToolResult>)>,
+    total: usize,
+) -> Option<String> {
+    let mut completed = 0;
+    let mut denied = 0;
+    let mut failed = 0;
+    let mut approved = 0;
+    let mut seen = 0;
+    for (index, approval, result) in calls {
+        seen += 1;
+        if let Some(label) = approval.and_then(ApprovalStatus::pending_label) {
+            return Some(format!(
+                "{}: call {} of {total}",
+                label.trim_end_matches('…'),
+                index + 1
+            ));
+        }
+        if approval.is_some_and(ApprovalStatus::auto_approved) {
+            approved += 1;
+        }
+        if approval.is_some_and(ApprovalStatus::denied) {
+            denied += 1;
+        } else if let Some(result) = result {
+            if result.is_error {
+                failed += 1;
+            } else {
+                completed += 1;
+            }
+        }
+    }
+    if seen == 0 {
+        return None;
+    }
+    let mut summary = format!("{completed} completed");
+    if denied > 0 {
+        summary.push_str(&format!(", {denied} denied"));
+    }
+    if failed > 0 {
+        summary.push_str(&format!(", {failed} failed"));
+    }
+    if approved > 0 {
+        summary.push_str(&format!(" · {approved} auto-approved"));
+    }
+    Some(summary)
+}
+
+pub(super) fn settled_batch_summary(
+    content: &str,
+    approvals: &ToolApprovals,
+    run: Uuid,
+) -> Option<String> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    let results = value["results"].as_array()?;
+    let mut counts = [0; 5];
+    let mut approved = 0;
+    for result in results {
+        let index = match result["status"].as_str()? {
+            "completed" => 0,
+            "denied" => 1,
+            "error" => 2,
+            "not_executed" => 3,
+            "unknown" => 4,
+            _ => return None,
+        };
+        counts[index] += 1;
+        if result["call_id"]
+            .as_str()
+            .and_then(|call| approvals.get(run, call))
+            .is_some_and(ApprovalStatus::auto_approved)
+        {
+            approved += 1;
+        }
+    }
+    let mut summary = format!("{} completed", counts[0]);
+    for (count, label) in counts[1..]
+        .iter()
+        .zip(["denied", "failed", "not executed", "unknown"])
+    {
+        if *count > 0 {
+            summary.push_str(&format!(", {count} {label}"));
+        }
+    }
+    if approved > 0 {
+        summary.push_str(&format!(" · {approved} auto-approved"));
+    }
+    Some(summary)
+}
+
+pub(super) fn snapshot_batch_summary(
+    snapshot: &ChatSnapshot,
+    run: Uuid,
+    call: &str,
+    input: Option<&Value>,
+) -> Option<String> {
+    let approvals = ToolApprovals::from_snapshot(snapshot);
+    let operations = nested_operations(snapshot, run, call).collect::<Vec<_>>();
+    let total = input
+        .and_then(|input| input["calls"].as_array())
+        .map_or(operations.len(), Vec::len);
+    batch_summary(
+        operations.iter().enumerate().map(|(index, operation)| {
+            (
+                operation.parent_call_index.unwrap_or(index),
+                approvals.get(run, &operation.call_id),
+                operation.result.as_ref(),
+            )
+        }),
+        total,
+    )
 }
 
 pub(super) fn tool_call_key(run: Uuid, call_id: &str) -> String {

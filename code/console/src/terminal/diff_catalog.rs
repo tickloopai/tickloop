@@ -1193,6 +1193,7 @@ mod tests {
     ) -> OperationRecord {
         OperationRecord {
             parent_call_id: None,
+            parent_call_index: None,
             task_binding: None,
             id: uuid::Uuid::new_v4(),
             loop_id: uuid::Uuid::new_v4().into(),
