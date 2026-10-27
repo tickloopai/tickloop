@@ -10,9 +10,10 @@ use tickloop_harness_policy::instructions::{InstructionFile, user_context_messag
 use tickloop_harness_policy::skills::SKILL_TOOL_NAME;
 use tickloop_harness_protocol::mcp::ToolExposure;
 use tickloop_harness_protocol::{
-    ChatId, Content, ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextItem,
-    ContextTokenCounter, ContextToolServer, Message, ModelRequestKind, Role, ToolDefinition,
-    ToolSearchMode, ToolSearchPool, UnavailableToolServer, message_content_tokens,
+    ChatId, ChatSnapshot, CompactionMarker, Content, ContextBreakdown, ContextCategory,
+    ContextCategoryUsage, ContextItem, ContextTokenCounter, ContextToolServer, GuidanceNote,
+    HostNote, Message, ModelRequestKind, Role, ToolDefinition, ToolSearchMode, ToolSearchPool,
+    UnavailableToolServer, message_content_tokens,
 };
 
 use crate::tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS, SearchSupport};
@@ -23,6 +24,8 @@ const MAX_SEARCH_LABEL_CHARS: usize = 60;
 const USER_MESSAGES: &str = "User messages";
 const ASSISTANT_MESSAGES: &str = "Assistant messages";
 const TOOL_RESULTS: &str = "Tool results";
+/// How far the service-reported total may exceed the count before the excess is shown apart.
+const MAX_CALIBRATION_GAP_PERCENT: u64 = 15;
 
 impl Agent {
     /// The current context of `chat_id` by category, as `/context` shows it.
@@ -117,7 +120,11 @@ impl Agent {
                 deferred: registry.deferred_definitions(),
             }
         });
-        let (mut messages, _) = crate::context::model_history(chat)?;
+        let (mut messages, _, origins) = crate::context::model_history_with_origins(chat)?;
+        let message_labels = origins
+            .into_iter()
+            .map(|index| index.and_then(|index| host_message_label(&chat.snapshot, index)))
+            .collect();
         match chat.tools.chat_directory() {
             Some(_) => crate::tool_results::apply_tool_result_replacements(
                 &mut messages,
@@ -161,6 +168,7 @@ impl Agent {
                 .map(|file| (file.path.clone(), file.content.clone()))
                 .collect(),
             messages,
+            message_labels,
             search,
             window,
             compaction_trigger: window.map(crate::context::input_token_budget),
@@ -175,6 +183,30 @@ impl Agent {
                 .flatten(),
         })
     }
+}
+
+/// What the host wrote at snapshot message `index`, as `/context` names it among the messages:
+/// host notes and compaction summaries are user-role messages the user never typed.
+fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
+    if let Some(note) = snapshot.host_notes.get(&index) {
+        return Some(match note {
+            HostNote::Guidance(GuidanceNote::Skill { name, .. }) => {
+                format!("Skill guidance · {name}")
+            }
+            HostNote::Guidance(GuidanceNote::McpInstructions { server, .. }) => {
+                format!("MCP server instructions · {server}")
+            }
+            HostNote::Guidance(GuidanceNote::Withdrawn { .. }) => "Withdrawn guidance".into(),
+            HostNote::HostTools(_) => "Host tool changes".into(),
+            HostNote::DateChange(_) => "Date change".into(),
+            HostNote::PlanModeExit => "Plan mode exit".into(),
+        });
+    }
+    matches!(
+        snapshot.message_compactions.get(&index),
+        Some(CompactionMarker::Summary { .. })
+    )
+    .then(|| "Compaction summary".into())
 }
 
 /// The name a Skill catalog line lists: `- name [source]: description`.
@@ -199,6 +231,8 @@ struct ContextParts {
     user_context: Message,
     instruction_files: Vec<(PathBuf, String)>,
     messages: Vec<Message>,
+    /// For each message the host wrote, what it is.
+    message_labels: Vec<Option<String>>,
     search: Option<SearchParts>,
     window: Option<usize>,
     compaction_trigger: Option<usize>,
@@ -222,6 +256,14 @@ struct MessageSplit {
     user: usize,
     assistant: usize,
     tool_results: usize,
+    /// Host notes by kind.
+    notes: BTreeMap<String, usize>,
+}
+
+impl MessageSplit {
+    fn messages(&self) -> usize {
+        self.user + self.assistant + self.tool_results + self.notes.values().sum::<usize>()
+    }
 }
 
 impl ContextParts {
@@ -264,7 +306,12 @@ impl ContextParts {
             .iter()
             .map(|(path, content)| (path.display().to_string(), counter.text_tokens(content)))
             .collect::<Vec<_>>();
-        let split = split_messages(&self.messages, self.search.as_ref(), counter);
+        let split = split_messages(
+            &self.messages,
+            &self.message_labels,
+            self.search.as_ref(),
+            counter,
+        );
         let sum = |items: &[(String, usize)]| items.iter().map(|(_, tokens)| tokens).sum::<usize>();
         let counted = [
             (ContextCategory::SystemPrompt, system_prompt),
@@ -279,27 +326,40 @@ impl ContextParts {
             ),
             (ContextCategory::Skills, skills_total),
             (ContextCategory::ToolSearchResults, sum(&split.search)),
-            (
-                ContextCategory::Messages,
-                split.user + split.assistant + split.tool_results,
-            ),
+            (ContextCategory::Messages, split.messages()),
         ];
         let counted_total = counted
             .iter()
             .map(|(_, tokens)| *tokens as u64)
             .sum::<u64>();
         let used_tokens = self.reported_total.unwrap_or(counted_total);
+        // Service usage close to the count calibrates it; a total well beyond it holds something
+        // the count cannot see, such as definitions a vendor loads, so that part stands apart
+        // instead of inflating every category.
+        let unattributed = used_tokens
+            .saturating_sub(counted_total.saturating_mul(100 + MAX_CALIBRATION_GAP_PERCENT) / 100);
+        let unattributed = if unattributed > 0 {
+            used_tokens - counted_total
+        } else {
+            0
+        };
         let scale = Scale {
             counted: counted_total,
-            used: used_tokens,
+            used: used_tokens - unattributed,
         };
-        let categories = counted
+        let mut categories = counted
             .iter()
             .map(|(category, _)| *category)
             .zip(scale.distribute(counted.iter().map(|(_, tokens)| *tokens)))
             .filter(|(_, tokens)| *tokens > 0)
             .map(|(category, tokens)| ContextCategoryUsage { category, tokens })
-            .collect();
+            .collect::<Vec<_>>();
+        if unattributed > 0 {
+            categories.push(ContextCategoryUsage {
+                category: ContextCategory::Unattributed,
+                tokens: unattributed,
+            });
+        }
         let items = |items: Vec<(String, usize)>| scale.items(items);
         let window = self.window.map(|window| window as u64);
         let autocompact_buffer_tokens =
@@ -315,9 +375,10 @@ impl ContextParts {
                 .saturating_sub(used_tokens)
                 .saturating_sub(autocompact_buffer_tokens.unwrap_or(0))
         });
+        // Not in context, so the context total never scales it.
         let tool_search = self.search.as_ref().map(|search| ToolSearchPool {
             mode: search.mode,
-            servers: scale.servers(
+            servers: Scale::UNSCALED.servers(
                 search
                     .pool
                     .iter()
@@ -345,14 +406,19 @@ impl ContextParts {
             instruction_files: items(instruction_files),
             skills: items(skills),
             tool_search_results: items(split.search),
-            messages: items(vec![
-                (USER_MESSAGES.into(), split.user),
-                (ASSISTANT_MESSAGES.into(), split.assistant),
-                (TOOL_RESULTS.into(), split.tool_results),
-            ])
+            messages: items(
+                [
+                    (USER_MESSAGES.into(), split.user),
+                    (ASSISTANT_MESSAGES.into(), split.assistant),
+                    (TOOL_RESULTS.into(), split.tool_results),
+                ]
+                .into_iter()
+                .collect(),
+            )
             .into_iter()
             .filter(|item| item.tokens > 0)
             .collect(),
+            host_notes: items(split.notes.into_iter().collect()),
             tool_search,
         }
     }
@@ -363,6 +429,7 @@ impl ContextParts {
 /// as it is, plus each deferred definition its result loads, once.
 fn split_messages(
     messages: &[Message],
+    message_labels: &[Option<String>],
     search: Option<&SearchParts>,
     counter: &dyn ContextTokenCounter,
 ) -> MessageSplit {
@@ -370,7 +437,12 @@ fn split_messages(
     let mut fold_calls = HashMap::<String, usize>::new();
     let mut loaded = BTreeSet::new();
     let deferred = search.map_or(&[][..], |search| search.deferred.as_slice());
-    for message in messages {
+    for (message, label) in messages.iter().zip(message_labels) {
+        if let Some(label) = label {
+            *split.notes.entry(label.clone()).or_default() +=
+                message_content_tokens(counter, message);
+            continue;
+        }
         let framing = message_content_tokens(
             counter,
             &Message {
@@ -462,6 +534,11 @@ struct Scale {
 }
 
 impl Scale {
+    const UNSCALED: Self = Self {
+        counted: 1,
+        used: 1,
+    };
+
     fn one(&self, tokens: usize) -> u64 {
         if self.counted == 0 {
             return 0;

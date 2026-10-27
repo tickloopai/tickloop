@@ -25,6 +25,8 @@ const LARGE_WINDOW_TOKENS: u64 = 1_000_000;
 const CELL_COLUMNS: usize = 2;
 const COLUMN_GAP: usize = 2;
 const FILLED_CELL_SHARE: f64 = 0.7;
+/// Host notes beyond this many tokens get a line of their own in plain `/context`.
+const HOST_NOTES_SUMMARY_TOKENS: u64 = 1_000;
 
 type Run = (String, Option<Role>);
 type Line = Vec<Run>;
@@ -325,10 +327,34 @@ impl ContextView<'_> {
                 category_tokens(ContextCategory::ToolSearchResults),
             ));
         }
-        if self.expanded && !breakdown.messages.is_empty() {
+        let host_notes = breakdown
+            .host_notes
+            .iter()
+            .map(|note| note.tokens)
+            .sum::<u64>();
+        if self.expanded {
+            let mut items = breakdown
+                .messages
+                .iter()
+                .chain(&breakdown.host_notes)
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by_key(|item| std::cmp::Reverse(item.tokens));
+            if !items.is_empty() {
+                lines.push(Vec::new());
+                lines.push(heading("Messages", ""));
+                lines.extend(item_lines(&items, "", ""));
+            }
+        } else if host_notes >= HOST_NOTES_SUMMARY_TOKENS {
             lines.push(Vec::new());
             lines.push(heading("Messages", ""));
-            lines.extend(item_lines(&breakdown.messages, "", ""));
+            lines.push(tree_line(
+                "",
+                format!(
+                    "includes {} tokens of host notes · /context {EXPAND_ARGUMENT}",
+                    compact_count(host_notes)
+                ),
+            ));
         }
         lines
     }
@@ -486,6 +512,7 @@ fn category_name(category: ContextCategory) -> &'static str {
         ContextCategory::Skills => "Skills",
         ContextCategory::ToolSearchResults => "Tool search results",
         ContextCategory::Messages => "Messages",
+        ContextCategory::Unattributed => "Unattributed (reported by the service)",
     }
 }
 
@@ -499,6 +526,7 @@ fn category_role(category: ContextCategory) -> Role {
         ContextCategory::Skills => Role::Warning,
         ContextCategory::ToolSearchResults => Role::ContextToolSearch,
         ContextCategory::Messages => Role::ContextMessages,
+        ContextCategory::Unattributed => Role::Subtle,
     }
 }
 

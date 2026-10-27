@@ -27,8 +27,12 @@ pub struct ContextBreakdown {
     pub instruction_files: Vec<ContextItem>,
     pub skills: Vec<ContextItem>,
     pub tool_search_results: Vec<ContextItem>,
-    /// User messages, assistant messages and tool results.
+    /// What the user typed, assistant messages and tool results.
     pub messages: Vec<ContextItem>,
+    /// User-role messages the host wrote, such as MCP server instructions and Skill guidance, by
+    /// source; they count under Messages too.
+    #[serde(default)]
+    pub host_notes: Vec<ContextItem>,
     /// Present when the Chat reaches MCP tools through tool search.
     pub tool_search: Option<ToolSearchPool>,
 }
@@ -43,6 +47,9 @@ pub enum ContextCategory {
     Skills,
     ToolSearchResults,
     Messages,
+    /// What the service reported beyond the count by more than the count can explain, such as
+    /// definitions a vendor's tool search loads.
+    Unattributed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

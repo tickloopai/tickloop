@@ -914,6 +914,10 @@ fn context_breakdown() -> ContextBreakdown {
                 category: ContextCategory::Messages,
                 tokens: 17_000,
             },
+            ContextCategoryUsage {
+                category: ContextCategory::Unattributed,
+                tokens: 2_000,
+            },
         ],
         autocompact_buffer_tokens: Some(40_000),
         free_tokens: Some(136_000),
@@ -926,6 +930,7 @@ fn context_breakdown() -> ContextBreakdown {
         skills: vec![context_item("tickloop", 120)],
         tool_search_results: vec![context_item("SearchTools quote", 1_000)],
         messages: vec![context_item("User messages", 17_000)],
+        host_notes: vec![context_item("MCP server instructions · market", 600)],
         tool_search: Some(ToolSearchPool {
             mode: ToolSearchMode::SearchTools,
             servers: vec![ContextToolServer {

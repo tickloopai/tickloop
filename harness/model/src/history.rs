@@ -25,17 +25,34 @@ pub(crate) fn compatible_source(
 /// Runtime checks model provenance; the client repeats projection with the actual credential
 /// identity before encoding. Neither pass changes the canonical conversation.
 pub fn project_request(
-    mut request: ModelRequest,
+    request: ModelRequest,
     target: &ModelConfig,
     target_source: Option<&PrivateHistorySource>,
 ) -> ModelRequest {
+    project_request_with_origins(request, target, target_source).0
+}
+
+/// [`project_request`], with the position in the given messages each projected message came
+/// from: a message whose content projects away is left out.
+pub fn project_request_with_origins(
+    mut request: ModelRequest,
+    target: &ModelConfig,
+    target_source: Option<&PrivateHistorySource>,
+) -> (ModelRequest, Vec<usize>) {
     let has_sources = request.history_sources.len() == request.messages.len();
     if !has_sources {
-        return request;
+        let origins = (0..request.messages.len()).collect();
+        return (request, origins);
     }
     let mut messages = Vec::with_capacity(request.messages.len());
     let mut sources = Vec::with_capacity(request.history_sources.len());
-    for (mut message, source) in request.messages.into_iter().zip(request.history_sources) {
+    let mut origins = Vec::with_capacity(request.messages.len());
+    for (position, (mut message, source)) in request
+        .messages
+        .into_iter()
+        .zip(request.history_sources)
+        .enumerate()
+    {
         let compatible = compatible_source(source.as_ref(), target_source);
         message.content = message
             .content
@@ -45,12 +62,13 @@ pub fn project_request(
         if !message.content.is_empty() {
             messages.push(message);
             sources.push(source);
+            origins.push(position);
         }
     }
     normalize_tool_ids(&mut messages, target.adapter());
     request.messages = messages;
     request.history_sources = sources;
-    request
+    (request, origins)
 }
 
 fn project_block(block: Content, compatible: bool, target: &ModelConfig) -> Vec<Content> {

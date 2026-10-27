@@ -28,17 +28,32 @@ pub(super) fn model_history(
     ),
     AgentError,
 > {
+    let (messages, sources, _) = model_history_with_origins(chat)?;
+    Ok((messages, sources))
+}
+
+/// Request messages, their private history sources, and the snapshot message each projects.
+type HistoryWithOrigins = (
+    Vec<Message>,
+    Vec<Option<tickloop_harness_protocol::PrivateHistorySource>>,
+    Vec<Option<usize>>,
+);
+
+/// [`model_history`], with the snapshot message each request message projects, where one does.
+pub(super) fn model_history_with_origins(chat: &Chat) -> Result<HistoryWithOrigins, AgentError> {
     let projected = projection::projected_messages_with_sources(
         &chat.snapshot,
         &chat.bookkeeping.denial_references,
     )?;
     let mut messages = Vec::with_capacity(projected.len());
     let mut sources = Vec::with_capacity(projected.len());
+    let mut indices = Vec::with_capacity(projected.len());
     for (message, index) in projected {
         sources.push(index.and_then(|index| chat.snapshot.message_sources.get(&index).cloned()));
+        indices.push(index);
         messages.push(message);
     }
-    let projected = tickloop_harness_model::history::project_request(
+    let (projected, origins) = tickloop_harness_model::history::project_request_with_origins(
         ModelRequest {
             deferred_tools: Vec::new(),
             messages,
@@ -51,7 +66,8 @@ pub(super) fn model_history(
         &chat.snapshot.model,
         chat.snapshot.model.private_history_source().as_ref(),
     );
-    Ok((projected.messages, projected.history_sources))
+    let indices = origins.into_iter().map(|origin| indices[origin]).collect();
+    Ok((projected.messages, projected.history_sources, indices))
 }
 
 fn apply_model_thinking(chat: &mut Chat, selection: Option<PendingModelThinking>) {

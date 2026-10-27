@@ -5,6 +5,7 @@ use tickloop_harness_protocol::mcp::McpServerState;
 use tickloop_harness_protocol::{ChatId, Protocol};
 
 use super::*;
+use crate::Chat;
 use crate::host_tools::{HostToolPermission, HostToolProvider};
 use crate::tool_exposure::{ExposureTool, UnavailableServer};
 
@@ -39,6 +40,7 @@ fn definition(name: &str, description: &str) -> ToolDefinition {
 
 fn parts(messages: Vec<Message>, search: Option<SearchParts>) -> ContextParts {
     ContextParts {
+        message_labels: vec![None; messages.len()],
         system_prompt: message(Role::System, vec![text("one two three four")]),
         system_tools: vec![definition("Read", "reads files")],
         skill_tool: Some(definition("Skill", "- alpha [project]: helps")),
@@ -118,21 +120,52 @@ fn before_a_request_the_counted_categories_make_the_total_and_leave_free_space_a
 }
 
 #[test]
-fn a_measured_total_scales_every_category_and_the_buffer_never_overlaps_used_space() {
-    let mut measured = parts(vec![message(Role::User, vec![text("hello there")])], None);
+fn a_measured_total_close_to_the_count_scales_every_category_exactly() {
+    let counted =
+        parts(vec![message(Role::User, vec![text("hello there")])], None).count(&WordCounter);
+    for reported in [
+        counted.used_tokens * 110 / 100,
+        counted.used_tokens * 60 / 100,
+    ] {
+        let mut measured = parts(vec![message(Role::User, vec![text("hello there")])], None);
+        measured.reported_total = Some(reported);
+        let breakdown = measured.count(&WordCounter);
+        assert!(breakdown.calibrated);
+        assert_eq!(breakdown.used_tokens, reported);
+        assert_eq!(
+            category_sum(&breakdown),
+            reported,
+            "categories add up exactly"
+        );
+        assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    }
+}
+
+#[test]
+fn a_measured_total_far_beyond_the_count_stands_apart_and_never_scales_the_pool() {
+    let counted = parts(Vec::new(), Some(search_parts(ToolSearchMode::Native))).count(&WordCounter);
+    let mut measured = parts(Vec::new(), Some(search_parts(ToolSearchMode::Native)));
     measured.reported_total = Some(900);
     let breakdown = measured.count(&WordCounter);
-    assert!(breakdown.calibrated);
     assert_eq!(breakdown.used_tokens, 900);
-    assert_eq!(category_sum(&breakdown), 900, "categories add up exactly");
+    assert_eq!(category_sum(&breakdown), 900);
+    assert_eq!(
+        category(&breakdown, ContextCategory::Unattributed),
+        900 - counted.used_tokens
+    );
+    for category_name in [ContextCategory::SystemPrompt, ContextCategory::Messages] {
+        assert_eq!(
+            category(&breakdown, category_name),
+            category(&counted, category_name),
+            "{category_name:?} keeps its count"
+        );
+    }
+    assert_eq!(
+        breakdown.tool_search, counted.tool_search,
+        "the pool is never scaled"
+    );
     assert_eq!(breakdown.autocompact_buffer_tokens, Some(100));
     assert_eq!(breakdown.free_tokens, Some(0));
-    let unscaled =
-        parts(vec![message(Role::User, vec![text("hello there")])], None).count(&WordCounter);
-    assert!(
-        category(&breakdown, ContextCategory::SystemPrompt)
-            > category(&unscaled, ContextCategory::SystemPrompt)
-    );
 
     let mut overflowing = parts(Vec::new(), None);
     overflowing.reported_total = Some(1_500);
@@ -418,5 +451,136 @@ async fn a_subagent_counts_only_the_tools_its_ceiling_grants() {
     let pool = breakdown.tool_search.unwrap();
     assert_eq!(pool.tool_count(), 1);
     assert_eq!(pool.servers[0].tools[0].name, "mcp__market__quote");
+    agent.shutdown().await;
+}
+
+fn push(
+    chat: &mut Chat,
+    role: Role,
+    body: &str,
+    note: Option<tickloop_harness_protocol::HostNote>,
+) {
+    let index = chat.snapshot.messages.len();
+    chat.snapshot.messages.push(message(role, vec![text(body)]));
+    chat.snapshot
+        .message_ids
+        .insert(index, tickloop_ids::generate());
+    if let Some(note) = note {
+        chat.snapshot.host_notes.insert(index, note);
+    }
+}
+
+fn mcp_instructions(server: &str) -> tickloop_harness_protocol::HostNote {
+    tickloop_harness_protocol::HostNote::Guidance(GuidanceNote::McpInstructions {
+        server: server.into(),
+        digest: "sha256:0".into(),
+    })
+}
+
+fn skill_guidance(name: &str) -> tickloop_harness_protocol::HostNote {
+    tickloop_harness_protocol::HostNote::Guidance(GuidanceNote::Skill {
+        name: name.into(),
+        digest: "sha256:1".into(),
+        truncated: false,
+    })
+}
+
+fn item_tokens(items: &[ContextItem], name: &str) -> u64 {
+    items
+        .iter()
+        .find(|item| item.name == name)
+        .map_or(0, |item| item.tokens)
+}
+
+/// The shape of a fresh Chat in which the user typed only a greeting: the host had already
+/// written the MCP server instructions and the tickloop Skill's guidance into its history.
+#[tokio::test]
+async fn host_notes_count_apart_from_what_the_user_typed() {
+    let (agent, chat_id, _directory) = agent_with_catalog().await;
+    let mut chats = agent.inner.chats.lock().await;
+    let chat = chats.get_mut(&chat_id).unwrap();
+    push(
+        chat,
+        Role::User,
+        &"server says use quotes ".repeat(50),
+        Some(mcp_instructions("longbridge")),
+    );
+    push(
+        chat,
+        Role::User,
+        &"skill guidance words ".repeat(200),
+        Some(skill_guidance("tickloop")),
+    );
+    push(chat, Role::User, "你好", None);
+    push(chat, Role::Assistant, "Hello there", None);
+    let chat = chats.get(&chat_id).unwrap();
+    let breakdown = agent
+        .context_parts(chat, &[], &[], "2026-10-27")
+        .unwrap()
+        .count(&WordCounter);
+    drop(chats);
+    assert_eq!(item_tokens(&breakdown.messages, USER_MESSAGES), 1 + 3);
+    assert_eq!(item_tokens(&breakdown.messages, ASSISTANT_MESSAGES), 2 + 3);
+    assert_eq!(
+        item_tokens(
+            &breakdown.host_notes,
+            "MCP server instructions · longbridge"
+        ),
+        200 + 3
+    );
+    assert_eq!(
+        item_tokens(&breakdown.host_notes, "Skill guidance · tickloop"),
+        600 + 3
+    );
+    assert_eq!(
+        category(&breakdown, ContextCategory::Messages),
+        4 + 5 + 203 + 603,
+        "Messages holds the notes and nothing the other categories count"
+    );
+    assert!(category(&breakdown, ContextCategory::InstructionFiles) > 0);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_notes_keep_their_labels_after_compaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        tickloop_harness_test_support::config(),
+        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![
+            tickloop_harness_test_support::text("Earlier reply"),
+            tickloop_harness_test_support::text("A short summary"),
+        ])),
+    );
+    let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat_id, "Earlier question".into())
+        .await
+        .unwrap();
+    agent.quiesce(chat_id).await;
+    agent.compact(chat_id).await.unwrap();
+    let mut chats = agent.inner.chats.lock().await;
+    let chat = chats.get_mut(&chat_id).unwrap();
+    push(
+        chat,
+        Role::User,
+        "instructions from the server",
+        Some(mcp_instructions("longbridge")),
+    );
+    push(chat, Role::User, "你好", None);
+    let chat = chats.get(&chat_id).unwrap();
+    let breakdown = agent
+        .context_parts(chat, &[], &[], "2026-10-27")
+        .unwrap()
+        .count(&WordCounter);
+    drop(chats);
+    assert_eq!(
+        item_tokens(
+            &breakdown.host_notes,
+            "MCP server instructions · longbridge"
+        ),
+        4 + 3
+    );
+    assert!(item_tokens(&breakdown.host_notes, "Compaction summary") > 0);
+    assert_eq!(item_tokens(&breakdown.messages, USER_MESSAGES), 1 + 3);
     agent.shutdown().await;
 }

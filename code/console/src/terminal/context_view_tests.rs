@@ -44,6 +44,7 @@ fn breakdown() -> ContextBreakdown {
         skills: vec![item("tickloop", 1_500), item("notes:summarize", 800)],
         tool_search_results: vec![item("SearchTools quote stock", 1_800)],
         messages: vec![item("User messages", 3_000), item("Tool results", 6_200)],
+        host_notes: Vec::new(),
         tool_search: Some(ToolSearchPool {
             mode: ToolSearchMode::SearchTools,
             servers: vec![
@@ -268,7 +269,7 @@ fn context_all_lists_every_item_the_largest_first_with_home_shortened() {
     );
     assert_eq!(
         section("Messages"),
-        ["└ User messages: 3k tokens", "└ Tool results: 6.2k tokens"]
+        ["└ Tool results: 6.2k tokens", "└ User messages: 3k tokens"]
     );
     let pool = section("Tool search pool");
     assert_eq!(pool[2], "    └ mcp__longbridge__quote: ~400 tokens");
@@ -318,4 +319,41 @@ fn names_from_servers_and_files_cannot_control_the_terminal() {
             assert!(lines.contains(&"  evil\\u{1b}[2J".to_owned()));
         }
     }
+}
+
+#[test]
+fn host_notes_show_apart_from_what_the_user_typed() {
+    let mut noted = breakdown();
+    noted.messages = vec![item("User messages", 4), item("Assistant messages", 110)];
+    noted.host_notes = vec![
+        item("Skill guidance · tickloop", 6_000),
+        item("MCP server instructions · longbridge\u{1b}[31m", 4_400),
+    ];
+    let lines = texts(&render(&noted, 120, false));
+    assert!(lines.contains(&"└ includes 10.4k tokens of host notes · /context all".to_owned()));
+    let lines = texts(&render(&noted, 120, true));
+    let start = lines.iter().position(|line| line == "Messages").unwrap();
+    assert_eq!(
+        &lines[start + 1..start + 5],
+        [
+            "└ Skill guidance · tickloop: 6k tokens",
+            "└ MCP server instructions · longbridge\\u{1b}[31m: 4.4k tokens",
+            "└ Assistant messages: 110 tokens",
+            "└ User messages: 4 tokens",
+        ]
+    );
+}
+
+#[test]
+fn what_the_service_reports_beyond_the_count_has_its_own_row() {
+    let mut gap = breakdown();
+    gap.categories
+        .push(usage(ContextCategory::Unattributed, 12_000));
+    let lines = texts(&render(&gap, 120, false));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line
+                .ends_with("⛁ Unattributed (reported by the service): 12k tokens (6.0%)"))
+    );
 }
