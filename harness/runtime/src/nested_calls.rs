@@ -44,17 +44,22 @@ pub(crate) struct NestedCalls {
     registry: ToolRegistry,
     stop: CancellationToken,
     stop_reason: std::sync::Mutex<Option<String>>,
-    pending: std::sync::Mutex<std::collections::BTreeMap<String, (String, Value)>>,
+    pending: std::sync::Mutex<std::collections::BTreeMap<String, (usize, String, Value)>>,
     permissions: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
     completed: Mutex<Vec<(Value, Value)>>,
 }
 
 tokio::task_local! {
     static CURRENT: Arc<NestedCalls>;
+    static CALL_INDEX: usize;
 }
 
 pub(crate) fn parent_call_id() -> Option<String> {
     CURRENT.try_with(|scope| scope.parent.clone()).ok()
+}
+
+pub(crate) fn parent_call_index() -> Option<usize> {
+    CALL_INDEX.try_with(|index| *index).ok()
 }
 
 pub(crate) async fn parent_call() -> Option<tickloop_harness_protocol::ProposedToolCall> {
@@ -114,6 +119,7 @@ impl NestedCalls {
 
     pub(crate) async fn execute(
         self: &Arc<Self>,
+        call_index: usize,
         name: String,
         input: Value,
         cancel: CancellationToken,
@@ -122,7 +128,7 @@ impl NestedCalls {
         self.pending
             .lock()
             .unwrap()
-            .insert(call_id.clone(), (name.clone(), input.clone()));
+            .insert(call_id.clone(), (call_index, name.clone(), input.clone()));
         let forbidden = matches!(
             name.as_str(),
             "ExecuteTools"
@@ -147,14 +153,14 @@ impl NestedCalls {
         } else {
             let invocation =
                 ToolInvocation::new(call_id.clone(), name.clone(), input.clone(), registration);
-            let result = CURRENT
+            let result = CALL_INDEX.scope(call_index, CURRENT
                 .scope(self.clone(), async {
                     tokio::select! {
                         biased;
                         result = Box::pin(self.agent.execute_registered_call(&self.receipt, self.message_id, invocation, cancel.clone())) => result,
                         _ = cancel.cancelled() => Err("Nested call cancelled; outcome is unknown if already dispatched".into()),
                     }
-                })
+                }))
                 .await;
             match result {
                 Ok(outcome) => {
@@ -238,6 +244,7 @@ impl NestedCalls {
         }) {
             let operation = OperationRecord {
                 parent_call_id: Some(self.parent.clone()),
+                parent_call_index: Some(call_index),
                 task_binding: None,
                 id: tickloop_ids::generate(),
                 loop_id: self.receipt.loop_id,
@@ -305,13 +312,14 @@ impl NestedCalls {
                 .chat_loop
                 .set_state(tickloop_harness_protocol::LoopState::Running);
         }
-        for (call_id, (name, input)) in pending {
+        for (call_id, (call_index, name, input)) in pending {
             let index = chat.snapshot.operations.iter().position(|operation| {
                 operation.run_id == self.receipt.run_id && operation.call_id == call_id
             });
             let index = index.unwrap_or_else(|| {
                 chat.snapshot.operations.push(OperationRecord {
                     parent_call_id: Some(self.parent.clone()),
+                    parent_call_index: Some(call_index),
                     task_binding: None,
                     id: tickloop_ids::generate(),
                     loop_id: self.receipt.loop_id,
@@ -442,6 +450,7 @@ impl Agent {
         };
         let operation = OperationRecord {
             parent_call_id: None,
+            parent_call_index: None,
             task_binding: None,
             id: tickloop_ids::generate(),
             loop_id: receipt.loop_id,
@@ -471,6 +480,7 @@ impl Agent {
                     index,
                     scope
                         .execute(
+                            index,
                             call["name"].as_str().unwrap().into(),
                             call["arguments"].clone(),
                             cancel,

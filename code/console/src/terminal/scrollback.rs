@@ -268,6 +268,7 @@ pub(super) struct Scrollback {
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
+    tool_result_lines: HashMap<String, Range<usize>>,
     /// The call each call a batch made runs under, by call id.
     nested_parents: HashMap<String, String>,
     running_shimmer: RunningShimmer,
@@ -307,6 +308,7 @@ impl Default for Scrollback {
             foreground_command_hint_lines: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
+            tool_result_lines: HashMap::new(),
             nested_parents: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
@@ -637,15 +639,68 @@ impl Scrollback {
         }
     }
 
+    pub(super) fn expand_tool_call(&mut self, call_id: &str) {
+        let Some(header) = self.tool_call_headers.get(call_id) else {
+            return;
+        };
+        let Some((_, group)) = header.collapse else {
+            return;
+        };
+        let run = header.run_id;
+        let spans = header.spans.clone();
+        let state = header.state;
+        self.tool_call_headers.remove(call_id);
+        if self.tool_call_headers.values().any(|header| {
+            header
+                .collapse
+                .as_ref()
+                .is_some_and(|(_, member)| *member == group)
+        }) {
+            self.draw_group(group);
+        } else {
+            let line = self.groups[group].line;
+            self.hide_lines(line..line + 1);
+            if self.open_group == Some(group) {
+                self.open_group = None;
+            }
+        }
+        self.set_tool_call(run, call_id, &spans, state, None);
+    }
+
     /// Draws a call's result under the call's own row and the result rows it already has, so
     /// parallel calls each keep their results. A result of a collapsed read or search shows only
     /// in the detailed transcript; one whose call is not shown goes to the end.
+    #[cfg(test)]
     pub(super) fn append_tool_result(
         &mut self,
         call_id: &str,
         runs: &[(String, Option<Role>)],
         clip_summary: bool,
     ) {
+        self.write_tool_result(call_id, runs, clip_summary, &[], false);
+    }
+
+    pub(super) fn set_tool_result(
+        &mut self,
+        call_id: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        clipped_rows: &[usize],
+    ) {
+        self.write_tool_result(call_id, runs, clip_summary, clipped_rows, true);
+    }
+
+    fn write_tool_result(
+        &mut self,
+        call_id: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        clipped_rows: &[usize],
+        replace: bool,
+    ) {
+        if replace && let Some(previous) = self.tool_result_lines.remove(call_id) {
+            self.hide_lines(previous);
+        }
         let Some(header) = self.tool_call_headers.get(call_id) else {
             self.append_response(runs);
             if clip_summary {
@@ -660,6 +715,11 @@ impl Scrollback {
         let indent = header.indent;
         let mut result = Scrollback::new();
         result.append_response(runs);
+        for index in clipped_rows {
+            if let Some(style) = result.line_styles.get_mut(*index) {
+                style.clipped = Some(Role::MutedText);
+            }
+        }
         if clip_summary {
             result.clip_last_response_line();
         }
@@ -679,7 +739,10 @@ impl Scrollback {
                 style.hang += indent;
             }
         }
+        let count = result.lines.len();
         self.insert_lines(at, result.lines, result.line_styles);
+        self.tool_result_lines
+            .insert(call_id.to_owned(), at..at + count);
     }
 
     fn clip_last_response_line(&mut self) {
@@ -699,6 +762,14 @@ impl Scrollback {
                 *line += count;
             }
         };
+        for range in self.tool_result_lines.values_mut() {
+            if range.start >= at {
+                range.start += count;
+                range.end += count;
+            } else if range.end > at {
+                range.end += count;
+            }
+        }
         for header in self.tool_call_headers.values_mut() {
             shift(&mut header.line);
             shift(&mut header.results_end);
@@ -917,7 +988,14 @@ impl Scrollback {
             .get(call_id)
             .and_then(|parent| self.tool_call_headers.get(parent))
             .filter(|parent| parent.collapse.is_none())
-            .map(|parent| (parent.results_end, parent.indent + NESTED_INDENT));
+            .map(|parent| {
+                let at = self
+                    .nested_parents
+                    .get(call_id)
+                    .and_then(|key| self.tool_result_lines.get(key))
+                    .map_or(parent.results_end, |range| range.start);
+                (at, parent.indent + NESTED_INDENT)
+            });
         let (header_line, results_end, collapse, indent) = match (existing, nested_under) {
             (Some(existing), _) => existing,
             (None, Some((at, indent))) => {

@@ -681,7 +681,8 @@ async fn human_refusal_and_approval_have_distinct_final_results() {
             ),
             text("done"),
         ]));
-        let agent = Agent::new_embedded(config(), model);
+        let root = temp.path().join("state");
+        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
         let chat = agent.create_chat(temp.path().into()).await.unwrap();
         agent
             .set_permission_rules(chat, vec![write_rule(Decision::Ask)])
@@ -728,6 +729,11 @@ async fn human_refusal_and_approval_have_distinct_final_results() {
         let history = agent.approval_history_view(chat).await.unwrap();
         assert_eq!(history.records.len(), 1);
         assert_eq!(history.records[0].path, ApprovalPath::Human);
+        assert_eq!(history.records[0].human_reason, request.approval_reason);
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().approval_records,
+            history.records
+        );
         assert_eq!(
             history.records[0].outcome,
             if allow {
@@ -752,6 +758,14 @@ async fn human_refusal_and_approval_have_distinct_final_results() {
         }
         assert_eq!(temp.path().join("human.txt").exists(), allow);
         agent.shutdown().await;
+        let restored =
+            Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+        restored.resume_chat(chat).await.unwrap();
+        assert_eq!(
+            restored.snapshot(chat).await.unwrap().approval_records,
+            history.records
+        );
+        restored.shutdown().await;
     }
 }
 

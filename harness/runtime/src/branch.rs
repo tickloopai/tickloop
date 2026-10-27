@@ -106,6 +106,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            approval_records: Vec::new(),
             search_config: source.snapshot.search_config.clone(),
             task_tools_enabled: false,
             subagent_reports: Default::default(),
@@ -1132,6 +1133,7 @@ mod tests {
                         .operations
                         .push(tickloop_harness_protocol::OperationRecord {
                             parent_call_id: None,
+                            parent_call_index: None,
                             task_binding: None,
                             id: Uuid::new_v4(),
                             loop_id: loop_id.into(),

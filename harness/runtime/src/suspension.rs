@@ -441,6 +441,7 @@ impl Agent {
                     }
                     chat.snapshot.operations.push(OperationRecord {
                         parent_call_id: None,
+                        parent_call_index: None,
                         task_binding: None,
                         id: *operation_id,
                         loop_id: wait.loop_id.into(),
@@ -476,6 +477,7 @@ impl Agent {
                     ));
                     chat.snapshot.operations.push(OperationRecord {
                         parent_call_id: None,
+                        parent_call_index: None,
                         task_binding: None,
                         id: *operation_id,
                         loop_id: wait.loop_id.into(),

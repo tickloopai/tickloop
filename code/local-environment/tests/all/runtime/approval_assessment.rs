@@ -100,8 +100,17 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             .await
             .unwrap();
         let mut assessments = Vec::new();
+        let mut started_reviewers = Vec::new();
+        let mut recorded = Vec::new();
         loop {
             match next_event(&mut events).await.kind {
+                EventKind::ApprovalReviewStarted { call_id, reviewer } => {
+                    assert_eq!(call_id, "link");
+                    assert!(assessments.is_empty());
+                    started_reviewers.push(reviewer);
+                }
+                EventKind::ApprovalRecorded { record } => recorded.push(record),
+                EventKind::ToolStarted { .. } => assert_eq!(recorded.len(), 1),
                 EventKind::ApprovalAssessed { assessment } => assessments.push(assessment),
                 EventKind::PermissionRequested { .. } => panic!("approved action asked the user"),
                 EventKind::Failed(error) => panic!("review failed: {error}"),
@@ -109,6 +118,15 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
                 _ => {}
             }
         }
+        assert_eq!(
+            started_reviewers,
+            vec![if use_jev {
+                ApprovalReviewerKind::Jev
+            } else {
+                ApprovalReviewerKind::Llm
+            }]
+        );
+        assert_eq!(recorded.len(), 1);
         let [assessment] = assessments.as_slice() else {
             panic!("expected one assessment for one proposed operation")
         };
@@ -117,6 +135,7 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
         assert_eq!(assessment.call_id, "link");
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(assessment.operation_id, snapshot.operations[0].id);
+        assert_eq!(snapshot.approval_records, vec![*recorded[0].clone()]);
         assert_eq!(
             assessment.permission_policy_revision,
             snapshot.policy.revision

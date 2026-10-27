@@ -891,14 +891,13 @@ impl Agent {
             .snapshot
             .operations
             .len();
-        let outcome = self
-            .execute_registered_call_inner(
-                receipt,
-                assistant_message_id,
-                invocation,
-                cancel.clone(),
-            )
-            .await;
+        let outcome = Box::pin(self.execute_registered_call_inner(
+            receipt,
+            assistant_message_id,
+            invocation,
+            cancel.clone(),
+        ))
+        .await;
         let command_state = if is_shell {
             self.command_state_for_call(receipt, &call_id).await
         } else {
@@ -1367,6 +1366,7 @@ impl Agent {
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
                 parent_call_id: crate::nested_calls::parent_call_id(),
+                parent_call_index: crate::nested_calls::parent_call_index(),
                 task_binding: task_binding.flatten(),
                 id: tickloop_ids::generate(),
                 loop_id: receipt.loop_id,
@@ -1939,6 +1939,7 @@ impl Agent {
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
                         parent_call_id: crate::nested_calls::parent_call_id(),
+                        parent_call_index: crate::nested_calls::parent_call_index(),
                         task_binding: task_binding.flatten(),
                         id: operation_id,
                         loop_id: receipt.loop_id,
@@ -2424,7 +2425,7 @@ impl Agent {
                                 assessment: assessment_details.as_ref(),
                             },
                         );
-                        chat.denial_window.add_approval(approval);
+                        self.record_approval(chat, receipt, approval);
                         self.save(&chat.snapshot);
                         self.emit(
                             chat,

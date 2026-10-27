@@ -1056,6 +1056,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        approval_records: Vec::new(),
         search_config: tickloop_harness_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
         subagent_reports: BTreeMap::new(),
@@ -1712,6 +1713,10 @@ impl Agent {
                 .with_fallback_reason(fallback_reason)
         };
         if !use_jev {
+            if emit_permission {
+                self.emit_approval_review_started(receipt, operation, ApprovalReviewerKind::Llm)
+                    .await;
+            }
             let run = self
                 .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
                 .await?;
@@ -1757,6 +1762,14 @@ impl Agent {
         let mut fallback_reason = skipped_reason;
         if let Some(permit) = permit {
             let run = if let Some(client) = client {
+                if emit_permission {
+                    self.emit_approval_review_started(
+                        receipt,
+                        operation,
+                        ApprovalReviewerKind::Jev,
+                    )
+                    .await;
+                }
                 self.review_with_jev(
                     receipt,
                     &context,
@@ -1801,6 +1814,10 @@ impl Agent {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
+        if emit_permission {
+            self.emit_approval_review_started(receipt, operation, ApprovalReviewerKind::Llm)
+                .await;
+        }
         let mut run = self
             .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
             .await?;
@@ -1815,6 +1832,24 @@ impl Agent {
             fallback_failure,
             fallback_reason,
         ))
+    }
+
+    async fn emit_approval_review_started(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        reviewer: ApprovalReviewerKind,
+    ) {
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
+            self.emit(
+                chat,
+                receipt,
+                EventKind::ApprovalReviewStarted {
+                    call_id: operation.call_id.clone(),
+                    reviewer,
+                },
+            );
+        }
     }
 
     async fn emit_auto_review_check(&self, receipt: &Receipt, review: &AutoReview) {
@@ -3535,7 +3570,7 @@ impl Agent {
                 assessment: admission.assessment,
             },
         );
-        chat.denial_window.add_approval(approval);
+        self.record_approval(chat, receipt, approval);
         self.save(&chat.snapshot);
         self.emit(
             chat,
@@ -4621,6 +4656,7 @@ impl Agent {
             {
                 return Err("user Shell permission expired".into());
             }
+            chat.denial_window.remember_human_prompt(&request);
             chat.snapshot.permissions.push(request.clone());
             self.inner.approvals.lock().await.insert(
                 request.id,
@@ -4666,6 +4702,12 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id) {
+            if answer.is_err() || resumed.is_err() {
+                chat.denial_window.human_prompts.retain(|(run, call, _)| {
+                    Some(*run) != request.execution.run_id()
+                        || *call != request.execution.call_key()
+                });
+            }
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
@@ -5108,6 +5150,12 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .snapshot
             .clone();
+        snapshot.approval_records = chats[&chat_id]
+            .denial_window
+            .records
+            .iter()
+            .cloned()
+            .collect();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
         snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();

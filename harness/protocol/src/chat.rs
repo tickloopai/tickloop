@@ -27,6 +27,8 @@ pub struct ChatSnapshot {
         skip_serializing_if = "crate::SearchConfig::is_enabled_default"
     )]
     pub search_config: Option<crate::SearchConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_records: Vec<crate::ApprovalRecord>,
     #[serde(default)]
     pub task_tools_enabled: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -342,6 +344,13 @@ pub enum EventKind {
         decision: Decision,
         reason: String,
     },
+    ApprovalReviewStarted {
+        call_id: String,
+        reviewer: crate::ApprovalReviewerKind,
+    },
+    ApprovalRecorded {
+        record: Box<crate::ApprovalRecord>,
+    },
     ApprovalAssessed {
         assessment: Box<ApprovalAssessmentDetails>,
     },
@@ -510,6 +519,8 @@ pub enum OperationState {
 pub struct OperationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_binding: Option<crate::TaskExecutionBinding>,
     pub id: Uuid,

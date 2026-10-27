@@ -834,6 +834,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::TaskToolsSetting(false),
             ObservationValue::Operation(Some(Box::new(OperationRecord {
                 parent_call_id: None,
+                parent_call_index: None,
                 task_binding: None,
                 id: id(0x50),
                 loop_id: tickloop_ids::Id::from(id(0x10)),
@@ -1290,4 +1291,42 @@ fn negotiated_handoff_frames_have_stable_wire_and_redacted_debug() {
         serde_json::from_value::<AccessErrorCode>(json!("HandoffNotAccepted")).unwrap(),
         AccessErrorCode::HandoffNotAccepted
     );
+}
+
+#[test]
+fn approval_status_events_round_trip() {
+    use tickloop_harness::protocol::{
+        ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, EventKind,
+    };
+    let record: ApprovalRecord = serde_json::from_value(json!({
+        "id":id(1),"chat_id":id(2),"loop_id":id(3),"run_id":id(4),"operation_id":id(5),
+        "call_id":"call-write","at_ms":1,"tool":"Write","input_summary":{"text":"file","truncated":false},
+        "outcome":ApprovalResult::Allow,"path":ApprovalPath::Human,"reason":"Human approved this operation",
+        "human_reason":"Explicit Ask rule requires confirmation","approval_source":"explicit_ask",
+        "policy_revision":1,"matching_rules":[],"review":null
+    })).unwrap();
+    let events = vec![
+        EventKind::ApprovalReviewStarted {
+            call_id: "call-write".into(),
+            reviewer: ApprovalReviewerKind::Jev,
+        },
+        EventKind::ApprovalReviewStarted {
+            call_id: "call-write".into(),
+            reviewer: ApprovalReviewerKind::Llm,
+        },
+        EventKind::ApprovalRecorded {
+            record: Box::new(record),
+        },
+    ];
+    assert_golden("approval-status-events", &events);
+}
+
+#[test]
+fn approval_nested_call_index_round_trip() {
+    let operation: tickloop_harness::protocol::OperationRecord = serde_json::from_value(json!({
+        "id":id(1),"loop_id":id(2),"run_id":id(3),"call_id":"child","name":"Bash","input":{},
+        "parent_call_id":"batch","parent_call_index":2,"state":"Proposed","result":null
+    }))
+    .unwrap();
+    assert_golden("approval-nested-call-index", &operation);
 }

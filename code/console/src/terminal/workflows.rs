@@ -1275,16 +1275,34 @@ fn append_public_message(
                         call_key: presentation::tool_call_key(run.into(), id),
                         spans,
                         state,
-                        collapse: history
-                            .tick_labels
-                            .native_tool_instance(name, input)
-                            .is_none()
-                            .then(|| presentation::collapsed_call(name, input))
-                            .flatten(),
+                        collapse: (!history.chat.approval_records.iter().any(|record| {
+                            record.run_id == run
+                                && record.call_id == *id
+                                && record.path != tickloop_harness::protocol::ApprovalPath::Direct
+                        }))
+                        .then(|| {
+                            history
+                                .tick_labels
+                                .native_tool_instance(name, input)
+                                .is_none()
+                                .then(|| presentation::collapsed_call(name, input))
+                                .flatten()
+                        })
+                        .flatten(),
                         parent_key: None,
                     });
                     if presentation::makes_nested_calls(name) {
                         append_nested_calls(history, run.into(), id, display);
+                    }
+                    let approvals =
+                        super::approval_status::ToolApprovals::from_snapshot(history.chat);
+                    if let Some(approval) = approvals.get(run.into(), id)
+                        && approval.pending_label().is_some()
+                    {
+                        history.pieces.push(ConversationPiece::ToolApproval {
+                            call_key: presentation::tool_call_key(run.into(), id),
+                            runs: approval.decorate(Vec::new(), display.glyph(Glyph::ToolResult)),
+                        });
                     }
                 } else {
                     history.push_role(
@@ -1370,7 +1388,7 @@ fn append_public_message(
                         .filter(|_| name == SUBAGENT_TOOL_NAME)
                         .and_then(|launch| agent_messaging::subagent_report(history.chat, launch)),
                 };
-                let runs = presentation::archived_tool_result(
+                let mut runs = presentation::archived_tool_result(
                     name,
                     input,
                     &result,
@@ -1378,9 +1396,41 @@ fn append_public_message(
                     display,
                     &facts,
                 );
+                if let Some(run) = run_id {
+                    if presentation::makes_nested_calls(name)
+                        && let Some(summary) = presentation::settled_batch_summary(
+                            &result.content,
+                            &super::approval_status::ToolApprovals::from_snapshot(history.chat),
+                            run.into(),
+                        )
+                        .or_else(|| {
+                            presentation::snapshot_batch_summary(
+                                history.chat,
+                                run.into(),
+                                tool_use_id,
+                                input,
+                            )
+                        })
+                    {
+                        runs = super::approval_status::result_runs(
+                            &summary,
+                            display.glyph(Glyph::ToolResult),
+                        );
+                    }
+                    let approvals =
+                        super::approval_status::ToolApprovals::from_snapshot(history.chat);
+                    if let Some(approval) = approvals.get(run.into(), tool_use_id) {
+                        runs = approval.decorate(runs, display.glyph(Glyph::ToolResult));
+                    }
+                }
                 match run_id {
                     Some(run) => history.pieces.push(ConversationPiece::ToolResult {
                         call_key: presentation::tool_call_key(run.into(), tool_use_id),
+                        clipped_rows: super::approval_status::ToolApprovals::from_snapshot(
+                            history.chat,
+                        )
+                        .get(run.into(), tool_use_id)
+                        .map_or_else(Vec::new, |approval| approval.clipped_rows(&runs)),
                         runs,
                         clip_summary: presentation::goal_completion_rejection_reason(
                             name,
@@ -1426,6 +1476,7 @@ fn append_nested_calls(
 ) {
     let folder = super::shown_folder(history.chat.folder.as_deref());
     let parent_key = presentation::tool_call_key(run, parent);
+    let approvals = super::approval_status::ToolApprovals::from_snapshot(history.chat);
     for operation in presentation::nested_operations(history.chat, run, parent) {
         let call_key = presentation::tool_call_key(run, &operation.call_id);
         let spans = presentation::tool_call_roles(
@@ -1454,8 +1505,9 @@ fn append_nested_calls(
             collapse: None,
             parent_key: Some(parent_key.clone()),
         });
+        let approval = approvals.get(run, &operation.call_id);
         if let Some(result) = &operation.result {
-            let runs = presentation::archived_tool_result(
+            let mut runs = presentation::archived_tool_result(
                 &operation.name,
                 Some(&operation.input),
                 result,
@@ -1463,12 +1515,42 @@ fn append_nested_calls(
                 display,
                 &presentation::CallFacts::default(),
             );
+            if let Some(approval) = approval {
+                runs = approval.decorate(runs, display.glyph(Glyph::ToolResult));
+            }
             history.pieces.push(ConversationPiece::ToolResult {
                 call_key,
+                clipped_rows: approval
+                    .map_or_else(Vec::new, |approval| approval.clipped_rows(&runs)),
                 runs,
                 clip_summary: false,
             });
+        } else if let Some(approval) = approval {
+            history.pieces.push(ConversationPiece::ToolResult {
+                call_key,
+                runs: approval.decorate(Vec::new(), display.glyph(Glyph::ToolResult)),
+                clipped_rows: vec![0, 1],
+                clip_summary: false,
+            });
         }
+    }
+    let input = history
+        .chat
+        .operations
+        .iter()
+        .find(|operation| operation.run_id.uuid() == run && operation.call_id == parent)
+        .map(|operation| &operation.input);
+    if presentation::nested_operations(history.chat, run, parent)
+        .any(|operation| operation.result.is_none())
+        && let Some(summary) =
+            presentation::snapshot_batch_summary(history.chat, run, parent, input)
+    {
+        history.pieces.push(ConversationPiece::ToolResult {
+            call_key: parent_key,
+            runs: super::approval_status::result_runs(&summary, display.glyph(Glyph::ToolResult)),
+            clipped_rows: Vec::new(),
+            clip_summary: false,
+        });
     }
 }
 

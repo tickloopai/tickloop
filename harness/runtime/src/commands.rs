@@ -437,6 +437,7 @@ mod tests {
                 .operations
                 .push(OperationRecord {
                     parent_call_id: None,
+                    parent_call_index: None,
                     task_binding: None,
                     id: operation_id,
                     loop_id: loop_id.into(),

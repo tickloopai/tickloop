@@ -566,6 +566,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
     let mut view = agent.permissions_view(chat).await.unwrap();
     view.execution_mode = tickloop_harness::protocol::ExecutionMode::AcceptEdits;
     let record = ApprovalRecord {
+        human_reason: None,
         id: Uuid::new_v4(),
         chat_id: chat.into(),
         loop_id: Uuid::new_v4().into(),

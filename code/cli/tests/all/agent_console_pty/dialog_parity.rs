@@ -202,17 +202,12 @@ async fn control_c_rejects_a_permission(fixture: &PrivateFixture) {
         .wait_for("Ctrl+C rejects the call", |frame| {
             !frame.contains("Permission required")
                 && new_input_is_visible(frame)
-                && frame.contains("Interrupted · What should the Agent do instead?")
+                && frame.contains("Denied by you")
         })
         .await;
     eprintln!("[permission-ctrl-c]\n{rejected}\n[/permission-ctrl-c]");
     let body = conversation_body(&rejected);
-    assert_eq!(
-        body.matches("Interrupted · What should the Agent do instead?")
-            .count(),
-        1,
-        "{rejected}"
-    );
+    assert_eq!(body.matches("Denied by you").count(), 1, "{rejected}");
     assert!(!rejected.contains(EXIT_HINT), "{rejected}");
     assert!(!marker.exists());
 
