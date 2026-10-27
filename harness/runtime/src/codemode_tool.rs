@@ -41,7 +41,33 @@ impl Agent {
                 "Codemode accepts only code".into(),
             ));
         }
-        let output_directory = {
+        let family_directory = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or("chat unavailable")?;
+            chat.tools.family_temp_directory().map(|_| {
+                crate::transcript::private_family_temp_directory(
+                    chat.snapshot
+                        .delegation
+                        .as_ref()
+                        .map_or(receipt.chat_id, |delegation| delegation.root_chat_id())
+                        .into(),
+                )
+            })
+        };
+        let output_directory = match family_directory {
+            Some(directory) => Some(
+                tokio::task::spawn_blocking(move || {
+                    directory.create().map_err(|error| {
+                        format!("Codemode output directory unavailable: {error}")
+                    })?;
+                    Ok::<_, String>(directory.path().to_owned())
+                })
+                .await
+                .map_err(|error| error.to_string())??,
+            ),
+            None => None,
+        };
+        {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).ok_or("chat unavailable")?;
             chat.snapshot.operations.push(OperationRecord {
@@ -58,10 +84,7 @@ impl Agent {
                 result: None,
             });
             self.save(&chat.snapshot);
-            chat.tools
-                .family_temp_directory()
-                .map(std::path::Path::to_owned)
-        };
+        }
         let scope = self
             .nested_calls(receipt, message_id, parent.clone(), &cancel)
             .await?;

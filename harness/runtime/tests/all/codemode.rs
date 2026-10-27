@@ -1050,3 +1050,55 @@ async fn successful_script_end_with_pending_confirmation_clears_it_and_records_n
     );
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn first_script_can_spill_output_before_any_filesystem_tool_runs() {
+    use std::sync::Arc;
+    use tickloop_harness_protocol::EventKind;
+    use tickloop_harness_runtime::Agent;
+    use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "script",
+            "Codemode",
+            json!({"code":"// @options: {\"max_output_tokens\":10}\ntext('spill'.repeat(1000));"}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, "Produce the sample output".into())
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let result = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.call_id == "script")
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    let path = result
+        .content
+        .split("Full output saved to: ")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    assert!(path.contains(&chat.uuid().to_string()));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "spill".repeat(1000));
+    agent.shutdown().await;
+}
