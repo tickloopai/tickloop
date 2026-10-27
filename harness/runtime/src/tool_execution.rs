@@ -2904,7 +2904,12 @@ mod tests {
     /// must be a tool the model can be given.
     #[test]
     fn shipped_skills_name_only_tools_the_agent_offers() {
-        const NOT_TOOLS: [&str; 3] = ["OutcomeUnknown", "TickUpdate", "CallToolResult"];
+        const NOT_TOOLS: [&str; 4] = [
+            "OutcomeUnknown",
+            "TickUpdate",
+            "CallToolResult",
+            "JavaScript",
+        ];
         let tools = built_in_definitions()
             .into_iter()
             .chain(crate::tool_exposure::fold_definitions())

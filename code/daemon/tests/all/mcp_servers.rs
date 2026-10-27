@@ -1018,7 +1018,7 @@ async fn live_native_tool_search_with_anthropic_and_openai_across_switches() {
     .await
     .unwrap();
     let first = "Use your tool search to find the acceptance marker probe tools of the local and the remote MCP servers, call each probe exactly once, and reply with both returned markers. Use no shell, scripts, web or other tools.";
-    let again = "Use your tool search to find the acceptance marker probe tools of the local and the remote MCP servers, call each probe exactly once, and reply with both returned markers. Use no shell, scripts, web or other tools. Markers can change between checks, so call both probes again now even though you called them before.";
+    let again = "Use your tool search to find the acceptance marker probe tools of the local and the remote MCP servers, call each probe exactly once, and reply with both returned markers. Use no shell, scripts, web or other tools. The tool set may have changed since the previous turn: use the tool definitions supplied for this request and make actual tool calls. Text describing a call does not execute it. Markers can change between checks, so call both probes again now even though you called them before.";
     let mut anthropic_without_native = anthropic.clone();
     anthropic_without_native
         .card
