@@ -366,7 +366,7 @@ async fn resources_and_unknown_call_outcomes_remain_bound_to_the_server() {
 }
 
 #[tokio::test]
-async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
+async fn expired_session_is_not_dispatched_and_the_server_reconnects() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"change","inputSchema":{"type":"object"}}]));
     let connections = McpConnections::new(
@@ -405,6 +405,7 @@ async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
         HostCallResult::NotDispatched(_)
     ));
     server.set_status(200);
+    wait_for_state(&connections, "expiry", McpServerState::Connected).await;
     assert!(matches!(
         connections
             .call("mcp__expiry__change", json!({}), CancellationToken::new())
@@ -1189,27 +1190,48 @@ async fn oauth_login_renews_rejected_and_expiring_tokens_and_stops_after_invalid
         1,
         "the dispatched call must not be replayed"
     );
+    assert_eq!(
+        authorization.requests_to(TOKEN_PATH).len(),
+        3,
+        "the rejected token was renewed on the open connection"
+    );
     connections.reconcile(configs.clone()).await;
     settled(&connections).await;
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
     assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 3);
 
+    let initializations = server.arrivals("initialize").len();
     let mut saved = credentials.current().unwrap();
     saved.token.as_mut().unwrap().expires_at = 0;
     credentials.replace(Some(saved));
     server.require_bearer("access-4");
     connections.reconcile(configs.clone()).await;
-    settled(&connections).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while authorization.requests_to(TOKEN_PATH).len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the expiring token is renewed");
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
-    assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 4);
+    assert!(matches!(
+        connections
+            .call("mcp__remote__probe", json!({}), cancel.clone())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(
+        server.arrivals("initialize").len(),
+        initializations,
+        "the renewed token is used on the open connection"
+    );
 
     authorization.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
     let mut saved = credentials.current().unwrap();
     saved.token.as_mut().unwrap().expires_at = 0;
     credentials.replace(Some(saved));
     connections.reconcile(configs.clone()).await;
-    settled(&connections).await;
-    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    wait_for_state(&connections, "remote", McpServerState::NeedsLogin).await;
     assert!(credentials.current().unwrap().token.is_none());
     let requests = server.request_count();
     connections.reconcile(configs).await;
@@ -2578,18 +2600,34 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
         .to_string();
     let hex: String = secret.bytes().map(|byte| format!("%{byte:02X}")).collect();
     let escaped = serde_json::to_string(secret).unwrap();
-    server.set_tools(json!([{"name":"second","description":format!("{} {} {} {}", secret, encoded, hex, escaped.trim_matches('"')),"inputSchema":{"type":"object"}}]));
     credentials.replace(Some(saved(secret)));
     provider.refresh(CancellationToken::new()).await.unwrap();
     settled(&connections).await;
     assert_eq!(
         connections.performance_counts(),
-        (configured.0 + 1, configured.1 + 1)
+        (configured.0 + 1, configured.1 + 1),
+        "a renewed login republishes the catalog with its new secret, without listing again"
     );
-    let definition = provider
-        .definitions()
-        .into_iter()
-        .find(|tool| tool.name == "mcp__changed__second")
+    server.set_tools(json!([{"name":"second","description":format!("{} {} {} {}", secret, encoded, hex, escaped.trim_matches('"')),"inputSchema":{"type":"object"}}]));
+    server.notify_tools_changed();
+    assert!(matches!(
+        connections
+            .call("mcp__changed__second", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    let definition =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(definition) = provider.definitions().into_iter().find(|tool| {
+                    tool.name == "mcp__changed__second" && !tool.description.is_empty()
+                }) {
+                    return definition;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
         .unwrap();
     assert_eq!(
         definition.description,

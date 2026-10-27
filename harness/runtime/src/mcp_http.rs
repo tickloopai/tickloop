@@ -147,7 +147,8 @@ pub(crate) type DirectoryRequests =
 pub(crate) struct McpHttpClient {
     client: Client,
     endpoint: Url,
-    token: Arc<str>,
+    /// Shared by every clone, so a renewed token reaches the open connection.
+    token: Arc<std::sync::RwLock<Arc<str>>>,
     unauthorized: Arc<AtomicBool>,
     insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
@@ -166,7 +167,7 @@ impl McpHttpClient {
         Ok(Self {
             client,
             endpoint,
-            token: token.into(),
+            token: Arc::new(std::sync::RwLock::new(token.into())),
             unauthorized: Arc::new(AtomicBool::new(false)),
             insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
@@ -268,6 +269,12 @@ impl McpHttpClient {
         self.unauthorized.load(Ordering::SeqCst)
     }
 
+    /// Sends `token` from the next request on, without opening a new connection.
+    pub(crate) fn set_token(&self, token: &str) {
+        *self.token.write().unwrap() = token.into();
+        self.unauthorized.store(false, Ordering::SeqCst);
+    }
+
     fn request(
         &self,
         method: Method,
@@ -276,7 +283,8 @@ impl McpHttpClient {
         custom: HashMap<HeaderName, HeaderValue>,
     ) -> Result<reqwest::RequestBuilder, StreamableHttpError<McpHttpError>> {
         let url = Url::parse(uri).map_err(|_| unexpected("invalid MCP endpoint"))?;
-        if url != self.endpoint || auth.as_deref().unwrap_or("") != self.token.as_ref() {
+        let token = self.token.read().unwrap().clone();
+        if url != self.endpoint || auth.is_some_and(|auth| auth != token.as_ref()) {
             return Err(unexpected("MCP endpoint or authorization changed"));
         }
         let mut request = self
@@ -284,8 +292,8 @@ impl McpHttpClient {
             .request(method, url)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::ACCEPT, "application/json, text/event-stream");
-        if !self.token.is_empty() {
-            request = request.bearer_auth(self.token.as_ref());
+        if !token.is_empty() {
+            request = request.bearer_auth(token.as_ref());
         }
         for (name, value) in &self.headers {
             request = request.header(name, value);

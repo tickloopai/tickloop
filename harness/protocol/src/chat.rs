@@ -295,6 +295,11 @@ pub enum EventKind {
         call_id: String,
         name: String,
     },
+    /// The Run's request waits for these MCP servers to finish connecting, in name order; an
+    /// empty list ends the wait. Display only: no Transcript record reflects this.
+    WaitingForMcpServers {
+        servers: Vec<String>,
+    },
     AssistantMessageCommitted {
         message_id: Uuid,
         tool_calls: Vec<ProposedToolCall>,
@@ -384,6 +389,7 @@ impl EventKind {
             Self::Text(_)
                 | Self::Thinking(_)
                 | Self::ToolUseStarted { .. }
+                | Self::WaitingForMcpServers { .. }
                 | Self::ModelRetry { .. }
         )
     }

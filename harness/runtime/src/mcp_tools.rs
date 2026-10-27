@@ -1977,6 +1977,12 @@ impl HostToolProvider for McpHostToolProvider {
         Ok(text)
     }
 
+    fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
+        self.native
+            .as_ref()
+            .and_then(|native| native.awaited_mcp_servers())
+    }
+
     async fn refresh(&self, cancel: CancellationToken) -> Result<(), String> {
         if let Some(native) = &self.native {
             native.refresh(cancel.clone()).await?;

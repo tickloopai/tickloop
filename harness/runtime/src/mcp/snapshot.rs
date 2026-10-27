@@ -16,7 +16,6 @@ pub(super) struct Tool {
 #[derive(Clone, Default)]
 pub(super) struct Catalog {
     pub generation: u64,
-    pub revision: u64,
     pub secret_generation: u64,
     pub tools: BTreeMap<String, Arc<Tool>>,
     pub instructions: String,
@@ -24,40 +23,60 @@ pub(super) struct Catalog {
     pub resources: Vec<Value>,
 }
 impl Entry {
-    pub(super) fn current_catalog(&self, connection: &Connection) -> Arc<Catalog> {
-        let snapshot = connection.snapshot.read().unwrap().clone();
+    pub(super) fn current_catalog(&self) -> Arc<Catalog> {
+        let snapshot = self.snapshot.read().unwrap().clone();
         if snapshot.secret_generation == self.secret_generation.load(Ordering::SeqCst) {
             snapshot
         } else {
             Arc::new(Catalog::default())
         }
     }
-    pub(super) fn publish_metadata(&self, connection: &Connection) {
+    /// Republishes what the connection says about itself, keeping the tools and their
+    /// generation.
+    pub(super) fn publish_metadata(&self) {
         let _publication = self.publication.lock().unwrap();
-        let mut snapshot = (*self.current_catalog(connection)).clone();
-        snapshot.resources = connection
-            .resources
+        let mut snapshot = (*self.current_catalog()).clone();
+        let connection = self.connection.read().unwrap().clone();
+        snapshot.instructions = connection
             .as_ref()
-            .map(|directory| redacted_resources(self, directory.resources.read().unwrap().clone()))
+            .map(|connection| redact_server_text(self, connection.instructions.clone()))
             .unwrap_or_default();
-        snapshot.warnings = connection
-            .warnings
-            .read()
-            .unwrap()
-            .iter()
-            .map(|warning| redact(self, warning.clone()))
-            .collect();
-        *connection.snapshot.write().unwrap() = Arc::new(snapshot);
+        snapshot.resources = self.published_resources(connection.as_deref());
+        snapshot.warnings = self.published_warnings(connection.as_deref());
+        *self.snapshot.write().unwrap() = Arc::new(snapshot);
     }
-    pub(super) fn publish_catalog(&self, connection: &Connection) {
+    fn published_resources(&self, connection: Option<&Connection>) -> Vec<Value> {
+        connection
+            .and_then(|connection| connection.resources.as_ref())
+            .map(|directory| redacted_resources(self, directory.resources.read().unwrap().clone()))
+            .unwrap_or_default()
+    }
+    fn published_warnings(&self, connection: Option<&Connection>) -> Vec<String> {
+        let listed = self.tools.read().unwrap().clone();
+        listed
+            .iter()
+            .flat_map(|list| list.warnings.iter())
+            .chain(
+                connection
+                    .map(|connection| connection.warnings.read().unwrap().clone())
+                    .unwrap_or_default()
+                    .iter(),
+            )
+            .map(|warning| redact(self, warning.clone()))
+            .collect()
+    }
+    /// Builds the model-facing catalog from the last listed tools; a server that has not listed
+    /// any yet has nothing to publish.
+    pub(super) fn publish_catalog(&self) {
+        let Some(listed) = self.tools.read().unwrap().clone() else {
+            return;
+        };
         let _publication = self.publication.lock().unwrap();
         let started = std::time::Instant::now();
         let _timing = crate::timing::Phase::new("mcp_catalog_build");
-        let revision = connection.catalog_revision.load(Ordering::SeqCst);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let raw = connection.tools.read().unwrap().clone();
         let mut tools = BTreeMap::new();
-        for (_, tool) in raw {
+        for tool in listed.tools.values().cloned() {
             let mut definition = tool.definition;
             if redact(self, definition.name.clone()) != definition.name {
                 continue;
@@ -102,33 +121,22 @@ impl Entry {
                 }),
             );
         }
+        let connection = self.connection.read().unwrap().clone();
         let snapshot = Arc::new(Catalog {
             generation,
-            revision,
             secret_generation: self.secret_generation.load(Ordering::SeqCst),
             tools,
-            instructions: redact_server_text(self, connection.instructions.clone()),
-            warnings: connection
-                .warnings
-                .read()
-                .unwrap()
-                .iter()
-                .map(|warning| redact(self, warning.clone()))
-                .collect(),
-            resources: connection
-                .resources
+            instructions: connection
                 .as_ref()
-                .map(|directory| {
-                    redacted_resources(self, directory.resources.read().unwrap().clone())
-                })
+                .map(|connection| redact_server_text(self, connection.instructions.clone()))
                 .unwrap_or_default(),
+            warnings: self.published_warnings(connection.as_deref()),
+            resources: self.published_resources(connection.as_deref()),
         });
-        if connection.catalog_revision.load(Ordering::SeqCst) == revision {
-            let previous = std::mem::replace(&mut *connection.snapshot.write().unwrap(), snapshot);
-            drop(previous);
-            self.catalog_builds.fetch_add(1, Ordering::Relaxed);
-            self.catalog_micros
-                .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        let previous = std::mem::replace(&mut *self.snapshot.write().unwrap(), snapshot);
+        drop(previous);
+        self.catalog_builds.fetch_add(1, Ordering::Relaxed);
+        self.catalog_micros
+            .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }

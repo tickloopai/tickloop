@@ -74,7 +74,9 @@ use tickloop_harness::protocol::{
 /// 28.4 adds the plugin source of an invoked Skill.
 /// 28.5 adds the status of the Agent's MCP servers and reconnecting one of them.
 /// 29.0 adds the model card's native tool search, which older readers reject as unknown.
-pub const PROTOCOL_MAJOR: u16 = 29;
+/// 30.0 adds the display-only event naming the MCP servers a request waits for, which older
+/// readers reject as unknown.
+pub const PROTOCOL_MAJOR: u16 = 30;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

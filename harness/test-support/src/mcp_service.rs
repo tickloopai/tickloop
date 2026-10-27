@@ -20,6 +20,8 @@ struct State {
     calls: Vec<Value>,
     delay: std::time::Duration,
     directory_delay: std::time::Duration,
+    directory_error: Option<Value>,
+    received: Vec<(String, tokio::time::Instant)>,
     status: u16,
     error: Option<Value>,
     changed: bool,
@@ -48,6 +50,8 @@ impl McpService {
                 calls: Vec::new(),
                 delay: std::time::Duration::ZERO,
                 directory_delay: std::time::Duration::ZERO,
+                directory_error: None,
+                received: Vec::new(),
                 status: 200,
                 error: None,
                 changed: false,
@@ -119,6 +123,7 @@ impl McpService {
                                 let mut state = state.lock().unwrap();
                                 state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
+                                state.received.push((method.to_owned(), tokio::time::Instant::now()));
                                 let result = match method {
                                     "initialize" => {
                                         let mut capabilities = json!({"tools":{"listChanged":true}});
@@ -136,7 +141,7 @@ impl McpService {
                                 if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()); }
                                 if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"}).to_string()); }
                                 if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
-                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications, state.challenge.clone())
+                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else if method == "tools/list" {state.directory_error.clone()} else {None}, notifications, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
@@ -186,6 +191,22 @@ impl McpService {
     }
     pub fn set_directory_delay(&self, delay: std::time::Duration) {
         self.state.lock().unwrap().directory_delay = delay;
+    }
+    /// Answers every later `tools/list` with this JSON-RPC error, or normally again with `None`.
+    pub fn set_directory_error(&self, error: Option<Value>) {
+        self.state.lock().unwrap().directory_error = error;
+    }
+    /// When each request with `method` arrived, in arrival order; every request with `None`.
+    pub fn arrivals<'a>(&self, method: impl Into<Option<&'a str>>) -> Vec<tokio::time::Instant> {
+        let method = method.into();
+        self.state
+            .lock()
+            .unwrap()
+            .received
+            .iter()
+            .filter(|(received, _)| method.is_none_or(|method| received == method))
+            .map(|(_, at)| *at)
+            .collect()
     }
     pub fn set_status(&self, status: u16) {
         self.state.lock().unwrap().status = status;
