@@ -36,6 +36,9 @@ use tickloop_harness::protocol::{
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
+/// Calls whose own calls a Run makes under them: a Codemode script's and an ExecuteTools batch's.
+const CODEMODE_TOOL_NAME: &str = "Codemode";
+const EXECUTE_TOOLS_NAME: &str = "ExecuteTools";
 const PREVIEW_LINES: usize = 5;
 /// Lines a failed result keeps from its start: the exit code and what ended the command.
 const FAILURE_HEAD_LINES: usize = 2;
@@ -333,6 +336,11 @@ pub(super) fn transcript_document(
                     None => transcript_arguments(name, input),
                 };
                 writer.tool_call(dot, name, &arguments);
+                if let Some(run) = exchange.run_id {
+                    for operation in nested_operations(snapshot, run, &exchange.call_id) {
+                        writer.nested_call(operation);
+                    }
+                }
                 if let (Some(result), Some((content, is_error))) = (result, content) {
                     let elapsed = block
                         .metadata
@@ -654,6 +662,75 @@ impl TranscriptWriter {
         self.text("\n", None);
     }
 
+    /// A call a script or batch made, with its result, indented under the call that made it.
+    fn nested_call(&mut self, operation: &OperationRecord) {
+        let hang = RESULT_INDENT + BLOCK_INDENT;
+        let dot = match operation.state {
+            tickloop_harness::protocol::OperationState::Completed => Role::Success,
+            tickloop_harness::protocol::OperationState::Failed => Role::Error,
+            tickloop_harness::protocol::OperationState::Unknown => Role::Warning,
+            tickloop_harness::protocol::OperationState::Proposed
+            | tickloop_harness::protocol::OperationState::Admitted => Role::MutedText,
+        };
+        self.hanging(" ".repeat(RESULT_INDENT), None, hang);
+        self.hanging(
+            format!("{} ", self.display.glyph(Glyph::ToolCall)),
+            Some(dot),
+            hang,
+        );
+        self.hanging(tool_name(&operation.name), Some(Role::ToolName), hang);
+        let arguments = transcript_arguments(&operation.name, &operation.input);
+        if !arguments.is_empty() {
+            let continuation = format!("\n{}", " ".repeat(hang));
+            self.hanging(
+                format!("({})", arguments.replace('\n', &continuation)),
+                None,
+                hang,
+            );
+        }
+        self.text("\n", None);
+        let Some(result) = &operation.result else {
+            return;
+        };
+        let lines = transcript_result_lines(
+            &operation.name,
+            Some(&operation.input),
+            &result.content,
+            result.is_error,
+            None,
+            None,
+        );
+        let hang = RESULT_INDENT * 2;
+        for (index, line) in lines.into_iter().enumerate() {
+            let lead = if index == 0 {
+                format!(
+                    "{}  {}  ",
+                    " ".repeat(RESULT_INDENT),
+                    self.display.glyph(Glyph::ToolResult)
+                )
+            } else {
+                " ".repeat(hang)
+            };
+            self.document.push(TranscriptPiece::Text {
+                text: lead,
+                role: Some(Role::MutedText),
+                fill: line.fill,
+                hang,
+                link: None,
+            });
+            for (text, role) in line.spans {
+                self.document.push(TranscriptPiece::Text {
+                    text,
+                    role,
+                    fill: line.fill,
+                    hang,
+                    link: None,
+                });
+            }
+            self.text("\n", None);
+        }
+    }
+
     /// Rows under a `⎿` connector, every row and its wrapped continuation indented to the
     /// content, as Claude Code's `MessageResponse` lays a result out.
     fn result(&mut self, lines: Vec<ResultLine>) {
@@ -704,6 +781,7 @@ fn transcript_arguments(name: &str, input: &Value) -> String {
         }
         WRITE_TOOL_NAME | EDIT_TOOL_NAME => field("file_path"),
         SUBAGENT_TOOL_NAME => field("description"),
+        CODEMODE_TOOL_NAME => field("code"),
         _ => match input {
             Value::Object(fields) => fields
                 .iter()
@@ -1043,6 +1121,31 @@ pub(super) struct ToolPresentation {
     detailed: bool,
     events: VecDeque<Event>,
     tick_labels: super::tick_labels::TickLabels,
+    /// Calls a script or batch made, by their row's key.
+    nested: HashMap<String, NestedCall>,
+}
+
+/// A call a script or batch made: the row of the call that made it, and what it calls.
+struct NestedCall {
+    parent_key: String,
+    name: String,
+    input: Value,
+}
+
+/// The calls a script or batch made under `call_id` in `run`, in the order they were made.
+pub(super) fn nested_operations<'a>(
+    snapshot: &'a ChatSnapshot,
+    run: Uuid,
+    call_id: &'a str,
+) -> impl Iterator<Item = &'a OperationRecord> {
+    snapshot.operations.iter().filter(move |operation| {
+        operation.run_id.uuid() == run && operation.parent_call_id.as_deref() == Some(call_id)
+    })
+}
+
+/// Whether a call of `name` makes calls of its own that show under its row.
+pub(super) fn makes_nested_calls(name: &str) -> bool {
+    matches!(name, CODEMODE_TOOL_NAME | EXECUTE_TOOLS_NAME)
 }
 
 /// Where a call's result finds what it shows beyond itself.
@@ -1086,6 +1189,33 @@ impl ToolPresentation {
         }
         let display = console.display_profile()?;
         let cwd = console.working_directory()?;
+        // A call a script or batch made without starting, such as one it was denied, still
+        // shows its row under the call that made it.
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = &event.kind
+            && console.is_interactive()
+            && !self.detailed
+            && !self.was_started(event, call_id)
+        {
+            let key = tool_call_key(event.run_id.into(), call_id);
+            if let Some(nested) = self.nested.get(&key) {
+                console.nest_tool_call(&key, &nested.parent_key)?;
+                console.write_tool_call(
+                    event.run_id.into(),
+                    &key,
+                    &tool_call_roles(
+                        &nested.name,
+                        &nested.input,
+                        &cwd,
+                        display,
+                        &self.tick_labels,
+                    ),
+                    tool_result_state(&nested.name, &result.content, result.is_error),
+                    None,
+                )?;
+            }
+        }
         for recorded in &self.events {
             if recorded.chat_id == event.chat_id
                 && let EventKind::CommandUpdated { command } = &recorded.kind
@@ -1157,12 +1287,20 @@ impl ToolPresentation {
                 name,
                 input,
             } if console.is_interactive() && !has_no_call_row(name) => {
+                let key = tool_call_key(event.run_id.into(), call_id);
+                let collapse = match self.nested.get(&key) {
+                    Some(nested) => {
+                        console.nest_tool_call(&key, &nested.parent_key)?;
+                        None
+                    }
+                    None => self.collapse(name, input),
+                };
                 console.write_tool_call(
                     event.run_id.into(),
-                    &tool_call_key(event.run_id.into(), call_id),
+                    &key,
                     &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                     ToolCallState::Running,
-                    self.collapse(name, input),
+                    collapse,
                 )?;
                 if self.is_detailed() {
                     console.write(&format!(
@@ -1302,11 +1440,63 @@ impl ToolPresentation {
             detailed,
             events: VecDeque::new(),
             tick_labels: super::tick_labels::TickLabels::default(),
+            nested: HashMap::new(),
         }
     }
 
     pub(super) fn is_detailed(&self) -> bool {
         self.detailed
+    }
+
+    /// The call of `event` whose parent this presentation has yet to learn: a call no assistant
+    /// message announced while a script or batch of the same Run was announced.
+    pub(super) fn nested_call_to_learn<'a>(&self, event: &'a Event) -> Option<&'a str> {
+        let call_id = match &event.kind {
+            EventKind::ToolStarted { call_id, .. } | EventKind::ToolCompleted { call_id, .. } => {
+                call_id.as_str()
+            }
+            _ => return None,
+        };
+        if self
+            .nested
+            .contains_key(&tool_call_key(event.run_id.into(), call_id))
+        {
+            return None;
+        }
+        let mut makes_nested = false;
+        for recorded in &self.events {
+            if let EventKind::AssistantMessageCommitted { tool_calls, .. } = &recorded.kind
+                && recorded.run_id == event.run_id
+            {
+                if tool_calls.iter().any(|call| call.call_id == call_id) {
+                    return None;
+                }
+                makes_nested |= tool_calls.iter().any(|call| makes_nested_calls(&call.name));
+            }
+        }
+        makes_nested.then_some(call_id)
+    }
+
+    fn was_started(&self, event: &Event, call_id: &str) -> bool {
+        self.events.iter().any(|recorded| {
+            recorded.run_id == event.run_id
+                && matches!(&recorded.kind, EventKind::ToolStarted { call_id: started, .. } if started == call_id)
+        })
+    }
+
+    /// Learns from the recorded operation of a call whether a script or batch made it.
+    pub(super) fn learn_nested_call(&mut self, event: &Event, operation: &OperationRecord) {
+        let Some(parent) = &operation.parent_call_id else {
+            return;
+        };
+        self.nested.insert(
+            tool_call_key(event.run_id.into(), &operation.call_id),
+            NestedCall {
+                parent_key: tool_call_key(event.run_id.into(), parent),
+                name: operation.name.clone(),
+                input: operation.input.clone(),
+            },
+        );
     }
 
     pub(super) fn restore(&mut self, events: &[Event]) {
@@ -1446,6 +1636,11 @@ impl ToolPresentation {
                     Some((name.as_str(), Some(input)))
                 }
                 _ => None,
+            })
+            .or_else(|| {
+                self.nested
+                    .get(&tool_call_key(event.run_id.into(), call_id))
+                    .map(|nested| (nested.name.as_str(), Some(&nested.input)))
             })
             .unwrap_or(("tool", None))
     }
@@ -1832,7 +2027,15 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
 fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let quickstart;
+    let script;
     let primary = match name {
+        CODEMODE_TOOL_NAME => {
+            let lines = input["code"]
+                .as_str()
+                .map_or(0, |code| code.lines().count());
+            script = format!("{lines}-line script");
+            Some(script.as_str())
+        }
         "ArtifactRead" if input["action"] == "quickstart" => {
             quickstart = format!(
                 "quickstart {}",
@@ -2416,6 +2619,11 @@ fn compact_result_runs(
         }
         return rows.runs;
     }
+    // A script's result already starts with how it ended.
+    if name == CODEMODE_TOOL_NAME {
+        rows.preview(&result.content, false, body);
+        return rows.runs;
+    }
     if name == BASH_TOOL_NAME {
         if tool_result_status(name, result) == BACKGROUND_RUNNING_STATUS {
             rows.row([(BACKGROUND_RUNNING_STATUS.into(), Some(Role::MutedText))]);
@@ -2549,7 +2757,7 @@ pub(super) fn goal_completion_rejection_reason<'a>(
         .flatten()
 }
 
-fn tool_result_state(name: &str, content: &str, is_error: bool) -> ToolCallState {
+pub(super) fn tool_result_state(name: &str, content: &str, is_error: bool) -> ToolCallState {
     if goal_completion_rejection_reason(name, content, is_error).is_some() {
         ToolCallState::Warning
     } else if is_error {
