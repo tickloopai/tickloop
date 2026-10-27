@@ -1092,7 +1092,11 @@ async fn blocked_host_refresh_leaves_other_chat_submission_status_and_stop_respo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
+    // Only the first refresh's capture blocks: the other Chat must be able to finish its own
+    // preparation, or `/stop` would wait for a Run stuck in the same capture. The capture
+    // blocks in place so that tasks queued on its worker thread still run elsewhere.
     struct BlockedCatalog {
+        armed: std::sync::atomic::AtomicBool,
         block: std::sync::atomic::AtomicBool,
         entered: tokio::sync::Notify,
         gate: (Mutex<bool>, std::sync::Condvar),
@@ -1100,18 +1104,22 @@ async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
     #[async_trait]
     impl HostToolProvider for BlockedCatalog {
         fn definitions(&self) -> Vec<ToolDefinition> {
-            if self.block.load(Ordering::SeqCst) {
+            if self.block.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
-                let (lock, changed) = &self.gate;
-                let mut released = lock.lock().unwrap();
-                while !*released {
-                    released = changed.wait(released).unwrap();
-                }
+                tokio::task::block_in_place(|| {
+                    let (lock, changed) = &self.gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                });
             }
             Vec::new()
         }
         async fn refresh(&self, _: CancellationToken) -> Result<(), String> {
-            self.block.store(true, Ordering::SeqCst);
+            if !self.armed.swap(true, Ordering::SeqCst) {
+                self.block.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
         fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
@@ -1123,6 +1131,7 @@ async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
     }
     let root = tempfile::tempdir().unwrap();
     let provider = Arc::new(BlockedCatalog {
+        armed: std::sync::atomic::AtomicBool::new(false),
         block: std::sync::atomic::AtomicBool::new(false),
         entered: tokio::sync::Notify::new(),
         gate: (Mutex::new(false), std::sync::Condvar::new()),

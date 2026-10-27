@@ -153,6 +153,62 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// Refreshes the host tools while telling the Chat which MCP servers the request waits for.
+    async fn refresh_showing_awaited_servers(
+        &self,
+        receipt: &Receipt,
+        provider: &dyn crate::host_tools::HostToolProvider,
+        cancel: &CancellationToken,
+    ) {
+        let mut awaited = provider.awaited_mcp_servers();
+        if let Some(awaited) = &mut awaited {
+            awaited.mark_changed();
+        }
+        let refresh = provider.refresh(cancel.clone());
+        tokio::pin!(refresh);
+        let mut shown = false;
+        loop {
+            let changed = async {
+                match &mut awaited {
+                    Some(awaited) => awaited
+                        .changed()
+                        .await
+                        .map(|()| awaited.borrow_and_update().clone()),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = &mut refresh => break,
+                servers = changed => match servers {
+                    Ok(servers) if servers.is_empty() && !shown => {}
+                    Ok(servers) => {
+                        shown = !servers.is_empty();
+                        self.show_awaited_mcp_servers(receipt, servers).await;
+                    }
+                    Err(_) => awaited = None,
+                },
+            }
+        }
+        if shown {
+            self.show_awaited_mcp_servers(receipt, Vec::new()).await;
+        }
+    }
+
+    async fn show_awaited_mcp_servers(&self, receipt: &Receipt, servers: Vec<String>) {
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats
+            .get_mut(&receipt.chat_id)
+            .filter(|chat| chat.active_run == Some(receipt.run_id))
+        else {
+            return;
+        };
+        self.publish_event(
+            chat,
+            receipt,
+            tickloop_harness_protocol::EventKind::WaitingForMcpServers { servers },
+        );
+    }
+
     /// The tools a model request of the Run offers, after refreshing what they depend on.
     #[tracing::instrument(target = "tickloop::request_timing", skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     pub(super) async fn prepare_tool_registry(
@@ -163,7 +219,8 @@ impl Agent {
         let host_provider = self.inner.host_tools.read().unwrap().clone();
         if let Some(provider) = host_provider {
             let _timing = crate::timing::Phase::new("refresh");
-            let _ = provider.refresh(cancel.clone()).await;
+            Box::pin(self.refresh_showing_awaited_servers(receipt, provider.as_ref(), cancel))
+                .await;
         }
         self.refresh_task_tools_setting()
             .await
@@ -172,18 +229,21 @@ impl Agent {
         self.pin_delegated_artifact_account(receipt.chat_id).await?;
         self.rediscover_skills(receipt.chat_id).await;
         self.synchronize_remote_skills(receipt).await;
-        let chats = self.inner.chats.lock().await;
-        let chat = chats.get(&receipt.chat_id).unwrap();
+        let mut chats = self.inner.chats.lock().await;
+        let task_access = shared_tasks::tool_access(&chats, receipt);
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let _timing = crate::timing::Phase::new("ToolRegistry::for_chat");
-        Ok(ToolRegistry::for_chat(
+        let mut registry = ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
             self.inner.host_options.prompt_policy,
-            shared_tasks::tool_access(&chats, receipt),
+            task_access,
             &self.inner.tool_policy,
             self.scheduled_task_terms(),
-        ))
+        );
+        registry.hold_host_tools(&mut chat.cache_prefix.held_host_tools, receipt.run_id);
+        Ok(registry)
     }
 
     /// Re-enters the Run's tool batch at `at` with freshly prepared tools.

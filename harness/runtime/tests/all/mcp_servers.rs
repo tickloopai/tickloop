@@ -990,7 +990,7 @@ async fn resources_and_unknown_call_outcomes_remain_bound_to_the_server() {
 }
 
 #[tokio::test]
-async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
+async fn expired_session_is_not_dispatched_and_the_server_reconnects() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"change","inputSchema":{"type":"object"}}]));
     let connections = McpConnections::new(
@@ -1029,6 +1029,7 @@ async fn expired_session_is_not_dispatched_and_next_use_reconnects() {
         HostCallResult::NotDispatched(_)
     ));
     server.set_status(200);
+    wait_for_state(&connections, "expiry", McpServerState::Connected).await;
     assert!(matches!(
         connections
             .call("mcp__expiry__change", json!({}), CancellationToken::new())
@@ -1813,27 +1814,48 @@ async fn oauth_login_renews_rejected_and_expiring_tokens_and_stops_after_invalid
         1,
         "the dispatched call must not be replayed"
     );
+    assert_eq!(
+        authorization.requests_to(TOKEN_PATH).len(),
+        3,
+        "the rejected token was renewed on the open connection"
+    );
     connections.reconcile(configs.clone()).await;
     settled(&connections).await;
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
     assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 3);
 
+    let initializations = server.arrivals("initialize").len();
     let mut saved = credentials.current().unwrap();
     saved.token.as_mut().unwrap().expires_at = 0;
     credentials.replace(Some(saved));
     server.require_bearer("access-4");
     connections.reconcile(configs.clone()).await;
-    settled(&connections).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while authorization.requests_to(TOKEN_PATH).len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the expiring token is renewed");
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
-    assert_eq!(authorization.requests_to(TOKEN_PATH).len(), 4);
+    assert!(matches!(
+        connections
+            .call("mcp__remote__probe", json!({}), cancel.clone())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(
+        server.arrivals("initialize").len(),
+        initializations,
+        "the renewed token is used on the open connection"
+    );
 
     authorization.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
     let mut saved = credentials.current().unwrap();
     saved.token.as_mut().unwrap().expires_at = 0;
     credentials.replace(Some(saved));
     connections.reconcile(configs.clone()).await;
-    settled(&connections).await;
-    assert_eq!(connections.snapshot()[0].state, McpServerState::NeedsLogin);
+    wait_for_state(&connections, "remote", McpServerState::NeedsLogin).await;
     assert!(credentials.current().unwrap().token.is_none());
     let requests = server.request_count();
     connections.reconcile(configs).await;
@@ -2624,16 +2646,14 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     }];
     connections.reconcile(configs.clone()).await;
     wait_for_state(&connections, "broken", McpServerState::Failed).await;
-    connections
-        .reconcile_keeping_failures(configs.clone())
-        .await;
+    connections.reconcile(configs.clone()).await;
     let status = &connections.statuses()[0];
     assert_eq!(
         (status.state.clone(), status.transport.as_str()),
         (McpServerState::Failed, "stdio")
     );
     assert!(status.failure.is_some());
-    connections.reconcile(configs).await;
+    assert!(connections.reconnect(configs, "broken").await);
     assert_ne!(connections.statuses()[0].state, McpServerState::Failed);
     connections.shutdown().await;
 }
@@ -2927,6 +2947,102 @@ async fn unchanged_catalog_reads_reuse_published_work() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn request_timing_lines_split_preparation_per_chat_run_and_request() {
+    use tickloop_harness_protocol::EventKind;
+    use tickloop_harness_runtime::{Agent, host_tools::HostToolProvider, mcp::McpToolProvider};
+    use tickloop_harness_test_support::{ScriptedModel, config, text};
+    use tracing_subscriber::util::SubscriberInitExt;
+    #[derive(Clone, Default)]
+    struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Log::default();
+    let writer = log.clone();
+    let _subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish()
+        .set_default();
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"quote","inputSchema":{"type":"object"}}]));
+    let server_config = http_config("timed", &server);
+    let provider = Arc::new(McpToolProvider::new(
+        McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        Arc::new(move || vec![server_config.clone()]),
+    ));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![text("done")])));
+    agent.install_host_tools(provider).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(root.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "hello".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    agent.shutdown().await;
+    let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let timing: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("request_preparation{"))
+        .collect();
+    let chat = format!("chat={chat:?}");
+    assert!(
+        !timing.is_empty()
+            && timing.iter().all(|line| line.contains(&chat)
+                && line.contains("run=")
+                && line.contains("request=")),
+        "{log}"
+    );
+    for phase in [
+        "refresh",
+        "configuration",
+        "reconcile_lock_wait",
+        "reconcile",
+        "wait_for_startup",
+        "chats_lock_wait",
+        "ToolRegistry::for_chat",
+        "mcp_instructions",
+        "announce_guidance",
+        "model_dispatch",
+    ] {
+        let phase = format!("phase=\"{phase}\"");
+        assert!(
+            timing.iter().any(|line| line.contains(&phase)),
+            "missing {phase}: {log}"
+        );
+    }
+    assert!(
+        timing
+            .iter()
+            .any(|line| line.contains("request catalog summary")
+                && line.contains("catalog_reads=")
+                && line.contains("catalog_builds=0")),
+        "{log}"
+    );
+}
+
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "isolated MCP performance scenario; run explicitly in debug and release"]
@@ -2948,11 +3064,15 @@ async fn mcp_catalog_performance_scenario() {
         .collect();
     let connections =
         McpConnections::new(HostCapabilities::default(), BTreeMap::new(), environment);
-    let config = Arc::new(std::sync::Mutex::new(http_config("bench", &server)));
-    let source = config.clone();
-    let provider = McpToolProvider::new(
+    // As the Daemon does, the host reports its configuration once and then "unchanged".
+    let configuration =
+        std::sync::Mutex::new(Some(tickloop_harness_runtime::mcp::McpConfiguration {
+            servers: vec![http_config("bench", &server)],
+            warnings: Vec::new(),
+        }));
+    let provider = McpToolProvider::with_configuration_updates(
         connections.clone(),
-        Arc::new(move || vec![source.lock().unwrap().clone()]),
+        Arc::new(move || configuration.lock().unwrap().take()),
     );
     provider.refresh(CancellationToken::new()).await.unwrap();
     let provider = Arc::new(provider);
@@ -2964,16 +3084,28 @@ async fn mcp_catalog_performance_scenario() {
     let root = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(root.path().into()).await.unwrap();
     assert_eq!(provider.definitions().len(), count);
-    let mut samples = Vec::new();
-    for _ in 0..5 {
+    let median = |mut samples: Vec<std::time::Duration>| {
+        samples.sort();
+        samples[samples.len() / 2]
+    };
+    let (mut preparation, mut refresh, mut instructions) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..21 {
         let started = std::time::Instant::now();
         assert!(agent.benchmark_host_tool_preparation(chat).await.unwrap() >= count);
-        samples.push(started.elapsed());
+        preparation.push(started.elapsed());
+        let started = std::time::Instant::now();
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        refresh.push(started.elapsed());
+        let started = std::time::Instant::now();
+        provider.mcp_instructions();
+        instructions.push(started.elapsed());
     }
-    samples.sort();
     eprintln!(
-        "MCP benchmark tools={count} preparation_p50={:?} samples={samples:?}",
-        samples[2]
+        "MCP benchmark tools={count} preparation_p50={:?} refresh_p50={:?} mcp_instructions_p50={:?} preparation_max={:?}",
+        median(preparation.clone()),
+        median(refresh),
+        median(instructions),
+        preparation.iter().max().unwrap()
     );
     let secret = "replacement/token+value".repeat(75);
     let credential = tickloop_harness_runtime::mcp::ConnectorCredential {
@@ -3090,18 +3222,34 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
         .to_string();
     let hex: String = secret.bytes().map(|byte| format!("%{byte:02X}")).collect();
     let escaped = serde_json::to_string(secret).unwrap();
-    server.set_tools(json!([{"name":"second","description":format!("{} {} {} {}", secret, encoded, hex, escaped.trim_matches('"')),"inputSchema":{"type":"object"}}]));
     credentials.replace(Some(saved(secret)));
     provider.refresh(CancellationToken::new()).await.unwrap();
     settled(&connections).await;
     assert_eq!(
         connections.performance_counts(),
-        (configured.0 + 1, configured.1 + 1)
+        (configured.0 + 1, configured.1 + 1),
+        "a renewed login republishes the catalog with its new secret, without listing again"
     );
-    let definition = provider
-        .definitions()
-        .into_iter()
-        .find(|tool| tool.name == "mcp__changed__second")
+    server.set_tools(json!([{"name":"second","description":format!("{} {} {} {}", secret, encoded, hex, escaped.trim_matches('"')),"inputSchema":{"type":"object"}}]));
+    server.notify_tools_changed();
+    assert!(matches!(
+        connections
+            .call("mcp__changed__second", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    let definition =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(definition) = provider.definitions().into_iter().find(|tool| {
+                    tool.name == "mcp__changed__second" && !tool.description.is_empty()
+                }) {
+                    return definition;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
         .unwrap();
     assert_eq!(
         definition.description,

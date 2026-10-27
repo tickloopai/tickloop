@@ -12,10 +12,11 @@ use tickloop_code_settings::{
         configured_statuses, validate_entry, validate_user_server_name,
     },
 };
-use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, ToolExposure};
 
-const USAGE: &str = "Usage: tickloop mcp list\n       tickloop mcp add <name> <url> [--header 'Name: value']... [--dir]\n       tickloop mcp add <name> [--env NAME=value]... [--dir] -- <command> [arguments...]\n       tickloop mcp remove <name> [--dir]\n       tickloop mcp login <name> | logout <name>";
+const USAGE: &str = "Usage: tickloop mcp list\n       tickloop mcp add <name> <url> [--header 'Name: value']... [--exposure direct|search|hidden] [--dir]\n       tickloop mcp add <name> [--env NAME=value]... [--exposure direct|search|hidden] [--dir] -- <command> [arguments...]\n       tickloop mcp remove <name> [--dir]\n       tickloop mcp login <name> | logout <name>";
 const DIRECTORY_FLAG: &str = "--dir";
+const EXPOSURE_FLAG: &str = "--exposure";
 
 pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
     let words = arguments
@@ -129,6 +130,7 @@ fn add(arguments: &[&str]) -> Result<(), String> {
     let mut headers = Map::new();
     let mut environment = Map::new();
     let mut directory = false;
+    let mut exposure = None;
     let mut options = options.iter();
     while let Some(option) = options.next() {
         match *option {
@@ -145,13 +147,19 @@ fn add(arguments: &[&str]) -> Result<(), String> {
                 let (name, value) = variable.split_once('=').ok_or("--env needs NAME=value")?;
                 environment.insert(name.to_owned(), Value::from(value));
             }
+            EXPOSURE_FLAG => {
+                if exposure.is_some() {
+                    return Err(format!("{EXPOSURE_FLAG} is given more than once\n{USAGE}"));
+                }
+                exposure = Some(parse_exposure(options.next().copied())?);
+            }
             word if word.starts_with('-') => {
                 return Err(format!("unknown option {}\n{USAGE}", safe_line(word)));
             }
             word => positional.push(word),
         }
     }
-    let entry = match (positional.as_slice(), command) {
+    let mut entry = match (positional.as_slice(), command) {
         ([_name, url], None) => {
             if !environment.is_empty() {
                 return Err("--env applies to a command; a remote server takes --header".into());
@@ -180,6 +188,9 @@ fn add(arguments: &[&str]) -> Result<(), String> {
         }
         _ => return Err(USAGE.into()),
     };
+    if let Some(exposure) = exposure {
+        entry["exposure"] = Value::from(exposure.as_str());
+    }
     let name = positional[0];
     validate_user_server_name(name)?;
     let layer = layer(directory)?;
@@ -212,6 +223,12 @@ fn add(arguments: &[&str]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn parse_exposure(value: Option<&str>) -> Result<ToolExposure, String> {
+    value
+        .and_then(|value| serde_json::from_value(Value::from(value)).ok())
+        .ok_or_else(|| format!("{EXPOSURE_FLAG} needs direct, search or hidden\n{USAGE}"))
 }
 
 fn remove(arguments: &[&str]) -> Result<(), String> {

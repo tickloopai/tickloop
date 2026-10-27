@@ -1,4 +1,4 @@
-use super::{CONNECT_TIMEOUT, Entry, Handler, redact};
+use super::{CONNECT_TIMEOUT, Entry, connection::Handler, redact};
 use crate::mcp_http::{McpHttpError, initialize_failure, nested_http_error};
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,

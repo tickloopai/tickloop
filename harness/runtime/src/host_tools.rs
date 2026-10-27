@@ -476,6 +476,11 @@ pub trait HostToolProvider: Send + Sync {
         Ok(())
     }
 
+    /// The MCP servers a refresh is waiting for, as they change; empty while it is not waiting.
+    fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
+        None
+    }
+
     fn mcp_resource_server(&self) -> Option<McpResourceServer> {
         None
     }

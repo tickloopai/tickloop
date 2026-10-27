@@ -19,7 +19,9 @@ fn unknown_exposure_values_fail_the_server_with_a_warning() {
     use tickloop_harness::protocol::mcp::McpTransport;
     let settings = json!({"mcpServers": {
         "server_wide": {"command":"server","exposure":"bogus"},
-        "per_tool": {"command":"server","toolExposure":{"mail":"bogus","*":"direct"}}
+        "per_tool": {"command":"server","toolExposure":{"mail":"bogus","*":"direct"}},
+        "codemode_wide": {"command":"server","exposure":"codemode"},
+        "codemode_tool": {"command":"server","toolExposure":{"*":"codemode"}}
     }});
     let resolved = resolve_servers(&settings, Path::new("/work"), &BTreeMap::new());
     assert!(resolved.servers.iter().all(|server| matches!(
@@ -29,6 +31,8 @@ fn unknown_exposure_values_fail_the_server_with_a_warning() {
     assert_eq!(
         resolved.warnings,
         [
+            "MCP codemode_tool: invalid tool exposure configuration",
+            "MCP codemode_wide: invalid tool exposure configuration",
             "MCP per_tool: invalid tool exposure configuration",
             "MCP server_wide: invalid tool exposure configuration",
         ]

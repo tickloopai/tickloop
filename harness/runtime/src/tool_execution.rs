@@ -4,6 +4,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::cache_prefix::{HeldHostTools, ListingGroup};
 use tickloop_harness_protocol::{
     ApprovalOutcome, ApprovalPath, ApprovalReviewerKind, AutoBlockKind, DenialCategory,
     DenialRecord, EventKind, HostToolAuthority, OperationRecord, OperationState,
@@ -53,6 +54,9 @@ enum ToolRoute {
     ScheduledTask,
     Handback,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
+    /// An MCP tool the Run's first request offered that is no longer offered: the Run keeps its
+    /// declaration where it was listed, and its calls are not executed.
+    Unavailable(ListingGroup),
 }
 
 /// What a call's admission hands its dispatch besides the call itself.
@@ -145,6 +149,42 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
     tools
 }
 
+fn listing_group(route: &ToolRoute) -> ListingGroup {
+    match route {
+        ToolRoute::BuiltIn => ListingGroup::BuiltIn,
+        ToolRoute::McpResource(_) => ListingGroup::McpResources,
+        ToolRoute::Fold(_) => ListingGroup::Fold,
+        ToolRoute::Host(_) | ToolRoute::TickManage(Some(_)) => ListingGroup::HostTools,
+        ToolRoute::Unavailable(group) => *group,
+        _ => ListingGroup::Runtime,
+    }
+}
+
+fn sort_for_listing(tools: &mut [RegisteredTool]) {
+    tools.sort_by(|first, second| {
+        listing_group(&first.route)
+            .cmp(&listing_group(&second.route))
+            .then_with(|| first.definition.name.cmp(&second.definition.name))
+    });
+}
+
+/// Whether a Run holds the tool to its first request: the tools MCP servers bring, which come and
+/// go as servers connect, disconnect and list again.
+fn is_held(tool: &RegisteredTool) -> bool {
+    match listing_group(&tool.route) {
+        ListingGroup::BuiltIn | ListingGroup::Runtime => false,
+        ListingGroup::McpResources | ListingGroup::Fold => true,
+        ListingGroup::HostTools => tool
+            .definition
+            .name
+            .starts_with(crate::tool_exposure::MCP_TOOL_PREFIX),
+    }
+}
+
+/// The result of a call to a host tool the Run still declares although its source no longer
+/// offers it.
+const UNAVAILABLE_HOST_TOOL_MESSAGE: &str = "This tool is unavailable now: its source stopped offering it during this turn. This call was not executed.";
+
 /// The result of a WebSearch call in a Chat whose host does not offer it.
 const UNOFFERED_WEB_SEARCH_MESSAGE: &str =
     "WebSearch is not available in this Chat. This call was not executed.";
@@ -200,6 +240,8 @@ pub(super) struct ToolRegistry {
     deferred: Vec<ToolDefinition>,
     /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
     offers_web_search: bool,
+    /// Whether the Chat's model searches deferred tools natively.
+    native_search: bool,
 }
 
 impl ToolRegistry {
@@ -328,6 +370,8 @@ impl ToolRegistry {
                     }),
             );
         }
+        let native_search =
+            tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model).is_some();
         let mut folded = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
@@ -355,6 +399,7 @@ impl ToolRegistry {
                     .with_unavailable_servers(provider.unavailable_tool_servers()),
                 );
                 deferred = directory.deferred_tools();
+                deferred.sort_by(|first, second| first.name.cmp(&second.name));
                 let deferred_names: HashSet<_> =
                     deferred.iter().map(|tool| tool.name.as_str()).collect();
                 folded.extend(
@@ -392,12 +437,67 @@ impl ToolRegistry {
                     }),
             );
         }
+        let mut tools = merge_tick_management(tools);
+        sort_for_listing(&mut tools);
         Self {
-            tools: merge_tick_management(tools),
+            tools,
             folded,
             deferred,
             offers_web_search: policy.web_search,
+            native_search,
         }
+    }
+
+    /// Holds the MCP part of the tools to what the Run's first request offered, as `held`
+    /// decides: MCP tools that appeared since stay unlisted until the next Run, and those that
+    /// vanished keep their declaration and are not executed. Other host tools, such as the
+    /// Artifacts tools a sign-in brings, follow the host as before.
+    pub(super) fn hold_host_tools(&mut self, held: &mut Option<HeldHostTools>, run_id: RunId) {
+        let listed = self
+            .tools
+            .iter()
+            .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
+            .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
+            .collect();
+        let Some(offer) = HeldHostTools::hold(
+            held,
+            run_id,
+            self.native_search,
+            listed,
+            self.deferred.clone(),
+        ) else {
+            return;
+        };
+        self.folded.extend(offer.withheld);
+        for (group, definition) in offer.listed {
+            self.folded.remove(&definition.name);
+            match self
+                .tools
+                .iter_mut()
+                .find(|tool| tool.definition.name == definition.name)
+            {
+                Some(tool) => tool.definition = definition,
+                None => self.tools.push(RegisteredTool {
+                    definition,
+                    route: ToolRoute::Unavailable(group),
+                }),
+            }
+        }
+        let registered: HashSet<_> = self
+            .tools
+            .iter()
+            .map(|tool| tool.definition.name.clone())
+            .collect();
+        for definition in &offer.deferred {
+            if !registered.contains(&definition.name) {
+                self.tools.push(RegisteredTool {
+                    definition: definition.clone(),
+                    route: ToolRoute::Unavailable(ListingGroup::HostTools),
+                });
+            }
+        }
+        sort_for_listing(&mut self.tools);
+        self.deferred = offer.deferred;
     }
 
     fn is_listed(&self, name: &str) -> bool {
@@ -433,6 +533,7 @@ impl ToolRegistry {
                 definition,
                 route: ToolRoute::BuiltIn,
             });
+            sort_for_listing(&mut self.tools);
         }
         if let Some(tool) = self
             .tools
@@ -454,7 +555,7 @@ impl ToolRegistry {
             .filter(|tool| {
                 matches!(
                     tool.route,
-                    ToolRoute::Host(_) | ToolRoute::TickManage(Some(_))
+                    ToolRoute::Host(_) | ToolRoute::TickManage(Some(_)) | ToolRoute::Unavailable(_)
                 )
             })
             .map(|tool| tool.definition.name.clone())
@@ -821,6 +922,7 @@ impl Agent {
             }
             ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
             ToolRoute::TickManage(_) => Err("TickManage route was not prepared".into()),
+            ToolRoute::Unavailable(_) => Err(UNAVAILABLE_HOST_TOOL_MESSAGE.into()),
             ToolRoute::TickSubscription => {
                 self.tick_subscription_tool(
                     receipt,
@@ -1021,6 +1123,14 @@ impl Agent {
         });
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
+        }
+        if registration
+            .as_ref()
+            .is_some_and(|tool| matches!(tool.route, ToolRoute::Unavailable(_)))
+        {
+            return Ok(ToolCallOutcome::not_admitted(
+                UNAVAILABLE_HOST_TOOL_MESSAGE.into(),
+            ));
         }
         if name == tickloop_harness_tools::WEB_SEARCH_TOOL_NAME
             && (registration.is_none()

@@ -301,6 +301,7 @@ impl Agent {
                 loaded_from_history: false,
                 goal_clock_ms: 0,
                 denial_window: super::denials::DenialWindow::default(),
+                cache_prefix: Default::default(),
             },
         );
         self.save(&snapshot);

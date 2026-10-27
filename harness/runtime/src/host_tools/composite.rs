@@ -27,7 +27,7 @@ pub(crate) struct CompositeHostTools {
 #[derive(Default)]
 struct SourceIndex {
     generations: Vec<Option<u64>>,
-    names: std::collections::BTreeMap<String, Option<usize>>,
+    names: std::collections::BTreeMap<String, usize>,
     definitions: Vec<ToolDefinition>,
     discovery: Vec<crate::tool_exposure::ExposureTool>,
 }
@@ -53,23 +53,30 @@ impl SourceIndex {
             generations: generations.clone(),
             ..Default::default()
         };
+        // A name two sources offer keeps the tool of the source installed earlier, which alone
+        // answers its calls, permission and authority. The rule depends on the fixed source order
+        // only, never on which source began offering the name first.
         for (index, source) in sources.iter().enumerate() {
             for definition in source.definitions() {
-                next.names
-                    .entry(definition.name.clone())
-                    .and_modify(|owner| *owner = None)
-                    .or_insert(Some(index));
+                if let Some(owner) = next.names.get(&definition.name) {
+                    tracing::warn!(
+                        tool = %definition.name,
+                        kept_source = owner,
+                        ignored_source = index,
+                        "two host tool sources offer the same tool name; keeping the earlier source's tool"
+                    );
+                    continue;
+                }
+                next.names.insert(definition.name.clone(), index);
                 next.definitions.push(definition);
             }
-            next.discovery.extend(source.discovery_tools());
+            next.discovery
+                .extend(source.discovery_tools().into_iter().filter(|tool| {
+                    next.names
+                        .get(&tool.definition.name)
+                        .is_none_or(|owner| *owner == index)
+                }));
         }
-        next.definitions
-            .retain(|tool| next.names[&tool.name].is_some());
-        next.discovery.retain(|tool| {
-            next.names
-                .get(&tool.definition.name)
-                .is_none_or(Option::is_some)
-        });
         let next = Arc::new(next);
         let mut index = published.write().unwrap();
         // A concurrent refresh may have published while this index was being assembled.
@@ -116,19 +123,15 @@ impl CompositeHostTools {
     }
     fn source(&self, name: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
         let index = self.update_index(false);
-        match index.names.get(name) {
-            Some(Some(owner)) => Ok(&self.sources[*owner]),
-            Some(None) => Err("host tool has conflicting sources".into()),
-            None => Err("host tool unavailable".into()),
-        }
+        index
+            .names
+            .get(name)
+            .map(|owner| &self.sources[*owner])
+            .ok_or_else(|| "host tool unavailable".into())
     }
     fn authority_source(&self, name: &str) -> Result<Option<&Arc<dyn HostToolProvider>>, String> {
         let index = self.update_index(false);
-        let mut owner = match index.names.get(name) {
-            Some(Some(owner)) => Some(*owner),
-            Some(None) => return Err("host tool has conflicting authorities".into()),
-            None => None,
-        };
+        let mut owner = index.names.get(name).copied();
         if crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) {
             for (candidate, source) in self
                 .sources
@@ -224,6 +227,11 @@ impl HostToolProvider for CompositeHostTools {
                 .await;
         self.capture_refreshed_index().await;
         results.into_iter().collect()
+    }
+    fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
+        self.sources
+            .iter()
+            .find_map(|source| source.awaited_mcp_servers())
     }
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
         self.sources
