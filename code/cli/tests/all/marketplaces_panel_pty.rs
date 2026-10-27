@@ -1,7 +1,6 @@
 //! The Marketplaces page of `/plugins` in the Agent's terminal, against a private config root.
 //! A local directory and a `git init` repository read through a `file://` URL stand in for
-//! marketplaces; the built-in Git marketplace has no stand-in, so it cannot be read. Nothing
-//! reaches the network.
+//! marketplaces, including the default official source. Nothing reaches the network.
 
 use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -52,7 +51,7 @@ fn panel_is_open(frame: &str) -> bool {
 }
 
 #[test]
-fn a_built_in_git_marketplace_fetched_on_opening_shows_its_commit() {
+fn the_default_claude_marketplace_is_removed_restored_and_stays_removed_after_reopening() {
     let fixture = Fixture::new();
     let official = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
     write_json(
@@ -72,8 +71,46 @@ fn a_built_in_git_marketplace_fetched_on_opening_shows_its_commit() {
             )
             && shows(frame, &format!(" at {}", &commit[..12]))
     });
+    for restore in [true, false] {
+        terminal.press(b"j", "the removable default source", |frame| {
+            is_selected(frame, "claude-plugins-official") && frame.contains("x remove")
+        });
+        terminal.press(b"x", "removal confirmation", |frame| {
+            shows(
+                frame,
+                "Press x again to remove marketplace claude-plugins-official",
+            )
+        });
+        terminal.press(b"x", "removed with restore instructions", |frame| {
+            shows(frame, "add it back with tickloop plugin marketplace add anthropics/claude-plugins-official")
+                && !shows(frame, "◉ claude-plugins-official")
+                && !frame.contains("x remove")
+        });
+        let listed = succeeded(&fixture.tickloop(&["plugin", "marketplace", "list"]));
+        assert!(!listed.contains("claude-plugins-official"), "{listed}");
+        if restore {
+            terminal.press(b"a", "add source", |frame| {
+                frame.contains("Add marketplace:")
+            });
+            terminal.press(b"anthropics/claude-plugins-official\r", "restored default source", |frame| {
+                shows(frame, "Added marketplace claude-plugins-official")
+                    && shows(frame, "https://github.com/anthropics/claude-plugins-official.git · built in; updated")
+            });
+        }
+    }
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
     terminal.exit();
+    let mut reopened = Terminal::start(&fixture, &marketplace);
+    reopened.wait_for_frame(0, "the prompt after reopening", |frame| frame.contains("❯"));
+    reopened.press(b"/plugins\r", "the Plugins panel", panel_is_open);
+    reopened.press(BACK_TAB, "only tickloop remains", |frame| {
+        on_marketplaces_page(frame)
+            && shows(frame, "◉ tickloop")
+            && !frame.contains("claude-plugins-official")
+            && !frame.contains("x remove")
+    });
+    reopened.press(ESCAPE, "closed", |frame| !panel_is_open(frame));
+    reopened.exit();
 }
 
 #[test]
@@ -131,11 +168,19 @@ fn marketplaces_are_added_updated_and_removed_in_the_plugins_panel() {
         ),
         "{frame}"
     );
-    assert!(frame.contains("enter update · a add · x remove"), "{frame}");
+    assert!(
+        frame.contains("enter update · a add") && !frame.contains("x remove"),
+        "{frame}"
+    );
 
-    terminal.press(b"x", "a built-in marketplace stays", |frame| {
-        shows(frame, "The built-in marketplace tickloop cannot be removed")
+    terminal.press(b"xj", "tickloop ignores removal", |frame| {
+        is_selected(frame, "claude-plugins-official")
+            && frame.contains("x remove")
+            && !frame.contains("cannot be removed")
             && !frame.contains("Press x again")
+    });
+    terminal.press(b"k", "tickloop has no removal hint", |frame| {
+        is_selected(frame, "tickloop") && !frame.contains("x remove")
     });
 
     terminal.press(b"a", "the source field", |frame| {

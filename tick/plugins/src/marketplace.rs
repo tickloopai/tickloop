@@ -25,6 +25,15 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 
 pub const CLAUDE_OFFICIAL_MARKETPLACE: &str = "claude-plugins-official";
 
+fn claude_official_source() -> MarketplaceSource {
+    MarketplaceSource::Git(GitSource {
+        url: "https://github.com/anthropics/claude-plugins-official.git".to_owned(),
+        reference: None,
+        sha: None,
+        subdirectory: None,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketplaceRegistration {
     pub name: String,
@@ -55,18 +64,17 @@ impl PluginStore {
             },
             MarketplaceRegistration {
                 name: CLAUDE_OFFICIAL_MARKETPLACE.to_owned(),
-                source: MarketplaceSource::Git(GitSource {
-                    url: "https://github.com/anthropics/claude-plugins-official.git".to_owned(),
-                    reference: None,
-                    sha: None,
-                    subdirectory: None,
-                }),
+                source: claude_official_source(),
                 builtin: true,
                 refreshed_at: None,
                 commit: None,
             },
         ];
-        for cached in self.read_marketplace_registry()?.into_values() {
+        let registry = self.read_marketplace_registry()?;
+        if matches!(registry.get(CLAUDE_OFFICIAL_MARKETPLACE), Some(None)) {
+            registrations.retain(|entry| entry.name != CLAUDE_OFFICIAL_MARKETPLACE);
+        }
+        for cached in registry.into_values().flatten() {
             if let Some(builtin) = registrations
                 .iter_mut()
                 .find(|entry| entry.name == cached.registration.name)
@@ -82,22 +90,33 @@ impl PluginStore {
     }
 
     pub fn remove_marketplace(&self, name: &str) -> Result<(), PluginError> {
-        if matches!(name, TICKLOOP_MARKETPLACE | CLAUDE_OFFICIAL_MARKETPLACE) {
+        if name == TICKLOOP_MARKETPLACE {
             return Err(PluginError::Invalid(format!(
                 "the built-in marketplace {name} cannot be removed"
             )));
         }
         let _lock = self.lock()?;
         let mut registry = self.read_marketplace_registry()?;
-        let removed = registry
-            .remove(name)
-            .ok_or_else(|| PluginError::Invalid(format!("marketplace {name} is not registered")))?;
+        let removed = if name == CLAUDE_OFFICIAL_MARKETPLACE {
+            if matches!(registry.get(name), Some(None)) {
+                return Err(PluginError::Invalid(format!(
+                    "marketplace {name} is not registered"
+                )));
+            }
+            registry.insert(name.to_owned(), None).flatten()
+        } else {
+            Some(registry.remove(name).flatten().ok_or_else(|| {
+                PluginError::Invalid(format!("marketplace {name} is not registered"))
+            })?)
+        };
         self.write_marketplace_registry(&registry)?;
-        let _ = fs::remove_dir_all(
-            self.directory
-                .join(MARKETPLACES_DIRECTORY)
-                .join(removed.cache),
-        );
+        if let Some(removed) = removed {
+            let _ = fs::remove_dir_all(
+                self.directory
+                    .join(MARKETPLACES_DIRECTORY)
+                    .join(removed.cache),
+            );
+        }
         Ok(())
     }
 }
@@ -154,7 +173,11 @@ impl PluginStore {
     ) -> Result<MarketplaceCatalog, PluginError> {
         {
             let _lock = self.lock()?;
-            if let Some(cached) = self.read_marketplace_registry()?.get(name) {
+            if let Some(cached) = self
+                .read_marketplace_registry()?
+                .get(name)
+                .and_then(Option::as_ref)
+            {
                 let current = self
                     .marketplaces()?
                     .into_iter()
@@ -226,7 +249,10 @@ impl PluginStore {
             })
             .map_or(name, |registration| registration.name.as_str());
         crate::validate_plugin_name(name)?;
+        let is_claude_official =
+            name == CLAUDE_OFFICIAL_MARKETPLACE && *source == claude_official_source();
         if previous.is_none()
+            && !is_claude_official
             && matches!(
                 name,
                 TICKLOOP_MARKETPLACE | CLAUDE_OFFICIAL_MARKETPLACE | crate::LOCAL_MARKETPLACE
@@ -244,7 +270,7 @@ impl PluginStore {
         let registration = MarketplaceRegistration {
             name: name.to_owned(),
             source: source.clone(),
-            builtin: previous.is_some_and(|previous| previous.builtin),
+            builtin: is_claude_official || previous.is_some_and(|previous| previous.builtin),
             refreshed_at: Some(
                 OffsetDateTime::now_utc()
                     .format(&Rfc3339)
@@ -255,14 +281,22 @@ impl PluginStore {
         let catalog = MarketplaceCatalog::parse(registration.clone(), &document)?;
         let _lock = self.lock()?;
         let mut registry = self.read_marketplace_registry()?;
-        if previous.is_none() && registry.contains_key(name) {
+        if previous.is_none()
+            && (registry.get(name).is_some_and(Option::is_some)
+                || (is_claude_official && !matches!(registry.get(name), Some(None))))
+        {
             return Err(PluginError::Invalid(format!(
                 "marketplace {name} is already registered"
             )));
         }
         if let Some(previous) = previous {
-            let current = registry.get(name).map(|cached| &cached.registration);
-            let changed = if previous.refreshed_at.is_some() {
+            let current = registry
+                .get(name)
+                .and_then(Option::as_ref)
+                .map(|cached| &cached.registration);
+            let changed = if matches!(registry.get(name), Some(None)) {
+                true
+            } else if previous.refreshed_at.is_some() {
                 current != Some(previous)
             } else {
                 current.is_some_and(|current| current.source == previous.source)
@@ -298,7 +332,7 @@ impl PluginStore {
                 .to_string_lossy()
                 .into_owned(),
         };
-        let old = registry.insert(name.to_owned(), cached);
+        let old = registry.insert(name.to_owned(), Some(cached)).flatten();
         self.write_marketplace_registry(&registry)?;
         let _ = cache.keep();
         if let Some(old) = old {
@@ -427,9 +461,10 @@ impl PluginStore {
         }
     }
 
+    // A null entry suppresses a default registration; existing cached entries keep their format.
     fn read_marketplace_registry(
         &self,
-    ) -> Result<BTreeMap<String, CachedMarketplace>, PluginError> {
+    ) -> Result<BTreeMap<String, Option<CachedMarketplace>>, PluginError> {
         let path = self.directory.join(MARKETPLACE_REGISTRY_FILE);
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| PluginError::Registry {
@@ -445,7 +480,7 @@ impl PluginStore {
 
     fn write_marketplace_registry(
         &self,
-        registry: &BTreeMap<String, CachedMarketplace>,
+        registry: &BTreeMap<String, Option<CachedMarketplace>>,
     ) -> Result<(), PluginError> {
         let mut file = tempfile::NamedTempFile::new_in(&self.directory)
             .map_err(PluginError::io("cannot stage marketplace registrations"))?;

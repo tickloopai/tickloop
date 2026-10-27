@@ -145,7 +145,7 @@ fn the_plugins_panel_lists_every_marketplace_as_the_command_line_does_on_a_third
     assert!(
         shown.contains("enter update")
             && shown.contains("a add")
-            && shown.contains("x remove")
+            && !shown.contains("x remove")
             && shown.contains("esc close"),
         "{shown}"
     );
@@ -312,22 +312,73 @@ fn removing_a_marketplace_takes_two_x_presses_and_keeps_its_plugins() {
 }
 
 #[test]
-fn a_built_in_marketplace_says_why_it_cannot_be_removed() {
+fn tickloop_ignores_removal_and_only_removable_rows_offer_it() {
     let mut panel = marketplaces_page();
-    for name in ["tickloop", "claude-plugins-official"] {
-        for _ in 0..2 {
-            assert!(matches!(
-                key(&mut panel, KeyCode::Char('x')),
-                TicksPanelEffect::None
-            ));
-        }
-        let shown = text(&mut panel);
+    let before = text(&mut panel);
+    assert!(!before.contains("x remove"), "{before}");
+    for _ in 0..2 {
+        assert!(matches!(
+            key(&mut panel, KeyCode::Char('x')),
+            TicksPanelEffect::None
+        ));
+        assert_eq!(text(&mut panel), before);
+    }
+    key(&mut panel, KeyCode::Char('j'));
+    assert!(text(&mut panel).contains("x remove"));
+    key(&mut panel, KeyCode::Char('x'));
+    assert!(
+        text(&mut panel).ends_with("Press x again to remove marketplace claude-plugins-official")
+    );
+    key(&mut panel, KeyCode::Char('k'));
+    assert_eq!(text(&mut panel), before);
+    key(&mut panel, KeyCode::Char('x'));
+    assert_eq!(text(&mut panel), before);
+    key(&mut panel, KeyCode::Char('j'));
+    key(&mut panel, KeyCode::Char('j'));
+    assert!(text(&mut panel).contains("x remove"));
+}
+
+#[test]
+fn removing_the_default_claude_marketplace_explains_how_to_add_it_back() {
+    for remaining in [vec![], vec!["notes@claude-plugins-official".into()]] {
+        let mut panel = marketplaces_page();
+        key(&mut panel, KeyCode::Char('j'));
+        assert!(matches!(
+            key(&mut panel, KeyCode::Char('x')),
+            TicksPanelEffect::None
+        ));
         assert!(
-            shown.contains(&format!(
-                "The built-in marketplace {name} cannot be removed"
-            )) && !shown.contains("Press x again"),
+            text(&mut panel)
+                .ends_with("Press x again to remove marketplace claude-plugins-official")
+        );
+        assert_eq!(
+            work(key(&mut panel, KeyCode::Char('x'))),
+            TickPackageRequest::RemoveMarketplace("claude-plugins-official".into())
+        );
+        panel.apply(TickPackageResult::MarketplaceRemoved {
+            name: "claude-plugins-official".into(),
+            result: Ok(remaining.clone()),
+        });
+        let shown = text(&mut panel)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            shown.contains("Removed marketplace claude-plugins-official"),
             "{shown}"
         );
-        key(&mut panel, KeyCode::Char('j'));
+        assert!(shown.contains("add it back with tickloop plugin marketplace add anthropics/claude-plugins-official"), "{shown}");
+        if !remaining.is_empty() {
+            assert!(
+                shown.contains("its plugins stay installed: notes@claude-plugins-official"),
+                "{shown}"
+            );
+        }
+        key(&mut panel, KeyCode::Char('a'));
+        type_text(&mut panel, "anthropics/claude-plugins-official");
+        assert_eq!(
+            work(key(&mut panel, KeyCode::Enter)),
+            TickPackageRequest::AddMarketplace("anthropics/claude-plugins-official".into())
+        );
     }
 }
