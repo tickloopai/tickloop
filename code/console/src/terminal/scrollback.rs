@@ -2009,11 +2009,11 @@ mod tests {
         let expected = scrollback.frame(80, 8).lines;
         let different = [
             (TITLE, Some(Role::Title)),
-            (" · Agent v0.9.0+old", Some(Role::MutedText)),
+            (" (Daemon: v0.9.0+old)", Some(Role::MutedText)),
         ];
         assert!(scrollback.set_banner_title(0, TITLE, &different));
         assert!(!scrollback.set_banner_title(0, TITLE, &different));
-        assert_eq!(scrollback.lines[0], "Tickloop v1.0.0 · Agent v0.9.0+old");
+        assert_eq!(scrollback.lines[0], "Tickloop v1.0.0 (Daemon: v0.9.0+old)");
         assert_eq!(scrollback.frame(80, 8).lines, expected);
         assert!(scrollback.set_banner_title(0, TITLE, &[(TITLE, Some(Role::Title))]));
         assert_eq!(scrollback.lines[0], TITLE);

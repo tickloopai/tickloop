@@ -2707,7 +2707,12 @@ impl Console {
         let line = build
             .map(|build| display_single_line(&build).trim().to_owned())
             .filter(|build| !build.is_empty())
-            .map(|build| format!("Agent v{build}{}", if pending { " · pending" } else { "" }));
+            .map(|build| {
+                format!(
+                    "Daemon: v{build}{}",
+                    if pending { ", upgrade pending" } else { "" }
+                )
+            });
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive || state.agent_runtime_banners.get(&chat) == line.as_ref() {
             return Ok(());

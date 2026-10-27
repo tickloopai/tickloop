@@ -1316,33 +1316,33 @@ fn agent_layout_runtime_banner_uses_each_chats_known_worker_build_without_duplic
             .unwrap();
     }
     let old = frame_lines(&console).join("\n");
-    assert_eq!(old.matches("Agent v").count(), 1, "{old}");
+    assert_eq!(old.matches("Daemon: v").count(), 1, "{old}");
     assert!(
-        title_line(&console).ends_with(" · Agent v0.2.11+aaaaaaaaaaaaaaaa · pending"),
+        title_line(&console).ends_with(" (Daemon: v0.2.11+aaaaaaaaaaaaaaaa, upgrade pending)"),
         "{old}"
     );
     assert!(old.contains("keep this conversation"));
     console.ensure_chat_banner(CHILD_AGENT, &banner).unwrap();
     console.reset_chat(CHILD_AGENT).unwrap();
     console.set_agent_runtime(CHILD_AGENT, None, true).unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
     console
         .set_agent_runtime(ROOT_AGENT, Some("0.2.12+bbbbbbbbbbbbbbbb".into()), false)
         .unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
     console.select_chat(Some(ROOT_AGENT)).unwrap();
     let updated = frame_lines(&console).join("\n");
-    assert_eq!(updated.matches("Agent v").count(), 1, "{updated}");
-    assert!(title_line(&console).ends_with(" · Agent v0.2.12+bbbbbbbbbbbbbbbb"));
+    assert_eq!(updated.matches("Daemon: v").count(), 1, "{updated}");
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     assert!(!updated.contains("aaaaaaaaaaaaaaaa") && !updated.contains("pending"));
     assert!(updated.contains("keep this conversation"));
     console.reset_chat(ROOT_AGENT).unwrap();
-    assert!(title_line(&console).ends_with(" · Agent v0.2.12+bbbbbbbbbbbbbbbb"));
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     console.set_agent_runtime(ROOT_AGENT, None, false).unwrap();
     let unknown = frame_lines(&console).join("\n");
-    assert!(!unknown.contains("Agent v") && !unknown.contains("bbbbbbbbbbbbbbbb"));
+    assert!(!unknown.contains("Daemon: v") && !unknown.contains("bbbbbbbbbbbbbbbb"));
     console.clear_visible_agent().unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
 }
 
 #[test]
@@ -1401,8 +1401,8 @@ fn agent_layout_runtime_banner_updates_preserve_the_reading_anchor_and_full_buil
         .scrollback
         .scroll(ScrollAction::First);
     let beginning = frame_lines(&console).join("\n");
-    assert_eq!(beginning.matches("Agent v").count(), 1, "{beginning}");
-    assert!(title_line(&console).ends_with(" · Agent v0.2.12+bbbbbbbbbbbbbbbb"));
+    assert_eq!(beginning.matches("Daemon: v").count(), 1, "{beginning}");
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     assert!(!beginning.contains("aaaaaaaaaaaaaaaa") && !beginning.contains("pending"));
 }
 
@@ -1444,7 +1444,10 @@ fn agent_layout_runtime_version_follows_the_title_and_keeps_the_banner_rows() {
                 .iter()
                 .map(|row| (*row).to_owned())
                 .collect::<Vec<_>>();
-            expected[title_row] = format!("{} · Agent v{build} · pending", banner_rows[title_row]);
+            expected[title_row] = format!(
+                "{} (Daemon: v{build}, upgrade pending)",
+                banner_rows[title_row]
+            );
             assert_eq!(
                 frame[start..start + banner_rows.len()]
                     .iter()
@@ -1454,7 +1457,10 @@ fn agent_layout_runtime_version_follows_the_title_and_keeps_the_banner_rows() {
                 "the logo and banner rows stay together, the build after the title: {frame:#?}"
             );
             assert_eq!(
-                frame.iter().filter(|line| line.contains("Agent v")).count(),
+                frame
+                    .iter()
+                    .filter(|line| line.contains("Daemon: v"))
+                    .count(),
                 1
             );
         }
@@ -1462,7 +1468,7 @@ fn agent_layout_runtime_version_follows_the_title_and_keeps_the_banner_rows() {
         assert!(
             !frame_lines(&console)
                 .iter()
-                .any(|line| line.contains("Agent v"))
+                .any(|line| line.contains("Daemon: v"))
         );
     }
 }

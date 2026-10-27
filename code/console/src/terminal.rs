@@ -1594,7 +1594,7 @@ fn banner_title(agent_runtime: Option<&str>) -> Vec<(String, Role)> {
         (format!(" v{}", env!("CARGO_PKG_VERSION")), Role::MutedText),
     ];
     if let Some(agent_runtime) = agent_runtime {
-        title.push((format!(" · {agent_runtime}"), Role::MutedText));
+        title.push((format!(" ({agent_runtime})"), Role::MutedText));
     }
     title
 }
