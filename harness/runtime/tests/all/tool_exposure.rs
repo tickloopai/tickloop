@@ -585,7 +585,7 @@ fn fold_calls_read_as_text_once_a_request_no_longer_offers_fold() {
         },
     ];
     let mut converted = history.clone();
-    fold_history_as_text(&mut converted);
+    fold_history_as_text(&mut converted, &[]);
     let Content::Text { text } = &converted[0].content[0] else {
         panic!("the Fold call stayed a tool call: {:?}", converted[0]);
     };
@@ -594,7 +594,7 @@ fn fold_calls_read_as_text_once_a_request_no_longer_offers_fold() {
     assert_eq!(converted[1].content[0], history[1].content[1]);
     assert!(matches!(&converted[1].content[1], Content::Text { text } if text.contains("MAIL_OK")));
     let mut again = converted.clone();
-    fold_history_as_text(&mut again);
+    fold_history_as_text(&mut again, &[]);
     assert_eq!(again, converted);
 }
 
@@ -632,11 +632,9 @@ fn hosts_without_scripts_discover_codemode_tools_through_search() {
         SearchSupport::Fold,
         true,
     );
-    assert!(
-        scripted.search(&json!({"queries":["email"]})).unwrap()["matches"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        scripted.search(&json!({"queries":["email"]})).unwrap()["matches"][0]["name"],
+        "mcp__office__mail"
     );
 }
 
@@ -1275,4 +1273,190 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
     }
     assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
+}
+
+#[cfg(feature = "codemode")]
+#[tokio::test]
+async fn native_models_discover_codemode_schemas_and_call_only_through_scripts() {
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tickloop_harness_model::cards::ModelCatalog;
+    use tickloop_harness_protocol::{
+        Content, EventKind, ExecutionMode,
+        mcp::{McpServerConfig, McpTransport},
+    };
+    use tickloop_harness_runtime::{
+        Agent,
+        mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, mcp_service::McpService, next_event, text,
+    };
+    let original_schema = json!({"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]});
+    let server = McpService::start().await;
+    server.set_tools(json!([
+        {"name":"mail","description":"Send email","inputSchema":original_schema},
+        {"name":"native","inputSchema":{"type":"object"}},
+        {"name":"direct","inputSchema":{"type":"object"}},
+        {"name":"secret","inputSchema":{"type":"object"}}
+    ]));
+    server.set_result(json!({"content":[{"type":"text","text":"SCRIPT_MAIL_OK"}]}));
+    let configs = vec![McpServerConfig {
+        name: "office".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        timeout_ms: 5000,
+        oauth: Default::default(),
+        sensitive_values: vec![],
+        disabled: false,
+        exposure: ToolExposure::Codemode,
+        tool_exposure: vec![
+            ("native".into(), ToolExposure::Search),
+            ("direct".into(), ToolExposure::Direct),
+            ("secret".into(), ToolExposure::Hidden),
+        ],
+        description: "Office tools".into(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: false,
+            scripts: true,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "find",
+            "SearchTools",
+            json!({"queries":["mail","native","direct","secret"]}),
+        ),
+        call(
+            "describe",
+            "DescribeTools",
+            json!({"names":["mcp__office__mail","mcp__office__native","mcp__office__direct","mcp__office__secret"]}),
+        ),
+        call(
+            "script",
+            "Codemode",
+            json!({"code":"text(await tools.mcp__office__mail({value: 'hello'}));"}),
+        ),
+        text("done"),
+    ]));
+    let mut native = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    native.base_url = config().base_url;
+    native.api_key_env.clear();
+    let agent = Agent::new_embedded(native, model.clone());
+    agent
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || configs.clone()),
+        )))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(
+            chat,
+            "Discover the mail parameters and send hello through a script".into(),
+        )
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let requests = model.requests.lock().unwrap().clone();
+    agent.shutdown().await;
+    for request in &requests {
+        for name in ["SearchTools", "DescribeTools", "Codemode"] {
+            assert!(
+                request.tools.iter().any(|tool| tool.name == name),
+                "missing {name}"
+            );
+        }
+        for name in ["ExecuteTools", "mcp__office__mail", "mcp__office__secret"] {
+            assert!(
+                request.tools.iter().all(|tool| tool.name != name),
+                "unexpected {name}"
+            );
+        }
+        assert_eq!(
+            request
+                .deferred_tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__office__native"]
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let tool_result = |request: usize, id: &str| {
+        requests[request]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| {
+                if let Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = block
+                    && tool_use_id == id
+                {
+                    assert!(!is_error, "{id} failed");
+                    Some(serde_json::from_str::<serde_json::Value>(&content.text()).unwrap())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing structured result for {id}"))
+    };
+    let found = tool_result(1, "find");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(found["matches"][0]["name"], "mcp__office__mail");
+    let described = tool_result(2, "describe");
+    assert_eq!(described["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(described["tools"][0]["input_schema"], original_schema);
+    assert_eq!(
+        described["not_found"],
+        json!([
+            "mcp__office__native",
+            "mcp__office__direct",
+            "mcp__office__secret"
+        ])
+    );
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        server.calls()[0]["params"]["arguments"],
+        json!({"value":"hello"})
+    );
+    assert!(
+        serde_json::to_string(&requests.last().unwrap().messages)
+            .unwrap()
+            .contains("SCRIPT_MAIL_OK")
+    );
 }
