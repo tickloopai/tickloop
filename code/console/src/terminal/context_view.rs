@@ -25,6 +25,16 @@ const LARGE_WINDOW_TOKENS: u64 = 1_000_000;
 const CELL_COLUMNS: usize = 2;
 const COLUMN_GAP: usize = 2;
 const FILLED_CELL_SHARE: f64 = 0.7;
+/// The widest a pool bar gets, and the terminal width below which pool bars are left out.
+const MAX_BAR_CELLS: usize = 24;
+const MIN_BAR_CELLS: usize = 6;
+const MIN_BAR_WIDTH: usize = 60;
+/// Room a pool line keeps beside its name and bar: the indent, gaps, count and tokens.
+const POOL_LINE_TEXT_COLUMNS: usize = 30;
+const MAX_POOL_NAME_COLUMNS: usize = 20;
+const MAX_POOL_TOOL_NAME_COLUMNS: usize = 40;
+/// Host notes beyond this many tokens get a line of their own in plain `/context`.
+const HOST_NOTES_SUMMARY_TOKENS: u64 = 1_000;
 
 type Run = (String, Option<Role>);
 type Line = Vec<Run>;
@@ -61,7 +71,7 @@ impl ContextView<'_> {
         lines.extend(self.overview(width, display));
         lines.extend(self.footnotes());
         lines.extend(self.sections());
-        lines.extend(self.tool_search_pool());
+        lines.extend(self.tool_search_pool(width, display));
         if !self.expanded {
             lines.push(Vec::new());
             lines.push(muted(format!("/context {EXPAND_ARGUMENT} to expand")));
@@ -256,6 +266,11 @@ impl ContextView<'_> {
                 compact_count(window)
             )));
         }
+        if breakdown.host_tools_pending {
+            lines.push(muted(
+                "Before the first message: Tick, Artifact and MCP tools join when the Agent starts and are not counted.".into(),
+            ));
+        }
         let basis = if breakdown.calibrated {
             "scaled to the context total the service last reported"
         } else {
@@ -325,10 +340,34 @@ impl ContextView<'_> {
                 category_tokens(ContextCategory::ToolSearchResults),
             ));
         }
-        if self.expanded && !breakdown.messages.is_empty() {
+        let host_notes = breakdown
+            .host_notes
+            .iter()
+            .map(|note| note.tokens)
+            .sum::<u64>();
+        if self.expanded {
+            let mut items = breakdown
+                .messages
+                .iter()
+                .chain(&breakdown.host_notes)
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by_key(|item| std::cmp::Reverse(item.tokens));
+            if !items.is_empty() {
+                lines.push(Vec::new());
+                lines.push(heading("Messages", ""));
+                lines.extend(item_lines(&items, "", ""));
+            }
+        } else if host_notes >= HOST_NOTES_SUMMARY_TOKENS {
             lines.push(Vec::new());
             lines.push(heading("Messages", ""));
-            lines.extend(item_lines(&breakdown.messages, "", ""));
+            lines.push(tree_line(
+                "",
+                format!(
+                    "includes {} tokens of host notes · /context {EXPAND_ARGUMENT}",
+                    compact_count(host_notes)
+                ),
+            ));
         }
         lines
     }
@@ -388,8 +427,10 @@ impl ContextView<'_> {
         lines
     }
 
-    /// The MCP tools only tool search reaches, by server: independent of the context above.
-    fn tool_search_pool(&self) -> Vec<Line> {
+    /// The MCP tools only tool search reaches, by server: independent of the context above. A bar
+    /// shows each server's share of the pool, and in `/context all` each tool's size against the
+    /// largest one.
+    fn tool_search_pool(&self, width: usize, display: DisplayProfile) -> Vec<Line> {
         let Some(pool) = &self.breakdown.tool_search else {
             return Vec::new();
         };
@@ -417,7 +458,7 @@ impl ContextView<'_> {
                 ),
             ),
         ];
-        let name_width = pool
+        let names = pool
             .servers
             .iter()
             .map(|server| server.server.as_str())
@@ -426,36 +467,54 @@ impl ContextView<'_> {
                     .iter()
                     .map(|server| server.name.as_str()),
             )
-            .map(|name| safe_line(name).width())
+            .map(|name| clipped_name(name, MAX_POOL_NAME_COLUMNS))
+            .collect::<Vec<_>>();
+        let name_width = names.iter().map(|name| name.width()).max().unwrap_or(0);
+        let count_width = pool
+            .servers
+            .iter()
+            .map(|server| server.tools.len().to_string().len())
+            .max()
+            .unwrap_or(1);
+        let bar_cells = bar_cells(width, name_width);
+        let pool_tokens = pool.tokens();
+        let largest_tool = pool
+            .servers
+            .iter()
+            .flat_map(|server| &server.tools)
+            .map(|tool| tool.tokens)
             .max()
             .unwrap_or(0);
         let padded = |name: &str| {
-            let name = safe_line(name);
             format!(
-                "  {name}{}   ",
+                "  {name}{}  ",
                 " ".repeat(name_width.saturating_sub(name.width()))
             )
         };
-        for server in &pool.servers {
-            lines.push(vec![
-                (padded(&server.server), None),
-                (
-                    format!(
-                        "{} {} · ~{} tokens",
-                        server.tools.len(),
-                        plural(server.tools.len(), "tool"),
-                        compact_count(server.tokens())
-                    ),
-                    Some(Role::MutedText),
+        for (server, name) in pool.servers.iter().zip(&names) {
+            let tools = server.tools.len();
+            let mut line = vec![(padded(name), None)];
+            line.extend(bar(server.tokens(), pool_tokens, bar_cells, display));
+            line.push((
+                format!(
+                    "{tools:>count_width$} {} · ~{}",
+                    plural(tools, "tool"),
+                    compact_count(server.tokens())
                 ),
-            ]);
+                Some(Role::MutedText),
+            ));
+            lines.push(line);
             if self.expanded {
-                lines.extend(item_lines(&server.tools, "    ", "~"));
+                lines.extend(self.pool_tool_lines(&server.tools, largest_tool, bar_cells, display));
             }
         }
-        for server in &pool.unavailable_servers {
+        for (server, name) in pool
+            .unavailable_servers
+            .iter()
+            .zip(&names[pool.servers.len()..])
+        {
             lines.push(vec![
-                (padded(&server.name), None),
+                (padded(name), None),
                 (server_state(&server.state).into(), Some(Role::MutedText)),
             ]);
         }
@@ -463,6 +522,50 @@ impl ContextView<'_> {
             lines.push(muted(
                 "SearchTools, DescribeTools and ExecuteTools count under System tools.".into(),
             ));
+        }
+        lines
+    }
+
+    /// A server's tools, the largest first, each with a bar against the pool's largest tool.
+    fn pool_tool_lines(
+        &self,
+        tools: &[ContextItem],
+        largest: u64,
+        bar_cells: usize,
+        display: DisplayProfile,
+    ) -> Vec<Line> {
+        let shown = &tools[..tools.len().min(MAX_SECTION_ITEMS)];
+        let names = shown
+            .iter()
+            .map(|tool| clipped_name(&tool.name, MAX_POOL_TOOL_NAME_COLUMNS))
+            .collect::<Vec<_>>();
+        let name_width = names.iter().map(|name| name.width()).max().unwrap_or(0);
+        let mut lines = shown
+            .iter()
+            .zip(names)
+            .map(|(tool, name)| {
+                let mut line = vec![(
+                    format!(
+                        "    └ {name}{}  ",
+                        " ".repeat(name_width.saturating_sub(name.width()))
+                    ),
+                    None,
+                )];
+                line.extend(bar(tool.tokens, largest, bar_cells, display));
+                line.push((
+                    format!("~{} tokens", compact_count(tool.tokens)),
+                    Some(Role::MutedText),
+                ));
+                line
+            })
+            .collect::<Vec<_>>();
+        let rest = &tools[shown.len()..];
+        if !rest.is_empty() {
+            lines.push(muted(format!(
+                "    … {} more (~{} tokens)",
+                rest.len(),
+                compact_count(rest.iter().map(|tool| tool.tokens).sum())
+            )));
         }
         lines
     }
@@ -486,6 +589,7 @@ fn category_name(category: ContextCategory) -> &'static str {
         ContextCategory::Skills => "Skills",
         ContextCategory::ToolSearchResults => "Tool search results",
         ContextCategory::Messages => "Messages",
+        ContextCategory::Unattributed => "Unattributed (reported by the service)",
     }
 }
 
@@ -499,6 +603,7 @@ fn category_role(category: ContextCategory) -> Role {
         ContextCategory::Skills => Role::Warning,
         ContextCategory::ToolSearchResults => Role::ContextToolSearch,
         ContextCategory::Messages => Role::ContextMessages,
+        ContextCategory::Unattributed => Role::Subtle,
     }
 }
 
@@ -553,6 +658,51 @@ fn item_lines(items: &[ContextItem], indent: &str, approximate: &str) -> Vec<Lin
         )));
     }
     lines
+}
+
+/// How many cells a pool bar takes at `width`: none on a narrow terminal.
+fn bar_cells(width: usize, name_width: usize) -> usize {
+    if width < MIN_BAR_WIDTH {
+        return 0;
+    }
+    let cells = width
+        .saturating_sub(name_width + POOL_LINE_TEXT_COLUMNS)
+        .min(MAX_BAR_CELLS);
+    if cells < MIN_BAR_CELLS { 0 } else { cells }
+}
+
+/// `part` of `whole` as filled cells out of `cells`, then a gap; any nonzero part fills one.
+fn bar(part: u64, whole: u64, cells: usize, display: DisplayProfile) -> Vec<Run> {
+    if cells == 0 {
+        return Vec::new();
+    }
+    let filled = if whole == 0 || part == 0 {
+        0
+    } else {
+        ((part as f64 / whole as f64 * cells as f64).round() as usize).clamp(1, cells)
+    };
+    vec![
+        (
+            display.glyph(Glyph::BarFilled).repeat(filled),
+            Some(Role::ContextToolSearch),
+        ),
+        (
+            display.glyph(Glyph::BarEmpty).repeat(cells - filled),
+            Some(Role::MutedText),
+        ),
+        ("  ".into(), None),
+    ]
+}
+
+/// A name cut to `columns`, ending in `…` when cut.
+fn clipped_name(name: &str, columns: usize) -> String {
+    let name = safe_line(name);
+    if name.width() <= columns {
+        return name;
+    }
+    let mut clipped = super::console::truncate_width(&name, columns.saturating_sub(1));
+    clipped.push('…');
+    clipped
 }
 
 fn heading(title: &str, hint: &str) -> Line {

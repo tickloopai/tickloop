@@ -2378,49 +2378,18 @@ impl Agent {
         self.save(&snapshot);
         chats.insert(
             id,
-            Chat {
-                ids: tickloop_ids::IdContext::new(),
-                family_generation: 0,
-                family_stopping: false,
-                task_checkpoint_pending: false,
-                family_finishing: HashSet::new(),
+            NewChat {
                 snapshot,
                 bookkeeping,
-                start_new_tool_result_message: false,
-                needs_plan_mode_exit_notice: false,
-                mode_before_plan: None,
-                active: None,
-                active_run: None,
-                upgrade_wait: None,
-                parked: HashMap::new(),
-                releases: HashMap::new(),
-                ready_runs: VecDeque::new(),
                 client,
-                pending_client: None,
-                pending_model_thinking: None,
-                tools,
-                skills,
-                content_replacements: Default::default(),
-                file_history,
-                watching_commands: false,
-                watching_user_shells: false,
-                user_shell_queue: Arc::new(Notify::new()),
-                feedback_watcher: None,
-                feedback_inputs: HashMap::new(),
-                feedback_cleanup_started: false,
-                user_loops: HashMap::new(),
-                deferred_messages: Vec::new(),
-                user_cancelled_runs: HashSet::new(),
                 output_style,
                 user_context,
                 announced_date,
-                auto_denials: auto_mode::DenialTracking::default(),
-                denial_window: denials::DenialWindow::default(),
-                branch_reservation: None,
-                goal_recorded_tokens: 0,
-                loaded_from_history: false,
-                goal_clock_ms: 0,
-            },
+                tools,
+                skills,
+                file_history,
+            }
+            .into_chat(),
         );
         Ok(id)
     }
@@ -5653,6 +5622,78 @@ impl tickloop_harness_tools::ShellRetention for WeakAgent {
         match self.upgrade() {
             Some(agent) => agent.monitor_may_list_shell(chat.into(), task).await,
             None => false,
+        }
+    }
+}
+
+/// What a new Chat starts from; everything else in it starts empty.
+pub(crate) struct NewChat {
+    snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
+    client: Arc<dyn ModelClient>,
+    output_style: tickloop_harness_base::output_style::OutputStyle,
+    user_context: OnceLock<String>,
+    announced_date: Option<String>,
+    tools: Arc<tickloop_harness_tools::Tools>,
+    skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
+    file_history: Option<FileHistory>,
+}
+
+impl NewChat {
+    fn into_chat(self) -> Chat {
+        let Self {
+            snapshot,
+            bookkeeping,
+            client,
+            output_style,
+            user_context,
+            announced_date,
+            tools,
+            skills,
+            file_history,
+        } = self;
+        Chat {
+            ids: tickloop_ids::IdContext::new(),
+            family_generation: 0,
+            family_stopping: false,
+            task_checkpoint_pending: false,
+            family_finishing: HashSet::new(),
+            snapshot,
+            bookkeeping,
+            start_new_tool_result_message: false,
+            needs_plan_mode_exit_notice: false,
+            mode_before_plan: None,
+            active: None,
+            active_run: None,
+            upgrade_wait: None,
+            parked: HashMap::new(),
+            releases: HashMap::new(),
+            ready_runs: VecDeque::new(),
+            client,
+            pending_client: None,
+            pending_model_thinking: None,
+            tools,
+            skills,
+            content_replacements: Default::default(),
+            file_history,
+            watching_commands: false,
+            watching_user_shells: false,
+            user_shell_queue: Arc::new(Notify::new()),
+            feedback_watcher: None,
+            feedback_inputs: HashMap::new(),
+            feedback_cleanup_started: false,
+            user_loops: HashMap::new(),
+            deferred_messages: Vec::new(),
+            user_cancelled_runs: HashSet::new(),
+            output_style,
+            user_context,
+            announced_date,
+            auto_denials: auto_mode::DenialTracking::default(),
+            denial_window: denials::DenialWindow::default(),
+            branch_reservation: None,
+            goal_recorded_tokens: 0,
+            loaded_from_history: false,
+            goal_clock_ms: 0,
         }
     }
 }

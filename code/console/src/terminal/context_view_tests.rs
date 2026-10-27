@@ -44,6 +44,7 @@ fn breakdown() -> ContextBreakdown {
         skills: vec![item("tickloop", 1_500), item("notes:summarize", 800)],
         tool_search_results: vec![item("SearchTools quote stock", 1_800)],
         messages: vec![item("User messages", 3_000), item("Tool results", 6_200)],
+        host_notes: Vec::new(),
         tool_search: Some(ToolSearchPool {
             mode: ToolSearchMode::SearchTools,
             servers: vec![
@@ -64,6 +65,7 @@ fn breakdown() -> ContextBreakdown {
                 state: McpServerState::NeedsLogin,
             }],
         }),
+        host_tools_pending: false,
     }
 }
 
@@ -182,9 +184,9 @@ fn the_tool_search_pool_lists_servers_apart_from_the_context_in_its_own_colour()
         [
             "Tool search pool · SearchTools (loaded on demand, not in context)",
             "└ 3 tools on 2 servers · ~950 tokens if all loaded",
-            "  longbridge   2 tools · ~700 tokens",
-            "  ui5          1 tool · ~250 tokens",
-            "  figma        needs login",
+            "  longbridge  ██████████████████░░░░░░  2 tools · ~700",
+            "  ui5         ██████░░░░░░░░░░░░░░░░░░  1 tool · ~250",
+            "  figma       needs login",
             "SearchTools, DescribeTools and ExecuteTools count under System tools.",
         ]
     );
@@ -268,10 +270,13 @@ fn context_all_lists_every_item_the_largest_first_with_home_shortened() {
     );
     assert_eq!(
         section("Messages"),
-        ["└ User messages: 3k tokens", "└ Tool results: 6.2k tokens"]
+        ["└ Tool results: 6.2k tokens", "└ User messages: 3k tokens"]
     );
     let pool = section("Tool search pool");
-    assert_eq!(pool[2], "    └ mcp__longbridge__quote: ~400 tokens");
+    assert_eq!(
+        pool[2],
+        "    └ mcp__longbridge__quote  ████████████████████████  ~400 tokens"
+    );
     assert!(!lines.iter().any(|line| line.contains("to expand")));
 }
 
@@ -318,4 +323,170 @@ fn names_from_servers_and_files_cannot_control_the_terminal() {
             assert!(lines.contains(&"  evil\\u{1b}[2J".to_owned()));
         }
     }
+}
+
+#[test]
+fn host_notes_show_apart_from_what_the_user_typed() {
+    let mut noted = breakdown();
+    noted.messages = vec![item("User messages", 4), item("Assistant messages", 110)];
+    noted.host_notes = vec![
+        item("Skill guidance · tickloop", 6_000),
+        item("MCP server instructions · longbridge\u{1b}[31m", 4_400),
+    ];
+    let lines = texts(&render(&noted, 120, false));
+    assert!(lines.contains(&"└ includes 10.4k tokens of host notes · /context all".to_owned()));
+    let lines = texts(&render(&noted, 120, true));
+    let start = lines.iter().position(|line| line == "Messages").unwrap();
+    assert_eq!(
+        &lines[start + 1..start + 5],
+        [
+            "└ Skill guidance · tickloop: 6k tokens",
+            "└ MCP server instructions · longbridge\\u{1b}[31m: 4.4k tokens",
+            "└ Assistant messages: 110 tokens",
+            "└ User messages: 4 tokens",
+        ]
+    );
+}
+
+#[test]
+fn what_the_service_reports_beyond_the_count_has_its_own_row() {
+    let mut gap = breakdown();
+    gap.categories
+        .push(usage(ContextCategory::Unattributed, 12_000));
+    let lines = texts(&render(&gap, 120, false));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line
+                .ends_with("⛁ Unattributed (reported by the service): 12k tokens (6.0%)"))
+    );
+}
+
+fn pool_lines(breakdown: &ContextBreakdown, width: usize, expanded: bool) -> Vec<String> {
+    let lines = texts(&render(breakdown, width, expanded));
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("Tool search pool"))
+        .unwrap();
+    lines[start + 2..]
+        .iter()
+        .take_while(|line| line.starts_with("  "))
+        .cloned()
+        .collect()
+}
+
+fn with_pool(servers: Vec<ContextToolServer>) -> ContextBreakdown {
+    let mut breakdown = breakdown();
+    breakdown.tool_search.as_mut().unwrap().servers = servers;
+    breakdown
+}
+
+#[test]
+fn pool_bars_show_each_servers_share_and_a_tiny_share_still_fills_a_cell() {
+    let pool = with_pool(vec![
+        ContextToolServer {
+            server: "longbridge".into(),
+            tools: (0..191)
+                .map(|index| item(&format!("tool{index}"), 438))
+                .collect(),
+        },
+        ContextToolServer {
+            server: "airtable".into(),
+            tools: (0..5)
+                .map(|index| item(&format!("table{index}"), 20))
+                .collect(),
+        },
+    ]);
+    let lines = pool_lines(&pool, 120, false);
+    assert_eq!(
+        lines[0],
+        "  longbridge  ████████████████████████  191 tools · ~83.7k"
+    );
+    assert_eq!(
+        lines[1],
+        "  airtable    █░░░░░░░░░░░░░░░░░░░░░░░    5 tools · ~100"
+    );
+    assert_eq!(lines[2], "  figma       needs login");
+    let bars = render(&pool, 120, false)
+        .into_iter()
+        .flatten()
+        .filter(|(text, _)| text.starts_with('█'))
+        .map(|(_, role)| role)
+        .collect::<Vec<_>>();
+    assert!(
+        bars.iter()
+            .all(|role| *role == Some(Role::ContextToolSearch))
+    );
+}
+
+#[test]
+fn a_narrow_terminal_lists_the_pool_without_bars() {
+    let lines = pool_lines(&breakdown(), 59, false);
+    assert_eq!(
+        lines,
+        [
+            "  longbridge  2 tools · ~700",
+            "  ui5         1 tool · ~250",
+            "  figma       needs login",
+        ]
+    );
+    let medium = pool_lines(&breakdown(), 64, false);
+    assert!(
+        medium[0].contains('█') && medium[0].width() <= 64,
+        "{medium:?}"
+    );
+}
+
+#[test]
+fn long_server_names_are_cut_and_aligned() {
+    let pool = with_pool(vec![ContextToolServer {
+        server: "a-very-long-server-name-indeed".into(),
+        tools: vec![item("tool", 10)],
+    }]);
+    let lines = pool_lines(&pool, 120, false);
+    assert!(
+        lines[0].starts_with("  a-very-long-server-…  █"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("  figma                 needs login"),
+        "{}",
+        lines[1]
+    );
+}
+
+#[test]
+fn context_all_bars_each_tool_against_the_largest_and_sums_up_the_rest() {
+    let pool = with_pool(vec![ContextToolServer {
+        server: "longbridge".into(),
+        tools: (0..60)
+            .map(|index| item(&format!("tool{index:02}"), 600 - index * 10))
+            .collect(),
+    }]);
+    let lines = pool_lines(&pool, 120, true);
+    assert_eq!(
+        lines[1],
+        "    └ tool00  ████████████████████████  ~600 tokens"
+    );
+    assert_eq!(
+        lines[50],
+        "    └ tool49  ████░░░░░░░░░░░░░░░░░░░░  ~110 tokens"
+    );
+    assert_eq!(lines[51], "    … 10 more (~550 tokens)");
+}
+
+#[test]
+fn a_count_before_the_first_message_says_what_it_leaves_out() {
+    let mut draft = breakdown();
+    draft.calibrated = false;
+    draft.host_tools_pending = true;
+    let lines = texts(&render(&draft, 120, false));
+    assert!(lines.contains(
+        &"Before the first message: Tick, Artifact and MCP tools join when the Agent starts and are not counted."
+            .to_owned()
+    ));
+    assert!(lines.contains(
+        &"Estimated with o200k_base · no request has measured this context yet".to_owned()
+    ));
 }

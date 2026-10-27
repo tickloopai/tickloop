@@ -1113,6 +1113,10 @@
         {
           "category": "messages",
           "tokens": 17000
+        },
+        {
+          "category": "unattributed",
+          "tokens": 2000
         }
       ],
       "autocompact_buffer_tokens": 40000,
@@ -1158,6 +1162,12 @@
           "tokens": 17000
         }
       ],
+      "host_notes": [
+        {
+          "name": "MCP server instructions · market",
+          "tokens": 600
+        }
+      ],
       "tool_search": {
         "mode": "search_tools",
         "servers": [
@@ -1177,7 +1187,8 @@
             "state": "needs_login"
           }
         ]
-      }
+      },
+      "host_tools_pending": true
     }
   },
   {

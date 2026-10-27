@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mcp::McpServerState;
+use crate::{ExecutionMode, ModelConfig, SearchConfig};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextBreakdown {
@@ -27,10 +28,18 @@ pub struct ContextBreakdown {
     pub instruction_files: Vec<ContextItem>,
     pub skills: Vec<ContextItem>,
     pub tool_search_results: Vec<ContextItem>,
-    /// User messages, assistant messages and tool results.
+    /// What the user typed, assistant messages and tool results.
     pub messages: Vec<ContextItem>,
+    /// User-role messages the host wrote, such as MCP server instructions and Skill guidance, by
+    /// source; they count under Messages too.
+    #[serde(default)]
+    pub host_notes: Vec<ContextItem>,
     /// Present when the Chat reaches MCP tools through tool search.
     pub tool_search: Option<ToolSearchPool>,
+    /// Counted before the Agent started: the host's Tick, Artifact and MCP tools join when it
+    /// does and are not counted, and its MCP servers have not connected yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_tools_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +52,9 @@ pub enum ContextCategory {
     Skills,
     ToolSearchResults,
     Messages,
+    /// What the service reported beyond the count by more than the count can explain, such as
+    /// definitions a vendor's tool search loads.
+    Unattributed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -102,4 +114,14 @@ pub enum ToolSearchMode {
 pub struct UnavailableToolServer {
     pub name: String,
     pub state: McpServerState,
+}
+
+/// What a New Agent would start its first request with, for `/context` before that request: the
+/// draft's model and settings, which the Agent's own defaults would otherwise choose.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextDraft {
+    pub model: ModelConfig,
+    pub execution_mode: ExecutionMode,
+    pub search_config: Option<SearchConfig>,
+    pub task_tools_enabled: bool,
 }

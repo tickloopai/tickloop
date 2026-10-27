@@ -3786,20 +3786,28 @@ async fn interact_with_herdr(
                                 (Some(context_view::EXPAND_ARGUMENT), None) => true,
                                 _ => { outln!(console, "Usage: /context [{}]", context_view::EXPAND_ARGUMENT); continue; }
                             };
-                            let Some(chat)=selected_chat else { outln!(console,"No Chat is selected."); continue; };
-                            match (agent.context_breakdown(chat.into()).await, agent.status(chat.into()).await) {
-                                (Ok(breakdown), Ok(status)) => {
+                            let counted = match selected_chat {
+                                Some(chat) => match (agent.context_breakdown(chat.into()).await, agent.status(chat.into()).await) {
+                                    (Ok(breakdown), Ok(status)) => Ok(Some((breakdown, status.model))),
+                                    (Err(error), _) | (_, Err(error)) => Err(error),
+                                },
+                                // Before the first message the New Agent does not exist yet: count what its first request would hold.
+                                None => agent.draft_context_breakdown(global.projection().dispatch_directory).await,
+                            };
+                            match counted {
+                                Ok(Some((breakdown, model))) => {
                                     let home = std::env::home_dir();
                                     let view = context_view::ContextView {
                                         breakdown: &breakdown,
-                                        model_name: settings::model_name(&status.model),
-                                        model_id: &status.model.model,
+                                        model_name: settings::model_name(&model),
+                                        model_id: &model.model,
                                         home: home.as_deref(),
                                         expanded,
                                     };
                                     console.write_roles(&view.runs(console.conversation_width()?, console.display_profile()?))?;
                                 },
-                                (Err(error), _) | (_, Err(error)) => outln!(console,"Cannot read context usage: {}",safe_text(&error.to_string())),
+                                Ok(None) => outln!(console,"No model is set up for the New Agent yet; choose one with /model to see its context."),
+                                Err(error) => outln!(console,"Cannot read context usage: {}",safe_text(&error.to_string())),
                             }
                         },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat.map(Into::into),false).await {

@@ -71,8 +71,8 @@ pub use chat::{
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_breakdown::{
-    ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextItem, ContextToolServer,
-    ToolSearchMode, ToolSearchPool, UnavailableToolServer,
+    ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextDraft, ContextItem,
+    ContextToolServer, ToolSearchMode, ToolSearchPool, UnavailableToolServer,
 };
 pub use context_usage::{
     ContextMeasurement, ContextTokenCounter, ESTIMATED_CONTEXT_BYTES_PER_TOKEN,
