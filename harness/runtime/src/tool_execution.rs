@@ -2564,7 +2564,7 @@ impl Agent {
         match assessment.verdict.clone() {
             AutoReview::Allow => decision = Decision::Allow,
             AutoReview::Ask { reason, .. } => {
-                decision = self.apply_prompt_policy(Decision::Ask);
+                decision = self.review_escalation();
                 approval_reason = Some(reason.clone());
                 if decision == Decision::Deny {
                     auto_denial_message = Some(reason);
@@ -2614,7 +2614,7 @@ impl Agent {
                 approval_reason = Some(auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into());
             }
             AutoReview::Unavailable { message } => {
-                decision = self.apply_prompt_policy(Decision::Ask);
+                decision = self.review_escalation();
                 approval_reason = Some(message.clone());
                 if decision == Decision::Deny {
                     auto_denial_message = Some(message);

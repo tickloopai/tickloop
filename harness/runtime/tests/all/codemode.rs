@@ -1102,3 +1102,127 @@ async fn first_script_can_spill_output_before_any_filesystem_tool_runs() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), "spill".repeat(1000));
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn auto_reviews_script_mcp_calls_against_the_script_and_earlier_redacted_results() {
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tickloop_harness_protocol::{
+        EventKind, ExecutionMode,
+        mcp::{McpServerConfig, McpTransport, ToolExposure},
+    };
+    use tickloop_harness_runtime::{
+        Agent,
+        mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, auto_classification, call, config, mcp_service::McpService, next_event, text,
+    };
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"rows","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
+    server
+        .set_result(json!({"content":[{"type":"text","text":"ROWS_EVIDENCE SENSITIVE_FIXTURE"}]}));
+    let configs = vec![McpServerConfig {
+        name: "data-source".into(),
+        source: "fixture".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        timeout_ms: 5000,
+        oauth: Default::default(),
+        sensitive_values: vec!["SENSITIVE_FIXTURE".into()],
+        disabled: false,
+        exposure: ToolExposure::Codemode,
+        tool_exposure: vec![],
+        description: String::new(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities {
+            scripts: true,
+            local_processes: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let script = "await tools.mcp__data_source__rows({}); await tools.mcp__data_source__rows({}); text('SCRIPT_FINISHED');";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("script", "Codemode", json!({"code":script})),
+        text("done"),
+    ]));
+    let mut rejection = auto_classification(true);
+    rejection["reason"] = json!("SCRIPT_REVIEW_DENIED");
+    let reviewer = Arc::new(ScriptedModel::new(vec![
+        text(&auto_classification(false).to_string()),
+        text(&rejection.to_string()),
+        text(&rejection.to_string()),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || configs.clone()),
+        )))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Read the rows".into()).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { .. } => panic!("Auto review decides these calls"),
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(server.calls().len(), 1);
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let result = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.call_id == "script")
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap();
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("SCRIPT_REVIEW_DENIED"),
+        "{}",
+        result.content
+    );
+    assert!(!result.content.contains("SCRIPT_FINISHED"));
+    let reviews = reviewer.requests.lock().unwrap();
+    assert_eq!(reviews.len(), 3);
+    let first = serde_json::to_string(&reviews[0].messages).unwrap();
+    assert!(first.contains("Model-authored nested calls"));
+    assert!(
+        first.contains("SCRIPT_FINISHED"),
+        "the whole script is evidence"
+    );
+    let second = serde_json::to_string(&reviews[1].messages).unwrap();
+    assert!(
+        second.contains("ROWS_EVIDENCE"),
+        "earlier results are evidence"
+    );
+    let every_review = reviews
+        .iter()
+        .map(|review| serde_json::to_string(&review.messages).unwrap())
+        .collect::<String>();
+    assert!(!every_review.contains("SENSITIVE_FIXTURE"));
+    drop(reviews);
+    agent.shutdown().await;
+}

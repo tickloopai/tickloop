@@ -760,10 +760,12 @@ fn host_tool_decision(
             Decision::Deny
         } else if let Some(rule) = configured {
             Decision::from(rule.decision)
-        } else if execution_mode == ExecutionMode::FullAccess {
-            Decision::Allow
         } else {
-            Decision::Ask
+            match execution_mode {
+                ExecutionMode::FullAccess => Decision::Allow,
+                ExecutionMode::Auto => Decision::Check,
+                _ => Decision::Ask,
+            }
         };
     }
     let is_allowed_by_host = configured.is_some_and(|matched| {
@@ -1483,12 +1485,8 @@ impl Agent {
                     "Auto reviewer settings are unavailable ({error}); review this action manually."
                 );
                 if emit_permission {
-                    self.emit_permission_check(
-                        receipt,
-                        self.apply_prompt_policy(Decision::Ask),
-                        reason.clone(),
-                    )
-                    .await;
+                    self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                        .await;
                 }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
@@ -1504,12 +1502,8 @@ impl Agent {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
-                self.emit_permission_check(
-                    receipt,
-                    self.apply_prompt_policy(Decision::Ask),
-                    reason.clone(),
-                )
-                .await;
+                self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                    .await;
             }
             return Ok(approval_assessment::ApprovalAssessment::missing_context(
                 operation,
@@ -1536,12 +1530,8 @@ impl Agent {
             Err(approval_context::ApprovalContextError::MissingOriginalUserInput) => {
                 let reason = "Original user authorization for this Loop is unavailable; review this action manually.".to_owned();
                 if emit_permission {
-                    self.emit_permission_check(
-                        receipt,
-                        self.apply_prompt_policy(Decision::Ask),
-                        reason.clone(),
-                    )
-                    .await;
+                    self.emit_permission_check(receipt, self.review_escalation(), reason.clone())
+                        .await;
                 }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
@@ -1766,16 +1756,12 @@ impl Agent {
         let (decision, reason) = match review {
             AutoReview::Allow => (Decision::Allow, "Auto policy allowed the operation".into()),
             AutoReview::Block { reason, .. } => (Decision::Deny, reason.clone()),
-            AutoReview::Ask { reason, .. } => {
-                (self.apply_prompt_policy(Decision::Ask), reason.clone())
-            }
+            AutoReview::Ask { reason, .. } => (self.review_escalation(), reason.clone()),
             AutoReview::ContextLimit => (
-                self.apply_prompt_policy(Decision::Ask),
+                self.review_escalation(),
                 auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into(),
             ),
-            AutoReview::Unavailable { message } => {
-                (self.apply_prompt_policy(Decision::Ask), message.clone())
-            }
+            AutoReview::Unavailable { message } => (self.review_escalation(), message.clone()),
         };
         self.emit_permission_check(receipt, decision, reason).await;
     }
@@ -2107,20 +2093,31 @@ impl Agent {
         }
     }
 
-    /// `apply_prompt_policy`, except that an Ask the user explicitly required still asks under
-    /// an Unrestricted host.
+    /// `apply_prompt_policy`, except that an Unrestricted host cannot waive a person or a reviewer
+    /// that an explicit Ask rule or the tool's own permission class requires.
     fn apply_prompt_policy_with_explicit_ask(
         &self,
         decision: Decision,
         is_explicit_ask: bool,
     ) -> Decision {
         if is_explicit_ask
-            && decision == Decision::Ask
+            && matches!(decision, Decision::Ask | Decision::Check)
             && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
         {
-            Decision::Ask
+            decision
         } else {
             self.apply_prompt_policy(decision)
+        }
+    }
+
+    /// Where an Auto review that does not admit a call sends it: to a person, or to a denial on a
+    /// host that cannot ask. Review runs under an Unrestricted host only for calls that host
+    /// cannot waive, so their escalation still reaches a person.
+    fn review_escalation(&self) -> Decision {
+        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+            Decision::Deny
+        } else {
+            Decision::Ask
         }
     }
 
