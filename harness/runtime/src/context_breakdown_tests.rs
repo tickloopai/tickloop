@@ -623,3 +623,59 @@ async fn a_draft_counts_its_first_request_without_creating_a_chat() {
     let _ = existing;
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_autocompact_buffer_ends_where_compaction_starts_under_the_window_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    for cap in [None, Some(100_000)] {
+        let mut options = crate::local_options(
+            tickloop_harness_test_support::config_with_window(200_000),
+            None,
+            tickloop_harness_protocol::AgentHostOptions::embedded_defaults(),
+        );
+        options.settings = Some(Arc::new(
+            tickloop_harness_policy::settings::MemorySettingsStore::new(
+                tickloop_harness_policy::settings::SettingsSnapshot {
+                    auto_compact_window: cap,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let agent = Agent::with_seams(
+            crate::HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
+                models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(
+                    tickloop_harness_test_support::ScriptedModel::new(vec![]),
+                )),
+            },
+            options,
+        )
+        .unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.auto_compact_window, cap);
+        let line = crate::context::auto_compact_tokens(&snapshot).unwrap() as u64;
+        assert_eq!(
+            line,
+            tickloop_harness_protocol::auto_compact_line(
+                cap.unwrap_or(200_000),
+                snapshot.model.max_output_tokens,
+                None,
+            ) as u64
+        );
+        assert_eq!(
+            agent.status(chat).await.unwrap().auto_compact_tokens,
+            Some(line)
+        );
+        let breakdown = agent.context_breakdown(chat).await.unwrap();
+        assert_eq!(breakdown.autocompact_buffer_tokens, Some(200_000 - line));
+        assert_eq!(
+            breakdown.free_tokens,
+            Some(line - breakdown.used_tokens),
+            "free space runs out exactly at the compaction line"
+        );
+        agent.shutdown().await;
+    }
+}

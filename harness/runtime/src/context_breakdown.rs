@@ -12,8 +12,8 @@ use tickloop_harness_protocol::mcp::ToolExposure;
 use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, CompactionMarker, Content, ContextBreakdown, ContextCategory,
     ContextCategoryUsage, ContextDraft, ContextItem, ContextTokenCounter, ContextToolServer,
-    GuidanceNote, HostNote, Message, ModelRequestKind, Role, ToolDefinition, ToolSearchMode,
-    ToolSearchPool, UnavailableToolServer, message_content_tokens,
+    GuidanceNote, HostNote, Message, Role, ToolDefinition, ToolSearchMode, ToolSearchPool,
+    UnavailableToolServer, message_content_tokens,
 };
 
 use crate::tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS, SearchSupport};
@@ -84,6 +84,9 @@ impl Agent {
         snapshot.search_config = draft.search_config;
         snapshot.task_tools_enabled = draft.task_tools_enabled;
         snapshot.context_window_tokens = defaults.context_window_tokens;
+        snapshot.auto_compact_window = settings
+            .as_ref()
+            .and_then(|settings| settings.auto_compact_window);
         if let crate::SearchDefaults::Fixed(config) = &self.inner.search {
             snapshot.search_config = config.clone();
         }
@@ -208,12 +211,6 @@ impl Agent {
             .get()
             .cloned()
             .unwrap_or_else(|| user_context_message(instruction_files, current_date));
-        let identity = chat.snapshot.model.identity();
-        let is_measured = chat.snapshot.request_usage.entries().iter().any(|entry| {
-            entry.kind == ModelRequestKind::Conversation
-                && entry.model == identity
-                && entry.context_measurement.is_some()
-        });
         Ok(ContextParts {
             system_prompt: self.conversation_system_message(
                 chat,
@@ -235,8 +232,8 @@ impl Agent {
             message_labels,
             search,
             window,
-            compaction_trigger: window.map(crate::context::input_token_budget),
-            reported_total: is_measured
+            compaction_trigger: crate::context::auto_compact_tokens(&chat.snapshot),
+            reported_total: crate::context::is_context_measured(&chat.snapshot)
                 .then(|| {
                     tickloop_harness_protocol::current_context_tokens(
                         &chat.snapshot,

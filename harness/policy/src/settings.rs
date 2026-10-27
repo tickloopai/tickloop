@@ -32,6 +32,9 @@ pub struct SettingsSnapshot {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_enabled: bool,
     pub context_window_tokens: Option<usize>,
+    /// The `autoCompactWindow` setting: caps the window the automatic compaction line is measured
+    /// in.
+    pub auto_compact_window: Option<usize>,
     pub search: Option<SearchConfig>,
     pub output_style: OutputStyle,
     pub goal_token_budget: Option<u64>,
@@ -52,6 +55,7 @@ impl Default for SettingsSnapshot {
             reasoning_effort: None,
             thinking_enabled: true,
             context_window_tokens: None,
+            auto_compact_window: None,
             search: SearchConfig::enabled_default(),
             output_style: OutputStyle::default(),
             goal_token_budget: None,

@@ -817,6 +817,8 @@ pub struct LiveChatSnapshot {
     pub user_shells: Vec<UserShellRecord>,
     pub request_usage: RequestUsageLedger,
     pub context_window_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_window: Option<usize>,
     pub last_model_run: Option<RunId>,
     pub warnings: Vec<String>,
     pub request_refs: Vec<RequestRef>,
@@ -858,6 +860,7 @@ impl LiveChatSnapshot {
             user_shells: snapshot.user_shells.clone(),
             request_usage: snapshot.request_usage.clone(),
             context_window_tokens: snapshot.context_window_tokens,
+            auto_compact_window: snapshot.auto_compact_window,
             last_model_run: snapshot.last_model_run,
             request_refs: RequestRef::pending(
                 execution,
@@ -891,6 +894,7 @@ impl LiveChatSnapshot {
                     commands: &self.commands,
                     request_usage: &self.request_usage,
                     context_window_tokens: self.context_window_tokens,
+                    auto_compact_window: self.auto_compact_window,
                     events: &self.events,
                     last_sequence: self.last_sequence,
                 },
@@ -924,6 +928,7 @@ impl LiveChatSnapshot {
         snapshot.user_shells = self.user_shells;
         snapshot.request_usage = self.request_usage;
         snapshot.context_window_tokens = self.context_window_tokens;
+        snapshot.auto_compact_window = self.auto_compact_window;
         snapshot.last_model_run = self.last_model_run;
         snapshot
     }

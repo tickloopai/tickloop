@@ -133,6 +133,10 @@ pub fn serialize<S: Serializer>(snapshot: &ChatSnapshot, serializer: S) -> Resul
         serde_json::to_value(snapshot.context_window_tokens).map_err(serde::ser::Error::custom)?,
     );
     live.insert(
+        "auto_compact_window".into(),
+        serde_json::to_value(snapshot.auto_compact_window).map_err(serde::ser::Error::custom)?,
+    );
+    live.insert(
         "pending_model".into(),
         serde_json::to_value(&snapshot.pending_model).map_err(serde::ser::Error::custom)?,
     );
@@ -247,6 +251,13 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ChatSna
     snapshot.context_window_tokens =
         serde_json::from_value(take(&mut live, "context_window_tokens")?)
             .map_err(serde::de::Error::custom)?;
+    // A process from before the setting hands over no cap.
+    snapshot.auto_compact_window = live
+        .remove("auto_compact_window")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)?
+        .flatten();
     snapshot.pending_model = serde_json::from_value(take(&mut live, "pending_model")?)
         .map_err(serde::de::Error::custom)?;
     snapshot.commands =

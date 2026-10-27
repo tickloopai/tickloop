@@ -170,6 +170,10 @@ pub struct ChatSnapshot {
     pub pending_thinking: BTreeMap<RunId, String>,
     #[serde(skip)]
     pub context_window_tokens: Option<usize>,
+    /// The `autoCompactWindow` setting: the window the automatic compaction line is measured in,
+    /// when smaller than the model's.
+    #[serde(skip)]
+    pub auto_compact_window: Option<usize>,
     #[serde(skip)]
     pub pending_model: Option<ModelConfig>,
     /// Plan and progress of each Loop. Plan content is written to

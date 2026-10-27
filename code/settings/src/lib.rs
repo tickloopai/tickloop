@@ -64,6 +64,9 @@ const EFFORT_LEVEL_KEY: &str = "effortLevel";
 const THINKING_ENABLED_KEY: &str = "alwaysThinkingEnabled";
 const DEFAULT_MODE_KEY: &str = "defaultMode";
 const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
+/// Claude Code's `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: a window in tokens that caps the one the
+/// automatic compaction line is measured in.
+const AUTO_COMPACT_WINDOW_KEY: &str = "autoCompactWindow";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
 const MONITOR_POPUP_KEY: &str = "monitorPopup";
@@ -326,6 +329,22 @@ impl LoadedSettings {
             _ => {
                 self.warn(format!(
                     "`{GOAL_TOKEN_BUDGET_KEY}` must be a positive integer and is ignored"
+                ));
+                None
+            }
+        }
+    }
+
+    pub fn auto_compact_window(&mut self) -> Option<usize> {
+        let value = self.settings.get(AUTO_COMPACT_WINDOW_KEY)?;
+        match value
+            .as_u64()
+            .and_then(|tokens| usize::try_from(tokens).ok())
+        {
+            Some(tokens) if tokens > 0 => Some(tokens),
+            _ => {
+                self.warn(format!(
+                    "`{AUTO_COMPACT_WINDOW_KEY}` must be a positive integer of tokens and is ignored"
                 ));
                 None
             }
@@ -747,6 +766,10 @@ impl UserSettings {
 
     pub fn goal_check_model(&self) -> Option<ModelConfig> {
         self.load().goal_check_model()
+    }
+
+    pub fn auto_compact_window(&self) -> Option<usize> {
+        self.load().auto_compact_window()
     }
 
     pub fn context_window_tokens(&self) -> Option<usize> {
