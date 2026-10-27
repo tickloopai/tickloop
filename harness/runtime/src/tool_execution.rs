@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::cache_prefix::{HeldHostTools, ListingGroup};
+use crate::cache_prefix::ListingGroup;
 use tickloop_harness_protocol::{
     ApprovalOutcome, ApprovalPath, ApprovalReviewerKind, AutoBlockKind, DenialCategory,
     DenialRecord, EventKind, HostToolAuthority, OperationRecord, OperationState,
@@ -242,6 +242,8 @@ pub(super) struct ToolRegistry {
     offers_web_search: bool,
     /// Whether the Chat's model searches deferred tools natively.
     native_search: bool,
+    /// The user's exposure changes, which reach the Run's held MCP tools at once.
+    user_exposure: crate::cache_prefix::UserExposure,
 }
 
 impl ToolRegistry {
@@ -374,6 +376,7 @@ impl ToolRegistry {
             tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model).is_some();
         let mut folded = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
+        let mut user_exposure = crate::cache_prefix::UserExposure::default();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
             if provider.has_tool_search()
                 || provider
@@ -391,9 +394,17 @@ impl ToolRegistry {
                 );
             }
             if provider.has_tool_search() {
+                let discovery_tools = chat_discovery_tools(chat, provider.as_ref());
+                user_exposure = crate::cache_prefix::UserExposure {
+                    revisions: provider.exposure_revisions(),
+                    tool_servers: discovery_tools
+                        .iter()
+                        .map(|tool| (tool.definition.name.clone(), tool.server.clone()))
+                        .collect(),
+                };
                 let directory = Arc::new(
                     crate::tool_exposure::ExposureDirectory::new(
-                        chat_discovery_tools(chat, provider.as_ref()),
+                        discovery_tools,
                         search_support(chat),
                     )
                     .with_unavailable_servers(provider.unavailable_tool_servers()),
@@ -445,26 +456,32 @@ impl ToolRegistry {
             deferred,
             offers_web_search: policy.web_search,
             native_search,
+            user_exposure,
         }
     }
 
-    /// Holds the MCP part of the tools to what the Run's first request offered, as `held`
+    /// Holds the MCP part of the tools to what the Run's first request offered, as `state`
     /// decides: MCP tools that appeared since stay unlisted until the next Run, and those that
-    /// vanished keep their declaration and are not executed. Other host tools, such as the
-    /// Artifacts tools a sign-in brings, follow the host as before.
-    pub(super) fn hold_host_tools(&mut self, held: &mut Option<HeldHostTools>, run_id: RunId) {
+    /// vanished keep their declaration and are not executed, unless the user changed their
+    /// server's exposure. Other host tools, such as the Artifacts tools a sign-in brings, follow
+    /// the host as before.
+    pub(super) fn hold_host_tools(
+        &mut self,
+        state: &mut crate::cache_prefix::CachePrefixState,
+        run_id: RunId,
+    ) {
         let listed = self
             .tools
             .iter()
             .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
             .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
             .collect();
-        let Some(offer) = HeldHostTools::hold(
-            held,
+        let Some(offer) = state.hold(
             run_id,
             self.native_search,
             listed,
             self.deferred.clone(),
+            self.user_exposure.clone(),
         ) else {
             return;
         };

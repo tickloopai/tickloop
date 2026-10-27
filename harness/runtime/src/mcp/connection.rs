@@ -91,8 +91,8 @@ pub(super) enum Served {
     Closed,
 }
 
-/// Which remembered tool list a server may start from: its configuration without secret values,
-/// and the account its login belongs to.
+/// Which remembered tool list a server may start from: its configuration without secret values
+/// or exposure, and the account its login belongs to.
 pub(super) fn tool_list_key(
     config: &McpServerConfig,
     credential: Option<&ConnectorCredential>,
@@ -101,6 +101,8 @@ pub(super) fn tool_list_key(
     let mut identity = config.clone();
     identity.sensitive_values.clear();
     identity.disabled = false;
+    identity.exposure = Default::default();
+    identity.tool_exposure.clear();
     match &mut identity.transport {
         McpTransport::Http { headers, .. } => headers.values_mut().for_each(String::clear),
         McpTransport::Stdio { env, .. } => env.values_mut().for_each(String::clear),
@@ -337,7 +339,7 @@ pub(super) async fn serve(
                     }
                 }
                 if let Ok(Ok(tools)) = tools {
-                    let (mut tools, mut warnings) = catalog::directory(&entry.config, tools);
+                    let (mut tools, mut warnings) = catalog::directory(&entry.config.name, tools);
                     entry.restore_tool_schemas(&mut tools, &mut warnings);
                     entry.adopt_tools(tools, warnings);
                 } else {
@@ -533,7 +535,7 @@ async fn open(
         }
         None => None,
     };
-    let (mut tools, mut warnings) = catalog::directory(config, tools);
+    let (mut tools, mut warnings) = catalog::directory(&config.name, tools);
     entry.restore_tool_schemas(&mut tools, &mut warnings);
     let instructions = service
         .peer()

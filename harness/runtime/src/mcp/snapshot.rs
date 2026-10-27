@@ -13,6 +13,30 @@ pub(super) struct Tool {
     pub display_validator: jsonschema::Validator,
     pub fingerprint: [u8; 32],
 }
+/// How a server's tools reach the model: the server's exposure and its per-tool overrides.
+#[derive(Clone, PartialEq)]
+pub(super) struct Exposure {
+    pub server: ToolExposure,
+    pub tools: Vec<(String, ToolExposure)>,
+}
+impl Exposure {
+    pub(super) fn of(config: &McpServerConfig) -> Self {
+        Self {
+            server: config.exposure,
+            tools: config.tool_exposure.clone(),
+        }
+    }
+    fn of_tool(&self, original: &str) -> ToolExposure {
+        crate::tool_exposure::effective_exposure(self.server, &self.tools, original)
+    }
+    pub(super) fn offers_tools(&self) -> bool {
+        self.server != ToolExposure::Hidden
+            || self
+                .tools
+                .iter()
+                .any(|(_, exposure)| *exposure != ToolExposure::Hidden)
+    }
+}
 #[derive(Clone, Default)]
 pub(super) struct Catalog {
     pub generation: u64,
@@ -23,6 +47,19 @@ pub(super) struct Catalog {
     pub resources: Vec<Value>,
 }
 impl Entry {
+    pub(super) fn exposure(&self) -> Exposure {
+        self.exposure.read().unwrap().clone()
+    }
+    /// Takes up the user's new choice of how the tools reach the model and republishes them;
+    /// false when nothing changed.
+    pub(super) fn change_exposure(&self, exposure: Exposure) -> bool {
+        if *self.exposure.read().unwrap() == exposure {
+            return false;
+        }
+        *self.exposure.write().unwrap() = exposure;
+        self.publish_catalog();
+        true
+    }
     pub(super) fn current_catalog(&self) -> Arc<Catalog> {
         let snapshot = self.snapshot.read().unwrap().clone();
         if snapshot.secret_generation == self.secret_generation.load(Ordering::SeqCst) {
@@ -53,9 +90,17 @@ impl Entry {
     }
     fn published_warnings(&self, connection: Option<&Connection>) -> Vec<String> {
         let listed = self.tools.read().unwrap().clone();
+        let exposure = self.exposure();
+        let omitted = listed
+            .iter()
+            .flat_map(|list| list.tools.iter())
+            .filter(|(_, tool)| !tool.lists_directly(&exposure))
+            .map(|(name, _)| format!("{name}: unsupported input schema; tool omitted"))
+            .collect::<Vec<_>>();
         listed
             .iter()
             .flat_map(|list| list.warnings.iter())
+            .chain(omitted.iter())
             .chain(
                 connection
                     .map(|connection| connection.warnings.read().unwrap().clone())
@@ -76,7 +121,11 @@ impl Entry {
         let _timing = crate::timing::Phase::new("mcp_catalog_build");
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut tools = BTreeMap::new();
+        let exposure = self.exposure();
         for tool in listed.tools.values().cloned() {
+            if !tool.lists_directly(&exposure) {
+                continue;
+            }
             let mut definition = tool.definition;
             if redact(self, definition.name.clone()) != definition.name {
                 continue;
@@ -101,11 +150,7 @@ impl Entry {
             redact_schema(self, &mut original_schema);
             let mut annotations = tool.annotations;
             redact_schema(self, &mut annotations);
-            let exposure = crate::tool_exposure::effective_exposure(
-                self.config.exposure,
-                &self.config.tool_exposure,
-                &tool.original,
-            );
+            let exposure = exposure.of_tool(&tool.original);
             tools.insert(
                 definition.name.clone(),
                 Arc::new(Tool {
@@ -138,5 +183,12 @@ impl Entry {
         self.catalog_builds.fetch_add(1, Ordering::Relaxed);
         self.catalog_micros
             .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+impl super::catalog::Tool {
+    /// Whether the tool can be offered as `exposure` offers it: a tool listed directly needs a
+    /// schema that flattens to an object.
+    fn lists_directly(&self, exposure: &Exposure) -> bool {
+        self.flattened || exposure.of_tool(&self.original) != ToolExposure::Direct
     }
 }

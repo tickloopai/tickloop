@@ -156,6 +156,10 @@ impl HostToolProvider for McpToolProvider {
         self.connections.unavailable_tool_servers()
     }
 
+    fn exposure_revisions(&self) -> BTreeMap<String, u64> {
+        self.connections.exposure_revisions()
+    }
+
     fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
         Some(self.connections.awaited_servers())
     }
@@ -234,7 +238,7 @@ impl HostToolProvider for McpToolProvider {
                         &entry.config.name,
                         &entry.config.source,
                         &state,
-                        entry.config.exposure,
+                        entry.exposure().server,
                         &entry.description.read().unwrap(),
                         &instructions,
                     ),
