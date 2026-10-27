@@ -878,3 +878,94 @@ async fn live_fold_search_describe_execute_with_kimi() {
         "Live Fold acceptance passed: model=kimi-k3; SearchTools, DescribeTools, ExecuteTools; stdio=1; HTTP=1; LOCAL_MCP_OK; HTTP_MCP_OK"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated TICKLOOP_CONFIG_DIR with MOONSHOT_CN_API_KEY; calls the billed API"]
+async fn live_codemode_composes_tools_and_resumes_after_confirmation() {
+    let root = std::path::PathBuf::from(
+        std::env::var("TICKLOOP_CONFIG_DIR").expect("isolated configuration required"),
+    );
+    assert!(
+        root.to_string_lossy()
+            .contains(".scratch/plugin-mcp/evidence/09-codex/")
+    );
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("kimi-cn-api", "kimi-k3")
+        .unwrap();
+    let (agent, local, remote) = configured_agent(
+        &root,
+        model,
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    )
+    .await;
+    let path = root.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for entry in settings["mcpServers"].as_object_mut().unwrap().values_mut() {
+        entry["exposure"] = json!("codemode");
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat,"Use Codemode to call tools.mcp__local__probe({}) and tools.mcp__remote__probe({}) exactly once each inside one JavaScript script. Both return MCP CallToolResult objects. Print their text content with text(). Set the script first line to // @options: {\"timeout_ms\":1000}. Each call will be confirmed by the test operator; wait for confirmation. Do not use Bash, search, or any other tools. Finally report the two acceptance markers.".into()).await.unwrap();
+    let mut confirmations = 0;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.parent_call.as_ref().unwrap().name, "Codemode");
+                    if confirmations == 0 {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        assert!(
+                            agent
+                                .snapshot(chat)
+                                .await
+                                .unwrap()
+                                .permissions
+                                .iter()
+                                .any(|permission| permission.id == request.id)
+                        );
+                    }
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                    confirmations += 1;
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("live Codemode run timed out");
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    let scripts = snapshot
+        .operations
+        .iter()
+        .filter(|operation| operation.name == "Codemode")
+        .collect::<Vec<_>>();
+    assert_eq!(scripts.len(), 1);
+    assert!(
+        !scripts[0].result.as_ref().unwrap().is_error,
+        "{:?}",
+        scripts[0].result
+    );
+    assert_eq!(confirmations, 2);
+    assert_eq!(local.calls().len(), 1);
+    assert_eq!(remote.calls().len(), 1);
+    let result = &scripts[0].result.as_ref().unwrap().content;
+    assert!(
+        result.contains("LOCAL_MCP_OK") && result.contains("HTTP_MCP_OK"),
+        "{result}"
+    );
+    eprintln!(
+        "Live Codemode acceptance passed: kimi-k3; one script; stdio=1; HTTP=1; two confirmations; first confirmation paused beyond timeout; LOCAL_MCP_OK; HTTP_MCP_OK"
+    );
+}

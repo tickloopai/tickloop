@@ -146,6 +146,8 @@ tickloop plugin install --path ./my-plugin
 
 MCP 工具默认采用 `exposure: "search"`：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
 
+本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。
+
 `/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。在 `/mcp` 中登录时显示链接，本机时打开浏览器；浏览器在其他机器上时，把跳转后的地址粘贴到输入框；Esc 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。

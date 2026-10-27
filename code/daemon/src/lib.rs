@@ -803,7 +803,7 @@ pub async fn build_runtime_with_models(
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
-                scripts: false,
+                scripts: true,
             },
             std::collections::BTreeMap::new(),
             startup_environment.clone(),

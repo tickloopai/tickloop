@@ -62,6 +62,10 @@ mod chat_reads;
 mod chat_settings;
 mod chat_title;
 mod citations;
+#[cfg(feature = "codemode")]
+pub mod codemode;
+#[cfg(feature = "codemode")]
+mod codemode_tool;
 mod compaction;
 mod context;
 mod delegation;
@@ -4509,6 +4513,8 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        #[cfg(feature = "codemode")]
+        let _script_pause = nested_calls::pause_script_clock();
         let nested = nested_calls::is_nested();
         if !nested {
             tool_batch::serialize_permission_prompt(&cancel).await?;
@@ -5415,6 +5421,11 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
         .chain(tool_exposure::fold_definitions())
+        .chain(std::iter::once(tickloop_harness_protocol::ToolDefinition {
+            name: "Codemode".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }))
         .chain(plan::definitions(false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())

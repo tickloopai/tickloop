@@ -1607,6 +1607,20 @@ impl McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
+        if result.is_error != Some(true) {
+            let mut serialized = serde_json::to_string(&result).unwrap_or_default();
+            let mut tokens = vec![current.access_token.clone()];
+            if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
+                tokens.push(latest.access_token);
+            }
+            for token in tokens.into_iter().filter(|token| !token.is_empty()) {
+                let encoded = serde_json::to_string(&token).unwrap();
+                serialized = serialized.replace(&encoded[1..encoded.len() - 1], "[redacted]");
+            }
+            if let Ok(value) = serde_json::from_str(&serialized) {
+                crate::nested_calls::capture_script_value(value);
+            }
+        }
         let mut tool_result = Self::model_result(result, &current.access_token);
         if let Ok(Some(latest)) = self.artifact.credential_snapshot() {
             tool_result.content = tool_result
