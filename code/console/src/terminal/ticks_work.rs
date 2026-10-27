@@ -5,10 +5,11 @@
 
 use std::{collections::HashMap, future::Future, path::Path};
 
-use tick_plugins::{MarketplaceSource, PluginStore};
+use tick_plugins::PluginStore;
 use tickloop_tick_installer::{
-    DeviceLogin, LoggedOut, LoginError, install_from, needs_no_login, plugin_http,
-    read_marketplace, read_marketplaces, remove_marketplace, start_login,
+    DeviceLogin, LoggedOut, LoginError, add_marketplace, install_from, marketplace_registration,
+    needs_no_login, read_marketplace, read_marketplaces, remove_marketplace, start_login,
+    update_marketplace,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -197,12 +198,7 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                         .marketplace
                         .as_deref()
                         .ok_or_else(|| "Choose a marketplace before installing".to_owned())?;
-                    let registration = store
-                        .marketplaces()
-                        .map_err(|error| error.to_string())?
-                        .into_iter()
-                        .find(|registration| registration.name == marketplace)
-                        .ok_or_else(|| format!("marketplace {marketplace} is not registered"))?;
+                    let registration = marketplace_registration(&store, marketplace)?;
                     let plugins = read_marketplace(HTTP, &store, &registration, refresh)
                         .await
                         .map_err(|reason| {
@@ -323,16 +319,7 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
         }
         TickPackageRequest::AddMarketplace(source) => {
             tasks.spawn(async move {
-                let result = async {
-                    let parsed =
-                        MarketplaceSource::parse(&source).map_err(|error| error.to_string())?;
-                    store
-                        .add_marketplace(&parsed, &plugin_http(HTTP))
-                        .await
-                        .map(Box::new)
-                        .map_err(|error| error.to_string())
-                }
-                .await;
+                let result = add_marketplace(HTTP, &store, &source).await.map(Box::new);
                 (
                     panel,
                     TickPackageResult::MarketplaceAdded {
@@ -344,18 +331,9 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
         }
         TickPackageRequest::UpdateMarketplace(name) => {
             tasks.spawn(async move {
-                let result = async {
-                    let registration = store
-                        .marketplaces()
-                        .map_err(|error| error.to_string())?
-                        .into_iter()
-                        .find(|registration| registration.name == name)
-                        .ok_or_else(|| format!("marketplace {name} is not registered"))?;
-                    read_marketplace(HTTP, &store, &registration, true)
-                        .await
-                        .map(|plugins| plugins.len())
-                }
-                .await;
+                let result = update_marketplace(HTTP, &store, &name)
+                    .await
+                    .map(|plugins| plugins.len());
                 (
                     panel,
                     TickPackageResult::MarketplaceUpdated { name, result },

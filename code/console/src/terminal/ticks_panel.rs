@@ -90,7 +90,9 @@ pub(super) enum TickPackageRequest {
     RefreshLogin(String),
     /// Registers the marketplace the text names, as `tickloop plugin marketplace add` does.
     AddMarketplace(String),
+    /// Reads the marketplace afresh, as `tickloop plugin marketplace update NAME` does.
     UpdateMarketplace(String),
+    /// Unregisters the marketplace and keeps the plugins installed from it.
     RemoveMarketplace(String),
 }
 
@@ -489,7 +491,7 @@ pub(super) struct TicksPanel {
     filter: Editor,
     filtering: bool,
     /// The source of a marketplace being added, while its field is open.
-    marketplace_source: Option<Editor>,
+    add_marketplace_field: Option<Editor>,
     /// The plugin to uninstall, or on the Marketplaces page the marketplace to remove, once `x`
     /// was pressed on it; any other key cancels it, so it belongs to the page shown.
     uninstall_confirmation: Option<(String, Instant)>,
@@ -524,7 +526,7 @@ impl TicksPanel {
             page: INSTALLED_PAGE,
             filter: Editor::new(),
             filtering: false,
-            marketplace_source: None,
+            add_marketplace_field: None,
             uninstall_confirmation: None,
             installed: Listing::Loading,
             installed_read: 0,
@@ -657,7 +659,7 @@ impl TicksPanel {
 
     /// Takes pasted text into the key being entered; elsewhere the panel takes no text.
     pub(super) fn filter_text(&self) -> &str {
-        if let Some(source) = &self.marketplace_source {
+        if let Some(source) = &self.add_marketplace_field {
             return source.draft();
         }
         self.configuration
@@ -672,7 +674,7 @@ impl TicksPanel {
             form.editor.replace_draft(text, cursor);
             return;
         }
-        if let Some(source) = &mut self.marketplace_source {
+        if let Some(source) = &mut self.add_marketplace_field {
             source.replace_draft(text, cursor);
             return;
         }
@@ -691,7 +693,7 @@ impl TicksPanel {
             return;
         }
         self.cancel_uninstall();
-        if let Some(source) = &mut self.marketplace_source {
+        if let Some(source) = &mut self.add_marketplace_field {
             source.apply(EditorCommand::InsertPasted(compact_line(text)));
             return;
         }
@@ -733,8 +735,8 @@ impl TicksPanel {
                 }
             };
         }
-        if self.marketplace_source.is_some() {
-            return self.marketplace_source_key(key);
+        if self.add_marketplace_field.is_some() {
+            return self.add_marketplace_field_key(key);
         }
         let uninstall_key = key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::NONE;
         if !uninstall_key {
@@ -777,7 +779,7 @@ impl TicksPanel {
                     .get(selected)
                     .map(|entry| entry.name().to_owned())
             } else {
-                match self.registrations().get(selected) {
+                match self.registered_marketplaces().get(selected) {
                     Some(offer) if offer.registration.builtin => {
                         self.notice = Some(Notice::failure(format!(
                             "The built-in marketplace {} cannot be removed",
@@ -824,7 +826,7 @@ impl TicksPanel {
             (KeyCode::Char('a'), KeyModifiers::NONE)
                 if self.page == REGISTERED_MARKETPLACES_PAGE =>
             {
-                self.marketplace_source = Some(Editor::new());
+                self.add_marketplace_field = Some(Editor::new());
                 self.notice = None;
                 TicksPanelEffect::None
             }
@@ -870,13 +872,13 @@ impl TicksPanel {
     }
 
     /// A key while the source of a marketplace to add is entered.
-    fn marketplace_source_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
-        let Some(source) = &mut self.marketplace_source else {
+    fn add_marketplace_field_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        let Some(source) = &mut self.add_marketplace_field else {
             return TicksPanelEffect::None;
         };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                self.marketplace_source = None;
+                self.add_marketplace_field = None;
             }
             (KeyCode::Char('g'), KeyModifiers::CONTROL) => return TicksPanelEffect::EditFilter,
             (KeyCode::Enter, _) => {
@@ -886,7 +888,7 @@ impl TicksPanel {
                 }
                 let effect = self.start(TickPackageRequest::AddMarketplace(text));
                 if matches!(effect, TicksPanelEffect::Work(_)) {
-                    self.marketplace_source = None;
+                    self.add_marketplace_field = None;
                 }
                 return effect;
             }
@@ -1153,7 +1155,7 @@ impl TicksPanel {
         let index = self.selected[self.page];
         if self.page == REGISTERED_MARKETPLACES_PAGE {
             let Some(name) = self
-                .registrations()
+                .registered_marketplaces()
                 .get(index)
                 .map(|offer| offer.registration.name.clone())
             else {
@@ -1409,7 +1411,7 @@ impl TicksPanel {
     }
 
     /// Every registered marketplace, with what reading it gave.
-    fn registrations(&self) -> Vec<&MarketplaceOffer> {
+    fn registered_marketplaces(&self) -> Vec<&MarketplaceOffer> {
         match &self.marketplace {
             Listing::Loaded(marketplaces) => marketplaces.iter().collect(),
             _ => Vec::new(),
@@ -1420,7 +1422,7 @@ impl TicksPanel {
         match page {
             INSTALLED_PAGE => self.installed_entries().len(),
             MARKETPLACE_PAGE => self.offers().len() + self.marketplace_errors().len(),
-            _ => self.registrations().len(),
+            _ => self.registered_marketplaces().len(),
         }
     }
 
@@ -1528,7 +1530,7 @@ impl TicksPanel {
         }
         if self.page == REGISTERED_MARKETPLACES_PAGE {
             return self
-                .registrations()
+                .registered_marketplaces()
                 .into_iter()
                 .enumerate()
                 .map(|(index, offer)| {
@@ -1644,7 +1646,7 @@ impl TicksPanel {
                 Role::Text,
             );
         }
-        if let Some(source) = &self.marketplace_source {
+        if let Some(source) = &self.add_marketplace_field {
             let label = "Add marketplace: ";
             add(
                 &format!(
@@ -1789,7 +1791,7 @@ impl TicksPanel {
             if body.is_empty() {
                 body = self.empty_lines(width);
             }
-            let mut hints = if self.marketplace_source.is_some() {
+            let hints = if self.add_marketplace_field.is_some() {
                 vec![
                     ("enter add".into(), 10),
                     ("ctrl+g editor".into(), 3),
@@ -1804,39 +1806,9 @@ impl TicksPanel {
                     ("r refresh".into(), 4),
                     ("esc close".into(), 9),
                 ]
-            } else if self.filtering && self.page == MARKETPLACE_PAGE {
-                vec![
-                    ("ctrl+n/p select".into(), 8),
-                    ("ctrl+g editor".into(), 3),
-                    ("esc leave filter".into(), 9),
-                ]
             } else {
-                let mut hints = vec![
-                    ("tab/←/→ page".into(), 6),
-                    ("r refresh".into(), 4),
-                    ("esc close".into(), 9),
-                ];
-                hints.insert(
-                    0,
-                    (
-                        if self.page == INSTALLED_PAGE {
-                            "x uninstall"
-                        } else {
-                            "/ filter"
-                        }
-                        .into(),
-                        5,
-                    ),
-                );
-                hints
+                self.package_hints()
             };
-            if self.marketplace_source.is_some() || self.page == REGISTERED_MARKETPLACES_PAGE {
-                // Their hints are complete.
-            } else if self.page == INSTALLED_PAGE {
-                hints.insert(0, ("enter actions".into(), 10));
-            } else if self.selected[MARKETPLACE_PAGE] < self.offers().len() {
-                hints.insert(0, ("enter install/update".into(), 10));
-            }
             let hint = fit_hint(&hints, width, display);
             (hint, selected_rows)
         };
@@ -1891,6 +1863,38 @@ impl TicksPanel {
         }
     }
 
+    /// The key hints of the Installed and Available pages, each with its priority.
+    fn package_hints(&self) -> Vec<(String, u8)> {
+        let mut hints = if self.filtering && self.page == MARKETPLACE_PAGE {
+            vec![
+                ("ctrl+n/p select".into(), 8),
+                ("ctrl+g editor".into(), 3),
+                ("esc leave filter".into(), 9),
+            ]
+        } else {
+            vec![
+                (
+                    if self.page == INSTALLED_PAGE {
+                        "x uninstall"
+                    } else {
+                        "/ filter"
+                    }
+                    .into(),
+                    5,
+                ),
+                ("tab/←/→ page".into(), 6),
+                ("r refresh".into(), 4),
+                ("esc close".into(), 9),
+            ]
+        };
+        if self.page == INSTALLED_PAGE {
+            hints.insert(0, ("enter actions".into(), 10));
+        } else if self.selected[MARKETPLACE_PAGE] < self.offers().len() {
+            hints.insert(0, ("enter install/update".into(), 10));
+        }
+        hints
+    }
+
     /// What the page shows without packages to list, wrapped at `width`.
     fn empty_lines(&self, width: usize) -> Vec<RoleLine> {
         let plural = self.kind.plural();
@@ -1903,6 +1907,9 @@ impl TicksPanel {
             ),
             (_, _, Listing::Loading) => ("Reading marketplaces…".to_owned(), Role::MutedText),
             (_, _, Listing::Failed(error)) => (safe_line(error), Role::Error),
+            (REGISTERED_MARKETPLACES_PAGE, _, Listing::Loaded(_)) => {
+                ("No marketplaces are registered".to_owned(), Role::MutedText)
+            }
             (_, _, Listing::Loaded(_)) => (
                 if self.filter.draft().is_empty() {
                     format!("No {plural} available")

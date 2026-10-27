@@ -4,7 +4,7 @@
 
 use tick_packages::{CURRENT_TARGET, Marketplace, validate_package_name};
 use tick_plugins::{
-    Installation, InstalledPlugins, MarketplacePlugin, MarketplacePluginSource,
+    Installation, InstalledPlugins, MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource,
     MarketplaceRegistration, MarketplaceSource as PluginMarketplaceSource, PluginError,
     PluginStore, TICKLOOP_MARKETPLACE, validate_plugin_name,
 };
@@ -100,6 +100,42 @@ pub fn plugin_count(count: usize) -> String {
         1 => "1 plugin".to_owned(),
         count => format!("{count} plugins"),
     }
+}
+
+pub fn marketplace_registration(
+    store: &PluginStore,
+    name: &str,
+) -> Result<MarketplaceRegistration, String> {
+    store
+        .marketplaces()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|registration| registration.name == name)
+        .ok_or_else(|| format!("marketplace {name} is not registered"))
+}
+
+/// Registers the marketplace `text` names: a local path, a Git URL, an HTTPS marketplace file or
+/// `OWNER/REPO[#REF]`.
+pub async fn add_marketplace(
+    http: &'static HttpClient,
+    store: &PluginStore,
+    text: &str,
+) -> Result<MarketplaceCatalog, String> {
+    let source = PluginMarketplaceSource::parse(text).map_err(|error| error.to_string())?;
+    store
+        .add_marketplace(&source, &plugin_http(http))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Reads the registered marketplace `name` afresh.
+pub async fn update_marketplace(
+    http: &'static HttpClient,
+    store: &PluginStore,
+    name: &str,
+) -> Result<Vec<MarketplacePlugin>, String> {
+    let registration = marketplace_registration(store, name)?;
+    read_marketplace(http, store, &registration, true).await
 }
 
 /// Unregisters the marketplace `name`; the plugins installed from it stay, and their IDs are

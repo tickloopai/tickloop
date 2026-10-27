@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use tick_plugins::{
-    InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, MarketplaceRegistration,
-    MarketplaceSource, PluginStore, TICKLOOP_MARKETPLACE,
+    InstallOutcome, Installation, LOCAL_MARKETPLACE, MarketplacePlugin, PluginStore,
+    TICKLOOP_MARKETPLACE,
 };
 use tickloop_code_console::terminal::safe_line;
 use tickloop_tick_installer::{
-    PluginKind, PluginRequest, install_from, installed_status, marketplace_state, plugin_count,
-    plugin_http, read_marketplace, read_marketplaces, source_label, unavailable_reason,
+    PluginKind, PluginRequest, install_from, installed_status, marketplace_registration,
+    marketplace_state, plugin_count, read_marketplace, read_marketplaces, source_label,
+    unavailable_reason, update_marketplace,
 };
 
 use super::plugin_command::{other_kind, print_table, report, report_notes};
@@ -19,12 +20,9 @@ const NO_MARKETPLACE_READ: &str = "no marketplace could be read";
 const HTTP: &tickloop_tick_installer::HttpClient = &tickloop_code_settings::package_http::client;
 
 pub(super) async fn add_marketplace(store: &PluginStore, text: &str) -> Result<(), String> {
-    let failed = |reason: String| format!("cannot add marketplace {}: {reason}", safe_line(text));
-    let source = MarketplaceSource::parse(text).map_err(|error| failed(error.to_string()))?;
-    let catalog = store
-        .add_marketplace(&source, &plugin_http(HTTP))
+    let catalog = tickloop_tick_installer::add_marketplace(HTTP, store, text)
         .await
-        .map_err(|error| failed(error.to_string()))?;
+        .map_err(|reason| format!("cannot add marketplace {}: {reason}", safe_line(text)))?;
     println!(
         "Added marketplace {} from {}; it offers {}.",
         catalog.registration.name,
@@ -40,8 +38,8 @@ pub(super) async fn update_marketplaces(
     store: &PluginStore,
     name: Option<&str>,
 ) -> Result<(), String> {
-    let registrations = store.marketplaces().map_err(|error| error.to_string())?;
     let Some(name) = name else {
+        let registrations = store.marketplaces().map_err(|error| error.to_string())?;
         let mut failures = 0;
         for registration in &registrations {
             match read_marketplace(HTTP, store, registration, true).await {
@@ -64,14 +62,9 @@ pub(super) async fn update_marketplaces(
             )),
         };
     };
-    let failed = |reason: String| format!("cannot update marketplace {name}: {reason}");
-    let registration = registrations
-        .iter()
-        .find(|registration| registration.name == name)
-        .ok_or_else(|| failed(format!("marketplace {name} is not registered")))?;
-    let plugins = read_marketplace(HTTP, store, registration, true)
+    let plugins = update_marketplace(HTTP, store, name)
         .await
-        .map_err(failed)?;
+        .map_err(|reason| format!("cannot update marketplace {name}: {reason}"))?;
     report_updated_marketplace(name, plugins.len());
     Ok(())
 }
@@ -112,15 +105,6 @@ pub(super) fn remove_marketplace(store: &PluginStore, name: &str) -> Result<(), 
     Ok(())
 }
 
-fn registration(store: &PluginStore, name: &str) -> Result<MarketplaceRegistration, String> {
-    store
-        .marketplaces()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|registration| registration.name == name)
-        .ok_or_else(|| format!("marketplace {name} is not registered"))
-}
-
 /// Installs `NAME@MARKETPLACE`, or `NAME` from the one marketplace that offers it, when what the
 /// marketplace offers is of `kind`; `typed` is the command as the user gave it.
 pub(super) async fn install(
@@ -144,7 +128,7 @@ pub(super) async fn install(
         }
         Some(TICKLOOP_MARKETPLACE) => return Err(other_kind(name, PluginKind::Tick, typed)),
         Some(marketplace) => {
-            let registration = registration(store, marketplace)?;
+            let registration = marketplace_registration(store, marketplace)?;
             let plugins = read_marketplace(HTTP, store, &registration, false)
                 .await
                 .map_err(|reason| format!("cannot read marketplace {marketplace}: {reason}"))?;
@@ -312,7 +296,7 @@ pub(super) async fn update(
             continue;
         }
         if !marketplaces.contains_key(marketplace) {
-            let plugins = match registration(store, marketplace) {
+            let plugins = match marketplace_registration(store, marketplace) {
                 Ok(registration) => read_marketplace(HTTP, store, &registration, true)
                     .await
                     .map_err(|reason| format!("cannot read marketplace {marketplace}: {reason}")),
