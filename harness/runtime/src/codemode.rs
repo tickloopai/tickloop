@@ -20,9 +20,9 @@ const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 const INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
 const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_STORE_VALUE_CHARS: usize = 262_144;
-const MAX_STORE_TOTAL_CHARS: usize = 1_048_576;
-const MAX_STORE_KEYS: usize = 4096;
+pub(crate) const MAX_STORE_VALUE_CHARS: usize = 262_144;
+pub(crate) const MAX_STORE_TOTAL_CHARS: usize = 1_048_576;
+pub(crate) const MAX_STORE_KEYS: usize = 4096;
 /// Generous for any write set within the limits, even one escaped twice.
 const MAX_STORE_WRITES_BYTES: usize = 16 * MAX_STORE_TOTAL_CHARS;
 
@@ -128,12 +128,6 @@ impl StoreWrites {
     pub fn is_empty(&self) -> bool {
         self.set.is_empty() && self.delete.is_empty()
     }
-    pub fn apply_to(&self, store: &mut BTreeMap<String, Value>) {
-        for key in &self.delete {
-            store.remove(key);
-        }
-        store.extend(self.set.clone());
-    }
     /// Checks the writes the prelude reports (`[key, json]` sets a key, `[key]` deletes it)
     /// against `store`. The prelude shares its realm with the script, so the limits it applies
     /// are advisory; these are the ones that hold.
@@ -171,7 +165,8 @@ impl StoreWrites {
             }
         }
         let mut result = store.clone();
-        writes.apply_to(&mut result);
+        result.retain(|key, _| !writes.delete.contains(key));
+        result.extend(writes.set.clone());
         if result.len() > MAX_STORE_KEYS {
             return Err(format!("store holds at most {MAX_STORE_KEYS} keys"));
         }
@@ -454,13 +449,16 @@ fn execute(
                     done,
                     serde_json::to_string(&tools).unwrap(),
                     MAX_CONCURRENT_CALLS,
-                    serde_json::to_string(
-                        &store
+                    serde_json::json!({
+                        "values": store
                             .iter()
                             .map(|(key, value)| (key, value.to_string()))
                             .collect::<BTreeMap<_, _>>(),
-                    )
-                    .unwrap(),
+                        "maxValueChars": MAX_STORE_VALUE_CHARS,
+                        "maxTotalChars": MAX_STORE_TOTAL_CHARS,
+                        "maxKeys": MAX_STORE_KEYS,
+                    })
+                    .to_string(),
                 ))?;
                 let run: Function = bridge.get("run")?;
                 let constructor: Function = ctx.eval("(async function() {}).constructor")?;

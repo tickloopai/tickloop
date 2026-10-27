@@ -107,6 +107,26 @@ async fn store_limits_count_key_and_json_characters() {
 }
 
 #[tokio::test]
+async fn store_rejects_unpaired_surrogates_the_host_cannot_keep() {
+    let result = run(
+        r#"
+        try { store("lone", "\ud800"); } catch (error) { text(error.name); }
+        store("escaped", "\\ud800 and 😀");
+        "#,
+        Options::default(),
+        vec![],
+        |_, _, _| async { unreachable!() },
+    )
+    .await;
+    assert_eq!(result.error, None);
+    assert_eq!(result.output, "TypeError");
+    assert_eq!(
+        result.store_writes.set,
+        BTreeMap::from([("escaped".to_owned(), json!("\\ud800 and 😀"))])
+    );
+}
+
+#[tokio::test]
 async fn tampered_builtins_cannot_bypass_store_limits() {
     let seed = BTreeMap::from([("seed".to_owned(), json!("kept"))]);
     for source in [
@@ -366,6 +386,55 @@ mod agent {
                 .contains("value=branch")
         );
         third.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stored_values_survive_compaction_and_a_reload_after_it() {
+        let transcripts = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(ScriptedModel::new(vec![]));
+        let first = agent(&transcripts, &model);
+        let directory = tempfile::tempdir().unwrap();
+        let chat = first.create_chat(directory.path().into()).await.unwrap();
+        script(
+            &model,
+            "save",
+            "store('cursor', 1); store('tmp', 'x'); store('gone', true);",
+        );
+        model.enqueue(text("saved"));
+        turn(&first, chat, "Save the cursor").await;
+        script(&model, "delete", "store('gone', undefined);");
+        model.enqueue(text("deleted"));
+        turn(&first, chat, "Delete a value").await;
+        model.enqueue(text("Earlier scripts stored a cursor."));
+        first.compact(chat).await.unwrap();
+        script(
+            &model,
+            "after-compaction",
+            "text(String(load('cursor')) + '/' + String(load('tmp')) + '/' + String(load('gone')));",
+        );
+        model.enqueue(text("checked"));
+        turn(&first, chat, "Check after compaction").await;
+        let snapshot = first.snapshot(chat).await.unwrap();
+        assert!(
+            script_result(&snapshot, "after-compaction").contains("1/x/undefined"),
+            "{}",
+            script_result(&snapshot, "after-compaction")
+        );
+        first.sync().await.unwrap();
+        first.shutdown().await;
+
+        let second = agent(&transcripts, &model);
+        second.resume_chat(chat).await.unwrap();
+        script(
+            &model,
+            "reloaded",
+            "text(String(load('cursor')) + '/' + String(load('tmp')) + '/' + String(load('gone')));",
+        );
+        model.enqueue(text("checked again"));
+        turn(&second, chat, "Check after reload").await;
+        let snapshot = second.snapshot(chat).await.unwrap();
+        assert!(script_result(&snapshot, "reloaded").contains("1/x/undefined"));
+        second.shutdown().await;
     }
 
     #[tokio::test]

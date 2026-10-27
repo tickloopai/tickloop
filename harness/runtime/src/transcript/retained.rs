@@ -279,10 +279,7 @@ impl RetainedFold {
                 matches!(&kept.line, Line::ContentReplacement(entry) if entry.replacements.iter().any(|replacement| self.chain.keeps_tool_result(replacement.tool_use_id())))
             }))
             .chain(self.codemode_store.iter().filter(|kept| {
-                matches!(&kept.line, Line::CodemodeStore(entry) if match (entry.run_id, &entry.call_id) {
-                    (Some(run), Some(call)) => self.chain.keeps_nested_parent(run, call),
-                    _ => true,
-                })
+                matches!(&kept.line, Line::CodemodeStore(entry) if entry.parent_call().is_none_or(|(run, call)| self.chain.keeps_nested_parent(run, call)))
             }))
             .chain(&self.goal_events)
             .chain(

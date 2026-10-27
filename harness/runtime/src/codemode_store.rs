@@ -5,15 +5,11 @@ use std::collections::BTreeMap;
 use tickloop_harness_protocol::{ChatId, ChatSnapshot};
 use tickloop_harness_transcript::CodemodeStoreEntry;
 
-/// Whether `entry` belongs to the chain `snapshot` holds; the values a Chat started with always
-/// do.
+/// Whether `entry` belongs to the chain `snapshot` holds; a whole store always does.
 pub(crate) fn is_on_chain(snapshot: &ChatSnapshot, entry: &CodemodeStoreEntry) -> bool {
-    match (entry.run_id, &entry.call_id) {
-        (Some(run), Some(call_id)) => {
-            crate::nested_calls::tool_use_on_chain(snapshot, run.into(), call_id)
-        }
-        _ => true,
-    }
+    entry.parent_call().is_none_or(|(run, call_id)| {
+        crate::nested_calls::tool_use_on_chain(snapshot, run.into(), call_id)
+    })
 }
 
 /// The values a script on the chain `snapshot` holds loads.
@@ -28,22 +24,19 @@ pub(crate) fn current(
     store
 }
 
-/// The values a Chat copied from the chain `snapshot` holds starts with, recorded under its own
-/// id.
-pub(crate) fn starting_entries(
+/// The whole store of the chain `snapshot` holds, recorded under `chat_id`, for a Chat that
+/// goes on without the calls that stored it: a Branch, a copy under a new Chat id, or the Chat
+/// after a compaction. A Chat that never stored anything needs none.
+pub(crate) fn whole_store(
     chat_id: ChatId,
     snapshot: &ChatSnapshot,
     entries: &[CodemodeStoreEntry],
-) -> Vec<CodemodeStoreEntry> {
-    let set = current(snapshot, entries);
-    if set.is_empty() {
-        return Vec::new();
-    }
-    vec![CodemodeStoreEntry {
+) -> Option<CodemodeStoreEntry> {
+    (!entries.is_empty()).then(|| CodemodeStoreEntry {
         chat_id: chat_id.into(),
         run_id: None,
         call_id: None,
-        set,
+        set: current(snapshot, entries),
         delete: Vec::new(),
-    }]
+    })
 }

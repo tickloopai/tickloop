@@ -1,6 +1,8 @@
 use crate::{
     Agent,
-    codemode::{self, Control, Options},
+    codemode::{
+        self, Control, MAX_STORE_KEYS, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS, Options,
+    },
     nested_calls::NestedStatus,
     tool_execution::{ToolCallError, ToolCallOutcome},
 };
@@ -14,7 +16,9 @@ use uuid::Uuid;
 pub(crate) fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "Codemode".into(),
-        description: "Run JavaScript as an async function body in a QuickJS sandbox without files, network, timers or module loading. Use await tools.<name>(arguments), replacing invalid identifier characters with _. Exact tool names also work as tools['original-name']; exact names take precedence when normalized names collide. Each tool call has its usual permissions and may pause for confirmation. text(value), image(base64 data URL or MCP image block), console.log/info/warn/error/debug, return and exit() produce output; only explicit output returns to the model. First-line // @options: {\"max_output_tokens\":10000,\"timeout_ms\":300000} controls output and active elapsed time; confirmation waits do not count. Excess output preserves its start and end with a full-output file. Memory is limited to 256 MB. store(key, value) keeps a small JSON value for later Codemode calls in this conversation and store(key, undefined) deletes it; load(key) returns it or undefined. Stored changes are kept only when the script succeeds; one value may have at most 262144 characters of JSON, keys and values together at most 1048576, and at most 4096 keys. Tool errors and human denials throw Error; Auto denial ends the entire script. Calls still running at script completion are cancelled and may have an unknown outcome. Cannot call Codemode, ExecuteTools, AskUserQuestion, Subagent, Skill, plan mode controls, family control, scheduled task or Goal tools. Discover tool names and schemas with top-level SearchTools and DescribeTools.".into(),
+        description: format!(
+            "Run JavaScript as an async function body in a QuickJS sandbox without files, network, timers or module loading. Use await tools.<name>(arguments), replacing invalid identifier characters with _. Exact tool names also work as tools['original-name']; exact names take precedence when normalized names collide. Each tool call has its usual permissions and may pause for confirmation. text(value), image(base64 data URL or MCP image block), console.log/info/warn/error/debug, return and exit() produce output; only explicit output returns to the model. First-line // @options: {{\"max_output_tokens\":10000,\"timeout_ms\":300000}} controls output and active elapsed time; confirmation waits do not count. Excess output preserves its start and end with a full-output file. Memory is limited to 256 MB. store(key, value) keeps a small JSON value for later Codemode calls in this conversation and store(key, undefined) deletes it; load(key) returns it or undefined. Stored changes are kept only when the script succeeds; one value may have at most {MAX_STORE_VALUE_CHARS} characters of JSON, keys and values together at most {MAX_STORE_TOTAL_CHARS}, and at most {MAX_STORE_KEYS} keys. Tool errors and human denials throw Error; Auto denial ends the entire script. Calls still running at script completion are cancelled and may have an unknown outcome. Cannot call Codemode, ExecuteTools, AskUserQuestion, Subagent, Skill, plan mode controls, family control, scheduled task or Goal tools. Discover tool names and schemas with top-level SearchTools and DescribeTools."
+        ),
         input_schema: json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}),
     }
 }

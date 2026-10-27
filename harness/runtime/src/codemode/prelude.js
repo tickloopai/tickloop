@@ -43,13 +43,18 @@
     // prototype-free records reached only through syntax and functions captured here; the host
     // checks the reported writes again.
     const ownKeys = Object.keys;
-    const MAX_STORE_VALUE_CHARS = 262144;
-    const MAX_STORE_TOTAL_CHARS = 1048576;
-    const MAX_STORE_KEYS = 4096;
+    const apply = Reflect.apply;
+    const regexpTest = RegExp.prototype.test;
+    // JSON.stringify escapes only unpaired surrogates, which the host's JSON cannot hold.
+    const UNPAIRED_SURROGATE = /(?:^|[^\\])(?:\\\\)*\\ud[89a-f][0-9a-f]{2}/;
     const STORE_HINT = "store() is for small state such as IDs, cursors or summaries; keep large data in variables or write it to a file with a tool.";
     const stored = Object.create(null);
     const writes = Object.create(null);
-    const initialStore = parse(storeJson);
+    const storeState = parse(storeJson);
+    const initialStore = storeState.values;
+    const MAX_STORE_VALUE_CHARS = storeState.maxValueChars;
+    const MAX_STORE_TOTAL_CHARS = storeState.maxTotalChars;
+    const MAX_STORE_KEYS = storeState.maxKeys;
     let storedChars = 0;
     let storedKeys = 0;
     const initialKeys = ownKeys(initialStore);
@@ -78,6 +83,7 @@
         let json;
         try { json = stringify(value); } catch (error) { json = undefined; }
         if (typeof json !== "string") throw new TypeError("store(" + stringify(key) + ") value is not JSON-serializable");
+        if (apply(regexpTest, UNPAIRED_SURROGATE, [json])) throw new TypeError("store(" + stringify(key) + ") value contains an unpaired surrogate");
         if (json.length > MAX_STORE_VALUE_CHARS) {
             throw new RangeError("store(" + stringify(key) + ") value has " + json.length + " characters of JSON, more than the limit of " + MAX_STORE_VALUE_CHARS + ". " + STORE_HINT);
         }

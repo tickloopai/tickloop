@@ -1299,8 +1299,9 @@ pub struct NestedCallEntry {
 }
 
 /// What one successful Codemode script changed with `store()`. The Codemode call it belongs to
-/// decides which conversation chains see it; an entry without one holds the values a Chat
-/// started with, as a Branch or a copy under a new Chat id does.
+/// decides which conversation chains see it. An entry without one holds the whole store at that
+/// point: the values a Branch or a copy under a new Chat id started with, or those a compaction
+/// kept after the calls that stored them left the conversation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodemodeStoreEntry {
@@ -1316,7 +1317,15 @@ pub struct CodemodeStoreEntry {
 }
 
 impl CodemodeStoreEntry {
+    /// The Run and Codemode call whose script stored these values; none for a whole store.
+    pub fn parent_call(&self) -> Option<(Uuid, &str)> {
+        self.run_id.zip(self.call_id.as_deref())
+    }
+
     pub fn apply_to(&self, store: &mut std::collections::BTreeMap<String, serde_json::Value>) {
+        if self.parent_call().is_none() {
+            store.clear();
+        }
         for key in &self.delete {
             store.remove(key);
         }

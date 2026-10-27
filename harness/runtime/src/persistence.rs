@@ -679,7 +679,7 @@ impl ChatRecorder {
             }),
         ];
         lines.extend(
-            super::codemode_store::starting_entries(
+            super::codemode_store::whole_store(
                 child_chat_id,
                 source,
                 &source_bookkeeping.codemode_store,
@@ -797,6 +797,16 @@ impl ChatRecorder {
             ));
         }
         lines.extend(compaction_lines);
+        // After the boundary, so a load that skips what came before it still finds them.
+        if compacted_bookkeeping.codemode_store != chat.bookkeeping.codemode_store {
+            lines.extend(
+                compacted_bookkeeping
+                    .codemode_store
+                    .iter()
+                    .cloned()
+                    .map(Line::CodemodeStore),
+            );
+        }
         lines.extend(renamed_snapshots.iter().filter_map(|renamed| {
             Some(Line::FileHistorySnapshot(FileHistorySnapshotEntry {
                 message_id: renamed.message_id,
@@ -2419,11 +2429,10 @@ fn recover_transcript(
         })
         .collect();
     if chat_id != source_chat_id {
-        bookkeeping.codemode_store = super::codemode_store::starting_entries(
-            chat_id,
-            &snapshot,
-            &bookkeeping.codemode_store,
-        );
+        bookkeeping.codemode_store =
+            super::codemode_store::whole_store(chat_id, &snapshot, &bookkeeping.codemode_store)
+                .into_iter()
+                .collect();
     }
 
     recover_snapshot_for_resume(
