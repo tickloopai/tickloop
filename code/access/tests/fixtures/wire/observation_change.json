@@ -549,6 +549,7 @@
           "entries": []
         },
         "context_window_tokens": 200000,
+        "auto_compact_window": 150000,
         "last_model_run": "00000000-0000-0000-0000-000000000020",
         "warnings": [
           "slow disk"

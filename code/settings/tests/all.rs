@@ -1,5 +1,7 @@
 //! Every code/settings integration test, compiled as one binary.
 
+#[path = "all/auto_compact_settings.rs"]
+mod auto_compact_settings;
 #[path = "all/claude_auto_import.rs"]
 mod claude_auto_import;
 

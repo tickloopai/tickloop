@@ -261,7 +261,8 @@ pub fn current_context_tokens(
     current_context_tokens_counted(snapshot, ledger, model, context_token_counter())
 }
 
-pub(crate) fn current_context_tokens_counted(
+/// [`current_context_tokens`] counted with `counter`, or in serialized bytes without one.
+pub fn current_context_tokens_counted(
     snapshot: &ChatSnapshot,
     ledger: &RequestUsageLedger,
     model: &ModelConfig,

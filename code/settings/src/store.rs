@@ -71,6 +71,7 @@ impl SettingsStore for UserSettings {
             reasoning_effort: saved.reasoning_effort(),
             thinking_enabled: saved.thinking_enabled(),
             context_window_tokens: saved.context_window_tokens(),
+            auto_compact_window: saved.auto_compact_window(),
             search: saved.search_config(),
             output_style: saved.output_style(),
             goal_token_budget: saved.clone().goal_token_budget(),

@@ -115,6 +115,7 @@ impl Agent {
             return OutputStyle::default();
         };
         snapshot.context_window_tokens = defaults.context_window_tokens;
+        snapshot.auto_compact_window = saved.auto_compact_window;
         snapshot.reasoning_effort = defaults.reasoning_effort;
         snapshot.thinking_enabled = defaults.thinking_enabled;
         for (directory, sources) in &saved.additional_directories {
