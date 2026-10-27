@@ -36,13 +36,13 @@ use tickloop_code_settings::new_chat::new_chat_settings;
 use tickloop_harness::model::judgment::jev_key_status_in;
 use tickloop_harness::protocol::{
     ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
-    CompactionOutcome, DirectedSummaryOutcome, DirectedSummaryRequest, Event, ExecutionMode,
-    HostedMember, InputContext, LoopState, LoopTriggerNotice, ModelChange, ModelConfig,
-    MonitorMembership, OperationRecord, PermissionChange, PermissionRule, PermissionScope,
-    PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer, QueuedInput,
-    ReasoningEffort, Receipt, RewindMode, RewindOutcome, SavedChat, ShellTask, ShellTaskOrigin,
-    ShellTaskOutputChunk, TakenBackPrompt, TaskNotification, TickSubscriptionChange,
-    TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
+    CompactionOutcome, ContextBreakdown, DirectedSummaryOutcome, DirectedSummaryRequest, Event,
+    ExecutionMode, HostedMember, InputContext, LoopState, LoopTriggerNotice, ModelChange,
+    ModelConfig, MonitorMembership, OperationRecord, PermissionChange, PermissionRule,
+    PermissionScope, PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer,
+    QueuedInput, ReasoningEffort, Receipt, RewindMode, RewindOutcome, SavedChat, ShellTask,
+    ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskNotification,
+    TickSubscriptionChange, TickSubscriptionStatus, ToolResult, UserShellReceipt, UserShellRecord,
     recover_shell_update_time,
 };
 use tickloop_harness::tools::permissions::{canonical_directory, rule_views, validate_rule};
@@ -3540,6 +3540,16 @@ impl ConsoleExecution {
     ) -> Result<ApprovalHistoryView, AccessError> {
         match self.value(chat, AgentDetailQuery::ApprovalHistory).await? {
             ObservationValue::ApprovalHistory(view) => Ok(view),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn context_breakdown(
+        &self,
+        chat: Uuid,
+    ) -> Result<ContextBreakdown, AccessError> {
+        match self.value(chat, AgentDetailQuery::ContextBreakdown).await? {
+            ObservationValue::ContextBreakdown(breakdown) => Ok(*breakdown),
             _ => Err(unexpected()),
         }
     }

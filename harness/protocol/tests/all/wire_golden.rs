@@ -355,6 +355,18 @@ fn transcript_chat_snapshots_keep_their_recorded_wire() {
     assert_golden("chat_snapshot", &chat_snapshot());
 }
 
+/// A measurement recorded before token counting holds bytes alone; one counted with a
+/// tokenizer adds its token counts beside them, so older readers still load it.
+#[test]
+fn transcript_context_measurements_keep_their_recorded_wire() {
+    let snapshot = chat_snapshot();
+    let bytes = tickloop_harness_protocol::ContextMeasurement::capture(&snapshot, 12_000, 3_000);
+    assert_golden(
+        "context_measurement",
+        &vec![bytes.clone(), bytes.with_tokens(5_200, 1_400)],
+    );
+}
+
 #[test]
 fn transcript_messages_keep_their_recorded_wire() {
     assert_golden("message", &messages());

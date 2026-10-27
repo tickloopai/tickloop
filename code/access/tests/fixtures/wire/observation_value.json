@@ -1096,6 +1096,91 @@
     "OtherTickhost": null
   },
   {
+    "ContextBreakdown": {
+      "tokenizer": "o200k_base",
+      "context_window_tokens": 200000,
+      "used_tokens": 24000,
+      "calibrated": true,
+      "categories": [
+        {
+          "category": "system_prompt",
+          "tokens": 6000
+        },
+        {
+          "category": "tool_search_results",
+          "tokens": 1000
+        },
+        {
+          "category": "messages",
+          "tokens": 17000
+        }
+      ],
+      "autocompact_buffer_tokens": 40000,
+      "free_tokens": 136000,
+      "system_tools": [
+        {
+          "name": "Read",
+          "tokens": 900
+        }
+      ],
+      "mcp_tools": [
+        {
+          "server": "office",
+          "tools": [
+            {
+              "name": "mcp__office__open",
+              "tokens": 300
+            }
+          ]
+        }
+      ],
+      "instruction_files": [
+        {
+          "name": "/work/project/AGENTS.md",
+          "tokens": 2000
+        }
+      ],
+      "skills": [
+        {
+          "name": "tickloop",
+          "tokens": 120
+        }
+      ],
+      "tool_search_results": [
+        {
+          "name": "SearchTools quote",
+          "tokens": 1000
+        }
+      ],
+      "messages": [
+        {
+          "name": "User messages",
+          "tokens": 17000
+        }
+      ],
+      "tool_search": {
+        "mode": "search_tools",
+        "servers": [
+          {
+            "server": "market",
+            "tools": [
+              {
+                "name": "mcp__market__quote",
+                "tokens": 400
+              }
+            ]
+          }
+        ],
+        "unavailable_servers": [
+          {
+            "name": "figma",
+            "state": "needs_login"
+          }
+        ]
+      }
+    }
+  },
+  {
     "RuntimeVersion": {
       "executable": "/opt/tickloop/versions/0.2.9/tickloop",
       "build_id": "0.2.9+0000000000000000",

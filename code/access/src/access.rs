@@ -19,14 +19,14 @@ use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
 use tickloop_harness::protocol::{
     AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
-    CommandSnapshot, DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode,
-    HostedMember, HostedViewGrant, InputContext, LoopState, LoopTriggerNotice, Message,
-    ModelChange, ModelConfig, MonitorMembership, OperationRecord, PendingCommand, PendingInput,
-    PermissionChange, PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope,
-    PermissionsRevision, PermissionsView, ProviderCredentialScope, ProviderPatch, QuestionAnswer,
-    QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger, RewindDraft,
-    RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult, ShellTask,
-    ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
+    CommandSnapshot, ContextBreakdown, DirectedSummaryDraft, DirectedSummaryRequest, Event,
+    ExecutionMode, HostedMember, HostedViewGrant, InputContext, LoopState, LoopTriggerNotice,
+    Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord, PendingCommand,
+    PendingInput, PermissionChange, PermissionPolicy, PermissionRequest, PermissionRule,
+    PermissionScope, PermissionsRevision, PermissionsView, ProviderCredentialScope, ProviderPatch,
+    QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
+    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult,
+    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
     TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery,
     UserShellReceipt, UserShellRecord,
 };
@@ -74,8 +74,9 @@ use tickloop_harness::protocol::{
 /// 28.4 adds the plugin source of an invoked Skill.
 /// 28.5 adds the status of the Agent's MCP servers and reconnecting one of them.
 /// 29.0 adds the model card's native tool search, which older readers reject as unknown.
+/// 29.1 adds reading the Chat's context breakdown, as `/context` shows it.
 pub const PROTOCOL_MAJOR: u16 = 29;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -652,6 +653,8 @@ pub enum AgentDetailQuery {
     },
     Permissions,
     ApprovalHistory,
+    /// The Chat's current context by category, as `/context` shows it.
+    ContextBreakdown,
     Tasks,
     TaskOutput {
         task: TaskRef,
@@ -963,6 +966,7 @@ pub enum ObservationValue {
     Events(Vec<Event>),
     Permissions(Box<PermissionsView>),
     ApprovalHistory(ApprovalHistoryView),
+    ContextBreakdown(Box<ContextBreakdown>),
     Tasks(Vec<ShellTask>),
     TaskOutput(ShellTaskOutputChunk),
     Subscriptions(Vec<TickSubscriptionStatus>),

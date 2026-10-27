@@ -22,8 +22,9 @@ use tickloop_code_access::{
 };
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
-    Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content, Decision,
-    Event, EventKind, ExecutionMode, HostedMember, HostedMemberState, HostedProgramExit,
+    Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content,
+    ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextItem, ContextToolServer,
+    Decision, Event, EventKind, ExecutionMode, HostedMember, HostedMemberState, HostedProgramExit,
     HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality, Message,
     ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
     MonitorMembership, ObservationKind, OperationRecord, OperationState, OtherTickhost,
@@ -31,6 +32,7 @@ use tickloop_harness::protocol::{
     ProviderCredentialScope, ReasoningEffort, Role, TakenBackPrompt, ThinkingBudgets,
     ThinkingControl, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
     TickSubscriptionStatus, TickhostOccupancy, ToolResult, ToolResultBlock, ToolResultContent,
+    ToolSearchMode, ToolSearchPool, UnavailableToolServer,
 };
 
 #[test]
@@ -715,6 +717,11 @@ fn observation_requests_keep_their_recorded_wire() {
                 detail: AgentDetailQuery::McpServers,
                 after: None,
             },
+            ObservationRequest::Agent {
+                execution: execution(),
+                detail: AgentDetailQuery::ContextBreakdown,
+                after: None,
+            },
             ObservationRequest::OtherTickhost,
             ObservationRequest::RuntimeVersion,
         ],
@@ -867,6 +874,7 @@ fn observation_values_keep_their_recorded_wire() {
                 }),
             })),
             ObservationValue::OtherTickhost(None),
+            ObservationValue::ContextBreakdown(Box::new(context_breakdown())),
             ObservationValue::RuntimeVersion(Box::new(tickloop_code_access::RuntimeVersion {
                 executable: "/opt/tickloop/versions/0.2.9/tickloop".into(),
                 build_id: "0.2.9+0000000000000000".into(),
@@ -877,6 +885,58 @@ fn observation_values_keep_their_recorded_wire() {
             })),
         ],
     );
+}
+
+fn context_item(name: &str, tokens: u64) -> ContextItem {
+    ContextItem {
+        name: name.into(),
+        tokens,
+    }
+}
+
+fn context_breakdown() -> ContextBreakdown {
+    ContextBreakdown {
+        tokenizer: "o200k_base".into(),
+        context_window_tokens: Some(200_000),
+        used_tokens: 24_000,
+        calibrated: true,
+        categories: vec![
+            ContextCategoryUsage {
+                category: ContextCategory::SystemPrompt,
+                tokens: 6_000,
+            },
+            ContextCategoryUsage {
+                category: ContextCategory::ToolSearchResults,
+                tokens: 1_000,
+            },
+            ContextCategoryUsage {
+                category: ContextCategory::Messages,
+                tokens: 17_000,
+            },
+        ],
+        autocompact_buffer_tokens: Some(40_000),
+        free_tokens: Some(136_000),
+        system_tools: vec![context_item("Read", 900)],
+        mcp_tools: vec![ContextToolServer {
+            server: "office".into(),
+            tools: vec![context_item("mcp__office__open", 300)],
+        }],
+        instruction_files: vec![context_item("/work/project/AGENTS.md", 2_000)],
+        skills: vec![context_item("tickloop", 120)],
+        tool_search_results: vec![context_item("SearchTools quote", 1_000)],
+        messages: vec![context_item("User messages", 17_000)],
+        tool_search: Some(ToolSearchPool {
+            mode: ToolSearchMode::SearchTools,
+            servers: vec![ContextToolServer {
+                server: "market".into(),
+                tools: vec![context_item("mcp__market__quote", 400)],
+            }],
+            unavailable_servers: vec![UnavailableToolServer {
+                name: "figma".into(),
+                state: McpServerState::NeedsLogin,
+            }],
+        }),
+    }
 }
 
 #[test]
