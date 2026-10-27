@@ -2585,7 +2585,19 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     provider.refresh(CancellationToken::new()).await.unwrap();
     let before = connections.performance_counts();
     server.set_tools(json!([{"name":"second","inputSchema":{"type":"object"}}]));
-    server.notify_tools_changed();
+    for server_name in ["changed", "unchanged"] {
+        server.notify_tools_changed();
+        assert!(matches!(
+            connections
+                .call(
+                    &format!("mcp__{server_name}__probe"),
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await,
+            HostCallResult::Completed(_)
+        ));
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         while provider
             .definitions()
