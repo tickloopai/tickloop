@@ -544,6 +544,8 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::InputTakenBack
         | EventKind::AgentMessageQueued { .. }
         | EventKind::ConversationRewound { .. }
+        | EventKind::ApprovalReviewStarted { .. }
+        | EventKind::ApprovalRecorded { .. }
         | EventKind::ApprovalAssessed { .. }
         | EventKind::PermissionChecked { .. }
         | EventKind::ContextCompaction { .. }

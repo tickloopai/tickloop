@@ -76,7 +76,12 @@ impl McpToolProvider {
                 .reconcile_restarting(configuration.servers, restart)
                 .await;
             *self.warnings.write().unwrap() = configuration.warnings;
-        } else if matches!(restart, Restart::Server(_)) {
+        } else if matches!(restart, Restart::Server(_))
+            || (restart == Restart::Failed && self.connections.inner.entries.read().unwrap().values().any(|entry| {
+                *entry.state.read().unwrap() == McpServerState::Connected
+                    && entry.credential.read().unwrap().as_ref().and_then(|saved| saved.token.as_ref()).is_some_and(|token| token.expires_at <= tickloop_harness_base::private_fs::unix_time_milliseconds() / 1000 + 30)
+            }))
+        {
             let configs = self.current.read().unwrap().clone();
             self.connections
                 .reconcile_restarting(configs, restart)
@@ -114,21 +119,34 @@ impl HostToolProvider for McpToolProvider {
         for (name, entry) in self.connections.inner.entries.read().unwrap().iter() {
             name.hash(&mut hash);
             (Arc::as_ptr(entry) as usize).hash(&mut hash);
-            entry.generation.load(Ordering::SeqCst).hash(&mut hash);
+            entry
+                .secret_generation
+                .load(Ordering::SeqCst)
+                .hash(&mut hash);
             if let Some(connection) = entry.connection.read().unwrap().as_ref() {
                 connection.revision.load(Ordering::SeqCst).hash(&mut hash);
+                connection
+                    .snapshot
+                    .read()
+                    .unwrap()
+                    .generation
+                    .hash(&mut hash);
             }
             (*entry.state.read().unwrap() == McpServerState::NeedsLogin).hash(&mut hash);
         }
         Some(hash.finish())
     }
     fn definitions(&self) -> Vec<ToolDefinition> {
-        self.discovery_tools()
+        self.connections
+            .catalog()
             .into_iter()
-            .filter(|tool| tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden)
-            .map(|tool| tool.definition)
+            .filter(|(_, _, tool)| {
+                tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden
+            })
+            .map(|(_, _, tool)| tool.definition.clone())
             .collect()
     }
+
     fn has_tool_search(&self) -> bool {
         true
     }

@@ -1,0 +1,43 @@
+[
+  {
+    "ApprovalReviewStarted": {
+      "call_id": "call-write",
+      "reviewer": "jev"
+    }
+  },
+  {
+    "ApprovalReviewStarted": {
+      "call_id": "call-write",
+      "reviewer": "llm"
+    }
+  },
+  {
+    "ApprovalRecorded": {
+      "record": {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "chat_id": "00000000-0000-0000-0000-000000000002",
+        "loop_id": "00000000-0000-0000-0000-000000000003",
+        "run_id": "00000000-0000-0000-0000-000000000004",
+        "operation_id": "00000000-0000-0000-0000-000000000005",
+        "call_id": "call-write",
+        "at_ms": 1,
+        "tool": "Write",
+        "input_summary": {
+          "text": "file",
+          "truncated": false
+        },
+        "request_details": null,
+        "outcome": "allow",
+        "path": "human",
+        "denial_category": null,
+        "approval_source": "explicit_ask",
+        "reason": "Human approved this operation",
+        "human_reason": "Explicit Ask rule requires confirmation",
+        "policy_revision": 1,
+        "matching_rules": [],
+        "matching_rules_truncated": false,
+        "review": null
+      }
+    }
+  }
+]

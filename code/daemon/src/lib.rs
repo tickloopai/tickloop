@@ -57,6 +57,7 @@ mod ipc;
 mod lifecycle;
 mod mcp_configuration;
 mod receipts;
+mod request_logging;
 #[cfg(test)]
 mod status_cost;
 mod summary;
@@ -571,6 +572,7 @@ pub async fn run_worker_with_models(
     }
     let bootstrap: WorkerBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
+    request_logging::install(bootstrap.launch.config_root.as_deref())?;
     let models = models(bootstrap.launch.config_root.clone())?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let (agent, environment) = build_runtime_with_models(
@@ -820,6 +822,7 @@ pub async fn build_runtime_with_models(
             if files.unchanged(&credential_root) {
                 return None;
             }
+            let before = files.revision(&credential_root);
             files.paths.clear();
             let (plugin_servers, mut warnings) =
                 enabled_plugin_mcp_servers(&plugins, &mut files.paths);
@@ -858,7 +861,7 @@ pub async fn build_runtime_with_models(
             }
             credential_connections.set_credentials(credentials);
             warnings.extend(resolved.warnings);
-            files.remember(&credential_root);
+            files.remember(&credential_root, before);
             Some(McpConfiguration {
                 servers: resolved.servers,
                 warnings,

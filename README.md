@@ -57,6 +57,7 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 | `/permissions`, `/settings` | Choose how much the agent may do on its own; other preferences |
 | `/ticks`, `/plugins` | Install and log in to Ticks; manage other plugins |
 | `/mcp` | Inspect MCP servers, manage their login and turn them on or off here |
+| `/context` | See what fills the context, by category, and how many MCP tools tool search can reach; `/context all` lists every item |
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
@@ -190,6 +191,8 @@ Without a permission rule, third-party tool calls ask for confirmation in Ask mo
 MCP tools default to `exposure: "search"`. Models whose cards support native Tool Search find tools with their own search and then call them directly. Other models use Fold: `SearchTools` finds tools from one `query` of space-separated words (any word matches; also an exact tool name, `mcp__<server>` for a server's tools, `select:A,B`, or `+word` to require a word), `DescribeTools` supplies their full parameters, and `ExecuteTools` runs 1–10 independent calls with individual approval. Searches also name servers that are still connecting, failed or need login; the first request waits up to 10 seconds for servers that are starting. Switching models selects the available form automatically. Use `direct` to list tools in every model request, or `hidden` to make them unavailable. `toolExposure` overrides individual original tool names; exact names win, then the first matching `*` pattern. Service updates append context without changing Fold tool definitions.
 
 If the Agent's process exits while an `ExecuteTools` batch runs, the batch is not run again: the loaded history lists what each of its calls did. In the conversation, each call a batch makes shows under its `ExecuteTools` call.
+
+Tool result rows show an Auto review in progress or a wait for your approval. Once allowed, a separate muted line below the result names the Auto reviewer or says “Approved by you”. Directly allowed calls have no approval label. Human approvals keep an extra line explaining why you were asked; denied calls show who denied them. ExecuteTools labels each nested call and summarizes the batch. Reopened conversations restore labels for the approval records still retained.
 
 ### Manage servers and log in
 

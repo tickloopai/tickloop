@@ -411,6 +411,23 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
         .await
         .unwrap();
     let first = completed_paused(&mut events, run.run_id.uuid()).await;
+    let started = agent
+        .snapshot(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ApprovalReviewStarted { reviewer, .. } if event.run_id == run.run_id => {
+                Some(reviewer)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        started,
+        vec![ApprovalReviewerKind::Jev, ApprovalReviewerKind::Llm]
+    );
     assert_eq!(first.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(first.fallback_from, Some(ApprovalReviewerKind::Jev));
     assert_eq!(
@@ -438,6 +455,20 @@ async fn authentication_failure_falls_back_then_cools_until_next_probe() {
         .await
         .unwrap();
     let second = completed_paused(&mut events, run.run_id.uuid()).await;
+    let started = agent
+        .snapshot(tickloop_ids::Id::from(chat))
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ApprovalReviewStarted { reviewer, .. } if event.run_id == run.run_id => {
+                Some(reviewer)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started, vec![ApprovalReviewerKind::Llm]);
     assert_eq!(second.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
         second.fallback_reason,

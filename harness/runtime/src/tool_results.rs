@@ -690,27 +690,36 @@ pub(super) fn enforce_tool_result_budget(
         }
     }
 
-    if !state.replacements.is_empty() {
-        for content in messages
-            .iter_mut()
-            .filter(|message| message.role == Role::User)
-            .flat_map(|message| message.content.iter_mut())
+    apply_tool_result_replacements(messages, state);
+    newly_replaced
+}
+
+/// Puts each result's recorded replacement in its place, replacing nothing new.
+pub(super) fn apply_tool_result_replacements(
+    messages: &mut [Message],
+    state: &ContentReplacementState,
+) {
+    if state.replacements.is_empty() {
+        return;
+    }
+    for content in messages
+        .iter_mut()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| message.content.iter_mut())
+    {
+        if let Content::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = content
+            && !content.has_images()
+            && let text = content.text()
+            && !text.starts_with(PERSISTED_OUTPUT_TAG)
+            && let Some(replacement) = state.replacement_for(tool_use_id, &text)
         {
-            if let Content::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = content
-                && !content.has_images()
-                && let text = content.text()
-                && !text.starts_with(PERSISTED_OUTPUT_TAG)
-                && let Some(replacement) = state.replacement_for(tool_use_id, &text)
-            {
-                *content = ToolResultContent::Text(replacement.clone());
-            }
+            *content = ToolResultContent::Text(replacement.clone());
         }
     }
-    newly_replaced
 }
 
 #[cfg(test)]

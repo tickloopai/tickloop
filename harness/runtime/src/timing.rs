@@ -24,15 +24,30 @@ impl Drop for Phase {
                 catalog.elapsed_us += self.started.elapsed().as_micros() as u64;
             });
         }
-        tracing::debug!(parent: &self.span, phase = self.name, elapsed_us = self.started.elapsed().as_micros() as u64, "request timing");
+        tracing::debug!(target: "tickloop::request_timing", parent: &self.span, phase = self.name, elapsed_us = self.started.elapsed().as_micros() as u64, "request timing");
     }
 }
 
-#[derive(Default)]
 struct CatalogTiming {
+    started: Instant,
     reads: u64,
     builds: u64,
     elapsed_us: u64,
+}
+impl Default for CatalogTiming {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            reads: 0,
+            builds: 0,
+            elapsed_us: 0,
+        }
+    }
+}
+pub(crate) fn dispatched() {
+    let _ = CATALOG.try_with(|catalog| {
+        tracing::debug!(target: "tickloop::request_timing", phase = "model_dispatch", elapsed_us = catalog.borrow().started.elapsed().as_micros() as u64, "request timing");
+    });
 }
 tokio::task_local! {
     static CATALOG: std::cell::RefCell<CatalogTiming>;
@@ -44,7 +59,7 @@ pub(crate) async fn request<T>(
     use tracing::Instrument;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let span = tracing::debug_span!("request_preparation", chat = ?receipt.chat_id, run = ?receipt.run_id, request);
+    let span = tracing::debug_span!(target: "tickloop::request_timing", "request_preparation", chat = ?receipt.chat_id, run = ?receipt.run_id, request);
     CATALOG
         .scope(
             Default::default(),
@@ -53,7 +68,7 @@ pub(crate) async fn request<T>(
                 CATALOG.with(|catalog| {
                     let catalog = catalog.borrow();
                     tracing::debug!(
-                        catalog_reads = catalog.reads,
+                        target: "tickloop::request_timing", catalog_reads = catalog.reads,
                         catalog_builds = catalog.builds,
                         catalog_elapsed_us = catalog.elapsed_us,
                         "request catalog summary"
@@ -71,9 +86,12 @@ impl<T> ChatsMutex<T> {
     pub(crate) fn new(value: T) -> Self {
         Self(tokio::sync::Mutex::new(value))
     }
-    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, T> {
-        let _timing = Phase::new("chats_lock_wait");
-        self.0.lock().await
+    pub(crate) fn lock(&self) -> impl std::future::Future<Output = tokio::sync::MutexGuard<'_, T>> {
+        // Keep instrumentation out of the large futures that hosts await on small stacks.
+        Box::pin(async {
+            let _timing = Phase::new("chats_lock_wait");
+            self.0.lock().await
+        })
     }
 }
 impl<T> std::ops::Deref for ChatsMutex<T> {

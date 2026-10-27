@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use tickloop_harness_protocol::mcp::ToolExposure;
 
 pub(super) struct Tool {
+    pub generation: u64,
     pub original: String,
     pub definition: ToolDefinition,
     pub original_schema: Value,
@@ -53,6 +54,7 @@ impl Entry {
         let started = std::time::Instant::now();
         let _timing = crate::timing::Phase::new("mcp_catalog_build");
         let revision = connection.catalog_revision.load(Ordering::SeqCst);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let raw = connection.tools.read().unwrap().clone();
         let mut tools = BTreeMap::new();
         for (_, tool) in raw {
@@ -88,6 +90,7 @@ impl Entry {
             tools.insert(
                 definition.name.clone(),
                 Arc::new(Tool {
+                    generation,
                     original: tool.original,
                     definition,
                     original_schema,
@@ -100,7 +103,7 @@ impl Entry {
             );
         }
         let snapshot = Arc::new(Catalog {
-            generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
+            generation,
             revision,
             secret_generation: self.secret_generation.load(Ordering::SeqCst),
             tools,
@@ -121,7 +124,8 @@ impl Entry {
                 .unwrap_or_default(),
         });
         if connection.catalog_revision.load(Ordering::SeqCst) == revision {
-            *connection.snapshot.write().unwrap() = snapshot;
+            let previous = std::mem::replace(&mut *connection.snapshot.write().unwrap(), snapshot);
+            drop(previous);
             self.catalog_builds.fetch_add(1, Ordering::Relaxed);
             self.catalog_micros
                 .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);

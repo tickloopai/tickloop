@@ -28,6 +28,7 @@ pub mod auxiliary;
 pub mod availability;
 pub mod cards;
 mod chat_completions;
+pub mod context_tokens;
 mod generation_budget;
 pub mod judgment;
 pub use generation_budget::GenerationBudget;

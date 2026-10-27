@@ -350,7 +350,7 @@ impl Agent {
                         .ok_or(AgentError::NotFound)?;
                     chat.snapshot
                         .request_usage
-                        .add_context_output_bytes(sequence, text.len())?;
+                        .add_context_output(sequence, &text)?;
                     chat.snapshot.last_sequence += 1;
                     let event = Event {
                         sequence: chat.snapshot.last_sequence,
@@ -376,7 +376,7 @@ impl Agent {
                         .ok_or(AgentError::NotFound)?;
                     chat.snapshot
                         .request_usage
-                        .add_context_output_bytes(sequence, thinking.len())?;
+                        .add_context_output(sequence, &thinking)?;
                     chat.snapshot
                         .pending_thinking
                         .entry(receipt.run_id)
@@ -733,6 +733,12 @@ impl Agent {
             };
             super::context::serialized_request_bytes(messages, &request.tools)
         });
+        let request_tokens = match tickloop_harness_protocol::context_token_counter()
+            .filter(|_| request_bytes.is_some())
+        {
+            Some(counter) => Some(count_request_tokens(counter, &request).await?),
+            None => None,
+        };
         let was_cancelled = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
@@ -763,6 +769,10 @@ impl Agent {
                         &request.tools,
                     ),
                 );
+                let measurement = match request_tokens {
+                    Some((request, overhead)) => measurement.with_tokens(request, overhead),
+                    None => measurement,
+                };
                 chat.snapshot
                     .request_usage
                     .record_serialized_request_bytes(sequence, bytes)?;
@@ -801,6 +811,8 @@ impl Agent {
         let request_cancel = cancel.child_token();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut progress = RequestProgress::default();
+        let sent = std::time::Instant::now();
+        let mut first_event = true;
         // The scope destroys the actual request future before the receiver is closed and drained.
         let mut result = {
             let response = async {
@@ -845,6 +857,7 @@ impl Agent {
                         );
                     }
                 }
+                crate::timing::dispatched();
                 match model_context {
                     Some(model_context) => {
                         client
@@ -875,8 +888,6 @@ impl Agent {
                     None => std::future::pending::<()>().await,
                 }
             };
-            let sent = std::time::Instant::now();
-            let mut first_event = true;
             tokio::pin!(response, deadline);
             loop {
                 let flush_deadline = progress.delta_deadline;
@@ -899,7 +910,7 @@ impl Agent {
                     Some(delta) = receiver.recv() => {
                         if first_event {
                             first_event = false;
-                            tracing::debug!(chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
+                            tracing::debug!(target: "tickloop::request_timing", chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
                         }
                         if let Err(error) = self.buffer_model_delta(&context, sequence, delta,
                             &cancel, &mut progress).await {
@@ -912,6 +923,10 @@ impl Agent {
         request_cancel.cancel();
         receiver.close();
         while let Ok(delta) = receiver.try_recv() {
+            if first_event {
+                first_event = false;
+                tracing::debug!(target: "tickloop::request_timing", chat = ?context.owner.chat_id, run = ?context.owner.run_id, ledger_sequence = ?sequence, phase = "first_stream_event", elapsed_us = sent.elapsed().as_micros() as u64, "request timing");
+            }
             if let Err(error) = self
                 .buffer_model_delta(&context, sequence, delta, &cancel, &mut progress)
                 .await
@@ -1018,6 +1033,33 @@ impl Agent {
             }
         }
     }
+}
+
+/// The tokens of a conversation request, and of its system prompt and tool definitions, counted
+/// off the executor: a long Chat's first request after loading counts every message once.
+async fn count_request_tokens(
+    counter: &'static dyn tickloop_harness_protocol::ContextTokenCounter,
+    request: &ModelRequest,
+) -> Result<(usize, usize), AgentError> {
+    let messages = request.messages.clone();
+    let tools = request.tools.clone();
+    tokio::task::spawn_blocking(move || {
+        let definitions = tools
+            .iter()
+            .map(|tool| counter.definition_tokens(tool))
+            .sum::<usize>();
+        let system = messages
+            .first()
+            .filter(|message| message.role == Role::System)
+            .map_or(0, |message| counter.message_tokens(message));
+        let all = messages
+            .iter()
+            .map(|message| counter.message_tokens(message))
+            .sum::<usize>();
+        (all + definitions, system + definitions)
+    })
+    .await
+    .map_err(|error| AgentError::Invalid(format!("counting request tokens failed: {error}")))
 }
 
 fn retry_error_label(error: &ModelError) -> String {

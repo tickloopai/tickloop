@@ -355,6 +355,18 @@ fn transcript_chat_snapshots_keep_their_recorded_wire() {
     assert_golden("chat_snapshot", &chat_snapshot());
 }
 
+/// A measurement recorded before token counting holds bytes alone; one counted with a
+/// tokenizer adds its token counts beside them, so older readers still load it.
+#[test]
+fn transcript_context_measurements_keep_their_recorded_wire() {
+    let snapshot = chat_snapshot();
+    let bytes = tickloop_harness_protocol::ContextMeasurement::capture(&snapshot, 12_000, 3_000);
+    assert_golden(
+        "context_measurement",
+        &vec![bytes.clone(), bytes.with_tokens(5_200, 1_400)],
+    );
+}
+
 #[test]
 fn transcript_messages_keep_their_recorded_wire() {
     assert_golden("message", &messages());
@@ -373,4 +385,32 @@ fn task_board_mode_preserves_legacy_teams_and_new_solo_boards() {
     let solo = board.clone();
     board.is_team = true;
     assert_golden("task_board", &vec![solo, board]);
+}
+
+#[test]
+fn approval_status_events_round_trip() {
+    use tickloop_harness_protocol::{
+        ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, EventKind,
+    };
+    let record: ApprovalRecord = serde_json::from_value(json!({
+        "id":id(1),"chat_id":id(2),"loop_id":id(3),"run_id":id(4),"operation_id":id(5),
+        "call_id":"call-write","at_ms":1,"tool":"Write","input_summary":{"text":"file","truncated":false},
+        "outcome":ApprovalResult::Allow,"path":ApprovalPath::Human,"reason":"Human approved this operation",
+        "human_reason":"Explicit Ask rule requires confirmation","approval_source":"explicit_ask",
+        "policy_revision":1,"matching_rules":[],"review":null
+    })).unwrap();
+    let events = vec![
+        EventKind::ApprovalReviewStarted {
+            call_id: "call-write".into(),
+            reviewer: ApprovalReviewerKind::Jev,
+        },
+        EventKind::ApprovalReviewStarted {
+            call_id: "call-write".into(),
+            reviewer: ApprovalReviewerKind::Llm,
+        },
+        EventKind::ApprovalRecorded {
+            record: Box::new(record),
+        },
+    ];
+    assert_golden("approval-status-events", &events);
 }

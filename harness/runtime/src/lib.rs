@@ -65,6 +65,7 @@ mod chat_title;
 mod citations;
 mod compaction;
 mod context;
+mod context_breakdown;
 mod delegation;
 mod denials;
 mod directed_summary;
@@ -1055,6 +1056,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        approval_records: Vec::new(),
         search_config: tickloop_harness_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
         subagent_reports: BTreeMap::new(),
@@ -1176,6 +1178,11 @@ impl Agent {
     }
 
     fn tool_definitions(&self, chat: &Chat) -> Vec<tickloop_harness_protocol::ToolDefinition> {
+        self.tool_registry(chat).definitions()
+    }
+
+    /// The tools a request of `chat` offers, without refreshing what they depend on.
+    fn tool_registry(&self, chat: &Chat) -> ToolRegistry {
         ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
@@ -1189,7 +1196,6 @@ impl Agent {
             &self.inner.tool_policy,
             self.scheduled_task_terms(),
         )
-        .definitions()
     }
 
     /// Installs execution-owner services for Shell handoff. An environment is required.
@@ -1212,6 +1218,29 @@ impl Agent {
             .unwrap()
             .as_ref()
             .map_or((0, 0, 0), |provider| provider.mcp_performance_counts())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn benchmark_host_tool_preparation(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<usize, AgentError> {
+        let provider = self.inner.host_tools.read().unwrap().clone();
+        if let Some(provider) = &provider {
+            provider
+                .refresh(CancellationToken::new())
+                .await
+                .map_err(AgentError::Invalid)?;
+        }
+        let count = {
+            let chats = self.inner.chats.lock().await;
+            self.tool_definitions(chats.get(&chat_id).ok_or(AgentError::NotFound)?)
+                .len()
+        };
+        if let Some(provider) = provider {
+            provider.mcp_instructions();
+        }
+        Ok(count)
     }
 
     /// Registers the provider's current tools without refreshing remote directories. Call
@@ -1684,6 +1713,10 @@ impl Agent {
                 .with_fallback_reason(fallback_reason)
         };
         if !use_jev {
+            if emit_permission {
+                self.emit_approval_review_started(receipt, operation, ApprovalReviewerKind::Llm)
+                    .await;
+            }
             let run = self
                 .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
                 .await?;
@@ -1729,6 +1762,14 @@ impl Agent {
         let mut fallback_reason = skipped_reason;
         if let Some(permit) = permit {
             let run = if let Some(client) = client {
+                if emit_permission {
+                    self.emit_approval_review_started(
+                        receipt,
+                        operation,
+                        ApprovalReviewerKind::Jev,
+                    )
+                    .await;
+                }
                 self.review_with_jev(
                     receipt,
                     &context,
@@ -1773,6 +1814,10 @@ impl Agent {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
+        if emit_permission {
+            self.emit_approval_review_started(receipt, operation, ApprovalReviewerKind::Llm)
+                .await;
+        }
         let mut run = self
             .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
             .await?;
@@ -1787,6 +1832,24 @@ impl Agent {
             fallback_failure,
             fallback_reason,
         ))
+    }
+
+    async fn emit_approval_review_started(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        reviewer: ApprovalReviewerKind,
+    ) {
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
+            self.emit(
+                chat,
+                receipt,
+                EventKind::ApprovalReviewStarted {
+                    call_id: operation.call_id.clone(),
+                    reviewer,
+                },
+            );
+        }
     }
 
     async fn emit_auto_review_check(&self, receipt: &Receipt, review: &AutoReview) {
@@ -3050,7 +3113,7 @@ impl Agent {
         let _ = self.inner.events.send(event);
     }
 
-    #[tracing::instrument(skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
+    #[tracing::instrument(target = "tickloop::request_timing", skip_all, fields(chat = ?receipt.chat_id, run = ?receipt.run_id))]
     async fn model_request(
         &self,
         receipt: &Receipt,
@@ -3148,65 +3211,17 @@ impl Agent {
                 }
                 None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let scope = system_prompt::PromptScope {
-                has_folder: chat.snapshot.folder.is_some(),
-                tools: self.inner.tool_policy,
-                waits: self.inner.waits,
-                host_section: self.inner.system_prompt_addition.as_deref(),
-                citation_style: self.inner.citation_style,
-            };
-            let family_temp = chat.tools.family_temp_directory();
-            let mut web_search =
-                serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
-            if chat.snapshot.folder.is_some() {
-                web_search["settings_command"] = "/websearch".into();
-            }
-            let mut state = serde_json::json!({
-                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-                "artifact_ticks": chat.snapshot.artifact_ticks,
-                "delegation": chat.snapshot.delegation,
-                "family_members": family_roster.iter().map(|member| serde_json::json!({
-                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                    "name": member.handle, "depth": member.depth, "state": member.availability,
-                    })).collect::<Vec<_>>(),
-                "loop": chat.snapshot.chat_loop,
-                "execution_mode": chat.snapshot.policy.mode,
-                "web_search": web_search,
-                "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-            });
-            if let Some(folder) = &chat.snapshot.folder {
-                state.as_object_mut().unwrap().extend(serde_json::json!({
-                    "workdir": folder,
-                    "family_temp_directory": family_temp,
-                    "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
-                    "workspace_host": workspace_host,
-                }).as_object().unwrap().clone());
-            }
-            if chat.snapshot.folder.is_none() {
-                let chat_loop = &chat.snapshot.chat_loop;
-                state["loop"] = serde_json::json!({
-                    "id": chat_loop.id,
-                    "receiving": chat_loop.receiving,
-                    "subscriptions": chat_loop.subscriptions,
-                });
-            }
-            let state = tickloop_harness_protocol::model_ids::model_json(&chat.ids, state);
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
-                Message {
-                    role: Role::System,
-                    content: vec![Content::Text {
-                        text: system_prompt::conversation_system_prompt(
-                            &state,
-                            chat.output_style,
-                            plan_mode.as_deref(),
-                            scope,
-                        ),
-                    }],
-                },
+                self.conversation_system_message(
+                    chat,
+                    receipt.loop_id,
+                    &family_roster,
+                    workspace_host.as_ref(),
+                    plan_mode.as_deref(),
+                ),
             );
             request.history_sources.insert(1, None);
             request.messages.insert(1, user_context);
@@ -3555,7 +3570,7 @@ impl Agent {
                 assessment: admission.assessment,
             },
         );
-        chat.denial_window.add_approval(approval);
+        self.record_approval(chat, receipt, approval);
         self.save(&chat.snapshot);
         self.emit(
             chat,
@@ -3593,7 +3608,7 @@ impl Agent {
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
             self.feedback_account_context(&receipt).await?;
             *is_awaiting_model = true;
-            let prepared = timing::request(&receipt, async {
+            let prepared = Box::pin(timing::request(&receipt, async {
                 let mut registry = self
                     .prepare_tool_registry(&receipt, &cancel)
                     .await
@@ -3610,7 +3625,7 @@ impl Agent {
                     )
                     .await?;
                 Ok::<_, AgentError>((registry, output))
-            })
+            }))
             .await;
             let (registry, output) = match prepared {
                 Ok(prepared) => prepared,
@@ -4641,6 +4656,7 @@ impl Agent {
             {
                 return Err("user Shell permission expired".into());
             }
+            chat.denial_window.remember_human_prompt(&request);
             chat.snapshot.permissions.push(request.clone());
             self.inner.approvals.lock().await.insert(
                 request.id,
@@ -4686,6 +4702,12 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id) {
+            if answer.is_err() || resumed.is_err() {
+                chat.denial_window.human_prompts.retain(|(run, call, _)| {
+                    Some(*run) != request.execution.run_id()
+                        || *call != request.execution.call_key()
+                });
+            }
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
@@ -5128,6 +5150,12 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .snapshot
             .clone();
+        snapshot.approval_records = chats[&chat_id]
+            .denial_window
+            .records
+            .iter()
+            .cloned()
+            .collect();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
         snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();

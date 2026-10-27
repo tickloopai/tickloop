@@ -920,6 +920,7 @@ mod tests {
         );
         let operation = OperationRecord {
             parent_call_id: None,
+            parent_call_index: None,
             task_binding: None,
             id: Uuid::new_v4(),
             loop_id: child.chat_loop.id,
@@ -1013,6 +1014,7 @@ mod tests {
         }
         let operation = OperationRecord {
             parent_call_id: None,
+            parent_call_index: None,
             task_binding: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4().into(),

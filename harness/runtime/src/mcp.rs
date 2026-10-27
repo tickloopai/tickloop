@@ -198,21 +198,36 @@ impl Entry {
             }
         }
         *self.credential.write().unwrap() = credential;
+        self.refresh_redactor();
+    }
+
+    fn remember_token(&self, token: AccessToken) {
+        let secret = token.secret().to_owned();
+        let mut secrets = self.credential_secrets.write().unwrap();
+        if !secrets.contains(&secret) {
+            secrets.push(secret);
+        }
+        drop(secrets);
+        *self.token.write().unwrap() = Some(token);
+        self.refresh_redactor();
+    }
+
+    fn refresh_redactor(&self) {
         let changed = {
             let _publication = self.publication.lock().unwrap();
             if let Some(redactor) = redaction::Redactor::new(self) {
                 self.secret_generation.fetch_add(1, Ordering::SeqCst);
                 *self.redactor.write().unwrap() = Some(Arc::new(redactor));
                 self.redactor_builds.fetch_add(1, Ordering::Relaxed);
-                *self.description.write().unwrap() = redact(self, self.config.description.clone());
-                *self.config_failure.write().unwrap() = match &self.config.transport {
-                    McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
-                    _ => None,
-                };
                 true
             } else {
                 false
             }
+        };
+        *self.description.write().unwrap() = redact(self, self.config.description.clone());
+        *self.config_failure.write().unwrap() = match &self.config.transport {
+            McpTransport::Failed { reason } => Some(redact(self, reason.clone())),
+            _ => None,
         };
         if changed && let Some(connection) = self.connection.read().unwrap().clone() {
             self.publish_catalog(&connection);
@@ -402,6 +417,12 @@ impl McpConnections {
                 .unwrap()
                 .get(&config.name)
                 .cloned();
+            let previous_redactor = existing
+                .as_ref()
+                .and_then(|entry| entry.redactor.read().unwrap().clone());
+            let previous_secret_generation = existing
+                .as_ref()
+                .map_or(0, |entry| entry.secret_generation.load(Ordering::SeqCst));
             let previous_generation = existing
                 .as_ref()
                 .map_or(0, |entry| entry.generation.load(Ordering::SeqCst));
@@ -460,10 +481,10 @@ impl McpConnections {
                     .collect();
                 let entry = Arc::new(Entry {
                     legacy,
-                    redactor: RwLock::new(None),
+                    redactor: RwLock::new(previous_redactor),
                     publication: std::sync::Mutex::new(()),
                     generation: AtomicU64::new(previous_generation),
-                    secret_generation: AtomicU64::new(0),
+                    secret_generation: AtomicU64::new(previous_secret_generation),
                     description: RwLock::new(String::new()),
                     config_failure: RwLock::new(None),
                     catalog_builds: self.inner.catalog_builds.clone(),
@@ -524,7 +545,7 @@ impl McpConnections {
                     if let Some(credentials) = &entry.credentials {
                         entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
                     }
-                    *entry.token.write().unwrap() = Some(token.map_err(|error| match error {
+                    entry.remember_token(token.map_err(|error| match error {
                         TokenError::NeedsLogin | TokenError::RenewalFailed => "MCP login required",
                         _ => "MCP credential unavailable",
                     })?);
@@ -541,7 +562,7 @@ impl McpConnections {
                         entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
                     }
                     let renewed = renewed.map_err(|_| opened.as_ref().err().cloned().unwrap_or_else(|| "MCP login required".into()))?;
-                    *entry.token.write().unwrap() = Some(renewed.clone());
+                    entry.remember_token(renewed.clone());
                     authenticating.store(false, Ordering::SeqCst);
                     return open(&entry, Some(renewed.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
                 }
@@ -631,6 +652,19 @@ impl McpConnections {
     #[cfg(feature = "test-support")]
     pub fn last_catalog_build_micros(&self) -> u64 {
         self.inner.catalog_micros.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn benchmark_remember_credential(&self, server: &str, credential: ConnectorCredential) {
+        let entry = self
+            .inner
+            .entries
+            .read()
+            .unwrap()
+            .get(server)
+            .expect("benchmark server")
+            .clone();
+        entry.remember_credential(Some(credential));
     }
 
     #[cfg(feature = "test-support")]
@@ -773,10 +807,14 @@ impl McpConnections {
                         .as_ref()
                         .map(|connection| entry.current_catalog(connection).instructions.clone())
                         .unwrap_or_default(),
-                    warnings: connection
-                        .as_ref()
-                        .map(|connection| entry.current_catalog(connection).warnings.clone())
-                        .unwrap_or_default(),
+                    warnings: if let Some(reason) = entry.config_failure.read().unwrap().clone() {
+                        vec![reason]
+                    } else {
+                        connection
+                            .as_ref()
+                            .map(|connection| entry.current_catalog(connection).warnings.clone())
+                            .unwrap_or_default()
+                    },
                 }
             })
             .collect()
@@ -832,7 +870,7 @@ impl McpConnections {
         if *entry.state.read().unwrap() != McpServerState::Connected {
             return Err("MCP connection is unavailable".into());
         }
-        let generation = connection.snapshot.read().unwrap().generation;
+        let generation = tool.generation;
         Ok(PreparedMcpCall {
             generation,
             entry,

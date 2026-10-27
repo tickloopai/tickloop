@@ -9,6 +9,7 @@ const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
 const DEVELOPMENT_CONFIG_ROOT: &str = ".tickloop-dev";
 
 fn main() {
+    tickloop_harness::model::context_tokens::install();
     if cfg!(debug_assertions) {
         default_to_development_config_root();
     }

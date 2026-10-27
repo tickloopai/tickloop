@@ -145,6 +145,8 @@ pub struct ApprovalRecord {
     pub denial_category: Option<DenialCategory>,
     pub approval_source: Option<PermissionApprovalSource>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_reason: Option<String>,
     pub policy_revision: u64,
     pub matching_rules: Vec<DenialRuleSummary>,
     #[serde(default)]
@@ -198,6 +200,7 @@ impl ApprovalRecord {
             denial_category: Some(record.category),
             approval_source: record.approval_source,
             reason: record.reason,
+            human_reason: None,
             policy_revision: record.policy_revision,
             matching_rules: record.matching_rules,
             matching_rules_truncated: record.matching_rules_truncated,

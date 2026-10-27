@@ -13,6 +13,7 @@ use tickloop_harness::tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAM
 use tokio::sync::{broadcast, mpsc};
 
 mod agent_messaging;
+mod approval_status;
 mod artifact_ui;
 mod artifacts_picker;
 pub mod attach;
@@ -24,6 +25,7 @@ mod clipboard_hint;
 mod completed_tasks;
 mod completion;
 mod console;
+mod context_view;
 mod conversation;
 #[cfg(test)]
 mod conversation_layout_tests;
@@ -416,6 +418,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/details"
                 | "/diff"
                 | "/status"
+                | "/context"
                 | "/artifacts"
                 | "/plugins"
                 | "/ticks"
@@ -1928,7 +1931,7 @@ async fn interact_with_herdr(
             show_opened_chat(console, agent, &snapshot, has_history)?;
             selected_chat = Some(snapshot.id);
             displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
-            tools.restore(&snapshot.conversation_events());
+            tools.restore_snapshot(&snapshot);
             sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
         }
         StartupChat::Picker { as_new_chat } => {
@@ -2132,7 +2135,7 @@ async fn interact_with_herdr(
             }
             if let Some(snapshot) = outcome.restored {
                 displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
-                tools.restore(&snapshot.conversation_events());
+                tools.restore_snapshot(&snapshot);
                 sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
             }
             if let Some(chat) = outcome.selection {
@@ -2989,7 +2992,7 @@ async fn interact_with_herdr(
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
                             displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
-                            tools.restore(&snapshot.conversation_events());
+                            tools.restore_snapshot(&snapshot);
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                             message_groups=MessageGroups::default();
                             #[cfg(test)]
@@ -3459,7 +3462,7 @@ async fn interact_with_herdr(
                                 Ok(Some(effect))=>{if let Some(snapshot)=navigate_agent(&mut global,agent,console,&mut menus,effect,&displayed_sequences,&mut reply_lines).await? {
                                     selected_chat=Some(snapshot.id);overview_active=false;
                                     displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
-                                    tools.restore(&snapshot.conversation_events());
+                                    tools.restore_snapshot(&snapshot);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                     message_groups=MessageGroups::default();
                                 }},
@@ -3776,6 +3779,29 @@ async fn interact_with_herdr(
                                 } else { outln!(console, "Prompt suggestions: Off"); }
                             } else {outln!(console,"No Chat is selected.");}
                         },
+                        command if command.split_whitespace().next() == Some("/context") => {
+                            let mut arguments = command.split_whitespace().skip(1);
+                            let expanded = match (arguments.next(), arguments.next()) {
+                                (None, _) => false,
+                                (Some(context_view::EXPAND_ARGUMENT), None) => true,
+                                _ => { outln!(console, "Usage: /context [{}]", context_view::EXPAND_ARGUMENT); continue; }
+                            };
+                            let Some(chat)=selected_chat else { outln!(console,"No Chat is selected."); continue; };
+                            match (agent.context_breakdown(chat.into()).await, agent.status(chat.into()).await) {
+                                (Ok(breakdown), Ok(status)) => {
+                                    let home = std::env::home_dir();
+                                    let view = context_view::ContextView {
+                                        breakdown: &breakdown,
+                                        model_name: settings::model_name(&status.model),
+                                        model_id: &status.model.model,
+                                        home: home.as_deref(),
+                                        expanded,
+                                    };
+                                    console.write_roles(&view.runs(console.conversation_width()?, console.display_profile()?))?;
+                                },
+                                (Err(error), _) | (_, Err(error)) => outln!(console,"Cannot read context usage: {}",safe_text(&error.to_string())),
+                            }
+                        },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat.map(Into::into),false).await {
                             Ok(picker) => menus.conversations(console,picker)?,
                             Err(error) => outln!(console,"{error}"),
@@ -3875,7 +3901,7 @@ async fn interact_with_herdr(
                                     selected_chat=Some(outcome.child_chat_id);
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(outcome.child_chat_id.into(),outcome.snapshot.last_sequence);
-                                    tools.restore(&outcome.snapshot.conversation_events());
+                                    tools.restore_snapshot(&outcome.snapshot);
                                     sync_snapshot(&outcome.snapshot,&mut pending,&mut permissions,&mut questions);
                                     console.scroll_conversation_to_end()?;
                                     status_dirty=true;
@@ -4108,7 +4134,7 @@ async fn interact_with_herdr(
                                     selected_chat=Some(snapshot.id);
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
-                                    tools.restore(&snapshot.conversation_events());
+                                    tools.restore_snapshot(&snapshot);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
                                 Err(error) => outln!(console, "{}", safe_text(&error)),
@@ -4372,7 +4398,7 @@ async fn interact_with_herdr(
                             .await
                             .map_err(|error| error.to_string())?;
                         displayed_sequences.insert(event.chat_id.into(), snapshot.last_sequence);
-                        tools.restore(&snapshot.conversation_events());
+                        tools.restore_snapshot(&snapshot);
                         message_groups = MessageGroups::default();
                         thinking_runs.clear();
                         thinking_previews.clear();
@@ -4585,7 +4611,7 @@ async fn interact_with_herdr(
                                     && let Some(restored)=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
                                 {
                                     displayed_sequences.insert(restored.id.into(),restored.last_sequence);
-                                    tools.restore(&restored.conversation_events());
+                                    tools.restore_snapshot(&restored);
                                     sync_snapshot(&restored,&mut pending,&mut permissions,&mut questions);
                                 }
                             } else {
@@ -4617,7 +4643,7 @@ async fn interact_with_herdr(
                             else {outln!(console, "\nPermission request: {0} · {1}\nOperation: {2}\nUse /allow {0} [once|session|persistent] or /deny {0}.", shown_id(request.id), safe_text(&request.name), safe_text(&request.input.to_string()));}
                         },
                         EventKind::PermissionRequested {..} => {},
-                        EventKind::ApprovalAssessed { .. } => {},
+                        EventKind::ApprovalAssessed { .. } | EventKind::ApprovalReviewStarted { .. } | EventKind::ApprovalRecorded { .. } => {},
                         EventKind::PermissionChecked {decision,reason} => {
                             if decision != Decision::Allow && (!interactive || decision != Decision::Deny) {
                                 outln!(console, "\nAuto review: {decision:?} · {}",safe_text(&reason));
@@ -4779,7 +4805,7 @@ async fn interact_with_herdr(
                             summary_recovery_required.remove(&metadata.chat);
                             displayed_sequences.insert(metadata.chat.into(),effect.snapshot.last_sequence);
                             merged_echoes.close_all();
-                            tools.restore(&effect.snapshot.conversation_events());
+                            tools.restore_snapshot(&effect.snapshot);
                             message_groups=MessageGroups::default();
                             sync_snapshot(&effect.snapshot,&mut pending,&mut permissions,&mut questions);
                             selected_chat=Some(metadata.chat);
@@ -5785,7 +5811,7 @@ fn render_restored_observation(
     }
     if observation.reset_required {
         console.reset_chat(chat.into())?;
-        tools.restore(&conversation_events);
+        tools.restore_snapshot(&observation.snapshot);
         workflows::write_public_history(console, &observation.snapshot)?;
         if observation.snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Failed {
             let error=observation.snapshot.events.iter().rev().find_map(|event| {

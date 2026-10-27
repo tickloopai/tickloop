@@ -90,6 +90,8 @@ pub(super) fn allowed_approval_record(
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DenialWindow {
     pub records: VecDeque<ApprovalRecord>,
+    #[serde(skip)]
+    pub human_prompts: VecDeque<(tickloop_harness_protocol::RunId, String, Option<String>)>,
     pub revision: u64,
     pub saved_revision: u64,
     pub save_error: Option<String>,
@@ -97,11 +99,41 @@ pub(super) struct DenialWindow {
 }
 
 impl DenialWindow {
-    pub fn add(&mut self, record: DenialRecord) {
-        self.add_approval(ApprovalRecord::from_denial(record));
+    pub fn remember_human_prompt(
+        &mut self,
+        request: &tickloop_harness_protocol::PermissionRequest,
+    ) {
+        if let Some(run) = request.execution.run_id() {
+            self.human_prompts.push_front((
+                run,
+                request.execution.call_key().to_owned(),
+                request.approval_reason.as_deref().map(|reason| {
+                    if looks_like_secret(reason) {
+                        "[REDACTED]".into()
+                    } else {
+                        bounded(
+                            &reason.split_whitespace().collect::<Vec<_>>().join(" "),
+                            MAX_REQUEST_DETAIL_CHARS,
+                        )
+                        .text
+                    }
+                }),
+            ));
+            self.human_prompts.truncate(MAX_RECENT_DENIALS);
+        }
     }
 
-    pub fn add_approval(&mut self, record: ApprovalRecord) {
+    pub fn add_approval(&mut self, mut record: ApprovalRecord) {
+        if let Some(index) = self
+            .human_prompts
+            .iter()
+            .position(|(run, call, _)| *run == record.run_id && *call == record.call_id)
+        {
+            record.human_reason = self
+                .human_prompts
+                .remove(index)
+                .and_then(|(_, _, reason)| reason);
+        }
         if self
             .records
             .iter()
@@ -804,12 +836,42 @@ impl Agent {
         }
     }
 
+    pub(super) fn record_approval(
+        &self,
+        chat: &mut super::Chat,
+        receipt: &Receipt,
+        record: ApprovalRecord,
+    ) {
+        let operation_id = record.operation_id;
+        chat.denial_window.add_approval(record);
+        if let Some(record) = chat
+            .denial_window
+            .records
+            .iter()
+            .find(|record| record.operation_id == operation_id)
+            .cloned()
+        {
+            self.emit(
+                chat,
+                receipt,
+                tickloop_harness_protocol::EventKind::ApprovalRecorded {
+                    record: Box::new(record),
+                },
+            );
+        }
+    }
+
     pub(super) async fn record_final_denial(&self, record: DenialRecord) {
         let mut chats = self.inner.chats.lock().await;
         let Some(chat) = chats.get_mut(&record.chat_id) else {
             return;
         };
-        chat.denial_window.add(record);
+        let receipt = Receipt {
+            chat_id: record.chat_id,
+            loop_id: record.loop_id,
+            run_id: record.run_id,
+        };
+        self.record_approval(chat, &receipt, ApprovalRecord::from_denial(record));
         self.save(&chat.snapshot);
     }
 

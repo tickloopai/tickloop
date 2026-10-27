@@ -165,6 +165,34 @@ const FOLDER_HOST_TOOLS: [&str; 6] = [
     crate::mcp_tools::ARTIFACT_UPLOAD_TOOL,
 ];
 
+/// The MCP tools discovery offers `chat`; a delegated Chat only those its ceiling grants.
+pub(super) fn chat_discovery_tools(
+    chat: &Chat,
+    provider: &dyn crate::host_tools::HostToolProvider,
+) -> Vec<crate::tool_exposure::ExposureTool> {
+    provider
+        .discovery_tools()
+        .into_iter()
+        .filter(|tool| {
+            chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                delegation
+                    .ceiling
+                    .host_tools
+                    .contains_key(&tool.definition.name)
+            })
+        })
+        .collect()
+}
+
+/// Vendor tool search when the Chat's model offers it, SearchTools otherwise.
+pub(super) fn search_support(chat: &Chat) -> crate::tool_exposure::SearchSupport {
+    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model).is_some() {
+        crate::tool_exposure::SearchSupport::Native
+    } else {
+        crate::tool_exposure::SearchSupport::Fold
+    }
+}
+
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
@@ -319,39 +347,22 @@ impl ToolRegistry {
                 );
             }
             if provider.has_tool_search() {
-                let discovery = provider
-                    .discovery_tools()
-                    .into_iter()
-                    .filter(|tool| {
-                        chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
-                            delegation
-                                .ceiling
-                                .host_tools
-                                .contains_key(&tool.definition.name)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let search_support =
-                    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model)
-                        .is_some()
-                    {
-                        crate::tool_exposure::SearchSupport::Native
-                    } else {
-                        crate::tool_exposure::SearchSupport::Fold
-                    };
                 let directory = Arc::new(
-                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support)
-                        .with_unavailable_servers(provider.unavailable_tool_servers()),
+                    crate::tool_exposure::ExposureDirectory::new(
+                        chat_discovery_tools(chat, provider.as_ref()),
+                        search_support(chat),
+                    )
+                    .with_unavailable_servers(provider.unavailable_tool_servers()),
                 );
                 deferred = directory.deferred_tools();
+                let deferred_names: HashSet<_> =
+                    deferred.iter().map(|tool| tool.name.as_str()).collect();
                 folded.extend(
                     directory
                         .tools()
                         .filter(|tool| {
                             tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
-                                && !deferred
-                                    .iter()
-                                    .any(|deferred| deferred.name == tool.definition.name)
+                                && !deferred_names.contains(tool.definition.name.as_str())
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
@@ -880,14 +891,13 @@ impl Agent {
             .snapshot
             .operations
             .len();
-        let outcome = self
-            .execute_registered_call_inner(
-                receipt,
-                assistant_message_id,
-                invocation,
-                cancel.clone(),
-            )
-            .await;
+        let outcome = Box::pin(self.execute_registered_call_inner(
+            receipt,
+            assistant_message_id,
+            invocation,
+            cancel.clone(),
+        ))
+        .await;
         let command_state = if is_shell {
             self.command_state_for_call(receipt, &call_id).await
         } else {
@@ -1356,6 +1366,7 @@ impl Agent {
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
                 parent_call_id: crate::nested_calls::parent_call_id(),
+                parent_call_index: crate::nested_calls::parent_call_index(),
                 task_binding: task_binding.flatten(),
                 id: tickloop_ids::generate(),
                 loop_id: receipt.loop_id,
@@ -1928,6 +1939,7 @@ impl Agent {
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
                         parent_call_id: crate::nested_calls::parent_call_id(),
+                        parent_call_index: crate::nested_calls::parent_call_index(),
                         task_binding: task_binding.flatten(),
                         id: operation_id,
                         loop_id: receipt.loop_id,
@@ -2413,7 +2425,7 @@ impl Agent {
                                 assessment: assessment_details.as_ref(),
                             },
                         );
-                        chat.denial_window.add_approval(approval);
+                        self.record_approval(chat, receipt, approval);
                         self.save(&chat.snapshot);
                         self.emit(
                             chat,

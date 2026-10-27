@@ -11,6 +11,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tickloop-harness = { path = "../../harness/sdk", features = ["artifacts", "engine", "model", "policy", "tools", "connector"] }
 tickloop-code-local-environment = { path = "../local-environment" }
 async-trait = "0.1"

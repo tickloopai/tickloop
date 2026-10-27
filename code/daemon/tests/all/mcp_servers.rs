@@ -1205,7 +1205,7 @@ async fn unchanged_worker_requests_reuse_configuration_and_only_changed_settings
     .unwrap();
     assert_eq!(
         agent.mcp_performance_counts(),
-        (before.0 + 1, before.1 + 1, before.2 + 1)
+        (before.0 + 1, before.1, before.2 + 1)
     );
     agent.shutdown().await;
 }

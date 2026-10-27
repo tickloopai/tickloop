@@ -3521,6 +3521,33 @@ impl Console {
             call_key: call_key.to_owned(),
             runs: runs.to_vec(),
             clip_summary,
+            clipped_rows: Vec::new(),
+        }])
+    }
+
+    pub(super) fn write_approved_tool_result(
+        &self,
+        call_key: &str,
+        runs: &[(String, Option<Role>)],
+        clip_summary: bool,
+        approval: Option<&super::approval_status::ApprovalStatus>,
+    ) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::ToolResult {
+            call_key: call_key.to_owned(),
+            runs: runs.to_vec(),
+            clip_summary,
+            clipped_rows: approval.map_or_else(Vec::new, |approval| approval.clipped_rows(runs)),
+        }])
+    }
+
+    pub(super) fn write_tool_approval(
+        &self,
+        call_key: &str,
+        runs: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::ToolApproval {
+            call_key: call_key.to_owned(),
+            runs: runs.to_vec(),
         }])
     }
 
@@ -5344,11 +5371,16 @@ pub(super) enum ConversationPiece {
         /// The row of the batch call that made this call.
         parent_key: Option<String>,
     },
+    ToolApproval {
+        call_key: String,
+        runs: Vec<(String, Option<Role>)>,
+    },
     /// The result of the call named `call_key`, drawn under the call's own row.
     ToolResult {
         call_key: String,
         runs: Vec<(String, Option<Role>)>,
         clip_summary: bool,
+        clipped_rows: Vec<usize>,
     },
 }
 
@@ -5399,11 +5431,20 @@ impl ConversationPiece {
                 }
                 scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone());
             }
+            Self::ToolApproval { call_key, runs } => {
+                scrollback.expand_tool_call(call_key);
+                let rows = runs
+                    .iter()
+                    .map(|(text, _)| text.chars().filter(|character| *character == '\n').count())
+                    .sum::<usize>();
+                scrollback.set_tool_result(call_key, runs, false, &(0..rows).collect::<Vec<_>>());
+            }
             Self::ToolResult {
                 call_key,
                 runs,
                 clip_summary,
-            } => scrollback.append_tool_result(call_key, runs, *clip_summary),
+                clipped_rows,
+            } => scrollback.set_tool_result(call_key, runs, *clip_summary, clipped_rows),
             Self::Response(runs) => scrollback.append_response(runs),
             Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
@@ -5438,7 +5479,10 @@ impl ConversationPiece {
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text.as_str().into(),
-            Self::Response(runs) | Self::Body(runs) | Self::ToolResult { runs, .. } => {
+            Self::Response(runs)
+            | Self::Body(runs)
+            | Self::ToolResult { runs, .. }
+            | Self::ToolApproval { runs, .. } => {
                 runs.iter().map(|(text, _)| text.as_str()).collect()
             }
         }

@@ -32,5 +32,9 @@ opt-level = 2
 [profile.dev.package.regex-syntax]
 opt-level = 2
 
+# Loading the embedded o200k_base vocabulary must stay quick in debug builds and tests.
+[profile.dev.package.tiktoken-rs]
+opt-level = 2
+
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
