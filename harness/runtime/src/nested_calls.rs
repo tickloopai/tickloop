@@ -1,6 +1,6 @@
 //! Shared preparation, admission and execution for calls made inside a model tool.
 use crate::{
-    Agent, ToolInvocation, ToolRegistry,
+    Agent, LoopSnapshotExt, ToolInvocation, ToolRegistry,
     tool_execution::{ToolCallError, ToolCallOutcome},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -48,6 +48,8 @@ pub(crate) struct NestedCalls {
     registry: ToolRegistry,
     stop: CancellationToken,
     stop_reason: std::sync::Mutex<Option<String>>,
+    pending: std::sync::Mutex<std::collections::BTreeMap<String, (String, Value)>>,
+    permissions: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
     completed: Mutex<Vec<(Value, Value)>>,
     #[cfg(feature = "codemode")]
     script_control: std::sync::Mutex<Option<crate::codemode::Control>>,
@@ -105,6 +107,10 @@ pub(crate) async fn parent_call() -> Option<tickloop_harness_protocol::ProposedT
     })
 }
 
+pub(crate) fn register_permission(id: Uuid) {
+    let _ = CURRENT.try_with(|scope| scope.permissions.lock().unwrap().insert(id));
+}
+
 pub(crate) fn is_nested() -> bool {
     CURRENT.try_with(|_| true).unwrap_or(false)
 }
@@ -158,6 +164,10 @@ impl NestedCalls {
         cancel: CancellationToken,
     ) -> NestedOutcome {
         let call_id = tickloop_ids::generate().to_string();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(call_id.clone(), (name.clone(), input.clone()));
         let forbidden = matches!(
             name.as_str(),
             "ExecuteTools"
@@ -330,7 +340,96 @@ impl NestedCalls {
             },
         );
         self.agent.save(&chat.snapshot);
+        self.pending.lock().unwrap().remove(&outcome.call_id);
         outcome
+    }
+
+    /// Settles calls and confirmations even when the engine dropped their futures while they
+    /// were waiting for runtime locks. The parent awaits this after the bounded callback wait.
+    pub(crate) async fn finish(&self) {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        let permissions = std::mem::take(&mut *self.permissions.lock().unwrap());
+        let mut chats = self.agent.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&self.receipt.chat_id) else {
+            return;
+        };
+        let mut approvals = self.agent.inner.approvals.lock().await;
+        chat.snapshot
+            .permissions
+            .retain(|request| !permissions.contains(&request.id));
+        for id in permissions {
+            approvals.remove(&id);
+        }
+        drop(approvals);
+        if chat.snapshot.permissions.is_empty()
+            && chat.active_run == Some(self.receipt.run_id)
+            && chat.snapshot.chat_loop.state
+                == tickloop_harness_protocol::LoopState::WaitingPermission
+        {
+            chat.snapshot
+                .chat_loop
+                .set_state(tickloop_harness_protocol::LoopState::Running);
+        }
+        for (call_id, (name, input)) in pending {
+            let index = chat.snapshot.operations.iter().position(|operation| {
+                operation.run_id == self.receipt.run_id && operation.call_id == call_id
+            });
+            let index = index.unwrap_or_else(|| {
+                chat.snapshot.operations.push(OperationRecord {
+                    parent_call_id: Some(self.parent.clone()),
+                    task_binding: None,
+                    id: tickloop_ids::generate(),
+                    loop_id: self.receipt.loop_id,
+                    run_id: self.receipt.run_id,
+                    call_id: call_id.clone(),
+                    name,
+                    input,
+                    file_change: None,
+                    state: OperationState::Proposed,
+                    result: None,
+                });
+                chat.snapshot.operations.len() - 1
+            });
+            let operation = &mut chat.snapshot.operations[index];
+            if matches!(
+                operation.state,
+                OperationState::Proposed | OperationState::Admitted
+            ) || operation.result.is_none()
+            {
+                let dispatched = matches!(
+                    operation.state,
+                    OperationState::Admitted | OperationState::Unknown
+                );
+                operation.state = if dispatched {
+                    OperationState::Unknown
+                } else {
+                    OperationState::Failed
+                };
+                operation.result = Some(ToolResult {
+                    content: if dispatched {
+                        "Nested call cancelled after dispatch; outcome unknown"
+                    } else {
+                        "Nested call cancelled before dispatch; not executed"
+                    }
+                    .into(),
+                    is_error: true,
+                    output_ref: None,
+                });
+            }
+            self.agent
+                .record_nested_operation(self.receipt.chat_id, operation);
+            let result = operation.result.clone().unwrap();
+            self.agent.emit(
+                chat,
+                &self.receipt,
+                EventKind::ToolCompleted {
+                    call_id,
+                    result,
+                    sources: vec![],
+                },
+            );
+        }
+        self.agent.save(&chat.snapshot);
     }
 }
 
@@ -371,6 +470,8 @@ impl Agent {
             registry,
             stop: CancellationToken::new(),
             stop_reason: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            permissions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             completed: Mutex::new(Vec::new()),
             #[cfg(feature = "codemode")]
             script_control: std::sync::Mutex::new(None),
@@ -459,6 +560,7 @@ impl Agent {
             });
         }
         let mut outcomes = pending.collect::<Vec<_>>().await;
+        scope.finish().await;
         outcomes.sort_by_key(|(index, _)| *index);
         let images = outcomes
             .iter_mut()

@@ -4502,6 +4502,7 @@ impl Agent {
             approval_reason: prompt.reason,
             approval_source: prompt.source,
         };
+        nested_calls::register_permission(request.id);
         self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
             .await
     }

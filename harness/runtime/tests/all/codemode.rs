@@ -950,3 +950,103 @@ async fn tool_bridge_bounds_concurrency_without_losing_queued_calls() {
     assert_eq!(result.output, "40");
     assert!(seen.load(Ordering::SeqCst) <= 10);
 }
+
+struct ConfirmationGate(tokio::sync::Notify);
+#[async_trait::async_trait]
+impl tickloop_harness_runtime::host_tools::HostToolProvider for ConfirmationGate {
+    fn definitions(&self) -> Vec<tickloop_harness_protocol::ToolDefinition> {
+        ["Pending", "Gate"]
+            .into_iter()
+            .map(|name| tickloop_harness_protocol::ToolDefinition {
+                name: name.into(),
+                description: "Controlled fixture call".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+            })
+            .collect()
+    }
+    fn permission(
+        &self,
+        _: tickloop_harness_protocol::ChatId,
+        name: &str,
+        _: &serde_json::Value,
+    ) -> tickloop_harness_runtime::host_tools::HostToolPermission {
+        use tickloop_harness_runtime::host_tools::HostToolPermission;
+        if name == "Pending" {
+            HostToolPermission::ThirdParty
+        } else {
+            HostToolPermission::ReadOnly
+        }
+    }
+    async fn execute(
+        &self,
+        _: tickloop_harness_protocol::ChatId,
+        name: &str,
+        _: serde_json::Value,
+        _: tokio_util::sync::CancellationToken,
+    ) -> tickloop_harness_protocol::ToolResult {
+        assert_eq!(name, "Gate", "unconfirmed call must never dispatch");
+        self.0.notified().await;
+        tickloop_harness_protocol::ToolResult {
+            content: "ready".into(),
+            is_error: false,
+            output_ref: None,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_script_end_with_pending_confirmation_clears_it_and_records_not_executed() {
+    use std::sync::Arc;
+    use tickloop_harness_protocol::{EventKind, ExecutionMode, OperationState};
+    use tickloop_harness_runtime::Agent;
+    use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
+    let provider = Arc::new(ConfirmationGate(tokio::sync::Notify::new()));
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "script",
+                "Codemode",
+                json!({"code":"tools.Pending({}); await tools.Gate({}); return 'done';"}),
+            ),
+            text("finished"),
+        ])),
+    );
+    agent.install_host_tools(provider.clone()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Run the script".into()).await.unwrap();
+    let mut pending = None;
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                pending = Some(request.id);
+                provider.0.notify_one();
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.permissions.is_empty());
+    let child = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.name == "Pending")
+        .unwrap();
+    assert_eq!(child.state, OperationState::Failed);
+    assert!(child.result.as_ref().unwrap().is_error);
+    assert!(
+        agent
+            .answer_permission(chat, pending.unwrap(), true)
+            .await
+            .is_err()
+    );
+    agent.shutdown().await;
+}

@@ -131,36 +131,42 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
     let events = run_turn(&agent, chat.uuid(), "hello").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     let requests = model.requests.lock().unwrap().clone();
-    assert_eq!(
-        tool_names(&requests[0]),
-        [
-            "Read",
-            "Glob",
-            "Grep",
-            "Write",
-            "Edit",
-            "Bash",
-            "TaskStop",
-            "WebFetch",
-            "WebSearch",
-            "EnterPlanMode",
-            "ExitPlanMode",
-            "AskUserQuestion",
-            "Subagent",
-            "ListSubagents",
-            "SendMessage",
-            "StopSubagent",
-            "GetGoal",
-            "CreateGoal",
-            "UpdateGoal",
-            "CronCreate",
-            "CronList",
-            "CronUpdate",
-            "CronDelete",
-            "ScheduleWakeup",
-            "Skill",
-        ]
-    );
+    let mut expected = [
+        "Read",
+        "Glob",
+        "Grep",
+        "Write",
+        "Edit",
+        "Bash",
+        "TaskStop",
+        "WebFetch",
+        "WebSearch",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "AskUserQuestion",
+        "Subagent",
+        "ListSubagents",
+        "SendMessage",
+        "StopSubagent",
+        "GetGoal",
+        "CreateGoal",
+        "UpdateGoal",
+        "CronCreate",
+        "CronList",
+        "CronUpdate",
+        "CronDelete",
+        "ScheduleWakeup",
+        "Skill",
+    ]
+    .to_vec();
+    if tickloop_harness::runtime::ToolPolicy::local().scripts {
+        let index = expected
+            .iter()
+            .position(|name| *name == "EnterPlanMode")
+            .unwrap();
+        expected.insert(index, "Codemode");
+    }
+    assert_eq!(tool_names(&requests[0]), expected);
     let prompt = system_prompt(&requests[0]);
     for section in [
         "# Ticks, Loops, and workspace displays",

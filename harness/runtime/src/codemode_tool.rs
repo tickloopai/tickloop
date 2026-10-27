@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub(crate) fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "Codemode".into(),
-        description: "Run JavaScript as an async function body in a QuickJS sandbox without files, network, timers or module loading. Use await tools.<name>(arguments), replacing invalid identifier characters with _. Exact tool names also work as tools['original-name']; exact names take precedence when normalized names collide. Each tool call has its usual permissions and may pause for confirmation. text(value), image(base64 data URL or MCP image block), console.log/info/warn/error/debug, return and exit() produce output; only explicit output returns to the model. First-line // @options: {\"max_output_tokens\":10000,\"timeout_ms\":300000} controls output and active elapsed time; confirmation waits do not count. Excess output preserves its start and end with a full-output file. Memory is limited to 256 MB. Tool errors and human denials throw Error; Auto denial ends the entire script. Calls still running at script completion are cancelled and may have an unknown outcome. Cannot call Codemode, ExecuteTools, AskUserQuestion, EnterPlanMode, ExitPlanMode, Subagent, Skill, family control, scheduled task or Goal tools. Discover tool names and schemas with top-level SearchTools and DescribeTools.".into(),
+        description: "Run JavaScript as an async function body in a QuickJS sandbox without files, network, timers or module loading. Use await tools.<name>(arguments), replacing invalid identifier characters with _. Exact tool names also work as tools['original-name']; exact names take precedence when normalized names collide. Each tool call has its usual permissions and may pause for confirmation. text(value), image(base64 data URL or MCP image block), console.log/info/warn/error/debug, return and exit() produce output; only explicit output returns to the model. First-line // @options: {\"max_output_tokens\":10000,\"timeout_ms\":300000} controls output and active elapsed time; confirmation waits do not count. Excess output preserves its start and end with a full-output file. Memory is limited to 256 MB. Tool errors and human denials throw Error; Auto denial ends the entire script. Calls still running at script completion are cancelled and may have an unknown outcome. Cannot call Codemode, ExecuteTools, AskUserQuestion, Subagent, Skill, plan mode controls, family control, scheduled task or Goal tools. Discover tool names and schemas with top-level SearchTools and DescribeTools.".into(),
         input_schema: json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}),
     }
 }
@@ -98,6 +98,7 @@ impl Agent {
             _ = cancel.cancelled() => { control.cancel.cancel(); execution.await },
             result = &mut execution => result,
         };
+        scope.finish().await;
         if let Some(reason) = scope.rejection_reason() {
             outcome.error = Some(reason);
         }
