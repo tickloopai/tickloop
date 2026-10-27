@@ -733,6 +733,10 @@ fn observation_requests_keep_their_recorded_wire() {
                     task_tools_enabled: true,
                 }),
             },
+            ObservationRequest::DraftMcpServer {
+                launch: Box::new(launch_spec()),
+                name: "plugin_notes_search".into(),
+            },
         ],
     );
 }

@@ -4155,6 +4155,32 @@ impl ConsoleExecution {
         }
     }
 
+    /// Connects the MCP server `name` a New Agent in `folder` would start, as that Agent would,
+    /// and returns its status with the tools it lists; the daemon closes the connection after.
+    pub(super) async fn draft_mcp_server(
+        &self,
+        folder: PathBuf,
+        name: &str,
+    ) -> Result<tickloop_harness::protocol::mcp::McpServerStatus, AccessError> {
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::DraftMcpServer {
+                launch: Box::new(launch),
+                name: name.to_owned(),
+            })
+            .await?
+            .initial
+        {
+            ObservationValue::McpServers(servers) => {
+                servers.into_iter().next().ok_or_else(unexpected)
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
     pub(super) async fn reconnect_mcp_server(
         &self,
         chat: Uuid,
