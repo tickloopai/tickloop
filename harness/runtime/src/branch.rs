@@ -184,6 +184,11 @@ impl Agent {
                 .map(|skill| skill.name.clone())
                 .collect(),
             plan_slug: source.bookkeeping.plan_slug.clone(),
+            codemode_store: super::codemode_store::starting_entries(
+                child_chat_id,
+                &source.snapshot,
+                &source.bookkeeping.codemode_store,
+            ),
             ..ChatBookkeeping::default()
         };
         let output_style = self.apply_new_chat_settings(&mut snapshot, &mut bookkeeping);

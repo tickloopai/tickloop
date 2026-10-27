@@ -41,10 +41,12 @@ impl Agent {
                 "Codemode accepts only code".into(),
             ));
         }
-        let family_directory = {
+        let (family_directory, store) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat unavailable")?;
-            chat.tools.family_temp_directory().map(|_| {
+            let store =
+                crate::codemode_store::current(&chat.snapshot, &chat.bookkeeping.codemode_store);
+            let directory = chat.tools.family_temp_directory().map(|_| {
                 crate::transcript::private_family_temp_directory(
                     chat.snapshot
                         .delegation
@@ -52,7 +54,8 @@ impl Agent {
                         .map_or(receipt.chat_id, |delegation| delegation.root_chat_id())
                         .into(),
                 )
-            })
+            });
+            (directory, store)
         };
         let output_directory = match family_directory {
             Some(directory) => Some(
@@ -96,6 +99,7 @@ impl Agent {
             Options {
                 control: control.clone(),
                 output_directory,
+                store,
                 ..Default::default()
             },
             tools,
@@ -159,6 +163,21 @@ impl Agent {
                     OperationState::Completed
                 };
                 operation.result = Some(result.clone());
+            }
+            if outcome.error.is_none() && !outcome.store_writes.is_empty() {
+                let writes = std::mem::take(&mut outcome.store_writes);
+                let entry = tickloop_harness_transcript::CodemodeStoreEntry {
+                    chat_id: receipt.chat_id.into(),
+                    run_id: Some(receipt.run_id.into()),
+                    call_id: Some(parent.clone()),
+                    set: writes.set,
+                    delete: writes.delete.into_iter().collect(),
+                };
+                self.record_chat_metadata(
+                    receipt.chat_id,
+                    tickloop_harness_transcript::Line::CodemodeStore(entry.clone()),
+                );
+                chat.bookkeeping.codemode_store.push(entry);
             }
             self.save(&chat.snapshot);
         }

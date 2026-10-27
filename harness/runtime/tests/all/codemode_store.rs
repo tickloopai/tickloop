@@ -157,3 +157,214 @@ async fn tampered_builtins_cannot_bypass_store_limits() {
         }
     );
 }
+
+mod agent {
+    use serde_json::json;
+    use std::sync::Arc;
+    use tickloop_harness_protocol::{
+        BranchRequest, ChatId, ChatSnapshot, Content, EventKind, ExecutionMode, RewindMode,
+    };
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams, environment::FolderEnvironment,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, harness::ChosenModels, next_event, text,
+        transcripts::InMemoryTranscriptStore,
+    };
+
+    const PROBE: &str = "text(String(load('cursor')) + '/' + String(load('tmp')));";
+
+    fn agent(store: &Arc<InMemoryTranscriptStore>, model: &Arc<ScriptedModel>) -> Agent {
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store.clone()),
+                environment: Some(Arc::new(FolderEnvironment::bare())),
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions::local(config()),
+        )
+        .unwrap()
+    }
+
+    fn script(model: &ScriptedModel, call_id: &str, code: &str) {
+        model.enqueue(call(call_id, "Codemode", json!({ "code": code })));
+    }
+
+    async fn turn(agent: &Agent, chat: ChatId, prompt: &str) {
+        let mut events = agent.subscribe();
+        agent.submit(chat, prompt.into()).await.unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.chat_id != chat {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn script_result(snapshot: &ChatSnapshot, call_id: &str) -> String {
+        snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == call_id => Some(format!("{content:?}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {call_id}"))
+    }
+
+    #[tokio::test]
+    async fn stored_values_follow_successful_scripts_reloads_and_rewinds() {
+        let transcripts = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(ScriptedModel::new(vec![]));
+        let first = agent(&transcripts, &model);
+        let directory = tempfile::tempdir().unwrap();
+        let chat = first.create_chat(directory.path().into()).await.unwrap();
+        first
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        script(&model, "save", "store('cursor', 1); store('tmp', 'x');");
+        model.enqueue(text("saved"));
+        turn(&first, chat, "Save the cursor").await;
+        script(
+            &model,
+            "failing",
+            "store('cursor', 2); throw new Error('fail');",
+        );
+        script(&model, "after-failure", PROBE);
+        script(
+            &model,
+            "advance",
+            "store('cursor', 3); store('tmp', undefined);",
+        );
+        model.enqueue(text("advanced"));
+        turn(&first, chat, "Advance the cursor").await;
+        let snapshot = first.snapshot(chat).await.unwrap();
+        assert!(script_result(&snapshot, "after-failure").contains("1/x"));
+        first.sync().await.unwrap();
+        first.shutdown().await;
+
+        let second = agent(&transcripts, &model);
+        second.resume_chat(chat).await.unwrap();
+        script(&model, "reloaded", PROBE);
+        model.enqueue(text("checked"));
+        turn(&second, chat, "Check after reload").await;
+        let snapshot = second.snapshot(chat).await.unwrap();
+        assert!(script_result(&snapshot, "reloaded").contains("3/undefined"));
+        let advance_prompt = snapshot.rewind_points()[1].message_id;
+        second
+            .rewind(chat, advance_prompt, RewindMode::Conversation)
+            .await
+            .unwrap();
+        script(&model, "rewound", PROBE);
+        model.enqueue(text("rewound"));
+        turn(&second, chat, "Check after rewind").await;
+        let snapshot = second.snapshot(chat).await.unwrap();
+        assert!(script_result(&snapshot, "rewound").contains("1/x"));
+        second.sync().await.unwrap();
+        second.shutdown().await;
+
+        let third = agent(&transcripts, &model);
+        third.resume_chat(chat).await.unwrap();
+        script(&model, "rewound-reloaded", PROBE);
+        model.enqueue(text("checked again"));
+        turn(&third, chat, "Check the rewound branch after reload").await;
+        let snapshot = third.snapshot(chat).await.unwrap();
+        assert!(script_result(&snapshot, "rewound-reloaded").contains("1/x"));
+        third.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_branch_starts_from_the_source_values_and_then_keeps_its_own() {
+        let transcripts = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(ScriptedModel::new(vec![]));
+        let first = agent(&transcripts, &model);
+        let directory = tempfile::tempdir().unwrap();
+        let source = first.create_chat(directory.path().into()).await.unwrap();
+        first
+            .set_execution_mode(source, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        script(&model, "source-save", "store('cursor', 'source');");
+        model.enqueue(text("saved"));
+        turn(&first, source, "Save in the source").await;
+        let branch = first
+            .branch_chat(BranchRequest {
+                request_id: uuid::Uuid::new_v4(),
+                source_chat_id: source,
+                name: Some("Cursor branch".into()),
+            })
+            .await
+            .unwrap()
+            .child_chat_id;
+        first
+            .set_execution_mode(branch, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        script(
+            &model,
+            "branch-probe",
+            "text(String(load('cursor'))); store('cursor', 'branch');",
+        );
+        model.enqueue(text("branched"));
+        turn(&first, branch, "Continue in the branch").await;
+        script(&model, "source-probe", "text(String(load('cursor')));");
+        model.enqueue(text("source checked"));
+        turn(&first, source, "Check the source").await;
+        assert!(
+            script_result(&first.snapshot(branch).await.unwrap(), "branch-probe")
+                .contains("source")
+        );
+        assert!(
+            script_result(&first.snapshot(source).await.unwrap(), "source-probe")
+                .contains("source")
+        );
+        first.sync().await.unwrap();
+        first.shutdown().await;
+
+        let second = agent(&transcripts, &model);
+        for (chat, expected) in [(branch, "branch"), (source, "source")] {
+            second.resume_chat(chat).await.unwrap();
+            second
+                .set_execution_mode(chat, ExecutionMode::FullAccess)
+                .await
+                .unwrap();
+            let call_id = format!("reloaded-{expected}");
+            script(&model, &call_id, "text('value=' + String(load('cursor')));");
+            model.enqueue(text("checked"));
+            turn(&second, chat, "Check after reload").await;
+            assert!(
+                script_result(&second.snapshot(chat).await.unwrap(), &call_id)
+                    .contains(&format!("value={expected}"))
+            );
+        }
+        let copy = second.resume_as_new_chat(branch).await.unwrap().id;
+        second.sync().await.unwrap();
+        second.shutdown().await;
+        let third = agent(&transcripts, &model);
+        third.resume_chat(copy).await.unwrap();
+        script(
+            &model,
+            "copy-probe",
+            "text('value=' + String(load('cursor')));",
+        );
+        model.enqueue(text("checked"));
+        turn(&third, copy, "Check the copy").await;
+        assert!(
+            script_result(&third.snapshot(copy).await.unwrap(), "copy-probe")
+                .contains("value=branch")
+        );
+        third.shutdown().await;
+    }
+}

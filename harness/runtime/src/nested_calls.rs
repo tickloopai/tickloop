@@ -602,9 +602,27 @@ pub(crate) fn parent_on_chain(
     snapshot: &tickloop_harness_protocol::ChatSnapshot,
     operation: &OperationRecord,
 ) -> bool {
-    snapshot.messages.iter().enumerate().any(|(index, message)| {
-        snapshot.message_runs.get(&index) == Some(&operation.run_id)
-            && message.content.iter().any(|content| matches!(content,
-                tickloop_harness_protocol::Content::ToolUse { id, .. } if Some(id) == operation.parent_call_id.as_ref()))
-    })
+    operation
+        .parent_call_id
+        .as_deref()
+        .is_some_and(|parent| tool_use_on_chain(snapshot, operation.run_id, parent))
+}
+
+/// Whether `run` made the call `call_id` on the conversation chain `snapshot` holds.
+pub(crate) fn tool_use_on_chain(
+    snapshot: &tickloop_harness_protocol::ChatSnapshot,
+    run: tickloop_harness_protocol::RunId,
+    call_id: &str,
+) -> bool {
+    snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .any(|(index, message)| {
+            snapshot.message_runs.get(&index) == Some(&run)
+                && message.content.iter().any(|content| {
+                    matches!(content,
+                tickloop_harness_protocol::Content::ToolUse { id, .. } if id == call_id)
+                })
+        })
 }

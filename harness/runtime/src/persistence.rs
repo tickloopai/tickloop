@@ -678,6 +678,15 @@ impl ChatRecorder {
                 custom_title: title.to_owned(),
             }),
         ];
+        lines.extend(
+            super::codemode_store::starting_entries(
+                child_chat_id,
+                source,
+                &source_bookkeeping.codemode_store,
+            )
+            .into_iter()
+            .map(Line::CodemodeStore),
+        );
         if !source_bookkeeping.citation_sources.sources.is_empty() {
             lines.push(Line::CitationSources(
                 tickloop_harness_transcript::CitationSourcesEntry {
@@ -2396,6 +2405,26 @@ fn recover_transcript(
         }
     }
     snapshot.operations.extend(nested.into_values());
+    bookkeeping.codemode_store = loaded
+        .lifecycle
+        .iter()
+        .filter_map(|line| match line {
+            Line::CodemodeStore(entry)
+                if entry.chat_id == source_chat_id
+                    && super::codemode_store::is_on_chain(&snapshot, entry) =>
+            {
+                Some(entry.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if chat_id != source_chat_id {
+        bookkeeping.codemode_store = super::codemode_store::starting_entries(
+            chat_id,
+            &snapshot,
+            &bookkeeping.codemode_store,
+        );
+    }
 
     recover_snapshot_for_resume(
         snapshot,
@@ -3673,6 +3702,9 @@ impl Agent {
                 // the new file exceeds 5MB, loading does not skip them along with the content
                 // before the boundary.
                 recorder.enqueue_sync(&snapshot, &bookkeeping);
+                for entry in &bookkeeping.codemode_store {
+                    self.record_chat_metadata(chat_id, Line::CodemodeStore(entry.clone()));
+                }
                 // Following Claude Code's `processResumedConversation`: re-record all of the source
                 // Chat's replacement decisions under the new chatId; the replacement text still
                 // points to the externalized files in the source Chat's directory.
