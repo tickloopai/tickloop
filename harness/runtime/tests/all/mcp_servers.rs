@@ -145,16 +145,16 @@ async fn http_legacy_fallback_failure_names_both_phases_without_secrets() {
 #[tokio::test]
 async fn http_initialize_error_redacts_credentials_before_bounding_the_cause() {
     let server = McpService::start().await;
-    let secret = format!("private/{}+token", "x".repeat(240));
+    let secret = format!("private credential/{}+token", "x".repeat(240));
     let encoded =
         percent_encoding::utf8_percent_encode(&secret, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
     server.set_initialize_error(
-        json!({"code":-32602,"message":format!("Denied {secret} {encoded}")}),
+        json!({"code":-32602,"message":format!("Denied {secret} {encoded} {}", secret.replace(' ', "\t"))}),
     );
     let mut config = http_config("legacy", &server);
     if let McpTransport::Http { headers, .. } = &mut config.transport {
-        headers.insert("Authorization".into(), format!("Bearer {secret}"));
+        headers.insert("X-Api-Key".into(), secret.clone());
     }
     let connections = McpConnections::new(
         HostCapabilities::default(),
@@ -169,7 +169,7 @@ async fn http_initialize_error_redacts_credentials_before_bounding_the_cause() {
         "{failure}"
     );
     assert!(
-        failure.contains("Denied [redacted] [redacted]"),
+        failure.contains("Denied [redacted] [redacted] [redacted]"),
         "{failure}"
     );
     assert!(

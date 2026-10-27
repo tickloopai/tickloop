@@ -82,7 +82,10 @@ pub(crate) fn request_failure(error: &ServiceError, resource_uri: Option<&str>) 
     }
 }
 
-pub(crate) fn initialize_failure(error: &rmcp::service::ClientInitializeError) -> String {
+pub(crate) fn initialize_failure(
+    error: &rmcp::service::ClientInitializeError,
+    redact: &impl Fn(String) -> String,
+) -> String {
     use rmcp::service::ClientInitializeError;
     match error {
         ClientInitializeError::TransportError { error, .. } => error
@@ -93,13 +96,13 @@ pub(crate) fn initialize_failure(error: &rmcp::service::ClientInitializeError) -
             format!(
                 "MCP server error {}: {}",
                 error.code.0,
-                bounded_line(&error.message)
+                bounded_line(&redact(normalized_line(&error.message)))
             )
         }
         ClientInitializeError::LegacyFallbackFailed { discover, fallback } => format!(
             "discover failed: {}; legacy initialize failed: {}",
-            initialize_failure(discover),
-            initialize_failure(fallback)
+            initialize_failure(discover, redact),
+            initialize_failure(fallback, redact)
         ),
         ClientInitializeError::NoCompatibleProtocolVersion { .. } => {
             "no compatible MCP protocol version".into()
@@ -139,8 +142,17 @@ fn transport_failure(error: &StreamableHttpError<McpHttpError>) -> String {
 /// One bounded line: control and invisible formatting characters become spaces and whitespace
 /// runs collapse.
 fn bounded_line(text: &str) -> String {
-    let line = text
-        .chars()
+    let line = normalized_line(text);
+    if line.chars().count() <= MAX_URI_CHARS {
+        return line;
+    }
+    let mut bounded = line.chars().take(MAX_URI_CHARS).collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn normalized_line(text: &str) -> String {
+    text.chars()
         .map(|character| {
             if character.is_control() || is_invisible_format(character) {
                 ' '
@@ -151,13 +163,7 @@ fn bounded_line(text: &str) -> String {
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
-    if line.chars().count() <= MAX_URI_CHARS {
-        return line;
-    }
-    let mut bounded = line.chars().take(MAX_URI_CHARS).collect::<String>();
-    bounded.push('…');
-    bounded
+        .join(" ")
 }
 
 /// Zero-width and bidirectional controls that could hide or reorder text shown to the user.
@@ -875,7 +881,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = [0; 4096];
-                stream.read(&mut bytes).await.unwrap();
+                assert!(stream.read(&mut bytes).await.unwrap() > 0);
                 let reply = format!(
                     "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()

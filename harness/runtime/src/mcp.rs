@@ -1166,7 +1166,12 @@ async fn open(
                     };
                     format!(
                         "{category}: {}",
-                        redact(entry, crate::mcp_http::initialize_failure(&error))
+                        redact(
+                            entry,
+                            crate::mcp_http::initialize_failure(&error, &|text| redact(
+                                entry, text
+                            ))
+                        )
                     )
                 })?;
             (service, Some(http))
