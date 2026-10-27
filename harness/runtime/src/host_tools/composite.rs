@@ -194,6 +194,12 @@ impl HostToolProvider for CompositeHostTools {
     fn has_tool_search(&self) -> bool {
         self.sources.iter().any(|source| source.has_tool_search())
     }
+    fn exposure_revisions(&self) -> std::collections::BTreeMap<String, u64> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.exposure_revisions())
+            .collect()
+    }
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
         let mut states = Vec::new();
         for source in self.sources.iter() {

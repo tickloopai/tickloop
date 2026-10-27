@@ -119,7 +119,7 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     });
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{dialog}");
     assert!(
-        dialog.contains("enter actions · r refresh · esc close"),
+        dialog.contains("enter actions · e exposure · r refresh · esc close"),
         "{dialog}"
     );
     assert!(is_selected(&frame, "notes"), "{frame}");
@@ -176,12 +176,127 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
         frame.contains("Enable in this directory")
     });
     terminal.press(ESCAPE, "the list", |frame| {
-        frame.contains("enter actions · r refresh · esc close")
+        frame.contains("enter actions · e exposure · r refresh · esc close")
     });
     terminal.press(ESCAPE, "the panel closed", |frame| {
-        !frame.contains("enter actions · r refresh")
+        !frame.contains("enter actions · e exposure")
     });
     terminal.exit();
+}
+
+#[test]
+fn e_and_the_actions_menu_change_where_each_server_is_configured() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let notes = runtime.block_on(McpService::start());
+    notes.set_tools(json!([{"name":"search","inputSchema":{"type":"object"}}]));
+    let docs = runtime.block_on(McpService::start());
+    docs.set_tools(json!([{"name":"lookup","inputSchema":{"type":"object"}}]));
+    let fixture = Fixture::new();
+    let plugin = fixture.root.join("sources/docs");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    let manifest = |version: &str, exposure: &str| {
+        fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            json!({"name":"docs","version":version,
+                "mcpServers":{"search":{"url":docs.url(),"exposure":exposure}}})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    manifest("1.0.0", "search");
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&plugin)]));
+    let directory = path_text(&fixture.root);
+    let mut configured = settings(&fixture);
+    configured["mcpServers"] = json!({"notes":{"command":"tickloop-missing-mcp-program"}});
+    configured["projects"] = json!({&directory: {"mcpServers":{"notes":{"url":notes.url()}}}});
+    write_settings(&fixture, &configured);
+    let mut terminal = started_agent(&fixture);
+    let frame = terminal.press(b"/mcp\r", "the connected servers", |frame| {
+        row_shows(frame, "notes", "http · connected · 1 tool · search")
+            && row_shows(
+                frame,
+                "plugin_docs_search",
+                "http · connected · 1 tool · search",
+            )
+    });
+    assert!(is_selected(&frame, "notes"), "{frame}");
+    assert!(
+        dialog_text(&frame).contains("enter actions · e exposure · r refresh · esc close"),
+        "{frame}"
+    );
+
+    let directory_entry = |fixture: &Fixture| {
+        settings(fixture)["projects"][&directory]["mcpServers"]["notes"].clone()
+    };
+    for exposure in ["direct", "hidden"] {
+        terminal.press(b"e", exposure, |frame| {
+            frame.contains(&format!("Exposure of notes is now {exposure}"))
+                && row_shows(frame, "notes", &format!("· {exposure}"))
+        });
+        assert_eq!(directory_entry(&fixture)["exposure"], exposure);
+    }
+    terminal.press(b"e", "search again", |frame| {
+        frame.contains("Exposure of notes is now search")
+            && row_shows(frame, "notes", "http · connected · 1 tool · search")
+    });
+    assert_eq!(directory_entry(&fixture), json!({"url":notes.url()}));
+    assert_eq!(
+        settings(&fixture)["mcpServers"]["notes"],
+        json!({"command":"tickloop-missing-mcp-program"}),
+        "the global entry the directory's replaces stays as it was"
+    );
+
+    terminal.press(DOWN, "the plugin server selected", |frame| {
+        is_selected(frame, "plugin_docs_search")
+    });
+    terminal.press(b"\r", "its actions", |frame| {
+        frame.contains("Change exposure")
+    });
+    let mark = terminal.mark();
+    for _ in 0..4 {
+        terminal.send(DOWN);
+    }
+    terminal.wait_for_frame(mark, "Change exposure selected", |frame| {
+        frame.contains("❯ Change exposure")
+    });
+    terminal.press(b"\r", "the exposures", |frame| {
+        frame.contains("❯ search") && frame.contains("hidden")
+    });
+    terminal.press(b"k", "direct selected", |frame| frame.contains("❯ direct"));
+    terminal.press(b"\r", "the plugin server listed directly", |frame| {
+        frame.contains("Exposure of plugin_docs_search is now direct")
+            && row_shows(
+                frame,
+                "plugin_docs_search",
+                "http · connected · 1 tool · direct",
+            )
+    });
+    assert_eq!(
+        settings(&fixture)["pluginMcpServerExposure"],
+        json!({"plugin_docs_search":"direct"})
+    );
+    terminal.press(ESCAPE, "the panel closed", |frame| {
+        !frame.contains("e exposure")
+    });
+    let before = settings(&fixture);
+    terminal.press(b"e", "e typed in the prompt", |frame| {
+        frame.contains("enter send · ctrl+g editor · ctrl+c clear")
+    });
+    assert_eq!(
+        settings(&fixture),
+        before,
+        "e outside the panel saves nothing"
+    );
+    terminal.send(b"\x15");
+    terminal.exit();
+
+    manifest("2.0.0", "hidden");
+    succeeded(&fixture.tickloop(&["plugin", "install", "--path", &path_text(&plugin)]));
+    let listed = succeeded(&fixture.tickloop(&["mcp", "list"]));
+    assert!(
+        listed.contains("plugin_docs_search · http · direct · enabled"),
+        "the override outlives the plugin update: {listed}"
+    );
 }
 
 /// The authorization link the login shows, its wrapped rows joined.

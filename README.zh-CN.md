@@ -56,7 +56,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/resume`、`/clear` | 重新打开以前的对话；开始新对话 |
 | `/permissions`、`/settings` | 设置 Agent 可以自行做多少事；其他偏好 |
 | `/ticks`、`/plugins` | 安装并登录 Tick；管理其他插件 |
-| `/mcp` | 查看 MCP 服务，管理登录及当前目录的启用状态 |
+| `/mcp` | 查看 MCP 服务，管理登录、暴露方式及当前目录的启用状态 |
 | `/context` | 按类别查看上下文占用，以及工具搜索能找到多少 MCP 工具；`/context all` 列出每一项 |
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
@@ -184,7 +184,7 @@ MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 
 
 ### 管理服务与登录
 
-`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。登录或重连后服务立即连接，行内先显示 `connecting`，列出工具后显示 `connected · N tools`，失败则显示 `failed`，原因写在操作菜单里。Agent 启动前，打开面板会连接远程服务以列出工具，随后关闭这些连接；本地（stdio）服务显示 `starts with the Agent`，只有选 Connect 或按 `r` 才连接。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
+`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连、在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`），以及修改暴露方式。登录或重连后服务立即连接，行内先显示 `connecting`，列出工具后显示 `connected · N tools`，失败则显示 `failed`，原因写在操作菜单里。Agent 启动前，打开面板会连接远程服务以列出工具，随后关闭这些连接；本地（stdio）服务显示 `starts with the Agent`，只有选 Connect 或按 `r` 才连接。在服务上按 `e`，暴露方式按 `search` → `direct` → `hidden` → `search` 循环切换，每次立即保存。用户服务的 `exposure` 写回该条目所在的那一层（全局与当前目录同名时写到当前目录），改为 `search` 时删除该字段；插件服务的选择按完整服务名记在全局设置的 `pluginMcpServerExposure` 对象中（例如 `"pluginMcpServerExposure": {"plugin_docs_search": "direct"}`），覆盖插件自带的 `exposure`，插件更新后仍然有效。运行中的 Agent 从下一次请求起按新暴露方式提供工具，一轮进行中也是如此。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`e` 切换暴露方式，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目；`toolExposure` 在 `settings.json` 中编辑。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。
 

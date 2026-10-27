@@ -442,6 +442,13 @@ pub trait HostToolProvider: Send + Sync {
         false
     }
 
+    /// How many times the user changed each MCP server's exposure, by server name. A Run lets
+    /// such a change reach its next request, while other changes to its MCP tools wait for the
+    /// next Run.
+    fn exposure_revisions(&self) -> std::collections::BTreeMap<String, u64> {
+        std::collections::BTreeMap::new()
+    }
+
     /// Private process-transfer state. `None` defers replacement while the provider owns an
     /// interaction that cannot move, such as a pending device sign-in.
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {

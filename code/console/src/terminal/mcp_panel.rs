@@ -1,6 +1,7 @@
 //! `/mcp`: the Agent's MCP servers grouped by where they are configured, each with its
-//! transport, state, tools and exposure. Enter opens a server's actions: view its tools, log in
-//! or out, reconnect, and turn it off or on in the Agent's directory. A login happens in the panel:
+//! transport, state, tools and exposure. `e` moves the selected server to its next exposure.
+//! Enter opens a server's actions: view its tools, log in or out, reconnect, turn it off or on in
+//! the Agent's directory, and choose its exposure. A login happens in the panel:
 //! the authorization link, and a field for the address the browser ends on when it runs on
 //! another machine. After a login or a reconnect the panel follows the server until it has
 //! connected and listed its tools, or failed. The panel keeps what it shows and what the user
@@ -10,7 +11,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_code_settings::mcp::{DIRECTORY_SOURCE, GLOBAL_SOURCE, PLUGIN_SOURCE_PREFIX};
-use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, ToolExposure};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -42,6 +43,12 @@ pub(super) enum McpRequest {
         name: String,
         disabled: bool,
     },
+    /// Saves how the tools of the server `name`, configured in `source`, reach the model.
+    SetExposure {
+        name: String,
+        source: String,
+        exposure: ToolExposure,
+    },
     /// Starts the login `attempt` to the server `name`; the panel numbers each attempt.
     LogIn {
         name: String,
@@ -66,6 +73,16 @@ impl std::fmt::Debug for McpRequest {
                 .debug_struct("SetDisabled")
                 .field("name", name)
                 .field("disabled", disabled)
+                .finish(),
+            Self::SetExposure {
+                name,
+                source,
+                exposure,
+            } => formatter
+                .debug_struct("SetExposure")
+                .field("name", name)
+                .field("source", source)
+                .field("exposure", exposure)
                 .finish(),
             Self::LogIn { name, attempt } => formatter
                 .debug_struct("LogIn")
@@ -121,6 +138,11 @@ pub(super) enum McpResult {
         disabled: bool,
         result: Result<(), String>,
     },
+    ExposureSet {
+        name: String,
+        exposure: ToolExposure,
+        result: Result<(), String>,
+    },
     /// The login `attempt` waits for the user to approve it at `link`; `opened` says whether the
     /// browser was asked to open it.
     LoginWaiting {
@@ -164,6 +186,18 @@ impl McpResult {
                 (Err(error), true) => Notice::failure(format!("Cannot disable {name}: {error}")),
                 (Err(error), false) => Notice::failure(format!("Cannot enable {name}: {error}")),
             },
+            Self::ExposureSet {
+                name,
+                exposure,
+                result,
+            } => match result {
+                Ok(()) => {
+                    Notice::success(format!("Exposure of {name} is now {}", exposure.as_str()))
+                }
+                Err(error) => {
+                    Notice::failure(format!("Cannot change the exposure of {name}: {error}"))
+                }
+            },
             Self::LoginEnded { name, result, .. } => match result {
                 Ok(()) => Notice::success(format!("Logged in to {name}")),
                 Err(error) => Notice::failure(format!("Cannot log in to {name}: {error}")),
@@ -197,11 +231,34 @@ enum Listing {
 enum Choice {
     Tools(String),
     Run(McpRequest),
+    /// Opens the choice of the server's exposure.
+    Exposure,
     Back,
 }
 
-/// A server's actions, with the `❯` cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuKind {
+    Actions,
+    Exposure,
+}
+
+/// The exposures in the order `e` moves through them, starting from the default.
+const EXPOSURE_CYCLE: [ToolExposure; 3] = [
+    ToolExposure::Search,
+    ToolExposure::Direct,
+    ToolExposure::Hidden,
+];
+/// The exposures in the order their menu lists them.
+const EXPOSURE_OPTIONS: [ToolExposure; 3] = [
+    ToolExposure::Direct,
+    ToolExposure::Search,
+    ToolExposure::Hidden,
+];
+const CHANGE_EXPOSURE: &str = "Change exposure";
+
+/// A server's actions, or the choice of its exposure, with the `❯` cursor.
 struct ActionsMenu {
+    kind: MenuKind,
     title: String,
     context: Vec<String>,
     options: Vec<(String, Choice)>,
@@ -367,7 +424,7 @@ impl McpPanel {
                 if let Some(menu) = self.menu.take() {
                     let option = menu.options[menu.selected].0.clone();
                     self.menu = self
-                        .actions_menu()
+                        .menu_of(menu.kind)
                         .filter(|next| next.title == menu.title)
                         .map(|mut next| {
                             next.selected = next
@@ -422,6 +479,22 @@ impl McpPanel {
                         self.notice = Some(following.failed(&error));
                     }
                     _ => {}
+                }
+            }
+            McpResult::ExposureSet {
+                name,
+                exposure,
+                result,
+            } => {
+                self.busy = None;
+                if result.is_ok()
+                    && let Listing::Loaded(listing) = &mut self.listing
+                    && let Some(server) = listing
+                        .servers
+                        .iter_mut()
+                        .find(|server| server.name == name)
+                {
+                    server.exposure = exposure.as_str().into();
                 }
             }
             McpResult::DisabledSet { .. } | McpResult::LoggedOut { .. } => self.busy = None,
@@ -544,7 +617,11 @@ impl McpPanel {
             }
             return match key.code {
                 KeyCode::Esc => {
+                    let kind = menu.kind;
                     self.menu = None;
+                    if kind == MenuKind::Exposure {
+                        self.open_actions_at(CHANGE_EXPOSURE);
+                    }
                     McpPanelEffect::None
                 }
                 KeyCode::Enter => {
@@ -561,6 +638,21 @@ impl McpPanel {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => McpPanelEffect::Close,
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.start(McpRequest::Load),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => match self.servers().get(self.selected) {
+                Some(server) => {
+                    let current = EXPOSURE_CYCLE
+                        .iter()
+                        .position(|exposure| exposure.as_str() == server.exposure)
+                        .unwrap_or(0);
+                    let request = McpRequest::SetExposure {
+                        name: server.name.clone(),
+                        source: server.source.clone(),
+                        exposure: EXPOSURE_CYCLE[(current + 1) % EXPOSURE_CYCLE.len()],
+                    };
+                    self.start(request)
+                }
+                None => McpPanelEffect::None,
+            },
             (KeyCode::Enter, _) => {
                 self.menu = self.actions_menu();
                 McpPanelEffect::None
@@ -646,7 +738,14 @@ impl McpPanel {
     fn choose(&mut self, choice: Choice) -> McpPanelEffect {
         match choice {
             Choice::Back => {
-                self.menu = None;
+                let kind = self.menu.take().map(|menu| menu.kind);
+                if kind == Some(MenuKind::Exposure) {
+                    self.open_actions_at(CHANGE_EXPOSURE);
+                }
+                McpPanelEffect::None
+            }
+            Choice::Exposure => {
+                self.menu = self.exposure_menu();
                 McpPanelEffect::None
             }
             Choice::Tools(server) => {
@@ -681,6 +780,9 @@ impl McpPanel {
                 "{} {name}…",
                 if *disabled { "Disabling" } else { "Enabling" }
             ),
+            McpRequest::SetExposure { name, .. } => {
+                format!("Changing the exposure of {name}…")
+            }
             McpRequest::LogIn { name, .. } => format!("Logging in to {name}…"),
             McpRequest::LogOut(name) => format!("Logging out of {name}…"),
         };
@@ -710,6 +812,57 @@ impl McpPanel {
             });
         }
         McpPanelEffect::Work(request)
+    }
+
+    fn menu_of(&self, kind: MenuKind) -> Option<ActionsMenu> {
+        match kind {
+            MenuKind::Actions => self.actions_menu(),
+            MenuKind::Exposure => self.exposure_menu(),
+        }
+    }
+
+    /// Opens the actions of the selected server on the option `label`.
+    fn open_actions_at(&mut self, label: &str) {
+        self.menu = self.actions_menu().map(|mut menu| {
+            menu.selected = menu
+                .options
+                .iter()
+                .position(|(option, _)| option == label)
+                .unwrap_or(0);
+            menu
+        });
+    }
+
+    /// The exposures the selected server can take, with the cursor on its current one.
+    fn exposure_menu(&self) -> Option<ActionsMenu> {
+        let server = self.servers().get(self.selected)?;
+        let mut options = EXPOSURE_OPTIONS
+            .iter()
+            .map(|exposure| {
+                (
+                    exposure.as_str().to_owned(),
+                    Choice::Run(McpRequest::SetExposure {
+                        name: server.name.clone(),
+                        source: server.source.clone(),
+                        exposure: *exposure,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = options
+            .iter()
+            .position(|(label, _)| *label == server.exposure)
+            .unwrap_or(0);
+        options.push(("Back".to_owned(), Choice::Back));
+        Some(ActionsMenu {
+            kind: MenuKind::Exposure,
+            title: server.name.clone(),
+            context: vec![
+                "How its tools reach the model: direct lists them, search finds them when needed, hidden never offers them.".to_owned(),
+            ],
+            options,
+            selected,
+        })
     }
 
     /// The actions of the selected server.
@@ -764,6 +917,7 @@ impl McpPanel {
                 disabled: !disabled,
             }),
         ));
+        options.push((CHANGE_EXPOSURE.to_owned(), Choice::Exposure));
         options.push(("Back".to_owned(), Choice::Back));
         let mut context = vec![row_details(server, backed)];
         if let Some(failure) = &server.failure {
@@ -777,6 +931,7 @@ impl McpPanel {
             ));
         }
         Some(ActionsMenu {
+            kind: MenuKind::Actions,
             title: name,
             context,
             options,
@@ -960,6 +1115,7 @@ impl McpPanel {
         let mut hints = vec![("r refresh".to_owned(), 4), ("esc close".to_owned(), 9)];
         if !self.servers().is_empty() {
             hints.insert(0, ("enter actions".to_owned(), 10));
+            hints.insert(1, ("e exposure".to_owned(), 5));
         }
         body.hint = fit_hint(&hints, width, display);
         body
@@ -1294,7 +1450,7 @@ mod tests {
             "{frame}"
         );
         assert!(
-            frame.contains("enter actions · r refresh · esc close"),
+            frame.contains("enter actions · e exposure · r refresh · esc close"),
             "{frame}"
         );
         assert!(selected(&mut panel)[0].contains("notes"));
@@ -1729,5 +1885,145 @@ mod tests {
             "notes",
             "http · disabled · direct"
         ));
+    }
+
+    fn exposed(name: &str, source: &str, exposure: &str) -> McpServerStatus {
+        McpServerStatus {
+            exposure: exposure.into(),
+            ..server(name, source, McpServerState::Connected, 1)
+        }
+    }
+
+    fn set_exposure(name: &str, source: &str, exposure: ToolExposure) -> McpRequest {
+        McpRequest::SetExposure {
+            name: name.into(),
+            source: source.into(),
+            exposure,
+        }
+    }
+
+    #[test]
+    fn e_cycles_the_selected_servers_exposure_and_its_row_follows() {
+        let mut panel = loaded(
+            vec![
+                exposed("notes", "global", "search"),
+                exposed("plugin_docs_search", "plugin:docs", "search"),
+            ],
+            true,
+        );
+        press(&mut panel, KeyCode::Char('j'));
+        for (shown, next) in [
+            ("search", ToolExposure::Direct),
+            ("direct", ToolExposure::Hidden),
+            ("hidden", ToolExposure::Search),
+        ] {
+            assert!(row_shows(
+                &text(&mut panel),
+                "plugin_docs_search",
+                &format!("connected · 1 tool · {shown}")
+            ));
+            assert_eq!(
+                work(press(&mut panel, KeyCode::Char('e'))),
+                set_exposure("plugin_docs_search", "plugin:docs", next)
+            );
+            assert!(text(&mut panel).contains("Changing the exposure of plugin_docs_search…"));
+            panel.apply(McpResult::ExposureSet {
+                name: "plugin_docs_search".into(),
+                exposure: next,
+                result: Ok(()),
+            });
+        }
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "plugin_docs_search", "connected · 1 tool · search"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("Exposure of plugin_docs_search is now search"),
+            "{frame}"
+        );
+        assert!(row_shows(&frame, "notes", "connected · 1 tool · search"));
+
+        panel.apply(McpResult::ExposureSet {
+            name: "notes".into(),
+            exposure: ToolExposure::Direct,
+            result: Err("settings file is not valid JSON".into()),
+        });
+        let frame = text(&mut panel);
+        assert!(row_shows(&frame, "notes", "connected · 1 tool · search"));
+        assert!(
+            frame.contains("Cannot change the exposure of notes: settings file is not valid JSON"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn e_acts_only_on_the_list() {
+        let mut panel = loaded(vec![exposed("notes", "global", "search")], true);
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert_eq!(selected(&mut panel), ["❯ View tools"]);
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert!(text(&mut panel).contains("mcp__notes__tool0"));
+        let mut empty = loaded(Vec::new(), true);
+        assert!(matches!(
+            press(&mut empty, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert!(!text(&mut empty).contains("e exposure"));
+    }
+
+    #[test]
+    fn the_actions_menu_offers_each_exposure_with_the_current_one_under_the_cursor() {
+        let mut panel = loaded(vec![exposed("notes", "directory", "search")], true);
+        press(&mut panel, KeyCode::Enter);
+        for _ in 0..4 {
+            press(&mut panel, KeyCode::Char('j'));
+        }
+        assert_eq!(selected(&mut panel), ["❯ Change exposure"]);
+        press(&mut panel, KeyCode::Enter);
+        assert_eq!(selected(&mut panel), ["❯ search"]);
+        let frame = text(&mut panel);
+        let options = ["  direct", "❯ search", "  hidden", "  Back"].map(|option| {
+            frame
+                .find(option)
+                .unwrap_or_else(|| panic!("{option:?} in\n{frame}"))
+        });
+        assert!(options.windows(2).all(|pair| pair[0] < pair[1]), "{frame}");
+        assert!(frame.contains("enter confirm · esc back"), "{frame}");
+        press(&mut panel, KeyCode::Esc);
+        assert_eq!(
+            selected(&mut panel),
+            ["❯ Change exposure"],
+            "esc goes back to the actions"
+        );
+        press(&mut panel, KeyCode::Enter);
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(McpListing {
+                servers: vec![exposed("notes", "directory", "search")],
+                live: true,
+                directory: "/work".into(),
+                probed: BTreeSet::new(),
+            }),
+        });
+        assert_eq!(
+            selected(&mut panel),
+            ["❯ search"],
+            "a new read keeps the choice open"
+        );
+        press(&mut panel, KeyCode::Char('j'));
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            set_exposure("notes", "directory", ToolExposure::Hidden)
+        );
+        assert!(text(&mut panel).contains("Changing the exposure of notes…"));
     }
 }

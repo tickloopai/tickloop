@@ -12,6 +12,10 @@ const PROJECTS_KEY: &str = "projects";
 const SERVERS_KEY: &str = "mcpServers";
 /// Servers turned off in one directory, user and plugin servers alike, by their resolved name.
 const DISABLED_SERVERS_KEY: &str = "disabledMcpServers";
+/// The exposure the user chose for plugin servers, by their resolved name, in the global settings:
+/// it overrides the plugin's own and outlives plugin updates.
+pub const PLUGIN_SERVER_EXPOSURE_KEY: &str = "pluginMcpServerExposure";
+const EXPOSURE_FIELD: &str = "exposure";
 /// The names of plugin servers start with this; user servers cannot.
 pub const PLUGIN_SERVER_PREFIX: &str = "plugin_";
 pub const ARTIFACTS_SERVER_NAME: &str = "tickloop-artifacts";
@@ -133,6 +137,53 @@ impl crate::UserSettings {
             Ok(())
         })?;
         Ok(removed)
+    }
+
+    /// Sets how the tools of the user server `name` in `layer` reach the model; `search`, the
+    /// default, removes the field. False, changing nothing, when the layer has no such server.
+    pub fn set_mcp_server_exposure(
+        &self,
+        layer: &McpLayer,
+        name: &str,
+        exposure: ToolExposure,
+    ) -> Result<bool, crate::SettingsError> {
+        let mut found = false;
+        self.update(|settings| {
+            let servers = layer.servers(settings)?;
+            let Some(entry) = servers.get_mut(name) else {
+                return Ok(());
+            };
+            let fields = entry.as_object_mut().ok_or(crate::InvalidEntry {
+                key: format!("{SERVERS_KEY}.{name}"),
+                expected: "an object".into(),
+            })?;
+            if exposure == ToolExposure::Search {
+                fields.remove(EXPOSURE_FIELD);
+            } else {
+                fields.insert(EXPOSURE_FIELD.into(), exposure.as_str().into());
+            }
+            found = true;
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// Records the exposure the user chose for the plugin server `name` in the global settings,
+    /// where it overrides what the plugin declares, whichever version of the plugin is installed.
+    pub fn set_plugin_mcp_server_exposure(
+        &self,
+        name: &str,
+        exposure: ToolExposure,
+    ) -> Result<(), crate::SettingsError> {
+        self.update(|settings| {
+            crate::object_entry(
+                settings,
+                PLUGIN_SERVER_EXPOSURE_KEY,
+                PLUGIN_SERVER_EXPOSURE_KEY.into(),
+            )?
+            .insert(name.to_owned(), exposure.as_str().into());
+            Ok(())
+        })
     }
 
     /// Turns the server `name`, a user or plugin server, off or on again in `directory` only.
@@ -350,6 +401,16 @@ pub fn resolve_servers_with_plugins(
             signatures.entry(signature).or_insert_with(|| name.clone());
         }
     }
+    let exposure_overrides = match settings.get(PLUGIN_SERVER_EXPOSURE_KEY) {
+        Some(Value::Object(overrides)) => overrides.clone(),
+        Some(_) => {
+            resolved
+                .warnings
+                .push(format!("{PLUGIN_SERVER_EXPOSURE_KEY} must be an object"));
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
     let mut plugins = plugins.iter().collect::<Vec<_>>();
     plugins.sort_by(|left, right| left.name.cmp(&right.name));
     for plugin in plugins {
@@ -372,17 +433,23 @@ pub fn resolve_servers_with_plugins(
                 ));
                 continue;
             }
+            let mut entry = entry.clone();
+            if let (Some(exposure), Some(fields)) =
+                (exposure_overrides.get(&name), entry.as_object_mut())
+            {
+                fields.insert(EXPOSURE_FIELD.into(), exposure.clone());
+            }
             resolved.push(
                 name.clone(),
                 format!("{PLUGIN_SOURCE_PREFIX}{}", plugin.name),
-                entry,
+                &entry,
                 directory,
                 &environment,
             );
             if let Some(server) = resolved.servers.last_mut() {
-                server.sensitive_values = plugin.user_config.secrets_for(entry);
+                server.sensitive_values = plugin.user_config.secrets_for(&entry);
             }
-            if let Some(signature) = signature(entry, directory, &environment) {
+            if let Some(signature) = signature(&entry, directory, &environment) {
                 if let Some(preferred) = signatures.get(&signature) {
                     resolved.warnings.push(format!(
                         "MCP {name} skipped: same command or URL as {preferred}"
@@ -493,7 +560,7 @@ impl ResolvedServers {
         };
 
         let exposure = expanded_entry
-            .get("exposure")
+            .get(EXPOSURE_FIELD)
             .map(|value| serde_json::from_value::<ToolExposure>(value.clone()))
             .transpose();
         let tool_exposure = expanded_entry

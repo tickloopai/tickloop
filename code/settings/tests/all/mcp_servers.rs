@@ -430,3 +430,182 @@ fn plugin_service_names_collapse_underscore_runs_without_silently_replacing_a_se
             .any(|warning| warning.contains("name") && warning.contains("plugin_demo_read_notes"))
     );
 }
+
+fn settings_file(root: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(root.join("settings.json")).unwrap()).unwrap()
+}
+
+fn write_settings_file(root: &Path, settings: &serde_json::Value) {
+    std::fs::write(
+        root.join("settings.json"),
+        serde_json::to_vec_pretty(settings).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn exposure_changes_are_written_to_the_layer_that_configures_the_server() {
+    use tickloop_code_settings::{UserSettings, mcp::McpLayer};
+    use tickloop_harness::protocol::mcp::ToolExposure;
+    let root = tempfile::tempdir().unwrap();
+    write_settings_file(
+        root.path(),
+        &json!({
+            "mcpServers": {
+                "notes": {"url":"https://example.com/notes","exposure":"hidden"},
+                "both": {"command":"global-program"}
+            },
+            "projects": {"/work": {"mcpServers": {"both": {"command":"directory-program"}}}}
+        }),
+    );
+    let settings = UserSettings::in_root(root.path());
+    let directory = McpLayer::Directory("/work".into());
+    let exposures = || {
+        settings
+            .load()
+            .mcp_servers(Path::new("/work"), &BTreeMap::new())
+            .servers
+            .into_iter()
+            .map(|server| (server.name, server.exposure))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    assert!(
+        settings
+            .set_mcp_server_exposure(&McpLayer::Global, "notes", ToolExposure::Direct)
+            .unwrap()
+    );
+    assert_eq!(
+        settings_file(root.path())["mcpServers"]["notes"],
+        json!({"url":"https://example.com/notes","exposure":"direct"})
+    );
+    assert!(
+        settings
+            .set_mcp_server_exposure(&directory, "both", ToolExposure::Hidden)
+            .unwrap()
+    );
+    let written = settings_file(root.path());
+    assert_eq!(
+        written["projects"]["/work"]["mcpServers"]["both"],
+        json!({"command":"directory-program","exposure":"hidden"})
+    );
+    assert_eq!(
+        written["mcpServers"]["both"],
+        json!({"command":"global-program"})
+    );
+    assert_eq!(
+        exposures(),
+        BTreeMap::from([
+            ("both".into(), ToolExposure::Hidden),
+            ("notes".into(), ToolExposure::Direct)
+        ])
+    );
+
+    assert!(
+        settings
+            .set_mcp_server_exposure(&McpLayer::Global, "notes", ToolExposure::Search)
+            .unwrap()
+    );
+    assert_eq!(
+        settings_file(root.path())["mcpServers"]["notes"],
+        json!({"url":"https://example.com/notes"}),
+        "search is the default, so the field goes"
+    );
+
+    let before = std::fs::read(root.path().join("settings.json")).unwrap();
+    assert!(
+        !settings
+            .set_mcp_server_exposure(&directory, "notes", ToolExposure::Direct)
+            .unwrap(),
+        "notes is configured globally, not in the directory"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("settings.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_plugin_server_exposure_override_lives_in_the_global_settings_and_outlives_plugin_updates() {
+    use tickloop_code_settings::{
+        UserSettings,
+        mcp::{PluginServers, resolve_servers_with_plugins},
+    };
+    use tickloop_harness::protocol::mcp::{McpTransport, ToolExposure};
+    let root = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(root.path());
+    settings
+        .set_plugin_mcp_server_exposure("plugin_docs_search", ToolExposure::Direct)
+        .unwrap();
+    let written = settings_file(root.path());
+    assert_eq!(
+        written,
+        json!({"pluginMcpServerExposure": {"plugin_docs_search": "direct"}})
+    );
+    let plugin = |entry: serde_json::Value| PluginServers {
+        user_config: Default::default(),
+        name: "docs".into(),
+        root: "/plugins/docs".into(),
+        data_directory: "/data/docs".into(),
+        entries: BTreeMap::from([("search".into(), entry)]),
+    };
+    let exposure = |settings: &serde_json::Value, entry: serde_json::Value| {
+        let resolved = resolve_servers_with_plugins(
+            settings,
+            Path::new("/elsewhere"),
+            &BTreeMap::new(),
+            &[plugin(entry)],
+        );
+        let server = resolved.servers.into_iter().next().unwrap();
+        (server.exposure, server.transport, resolved.warnings)
+    };
+    let (chosen, _, warnings) = exposure(
+        &written,
+        json!({"url":"https://example.com/search","exposure":"hidden"}),
+    );
+    assert_eq!(chosen, ToolExposure::Direct);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (after_update, _, _) = exposure(&written, json!({"url":"https://example.com/v2/search"}));
+    assert_eq!(
+        after_update,
+        ToolExposure::Direct,
+        "a plugin update keeps it"
+    );
+
+    settings
+        .set_plugin_mcp_server_exposure("plugin_docs_search", ToolExposure::Search)
+        .unwrap();
+    let (search, _, _) = exposure(
+        &settings_file(root.path()),
+        json!({"url":"https://example.com/search","exposure":"direct"}),
+    );
+    assert_eq!(
+        search,
+        ToolExposure::Search,
+        "an explicit search overrides the plugin's own choice"
+    );
+
+    let (_, transport, warnings) = exposure(
+        &json!({"pluginMcpServerExposure": {"plugin_docs_search": "codemode"}}),
+        json!({"url":"https://example.com/search"}),
+    );
+    assert!(matches!(
+        transport,
+        McpTransport::Failed { reason } if reason == "invalid tool exposure configuration"
+    ));
+    assert_eq!(
+        warnings,
+        ["MCP plugin_docs_search: invalid tool exposure configuration"]
+    );
+    let user = resolve_servers(
+        &json!({"mcpServers": {"notes": {"url":"https://example.com/notes"}},
+            "pluginMcpServerExposure": {"notes": "hidden"}}),
+        Path::new("/work"),
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        user.servers[0].exposure,
+        ToolExposure::Search,
+        "the override is for plugin servers only"
+    );
+}
