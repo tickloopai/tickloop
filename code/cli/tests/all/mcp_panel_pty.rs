@@ -413,7 +413,7 @@ fn before_the_agent_starts_remote_servers_connect_and_local_ones_wait_for_connec
             && row_shows(frame, "local", "stdio · connected · 1 tool · search")
     });
     terminal.press(ESCAPE, "the panel closed", |frame| {
-        !frame.contains("enter actions · r refresh")
+        !frame.contains("enter actions · e exposure")
     });
     terminal.exit();
 }
