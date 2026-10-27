@@ -93,6 +93,99 @@ fn add_writes_the_global_or_directory_layer_and_list_starts_nothing() {
 }
 
 #[test]
+fn add_writes_the_chosen_exposure_and_list_shows_it() {
+    let fixture = Fixture::new();
+    succeeded(&mcp(
+        &fixture,
+        &[
+            "add",
+            "notes",
+            "https://example.com/mcp",
+            "--exposure",
+            "direct",
+        ],
+    ));
+    succeeded(&mcp(
+        &fixture,
+        &[
+            "add",
+            "local",
+            "--exposure",
+            "hidden",
+            "--dir",
+            "--",
+            "python3",
+            "server.py",
+        ],
+    ));
+    let saved = settings(&fixture);
+    assert_eq!(
+        saved["mcpServers"]["notes"],
+        json!({"type":"http","url":"https://example.com/mcp","exposure":"direct"})
+    );
+    assert_eq!(
+        saved["projects"][path_text(&fixture.root)]["mcpServers"]["local"],
+        json!({"type":"stdio","command":"python3","args":["server.py"],"exposure":"hidden"})
+    );
+    assert_eq!(
+        succeeded(&mcp(&fixture, &["list"])),
+        "Global\n  notes · http · direct · enabled\n\
+         This directory\n  local · stdio · hidden · enabled\n"
+    );
+}
+
+#[test]
+fn add_refuses_an_invalid_missing_or_repeated_exposure_and_writes_nothing() {
+    let fixture = Fixture::new();
+    succeeded(&mcp(&fixture, &["add", "notes", "https://example.com/mcp"]));
+    let before = fs::read(fixture.root.join("config/settings.json")).unwrap();
+    for arguments in [
+        &["add", "a", "https://example.com/mcp", "--exposure", "bogus"][..],
+        &[
+            "add",
+            "a",
+            "https://example.com/mcp",
+            "--exposure",
+            "codemode",
+        ][..],
+        &["add", "a", "https://example.com/mcp", "--exposure"][..],
+        &["add", "a", "--exposure", "--", "node", "server.js"][..],
+        &[
+            "add",
+            "a",
+            "https://example.com/mcp",
+            "--exposure",
+            "direct",
+            "--exposure",
+            "search",
+        ][..],
+        &[
+            "add",
+            "a",
+            "--exposure",
+            "hidden",
+            "--exposure",
+            "hidden",
+            "--",
+            "node",
+            "server.js",
+        ][..],
+    ] {
+        let error = failed(&mcp(&fixture, arguments));
+        assert!(error.contains("--exposure"), "{arguments:?}: {error}");
+        assert!(
+            error.contains("Usage: tickloop mcp"),
+            "{arguments:?}: {error}"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("config/settings.json")).unwrap(),
+            before,
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn add_and_remove_refuse_conflicts_and_names_they_cannot_own() {
     let fixture = Fixture::new();
     succeeded(&mcp(&fixture, &["add", "notes", "https://example.com/mcp"]));
