@@ -133,3 +133,20 @@ fn add_and_remove_refuse_conflicts_and_names_they_cannot_own() {
     );
     assert_eq!(settings(&fixture)["mcpServers"], json!({}));
 }
+
+#[test]
+fn a_debug_build_defaults_to_the_development_root_unless_the_config_root_is_set() {
+    let fixture = Fixture::new();
+    let home = fixture.root.join("home");
+    let mut command = fixture.command(&["mcp", "add", "notes", "https://example.com/mcp"]);
+    command.env_remove("TICKLOOP_CONFIG_DIR");
+    succeeded(&command.output().unwrap());
+    assert!(home.join(".tickloop-dev/settings.json").exists());
+    assert!(!home.join(".tickloop").exists());
+
+    succeeded(&mcp(&fixture, &["add", "notes", "https://example.com/mcp"]));
+    assert_eq!(
+        settings(&fixture)["mcpServers"]["notes"]["url"],
+        "https://example.com/mcp"
+    );
+}

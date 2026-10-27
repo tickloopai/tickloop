@@ -3,8 +3,15 @@ use std::io::{self, IsTerminal, Write};
 use crossterm::style::Stylize;
 
 const TERMINAL_WORKER_THREADS: usize = 2;
+const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
+/// Debug builds keep their own config root, so a checkout's build never joins the released
+/// daemon; `TICKLOOP_CONFIG_DIR` still overrides it.
+const DEVELOPMENT_CONFIG_ROOT: &str = ".tickloop-dev";
 
 fn main() {
+    if cfg!(debug_assertions) {
+        default_to_development_config_root();
+    }
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let build = tickloop_code_updater::Build {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -192,6 +199,18 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+/// Daemons, workers and the Tickhost this process starts inherit the root through the environment.
+fn default_to_development_config_root() {
+    if std::env::var_os(CONFIG_ROOT_VARIABLE).is_some_and(|root| !root.is_empty()) {
+        return;
+    }
+    let Some(home) = std::env::home_dir().filter(|home| !home.as_os_str().is_empty()) else {
+        return;
+    };
+    // SAFETY: Called first in `main`, before any other thread exists.
+    unsafe { std::env::set_var(CONFIG_ROOT_VARIABLE, home.join(DEVELOPMENT_CONFIG_ROOT)) };
 }
 
 fn fail_startup(arguments: &[std::ffi::OsString], message: &str) -> ! {
