@@ -109,6 +109,7 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: Some(UserInput::Text {
                     text: "Audit evidence".into(),
@@ -1257,6 +1258,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
             daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: None,
                 origin: None,
@@ -1712,6 +1714,7 @@ async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text
             daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: None,
                 origin: None,
@@ -2200,6 +2203,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
             daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: Some(UserInput::Text {
                     text: "Delegate a bounded check".into(),
@@ -2560,6 +2564,7 @@ impl DirectedFixture {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: LaunchSpec::embedded(directory.path().into()),
                     initial: None,
                     origin: None,

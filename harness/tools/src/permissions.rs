@@ -45,13 +45,14 @@ impl From<ExplicitPermissionDecision> for Decision {
 }
 
 /// Whose rule decided a call: the host's, a managed or project constraint, or the user's own
-/// rules and session decisions.
+/// rules and session decisions, or launch arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleSource {
     Host,
     Managed,
     Project,
     User,
+    LaunchArguments,
 }
 
 /// An explicit decision for a call and the source whose rule made it.
@@ -237,6 +238,7 @@ impl PermissionPolicyExt for PermissionPolicy {
         // underscores in service names must not grant a different service's authority.
         for rules in [
             &mut policy.rules,
+            &mut policy.launch_rules,
             &mut policy.host_rules,
             &mut policy.project_constraints,
             &mut policy.managed_constraints,
@@ -368,13 +370,14 @@ fn content_rule_asks(policy: &PermissionPolicy, name: &str, input: &Value, loop_
 }
 
 /// Every rule the policy evaluates, by source: the host's first, then the managed and project
-/// constraints, then the user's rules.
-fn rule_sources(policy: &PermissionPolicy) -> [(RuleSource, &[PermissionRule]); 4] {
+/// constraints, then the user's rules and launch arguments.
+fn rule_sources(policy: &PermissionPolicy) -> [(RuleSource, &[PermissionRule]); 5] {
     [
         (RuleSource::Host, &policy.host_rules),
         (RuleSource::Managed, &policy.managed_constraints),
         (RuleSource::Project, &policy.project_constraints),
         (RuleSource::User, &policy.rules),
+        (RuleSource::LaunchArguments, &policy.launch_rules),
     ]
 }
 
@@ -508,6 +511,27 @@ pub fn rule_views(
             effective_note: Some("the host's rule cannot be edited".into()),
         }))
         .collect()
+}
+
+/// Launch rules appear separately from editable and persistent user rules.
+pub fn launch_rule_views(
+    rules: &[PermissionRule],
+    mode: ExecutionMode,
+) -> impl Iterator<Item = PermissionRuleView> + '_ {
+    rules.iter().map(move |rule| PermissionRuleView {
+        rule: rule.clone(),
+        source: PermissionRuleSource::LaunchArguments,
+        scope: PermissionRuleScope::Chat,
+        editable: false,
+        effective_note: Some(
+            if mode == ExecutionMode::Auto && bypasses_auto_classifier(rule) {
+                "launch argument; broad Allow does not bypass Auto review"
+            } else {
+                "launch argument; cannot be edited or saved"
+            }
+            .into(),
+        ),
+    })
 }
 
 /// An additional directory as permissions record it: canonical, and an existing directory.

@@ -43,6 +43,8 @@ Want to see a Tick in action? Ask the agent:
 
 Then press Enter on the Counter in the Monitor, type `+` and press Enter: the agent receives the new count and responds.
 
+To add temporary tool rules for a new Agent, run `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`. The aliases `--allowed-tools` and `--disallowed-tools` also work. Repeat a flag or separate rules with spaces or commas. These flags cannot be combined with `--continue`, `--resume` or `--chat-id`. `/permissions` lists these as read-only **Launch arguments**. They apply to that Agent and its Subagents until restart, never to settings or other Agents. Deny and Ask rules and sensitive-path checks still take precedence; broad Bash allows still require Auto review. Add `--deny-on-prompt` to reject operations that would need human approval.
+
 ## Everyday use
 
 | Command | What it does |

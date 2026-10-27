@@ -172,6 +172,7 @@ fn create(epoch: Uuid, path: &Path) -> CommandEnvelope {
     envelope(
         epoch,
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: LaunchSpec::embedded(path.to_path_buf()),
             initial: None,
             origin: None,
@@ -466,6 +467,7 @@ async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
         .execute(envelope(
             client.daemon_epoch(),
             AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: Some(UserInput::Text {
                     text: "Finish the task".into(),
@@ -901,6 +903,7 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
                 .execute(envelope(
                     epoch,
                     AgentCommand::Create {
+                        launch_rules: Vec::new(),
                         launch,
                         initial: None,
                         origin: None,
@@ -1102,6 +1105,7 @@ async fn start_daemon_with_agent_executable(
             .execute(envelope(
                 client.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: None,
                     origin: None,
@@ -1565,6 +1569,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
         .execute(envelope(
             first.daemon_epoch(),
             AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: launch.clone(),
                 initial: Some(UserInput::Text {
                     text: "Record the result".into(),
@@ -1757,6 +1762,7 @@ async fn a_lost_user_shell_agent_keeps_its_task_title_in_the_daemon_directory() 
             .execute(envelope(
                 daemon.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                     initial: Some(UserInput::Shell {
                         command: "printf alpha".into(),
@@ -1794,6 +1800,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
             .execute(envelope(
                 daemon.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: Some(UserInput::Text {
                         text: "Retain this record".into(),
@@ -2097,6 +2104,7 @@ async fn create_running(
             .execute(envelope(
                 daemon.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: launch.clone(),
                     initial: Some(UserInput::Text {
                         text: "Keep working while the link drops".into(),
@@ -2909,6 +2917,7 @@ async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing
     let command = envelope(
         client.daemon_epoch(),
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: LaunchSpec::embedded(temporary.path().into()),
             initial: Some(UserInput::Text {
                 text: "Read the referenced file".into(),
@@ -2988,6 +2997,7 @@ async fn an_unknown_first_skill_registers_no_agent_runs_no_model_and_deduplicate
     let command = envelope(
         client.daemon_epoch(),
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: LaunchSpec::embedded(temporary.path().into()),
             initial: Some(UserInput::Skill {
                 name: "fixture-no-such-skill".into(),
@@ -3033,6 +3043,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
             .execute(envelope(
                 client.daemon_epoch(),
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: Some(UserInput::Text {
                         text: prompt.into(),

@@ -350,6 +350,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
     } = access_command(
         &access,
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch,
             initial: None,
             origin: None,
@@ -574,6 +575,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     } = access_command(
         &access,
         AgentCommand::Create {
+            launch_rules: Vec::new(),
             launch: launch(),
             initial: None,
             origin: None,
@@ -1504,6 +1506,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
             daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: None,
                 origin: None,

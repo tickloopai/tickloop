@@ -43,6 +43,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 然后在 Monitor 中对 Counter 按 Enter，输入 `+` 再按 Enter：Agent 会收到新的计数并作出回应。
 
+为新 Agent 添加临时工具规则，可运行 `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`，也支持别名 `--allowed-tools` 和 `--disallowed-tools`。参数可重复，规则以空格或逗号分隔。这些参数不能与 `--continue`、`--resume` 或 `--chat-id` 同用。`/permissions` 中这些规则标为只读的 **Launch arguments（启动参数）**，只作用于该 Agent 及其 Subagent，重启后失效，不写入设置，也不影响其他 Agent。Deny、Ask 和敏感路径检查仍优先；宽泛的 Bash allow 仍需 Auto 审查。加上 `--deny-on-prompt`，需要人工确认的操作将直接拒绝。
+
 ## 日常使用
 
 | 命令 | 作用 |

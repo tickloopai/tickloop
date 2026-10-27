@@ -135,6 +135,7 @@ impl Busy {
             .execute(envelope(
                 &access,
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: Some(text_input("start the busy work", &[])),
                     origin: None,

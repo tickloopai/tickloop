@@ -157,6 +157,7 @@ impl LongChat {
                 daemon_epoch: access.daemon_epoch(),
                 command_id: tickloop_ids::generate(),
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: LaunchSpec::embedded(PathBuf::from("/tmp")),
                     initial: None,
                     origin: None,
