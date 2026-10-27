@@ -312,19 +312,24 @@ async fn render(scenario: &Scenario, output: &Path) {
         loop {
             scripted.enqueue(text("ready"));
             complete(&agent, warmup, "warm up").await;
-            let requests = scripted.requests.lock().unwrap();
-            let last = requests.last().unwrap();
-            let names = last
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>();
-            let artifacts_ready = names.contains(&"ArtifactRead") == scenario.signed_in;
-            let mcp_ready = expected_mcp_tool.is_none_or(|tool| names.contains(&tool));
-            if artifacts_ready && mcp_ready {
+            let settled = {
+                let requests = scripted.requests.lock().unwrap();
+                let names = requests
+                    .last()
+                    .unwrap()
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect::<Vec<_>>();
+                let artifacts_ready =
+                    names.iter().any(|name| name == "ArtifactRead") == scenario.signed_in;
+                let mcp_ready =
+                    expected_mcp_tool.is_none_or(|tool| names.iter().any(|name| name == tool));
+                artifacts_ready && mcp_ready
+            };
+            if settled {
                 break;
             }
-            drop(requests);
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
@@ -335,21 +340,23 @@ async fn render(scenario: &Scenario, output: &Path) {
     let before = scripted.requests.lock().unwrap().len();
     scripted.enqueue(text("Hello!"));
     complete(&agent, chat, "hi").await;
-    let requests = scripted.requests.lock().unwrap();
-    let first = requests[before..]
-        .iter()
-        .find(|request| request.tools.iter().any(|tool| tool.name == "Bash"))
-        .expect("the Chat's first conversation request");
-    let mut rendered = request_json(first);
-    drop(requests);
+    let mut rendered = {
+        let requests = scripted.requests.lock().unwrap();
+        let first = requests[before..]
+            .iter()
+            .find(|request| request.tools.iter().any(|tool| tool.name == "Bash"))
+            .expect("the Chat's first conversation request");
+        request_json(first)
+    };
     // A second turn shows whether the system part, the start of the prompt cache prefix, stays
     // the same across the Chat's Runs.
     let before = scripted.requests.lock().unwrap().len();
     scripted.enqueue(text("You're welcome."));
     complete(&agent, chat, "thanks").await;
-    let requests = scripted.requests.lock().unwrap();
-    rendered["second_run_system"] = request_json(&requests[before])["messages"][0]["text"].clone();
-    drop(requests);
+    rendered["second_run_system"] = {
+        let requests = scripted.requests.lock().unwrap();
+        request_json(&requests[before])["messages"][0]["text"].clone()
+    };
     agent.shutdown().await;
     fs::write(
         output.join(format!("{}.json", scenario.name)),
