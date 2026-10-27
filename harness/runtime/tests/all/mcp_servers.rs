@@ -2089,3 +2089,91 @@ async fn schema_metadata_reaches_mcp_approval_while_invalid_arguments_never_disp
         assert!(final_messages.contains("invalid"));
     }
 }
+
+#[tokio::test]
+async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_validation() {
+    let log = ProtocolLog::default();
+    let writer = log.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let secret = "stdio-private-credential";
+    let server = McpService::start().await;
+    server.set_instructions(format!("INITIALIZE_MARKER {secret}"));
+    server.set_tools(json!([{"name":"probe","description":format!("DESCRIPTION_MARKER {secret}"),"inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271}}}}]));
+    server
+        .set_result(json!({"content":[{"type":"text","text":format!("RESULT_MARKER {secret}")}]}));
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        Default::default(),
+        std::env::vars().collect(),
+    );
+    connections
+        .reconcile(vec![McpServerConfig {
+            name: "local".into(),
+            source: "global".into(),
+            transport: McpTransport::Stdio {
+                command: "python3".into(),
+                args: server.stdio_args(),
+                env: BTreeMap::from([("FIXTURE_CREDENTIAL".into(), secret.into())]),
+                cwd: std::env::current_dir().unwrap(),
+            },
+            timeout_ms: 5000,
+            oauth: Default::default(),
+            sensitive_values: vec![json!(secret), json!(839271), json!(true), json!(false)],
+            disabled: false,
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: vec![],
+            description: String::new(),
+        }])
+        .await;
+    settled(&connections).await;
+    assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
+    assert!(
+        connections.snapshot()[0].tools[0].input_schema["properties"]["pin"]
+            .get("minimum")
+            .is_none()
+    );
+    assert!(matches!(
+        connections
+            .call(
+                "mcp__local__probe",
+                json!({"pin":0}),
+                CancellationToken::new()
+            )
+            .await,
+        HostCallResult::NotDispatched(_)
+    ));
+    assert!(server.calls().is_empty());
+    let HostCallResult::Completed(result) = connections
+        .call(
+            "mcp__local__probe",
+            json!({"pin":839272}),
+            CancellationToken::new(),
+        )
+        .await
+    else {
+        panic!("valid call did not complete")
+    };
+    assert!(!result.content.contains(secret));
+    assert_eq!(server.calls().len(), 1);
+    connections.shutdown().await;
+    let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for marker in ["INITIALIZE_MARKER", "DESCRIPTION_MARKER", "RESULT_MARKER"] {
+        assert!(logged.contains(marker), "TRACE capture missed {marker}");
+    }
+    assert!(
+        !logged.contains(secret),
+        "SDK logging exposed the stdio credential"
+    );
+    assert!(
+        !logged.contains("839271"),
+        "SDK logging exposed a sensitive schema constraint"
+    );
+}

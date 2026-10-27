@@ -26,7 +26,7 @@ use sse_stream::{Sse, SseStream};
 
 use tickloop_harness_base::network::{HttpPolicy, build_http_client};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION"), " MCP/1");
 pub(crate) const REQUEST_TIMED_OUT: &str = "MCP request timed out";
@@ -139,8 +139,9 @@ pub(crate) enum ResponsePart {
     Data,
     ToolDirectory,
 }
-type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePart) + Send + Sync>;
-type DirectoryRequests = Arc<Mutex<HashMap<rmcp::model::RequestId, tokio::time::Instant>>>;
+pub(crate) type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePart) + Send + Sync>;
+pub(crate) type DirectoryRequests =
+    Arc<Mutex<HashMap<rmcp::model::RequestId, tokio::time::Instant>>>;
 
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
@@ -414,7 +415,7 @@ fn sse_stream(
         .boxed()
 }
 
-fn redact_message(
+pub(crate) fn redact_message(
     text: &str,
     redact: &ResponseRedactor,
     directory_requests: &DirectoryRequests,

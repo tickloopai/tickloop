@@ -51,10 +51,26 @@ impl ExposureDirectory {
             .filter(|tool| tool.exposure == ToolExposure::Direct)
             .map(|tool| tool.definition.clone())
             .collect();
-        if matches!(self.search_support, SearchSupport::Fold) {
-            definitions.extend(fold_definitions());
-        }
+        definitions.extend(self.discovery_definitions());
         definitions
+    }
+
+    pub fn discovery_definitions(&self) -> Vec<ToolDefinition> {
+        match self.search_support {
+            SearchSupport::Fold => fold_definitions(),
+            SearchSupport::Native
+                if self
+                    .tools
+                    .iter()
+                    .any(|tool| tool.exposure == ToolExposure::Codemode) =>
+            {
+                fold_definitions()
+                    .into_iter()
+                    .filter(|tool| tool.name != EXECUTE_TOOLS)
+                    .collect()
+            }
+            SearchSupport::Native => Vec::new(),
+        }
     }
 
     /// Native search reads the original schema, as DescribeTools would show it: only vendors
@@ -94,7 +110,11 @@ impl ExposureDirectory {
         let tools: Vec<_> = self
             .tools
             .iter()
-            .filter(|tool| tool.exposure == ToolExposure::Search)
+            .filter(|tool| {
+                tool.exposure == ToolExposure::Codemode
+                    || (matches!(self.search_support, SearchSupport::Fold)
+                        && tool.exposure == ToolExposure::Search)
+            })
             .collect();
         let documents: Vec<_> = tools
             .iter()
@@ -179,7 +199,11 @@ impl ExposureDirectory {
         let mut tools = Vec::new();
         let mut not_found = Vec::new();
         for name in names {
-            match self.tools.iter().find(|tool| tool.definition.name == name && tool.exposure != ToolExposure::Hidden) {
+            match self.tools.iter().find(|tool| tool.definition.name == name
+                && match self.search_support {
+                    SearchSupport::Fold => tool.exposure != ToolExposure::Hidden,
+                    SearchSupport::Native => tool.exposure == ToolExposure::Codemode,
+                }) {
                 Some(tool) => tools.push(json!({"name":tool.definition.name,"server":tool.server,
                     "description":tool.definition.description,"input_schema":tool.original_schema,
                     "annotations":tool.annotations,"annotations_notice":"Server-provided annotations are for reference only and grant no permissions."})),
@@ -274,11 +298,13 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
     remaining.is_empty()
 }
 
-/// A model offered native search instead of Fold would repeat the Fold calls it sees in
-/// history, so for that request they read as plain text; results that become text follow the
-/// remaining tool results of their message.
-pub fn fold_history_as_text(messages: &mut [Message]) {
-    let fold_names = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS];
+/// Unavailable discovery or batch tools read as plain text; tools still offered for
+/// script discovery keep their call/result pairs.
+pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinition]) {
+    let fold_names: Vec<_> = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS]
+        .into_iter()
+        .filter(|name| !available.iter().any(|tool| tool.name == *name))
+        .collect();
     let mut converted = BTreeMap::new();
     for message in messages {
         let mut results_as_text = Vec::new();
@@ -311,8 +337,8 @@ pub fn fold_history_as_text(messages: &mut [Message]) {
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools using 1–5 search queries or exact tool names. Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them.".into(), input_schema: json!({"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["queries"],"additionalProperties":false}) },
-        ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Use ExecuteTools to call tools.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools using 1–5 search queries or exact tool names. Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["queries"],"additionalProperties":false}) },
+        ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]
 }

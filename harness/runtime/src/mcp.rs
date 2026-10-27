@@ -126,9 +126,7 @@ impl Entry {
     ) {
         let mut originals = self.tool_schemas.write().unwrap();
         tools.retain(|name, tool| {
-            if matches!(self.config.transport, McpTransport::Http { .. })
-                && !originals.contains_key(&tool.original)
-            {
+            if !originals.contains_key(&tool.original) {
                 warnings.push(format!(
                     "{name}: original input schema unavailable; tool omitted"
                 ));
@@ -1109,7 +1107,18 @@ async fn open(
             } else {
                 std::process::Stdio::inherit()
             };
-            let transport = process::ProcessTransport::spawn(process, stderr)?;
+            let redact_entry = Arc::downgrade(entry);
+            let transport = process::ProcessTransport::spawn(
+                process,
+                stderr,
+                Arc::new(move |value, part| {
+                    if let Some(entry) = redact_entry.upgrade() {
+                        redact_wire_value(&entry, value, part);
+                    } else {
+                        *value = Value::Null;
+                    }
+                }),
+            )?;
             let service = handler
                 .serve_with_lifecycle(transport, lifecycle)
                 .await

@@ -375,14 +375,15 @@ impl ToolRegistry {
                         })
                         .map(|tool| tool.definition.name.clone()),
                 );
-                if matches!(search_support, crate::tool_exposure::SearchSupport::Fold) {
-                    tools.extend(crate::tool_exposure::fold_definitions().into_iter().map(
-                        |definition| RegisteredTool {
+                tools.extend(
+                    directory
+                        .discovery_definitions()
+                        .into_iter()
+                        .map(|definition| RegisteredTool {
                             definition,
                             route: ToolRoute::Fold(directory.clone()),
-                        },
-                    ));
-                }
+                        }),
+                );
             }
             tools.extend(
                 provider
