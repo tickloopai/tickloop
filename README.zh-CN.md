@@ -149,7 +149,7 @@ tickloop plugin install --path ./my-plugin
 
 已启用插件可在 `.mcp.json` 中声明 MCP 服务（服务映射或带 `mcpServers` 外层），也可在清单的 `mcpServers` 中使用对象、相对路径或数组。支持 stdio 与 streamable HTTP，工具名为 `mcp__plugin_<插件>_<服务>__<工具>`；名称各部分的连续下划线合并为一个；过长或碰撞的工具名补哈希并保留服务／工具分隔符，规范化后同名的插件服务会跳过并警告。`validate`、安装与启用会列出命令、地址及缺少的配置。启用即同意从下一次 Agent 请求起以用户身份运行服务；禁用或卸载后从下一次请求起停止，工具调用仍按用户权限审批。
 
-你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
+你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`--exposure direct|search|hidden` 设定该服务的工具怎样到达模型；不加时条目不含 `exposure`，按 `search` 处理。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
 
 例如，将下面内容合入配置目录中的 `settings.json`，把命令和 URL 换成你的服务：
 
