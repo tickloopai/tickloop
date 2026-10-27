@@ -1535,6 +1535,7 @@ mod tests {
 
     fn empty_request() -> ModelRequest {
         ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),

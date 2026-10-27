@@ -233,6 +233,14 @@ impl ModelCatalog {
                         "{location}.thinking_off: requires a controllable Messages model without manual thinking budgets"
                     ));
                 }
+                if let Some(search) = model.native_tool_search.flatten()
+                    && search.adapter() != model.adapter
+                {
+                    return Err(format!(
+                        "{location}.native_tool_search: {search:?} tool search needs the {:?} adapter",
+                        search.adapter()
+                    ));
+                }
                 if model.adaptive_by_default
                     && !matches!(model.adapter, Adapter::Messages | Adapter::MinimaxMessages)
                 {
@@ -632,6 +640,7 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
                 thinking_budgets: None,
                 temperature_control: None,
                 thinking_off: None,
+                native_tool_search: None,
             });
         card.id = config.model_id.clone();
         card.display_name = config.name.clone();
@@ -677,6 +686,7 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
             card.temperature_control = card
                 .temperature_control
                 .or(current_card.temperature_control);
+            card.native_tool_search = card.native_tool_search.or(current_card.native_tool_search);
             if card.thinking == current_card.thinking
                 && card.thinking_budgets == current_card.thinking_budgets
             {
@@ -717,6 +727,7 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
         thinking_budgets: None,
         temperature_control: None,
         thinking_off: None,
+        native_tool_search: None,
     });
     config
 }

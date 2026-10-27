@@ -20,6 +20,8 @@ mod model_protocols;
 mod model_seams;
 #[path = "all/model_usage_observations.rs"]
 mod model_usage_observations;
+#[path = "all/native_tool_search.rs"]
+mod native_tool_search;
 #[path = "all/openai_models.rs"]
 mod openai_models;
 #[path = "all/provider_expansion.rs"]

@@ -311,6 +311,7 @@ async fn echo(
     let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config)?;
     let (events, _receiver) = mpsc::unbounded_channel();
     let mut request = ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![None],
         messages: vec![Message {
             role: Role::User,
@@ -375,6 +376,7 @@ async fn echo(
     let verdict = client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: vec![None],
                 messages: vec![Message {
                     role: Role::User,

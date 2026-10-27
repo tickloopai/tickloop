@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config)?;
     let (events, _receiver) = mpsc::unbounded_channel();
     let mut request = ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![None],
         messages: vec![Message {
             role: Role::User,
@@ -157,6 +158,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }];
     verdict_content.extend(image_inputs);
     let verdict = client.complete(ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![None],
         messages: vec![Message { role: Role::User, content: verdict_content }],
         tools: Vec::new(),

@@ -3059,7 +3059,15 @@ impl Agent {
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             registry.refresh(chat);
             request.tools = registry.definitions();
+            request.deferred_tools = registry.deferred_definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
+            if !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == tool_exposure::EXECUTE_TOOLS)
+            {
+                tool_exposure::fold_history_as_text(&mut request.messages);
+            }
             match chat.tools.chat_directory() {
                 Some(chat_directory) => {
                     let replacements = tool_results::enforce_tool_result_budget(
@@ -3146,6 +3154,7 @@ impl Agent {
         let available_tools = request
             .tools
             .iter()
+            .chain(&request.deferred_tools)
             .map(|tool| tool.name.clone())
             .collect::<HashSet<_>>();
         let mut recovered_text = String::new();
@@ -3517,6 +3526,7 @@ impl Agent {
             *is_awaiting_model = true;
             let mut registry = self.prepare_tool_registry(&receipt, &cancel).await?;
             request.tools = registry.definitions();
+            request.deferred_tools = registry.deferred_definitions();
             let output = match self
                 .model_request(
                     &receipt,
@@ -3774,6 +3784,7 @@ impl Agent {
         let (messages, history_sources) =
             context::model_history(chat).map_err(|error| error.to_string())?;
         Ok(ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources,
             messages,
             tools: self.tool_definitions(chat),
@@ -4449,6 +4460,7 @@ impl Agent {
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources,
                 messages,
                 tools: self.tool_definitions(&candidate),

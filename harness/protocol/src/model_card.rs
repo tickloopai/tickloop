@@ -84,6 +84,26 @@ impl ThinkingOffEncoding {
     }
 }
 
+/// The vendor's own deferred tool loading a model accepts, so Tool Search needs no Fold tools.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolSearch {
+    /// Messages `tool_search_tool_bm25` with `defer_loading` tools.
+    Anthropic,
+    /// Responses `tool_search` with `defer_loading` functions.
+    #[serde(rename = "openai")]
+    OpenAi,
+}
+
+impl NativeToolSearch {
+    pub const fn adapter(self) -> Adapter {
+        match self {
+            Self::Anthropic => Adapter::Messages,
+            Self::OpenAi => Adapter::Responses,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCard {
@@ -120,6 +140,13 @@ pub struct ModelCard {
         deserialize_with = "deserialize_nullable"
     )]
     pub thinking_off: Option<Option<ThinkingOffEncoding>>,
+    /// Missing inherits catalog capabilities; explicit null offers no native tool search.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub native_tool_search: Option<Option<NativeToolSearch>>,
 }
 
 /// Manual thinking budgets for the effort levels a budget-only Messages model offers; pi uses
@@ -205,6 +232,12 @@ pub struct ModelPatch {
         deserialize_with = "deserialize_nullable"
     )]
     pub thinking_off: Option<Option<ThinkingOffEncoding>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub native_tool_search: Option<Option<NativeToolSearch>>,
 }
 
 fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -250,6 +283,9 @@ impl ModelPatch {
         if let Some(value) = self.thinking_off {
             model.thinking_off = Some(value);
         }
+        if let Some(value) = self.native_tool_search {
+            model.native_tool_search = Some(value);
+        }
     }
 
     pub fn into_new(self, provider_location: &str) -> Result<ModelCard, String> {
@@ -273,6 +309,7 @@ impl ModelPatch {
             thinking_budgets: self.thinking_budgets,
             temperature_control: self.temperature_control,
             thinking_off: self.thinking_off,
+            native_tool_search: self.native_tool_search,
         })
     }
 }

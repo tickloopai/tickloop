@@ -132,6 +132,7 @@ fn client(state_dir: &Path, endpoint: &str) -> CodexModelClient {
 
 fn request() -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,

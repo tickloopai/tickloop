@@ -118,6 +118,7 @@ async fn fixture(model: Arc<RaceModel>) -> (tempfile::TempDir, Agent, ChatId) {
 
 fn empty_request() -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: Vec::new(),
         tools: Vec::new(),

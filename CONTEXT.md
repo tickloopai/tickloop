@@ -72,7 +72,11 @@ _Avoid_: "associated Artifact" (Artifact Association refers specifically to the 
 ### Plugins
 
 **Plugin**:
-An installable unit of components that extend the Agent's available Skills or Tick programs. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; a plugin grants no additional permissions.
+An installable unit of components that extend the Agent's available Skills, Tick programs, or MCP Servers. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; enabling a plugin consents to running its programs and MCP Servers, but a plugin grants no additional permissions.
+
+**Plugin User Config**:
+Values a plugin declares that the user fills in, such as an API key or a server address, used by its components. Sensitive values are kept with the plugin's credentials and never reach content the model can see.
+_Avoid_: plugin settings (a plugin's `settings` component is a different, unsupported thing)
 
 **Plugin Marketplace**:
 A named catalog of plugins and their sources. Tickloop includes `tickloop` and `claude-plugins-official`; users can register additional marketplaces.
@@ -87,6 +91,33 @@ _Avoid_: builtin provider (Terminal, Shell, Artifact, and the protocol are Tick 
 **Tick Marketplace**:
 The built-in `tickloop` Plugin Marketplace, listing Tick Packages and their prebuilt downloads from [tickloopai/ticks](https://github.com/tickloopai/ticks).
 _Avoid_: Store
+
+### MCP and Connectors
+
+**MCP Server**:
+A Model Context Protocol endpoint the Agent connects to, either a local program over stdio or a remote address over streamable HTTP, configured in the user's settings or by an enabled plugin. Its tools, resources, and instructions reach the Agent; it is not a Tick, and its processes belong to the Agent that uses them. Repository content cannot add or enable one.
+_Avoid_: MCP plugin (a plugin may carry MCP Servers, but they are separate things)
+
+**MCP Tool**:
+A tool an MCP Server offers, named `mcp__<server>__<tool>` for the model; a plugin's servers are named `plugin_<plugin>_<server>`. Its self-declared hints, such as read-only, grant nothing: approval treats it as a tool with side effects.
+
+**Connector**:
+The product layer over a remote MCP Server that makes "give an address, log in, and use it" work: login, renewal and logout of the user's authorization, and management of those credentials. The MCP Server is the protocol endpoint; the Connector is the user's authorized connection to it.
+_Avoid_: integration, app
+
+**Tool Exposure**:
+How an MCP Server's tools reach the model, set per server: direct (listed among the model's tools), search (found and called through Tool Search), codemode (callable only from Codemode scripts), or hidden (not callable). Exposure changes only how tools are reached, never their permissions.
+
+**Tool Search**:
+Reaching tools on demand without changing the model's tool list. It uses the model's native search when the model card supports it, and otherwise Fold.
+_Avoid_: deferred loading (that names the native form only), lazy tools
+
+**Fold**:
+The Tool Search form that asks nothing of the model: three fixed tools, SearchTools, DescribeTools and ExecuteTools, find, describe and call the tools, which never enter the tool list. ExecuteTools runs a batch of independent calls.
+
+**Codemode**:
+A tool that runs a script the model writes, in a sandbox with no file, network or timer access; the script reaches the outside only by calling other tools, and only its output returns to the model. Each call in a script is prepared, approved and recorded as if the model had made it directly. Hosts that cannot run scripts do not offer it.
+_Avoid_: sandbox (that names execution services), call plan
 
 ### Loop and Trigger
 

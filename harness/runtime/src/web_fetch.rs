@@ -58,6 +58,7 @@ impl SecondaryModel for ChatSecondaryModel<'_> {
         cancel: CancellationToken,
     ) -> Result<String, ToolError> {
         let request = ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: vec![Message {
                 role: Role::User,

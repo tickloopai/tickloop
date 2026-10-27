@@ -33,6 +33,7 @@ models:
   - id: "claude-opus-5"
     display_name: "Claude Opus 5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -50,6 +51,7 @@ models:
   - id: "claude-opus-4-8"
     display_name: "Claude Opus 4.8"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -67,6 +69,7 @@ models:
   - id: "claude-opus-4-7"
     display_name: "Claude Opus 4.7"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -84,6 +87,7 @@ models:
   - id: "claude-opus-4-6"
     display_name: "Claude Opus 4.6"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -100,6 +104,7 @@ models:
   - id: "claude-sonnet-5"
     display_name: "Claude Sonnet 5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -117,6 +122,7 @@ models:
   - id: "claude-sonnet-4-6"
     display_name: "Claude Sonnet 4.6"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -133,6 +139,7 @@ models:
   - id: "claude-fable-5-1"
     display_name: "Claude Fable 5.1"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 128000
     context_window_tokens: 1000000
@@ -150,6 +157,7 @@ models:
   - id: "claude-fable-5"
     display_name: "Claude Fable 5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
@@ -167,6 +175,7 @@ models:
   - id: "claude-opus-5-5"
     display_name: "Claude Opus 5.5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 128000
     context_window_tokens: 1000000
@@ -177,6 +186,7 @@ models:
   - id: "claude-sonnet-5-5"
     display_name: "Claude Sonnet 5.5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     thinking_off: "between_tools"
     max_output_tokens: 128000
@@ -188,6 +198,7 @@ models:
   - id: "claude-haiku-4-5-20251001"
     display_name: "Claude Haiku 4.5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: 200000
@@ -198,6 +209,7 @@ models:
   - id: "claude-haiku-5-5"
     display_name: "Claude Haiku 5.5"
     adapter: "messages"
+    native_tool_search: "anthropic"
     temperature_control: "unsupported"
     max_output_tokens: 128000
     context_window_tokens: 1000000
