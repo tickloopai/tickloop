@@ -96,6 +96,12 @@ impl HostToolProvider for CompositeHostTools {
             .flat_map(|source| source.discovery_tools())
             .collect()
     }
+    fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.unavailable_tool_servers())
+            .collect()
+    }
     fn has_tool_search(&self) -> bool {
         self.sources.iter().any(|source| source.has_tool_search())
     }

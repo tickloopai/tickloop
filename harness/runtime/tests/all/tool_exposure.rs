@@ -90,6 +90,17 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         tool_exposure: vec![("secret".into(), ToolExposure::Hidden)],
         description: "Office tools".into(),
     }];
+    let mut configs = configs;
+    configs.push(McpServerConfig {
+        name: "ui5".into(),
+        transport: McpTransport::Failed {
+            reason: "missing command".into(),
+        },
+        exposure: ToolExposure::Search,
+        tool_exposure: vec![],
+        description: String::new(),
+        ..configs[0].clone()
+    });
     let connections = McpConnections::new(
         HostCapabilities::default(),
         BTreeMap::new(),
@@ -177,6 +188,12 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
                 .tools
                 .iter()
                 .any(|tool| tool.name.starts_with("mcp__"))
+        );
+        let searched = serde_json::to_string(&requests[1].messages).unwrap();
+        assert!(
+            searched
+                .contains(r#"\"unavailable_servers\":[{\"name\":\"ui5\",\"state\":\"failed\"}]"#),
+            "{searched}"
         );
         let first = serde_json::to_vec(&requests[0].tools).unwrap();
         for request in requests.iter() {
@@ -1606,5 +1623,40 @@ fn words_in_a_tool_name_outrank_the_same_words_in_descriptions() {
     assert_eq!(
         found_names(&directory, "version"),
         ["mcp__docs__get_version", "mcp__docs__release_notes"]
+    );
+}
+
+#[test]
+fn searches_name_servers_that_cannot_offer_tools_yet() {
+    use tickloop_harness_protocol::mcp::McpServerState;
+    use tickloop_harness_runtime::tool_exposure::UnavailableServer;
+    let directory = ExposureDirectory::new(
+        vec![server_tool("office", "mail", "Send an email message")],
+        SearchSupport::Fold,
+        false,
+    )
+    .with_unavailable_servers(vec![UnavailableServer {
+        name: "ui5".into(),
+        state: McpServerState::Connecting,
+    }]);
+    let found = directory.search(&json!({"query":"ui5 tools"})).unwrap();
+    assert_eq!(found["matches"], json!([]));
+    assert_eq!(
+        found["unavailable_servers"],
+        json!([{"name":"ui5","state":"connecting"}])
+    );
+    let note = found["note"].as_str().unwrap();
+    assert!(
+        note.contains("ui5 (connecting)") && note.contains("again"),
+        "{note}"
+    );
+    let found = directory.search(&json!({"query":"email"})).unwrap();
+    assert_eq!(found["matches"][0]["name"], "mcp__office__mail");
+    assert_eq!(
+        found["unavailable_servers"],
+        json!([{"name":"ui5","state":"connecting"}])
+    );
+    assert!(
+        ui5_directory().search(&json!({"query":"ui5"})).unwrap()["unavailable_servers"].is_null()
     );
 }

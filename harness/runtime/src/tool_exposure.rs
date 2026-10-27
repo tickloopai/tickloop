@@ -1,7 +1,11 @@
 //! Pure projection and discovery of the tools a directory makes available.
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use tickloop_harness_protocol::{Content, Message, ToolDefinition, mcp::ToolExposure};
+use tickloop_harness_protocol::{
+    Content, Message, ToolDefinition,
+    mcp::{McpServerState, ToolExposure},
+};
 
 pub const SEARCH_TOOLS: &str = "SearchTools";
 pub const DESCRIBE_TOOLS: &str = "DescribeTools";
@@ -39,9 +43,17 @@ pub struct ExposureTool {
     pub exposure: ToolExposure,
 }
 
+/// A server whose tools discovery cannot offer right now, so a search can say why it is missing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnavailableServer {
+    pub name: String,
+    pub state: McpServerState,
+}
+
 pub struct ExposureDirectory {
     tools: Vec<ExposureTool>,
     search_support: SearchSupport,
+    unavailable_servers: Vec<UnavailableServer>,
 }
 
 impl ExposureDirectory {
@@ -52,7 +64,13 @@ impl ExposureDirectory {
         Self {
             tools,
             search_support,
+            unavailable_servers: Vec::new(),
         }
+    }
+
+    pub fn with_unavailable_servers(mut self, servers: Vec<UnavailableServer>) -> Self {
+        self.unavailable_servers = servers;
+        self
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -190,12 +208,28 @@ impl ExposureDirectory {
         if !not_found.is_empty() {
             output["not_found"] = json!(not_found);
         }
+        if !self.unavailable_servers.is_empty() {
+            output["unavailable_servers"] = json!(self.unavailable_servers);
+        }
         if matches.is_empty() {
-            output["note"] = json!(
-                "No tool matched. Try another wording or an exact tool name; check the MCP server status for unavailable services."
-            );
+            output["note"] = json!(self.no_match_note());
         }
         Ok(output)
+    }
+
+    fn no_match_note(&self) -> String {
+        if self.unavailable_servers.is_empty() {
+            return "No tool matched. Try another wording or an exact tool name; check the MCP server status for unavailable services.".into();
+        }
+        let servers = self
+            .unavailable_servers
+            .iter()
+            .map(|server| format!("{} ({})", server.name, server_state_text(&server.state)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "No tool matched. These MCP servers cannot offer tools right now: {servers}. Search again shortly for a connecting server; check the MCP server status for the others."
+        )
     }
 
     pub fn describe(&self, input: &Value) -> Result<Value, String> {
@@ -216,6 +250,11 @@ impl ExposureDirectory {
         }
         Ok(json!({"tools":tools,"not_found":not_found}))
     }
+}
+
+/// The state as the search result spells it, such as `connecting`.
+fn server_state_text(state: &McpServerState) -> String {
+    json!(state).as_str().unwrap_or_default().to_owned()
 }
 
 fn strings<'a>(input: &'a Value, field: &str) -> Result<Vec<&'a str>, String> {

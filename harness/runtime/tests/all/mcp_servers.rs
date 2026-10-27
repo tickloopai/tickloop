@@ -2177,3 +2177,71 @@ async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_valida
         "SDK logging exposed a sensitive schema constraint"
     );
 }
+
+#[tokio::test]
+async fn the_first_refresh_waits_for_search_servers_and_reports_unavailable_ones() {
+    use tickloop_harness_protocol::mcp::ToolExposure;
+    use tickloop_harness_runtime::{
+        host_tools::HostToolProvider, mcp::McpToolProvider, tool_exposure::UnavailableServer,
+    };
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"get_version_info","description":"Get version information for UI5","inputSchema":{"type":"object"}}]));
+    server.set_directory_delay(Duration::from_millis(500));
+    let mut config = http_config("ui5", &server);
+    config.exposure = ToolExposure::Search;
+    let mut broken = config.clone();
+    broken.name = "broken".into();
+    broken.transport = McpTransport::Failed {
+        reason: "missing command".into(),
+    };
+    let mut hidden = broken.clone();
+    hidden.name = "hidden".into();
+    hidden.exposure = ToolExposure::Hidden;
+    let provider = McpToolProvider::new(
+        McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        Arc::new(move || vec![config.clone(), broken.clone(), hidden.clone()]),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider
+            .discovery_tools()
+            .iter()
+            .map(|tool| tool.definition.name.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp__ui5__get_version_info"]
+    );
+    assert_eq!(
+        provider.unavailable_tool_servers(),
+        [UnavailableServer {
+            name: "broken".into(),
+            state: McpServerState::Failed,
+        }]
+    );
+    provider.shutdown().await;
+
+    let slow = McpService::start().await;
+    slow.set_directory_delay(Duration::from_secs(30));
+    let mut config = http_config("ui5", &slow);
+    config.exposure = ToolExposure::Search;
+    let provider = McpToolProvider::new(
+        McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ),
+        Arc::new(move || vec![config.clone()]),
+    );
+    provider.mcp_server_statuses(CancellationToken::new()).await;
+    assert_eq!(
+        provider.unavailable_tool_servers(),
+        [UnavailableServer {
+            name: "ui5".into(),
+            state: McpServerState::Connecting,
+        }]
+    );
+    provider.shutdown().await;
+}

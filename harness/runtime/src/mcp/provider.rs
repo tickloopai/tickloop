@@ -92,6 +92,10 @@ impl HostToolProvider for McpToolProvider {
             .collect()
     }
 
+    fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
+        self.connections.unavailable_tool_servers()
+    }
+
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
         let validator =
             jsonschema::validator_for(schema).map_err(|_| format!("invalid {name} schema"))?;
@@ -124,7 +128,7 @@ impl HostToolProvider for McpToolProvider {
         let configuration = (self.configuration)();
         self.connections.reconcile(configuration.servers).await;
         *self.warnings.write().unwrap() = configuration.warnings;
-        self.connections.wait_for_direct(cancel).await;
+        self.connections.wait_for_startup(cancel).await;
         Ok(())
     }
     async fn mcp_server_statuses(&self, cancel: CancellationToken) -> Vec<McpServerStatus> {
