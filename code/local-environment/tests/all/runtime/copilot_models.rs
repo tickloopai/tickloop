@@ -276,6 +276,7 @@ fn user(text: &str) -> Message {
 
 fn request(messages: Vec<Message>, effort: Option<ReasoningEffort>) -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![None; messages.len()],
         messages,
         tools: vec![ToolDefinition {

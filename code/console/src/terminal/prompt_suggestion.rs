@@ -134,6 +134,7 @@ pub(super) async fn generate(
             client.as_ref(),
             request.id.into(),
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: vec![],
                 messages: vec![
                     Message {

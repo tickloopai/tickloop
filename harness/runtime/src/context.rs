@@ -40,6 +40,7 @@ pub(super) fn model_history(
     }
     let projected = tickloop_harness_model::history::project_request(
         ModelRequest {
+            deferred_tools: Vec::new(),
             messages,
             history_sources: sources,
             tools: Vec::new(),
@@ -396,6 +397,7 @@ impl Agent {
                 context,
                 client,
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: Vec::new(),
                     messages: summary_messages,
                     tools: Vec::new(),

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 fn request() -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![],
         messages: vec![],
         tools: vec![],

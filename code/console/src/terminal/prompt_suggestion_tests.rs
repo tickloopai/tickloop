@@ -166,6 +166,7 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
                 &client,
                 Uuid::new_v4().into(),
                 tickloop_harness::model::ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: vec![],
                     messages: conversation(),
                     tools: vec![],

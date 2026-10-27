@@ -121,6 +121,7 @@ async fn legacy_and_server_tool_shapes_are_terminal_before_text_is_parsed() {
         };
         let client = LocalModelClients::new(None).client(&model).unwrap();
         let request = tickloop_harness::model::ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: vec![Message {
                 role: Role::User,

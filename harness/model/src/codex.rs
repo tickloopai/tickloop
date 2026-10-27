@@ -159,6 +159,7 @@ impl CodexModelClient {
         cancel: CancellationToken,
         model_context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
+        super::native_tool_search::check_request(&self.config, &request)?;
         let structured_output = request.structured_output.clone();
         if let Some(format) = &structured_output {
             format.validator()?;
@@ -694,6 +695,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
@@ -819,6 +821,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages: vec![
                     Message {
@@ -971,6 +974,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: Vec::new(),
                 messages,
                 tools: Vec::new(),
@@ -1042,6 +1046,7 @@ mod tests {
 
     fn simple_request() -> ModelRequest {
         ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: Vec::new(),
             messages: vec![Message {
                 role: Role::User,

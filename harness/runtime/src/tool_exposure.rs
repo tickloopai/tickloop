@@ -1,7 +1,7 @@
 //! Pure projection and discovery of the tools a directory makes available.
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use tickloop_harness_protocol::{ToolDefinition, mcp::ToolExposure};
+use tickloop_harness_protocol::{Content, Message, ToolDefinition, mcp::ToolExposure};
 
 pub const SEARCH_TOOLS: &str = "SearchTools";
 pub const DESCRIBE_TOOLS: &str = "DescribeTools";
@@ -57,16 +57,29 @@ impl ExposureDirectory {
         definitions
     }
 
+    /// Native search reads the original schema, as DescribeTools would show it: only vendors
+    /// that accept combinators offer it. A schema whose root is not an object would make the
+    /// vendor refuse the whole request, so that tool keeps its flattened definition.
     pub fn deferred_tools(&self) -> Vec<ToolDefinition> {
         if matches!(self.search_support, SearchSupport::Native) {
             self.tools
                 .iter()
                 .filter(|tool| tool.exposure == ToolExposure::Search)
-                .map(|tool| tool.definition.clone())
+                .map(|tool| {
+                    let mut definition = tool.definition.clone();
+                    if tool.original_schema["type"] == "object" {
+                        definition.input_schema = tool.original_schema.clone();
+                    }
+                    definition
+                })
                 .collect()
         } else {
             Vec::new()
         }
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = &ExposureTool> {
+        self.tools.iter()
     }
 
     pub fn exposure(&self, name: &str) -> Option<ToolExposure> {
@@ -259,6 +272,41 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
         remaining = &remaining[position + part.len()..];
     }
     remaining.is_empty()
+}
+
+/// A model offered native search instead of Fold would repeat the Fold calls it sees in
+/// history, so for that request they read as plain text; results that become text follow the
+/// remaining tool results of their message.
+pub fn fold_history_as_text(messages: &mut [Message]) {
+    let fold_names = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS];
+    let mut converted = BTreeMap::new();
+    for message in messages {
+        let mut results_as_text = Vec::new();
+        message.content = std::mem::take(&mut message.content)
+            .into_iter()
+            .filter_map(|block| match block {
+                Content::ToolUse { id, name, input } if fold_names.contains(&name.as_str()) => {
+                    let text = format!("Called {name} with {input}.");
+                    converted.insert(id, name);
+                    Some(Content::Text { text })
+                }
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if converted.contains_key(&tool_use_id) => {
+                    let name = &converted[&tool_use_id];
+                    let outcome = if is_error { "failed" } else { "returned" };
+                    results_as_text.push(Content::Text {
+                        text: format!("{name} {outcome}: {}", content.text()),
+                    });
+                    None
+                }
+                block => Some(block),
+            })
+            .collect();
+        message.content.extend(results_as_text);
+    }
 }
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {

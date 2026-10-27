@@ -183,6 +183,7 @@ pub(crate) fn check_request(
         conversation_truncation,
     };
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: vec![
             Message {

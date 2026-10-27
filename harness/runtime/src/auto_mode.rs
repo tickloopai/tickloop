@@ -69,6 +69,7 @@ pub(super) fn classifier_request(
 ) -> ModelRequest {
     let schema = classifier_schema(&context.auto_policy);
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: vec![
             Message {

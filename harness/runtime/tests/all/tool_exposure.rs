@@ -549,6 +549,73 @@ fn exposure_overrides_and_discovery_limits_follow_the_contract() {
 }
 
 #[test]
+fn fold_calls_read_as_text_once_a_request_no_longer_offers_fold() {
+    use tickloop_harness_protocol::{Content, Message, Role};
+    use tickloop_harness_runtime::tool_exposure::{EXECUTE_TOOLS, fold_history_as_text};
+    let history = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::ToolUse {
+                    id: "batch".into(),
+                    name: EXECUTE_TOOLS.into(),
+                    input: json!({"calls":[{"name":"mcp__office__mail","arguments":{}}]}),
+                },
+                Content::ToolUse {
+                    id: "read".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path":"notes.md"}),
+                },
+            ],
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                Content::ToolResult {
+                    tool_use_id: "batch".into(),
+                    content: "MAIL_OK".into(),
+                    is_error: false,
+                },
+                Content::ToolResult {
+                    tool_use_id: "read".into(),
+                    content: "notes".into(),
+                    is_error: false,
+                },
+            ],
+        },
+    ];
+    let mut converted = history.clone();
+    fold_history_as_text(&mut converted);
+    let Content::Text { text } = &converted[0].content[0] else {
+        panic!("the Fold call stayed a tool call: {:?}", converted[0]);
+    };
+    assert!(text.contains(EXECUTE_TOOLS) && text.contains("mcp__office__mail"));
+    assert_eq!(converted[0].content[1], history[0].content[1]);
+    assert_eq!(converted[1].content[0], history[1].content[1]);
+    assert!(matches!(&converted[1].content[1], Content::Text { text } if text.contains("MAIL_OK")));
+    let mut again = converted.clone();
+    fold_history_as_text(&mut again);
+    assert_eq!(again, converted);
+}
+
+#[test]
+fn native_search_offers_original_object_schemas_and_flattened_ones_otherwise() {
+    let mut combined = tool("mail", "Mail", ToolExposure::Search);
+    combined.original_schema =
+        json!({"type":"object","properties":{"to":{"anyOf":[{"type":"string"},{"type":"array"}]}}});
+    let mut rootless = tool("draft", "Draft", ToolExposure::Search);
+    rootless.original_schema = json!({"anyOf":[{"type":"object"},{"type":"null"}]});
+    let native = ExposureDirectory::new(
+        vec![combined.clone(), rootless.clone()],
+        SearchSupport::Native,
+        false,
+    );
+    let deferred = native.deferred_tools();
+    assert_eq!(deferred[0].input_schema, combined.original_schema);
+    assert_eq!(deferred[1].input_schema, rootless.definition.input_schema);
+}
+
+#[test]
 fn hosts_without_scripts_discover_codemode_tools_through_search() {
     let exposure: ToolExposure = serde_json::from_value(json!("codemode")).unwrap();
     let directory = ExposureDirectory::new(
@@ -1069,5 +1136,143 @@ async fn partial_compaction_does_not_keep_old_children_with_reused_parent_ids() 
         |line| matches!(line,Line::NestedCall(entry) if entry.operation.run_id==receipts[1].run_id)
     ));
     assert!(!snapshot.lines.iter().any(|line|matches!(line,Line::NestedCall(entry) if entry.operation.run_id==receipts[0].run_id)),"old Run's children retained due to new Run's matching parent ID");
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_search_models_call_deferred_tools_directly_under_direct_call_approval() {
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tickloop_harness_model::cards::ModelCatalog;
+    use tickloop_harness_protocol::{
+        EventKind, ExecutionMode,
+        mcp::{McpServerConfig, McpTransport},
+    };
+    use tickloop_harness_runtime::{
+        Agent,
+        mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
+        tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS},
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, call, config, mcp_service::McpService, next_event, text,
+    };
+    let original_schema = json!({"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]});
+    let server = McpService::start().await;
+    server.set_tools(json!([
+        {"name":"mail","description":"Send email","inputSchema":original_schema},
+        {"name":"secret","inputSchema":{"type":"object"}},
+    ]));
+    server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
+    let configs = vec![McpServerConfig {
+        name: "office".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        timeout_ms: 5000,
+        oauth: Default::default(),
+        sensitive_values: vec![],
+        disabled: false,
+        exposure: ToolExposure::Search,
+        tool_exposure: vec![("secret".into(), ToolExposure::Hidden)],
+        description: "Office tools".into(),
+    }];
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(configs.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("direct", "mcp__office__mail", json!({"value":"hello"})),
+        text("done"),
+    ]));
+    let mut native = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    native.base_url = config().base_url;
+    native.api_key_env.clear();
+    let agent = Agent::new_embedded(native, model.clone());
+    agent
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || configs.clone()),
+        )))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Send the email".into()).await.unwrap();
+    let request = loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => break request,
+            EventKind::Completed { .. } => panic!("the direct call skipped confirmation"),
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(server.calls().is_empty());
+    assert_eq!(request.name, "mcp__office__mail");
+    assert_eq!(request.mcp_server.as_deref(), Some("office"));
+    assert!(request.parent_call.is_none());
+    agent
+        .answer_permission(chat, request.id, true)
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(server.calls().len(), 1);
+
+    agent.set_model(chat, config()).await.unwrap();
+    model.enqueue(text("folded"));
+    agent.submit(chat, "Again".into()).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let requests = model.requests.lock().unwrap().clone();
+    let fold_tools = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS];
+    let native_requests = &requests[..requests.len() - 1];
+    for native_request in native_requests {
+        assert!(native_request.tools.iter().all(|tool| {
+            !tool.name.starts_with("mcp__") && !fold_tools.contains(&tool.name.as_str())
+        }));
+        assert_eq!(
+            serde_json::to_value(&native_request.deferred_tools).unwrap(),
+            json!([{"name":"mcp__office__mail","description":"Send email","input_schema":original_schema}])
+        );
+        assert_eq!(
+            serde_json::to_vec(&native_request.tools).unwrap(),
+            serde_json::to_vec(&native_requests[0].tools).unwrap()
+        );
+    }
+    let after_call = serde_json::to_string(&native_requests[1].messages).unwrap();
+    assert!(after_call.contains("MAIL_OK"));
+    assert!(!after_call.contains("host tools available in this conversation now: mcp__"));
+    let folded = requests.last().unwrap();
+    assert!(folded.deferred_tools.is_empty());
+    for name in fold_tools {
+        assert!(folded.tools.iter().any(|tool| tool.name == name), "{name}");
+    }
+    assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
 }
