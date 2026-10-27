@@ -114,6 +114,7 @@ fn close_calls(
             && call.run_id.is_none_or(|run| !kept.contains(&run))
     }) {
         let reconciled = reconcile(snapshot, &call);
+        let nested_summary = interrupted_nested_calls(snapshot, &call);
         let matching = snapshot
             .operations
             .iter()
@@ -163,6 +164,22 @@ fn close_calls(
                 operation.result = Some(result.clone());
             }
             result
+        } else if let Some(summary) = nested_summary.filter(|_| {
+            recorded.as_ref().is_none_or(|operation| {
+                !matches!(
+                    operation.state,
+                    OperationState::Completed | OperationState::Failed
+                )
+            })
+        }) {
+            if let Some(operation) = recorded {
+                operation.state = OperationState::Unknown;
+            }
+            ToolResult {
+                content: summary,
+                is_error: true,
+                output_ref: None,
+            }
         } else {
             match recorded {
                 Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
@@ -200,6 +217,49 @@ fn close_calls(
         });
     }
     Ok(())
+}
+
+const MAX_REASON_CHARACTERS: usize = 200;
+
+/// What an interrupted script or batch did, call by call, when it made any calls: their effects
+/// stay, so the model decides how to go on instead of the load running anything again.
+fn interrupted_nested_calls(
+    snapshot: &ChatSnapshot,
+    parent: &projection::HistoryCall,
+) -> Option<String> {
+    let lines = snapshot
+        .operations
+        .iter()
+        .filter(|operation| {
+            operation.parent_call_id.as_deref() == Some(parent.call_id.as_str())
+                && parent.run_id.is_none_or(|run| operation.run_id == run)
+        })
+        .map(|operation| {
+            let outcome = match operation.state {
+                OperationState::Completed => "completed".to_owned(),
+                OperationState::Unknown | OperationState::Admitted => "outcome unknown; it may have taken effect, so inspect current state before repeating it".to_owned(),
+                OperationState::Proposed => "not executed".to_owned(),
+                OperationState::Failed => format!(
+                    "did not complete: {}",
+                    operation
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.content.lines().next())
+                        .unwrap_or("no result")
+                        .chars()
+                        .take(MAX_REASON_CHARACTERS)
+                        .collect::<String>()
+                ),
+            };
+            format!("- {}: {outcome}", operation.name)
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| {
+        format!(
+            "This call was interrupted before it returned, for example because the agent process exited, and it will not be rerun. The calls it made:\n{}",
+            lines.join("\n")
+        )
+    })
 }
 
 fn interrupted_before_admission() -> ToolResult {

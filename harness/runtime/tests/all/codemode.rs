@@ -705,7 +705,7 @@ async fn script_cannot_call_loop_control_or_nested_execution_tools() {
     agent.shutdown().await;
 }
 
-async fn slow_mcp_provider() -> (
+pub(crate) async fn slow_mcp_provider() -> (
     tickloop_harness_test_support::mcp_service::McpService,
     std::sync::Arc<tickloop_harness_runtime::mcp::McpToolProvider>,
 ) {

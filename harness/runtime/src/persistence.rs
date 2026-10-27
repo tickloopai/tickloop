@@ -3462,6 +3462,14 @@ impl Agent {
         if family.is_some() {
             waited_calls.extend(super::family_load::family_call_ids(&restored.messages));
         }
+        // Calls a script or batch made may have taken effect: their parent stays, and the load
+        // reports it as interrupted with each call's outcome.
+        waited_calls.extend(loaded.lifecycle.iter().filter_map(|line| match line {
+            Line::NestedCall(entry) if entry.chat_id == source_chat_id => {
+                entry.operation.parent_call_id.clone()
+            }
+            _ => None,
+        }));
         let removed = unrecoverable_assistant_messages(&restored.messages, &waited_calls);
         let mut recovered = recover_transcript(
             chat_id,

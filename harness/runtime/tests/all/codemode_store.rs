@@ -367,4 +367,110 @@ mod agent {
         );
         third.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn a_script_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_outcome() {
+        use std::time::Duration;
+        use tickloop_harness_protocol::{Decision, PermissionRule};
+        use tickloop_harness_runtime::transcript::StorePosition;
+        let (server, provider) = crate::codemode::slow_mcp_provider().await;
+        server.set_delay(Duration::from_secs(30));
+        let transcripts = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(ScriptedModel::new(vec![]));
+        let first = agent(&transcripts, &model);
+        first.install_host_tools(provider).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chat = first.create_chat(directory.path().into()).await.unwrap();
+        first
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        first
+            .set_permission_rules(
+                chat,
+                vec![PermissionRule {
+                    id: tickloop_ids::generate(),
+                    decision: Decision::Ask,
+                    tool: "Glob".into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
+            .await
+            .unwrap();
+        script(
+            &model,
+            "script",
+            "await tools.Write({file_path:'done.txt',content:'x'}); tools.mcp__slow__write({}); \
+             await tools.Glob({pattern:'*.txt'}); store('never', 1);",
+        );
+        let mut events = first.subscribe();
+        first.submit(chat, "Run the script".into()).await.unwrap();
+        let request = loop {
+            let event = next_event(&mut events).await;
+            match event.kind {
+                EventKind::PermissionRequested { request } if event.chat_id == chat => {
+                    break request;
+                }
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        };
+        assert_eq!(request.parent_call.as_ref().unwrap().call_id, "script");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // A view that attaches later finds the same pending confirmation under its script.
+        let attached = first.snapshot(chat).await.unwrap();
+        assert!(
+            attached
+                .permissions
+                .iter()
+                .any(|pending| pending.id == request.id
+                    && pending.parent_call.as_ref().unwrap().call_id == "script")
+        );
+        first.sync().await.unwrap();
+
+        // The process is gone now: a new holder sees only what the store holds.
+        let crashed = Arc::new(InMemoryTranscriptStore::new());
+        crashed.seed(chat, transcripts.lines(chat), StorePosition(1));
+        let restarted_model = Arc::new(ScriptedModel::new(vec![]));
+        let restarted = agent(&crashed, &restarted_model);
+        let snapshot = restarted.resume_chat(chat).await.unwrap();
+        let result = script_result(&snapshot, "script");
+        assert!(result.contains("interrupted"), "{result}");
+        assert!(result.contains("will not be rerun"), "{result}");
+        for (name, outcome) in [
+            ("Write", "completed"),
+            ("mcp__slow__write", "outcome unknown"),
+            ("Glob", "not executed"),
+        ] {
+            assert!(
+                result
+                    .lines()
+                    .chain(result.split("\\n"))
+                    .any(|line| line.contains(name) && line.contains(outcome)),
+                "{name} {outcome}: {result}"
+            );
+        }
+        assert_eq!(
+            snapshot
+                .operations
+                .iter()
+                .filter(|operation| operation.parent_call_id.as_deref() == Some("script"))
+                .count(),
+            3
+        );
+        assert!(snapshot.permissions.is_empty());
+        assert_eq!(server.calls().len(), 1);
+        assert!(restarted_model.requests.lock().unwrap().is_empty());
+        restarted.shutdown().await;
+        first.shutdown().await;
+    }
 }
