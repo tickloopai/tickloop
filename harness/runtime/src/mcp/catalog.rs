@@ -59,7 +59,7 @@ pub(super) fn directory(
         }
         let description = tool
             .description
-            .map(|text| text.chars().take(2048).collect())
+            .map(|text| text.into_owned())
             .unwrap_or_default();
         directory.insert(
             name.clone(),
