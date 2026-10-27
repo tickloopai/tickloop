@@ -171,7 +171,7 @@ impl McpService {
                             if request["method"] == "server/discover" && state.lock().unwrap().stall_discover_stream {
                                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: waiting\n\n").await;
                                 let mut byte = [0];
-                                if stream.read(&mut byte).await.is_ok_and(|size| size == 0) { discover_disconnected.notify_one(); }
+                                if peer_has_disconnected(stream.read(&mut byte).await) { discover_disconnected.notify_one(); }
                                 return;
                             }
                             if request["method"] == "server/discover" && !delay.is_zero() {
@@ -179,7 +179,7 @@ impl McpService {
                                 tokio::select! {
                                     _ = tokio::time::sleep(delay) => {}
                                     read = stream.read(&mut byte) => {
-                                        if read.is_ok_and(|size| size == 0) { discover_disconnected.notify_one(); }
+                                        if peer_has_disconnected(read) { discover_disconnected.notify_one(); }
                                         return;
                                     }
                                 }
@@ -366,6 +366,17 @@ impl Drop for McpService {
         self.cancel.cancel();
     }
 }
+fn peer_has_disconnected(read: std::io::Result<usize>) -> bool {
+    match read {
+        Ok(0) => true,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        ),
+        _ => false,
+    }
+}
+
 const STDIO_BRIDGE: &str = r#"
 import json, sys, urllib.request
 for line in sys.stdin:
