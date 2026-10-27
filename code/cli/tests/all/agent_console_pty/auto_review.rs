@@ -77,7 +77,9 @@ async fn environment_setup_preview_and_save(fixture: &PrivateFixture) {
     let mut view = PtyView::start_with_flags(fixture, &["--mode", "auto"]);
     view.wait_for("new input", new_input_is_visible).await;
     view.send(b"Say SETUP-READY\r");
-    view.wait_for("initial response", |frame| frame.contains("SETUP-READY"))
+    // The prompt line also says SETUP-READY; only the reply shows the turn took its response
+    // before setup asks the model for a draft.
+    view.wait_for("initial response", |frame| frame.contains("⏺ SETUP-READY"))
         .await;
     view.send(b"/auto-mode-setup\r");
     let frame = view
