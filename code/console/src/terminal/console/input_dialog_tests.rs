@@ -2195,8 +2195,27 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     agent.shutdown().await;
 }
 
-#[tokio::test]
-async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
+/// Choosing drives the embedded Agent's whole Run on this thread, whose unoptimized futures
+/// outgrow the default 2 MiB test stack.
+const EMBEDDED_RUN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+#[test]
+fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
+    std::thread::Builder::new()
+        .stack_size(EMBEDDED_RUN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(retire_a_restored_plan_dialog_after_another_view_decision());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn retire_a_restored_plan_dialog_after_another_view_decision() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
     use tickloop_harness::protocol::EventKind;
     use tickloop_harness::protocol::ExecutionMode;
