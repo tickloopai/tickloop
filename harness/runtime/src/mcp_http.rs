@@ -15,8 +15,8 @@ use reqwest::{Client, Method, StatusCode, Url, header, redirect::Policy};
 use rmcp::{
     ServiceError,
     model::{
-        ClientJsonRpcMessage, ClientRequest, CustomResult, ErrorCode, JsonRpcResponse,
-        ServerJsonRpcMessage, ServerResult,
+        ClientJsonRpcMessage, ClientRequest, CustomResult, ErrorCode, ErrorData, JsonRpcError,
+        JsonRpcResponse, ServerJsonRpcMessage, ServerResult,
     },
     transport::streamable_http_client::{
         SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
@@ -79,6 +79,40 @@ pub(crate) fn request_failure(error: &ServiceError, resource_uri: Option<&str>) 
         ServiceError::TransportClosed => CONNECTION_FAILED.into(),
         ServiceError::Cancelled { .. } => "MCP request cancelled".into(),
         _ => INVALID_RESPONSE.into(),
+    }
+}
+
+pub(crate) fn initialize_failure(error: &rmcp::service::ClientInitializeError) -> String {
+    use rmcp::service::ClientInitializeError;
+    match error {
+        ClientInitializeError::TransportError { error, .. } => error
+            .error
+            .downcast_ref::<StreamableHttpError<McpHttpError>>()
+            .map_or_else(|| CONNECTION_FAILED.into(), transport_failure),
+        ClientInitializeError::JsonRpcError(error) => {
+            format!(
+                "MCP server error {}: {}",
+                error.code.0,
+                bounded_line(&error.message)
+            )
+        }
+        ClientInitializeError::LegacyFallbackFailed { discover, fallback } => format!(
+            "discover failed: {}; legacy initialize failed: {}",
+            initialize_failure(discover),
+            initialize_failure(fallback)
+        ),
+        ClientInitializeError::NoCompatibleProtocolVersion { .. } => {
+            "no compatible MCP protocol version".into()
+        }
+        ClientInitializeError::ConnectionClosed(_) => {
+            "MCP connection closed during initialization".into()
+        }
+        ClientInitializeError::Cancelled => "MCP initialization cancelled".into(),
+        ClientInitializeError::ConflictInitResponseId(..)
+        | ClientInitializeError::UncorrelatedErrorResponse { .. } => {
+            "uncorrelated MCP initialization response".into()
+        }
+        _ => "invalid MCP initialization response".into(),
     }
 }
 
@@ -530,6 +564,15 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let discover_id = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if session_id.is_none()
+                    && matches!(request.request, ClientRequest::DiscoverRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
         let directory_request = match &message {
             ClientJsonRpcMessage::Request(request)
                 if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
@@ -555,6 +598,42 @@ impl StreamableHttpClient for McpHttpClient {
             request = request.header("Mcp-Session-Id", session_id.as_ref());
         }
         let response = self.send(request.json(&message)).await?;
+        let status = response.status();
+        if let Some(id) = discover_id
+            && matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            )
+        {
+            let body = json_bytes(response).await?;
+            let legacy = match serde_json::from_slice::<serde_json::Value>(&body) {
+                Err(_) => true,
+                Ok(value) => serde_json::from_value::<JsonRpcError>(value).is_ok_and(|error| {
+                    error.id.is_none()
+                        && !matches!(
+                            error.error.code,
+                            ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
+                                | ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+                                | ErrorCode::HEADER_MISMATCH
+                        )
+                }),
+            };
+            if legacy {
+                // Legacy servers may reject the probe before they can correlate its request id.
+                return Ok(StreamableHttpPostResponse::Json(
+                    ServerJsonRpcMessage::Error(JsonRpcError::new(
+                        Some(id),
+                        ErrorData::new(
+                            ErrorCode::METHOD_NOT_FOUND,
+                            format!("MCP returned HTTP {status}"),
+                            None,
+                        ),
+                    )),
+                    None,
+                ));
+            }
+            return Err(StreamableHttpError::Client(McpHttpError::Status(status)));
+        }
         self.verify_status(&response)?;
         if matches!(
             response.status(),
@@ -751,6 +830,80 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FOUND);
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn legacy_http_fallback_requires_a_sessionless_discover_and_legacy_response() {
+        for (is_discover, session, status, body) in [
+            (true, Some("existing-session"), 400, ""),
+            (false, None, 400, ""),
+            (true, None, 503, ""),
+            (
+                true,
+                None,
+                400,
+                r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no method"}}"#,
+            ),
+            (
+                true,
+                None,
+                400,
+                r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
+            ),
+            (
+                true,
+                None,
+                400,
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32021,"message":"capability required"}}"#,
+            ),
+            (
+                true,
+                None,
+                400,
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32020,"message":"header mismatch"}}"#,
+            ),
+            (
+                true,
+                None,
+                400,
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32022,"message":"unsupported version"}}"#,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint =
+                Url::parse(&format!("http://{}/mcp", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                stream.read(&mut bytes).await.unwrap();
+                let reply = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let request = if is_discover {
+                ClientRequest::DiscoverRequest(rmcp::model::DiscoverRequest::new(
+                    rmcp::model::DiscoverRequestParams {},
+                ))
+            } else {
+                ClientRequest::CustomRequest(rmcp::model::CustomRequest::new("tools/list", None))
+            };
+            let client = McpHttpClient::new(endpoint.clone(), String::new()).unwrap();
+            let result = client
+                .post_message(
+                    endpoint.as_str().into(),
+                    ClientJsonRpcMessage::request(request, rmcp::model::RequestId::Number(1)),
+                    session.map(Into::into),
+                    None,
+                    HashMap::new(),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(StreamableHttpError::Client(McpHttpError::Status(code))) if code.as_u16() == status)
+            );
+            server.await.unwrap();
+        }
     }
 
     const TOKEN: &str = "fixture-token";

@@ -523,7 +523,7 @@ impl McpConnections {
                 authenticating.store(false, Ordering::SeqCst);
                 let token = entry.token.read().unwrap().clone();
                 let opened = open(&entry, token.as_ref().map(|token| token.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
-                if matches!(&opened, Err(error) if error == "MCP login required")
+                if matches!(&opened, Err(error) if failure_has_category(error, "MCP login required"))
                     && let (Some(connector), Some(token)) = (&entry.connector, token)
                 {
                     authenticating.store(true, Ordering::SeqCst);
@@ -531,7 +531,7 @@ impl McpConnections {
                     if let Some(credentials) = &entry.credentials {
                         entry.remember_credential(credentials.load().await.map_err(|_| "MCP credential unavailable")?);
                     }
-                    let renewed = renewed.map_err(|_| "MCP login required")?;
+                    let renewed = renewed.map_err(|_| opened.as_ref().err().cloned().unwrap_or_else(|| "MCP login required".into()))?;
                     *entry.token.write().unwrap() = Some(renewed.clone());
                     authenticating.store(false, Ordering::SeqCst);
                     return open(&entry, Some(renewed.secret().to_owned()), &environment, stderr_directory.as_ref()).await;
@@ -608,7 +608,7 @@ impl McpConnections {
                     }
 
                 }
-                error => { *entry.failure.write().unwrap() = Some(match &error { Ok(Err(reason)) => reason.clone(), _ => CONNECTION_TIMED_OUT.into() }); *entry.state.write().unwrap() = if (error.is_err() && authenticating.load(Ordering::SeqCst)) || matches!(error, Ok(Err(ref error)) if (error == "MCP login required" || error == "MCP scope required") && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
+                error => { *entry.failure.write().unwrap() = Some(match &error { Ok(Err(reason)) => reason.clone(), _ => CONNECTION_TIMED_OUT.into() }); *entry.state.write().unwrap() = if (error.is_err() && authenticating.load(Ordering::SeqCst)) || matches!(error, Ok(Err(ref error)) if (failure_has_category(error, "MCP login required") || failure_has_category(error, "MCP scope required")) && entry.connector.is_some()) {McpServerState::NeedsLogin} else {McpServerState::Failed}; state_changed.notify_waiters(); }
             }
         });
     }
@@ -1102,6 +1102,13 @@ async fn authentication_rejected(entry: &Entry, http: &McpHttpClient, cancel: &C
     };
 }
 
+fn failure_has_category(error: &str, category: &str) -> bool {
+    error
+        .split_once(": ")
+        .map_or(error, |(category, _)| category)
+        == category
+}
+
 async fn open(
     entry: &Arc<Entry>,
     token: Option<String>,
@@ -1149,14 +1156,18 @@ async fn open(
             let service = handler
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
-                .map_err(|_| {
-                    if http.insufficient_scope() {
+                .map_err(|error| {
+                    let category = if http.insufficient_scope() {
                         "MCP scope required"
                     } else if http.unauthorized() {
                         "MCP login required"
                     } else {
                         "MCP connection failed"
-                    }
+                    };
+                    format!(
+                        "{category}: {}",
+                        redact(entry, crate::mcp_http::initialize_failure(&error))
+                    )
                 })?;
             (service, Some(http))
         }

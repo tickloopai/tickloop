@@ -35,6 +35,10 @@ struct State {
     resource_text: String,
     resources_changed: bool,
     discover_error_over_sse: bool,
+    http_responses: std::collections::HashMap<String, (u16, String)>,
+    protocol_version: Option<String>,
+    initialize_error: Option<Value>,
+    methods: Vec<String>,
 }
 impl McpService {
     pub async fn start() -> Self {
@@ -63,6 +67,10 @@ impl McpService {
                 resource_text: "resource text".into(),
                 resources_changed: false,
                 discover_error_over_sse: false,
+                http_responses: Default::default(),
+                protocol_version: None,
+                initialize_error: None,
+                methods: Vec::new(),
             })),
             cancel: CancellationToken::new(),
         };
@@ -119,11 +127,12 @@ impl McpService {
                                 let mut state = state.lock().unwrap();
                                 state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
+                                state.methods.push(method.to_owned());
                                 let result = match method {
                                     "initialize" => {
                                         let mut capabilities = json!({"tools":{"listChanged":true}});
                                         if let Some(resources) = &state.resources_capability { capabilities["resources"] = resources.clone(); }
-                                        json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":capabilities,"serverInfo":{"name":"fixture","version":"1"},"instructions":state.instructions})
+                                        json!({"protocolVersion":state.protocol_version.as_ref().map_or_else(|| request["params"]["protocolVersion"].clone(), |version| json!(version)), "capabilities":capabilities,"serverInfo":{"name":"fixture","version":"1"},"instructions":state.instructions})
                                     }
                                     "tools/list" => json!({"tools":state.tools}),
                                     "resources/list" => json!({"resources":state.resources}),
@@ -136,7 +145,7 @@ impl McpService {
                                 if call && std::mem::take(&mut state.changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string()); }
                                 if (call || method == "resources/read") && std::mem::take(&mut state.resources_changed) { notifications.push(json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"}).to_string()); }
                                 if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
-                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else {None}, notifications, state.challenge.clone())
+                                (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else if method == "initialize" {state.initialize_error.clone()} else {None}, notifications, state.challenge.clone())
                             };
                             tokio::time::sleep(delay).await;
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
@@ -156,6 +165,7 @@ impl McpService {
                                 let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
                                 (status, "text/event-stream", format!("{events}data: {response}\n\n"))
                             } else { (status, "application/json", response.to_string()) };
+                            let (status, body) = state.lock().unwrap().http_responses.get(request["method"].as_str().unwrap_or("")).cloned().unwrap_or((status, body));
                             let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
                             let reply = format!("HTTP/1.1 {status} Fixture\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = stream.write_all(reply.as_bytes()).await;
@@ -192,6 +202,22 @@ impl McpService {
     }
     pub fn reject_discover_over_sse(&self) {
         self.state.lock().unwrap().discover_error_over_sse = true;
+    }
+    pub fn set_http_response(&self, method: &str, status: u16, body: impl Into<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .http_responses
+            .insert(method.into(), (status, body.into()));
+    }
+    pub fn set_initialize_error(&self, error: Value) {
+        self.state.lock().unwrap().initialize_error = Some(error);
+    }
+    pub fn set_protocol_version(&self, version: &str) {
+        self.state.lock().unwrap().protocol_version = Some(version.into());
+    }
+    pub fn methods(&self) -> Vec<String> {
+        self.state.lock().unwrap().methods.clone()
     }
     pub fn resume_tool_directory_once(&self) {
         self.state.lock().unwrap().resume_directory = true;
