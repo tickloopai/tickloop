@@ -888,3 +888,219 @@ async fn the_source_that_keeps_a_shared_tool_name_alone_decides_its_permission_a
         "the source whose tool was ignored is never asked about it: {ignored:?}"
     );
 }
+
+/// The text and error flag of the result the request gives the call `id`.
+fn call_result(request: &ModelRequest, id: &str) -> (String, bool) {
+    use tickloop_harness_protocol::Content;
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == id => Some((content.text().into_owned(), *is_error)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no result for {id}"))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_users_exposure_change_reaches_the_next_request_of_the_same_run() {
+    use tickloop_harness_model::cards::ModelCatalog;
+    use tickloop_harness_test_support::{call, config, text};
+    use tracing_subscriber::util::SubscriberInitExt;
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let _subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish()
+        .set_default();
+    let alpha = McpService::start().await;
+    alpha.set_tools(json!([{"name":"lookup","inputSchema":{"type":"object"}}]));
+    alpha.set_result(json!({"content":[{"type":"text","text":"LOOKED_UP"}]}));
+    let beta = McpService::start().await;
+    beta.set_tools(json!([{"name":"fetch","inputSchema":{"type":"object"}}]));
+    let connections = new_connections();
+    let searched = server_config("alpha", &alpha, ToolExposure::Search);
+    connect(&connections, std::slice::from_ref(&searched)).await;
+    let configs = Arc::new(RwLock::new(vec![searched]));
+    let changes = (
+        connections.clone(),
+        configs.clone(),
+        alpha.url(),
+        beta.url(),
+    );
+    let scripted = Arc::new(ScriptedModel::new(vec![
+        call("first", "mcp__alpha__lookup", json!({})),
+        call("glob", "Glob", json!({"pattern":"*"})),
+        text("first run done"),
+        text("second run done"),
+    ]));
+    let model = HookedModel::new(
+        scripted.clone(),
+        Box::new(move |index| {
+            let (connections, configs, alpha_url, beta_url) = changes.clone();
+            Box::pin(async move {
+                let config = |name: &str, url: &str, exposure| McpServerConfig {
+                    transport: McpTransport::Http {
+                        url: url.into(),
+                        headers: BTreeMap::new(),
+                    },
+                    exposure,
+                    ..server_config_named(name)
+                };
+                match index {
+                    // The user lists alpha directly while beta, a direct server, connects late.
+                    0 => {
+                        let late = vec![
+                            config("alpha", &alpha_url, ToolExposure::Direct),
+                            config("beta", &beta_url, ToolExposure::Direct),
+                        ];
+                        connect(&connections, &late).await;
+                        *configs.write().unwrap() = late;
+                    }
+                    // The user hides alpha.
+                    1 => {
+                        configs.write().unwrap()[0].exposure = ToolExposure::Hidden;
+                    }
+                    _ => {}
+                }
+            })
+        }),
+    );
+    let mut native = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    native.base_url = config().base_url;
+    native.api_key_env.clear();
+    let agent = Agent::new_embedded(native, model);
+    agent
+        .install_host_tools(mcp_provider(connections, &configs))
+        .unwrap();
+    let (chat, _directory) = full_access_chat(&agent).await;
+    run_turn(&agent, chat, "Look it up").await;
+    run_turn(&agent, chat, "Again").await;
+    agent.shutdown().await;
+    let requests = scripted.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4);
+    let lookup = "mcp__alpha__lookup";
+    assert!(!tool_names(&requests[0].tools).contains(&lookup));
+    assert!(tool_names(&requests[0].deferred_tools).contains(&lookup));
+
+    assert!(
+        tool_names(&requests[1].tools).contains(&lookup),
+        "direct from the next request of the Run: {:?}",
+        tool_names(&requests[1].tools)
+    );
+    assert!(!tool_names(&requests[1].deferred_tools).contains(&lookup));
+    assert!(
+        !tool_names(&requests[1].tools).contains(&"mcp__beta__fetch"),
+        "a server connecting during the Run still waits for its end"
+    );
+
+    assert!(!tool_names(&requests[2].tools).contains(&lookup));
+    assert!(!tool_names(&requests[2].deferred_tools).contains(&lookup));
+    assert!(tool_names(&requests[3].tools).contains(&"mcp__beta__fetch"));
+    assert_eq!(
+        alpha.arrivals("initialize").len(),
+        1,
+        "changing the exposure keeps the connection"
+    );
+
+    let lines = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let breaks = lines
+        .lines()
+        .filter(|line| line.contains("cache break"))
+        .collect::<Vec<_>>();
+    let field = |line: &str, name: &str| {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{name}=")).map(str::to_owned))
+            .unwrap_or_else(|| panic!("missing {name}: {line}"))
+    };
+    let user_changes = breaks
+        .iter()
+        .filter(|line| field(line, "reason") == "user_changed_exposure")
+        .collect::<Vec<_>>();
+    assert_eq!(user_changes.len(), 2, "{breaks:#?}");
+    assert!(
+        user_changes
+            .iter()
+            .all(|line| field(line, "expected") == "true")
+    );
+    assert_eq!(field(user_changes[0], "added_tools"), lookup);
+    assert_eq!(field(user_changes[1], "removed_tools"), lookup);
+}
+
+#[tokio::test]
+async fn a_hidden_servers_tools_are_neither_found_nor_executed_from_the_next_request() {
+    use tickloop_harness_test_support::{call, config, text};
+    let alpha = McpService::start().await;
+    alpha.set_tools(json!([{"name":"lookup","inputSchema":{"type":"object"}}]));
+    alpha.set_result(json!({"content":[{"type":"text","text":"LOOKED_UP"}]}));
+    let connections = new_connections();
+    let searched = server_config("alpha", &alpha, ToolExposure::Search);
+    connect(&connections, std::slice::from_ref(&searched)).await;
+    let configs = Arc::new(RwLock::new(vec![searched]));
+    let hide = configs.clone();
+    let scripted = Arc::new(ScriptedModel::new(vec![
+        call("before", "SearchTools", json!({"query":"lookup"})),
+        call("after", "SearchTools", json!({"query":"lookup"})),
+        call(
+            "execute",
+            "ExecuteTools",
+            json!({"calls":[{"name":"mcp__alpha__lookup","arguments":{}}]}),
+        ),
+        text("done"),
+    ]));
+    let model = HookedModel::new(
+        scripted.clone(),
+        Box::new(move |index| {
+            let hide = hide.clone();
+            Box::pin(async move {
+                if index == 0 {
+                    hide.write().unwrap()[0].exposure = ToolExposure::Hidden;
+                }
+            })
+        }),
+    );
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(mcp_provider(connections, &configs))
+        .unwrap();
+    let (chat, _directory) = full_access_chat(&agent).await;
+    run_turn(&agent, chat, "Find lookup").await;
+    agent.shutdown().await;
+    let requests = scripted.requests.lock().unwrap().clone();
+    assert!(
+        call_result(&requests[1], "before")
+            .0
+            .contains("mcp__alpha__lookup")
+    );
+    let (after, _) = call_result(&requests[2], "after");
+    assert!(!after.contains("mcp__alpha__lookup"), "{after}");
+    let (executed, _) = call_result(&requests[3], "execute");
+    assert!(!executed.contains("LOOKED_UP"), "{executed}");
+    assert!(alpha.calls().is_empty(), "{executed}");
+}
+
+fn server_config_named(name: &str) -> McpServerConfig {
+    McpServerConfig {
+        name: name.into(),
+        source: "global".into(),
+        transport: McpTransport::Unsupported {
+            kind: String::new(),
+        },
+        timeout_ms: 5000,
+        oauth: Default::default(),
+        sensitive_values: Vec::new(),
+        disabled: false,
+        exposure: ToolExposure::Search,
+        tool_exposure: Vec::new(),
+        description: String::new(),
+    }
+}

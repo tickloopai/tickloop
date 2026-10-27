@@ -134,6 +134,9 @@ struct Entry {
     catalog_micros: Arc<AtomicU64>,
     redactor_builds: Arc<AtomicU64>,
     config: McpServerConfig,
+    /// How the tools reach the model: the configuration's at first, then the user's latest
+    /// choice, which takes effect without reconnecting.
+    exposure: RwLock<snapshot::Exposure>,
     token: RwLock<Option<AccessToken>>,
     credential: RwLock<Option<ConnectorCredential>>,
     credentials: Option<Arc<dyn ConnectorCredentials>>,
@@ -208,13 +211,7 @@ impl Entry {
     }
 
     fn offers_tools(&self) -> bool {
-        use tickloop_harness_protocol::mcp::ToolExposure;
-        self.config.exposure != ToolExposure::Hidden
-            || self
-                .config
-                .tool_exposure
-                .iter()
-                .any(|(_, exposure)| *exposure != ToolExposure::Hidden)
+        self.exposure().offers_tools()
     }
 
     fn restore_tool_schemas(
@@ -339,6 +336,8 @@ struct Inner {
     /// The servers a first request waits for right now; empty when none is waiting.
     awaited: tokio::sync::watch::Sender<Vec<String>>,
     tool_lists: ToolLists,
+    /// How many times the user changed each server's exposure while it stayed configured.
+    exposure_revisions: RwLock<BTreeMap<String, u64>>,
     #[cfg(feature = "test-support")]
     connection_log: ConnectionLog,
     state_changed: Arc<tokio::sync::Notify>,
@@ -367,6 +366,7 @@ impl McpConnections {
                 startup_deadline: std::sync::OnceLock::new(),
                 awaited: tokio::sync::watch::Sender::new(Vec::new()),
                 tool_lists: Arc::default(),
+                exposure_revisions: RwLock::default(),
                 #[cfg(feature = "test-support")]
                 connection_log: Arc::default(),
                 state_changed: Arc::new(tokio::sync::Notify::new()),
@@ -610,18 +610,27 @@ impl McpConnections {
                 .unwrap_or_default();
             let legacy = existing
                 .as_ref()
-                .filter(|entry| entry.config == config)
+                .filter(|entry| connects_alike(&entry.config, &config))
                 .map(|entry| entry.legacy.clone())
                 .unwrap_or_default();
             let entry = if let Some(entry) = existing.filter(|entry| {
                 restart != Restart::Server(config.name.as_str())
-                    && entry.config == config
+                    && connects_alike(&entry.config, &config)
                     && (*entry.credential.read().unwrap() == credential
                         || entry.renews_in_place(credential.as_ref()))
             }) {
                 if *entry.credential.read().unwrap() != credential {
                     entry.remember_credential(credential);
                     self.renew_in_place(entry.clone()).await;
+                }
+                if entry.change_exposure(snapshot::Exposure::of(&config)) {
+                    *self
+                        .inner
+                        .exposure_revisions
+                        .write()
+                        .unwrap()
+                        .entry(config.name.clone())
+                        .or_default() += 1;
                 }
                 entry
             } else {
@@ -676,6 +685,7 @@ impl McpConnections {
                     catalog_builds: self.inner.catalog_builds.clone(),
                     catalog_micros: self.inner.catalog_micros.clone(),
                     redactor_builds: self.inner.redactor_builds.clone(),
+                    exposure: RwLock::new(snapshot::Exposure::of(&config)),
                     config,
                     token: RwLock::new(None),
                     credential: RwLock::new(None),
@@ -873,6 +883,12 @@ impl McpConnections {
         }
         tools
     }
+    /// How many times the user changed each server's exposure, by server name; a change shows in
+    /// the next request even during a Run.
+    pub fn exposure_revisions(&self) -> BTreeMap<String, u64> {
+        self.inner.exposure_revisions.read().unwrap().clone()
+    }
+
     /// Servers that would offer tools but are starting, failed or waiting for login.
     pub fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
         self.inner
@@ -895,6 +911,36 @@ impl McpConnections {
                 })
             })
             .collect()
+    }
+
+    /// The status of the server `name` once it has stopped connecting, with the tools it listed;
+    /// `None` when no server has that name. It waits at most as long as a connection may take, so
+    /// a server still connecting after that is reported as connecting.
+    pub async fn settled_status(&self, name: &str) -> Option<McpServerStatus> {
+        let settled = async {
+            loop {
+                let changed = self.inner.state_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let connecting =
+                    self.inner
+                        .entries
+                        .read()
+                        .unwrap()
+                        .get(name)
+                        .is_some_and(|entry| {
+                            *entry.state.read().unwrap() == McpServerState::Connecting
+                        });
+                if !connecting {
+                    break;
+                }
+                changed.await;
+            }
+        };
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT + REQUEST_TIMEOUT, settled).await;
+        self.statuses()
+            .into_iter()
+            .find(|status| status.name == name)
     }
 
     /// What a View shows of each server, in name order.
@@ -924,7 +970,7 @@ impl McpConnections {
                     name: entry.config.name.clone(),
                     source: entry.config.source.clone(),
                     transport,
-                    exposure: entry.config.exposure.as_str().into(),
+                    exposure: entry.exposure().server.as_str().into(),
                     tools: catalog
                         .iter()
                         .filter(|(owner, _)| Arc::ptr_eq(owner, entry))
@@ -1290,6 +1336,15 @@ impl McpConnections {
         self.inner.entries.write().unwrap().clear();
     }
 }
+/// Whether `next` connects as `current` does: the two differ at most in how the tools reach the
+/// model, which changes without reconnecting.
+fn connects_alike(current: &McpServerConfig, next: &McpServerConfig) -> bool {
+    let mut next = next.clone();
+    next.exposure = current.exposure;
+    next.tool_exposure.clone_from(&current.tool_exposure);
+    *current == next
+}
+
 fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {
     for resource in &mut resources {
         redact_value(entry, resource);

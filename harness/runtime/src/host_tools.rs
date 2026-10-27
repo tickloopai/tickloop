@@ -428,7 +428,8 @@ pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// A revision of already-published definitions. Versioned providers must serve cheap reads.
-    /// Unversioned providers are captured only at installation and after refresh, outside Chats.
+    /// Unversioned providers are captured only at installation and after refresh, outside Chats;
+    /// after refresh on a blocking thread, so a slow capture never stalls a runtime worker.
     fn catalog_generation(&self) -> Option<u64> {
         None
     }
@@ -444,6 +445,13 @@ pub trait HostToolProvider: Send + Sync {
 
     fn has_tool_search(&self) -> bool {
         false
+    }
+
+    /// How many times the user changed each MCP server's exposure, by server name. A Run lets
+    /// such a change reach its next request, while other changes to its MCP tools wait for the
+    /// next Run.
+    fn exposure_revisions(&self) -> std::collections::BTreeMap<String, u64> {
+        std::collections::BTreeMap::new()
     }
 
     /// Private process-transfer state. `None` defers replacement while the provider owns an

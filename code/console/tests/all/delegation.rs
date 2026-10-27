@@ -2543,12 +2543,13 @@ impl tickloop_harness::model::ModelClient for BackgroundResultModel {
     ) -> Result<tickloop_harness::model::ModelOutput, tickloop_harness::model::ModelError> {
         use tickloop_harness::model::ModelOutput;
         use tickloop_harness::protocol::{Content, Role, Usage};
+        // Once a Chat's scripted turns are done, its notifications (the child's background
+        // output, the root's child completion) must not take the child's next scripted call.
         let already_ready = request.messages.iter().any(|message| {
             message.role == Role::Assistant
-                && message
-                    .content
-                    .iter()
-                    .any(|content| matches!(content,Content::Text{text} if text=="Child ready"))
+                && message.content.iter().any(|content| {
+                    matches!(content, Content::Text { text } if text == "Child ready" || text == "Root ready")
+                })
         });
         let notification = request.messages.iter().rev().find(|message|message.role==Role::User).is_some_and(|message|message.content.iter().all(|content|matches!(content,Content::Text{text} if text.starts_with("<task-notification>"))));
         if already_ready && notification {

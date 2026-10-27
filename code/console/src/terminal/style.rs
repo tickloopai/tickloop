@@ -260,6 +260,9 @@ pub(super) enum Role {
     ContextMcpTools,
     ContextMessages,
     ContextToolSearch,
+    /// The text a list filter matched in a row: bold and underlined in the terminal's own
+    /// colour, so it stays clear on muted rows, on bold names and on the selection.
+    FilterMatch,
 }
 
 impl Role {
@@ -352,6 +355,7 @@ impl Role {
         Self::ContextMcpTools,
         Self::ContextMessages,
         Self::ContextToolSearch,
+        Self::FilterMatch,
     ];
 
     /// Agent Colors and marks only paint marks, such as a member dot, a row's glyph or its `↻`,
@@ -411,7 +415,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 88;
+const ROLE_COUNT: usize = 89;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -520,6 +524,9 @@ const fn italic(red: u8, green: u8, blue: u8) -> Style {
     }
 }
 
+/// [`Role::FilterMatch`], the same in both themes because it keeps the terminal's text colour.
+const FILTER_MATCH: Style = attributes(true, false, true, false);
+
 /// Values reproduced from `darkTheme` in the Claude Code source. Order matches
 /// [`Role::ALL`].
 const DARK_PALETTE: [Style; ROLE_COUNT] = [
@@ -627,6 +634,7 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     CONTEXT_COLOURS[0],
     CONTEXT_COLOURS[1],
     CONTEXT_COLOURS[2],
+    FILTER_MATCH,
 ];
 
 /// Values reproduced from `lightTheme` in the Claude Code source.
@@ -735,6 +743,7 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     CONTEXT_COLOURS[0],
     CONTEXT_COLOURS[1],
     CONTEXT_COLOURS[2],
+    FILTER_MATCH,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1150,6 +1159,18 @@ impl RoleLine {
         self.spans.push(RoleSpan { text, role, link });
     }
 
+    /// Pushes `text` in `role` with every match of `filter` in [`Role::FilterMatch`]; see
+    /// [`filter_matches`].
+    pub(super) fn push_matching(&mut self, text: &str, role: Option<Role>, filter: &str) {
+        let mut pushed = 0;
+        for found in filter_matches(text, filter) {
+            self.push(&text[pushed..found.start], role);
+            self.push(&text[found.clone()], Some(Role::FilterMatch));
+            pushed = found.end;
+        }
+        self.push(&text[pushed..], role);
+    }
+
     pub(super) fn text(&self) -> String {
         self.spans.iter().map(|span| span.text.as_str()).collect()
     }
@@ -1268,6 +1289,58 @@ impl RoleLine {
     }
 }
 
+/// The byte ranges of `text` where `filter` occurs, compared as the list filters compare, in
+/// lowercase. Matches do not overlap, and each starts and ends between whole graphemes, so
+/// highlighting one never splits a character.
+pub(super) fn filter_matches(text: &str, filter: &str) -> Vec<std::ops::Range<usize>> {
+    let wanted = filter.to_lowercase().chars().collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    // Each lowercase character beside the source character it came from; one source
+    // character can lowercase to several.
+    let folded = text
+        .char_indices()
+        .flat_map(|(start, character)| {
+            let source = start..start + character.len_utf8();
+            character
+                .to_lowercase()
+                .map(move |lowercase| (lowercase, source.clone()))
+        })
+        .collect::<Vec<_>>();
+    let boundaries = text
+        .grapheme_indices(true)
+        .map(|(start, _)| start)
+        .chain([text.len()])
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut matches = Vec::new();
+    let mut index = 0;
+    while index + wanted.len() <= folded.len() {
+        let window = &folded[index..index + wanted.len()];
+        let first = &window[0].1;
+        let last = &window[window.len() - 1].1;
+        let whole_characters = (index == 0 || folded[index - 1].1 != *first)
+            && folded
+                .get(index + wanted.len())
+                .is_none_or(|(_, next)| next != last);
+        let found = first.start..last.end;
+        if whole_characters
+            && window
+                .iter()
+                .map(|(character, _)| *character)
+                .eq(wanted.iter().copied())
+            && boundaries.contains(&found.start)
+            && boundaries.contains(&found.end)
+        {
+            matches.push(found);
+            index += wanted.len();
+        } else {
+            index += 1;
+        }
+    }
+    matches
+}
+
 /// Splits `text` before the first grapheme that starts at or after `columns`.
 fn split_at_column(text: &str, columns: usize) -> (&str, &str) {
     let mut used = 0;
@@ -1334,6 +1407,49 @@ fn xterm_colour(index: u8) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_matches_ignore_case_and_never_split_a_character() {
+        let found = |text: &str, filter: &str| {
+            filter_matches(text, filter)
+                .into_iter()
+                .map(|range| text[range].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found("Google Drive · google", "GOOGLE"),
+            ["Google", "google"]
+        );
+        assert_eq!(found("aaaa", "aa"), ["aa", "aa"]);
+        assert_eq!(found("读取团队云盘的插件", "云盘"), ["云盘"]);
+        assert_eq!(found("İstanbul", "i̇st"), ["İst"]);
+        assert!(found("İstanbul", "i").is_empty(), "half of İ is no match");
+        assert!(
+            found("cafe\u{301}", "cafe").is_empty(),
+            "the accent belongs to the e"
+        );
+        assert!(found("anything", "").is_empty());
+    }
+
+    #[test]
+    fn filter_matches_stay_clear_on_the_selection_in_both_themes() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            let mut line = RoleLine::default();
+            line.push_matching("alpha · The alpha package", Some(Role::MutedText), "ALPHA");
+            let line = line.filled(Role::Selection).resolve(theme, 30);
+            let matched = line
+                .spans
+                .iter()
+                .filter(|span| span.text == "alpha")
+                .collect::<Vec<_>>();
+            assert_eq!(matched.len(), 2, "{name:?}");
+            for span in matched {
+                assert!(span.style.bold && span.style.underline, "{name:?}");
+                assert_eq!(span.style.foreground, theme.style(Role::Text).foreground);
+            }
+        }
+    }
 
     #[test]
     fn every_role_resolves_in_every_theme() {

@@ -1,15 +1,17 @@
 //! `/mcp`: the Agent's MCP servers grouped by where they are configured, each with its
-//! transport, state, tools and exposure. Enter opens a server's actions: view its tools, log in
-//! or out, reconnect, and turn it off or on in the Agent's directory. A login happens in the panel:
+//! transport, state, tools and exposure. `e` moves the selected server to its next exposure.
+//! Enter opens a server's actions: view its tools, log in or out, reconnect, turn it off or on in
+//! the Agent's directory, and choose its exposure. A login happens in the panel:
 //! the authorization link, and a field for the address the browser ends on when it runs on
-//! another machine. The panel keeps what it shows and what the user chose; the Console runs the
-//! work and hands each result back through [`McpPanel::apply`].
+//! another machine. After a login or a reconnect the panel follows the server until it has
+//! connected and listed its tools, or failed. The panel keeps what it shows and what the user
+//! chose; the Console runs the work and hands each result back through [`McpPanel::apply`].
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_code_settings::mcp::{DIRECTORY_SOURCE, GLOBAL_SOURCE, PLUGIN_SOURCE_PREFIX};
-use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, ToolExposure};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -41,6 +43,12 @@ pub(super) enum McpRequest {
         name: String,
         disabled: bool,
     },
+    /// Saves how the tools of the server `name`, configured in `source`, reach the model.
+    SetExposure {
+        name: String,
+        source: String,
+        exposure: ToolExposure,
+    },
     /// Starts the login `attempt` to the server `name`; the panel numbers each attempt.
     LogIn {
         name: String,
@@ -65,6 +73,16 @@ impl std::fmt::Debug for McpRequest {
                 .debug_struct("SetDisabled")
                 .field("name", name)
                 .field("disabled", disabled)
+                .finish(),
+            Self::SetExposure {
+                name,
+                source,
+                exposure,
+            } => formatter
+                .debug_struct("SetExposure")
+                .field("name", name)
+                .field("source", source)
+                .field("exposure", exposure)
                 .finish(),
             Self::LogIn { name, attempt } => formatter
                 .debug_struct("LogIn")
@@ -96,6 +114,9 @@ pub(super) struct McpListing {
     /// Whether the states come from the Agent's Worker; before it starts they come from the
     /// configuration, and a server that can run has not connected yet.
     pub(super) live: bool,
+    /// Before the Agent starts: the servers whose state comes from a connection made for the
+    /// panel rather than from the configuration.
+    pub(super) probed: BTreeSet<String>,
     /// The directory the Agent works in, where a server is turned off or on.
     pub(super) directory: PathBuf,
 }
@@ -115,6 +136,11 @@ pub(super) enum McpResult {
     DisabledSet {
         name: String,
         disabled: bool,
+        result: Result<(), String>,
+    },
+    ExposureSet {
+        name: String,
+        exposure: ToolExposure,
         result: Result<(), String>,
     },
     /// The login `attempt` waits for the user to approve it at `link`; `opened` says whether the
@@ -145,10 +171,11 @@ impl McpResult {
             Self::Servers { .. } | Self::LoginWaiting { .. } | Self::CallbackRefused { .. } => {
                 return None;
             }
-            Self::Reconnected { name, result } => match result {
-                Ok(()) => Notice::success(format!("Reconnecting {name}")),
-                Err(error) => Notice::failure(format!("Cannot reconnect {name}: {error}")),
-            },
+            Self::Reconnected { result: Ok(()), .. } => return None,
+            Self::Reconnected {
+                name,
+                result: Err(error),
+            } => Notice::failure(format!("Cannot reconnect {name}: {error}")),
             Self::DisabledSet {
                 name,
                 disabled,
@@ -159,10 +186,20 @@ impl McpResult {
                 (Err(error), true) => Notice::failure(format!("Cannot disable {name}: {error}")),
                 (Err(error), false) => Notice::failure(format!("Cannot enable {name}: {error}")),
             },
+            Self::ExposureSet {
+                name,
+                exposure,
+                result,
+            } => match result {
+                Ok(()) => {
+                    Notice::success(format!("Exposure of {name} is now {}", exposure.as_str()))
+                }
+                Err(error) => {
+                    Notice::failure(format!("Cannot change the exposure of {name}: {error}"))
+                }
+            },
             Self::LoginEnded { name, result, .. } => match result {
-                Ok(()) => Notice::success(format!(
-                    "Logged in to {name}; the Agent uses it from its next request"
-                )),
+                Ok(()) => Notice::success(format!("Logged in to {name}")),
                 Err(error) => Notice::failure(format!("Cannot log in to {name}: {error}")),
             },
             Self::LoggedOut { name, result } => match result {
@@ -194,11 +231,34 @@ enum Listing {
 enum Choice {
     Tools(String),
     Run(McpRequest),
+    /// Opens the choice of the server's exposure.
+    Exposure,
     Back,
 }
 
-/// A server's actions, with the `❯` cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuKind {
+    Actions,
+    Exposure,
+}
+
+/// The exposures in the order `e` moves through them, starting from the default.
+const EXPOSURE_CYCLE: [ToolExposure; 3] = [
+    ToolExposure::Search,
+    ToolExposure::Direct,
+    ToolExposure::Hidden,
+];
+/// The exposures in the order their menu lists them.
+const EXPOSURE_OPTIONS: [ToolExposure; 3] = [
+    ToolExposure::Direct,
+    ToolExposure::Search,
+    ToolExposure::Hidden,
+];
+const CHANGE_EXPOSURE: &str = "Change exposure";
+
+/// A server's actions, or the choice of its exposure, with the `❯` cursor.
 struct ActionsMenu {
+    kind: MenuKind,
     title: String,
     context: Vec<String>,
     options: Vec<(String, Choice)>,
@@ -215,6 +275,41 @@ struct LoginView {
     attempt: u64,
     name: String,
     stage: LoginStage,
+}
+
+/// A server the panel follows after a login or a reconnect, to tell how its connection ends.
+struct Following {
+    name: String,
+    after_login: bool,
+    /// Whether the connection was asked for; a read before that still shows the old state.
+    requested: bool,
+}
+
+impl Following {
+    fn status_text(&self) -> String {
+        if self.after_login {
+            format!("Logged in to {} · connecting…", self.name)
+        } else {
+            format!("Connecting to {}…", self.name)
+        }
+    }
+
+    fn connected(&self, tools: usize) -> Notice {
+        let tools = tool_count(tools);
+        Notice::success(if self.after_login {
+            format!("Logged in to {} · connected · {tools}", self.name)
+        } else {
+            format!("Connected to {} · {tools}", self.name)
+        })
+    }
+
+    fn failed(&self, cause: &str) -> Notice {
+        Notice::failure(if self.after_login {
+            format!("Logged in to {}, but cannot connect: {cause}", self.name)
+        } else {
+            format!("Cannot connect to {}: {cause}", self.name)
+        })
+    }
 }
 
 enum LoginStage {
@@ -240,6 +335,7 @@ pub(super) struct McpPanel {
     tools: Option<ToolsView>,
     login: Option<LoginView>,
     login_attempts: u64,
+    following: Option<Following>,
     /// The operation under way, as the panel shows it.
     busy: Option<String>,
     notice: Option<Notice>,
@@ -260,6 +356,7 @@ impl McpPanel {
             tools: None,
             login: None,
             login_attempts: 0,
+            following: None,
             busy: None,
             notice: None,
             row_targets: Vec::new(),
@@ -318,6 +415,7 @@ impl McpPanel {
                     .map(|server| server.name.clone());
                 self.read = read;
                 self.listing = listing.map_or_else(Listing::Failed, Listing::Loaded);
+                self.follow_connection();
                 self.selected = shown
                     .and_then(|name| self.servers().iter().position(|server| server.name == name))
                     .unwrap_or(self.selected)
@@ -326,7 +424,7 @@ impl McpPanel {
                 if let Some(menu) = self.menu.take() {
                     let option = menu.options[menu.selected].0.clone();
                     self.menu = self
-                        .actions_menu()
+                        .menu_of(menu.kind)
                         .filter(|next| next.title == menu.title)
                         .map(|mut next| {
                             next.selected = next
@@ -357,15 +455,94 @@ impl McpPanel {
                     *shown = Some(error);
                 }
             }
-            McpResult::LoginEnded { .. } => {
+            McpResult::LoginEnded { name, result, .. } => {
                 self.login = None;
                 self.busy = None;
+                if result.is_ok() {
+                    self.notice = None;
+                    self.following = Some(Following {
+                        name,
+                        after_login: true,
+                        requested: false,
+                    });
+                }
             }
-            McpResult::Reconnected { .. }
-            | McpResult::DisabledSet { .. }
-            | McpResult::LoggedOut { .. } => self.busy = None,
+            McpResult::Reconnected { name, result } => {
+                self.busy = None;
+                let following = self.following.take_if(|following| following.name == name);
+                match (following, result) {
+                    (Some(mut following), Ok(())) => {
+                        following.requested = true;
+                        self.following = Some(following);
+                    }
+                    (Some(following), Err(error)) if following.after_login => {
+                        self.notice = Some(following.failed(&error));
+                    }
+                    _ => {}
+                }
+            }
+            McpResult::ExposureSet {
+                name,
+                exposure,
+                result,
+            } => {
+                self.busy = None;
+                if result.is_ok()
+                    && let Listing::Loaded(listing) = &mut self.listing
+                    && let Some(server) = listing
+                        .servers
+                        .iter_mut()
+                        .find(|server| server.name == name)
+                {
+                    server.exposure = exposure.as_str().into();
+                }
+            }
+            McpResult::DisabledSet { .. } | McpResult::LoggedOut { .. } => self.busy = None,
         }
         true
+    }
+
+    /// Tells how the followed server's connection ended once a read shows it connected or
+    /// failed; a read that still shows it connecting, or shows its state from the configuration,
+    /// keeps following it.
+    fn follow_connection(&mut self) {
+        let Some(following) = self
+            .following
+            .as_ref()
+            .filter(|following| following.requested)
+        else {
+            return;
+        };
+        let Listing::Loaded(listing) = &self.listing else {
+            return;
+        };
+        let Some(server) = listing
+            .servers
+            .iter()
+            .find(|server| server.name == following.name)
+        else {
+            self.following = None;
+            return;
+        };
+        if !connection_backed(listing, server) {
+            return;
+        }
+        let notice = match &server.state {
+            McpServerState::Connecting => return,
+            McpServerState::Connected => following.connected(server.tools.len()),
+            McpServerState::Failed | McpServerState::NeedsLogin => following.failed(
+                server
+                    .failure
+                    .as_deref()
+                    .unwrap_or(state_label(&server.state, true)),
+            ),
+            _ => {
+                self.following = None;
+                return;
+            }
+        };
+        self.notice = Some(notice);
+        self.following = None;
     }
 
     pub(super) fn report(&mut self, error: String) {
@@ -440,7 +617,11 @@ impl McpPanel {
             }
             return match key.code {
                 KeyCode::Esc => {
+                    let kind = menu.kind;
                     self.menu = None;
+                    if kind == MenuKind::Exposure {
+                        self.open_actions_at(CHANGE_EXPOSURE);
+                    }
                     McpPanelEffect::None
                 }
                 KeyCode::Enter => {
@@ -457,6 +638,21 @@ impl McpPanel {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => McpPanelEffect::Close,
             (KeyCode::Char('r'), KeyModifiers::NONE) => self.start(McpRequest::Load),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => match self.servers().get(self.selected) {
+                Some(server) => {
+                    let current = EXPOSURE_CYCLE
+                        .iter()
+                        .position(|exposure| exposure.as_str() == server.exposure)
+                        .unwrap_or(0);
+                    let request = McpRequest::SetExposure {
+                        name: server.name.clone(),
+                        source: server.source.clone(),
+                        exposure: EXPOSURE_CYCLE[(current + 1) % EXPOSURE_CYCLE.len()],
+                    };
+                    self.start(request)
+                }
+                None => McpPanelEffect::None,
+            },
             (KeyCode::Enter, _) => {
                 self.menu = self.actions_menu();
                 McpPanelEffect::None
@@ -533,14 +729,23 @@ impl McpPanel {
         }
     }
 
-    fn is_live(&self) -> bool {
-        matches!(&self.listing, Listing::Loaded(listing) if listing.live)
+    /// Whether the state of `server` comes from a connection, the Agent's or one made for the
+    /// panel, rather than from the configuration.
+    fn is_backed(&self, server: &McpServerStatus) -> bool {
+        matches!(&self.listing, Listing::Loaded(listing) if connection_backed(listing, server))
     }
 
     fn choose(&mut self, choice: Choice) -> McpPanelEffect {
         match choice {
             Choice::Back => {
-                self.menu = None;
+                let kind = self.menu.take().map(|menu| menu.kind);
+                if kind == Some(MenuKind::Exposure) {
+                    self.open_actions_at(CHANGE_EXPOSURE);
+                }
+                McpPanelEffect::None
+            }
+            Choice::Exposure => {
+                self.menu = self.exposure_menu();
                 McpPanelEffect::None
             }
             Choice::Tools(server) => {
@@ -575,6 +780,9 @@ impl McpPanel {
                 "{} {name}…",
                 if *disabled { "Disabling" } else { "Enabling" }
             ),
+            McpRequest::SetExposure { name, .. } => {
+                format!("Changing the exposure of {name}…")
+            }
             McpRequest::LogIn { name, .. } => format!("Logging in to {name}…"),
             McpRequest::LogOut(name) => format!("Logging out of {name}…"),
         };
@@ -586,6 +794,14 @@ impl McpPanel {
         }
         self.busy = Some(busy);
         self.notice = None;
+        self.following = match &request {
+            McpRequest::Reconnect(name) => Some(Following {
+                name: name.clone(),
+                after_login: false,
+                requested: false,
+            }),
+            _ => None,
+        };
         if let McpRequest::LogIn { name, attempt } = &mut request {
             self.login_attempts += 1;
             *attempt = self.login_attempts;
@@ -598,11 +814,62 @@ impl McpPanel {
         McpPanelEffect::Work(request)
     }
 
+    fn menu_of(&self, kind: MenuKind) -> Option<ActionsMenu> {
+        match kind {
+            MenuKind::Actions => self.actions_menu(),
+            MenuKind::Exposure => self.exposure_menu(),
+        }
+    }
+
+    /// Opens the actions of the selected server on the option `label`.
+    fn open_actions_at(&mut self, label: &str) {
+        self.menu = self.actions_menu().map(|mut menu| {
+            menu.selected = menu
+                .options
+                .iter()
+                .position(|(option, _)| option == label)
+                .unwrap_or(0);
+            menu
+        });
+    }
+
+    /// The exposures the selected server can take, with the cursor on its current one.
+    fn exposure_menu(&self) -> Option<ActionsMenu> {
+        let server = self.servers().get(self.selected)?;
+        let mut options = EXPOSURE_OPTIONS
+            .iter()
+            .map(|exposure| {
+                (
+                    exposure.as_str().to_owned(),
+                    Choice::Run(McpRequest::SetExposure {
+                        name: server.name.clone(),
+                        source: server.source.clone(),
+                        exposure: *exposure,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = options
+            .iter()
+            .position(|(label, _)| *label == server.exposure)
+            .unwrap_or(0);
+        options.push(("Back".to_owned(), Choice::Back));
+        Some(ActionsMenu {
+            kind: MenuKind::Exposure,
+            title: server.name.clone(),
+            context: vec![
+                "How its tools reach the model: direct lists them, search finds them when needed, hidden never offers them.".to_owned(),
+            ],
+            options,
+            selected,
+        })
+    }
+
     /// The actions of the selected server.
     fn actions_menu(&self) -> Option<ActionsMenu> {
         let server = self.servers().get(self.selected)?;
         let name = server.name.clone();
-        let live = self.is_live();
+        let backed = self.is_backed(server);
         let mut options = Vec::new();
         if !server.tools.is_empty() {
             options.push(("View tools".to_owned(), Choice::Tools(name.clone())));
@@ -622,17 +889,18 @@ impl McpPanel {
                 options.push(("Log in".to_owned(), Choice::Run(login)));
             }
         }
-        if live
-            && matches!(
-                server.state,
-                McpServerState::Connected
-                    | McpServerState::Connecting
-                    | McpServerState::Failed
-                    | McpServerState::NeedsLogin
-            )
-        {
+        // Before the Agent starts, a server that can run connects for the panel; one whose
+        // configuration failed cannot connect.
+        let can_connect = match server.state {
+            McpServerState::Connecting => true,
+            McpServerState::Connected | McpServerState::Failed | McpServerState::NeedsLogin => {
+                backed
+            }
+            _ => false,
+        };
+        if can_connect {
             options.push((
-                "Reconnect".to_owned(),
+                if backed { "Reconnect" } else { "Connect" }.to_owned(),
                 Choice::Run(McpRequest::Reconnect(name.clone())),
             ));
         }
@@ -649,8 +917,9 @@ impl McpPanel {
                 disabled: !disabled,
             }),
         ));
+        options.push((CHANGE_EXPOSURE.to_owned(), Choice::Exposure));
         options.push(("Back".to_owned(), Choice::Back));
-        let mut context = vec![row_details(server, live)];
+        let mut context = vec![row_details(server, backed)];
         if let Some(failure) = &server.failure {
             context.push(safe_line(failure));
         }
@@ -662,6 +931,7 @@ impl McpPanel {
             ));
         }
         Some(ActionsMenu {
+            kind: MenuKind::Actions,
             title: name,
             context,
             options,
@@ -676,7 +946,6 @@ impl McpPanel {
         width: usize,
         display: DisplayProfile,
     ) -> Vec<(Option<usize>, Vec<RoleLine>)> {
-        let live = self.is_live();
         let glyph = display.glyph(Glyph::AgentViewed);
         let mut rows = Vec::new();
         let mut heading = None;
@@ -686,13 +955,14 @@ impl McpPanel {
                 rows.push((None, vec![RoleLine::role(safe_line(&group), Role::Accent)]));
                 heading = Some(group);
             }
-            let details = row_details(server, live);
+            let backed = self.is_backed(server);
+            let details = row_details(server, backed);
             let separate_details =
                 glyph.width() + server.name.width() + details.width() + 3 > width;
             let mut lines = ListRow {
                 selected: index == self.selected && self.menu.is_none(),
                 glyph,
-                glyph_role: state_role(&server.state, live),
+                glyph_role: state_role(&server.state, backed),
                 name: &server.name,
                 details: if separate_details {
                     String::new()
@@ -727,6 +997,8 @@ impl McpPanel {
         };
         if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
             add(busy, Role::Accent);
+        } else if let Some(following) = &self.following {
+            add(&following.status_text(), Role::Accent);
         }
         if let Some(notice) = &self.notice {
             add(
@@ -843,6 +1115,7 @@ impl McpPanel {
         let mut hints = vec![("r refresh".to_owned(), 4), ("esc close".to_owned(), 9)];
         if !self.servers().is_empty() {
             hints.insert(0, ("enter actions".to_owned(), 10));
+            hints.insert(1, ("e exposure".to_owned(), 5));
         }
         body.hint = fit_hint(&hints, width, display);
         body
@@ -1009,6 +1282,19 @@ fn source_heading(source: &str) -> String {
     }
 }
 
+/// Whether the state of `server` in `listing` comes from a connection rather than from the
+/// configuration.
+fn connection_backed(listing: &McpListing, server: &McpServerStatus) -> bool {
+    listing.live || listing.probed.contains(&server.name)
+}
+
+fn tool_count(count: usize) -> String {
+    match count {
+        1 => "1 tool".to_owned(),
+        count => format!("{count} tools"),
+    }
+}
+
 fn state_label(state: &McpServerState, live: bool) -> &'static str {
     match state {
         McpServerState::Connected => "connected",
@@ -1043,10 +1329,7 @@ fn row_details(server: &McpServerStatus, live: bool) -> String {
         parts.push("logged in".to_owned());
     }
     if live && server.state == McpServerState::Connected {
-        parts.push(match server.tools.len() {
-            1 => "1 tool".to_owned(),
-            count => format!("{count} tools"),
-        });
+        parts.push(tool_count(server.tools.len()));
     }
     parts.push(server.exposure.clone());
     safe_line(&parts.join(" · "))
@@ -1087,6 +1370,7 @@ mod tests {
                 servers,
                 live,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         panel
@@ -1166,7 +1450,7 @@ mod tests {
             "{frame}"
         );
         assert!(
-            frame.contains("enter actions · r refresh · esc close"),
+            frame.contains("enter actions · e exposure · r refresh · esc close"),
             "{frame}"
         );
         assert!(selected(&mut panel)[0].contains("notes"));
@@ -1198,6 +1482,231 @@ mod tests {
         let frame = text(&mut panel);
         assert!(!frame.contains("Reconnect"), "{frame}");
         assert!(frame.contains("Log in"), "{frame}");
+        assert!(frame.contains("  Connect\n"), "{frame}");
+    }
+
+    #[test]
+    fn a_server_whose_configuration_failed_cannot_connect_before_the_agent_starts() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Failed, 0)],
+            false,
+        );
+        press(&mut panel, KeyCode::Enter);
+        let frame = text(&mut panel);
+        assert!(!frame.contains("Connect"), "{frame}");
+    }
+
+    /// A listing from the configuration, with `probed` naming the servers connected for the
+    /// panel.
+    fn listing(servers: Vec<McpServerStatus>, live: bool, probed: &[&str]) -> McpListing {
+        McpListing {
+            servers,
+            live,
+            directory: "/work".into(),
+            probed: probed.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn logged_in(mut status: McpServerStatus) -> McpServerStatus {
+        status.logged_in = true;
+        status
+    }
+
+    /// Logs in to the first server from its actions, as the Console would finish it.
+    fn log_in(panel: &mut McpPanel) {
+        press(panel, KeyCode::Enter);
+        assert_eq!(selected(panel), ["❯ Log in"]);
+        let McpRequest::LogIn { attempt, name } = work(press(panel, KeyCode::Enter)) else {
+            panic!("a login starts");
+        };
+        assert!(panel.apply(McpResult::LoginEnded {
+            attempt,
+            name,
+            result: Ok(()),
+        }));
+    }
+
+    fn status_line(panel: &mut McpPanel) -> String {
+        let frame = panel.frame(WIDTH, HEIGHT, DisplayProfile::default());
+        frame.lines[HEIGHT - 2].text().trim().to_owned()
+    }
+
+    #[test]
+    fn after_a_login_the_agent_connects_the_server_and_the_row_shows_its_tools() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::NeedsLogin, 0)],
+            true,
+        );
+        log_in(&mut panel);
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        // A read before the Agent took up the login still shows the old state.
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::NeedsLogin,
+                    0,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        panel.apply(McpResult::Servers {
+            read: 3,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::Connecting,
+                    0,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connecting · logged in · direct"),
+            "{frame}"
+        );
+        assert!(panel.awaits_connections());
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        panel.apply(McpResult::Servers {
+            read: 4,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::Connected,
+                    191,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connected · 191 tools · direct"),
+            "{frame}"
+        );
+        assert_eq!(
+            status_line(&mut panel),
+            "Logged in to notes · connected · 191 tools"
+        );
+    }
+
+    #[test]
+    fn before_the_agent_starts_a_login_connects_for_the_panel_and_shows_a_failure_with_its_cause() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Connecting, 0)],
+            false,
+        );
+        log_in(&mut panel);
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        let connecting = logged_in(server("notes", "global", McpServerState::Connecting, 0));
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(vec![connecting.clone()], false, &["notes"])),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connecting · logged in · direct"),
+            "{frame}"
+        );
+        assert!(!panel.awaits_connections());
+        let mut failed = logged_in(server("notes", "global", McpServerState::Failed, 0));
+        failed.failure = Some("MCP connection failed: HTTP 500".into());
+        panel.apply(McpResult::Servers {
+            read: 3,
+            listing: Ok(listing(vec![failed], false, &["notes"])),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · failed · logged in · direct"),
+            "{frame}"
+        );
+        assert_eq!(
+            status_line(&mut panel),
+            "Logged in to notes, but cannot connect: MCP connection failed: HTTP 500"
+        );
+        press(&mut panel, KeyCode::Enter);
+        let frame = text(&mut panel);
+        assert!(frame.contains("MCP connection failed: HTTP 500"), "{frame}");
+        assert!(frame.contains("Reconnect"), "{frame}");
+    }
+
+    #[test]
+    fn before_the_agent_starts_a_server_connected_for_the_panel_shows_its_tools() {
+        let mut panel = loaded(
+            vec![
+                server("notes", "global", McpServerState::Connecting, 0),
+                server("local", "directory", McpServerState::Connecting, 0),
+            ],
+            false,
+        );
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![
+                    server("notes", "global", McpServerState::Connected, 2),
+                    server("local", "directory", McpServerState::Connecting, 0),
+                ],
+                false,
+                &["notes"],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connected · 2 tools · direct"),
+            "{frame}"
+        );
+        assert!(
+            row_shows(&frame, "local", "http · starts with the Agent · direct"),
+            "{frame}"
+        );
+        press(&mut panel, KeyCode::Enter);
+        assert_eq!(selected(&mut panel), ["❯ View tools"]);
+        assert!(text(&mut panel).contains("Reconnect"));
+    }
+
+    #[test]
+    fn a_reconnect_tells_how_the_connection_ended() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Failed, 0)],
+            true,
+        );
+        press(&mut panel, KeyCode::Enter);
+        press(&mut panel, KeyCode::Char('j'));
+        assert_eq!(selected(&mut panel), ["❯ Reconnect"]);
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            McpRequest::Reconnect("notes".into())
+        );
+        assert_eq!(status_line(&mut panel), "Reconnecting notes…");
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        assert_eq!(status_line(&mut panel), "Connecting to notes…");
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![server("notes", "global", McpServerState::Connected, 1)],
+                true,
+                &[],
+            )),
+        });
+        assert_eq!(status_line(&mut panel), "Connected to notes · 1 tool");
     }
 
     #[test]
@@ -1233,6 +1742,7 @@ mod tests {
                 servers: vec![server("notes", "global", McpServerState::Connected, 2)],
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         assert_eq!(
@@ -1358,6 +1868,7 @@ mod tests {
                 servers: vec![server("notes", "global", McpServerState::Disabled, 0)],
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         panel.apply(McpResult::Servers {
@@ -1366,6 +1877,7 @@ mod tests {
                 servers: Vec::new(),
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         assert!(row_shows(
@@ -1373,5 +1885,145 @@ mod tests {
             "notes",
             "http · disabled · direct"
         ));
+    }
+
+    fn exposed(name: &str, source: &str, exposure: &str) -> McpServerStatus {
+        McpServerStatus {
+            exposure: exposure.into(),
+            ..server(name, source, McpServerState::Connected, 1)
+        }
+    }
+
+    fn set_exposure(name: &str, source: &str, exposure: ToolExposure) -> McpRequest {
+        McpRequest::SetExposure {
+            name: name.into(),
+            source: source.into(),
+            exposure,
+        }
+    }
+
+    #[test]
+    fn e_cycles_the_selected_servers_exposure_and_its_row_follows() {
+        let mut panel = loaded(
+            vec![
+                exposed("notes", "global", "search"),
+                exposed("plugin_docs_search", "plugin:docs", "search"),
+            ],
+            true,
+        );
+        press(&mut panel, KeyCode::Char('j'));
+        for (shown, next) in [
+            ("search", ToolExposure::Direct),
+            ("direct", ToolExposure::Hidden),
+            ("hidden", ToolExposure::Search),
+        ] {
+            assert!(row_shows(
+                &text(&mut panel),
+                "plugin_docs_search",
+                &format!("connected · 1 tool · {shown}")
+            ));
+            assert_eq!(
+                work(press(&mut panel, KeyCode::Char('e'))),
+                set_exposure("plugin_docs_search", "plugin:docs", next)
+            );
+            assert!(text(&mut panel).contains("Changing the exposure of plugin_docs_search…"));
+            panel.apply(McpResult::ExposureSet {
+                name: "plugin_docs_search".into(),
+                exposure: next,
+                result: Ok(()),
+            });
+        }
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "plugin_docs_search", "connected · 1 tool · search"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("Exposure of plugin_docs_search is now search"),
+            "{frame}"
+        );
+        assert!(row_shows(&frame, "notes", "connected · 1 tool · search"));
+
+        panel.apply(McpResult::ExposureSet {
+            name: "notes".into(),
+            exposure: ToolExposure::Direct,
+            result: Err("settings file is not valid JSON".into()),
+        });
+        let frame = text(&mut panel);
+        assert!(row_shows(&frame, "notes", "connected · 1 tool · search"));
+        assert!(
+            frame.contains("Cannot change the exposure of notes: settings file is not valid JSON"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn e_acts_only_on_the_list() {
+        let mut panel = loaded(vec![exposed("notes", "global", "search")], true);
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert_eq!(selected(&mut panel), ["❯ View tools"]);
+        press(&mut panel, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert!(text(&mut panel).contains("mcp__notes__tool0"));
+        let mut empty = loaded(Vec::new(), true);
+        assert!(matches!(
+            press(&mut empty, KeyCode::Char('e')),
+            McpPanelEffect::None
+        ));
+        assert!(!text(&mut empty).contains("e exposure"));
+    }
+
+    #[test]
+    fn the_actions_menu_offers_each_exposure_with_the_current_one_under_the_cursor() {
+        let mut panel = loaded(vec![exposed("notes", "directory", "search")], true);
+        press(&mut panel, KeyCode::Enter);
+        for _ in 0..4 {
+            press(&mut panel, KeyCode::Char('j'));
+        }
+        assert_eq!(selected(&mut panel), ["❯ Change exposure"]);
+        press(&mut panel, KeyCode::Enter);
+        assert_eq!(selected(&mut panel), ["❯ search"]);
+        let frame = text(&mut panel);
+        let options = ["  direct", "❯ search", "  hidden", "  Back"].map(|option| {
+            frame
+                .find(option)
+                .unwrap_or_else(|| panic!("{option:?} in\n{frame}"))
+        });
+        assert!(options.windows(2).all(|pair| pair[0] < pair[1]), "{frame}");
+        assert!(frame.contains("enter confirm · esc back"), "{frame}");
+        press(&mut panel, KeyCode::Esc);
+        assert_eq!(
+            selected(&mut panel),
+            ["❯ Change exposure"],
+            "esc goes back to the actions"
+        );
+        press(&mut panel, KeyCode::Enter);
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(McpListing {
+                servers: vec![exposed("notes", "directory", "search")],
+                live: true,
+                directory: "/work".into(),
+                probed: BTreeSet::new(),
+            }),
+        });
+        assert_eq!(
+            selected(&mut panel),
+            ["❯ search"],
+            "a new read keeps the choice open"
+        );
+        press(&mut panel, KeyCode::Char('j'));
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            set_exposure("notes", "directory", ToolExposure::Hidden)
+        );
+        assert!(text(&mut panel).contains("Changing the exposure of notes…"));
     }
 }

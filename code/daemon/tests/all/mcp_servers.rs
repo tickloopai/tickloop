@@ -712,6 +712,90 @@ async fn worker_picks_up_a_login_saved_after_startup() {
 }
 
 #[tokio::test]
+async fn before_an_agent_starts_agent_access_connects_only_the_named_server_and_lists_its_tools() {
+    use tickloop_code_access::{AgentAccess, ObservationRequest, ObservationValue};
+    use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus};
+    let agent_directory = tempfile::tempdir().unwrap();
+    let agent_root = agent_directory.path().canonicalize().unwrap();
+    let mut agent_launch = LaunchSpec::embedded(agent_root.clone());
+    agent_launch.config_root = Some(agent_root);
+    agent_launch.model = Some(tickloop_harness::test_support::config());
+    agent_launch.session_persistence = false;
+    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(
+        &agent_launch,
+        ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
+        None,
+        &std::env::current_exe().unwrap(),
+    )
+    .await
+    .unwrap();
+    let access = tickloop_code_daemon::EmbeddedAgentAccess::new(agent.clone());
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let remote = McpService::start().await;
+    let local = McpService::start().await;
+    for service in [&remote, &local] {
+        service.set_tools(
+            json!([{"name":"probe","description":"Probe","inputSchema":{"type":"object"}}]),
+        );
+    }
+    std::fs::write(
+        root.join("settings.json"),
+        json!({"mcpServers":{
+            "remote":{"url":remote.url()},
+            "local":{"command":"python3","args":local.stdio_args()},
+            "broken":{"command":"tickloop-missing-mcp-program"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let mut launch = LaunchSpec::embedded(root.clone());
+    launch.config_root = Some(root.clone());
+    launch.environment = std::env::vars()
+        .map(|(name, value)| tickloop_code_access::EnvironmentValue {
+            name: name.into_bytes(),
+            value: value.into_bytes(),
+        })
+        .collect();
+    let connect = |name: &str| {
+        access.observe(ObservationRequest::DraftMcpServer {
+            launch: Box::new(launch.clone()),
+            name: name.into(),
+        })
+    };
+    let status = |observation: tickloop_code_access::Observation| -> McpServerStatus {
+        match observation.initial {
+            ObservationValue::McpServers(mut statuses) if statuses.len() == 1 => statuses.remove(0),
+            other => panic!("one server answers: {other:?}"),
+        }
+    };
+
+    let connected = status(connect("remote").await.unwrap());
+    assert_eq!(connected.state, McpServerState::Connected);
+    assert_eq!(
+        connected
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp__remote__probe"]
+    );
+    assert_eq!(local.request_count(), 0, "only the named server connects");
+
+    let connected = status(connect("local").await.unwrap());
+    assert_eq!(
+        (connected.state, connected.tools.len()),
+        (McpServerState::Connected, 1)
+    );
+    let failed = status(connect("broken").await.unwrap());
+    assert_eq!(failed.state, McpServerState::Failed);
+    assert!(failed.failure.is_some(), "{failed:?}");
+    assert!(connect("absent").await.is_err());
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn agent_access_reports_servers_takes_up_disabling_and_reconnects_one() {
     use tickloop_code_access::{
         AgentAccess, AgentCommand, AgentDetailQuery, CommandEnvelope, CommandResult,

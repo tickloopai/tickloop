@@ -9,12 +9,15 @@ pub(super) struct Tool {
     pub schema: Value,
     pub annotations: Value,
     pub definition: ToolDefinition,
+    /// Whether the schema flattened to an object; one that did not cannot be listed directly.
+    pub flattened: bool,
 }
+/// The tools a server listed, whatever their exposure, which the user changes without listing
+/// them again.
 pub(super) fn directory(
-    config: &tickloop_harness_protocol::mcp::McpServerConfig,
+    server: &str,
     tools: Vec<rmcp::model::Tool>,
 ) -> (BTreeMap<String, Tool>, Vec<String>) {
-    let server = &config.name;
     let mut names = BTreeMap::<String, usize>::new();
     for tool in &tools {
         *names.entry(normalize(server, &tool.name)).or_default() += 1;
@@ -31,21 +34,9 @@ pub(super) fn directory(
         };
         let schema = Value::Object((*tool.input_schema).clone());
         let flattened = flatten(schema.clone()).filter(|schema| schema["type"] == "object");
-        let exposure = crate::tool_exposure::effective_exposure(
-            config.exposure,
-            &config.tool_exposure,
-            &original,
-        );
-        let mut input_schema = match flattened {
-            Some(schema) => schema,
-            None if exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct => {
-                json!({"type":"object","properties":{}})
-            }
-            None => {
-                warnings.push(format!("{name}: unsupported input schema; tool omitted"));
-                continue;
-            }
-        };
+        let is_flattened = flattened.is_some();
+        let mut input_schema =
+            flattened.unwrap_or_else(|| json!({"type":"object","properties":{}}));
         input_schema
             .as_object_mut()
             .unwrap()
@@ -72,6 +63,7 @@ pub(super) fn directory(
                     description,
                     input_schema,
                 },
+                flattened: is_flattened,
             },
         );
     }

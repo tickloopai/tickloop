@@ -242,7 +242,7 @@ impl Agent {
             &self.inner.tool_policy,
             self.scheduled_task_terms(),
         );
-        registry.hold_host_tools(&mut chat.cache_prefix.held_host_tools, receipt.run_id);
+        registry.hold_host_tools(&mut chat.cache_prefix, receipt.run_id);
         Ok(registry)
     }
 
