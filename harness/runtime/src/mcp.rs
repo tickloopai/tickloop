@@ -52,6 +52,7 @@ pub struct McpServerSnapshot {
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
@@ -562,7 +563,8 @@ impl McpConnections {
                     if redact(entry, tool.definition.name.clone()) != tool.definition.name {
                         continue;
                     }
-                    tool.definition.description = redact(entry, tool.definition.description);
+                    tool.definition.description =
+                        redact_server_text(entry, tool.definition.description);
                     redact_schema(entry, &mut tool.definition.input_schema);
                     if tool.definition.input_schema["type"] != "object"
                         || jsonschema::validator_for(&tool.definition.input_schema).is_err()
@@ -662,7 +664,7 @@ impl McpConnections {
                         .unwrap_or_default(),
                     instructions: connection
                         .as_ref()
-                        .map(|c| redact(entry, c.instructions.clone()))
+                        .map(|c| redact_server_text(entry, c.instructions.clone()))
                         .unwrap_or_default(),
                     warnings: match &entry.config.transport {
                         McpTransport::Failed { reason } => vec![reason.clone()],
@@ -759,7 +761,7 @@ impl McpConnections {
         if !current.values().any(|tool| {
             tool.original == call.tool.original
                 && tool.schema == call.tool.schema
-                && redact(&call.entry, tool.definition.description.clone())
+                && redact_server_text(&call.entry, tool.definition.description.clone())
                     == call.tool.definition.description
         }) {
             return Err("MCP tool changed before dispatch".into());
@@ -1163,7 +1165,6 @@ async fn open(
         .peer()
         .peer_info()
         .and_then(|info| info.instructions.clone())
-        .map(|s| s.chars().take(2048).collect())
         .unwrap_or_default();
     Ok((
         Connection {
@@ -1287,6 +1288,13 @@ fn redact_value(entry: &Entry, value: &mut Value) {
         _ => {}
     }
 }
+fn redact_server_text(entry: &Entry, content: String) -> String {
+    redact(entry, content)
+        .chars()
+        .take(MAX_SERVER_TEXT_CHARACTERS)
+        .collect()
+}
+
 fn redact(entry: &Entry, content: String) -> String {
     let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
     let mut content = normalizer.normalize(&content).into_owned();

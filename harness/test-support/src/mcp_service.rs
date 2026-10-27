@@ -14,6 +14,7 @@ pub struct McpService {
     cancel: CancellationToken,
 }
 struct State {
+    instructions: String,
     tools: Value,
     result: Value,
     calls: Vec<Value>,
@@ -40,6 +41,7 @@ impl McpService {
         let server = Self {
             url: format!("http://{}/mcp", listener.local_addr().unwrap()),
             state: Arc::new(Mutex::new(State {
+                instructions: "Fixture service instructions".into(),
                 tools: json!([]),
                 result: json!({"content":[]}),
                 calls: Vec::new(),
@@ -119,7 +121,7 @@ impl McpService {
                                     "initialize" => {
                                         let mut capabilities = json!({"tools":{"listChanged":true}});
                                         if let Some(resources) = &state.resources_capability { capabilities["resources"] = resources.clone(); }
-                                        json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":capabilities,"serverInfo":{"name":"fixture","version":"1"},"instructions":"Fixture service instructions"})
+                                        json!({"protocolVersion":request["params"]["protocolVersion"], "capabilities":capabilities,"serverInfo":{"name":"fixture","version":"1"},"instructions":state.instructions})
                                     }
                                     "tools/list" => json!({"tools":state.tools}),
                                     "resources/list" => json!({"resources":state.resources}),
@@ -170,6 +172,9 @@ impl McpService {
     }
     pub fn set_tools(&self, tools: Value) {
         self.state.lock().unwrap().tools = tools;
+    }
+    pub fn set_instructions(&self, instructions: impl Into<String>) {
+        self.state.lock().unwrap().instructions = instructions.into();
     }
     pub fn set_result(&self, result: Value) {
         self.state.lock().unwrap().result = result;
