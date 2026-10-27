@@ -221,11 +221,8 @@ impl HostToolProvider for McpToolProvider {
     }
     fn mcp_instructions(&self) -> Vec<McpServerInstructions> {
         self.connections
-            .inner
-            .entries
-            .read()
-            .unwrap()
-            .values()
+            .entries()
+            .iter()
             .filter_map(|entry| {
                 let state = entry.state.read().unwrap().clone();
                 if state == McpServerState::Disabled {
