@@ -21,8 +21,8 @@ impl IntoHostToolSources for Vec<Arc<dyn HostToolProvider>> {
 }
 
 pub(crate) struct CompositeHostTools {
-    sources: Vec<Arc<dyn HostToolProvider>>,
-    index: std::sync::RwLock<Arc<SourceIndex>>,
+    sources: Arc<[Arc<dyn HostToolProvider>]>,
+    index: Arc<std::sync::RwLock<Arc<SourceIndex>>>,
 }
 #[derive(Default)]
 struct SourceIndex {
@@ -31,22 +31,19 @@ struct SourceIndex {
     definitions: Vec<ToolDefinition>,
     discovery: Vec<crate::tool_exposure::ExposureTool>,
 }
-impl CompositeHostTools {
-    pub(crate) fn combine(sources: Vec<Arc<dyn HostToolProvider>>) -> Arc<dyn HostToolProvider> {
-        let combined = Self {
-            sources,
-            index: std::sync::RwLock::new(Arc::new(SourceIndex::default())),
-        };
-        combined.update_index(true);
-        Arc::new(combined)
-    }
-    fn update_index(&self, refreshed: bool) -> Arc<SourceIndex> {
-        let generations: Vec<_> = self
-            .sources
+impl SourceIndex {
+    /// The index of `sources` published in `published`, captured again when a source's
+    /// generation changed or, after a refresh, when a source is unversioned.
+    fn update(
+        sources: &[Arc<dyn HostToolProvider>],
+        published: &std::sync::RwLock<Arc<SourceIndex>>,
+        refreshed: bool,
+    ) -> Arc<SourceIndex> {
+        let generations: Vec<_> = sources
             .iter()
             .map(|source| source.catalog_generation())
             .collect();
-        let current = self.index.read().unwrap().clone();
+        let current = published.read().unwrap().clone();
         if current.generations == generations
             && !(refreshed && generations.iter().any(Option::is_none))
         {
@@ -59,7 +56,7 @@ impl CompositeHostTools {
         // A name two sources offer keeps the tool of the source installed earlier, which alone
         // answers its calls, permission and authority. The rule depends on the fixed source order
         // only, never on which source began offering the name first.
-        for (index, source) in self.sources.iter().enumerate() {
+        for (index, source) in sources.iter().enumerate() {
             for definition in source.definitions() {
                 if let Some(owner) = next.names.get(&definition.name) {
                     tracing::warn!(
@@ -81,11 +78,10 @@ impl CompositeHostTools {
                 }));
         }
         let next = Arc::new(next);
-        let mut index = self.index.write().unwrap();
+        let mut index = published.write().unwrap();
         // A concurrent refresh may have published while this index was being assembled.
         if Arc::ptr_eq(&index, &current)
-            && self
-                .sources
+            && sources
                 .iter()
                 .map(|source| source.catalog_generation())
                 .eq(generations)
@@ -94,6 +90,35 @@ impl CompositeHostTools {
             next
         } else {
             index.clone()
+        }
+    }
+}
+impl CompositeHostTools {
+    pub(crate) fn combine(sources: Vec<Arc<dyn HostToolProvider>>) -> Arc<dyn HostToolProvider> {
+        let combined = Self {
+            sources: sources.into(),
+            index: Arc::new(std::sync::RwLock::new(Arc::new(SourceIndex::default()))),
+        };
+        combined.update_index(true);
+        Arc::new(combined)
+    }
+    fn update_index(&self, refreshed: bool) -> Arc<SourceIndex> {
+        SourceIndex::update(&self.sources, &self.index, refreshed)
+    }
+    /// Captures unversioned sources again on a blocking thread: their definitions may take long
+    /// to assemble, and a runtime worker blocked meanwhile would strand the task it last woke,
+    /// such as the next holder of the Chats lock.
+    async fn capture_refreshed_index(&self) {
+        let sources = self.sources.clone();
+        let published = self.index.clone();
+        let captured = tokio::task::spawn_blocking(move || {
+            SourceIndex::update(&sources, &published, true);
+        })
+        .await;
+        if let Err(error) = captured
+            && let Ok(panic) = error.try_into_panic()
+        {
+            std::panic::resume_unwind(panic);
         }
     }
     fn source(&self, name: &str) -> Result<&Arc<dyn HostToolProvider>, String> {
@@ -171,7 +196,7 @@ impl HostToolProvider for CompositeHostTools {
     }
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
         let mut states = Vec::new();
-        for source in &self.sources {
+        for source in self.sources.iter() {
             let Some(state) = source.upgrade_checkpoint()? else {
                 return Ok(None);
             };
@@ -200,7 +225,7 @@ impl HostToolProvider for CompositeHostTools {
         let results =
             futures_util::future::join_all(self.sources.iter().map(|s| s.refresh(cancel.clone())))
                 .await;
-        self.update_index(true);
+        self.capture_refreshed_index().await;
         results.into_iter().collect()
     }
     fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
@@ -235,7 +260,7 @@ impl HostToolProvider for CompositeHostTools {
         .collect()
     }
     async fn reconnect_mcp_server(&self, name: &str) -> bool {
-        for source in &self.sources {
+        for source in self.sources.iter() {
             if source.reconnect_mcp_server(name).await {
                 return true;
             }
@@ -286,7 +311,7 @@ impl HostToolProvider for CompositeHostTools {
         self.source(name)?.validate_input(name, schema, input)
     }
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
-        for source in &self.sources {
+        for source in self.sources.iter() {
             if let Some(endpoint) = source.host_endpoint()? {
                 return Ok(Some(endpoint));
             }
@@ -314,7 +339,7 @@ impl HostToolProvider for CompositeHostTools {
     }
     fn service_connections(&self) -> Value {
         let mut combined = serde_json::Map::new();
-        for source in &self.sources {
+        for source in self.sources.iter() {
             if let Value::Object(values) = source.service_connections() {
                 combined.extend(values);
             }

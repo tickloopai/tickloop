@@ -423,7 +423,8 @@ pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// A revision of already-published definitions. Versioned providers must serve cheap reads.
-    /// Unversioned providers are captured only at installation and after refresh, outside Chats.
+    /// Unversioned providers are captured only at installation and after refresh, outside Chats;
+    /// after refresh on a blocking thread, so a slow capture never stalls a runtime worker.
     fn catalog_generation(&self) -> Option<u64> {
         None
     }
