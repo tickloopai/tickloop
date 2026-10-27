@@ -65,6 +65,8 @@ Use `tickloop --add-dir ../shared --add-dir /path/to/docs` to add directories fo
 
 These sources merge into the Chat's existing additional directories, with duplicates removed. They support reads, edits and `@` file mentions; sensitive-file checks and explicit Ask/Deny rules still apply. `/cwd` shows each directory's sources. Repository settings cannot add directories, and `--add-dir` and `/add-dir` do not write them to settings.
 
+In `/permissions` → Auto mode, you can preview and select a one-time import of custom Auto rules. Built-in rules stay in place; imported rules do not override explicit Ask or Deny. Use `space` to toggle entries, `enter` to save and `esc` to cancel without changes.
+
 Keys:
 
 - `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.

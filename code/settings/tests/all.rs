@@ -1,5 +1,8 @@
 //! Every code/settings integration test, compiled as one binary.
 
+#[path = "all/claude_auto_import.rs"]
+mod claude_auto_import;
+
 #[path = "all/builtin_catalog.rs"]
 mod builtin_catalog;
 #[path = "all/builtin_skills.rs"]

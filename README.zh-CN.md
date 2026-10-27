@@ -65,6 +65,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 这些来源合并到 Chat 现有的附加目录中并去重，支持读取、编辑和 `@` 文件提及；敏感文件检查和显式 Ask/Deny 规则仍然生效。`/cwd` 会显示每个目录的来源。仓库设置不能添加目录，`--add-dir` 与 `/add-dir` 也不会把目录写入设置。
 
+在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
+
 按键：
 
 - `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。

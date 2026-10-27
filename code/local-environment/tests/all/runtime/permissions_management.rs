@@ -698,3 +698,96 @@ async fn management_ask_rule_requires_human_before_host_tool_execution() {
     assert_eq!(host.executions.load(Ordering::SeqCst), 1);
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn imported_soft_allow_never_overrides_explicit_ask_or_deny() {
+    use tickloop_code_settings::claude_auto_import::{prepare_import, preview_auto_mode};
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let agent = Agent::open_embedded(
+        temp.path().join("state"),
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "ask",
+                "Write",
+                json!({"file_path":"ask.txt","content":"ask"}),
+            ),
+            text("approved by user"),
+            call(
+                "deny",
+                "Write",
+                json!({"file_path":"deny.txt","content":"deny"}),
+            ),
+            text("denied"),
+        ])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(work.clone()).await.unwrap();
+    let initial = agent.permissions_view(chat).await.unwrap();
+    let rows = preview_auto_mode(
+        &json!({"allow":["Allow all file writes"]}),
+        &initial.auto_rule_settings,
+    )
+    .unwrap();
+    let imported = agent
+        .apply_permission_change(
+            chat,
+            PermissionChange::ChangeAutoRules {
+                change: prepare_import(
+                    &rows,
+                    &temp.path().join("claude/settings.json"),
+                    &initial.auto_rule_settings,
+                )
+                .unwrap(),
+            },
+            initial.revision,
+        )
+        .await
+        .unwrap();
+    let rule_id = Uuid::new_v4();
+    let asked = agent
+        .apply_permission_change(
+            chat,
+            PermissionChange::UpsertRule {
+                rule: rule(rule_id, Decision::Ask, false),
+            },
+            imported.revision,
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let attempt = agent.submit(chat, "Try the write".into()).await.unwrap();
+    let request = requested_permission(&mut events, attempt.run_id).await;
+    assert_eq!(
+        request.approval_source,
+        PermissionApprovalSource::ExplicitAsk
+    );
+    assert!(!work.join("ask.txt").exists());
+    agent
+        .answer_permission(chat, request.id, true)
+        .await
+        .unwrap();
+    completion(&mut events, attempt.run_id).await;
+    assert_eq!(
+        std::fs::read_to_string(work.join("ask.txt")).unwrap(),
+        "ask"
+    );
+    agent
+        .apply_permission_change(
+            chat,
+            PermissionChange::UpsertRule {
+                rule: rule(rule_id, Decision::Deny, false),
+            },
+            asked.revision,
+        )
+        .await
+        .unwrap();
+    let attempt = agent
+        .submit(chat, "Try the denied write".into())
+        .await
+        .unwrap();
+    assert!(!completed_without_request(&mut events, attempt.run_id).await);
+    assert!(!work.join("deny.txt").exists());
+}
