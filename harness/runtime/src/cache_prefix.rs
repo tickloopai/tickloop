@@ -1,6 +1,9 @@
 //! Keeping a Chat's prompt cache prefix stable across requests, and noticing when it breaks.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::{
+    collections::HashSet,
+    hash::{DefaultHasher, Hash, Hasher},
+};
 
 use serde::Serialize;
 use tickloop_harness_protocol::{Message, ModelIdentity, RunId, ToolDefinition};
@@ -12,6 +15,19 @@ pub(crate) struct CachePrefixState {
     compacted_since_last_request: bool,
 }
 
+/// Where a tool goes in the listed tools, which keep this order so the vendor's prompt cache
+/// prefix depends on neither registration order nor which host source or server came first: the
+/// built-in tools, the runtime tools, the MCP resource tools, the Fold tools, then every host tool,
+/// each group sorted by name.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ListingGroup {
+    BuiltIn,
+    Runtime,
+    McpResources,
+    Fold,
+    HostTools,
+}
+
 /// The MCP part of a Run's tools as the Run's first model request offered them. Later requests
 /// of the Run offer the same MCP tools byte for byte, so servers connecting, disconnecting or
 /// listing again change the listed tools only at a Run boundary.
@@ -21,9 +37,78 @@ pub(crate) struct HeldHostTools {
     /// Native search defers tools that Fold folds, so a model change re-holds the tools.
     pub(crate) native_search: bool,
     /// The listed MCP resource, Fold and MCP tools, each with the group it was listed in.
-    pub(crate) listed: Vec<(crate::tool_execution::ListingGroup, ToolDefinition)>,
+    listed: Vec<(ListingGroup, ToolDefinition)>,
     /// Every deferred tool the Run has offered so far, sorted by name.
+    deferred: Vec<ToolDefinition>,
+}
+
+/// What a later request of a Run offers of its MCP tools.
+pub(crate) struct HeldOffer {
+    /// Listed tools the Run's first request did not list: unlisted until the next Run.
+    pub(crate) withheld: Vec<String>,
+    /// The tools the Run's first request listed, with the definitions it listed them with.
+    pub(crate) listed: Vec<(ListingGroup, ToolDefinition)>,
+    /// Every deferred tool the Run has offered so far, sorted by name: deferred tools are only
+    /// added to, after the native search tool, so searches still find a server that connected
+    /// during the Run.
     pub(crate) deferred: Vec<ToolDefinition>,
+}
+
+impl HeldHostTools {
+    /// Holds the MCP tools a request of `run_id` would offer, `listed` and `deferred`, to what the
+    /// Run's first request offered. `None` when this request is the first of the Run in `held`, or
+    /// the first since a model change switched native search, and `held` now records its tools.
+    pub(crate) fn hold(
+        held: &mut Option<Self>,
+        run_id: RunId,
+        native_search: bool,
+        listed: Vec<(ListingGroup, ToolDefinition)>,
+        deferred: Vec<ToolDefinition>,
+    ) -> Option<HeldOffer> {
+        let Some(current) = held
+            .as_mut()
+            .filter(|held| held.run_id == run_id && held.native_search == native_search)
+        else {
+            *held = Some(Self {
+                run_id,
+                native_search,
+                listed,
+                deferred,
+            });
+            return None;
+        };
+        let held_names: HashSet<String> = current
+            .listed
+            .iter()
+            .map(|(_, tool)| tool.name.clone())
+            .collect();
+        let withheld = listed
+            .into_iter()
+            .map(|(_, tool)| tool.name)
+            .filter(|name| !held_names.contains(name))
+            .collect();
+        let mut deferred_names: HashSet<String> = current
+            .deferred
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        for definition in deferred {
+            if deferred_names.insert(definition.name.clone()) {
+                current.deferred.push(definition);
+            }
+        }
+        current
+            .deferred
+            .retain(|tool| !held_names.contains(&tool.name));
+        current
+            .deferred
+            .sort_by(|first, second| first.name.cmp(&second.name));
+        Some(HeldOffer {
+            withheld,
+            listed: current.listed.clone(),
+            deferred: current.deferred.clone(),
+        })
+    }
 }
 
 /// What a conversation request's prompt cache prefix depends on: the model, the system part
@@ -184,29 +269,35 @@ impl CachePrefixState {
 impl CacheBreak {
     /// Writes the break to the Agent log only: it never reaches the model or the Transcript.
     pub(crate) fn log(&self, chat: tickloop_harness_protocol::ChatId, run: RunId) {
-        let names = |names: &[String]| {
-            if names.is_empty() {
-                "none".to_owned()
-            } else {
-                names.join(",")
-            }
-        };
-        let tokens = |tokens: Option<u64>| tokens.map_or("unknown".to_owned(), |t| t.to_string());
+        let tokens =
+            |tokens: Option<u64>| tokens.map_or("unknown".to_owned(), |count| count.to_string());
         tracing::debug!(
             target: "tickloop::cache_break",
             chat = ?chat,
             run = ?run,
             reason = %self.reason.as_str(),
             expected = self.reason == CacheBreakReason::Compaction,
-            changed = %if self.changed_parts.is_empty() { "none".to_owned() } else { self.changed_parts.join(",") },
-            added_tools = %names(&self.added_tools),
-            removed_tools = %names(&self.removed_tools),
-            changed_tools = %names(&self.changed_tools),
+            changed = %joined_or_none(&self.changed_parts),
+            added_tools = %joined_or_none(&self.added_tools),
+            removed_tools = %joined_or_none(&self.removed_tools),
+            changed_tools = %joined_or_none(&self.changed_tools),
             previous_cache_read = %tokens(self.previous_cache_read),
             cache_read = %tokens(self.cache_read),
             fingerprint = %format!("{:016x}", self.fingerprint),
             "cache break"
         );
+    }
+}
+
+fn joined_or_none(items: &[impl AsRef<str>]) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

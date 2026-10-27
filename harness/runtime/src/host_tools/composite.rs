@@ -204,7 +204,9 @@ impl HostToolProvider for CompositeHostTools {
         results.into_iter().collect()
     }
     fn awaited_mcp_servers(&self) -> Option<tokio::sync::watch::Receiver<Vec<String>>> {
-        self.sources.iter().find_map(|s| s.awaited_mcp_servers())
+        self.sources
+            .iter()
+            .find_map(|source| source.awaited_mcp_servers())
     }
     fn mcp_resource_servers(&self) -> Vec<McpResourceServer> {
         self.sources

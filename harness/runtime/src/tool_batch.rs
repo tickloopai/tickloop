@@ -202,19 +202,11 @@ impl Agent {
         else {
             return;
         };
-        chat.snapshot.last_sequence += 1;
-        let event = tickloop_harness_protocol::Event {
-            sequence: chat.snapshot.last_sequence,
-            chat_id: receipt.chat_id,
-            loop_id: receipt.loop_id,
-            run_id: receipt.run_id,
-            kind: tickloop_harness_protocol::EventKind::WaitingForMcpServers { servers },
-        };
-        chat.snapshot.events.push(event.clone());
-        if chat.snapshot.events.len() > super::EVENT_REPLAY_LIMIT {
-            chat.snapshot.events.remove(0);
-        }
-        let _ = self.inner.events.send(event);
+        self.publish_event(
+            chat,
+            receipt,
+            tickloop_harness_protocol::EventKind::WaitingForMcpServers { servers },
+        );
     }
 
     /// The tools a model request of the Run offers, after refreshing what they depend on.

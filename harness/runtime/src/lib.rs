@@ -3071,7 +3071,11 @@ impl Agent {
         if chat.snapshot.events.len() > EVENT_REPLAY_LIMIT {
             chat.snapshot.events.remove(0);
         }
-        if !matches!(event.kind, EventKind::Text(_)) {
+        // Streamed text and the servers a request waits for only show progress: no record changes.
+        if !matches!(
+            event.kind,
+            EventKind::Text(_) | EventKind::WaitingForMcpServers { .. }
+        ) {
             self.save(&chat.snapshot);
         }
         let _ = self.inner.events.send(event);

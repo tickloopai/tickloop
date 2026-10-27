@@ -4,6 +4,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::cache_prefix::{HeldHostTools, ListingGroup};
 use tickloop_harness_protocol::{
     ApprovalOutcome, ApprovalPath, ApprovalReviewerKind, AutoBlockKind, DenialCategory,
     DenialRecord, EventKind, HostToolAuthority, OperationRecord, OperationState,
@@ -146,19 +147,6 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
         route: ToolRoute::TickManage(provider),
     });
     tools
-}
-
-/// Where a tool goes in the listed tools, which keep this order so the vendor's prompt cache
-/// prefix depends on neither registration order nor which host source or server came first: the
-/// built-in tools, the runtime tools, the MCP resource tools, the Fold tools, then every host tool,
-/// each group sorted by name.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ListingGroup {
-    BuiltIn,
-    Runtime,
-    McpResources,
-    Fold,
-    HostTools,
 }
 
 fn listing_group(route: &ToolRoute) -> ListingGroup {
@@ -446,83 +434,47 @@ impl ToolRegistry {
         }
     }
 
-    /// Holds the MCP part of the tools to what the Run's first request offered, recording it
-    /// when `held` belongs to no earlier request of `run_id`: the MCP resource and Fold tools and
-    /// the directly listed MCP tools. MCP tools that appeared since stay unlisted until the next
-    /// Run; those that vanished keep their declaration and are not executed. Other host tools,
-    /// such as the Artifacts tools a sign-in brings, follow the host as before. Deferred tools are
-    /// only added to, sorted by name after the native search tool, so searches still find a
-    /// server that connected during the Run.
-    pub(super) fn hold_host_tools(
-        &mut self,
-        held: &mut Option<crate::cache_prefix::HeldHostTools>,
-        run_id: RunId,
-    ) {
-        let Some(held) = held
-            .as_mut()
-            .filter(|held| held.run_id == run_id && held.native_search == self.native_search)
-        else {
-            *held = Some(crate::cache_prefix::HeldHostTools {
-                run_id,
-                native_search: self.native_search,
-                listed: self
-                    .tools
-                    .iter()
-                    .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
-                    .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
-                    .collect(),
-                deferred: self.deferred.clone(),
-            });
-            return;
-        };
-        let held_names: HashSet<_> = held
-            .listed
-            .iter()
-            .map(|(_, tool)| tool.name.clone())
-            .collect();
-        let appeared: Vec<_> = self
+    /// Holds the MCP part of the tools to what the Run's first request offered, as `held`
+    /// decides: MCP tools that appeared since stay unlisted until the next Run, and those that
+    /// vanished keep their declaration and are not executed. Other host tools, such as the
+    /// Artifacts tools a sign-in brings, follow the host as before.
+    pub(super) fn hold_host_tools(&mut self, held: &mut Option<HeldHostTools>, run_id: RunId) {
+        let listed = self
             .tools
             .iter()
-            .filter(|tool| {
-                is_held(tool)
-                    && self.is_listed(&tool.definition.name)
-                    && !held_names.contains(&tool.definition.name)
-            })
-            .map(|tool| tool.definition.name.clone())
+            .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
+            .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
             .collect();
-        self.folded.extend(appeared);
-        for (group, definition) in &held.listed {
+        let Some(offer) = HeldHostTools::hold(
+            held,
+            run_id,
+            self.native_search,
+            listed,
+            self.deferred.clone(),
+        ) else {
+            return;
+        };
+        self.folded.extend(offer.withheld);
+        for (group, definition) in offer.listed {
             self.folded.remove(&definition.name);
             match self
                 .tools
                 .iter_mut()
                 .find(|tool| tool.definition.name == definition.name)
             {
-                Some(tool) => tool.definition = definition.clone(),
+                Some(tool) => tool.definition = definition,
                 None => self.tools.push(RegisteredTool {
-                    definition: definition.clone(),
-                    route: ToolRoute::Unavailable(*group),
+                    definition,
+                    route: ToolRoute::Unavailable(group),
                 }),
             }
         }
-        sort_for_listing(&mut self.tools);
-        let mut deferred_names: HashSet<_> =
-            held.deferred.iter().map(|tool| tool.name.clone()).collect();
-        for definition in std::mem::take(&mut self.deferred) {
-            if deferred_names.insert(definition.name.clone()) {
-                held.deferred.push(definition);
-            }
-        }
-        held.deferred
-            .retain(|tool| !held_names.contains(&tool.name));
-        held.deferred
-            .sort_by(|first, second| first.name.cmp(&second.name));
         let registered: HashSet<_> = self
             .tools
             .iter()
             .map(|tool| tool.definition.name.clone())
             .collect();
-        for definition in &held.deferred {
+        for definition in &offer.deferred {
             if !registered.contains(&definition.name) {
                 self.tools.push(RegisteredTool {
                     definition: definition.clone(),
@@ -530,7 +482,8 @@ impl ToolRegistry {
                 });
             }
         }
-        self.deferred = held.deferred.clone();
+        sort_for_listing(&mut self.tools);
+        self.deferred = offer.deferred;
     }
 
     fn is_listed(&self, name: &str) -> bool {
