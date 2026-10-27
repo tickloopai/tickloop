@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Url;
-use rmcp::transport::auth::AuthorizationMetadata;
+use rmcp::transport::auth::{AuthorizationMetadata, WWWAuthenticateParams};
 use rmcp::transport::{
     AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
 };
@@ -204,6 +204,7 @@ impl Connector {
         challenge: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<PendingLogin, LoginError> {
+        let redaction = self.cause_redaction(challenge);
         let mut manager = cancellable(
             cancellation,
             AuthorizationManager::new_with_oauth_http_client(
@@ -212,10 +213,10 @@ impl Connector {
             ),
         )
         .await?
-        .map_err(|error| discovery_failure(&error))?;
+        .map_err(|error| redaction.discovery_failure(&error))?;
         let metadata = cancellable(
             cancellation,
-            self.authorization_metadata(&manager, challenge),
+            self.authorization_metadata(&manager, challenge, &redaction),
         )
         .await??;
         let endpoints = TokenEndpoints::from_metadata(&metadata)?;
@@ -231,7 +232,7 @@ impl Connector {
         }
         let session = cancellable(cancellation, AuthorizationSession::new(manager, request))
             .await?
-            .map_err(|(_, error)| authorization_error(&error))?;
+            .map_err(|(_, error)| authorization_error(&error, &redaction))?;
         let (client_id, _) = cancellable(cancellation, session.get_credentials())
             .await?
             .map_err(|_| LoginError::Registration)?;
@@ -264,13 +265,14 @@ impl Connector {
         &self,
         manager: &AuthorizationManager,
         challenge: Option<&str>,
+        redaction: &CauseRedaction,
     ) -> Result<AuthorizationMetadata, LoginError> {
         if let Some(metadata_url) = &self.metadata_url {
             let (status, body) = self
                 .http
                 .get_bounded(metadata_url)
                 .await
-                .map_err(|error| LoginError::Discovery(error_cause(&*error)))?;
+                .map_err(|error| redaction.error_cause(&*error))?;
             if status != 200 {
                 return Err(LoginError::Discovery(format!(
                     "the configured metadata address answered HTTP {status}"
@@ -286,12 +288,12 @@ impl Connector {
         if let Some(challenge) = challenge {
             self.http
                 .validate_challenge(challenge)
-                .map_err(|error| LoginError::Discovery(error_cause(&*error)))?;
+                .map_err(|error| redaction.error_cause(&*error))?;
         }
         let resolution = manager
             .resolve_metadata_from_challenge(challenge)
             .await
-            .map_err(|error| discovery_failure(&error))?;
+            .map_err(|error| redaction.discovery_failure(&error))?;
         if !resolution.source.is_discovered() {
             return Err(LoginError::Discovery(
                 "the server publishes neither protected resource metadata nor authorization server metadata"
@@ -299,6 +301,22 @@ impl Connector {
             ));
         }
         Ok(resolution.metadata)
+    }
+
+    /// The addresses a discovery failure can quote that this login already knows.
+    fn cause_redaction(&self, challenge: Option<&str>) -> CauseRedaction {
+        let challenged = challenge.and_then(|challenge| {
+            WWWAuthenticateParams::parse(challenge, &self.server_url).resource_metadata_url
+        });
+        CauseRedaction::new(
+            [
+                Some(self.server_url.clone()),
+                self.metadata_url.clone(),
+                challenged,
+            ]
+            .into_iter()
+            .flatten(),
+        )
     }
 
     /// Binds the callback port and picks the client: the configured one, else the stored
@@ -374,97 +392,139 @@ fn callback_error(error: CallbackError) -> LoginError {
     }
 }
 
-fn authorization_error(error: &AuthError) -> LoginError {
+fn authorization_error(error: &AuthError, redaction: &CauseRedaction) -> LoginError {
     match error {
         AuthError::RegistrationFailed(_) => LoginError::Registration,
         AuthError::PkceUnsupported | AuthError::InvalidScope(_) => LoginError::Unsupported,
-        _ => discovery_failure(error),
+        _ => redaction.discovery_failure(error),
     }
-}
-
-fn discovery_failure(error: &AuthError) -> LoginError {
-    let cause = match error {
-        AuthError::MetadataError(message) => redacted_line(message),
-        _ => error_cause(error),
-    };
-    LoginError::Discovery(cause)
-}
-
-/// `error` and its sources as one redacted line, skipping a source its parent already quotes.
-fn error_cause(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut chain = error.to_string();
-    for source in std::iter::successors(error.source(), |source| source.source()) {
-        let message = source.to_string();
-        if !chain.contains(&message) {
-            chain.push_str(": ");
-            chain.push_str(&message);
-        }
-    }
-    redacted_line(&chain)
 }
 
 const MAX_CAUSE_CHARS: usize = 400;
 const CAUSED_BY: &str = "Caused by:";
-const URL_DELIMITERS: &[char] = &['(', ')', '\'', '"', '`', '<', '>', ',', ';'];
+const UNREADABLE_ADDRESS: &str = "<address>";
 
-/// One line of an error text, without control characters, in which each address keeps only
-/// its origin: a server address may carry a credential in its user information, path or query.
-fn redacted_line(text: &str) -> String {
-    let words: Vec<String> = text
-        .lines()
-        .map(|line| line.trim().strip_prefix(CAUSED_BY).unwrap_or(line).trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(": ")
-        .split_whitespace()
-        .map(redact_addresses)
-        .collect();
-    let line: String = words
-        .join(" ")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    if line.chars().count() <= MAX_CAUSE_CHARS {
-        return line;
-    }
-    let mut truncated: String = line.chars().take(MAX_CAUSE_CHARS).collect();
-    truncated.push('…');
-    truncated
+/// Turns error texts into the one-line cause of a discovery failure. Each address keeps only
+/// its origin, since a server address may carry a credential in its user information, path or
+/// query: the addresses this login knows are replaced exactly first, then every word that
+/// contains `://` is replaced whole by the origin of the address in it, so no character of
+/// that word after the host can survive.
+struct CauseRedaction {
+    /// Each known address with its origin, longest first so that none is replaced inside
+    /// another.
+    known: Vec<(String, String)>,
 }
 
-fn redact_addresses(word: &str) -> String {
+impl CauseRedaction {
+    fn new(addresses: impl IntoIterator<Item = Url>) -> Self {
+        let mut known: Vec<(String, String)> = addresses
+            .into_iter()
+            .map(|address| (address.to_string(), origin_of(&address)))
+            .collect();
+        known.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()).then(left.cmp(right)));
+        known.dedup();
+        Self { known }
+    }
+
+    fn discovery_failure(&self, error: &AuthError) -> LoginError {
+        match error {
+            AuthError::MetadataError(message) => LoginError::Discovery(self.line(message)),
+            _ => self.error_cause(error),
+        }
+    }
+
+    /// `error` and its sources, skipping a source its parent already quotes.
+    fn error_cause(&self, error: &(dyn std::error::Error + 'static)) -> LoginError {
+        let mut chain = error.to_string();
+        for source in std::iter::successors(error.source(), |source| source.source()) {
+            let message = source.to_string();
+            if !chain.contains(&message) {
+                chain.push('\n');
+                chain.push_str(&message);
+            }
+        }
+        LoginError::Discovery(self.line(&chain))
+    }
+
+    /// The lines of `text` joined into one, without control characters.
+    fn line(&self, text: &str) -> String {
+        let line: String = text
+            .lines()
+            .map(|line| line.trim().strip_prefix(CAUSED_BY).unwrap_or(line).trim())
+            .filter(|line| !line.is_empty())
+            .map(|line| self.redact(line))
+            .collect::<Vec<_>>()
+            .join(": ")
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if line.chars().count() <= MAX_CAUSE_CHARS {
+            return line;
+        }
+        let mut truncated: String = line.chars().take(MAX_CAUSE_CHARS).collect();
+        truncated.push('…');
+        truncated
+    }
+
+    fn redact(&self, line: &str) -> String {
+        let mut line = line.to_owned();
+        for (address, origin) in &self.known {
+            line = line.replace(address.as_str(), origin);
+        }
+        line.split_whitespace()
+            .map(|word| {
+                if word.contains("://") {
+                    address_origin(word)
+                } else {
+                    word.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// The origin of the first address in `word`, which may be wrapped in punctuation.
+fn address_origin(word: &str) -> String {
     let Some(separator) = word.find("://") else {
-        return word.to_owned();
+        return UNREADABLE_ADDRESS.to_owned();
     };
     let start = word[..separator]
         .char_indices()
         .rev()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .take_while(|(_, character)| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
         .last()
         .map_or(separator, |(index, _)| index);
-    let end = word[start..]
-        .find(URL_DELIMITERS)
-        .map_or(word.len(), |index| start + index);
-    let address = word[start..end].trim_end_matches(['.', ':']);
-    let end = start + address.len();
-    let origin = Url::parse(address)
-        .ok()
-        .map(|url| url.origin())
-        .filter(|origin| origin.is_tuple())
-        .map_or_else(
-            || "<address>".to_owned(),
-            |origin| origin.ascii_serialization(),
-        );
-    format!(
-        "{}{origin}{}",
-        &word[..start],
-        redact_addresses(&word[end..])
-    )
+    Url::parse(&word[start..]).map_or_else(|_| UNREADABLE_ADDRESS.to_owned(), |url| origin_of(&url))
+}
+
+/// `url`'s origin, when its host is an ordinary name or IP address.
+fn origin_of(url: &Url) -> String {
+    let ordinary_host = url.host_str().is_some_and(|host| {
+        host.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | ':' | '[' | ']')
+        })
+    });
+    let origin = url.origin();
+    if ordinary_host && origin.is_tuple() {
+        origin.ascii_serialization()
+    } else {
+        UNREADABLE_ADDRESS.to_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn redaction() -> CauseRedaction {
+        CauseRedaction::new([
+            Url::parse("https://mcp.example.test/key-1/mcp?token=secret-1").unwrap(),
+            Url::parse("https://mcp.example.test/key-1/mcp").unwrap(),
+        ])
+    }
 
     #[test]
     fn a_discovery_cause_is_one_line_with_only_the_origins_of_addresses() {
@@ -472,28 +532,42 @@ mod tests {
             Caused by: error sending request for url (https://mcp.longbridge.cn/)\n  \
             Caused by: client error (Connect)\n  Caused by: operation timed out";
         assert_eq!(
-            redacted_line(timed_out),
+            redaction().line(timed_out),
             "OAuth metadata discovery failed for https://mcp.longbridge.cn: error sending \
-             request for url (https://mcp.longbridge.cn): client error (Connect): operation \
+             request for url https://mcp.longbridge.cn: client error (Connect): operation \
              timed out"
         );
         assert_eq!(
-            redacted_line(
-                "resource mismatch: reference 'https://user:pw@mcp.example.test:8443/key/mcp?token=t#f', \
-                 permitted 'mailto:a@b'\u{7}"
-            ),
-            "resource mismatch: reference 'https://mcp.example.test:8443', permitted 'mailto:a@b'"
+            redaction().line("expected https://a.test/x and a:// and “https://b.test/y\u{7}"),
+            "expected https://a.test and <address> and https://b.test"
         );
-        assert_eq!(
-            redacted_line("expected https://a.test/x,https://b.test/y?k=v and a://"),
-            "expected https://a.test,https://b.test and <address>"
-        );
-        assert_eq!(
-            redacted_line("named “https://a.test/x"),
-            "named “https://a.test"
-        );
-        let long = redacted_line(&"word ".repeat(MAX_CAUSE_CHARS));
+        let long = redaction().line(&"word ".repeat(MAX_CAUSE_CHARS));
         assert_eq!(long.chars().count(), MAX_CAUSE_CHARS + 1);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn no_part_of_an_address_after_its_host_survives_whatever_it_contains() {
+        let redaction = redaction();
+        for delimiter in ['"', ')', ',', ';', '>', '\'', '(', '<', '`', ']'] {
+            let text = format!(
+                "reference 'https://user:pw-secret@mcp.example.test:8443/path-secret?a=b{delimiter}token=query-secret#fragment-secret', \
+                 for (https://mcp.example.test/mcp?x=1{delimiter}code=code-secret{delimiter}) and \
+                 https://mcp.example.test/key-1/mcp?token=secret-1{delimiter}more-secret"
+            );
+            let line = redaction.line(&text);
+            assert!(!line.contains("secret"), "{delimiter}: {line}");
+            assert!(!line.contains("token"), "{delimiter}: {line}");
+            assert!(!line.contains('?'), "{delimiter}: {line}");
+            assert!(line.contains("https://mcp.example.test:8443"), "{line}");
+        }
+        assert_eq!(
+            redaction.line("at https://mcp.example.test/key-1/mcp?token=secret-1 and https://mcp.example.test/key-1/mcp/.well-known/x"),
+            "at https://mcp.example.test and https://mcp.example.test"
+        );
+        assert_eq!(
+            redaction.line("issuer https://a.test,https://b.test/?k=secret"),
+            "issuer <address>"
+        );
     }
 }
