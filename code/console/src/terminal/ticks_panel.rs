@@ -364,14 +364,19 @@ impl TickPackageResult {
             Self::MarketplaceRemoved {
                 name,
                 result: Ok(remaining),
-            } if remaining.is_empty() => Notice::success(format!("Removed marketplace {name}")),
-            Self::MarketplaceRemoved {
-                name,
-                result: Ok(remaining),
-            } => Notice::success(format!(
-                "Removed marketplace {name}; its plugins stay installed: {}",
-                remaining.join(", ")
-            )),
+            } => {
+                let mut message = format!("Removed marketplace {name}");
+                if !remaining.is_empty() {
+                    message.push_str(&format!(
+                        "; its plugins stay installed: {}",
+                        remaining.join(", ")
+                    ));
+                }
+                if name == tick_plugins::CLAUDE_OFFICIAL_MARKETPLACE {
+                    message.push_str("; add it back with tickloop plugin marketplace add anthropics/claude-plugins-official");
+                }
+                Notice::success(message)
+            }
             Self::MarketplaceRemoved {
                 name,
                 result: Err(error),
@@ -780,11 +785,9 @@ impl TicksPanel {
                     .map(|entry| entry.name().to_owned())
             } else {
                 match self.registered_marketplaces().get(selected) {
-                    Some(offer) if offer.registration.builtin => {
-                        self.notice = Some(Notice::failure(format!(
-                            "The built-in marketplace {} cannot be removed",
-                            offer.registration.name
-                        )));
+                    Some(offer)
+                        if offer.registration.name == tick_plugins::TICKLOOP_MARKETPLACE =>
+                    {
                         return TicksPanelEffect::None;
                     }
                     offer => offer.map(|offer| offer.registration.name.clone()),
@@ -1798,14 +1801,22 @@ impl TicksPanel {
                     ("esc cancel".into(), 9),
                 ]
             } else if self.page == REGISTERED_MARKETPLACES_PAGE {
-                vec![
-                    ("enter update".into(), 10),
-                    ("a add".into(), 8),
-                    ("x remove".into(), 5),
+                let mut hints = vec![("enter update".into(), 10), ("a add".into(), 8)];
+                if self
+                    .registered_marketplaces()
+                    .get(self.selected[self.page])
+                    .is_some_and(|offer| {
+                        offer.registration.name != tick_plugins::TICKLOOP_MARKETPLACE
+                    })
+                {
+                    hints.push(("x remove".into(), 5));
+                }
+                hints.extend([
                     ("tab/←/→ page".into(), 6),
                     ("r refresh".into(), 4),
                     ("esc close".into(), 9),
-                ]
+                ]);
+                hints
             } else {
                 self.package_hints()
             };

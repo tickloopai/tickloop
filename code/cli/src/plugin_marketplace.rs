@@ -95,7 +95,13 @@ pub(super) fn list_marketplaces(store: &PluginStore) -> Result<(), String> {
 
 pub(super) fn remove_marketplace(store: &PluginStore, name: &str) -> Result<(), String> {
     let remaining = tickloop_tick_installer::remove_marketplace(store, name)?;
-    println!("Removed marketplace {name}.");
+    if name == tick_plugins::CLAUDE_OFFICIAL_MARKETPLACE {
+        println!(
+            "Removed marketplace {name}; add it back with tickloop plugin marketplace add anthropics/claude-plugins-official."
+        );
+    } else {
+        println!("Removed marketplace {name}.");
+    }
     if !remaining.is_empty() {
         println!(
             "Its plugins stay installed: {}; tickloop plugin uninstall removes one.",

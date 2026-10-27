@@ -27,15 +27,47 @@ fn marketplace_sources_expand_github_and_builtins_are_lazy() {
             .any(|marketplace| marketplace.name == CLAUDE_OFFICIAL_MARKETPLACE)
     );
     assert!(!fixture.store.directory().exists());
-    for name in ["tickloop", CLAUDE_OFFICIAL_MARKETPLACE] {
-        assert!(
-            fixture
-                .store
-                .remove_marketplace(name)
-                .unwrap_err()
-                .to_string()
-                .contains("built-in")
-        );
+    assert!(
+        fixture
+            .store
+            .remove_marketplace("tickloop")
+            .unwrap_err()
+            .to_string()
+            .contains("built-in")
+    );
+}
+
+#[tokio::test]
+async fn removing_the_default_claude_marketplace_survives_reopening_the_store() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .remove_marketplace(CLAUDE_OFFICIAL_MARKETPLACE)
+        .unwrap();
+    let reopened = tick_plugins::PluginStore::in_config_root(&fixture.config_root());
+    assert_eq!(
+        reopened
+            .marketplaces()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tickloop"]
+    );
+    for error in [
+        reopened
+            .marketplace(CLAUDE_OFFICIAL_MARKETPLACE, &no_http)
+            .await
+            .unwrap_err(),
+        reopened
+            .refresh_marketplace(CLAUDE_OFFICIAL_MARKETPLACE, &no_http)
+            .await
+            .unwrap_err(),
+        reopened
+            .remove_marketplace(CLAUDE_OFFICIAL_MARKETPLACE)
+            .unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("is not registered"), "{error}");
     }
 }
 
@@ -1215,4 +1247,108 @@ async fn cancelling_git_stops_a_helper_after_it_has_started() {
     let _ = operation.await;
     let pid = ready.expect("Git helper did not announce readiness");
     assert_helper_stopped(&pid).await;
+}
+
+#[test]
+fn the_official_source_restores_its_builtin_registration_and_keeps_installed_plugins() {
+    const CONFIG_FILE: &str = "claude-market-test.gitconfig";
+    if std::env::var_os("GIT_CONFIG_GLOBAL").is_some_and(|path| {
+        std::path::Path::new(&path)
+            .file_name()
+            .is_some_and(|name| name == CONFIG_FILE)
+    }) {
+        let fixture = Fixture::new();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            fixture
+                .store
+                .install_marketplace_plugin(CLAUDE_OFFICIAL_MARKETPLACE, "review", &no_http)
+                .await
+                .unwrap();
+            let installed = fixture.store.get("review").unwrap();
+            for source in [
+                "anthropics/claude-plugins-official",
+                "https://github.com/anthropics/claude-plugins-official.git",
+            ] {
+                fixture
+                    .store
+                    .remove_marketplace(CLAUDE_OFFICIAL_MARKETPLACE)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_dir(fixture.store.directory().join("marketplaces"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+                let reopened = tick_plugins::PluginStore::in_config_root(&fixture.config_root());
+                assert_eq!(reopened.get("review").unwrap(), installed);
+                assert!(
+                    reopened
+                        .install_marketplace_plugin(CLAUDE_OFFICIAL_MARKETPLACE, "review", &no_http)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("is not registered")
+                );
+                let impostor = fixture.source("impostor");
+                write_json(
+                    &impostor.join("marketplace.json"),
+                    &json!({"name": CLAUDE_OFFICIAL_MARKETPLACE, "plugins": []}),
+                );
+                assert!(
+                    reopened
+                        .add_marketplace(&MarketplaceSource::Directory(impostor), &no_http)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("reserved")
+                );
+                let catalog = reopened
+                    .add_marketplace(&MarketplaceSource::parse(source).unwrap(), &no_http)
+                    .await
+                    .unwrap();
+                assert_eq!(catalog.registration.name, CLAUDE_OFFICIAL_MARKETPLACE);
+                assert!(catalog.registration.builtin);
+                assert_eq!(reopened.marketplaces().unwrap().len(), 2);
+                assert_eq!(
+                    reopened
+                        .marketplace(CLAUDE_OFFICIAL_MARKETPLACE, &no_http)
+                        .await
+                        .unwrap(),
+                    catalog
+                );
+                assert!(
+                    reopened
+                        .add_marketplace(&MarketplaceSource::parse(source).unwrap(), &no_http)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("already registered")
+                );
+            }
+        });
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture.source("official");
+    write_json(
+        &root.join("marketplace.json"),
+        &json!({"name": CLAUDE_OFFICIAL_MARKETPLACE, "plugins": [{"name": "review", "source": "./review"}]}),
+    );
+    crate::support::write_skill(&root.join("review/skills/check"), "Check");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "official"]);
+    let config = fixture.root().join(CONFIG_FILE);
+    std::fs::write(&config, format!("[url \"file://{}\"]\n\tinsteadOf = https://github.com/anthropics/claude-plugins-official.git\n", root.display())).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "marketplace::the_official_source_restores_its_builtin_registration_and_keeps_installed_plugins"])
+        .env("GIT_CONFIG_GLOBAL", config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

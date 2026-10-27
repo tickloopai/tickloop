@@ -154,7 +154,7 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
-fn the_built_in_marketplaces_are_listed_without_fetching_them_and_cannot_be_removed() {
+fn the_default_marketplaces_are_listed_without_fetching_and_tickloop_cannot_be_removed() {
     let fixture = Fixture::new();
     let tick_marketplace = path_text(
         &fixture
@@ -174,12 +174,10 @@ fn the_built_in_marketplaces_are_listed_without_fetching_them_and_cannot_be_remo
         ]
     );
     assert!(!fixture.root.join("config/plugins/marketplaces").exists());
-    for builtin in ["tickloop", "claude-plugins-official"] {
-        assert_eq!(
-            failed(&plugin(&fixture, &["marketplace", "remove", builtin])),
-            format!("Error: the built-in marketplace {builtin} cannot be removed\n")
-        );
-    }
+    assert_eq!(
+        failed(&plugin(&fixture, &["marketplace", "remove", "tickloop"])),
+        "Error: the built-in marketplace tickloop cannot be removed\n"
+    );
 }
 
 #[test]
@@ -861,4 +859,62 @@ fn a_tick_package_installs_and_updates_by_name_from_the_tickloop_marketplace() {
             cached_root(&fixture, "tickloop", "sample", "2.0.0")
         )
     );
+}
+
+#[test]
+fn the_default_claude_marketplace_can_be_removed_and_added_back_by_source() {
+    let fixture = Fixture::new();
+    let official = fixture.root.join(OFFICIAL_MARKETPLACE_REPOSITORY);
+    write_skill(&official.join("review/skills/check"), "check", "Review");
+    official_marketplace(&fixture, json!([{"name": "review", "source": "./review"}]));
+    succeeded(&plugin(
+        &fixture,
+        &["install", "review@claude-plugins-official"],
+    ));
+    for source in [
+        "anthropics/claude-plugins-official",
+        "https://github.com/anthropics/claude-plugins-official.git",
+    ] {
+        let removed = succeeded(&plugin(
+            &fixture,
+            &["marketplace", "remove", "claude-plugins-official"],
+        ));
+        assert!(removed.contains("add it back with tickloop plugin marketplace add anthropics/claude-plugins-official"), "{removed}");
+        assert!(
+            removed.contains("Its plugins stay installed: review@claude-plugins-official"),
+            "{removed}"
+        );
+        assert!(
+            !succeeded(&plugin(&fixture, &["marketplace", "list"]))
+                .contains("claude-plugins-official")
+        );
+        assert!(succeeded(&plugin(&fixture, &["list"])).contains("review@claude-plugins-official"));
+        assert_eq!(
+            failed(&plugin(&fixture, &["update", "review"])),
+            "Error: cannot update review@claude-plugins-official: marketplace claude-plugins-official is not registered\n"
+        );
+        assert!(
+            succeeded(&plugin(&fixture, &["update"]))
+                .contains("is not updated: marketplace claude-plugins-official is not registered")
+        );
+        let impostor =
+            marketplace_directory(&fixture, "impostor", "claude-plugins-official", json!([]));
+        assert!(
+            failed(&plugin(
+                &fixture,
+                &["marketplace", "add", &path_text(&impostor)]
+            ))
+            .contains("reserved")
+        );
+        succeeded(&plugin(&fixture, &["marketplace", "add", source]));
+        let listed = succeeded(&plugin(&fixture, &["marketplace", "list"]));
+        assert!(
+            listed
+                .lines()
+                .any(|line| line.starts_with("claude-plugins-official")
+                    && line.contains("built in; updated")),
+            "{listed}"
+        );
+        assert!(succeeded(&plugin(&fixture, &["update", "review"])).contains("is up to date"));
+    }
 }

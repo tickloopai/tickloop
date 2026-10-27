@@ -114,7 +114,7 @@ tickloop plugin uninstall NAME              # 删除插件数据
 tickloop plugin uninstall NAME --keep-data  # 同时保留插件数据
 ```
 
-内置 marketplace 为 `tickloop` 和 `claude-plugins-official`，不能删除；Git marketplace 在首次使用时才下载。来源明确时可只写 `NAME`；多个 marketplace 提供同名插件时，命令列出候选，已有安装则优先使用其来源。要把已安装的同名插件换到另一个 marketplace，先卸载。Git marketplace 中的插件若装好后才看出带 Tick 程序，由 `tickloop plugin` 安装，之后按 Tick 报告和管理。
+`tickloop` 是不能删除的内置 marketplace；`claude-plugins-official` 默认登记，首次使用时才下载，可以删除且重启后不会自动恢复。用 `tickloop plugin marketplace add anthropics/claude-plugins-official` 加回。两个名字仍保留给官方来源。来源明确时可只写 `NAME`；多个 marketplace 提供同名插件时，命令列出候选，已有安装则优先使用其来源。要把已安装的同名插件换到另一个 marketplace，先卸载。Git marketplace 中的插件若装好后才看出带 Tick 程序，由 `tickloop plugin` 安装，之后按 Tick 报告和管理。
 
 在 `/plugins` 的 **Marketplaces** 页或命令行中登记其他来源，`/ticks` 和 `/plugins` 都会读取：
 
@@ -138,7 +138,7 @@ tickloop plugin install --path ./my-plugin
 
 `/plugins` 的用法与 `/ticks` 相同：已安装和可安装两页，`Enter` 打开操作（启用/禁用、更新）或安装，`/` 过滤，同一行按两次 `x` 卸载。已安装行还显示暂不支持的组件。取不到的 marketplace 各自显示最多三行的错误摘要，其他来源和已安装页仍可用。
 
-`/plugins` 的第三页 **Marketplaces** 完成 `tickloop plugin marketplace` 能做的事。每行显示名字、来源、上次更新时间和是否内置；读取失败的 marketplace 在该行下显示错误。按 `a` 打开单行输入，接受与 `marketplace add` 相同的来源；`Enter` 添加，`Ctrl+G` 打开外部编辑器，`Esc` 取消。在某行按 `Enter` 重新读取该 marketplace，与 `marketplace update NAME` 相同。在同一行 3 秒内按两次 `x` 删除，已安装的插件保留；内置 marketplace 不能删除。添加、刷新和删除在后台进行，可安装页随之更新。`/ticks` 没有这一页，提示改到 `/plugins` 管理。
+`/plugins` 的第三页 **Marketplaces** 完成 `tickloop plugin marketplace` 能做的事。每行显示名字、来源、上次更新时间和是否内置；读取失败的 marketplace 在该行下显示错误。按 `a` 打开单行输入，接受与 `marketplace add` 相同的来源；`Enter` 添加，`Ctrl+G` 打开外部编辑器，`Esc` 取消。在某行按 `Enter` 重新读取该 marketplace，与 `marketplace update NAME` 相同。在同一行 3 秒内按两次 `x` 删除，已安装的插件保留；`tickloop` 行不显示 `x remove`，按 `x` 无操作也无提示；默认的 `claude-plugins-official` 可以删除，结果提示说明如何加回。添加、刷新和删除在后台进行，可安装页随之更新。`/ticks` 没有这一页，提示改到 `/plugins` 管理。
 
 输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目以及已启用插件和 Tick 的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
 
