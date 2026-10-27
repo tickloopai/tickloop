@@ -21,6 +21,7 @@ async fn create(access: &dyn AgentAccess, epoch: Uuid, directory: PathBuf) -> Ex
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory),
                 initial: None,
                 origin: None,
@@ -842,6 +843,7 @@ async fn create_with(
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory),
                 initial: Some(initial),
                 origin: None,

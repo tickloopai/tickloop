@@ -55,6 +55,7 @@ mod input_history;
 mod input_view;
 #[cfg(test)]
 mod late_receipt_tests;
+mod launch_rules;
 mod list_row;
 mod login;
 mod loop_view_text;
@@ -840,6 +841,7 @@ fn help_text() -> String {
 Usage: tickloop [--cwd DIRECTORY]
        [--add-dir PATH]
        [--mode | --permission-mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
+       [--allowedTools RULES] [--disallowedTools RULES]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
@@ -863,6 +865,7 @@ The working directory must exist; omitting --cwd uses the current directory.
 --permission-mode is the same as --mode; give one, or both with the same mode. Claude Code's dontAsk and bypassPermissions are --deny-on-prompt and --dangerously-skip-permissions here. defaultMode in settings.json takes the same names.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
 Starting without -c or -r opens a new Chat.
+--allowedTools / --allowed-tools and --disallowedTools / --disallowed-tools add temporary allow/deny rules to the new Agent and its Subagents. Repeat flags or separate rules with spaces or commas; quote command patterns, e.g. --allowedTools "Bash(git:*) Edit". /permissions shows these read-only Launch arguments. They are not saved and expire on restart; they cannot be combined with --continue, --resume or --chat-id. Deny, Ask, sensitive paths and Auto filtering still apply. --deny-on-prompt rejects operations that need human approval.
 -c, --continue resumes the most recent Chat in this directory.
 -r, --resume [CHAT] resumes the given Chat, or opens the Chat picker when CHAT is omitted.
 --fork-session copies the resumed conversation into a new Chat; use it with -c or -r.
@@ -977,6 +980,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let mut mode_flag = None;
     let mut permission_mode_flag = None;
     let mut prompt_policy = PromptPolicy::Interactive;
+    let mut launch_rules = Vec::new();
     let mut deny_on_prompt = false;
     let mut unrestricted = false;
     let mut caller_managed_trust = false;
@@ -1023,6 +1027,21 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                     mode_flag = given;
                 } else {
                     permission_mode_flag = given;
+                }
+            }
+            "--allowedTools" | "--allowed-tools" | "--disallowedTools" | "--disallowed-tools" => {
+                let value = arguments
+                    .next_if(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{argument} requires permission rules"))?;
+                let decision = if matches!(argument.as_str(), "--allowedTools" | "--allowed-tools")
+                {
+                    tickloop_harness::protocol::Decision::Allow
+                } else {
+                    tickloop_harness::protocol::Decision::Deny
+                };
+                launch_rules.extend(launch_rules::parse(&value, decision)?);
+                while let Some(value) = arguments.next_if(|value| !value.starts_with('-')) {
+                    launch_rules.extend(launch_rules::parse(&value, decision)?);
                 }
             }
             "--deny-on-prompt" => {
@@ -1100,6 +1119,15 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         fork_session = false;
     }
     let resumes_saved_chat = continue_recent || resume.is_some();
+    if !launch_rules.is_empty() && (resumes_saved_chat || exact_chat.is_some()) {
+        if view_handoff.is_none() {
+            return Err(
+                "launch tool rules require a new Agent; omit --continue, --resume and --chat-id"
+                    .into(),
+            );
+        }
+        launch_rules.clear();
+    }
     if fork_session && !resumes_saved_chat {
         return Err("--fork-session can only be used with --continue or --resume".into());
     }
@@ -1320,6 +1348,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         };
         Agent::connected(client, launch, view_host)
     };
+    agent.use_launch_rules(launch_rules);
     if (resumes_saved_chat || exact_chat.is_some())
         && !agent.saves_chats()
         && view_handoff.is_none()

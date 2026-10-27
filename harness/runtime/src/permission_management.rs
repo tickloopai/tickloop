@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use tickloop_harness_policy::AutoSettings;
 use tickloop_harness_policy::settings::{SettingsStoreError, SettingsUpdate};
-use tickloop_harness_tools::permissions::{canonical_directory, rule_views, validate_rule};
+use tickloop_harness_tools::permissions::{
+    canonical_directory, launch_rule_views, rule_views, validate_rule,
+};
 
 use super::{Agent, AgentError, ChatBookkeeping, require_folder};
 use tickloop_harness_protocol::{
@@ -191,6 +193,7 @@ impl Agent {
                         .project_constraints
                         .iter()
                         .chain(&snapshot.policy.managed_constraints)
+                        .chain(&snapshot.policy.launch_rules)
                         .any(|constraint| constraint.id == id)
                     {
                         return Err(PermissionChangeError::Invalid("rule is read-only".into()));
@@ -437,7 +440,7 @@ fn view_from_snapshot(
         key_status: jev_key_status,
         health: auto_reviewer_health,
     } = auto;
-    let rules = rule_views(
+    let mut rules = rule_views(
         &snapshot.policy.rules,
         |rule| {
             bookkeeping
@@ -452,6 +455,10 @@ fn view_from_snapshot(
         &snapshot.policy.managed_constraints,
         &snapshot.policy.host_rules,
     );
+    rules.extend(launch_rule_views(
+        &snapshot.policy.launch_rules,
+        snapshot.policy.mode,
+    ));
     PermissionsView {
         chat_id: snapshot.id,
         revision: PermissionsRevision::new(
@@ -485,6 +492,7 @@ fn validate_editable_rule(
         .project_constraints
         .iter()
         .chain(&snapshot.policy.managed_constraints)
+        .chain(&snapshot.policy.launch_rules)
         .any(|constraint| constraint.id == rule.id)
     {
         return Err(PermissionChangeError::Invalid("rule is read-only".into()));

@@ -82,6 +82,7 @@ async fn legacy_wire_schema_is_rejected_before_pipelined_create_can_execute() {
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: Some(UserInput::Text {
                     text: "Produce the fixture reply.".into(),
@@ -314,6 +315,7 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: Some(UserInput::Text {
                     text: "Delegate three scoped children and send follow-up context.".into(),

@@ -450,6 +450,7 @@ pub(super) fn effective_policy(
             };
             for rules in [
                 &ancestor_policy.rules,
+                &ancestor_policy.launch_rules,
                 &ancestor_policy.project_constraints,
                 &ancestor_policy.managed_constraints,
             ] {
@@ -1111,6 +1112,7 @@ impl Agent {
                     let mut policy = snapshot.policy.clone();
                     for rules in [
                         &mut policy.rules,
+                        &mut policy.launch_rules,
                         &mut policy.project_constraints,
                         &mut policy.managed_constraints,
                     ] {
@@ -1254,6 +1256,7 @@ impl Agent {
                                 user_context,
                                 announced_date,
                             }),
+                            Vec::new(),
                         )
                         .await
                         .map_err(|error| error.to_string())?;

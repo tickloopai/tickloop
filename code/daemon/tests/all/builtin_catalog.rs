@@ -28,6 +28,7 @@ async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
             daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: LaunchSpec::embedded(directory.path().into()),
                 initial: None,
                 origin: None,

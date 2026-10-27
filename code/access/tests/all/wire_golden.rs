@@ -197,6 +197,7 @@ fn permission_policy() -> PermissionPolicy {
         managed_constraints: vec![permission_rule(0x73, Decision::Deny, true)],
         // Never on the wire: the golden shows none.
         host_rules: vec![permission_rule(0x74, Decision::Allow, false)],
+        launch_rules: Vec::new(),
         revision: 4,
     }
 }
@@ -525,6 +526,7 @@ fn agent_commands_keep_their_recorded_wire() {
         "agent_command",
         &vec![
             AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch: launch_spec(),
                 initial: Some(UserInput::Text {
                     text: "Check the counter".into(),

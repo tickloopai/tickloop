@@ -2255,6 +2255,29 @@ impl Agent {
             .await
     }
 
+    /// Creates a root Chat with rules that last only for this launch and its descendants.
+    pub async fn create_chat_with_launch_rules(
+        &self,
+        folder: PathBuf,
+        rules: Vec<PermissionRule>,
+    ) -> Result<ChatId, AgentError> {
+        for rule in &rules {
+            tickloop_harness_tools::permissions::validate_rule(rule)
+                .map_err(|reason| AgentError::Invalid(reason.into()))?;
+            if rule.persistent
+                || rule.loop_id.is_some()
+                || !matches!(rule.decision, Decision::Allow | Decision::Deny)
+            {
+                return Err(AgentError::Invalid(
+                    "launch rules must be nonpersistent allow or deny rules for the whole Chat"
+                        .into(),
+                ));
+            }
+        }
+        self.create_chat_with_delegation(tickloop_ids::generate().into(), Some(folder), None, rules)
+            .await
+    }
+
     /// A new Chat without a Folder, in an Agent without an Execution Environment.
     pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
         self.create_chat_with_id(tickloop_ids::generate().into(), None)
@@ -2278,7 +2301,8 @@ impl Agent {
         id: ChatId,
         folder: Option<PathBuf>,
     ) -> Result<ChatId, AgentError> {
-        self.create_chat_with_delegation(id, folder, None).await
+        self.create_chat_with_delegation(id, folder, None, Vec::new())
+            .await
     }
 
     /// The canonical Folder of a new Chat. Chats have a Folder exactly when the Agent has an
@@ -2311,6 +2335,7 @@ impl Agent {
         id: ChatId,
         folder: Option<PathBuf>,
         inherited: Option<InheritedChat>,
+        launch_rules: Vec<PermissionRule>,
     ) -> Result<ChatId, AgentError> {
         let _upgrade = self.inner.upgrade_gate.read().await;
         let folder = self.admit_folder(folder)?;
@@ -2353,6 +2378,7 @@ impl Agent {
             (client, output_style, user_context, announced_date)
         } else {
             let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+            snapshot.policy.launch_rules = launch_rules;
             (client, output_style, OnceLock::new(), None)
         };
         if let SearchDefaults::Fixed(config) = &self.inner.search {

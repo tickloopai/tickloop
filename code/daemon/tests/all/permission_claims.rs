@@ -111,6 +111,7 @@ impl Fixture {
             envelope(
                 epoch,
                 AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch: LaunchSpec::embedded(directory.path().to_path_buf()),
                     initial: Some(UserInput::Text {
                         text: "Read the external source".into(),

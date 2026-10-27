@@ -616,6 +616,7 @@ impl AgentConsole {
                 daemon_epoch: self.epoch,
                 command_id,
                 command: AgentCommand::Create {
+                    launch_rules: Vec::new(),
                     launch,
                     initial: Some(input),
                     origin,

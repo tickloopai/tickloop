@@ -819,6 +819,7 @@ async fn agent_access_reports_servers_takes_up_disabling_and_reconnects_one() {
             daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
+                launch_rules: Vec::new(),
                 launch,
                 initial: None,
                 origin: None,
