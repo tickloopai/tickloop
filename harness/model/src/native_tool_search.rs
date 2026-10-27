@@ -62,6 +62,34 @@ pub(crate) fn is_record(protocol: Protocol, value: &Value) -> bool {
     }
 }
 
+/// A vendor tool search record in history, as `/context` counts it.
+pub struct SearchRecord {
+    pub label: String,
+    /// Deferred tools the record names whose definitions the vendor loads beside it: a Messages
+    /// search result carries references, not the definitions themselves.
+    pub loaded_tools: Vec<String>,
+}
+
+pub fn search_record(protocol: Protocol, value: &Value) -> Option<SearchRecord> {
+    if !is_record(protocol, value) {
+        return None;
+    }
+    let loaded_tools = if value["type"] == MESSAGES_SEARCH_RESULT {
+        value["content"]["tool_references"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference["tool_name"].as_str().map(str::to_owned))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(SearchRecord {
+        label: readable_text(value).unwrap_or_else(|| "Tool search namespace.".into()),
+        loaded_tools,
+    })
+}
+
 /// What a record says, for a model that cannot replay it; namespaces say nothing.
 pub(crate) fn readable_text(value: &Value) -> Option<String> {
     let found = |names: Vec<&str>| {

@@ -868,6 +868,21 @@ impl Agent {
         Some(plan_mode_reminder(&plan_file, plan_file.exists()))
     }
 
+    /// The Plan mode section as the next request would send it, without preparing the plan file
+    /// it names: a Chat without a plan file prefix yet reads with a stand-in name.
+    pub(super) fn plan_mode_preview(&self, chat: &Chat, loop_id: LoopId) -> Option<String> {
+        if chat.snapshot.policy.mode != ExecutionMode::Plan {
+            return None;
+        }
+        if chat.snapshot.delegation.is_some() {
+            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
+        }
+        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
+        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
+            .unwrap_or_else(|| directory.path().join(format!("plan{PLAN_FILE_EXTENSION}")));
+        Some(plan_mode_reminder(&plan_file, plan_file.exists()))
+    }
+
     pub(super) async fn control_tool(
         &self,
         receipt: &Receipt,

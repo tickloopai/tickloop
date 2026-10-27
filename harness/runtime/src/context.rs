@@ -606,7 +606,8 @@ pub(super) fn context_window(snapshot: &ChatSnapshot) -> Option<usize> {
         .or(snapshot.context_window_tokens)
 }
 
-fn input_token_budget(window: usize) -> usize {
+/// The input tokens beyond which a conversation request first compacts the Chat.
+pub(super) fn input_token_budget(window: usize) -> usize {
     window.saturating_mul(COMPACTION_INPUT_PERCENT) / 100
 }
 

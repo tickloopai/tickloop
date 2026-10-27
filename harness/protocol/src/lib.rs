@@ -7,6 +7,7 @@ mod auto_settings;
 mod auto_setup;
 mod chat;
 mod chat_status;
+mod context_breakdown;
 mod context_usage;
 mod denials;
 mod family;
@@ -69,6 +70,10 @@ pub use chat::{
     chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
+pub use context_breakdown::{
+    ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextItem, ContextToolServer,
+    ToolSearchMode, ToolSearchPool, UnavailableToolServer,
+};
 pub use context_usage::{
     ContextMeasurement, ContextTokenCounter, ESTIMATED_CONTEXT_BYTES_PER_TOKEN,
     context_token_counter, current_context_tokens, estimated_image_tokens, message_content_tokens,

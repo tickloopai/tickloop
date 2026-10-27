@@ -44,6 +44,18 @@ pub struct ExposureTool {
     pub exposure: ToolExposure,
 }
 
+impl ExposureTool {
+    /// The definition native search defers: the original schema, as DescribeTools would show it,
+    /// unless its root is not an object, which would make the vendor refuse the whole request.
+    pub fn deferred_definition(&self) -> ToolDefinition {
+        let mut definition = self.definition.clone();
+        if self.original_schema["type"] == "object" {
+            definition.input_schema = self.original_schema.clone();
+        }
+        definition
+    }
+}
+
 /// A server whose tools discovery cannot offer right now, so a search can say why it is missing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct UnavailableServer {
@@ -89,21 +101,13 @@ impl ExposureDirectory {
         }
     }
 
-    /// Native search reads the original schema, as DescribeTools would show it: only vendors
-    /// that accept combinators offer it. A schema whose root is not an object would make the
-    /// vendor refuse the whole request, so that tool keeps its flattened definition.
+    /// Native search reads the original schema: only vendors that accept combinators offer it.
     pub fn deferred_tools(&self) -> Vec<ToolDefinition> {
         if matches!(self.search_support, SearchSupport::Native) {
             self.tools
                 .iter()
                 .filter(|tool| tool.exposure == ToolExposure::Search)
-                .map(|tool| {
-                    let mut definition = tool.definition.clone();
-                    if tool.original_schema["type"] == "object" {
-                        definition.input_schema = tool.original_schema.clone();
-                    }
-                    definition
-                })
+                .map(ExposureTool::deferred_definition)
                 .collect()
         } else {
             Vec::new()

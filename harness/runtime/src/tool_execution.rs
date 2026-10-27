@@ -165,6 +165,34 @@ const FOLDER_HOST_TOOLS: [&str; 6] = [
     crate::mcp_tools::ARTIFACT_UPLOAD_TOOL,
 ];
 
+/// The MCP tools discovery offers `chat`; a delegated Chat only those its ceiling grants.
+pub(super) fn chat_discovery_tools(
+    chat: &Chat,
+    provider: &dyn crate::host_tools::HostToolProvider,
+) -> Vec<crate::tool_exposure::ExposureTool> {
+    provider
+        .discovery_tools()
+        .into_iter()
+        .filter(|tool| {
+            chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                delegation
+                    .ceiling
+                    .host_tools
+                    .contains_key(&tool.definition.name)
+            })
+        })
+        .collect()
+}
+
+/// Vendor tool search when the Chat's model offers it, SearchTools otherwise.
+pub(super) fn search_support(chat: &Chat) -> crate::tool_exposure::SearchSupport {
+    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model).is_some() {
+        crate::tool_exposure::SearchSupport::Native
+    } else {
+        crate::tool_exposure::SearchSupport::Fold
+    }
+}
+
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
@@ -319,29 +347,12 @@ impl ToolRegistry {
                 );
             }
             if provider.has_tool_search() {
-                let discovery = provider
-                    .discovery_tools()
-                    .into_iter()
-                    .filter(|tool| {
-                        chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
-                            delegation
-                                .ceiling
-                                .host_tools
-                                .contains_key(&tool.definition.name)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let search_support =
-                    if tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model)
-                        .is_some()
-                    {
-                        crate::tool_exposure::SearchSupport::Native
-                    } else {
-                        crate::tool_exposure::SearchSupport::Fold
-                    };
                 let directory = Arc::new(
-                    crate::tool_exposure::ExposureDirectory::new(discovery, search_support)
-                        .with_unavailable_servers(provider.unavailable_tool_servers()),
+                    crate::tool_exposure::ExposureDirectory::new(
+                        chat_discovery_tools(chat, provider.as_ref()),
+                        search_support(chat),
+                    )
+                    .with_unavailable_servers(provider.unavailable_tool_servers()),
                 );
                 deferred = directory.deferred_tools();
                 folded.extend(
