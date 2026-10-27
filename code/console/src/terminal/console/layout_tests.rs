@@ -60,7 +60,7 @@ fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
         .update_status_area(
             "Auto".into(),
             "deepseek-flash".into(),
-            Some((40_000, 1_000_000)),
+            Some((40_000, 1_000_000).into()),
             None,
         )
         .unwrap();
@@ -169,7 +169,7 @@ fn agent_layout_background_titles_use_display_columns_without_family_reading_num
                 .update_status_area(
                     "Auto".into(),
                     "deepseek-flash".into(),
-                    Some((40_000, 1_000_000)),
+                    Some((40_000, 1_000_000).into()),
                     None,
                 )
                 .unwrap();
@@ -441,9 +441,12 @@ fn child_clear_feedback_has_its_own_row_above_the_composer_and_expanded_family()
         state.chat = Some(ROOT_AGENT);
         state.prompt_enabled = true;
         state.visible_delegated = true;
-        state
-            .status_area
-            .update("Auto".into(), "fixture".into(), Some((20000, 200000)), None);
+        state.status_area.update(
+            "Auto".into(),
+            "fixture".into(),
+            Some((20000, 200000).into()),
+            None,
+        );
         state.status_area.update_agents(
             vec![
                 agent_row(ROOT_AGENT, None, "long root title"),
@@ -1914,7 +1917,12 @@ fn agent_layout_pty_fixture() {
         )
         .unwrap();
     console
-        .update_status_area("Ask".into(), "test model".into(), Some((20, 100)), None)
+        .update_status_area(
+            "Ask".into(),
+            "test model".into(),
+            Some((20, 100).into()),
+            None,
+        )
         .unwrap();
     console
         .set_agent_family(

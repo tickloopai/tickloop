@@ -22,6 +22,26 @@ const MAX_BACKGROUND_TITLE_COLUMNS: usize = 24;
 const BACKGROUND_AGENT_NAME_PREFIX: &str = "Agent ";
 const STATUS_SEGMENT_SEPARATOR: &str = " · ";
 
+/// What the status line's context segment shows: the share of the window used, in the warning
+/// role once the context is nearly full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ContextGauge {
+    pub(super) used_tokens: u64,
+    pub(super) window_tokens: usize,
+    /// Within the warning buffer of the automatic compaction line.
+    pub(super) is_nearly_full: bool,
+}
+
+impl From<(u64, usize)> for ContextGauge {
+    fn from((used_tokens, window_tokens): (u64, usize)) -> Self {
+        Self {
+            used_tokens,
+            window_tokens,
+            is_nearly_full: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BackgroundStatusNotice {
     pub(super) title: Option<String>,
@@ -131,7 +151,7 @@ struct TaskViewState {
 pub(super) struct StatusArea {
     mode: String,
     model: String,
-    context: Option<(u64, usize)>,
+    context: Option<ContextGauge>,
     tasks: Option<TaskBoard>,
     task_view: TaskViewState,
     task_views: HashMap<
@@ -171,10 +191,10 @@ impl StatusArea {
         &mut self,
         mode: String,
         model: String,
-        context: Option<(u64, usize)>,
+        context: Option<ContextGauge>,
         tasks: Option<TaskBoard>,
     ) -> bool {
-        let context = context.filter(|(_, limit)| *limit > 0);
+        let context = context.filter(|gauge| gauge.window_tokens > 0);
         let changed = self.mode != mode
             || self.model != model
             || self.context != context
@@ -456,10 +476,19 @@ impl StatusArea {
             _ => Role::Text,
         };
         let (context, context_role) = match self.context {
-            Some((used, limit)) => {
-                let percent =
-                    used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
-                (format!("Context {percent}% used"), Role::Success)
+            Some(gauge) => {
+                let window = gauge.window_tokens as u64;
+                let percent = gauge
+                    .used_tokens
+                    .saturating_mul(100)
+                    .saturating_add(window / 2)
+                    / window;
+                let role = if gauge.is_nearly_full {
+                    Role::Warning
+                } else {
+                    Role::Success
+                };
+                (format!("Context {percent}% used"), role)
             }
             None => ("Context unknown".into(), Role::MutedText),
         };
@@ -1375,7 +1404,12 @@ mod tests {
     #[test]
     fn context_segment_shows_zero_before_usage_with_a_known_window() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((0, 200_000)), None);
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((0, 200_000).into()),
+            None,
+        );
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 0% used"
@@ -1385,7 +1419,12 @@ mod tests {
     #[test]
     fn context_segment_shows_rounded_zero_usage() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((999, 200_000)), None);
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((999, 200_000).into()),
+            None,
+        );
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 0% used"
@@ -1395,7 +1434,7 @@ mod tests {
     #[test]
     fn context_segment_shows_unknown_when_usage_or_window_is_unavailable() {
         let mut area = StatusArea::default();
-        for context in [None, Some((42, 0))] {
+        for context in [None, Some((42, 0).into())] {
             area.update("Auto".into(), "model".into(), context, None);
             assert_eq!(
                 area.status_line(80, "").text(),
@@ -1407,7 +1446,12 @@ mod tests {
     #[test]
     fn context_segment_shows_rounded_usage_and_keeps_the_existing_fit_priority() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((1000, 200_000)), None);
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((1000, 200_000).into()),
+            None,
+        );
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 1% used"
@@ -1431,7 +1475,12 @@ mod tests {
         let narrow = area.status_line(24, "Not saved").text();
         assert!(narrow.starts_with("⏵⏵ Auto · Not saved"));
         assert!(!narrow.contains("gpt-5.6"));
-        area.update("Auto".into(), "gpt-5.6".into(), Some((0, 200_000)), None);
+        area.update(
+            "Auto".into(),
+            "gpt-5.6".into(),
+            Some((0, 200_000).into()),
+            None,
+        );
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · gpt-5.6 · Context 0% used"
@@ -1439,7 +1488,7 @@ mod tests {
         area.update(
             "Auto".into(),
             "gpt-5.6".into(),
-            Some((42_000, 200_000)),
+            Some((42_000, 200_000).into()),
             None,
         );
         assert_eq!(
@@ -1461,7 +1510,12 @@ mod tests {
         area.update("Auto".into(), "model".into(), None, None);
         assert_eq!(context_role(&area), Some(Role::MutedText));
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Warning));
-        area.update("Auto".into(), "model".into(), Some((42_000, 200_000)), None);
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((42_000, 200_000).into()),
+            None,
+        );
         assert_eq!(context_role(&area), Some(Role::Success));
         assert!(
             area.status_line(80, "")
@@ -1471,6 +1525,29 @@ mod tests {
         );
         area.update("Plan".into(), "model".into(), None, None);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::PlanMode));
+    }
+
+    #[test]
+    fn a_nearly_full_context_switches_to_the_warning_role_with_the_same_text() {
+        let mut area = StatusArea::default();
+        area.update(
+            "Ask".into(),
+            "model".into(),
+            Some(ContextGauge {
+                used_tokens: 150_000,
+                window_tokens: 200_000,
+                is_nearly_full: true,
+            }),
+            None,
+        );
+        let line = area.status_line(80, "");
+        assert_eq!(line.text(), "⏵⏵ Ask · model · Context 75% used");
+        let context = line
+            .spans
+            .iter()
+            .find(|span| span.text.contains("Context"))
+            .unwrap();
+        assert_eq!(context.role, Some(Role::Warning));
     }
 
     #[test]
@@ -1512,7 +1589,12 @@ mod tests {
     #[test]
     fn indicator_keeps_goal_and_model_before_optional_mode_and_context() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
+        area.update(
+            "Auto".into(),
+            "fixture".into(),
+            Some((21000, 100000).into()),
+            None,
+        );
         for (width, expected) in [
             (
                 100,

@@ -128,6 +128,7 @@ use renderer::Renderer;
 use reply_lines::ReplyLines;
 use running_shimmer::RunningShimmer;
 use scrollback::InputEcho;
+use status_area::ContextGauge;
 use style::Role;
 
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
@@ -1897,6 +1898,7 @@ async fn interact_with_herdr(
     // The inputs of each Chat still waiting for their echo after the conversation was last read
     // for them; the same waits are not read for again until they change.
     let mut unsettled_echoes: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+    let mut context_warnings = ContextWarnings::default();
     // The catalog's account of each family member whose snapshot this View last applied.
     let mut applied_member_work: HashMap<uuid::Uuid, MemberWork> = HashMap::new();
     let mut running_activity: Option<RunningActivity> = None;
@@ -2305,6 +2307,9 @@ async fn interact_with_herdr(
                     context_usage(&status),
                     visible_task_board,
                 )?;
+                if let Some(notice) = context_warnings.crossing_notice(&status) {
+                    write_warning(console, &notice)?;
+                }
                 let running_receipt = pending
                     .values()
                     .find(|receipt| {
@@ -7731,20 +7736,48 @@ fn recover_background_chat(
     recovery
 }
 
-fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
+fn initial_context_usage(model: &ModelConfig) -> Option<ContextGauge> {
     model
         .maximum_context_window_tokens()
         .filter(|limit| *limit > 0)
-        .map(|limit| (0, limit))
+        .map(|limit| (0, limit).into())
 }
 
-fn context_usage(status: &ChatStatus) -> Option<(u64, usize)> {
+fn context_usage(status: &ChatStatus) -> Option<ContextGauge> {
     let limit = status
         .model
         .maximum_context_window_tokens()
         .or(status.context_window_tokens)
         .filter(|limit| *limit > 0)?;
-    Some((status.context_tokens?, limit))
+    Some(ContextGauge {
+        used_tokens: status.context_tokens?,
+        window_tokens: limit,
+        is_nearly_full: status.is_context_nearly_full(),
+    })
+}
+
+/// The Chats this View has warned are nearly out of context. A Chat is warned once as it crosses
+/// into the warning buffer, and again only after its context falls back below it, as compaction
+/// makes it.
+#[derive(Default)]
+struct ContextWarnings(HashSet<uuid::Uuid>);
+
+impl ContextWarnings {
+    /// The notice to show when `status` has just crossed into the warning buffer.
+    fn crossing_notice(&mut self, status: &ChatStatus) -> Option<String> {
+        let chat = status.id.uuid();
+        if !status.is_context_nearly_full() {
+            self.0.remove(&chat);
+            return None;
+        }
+        let line = status.auto_compact_tokens?;
+        self.0.insert(chat).then(|| {
+            format!(
+                "Context nearly full · auto-compact at {} tokens · /compact to compact now",
+                presentation::compact_count(line)
+            )
+        })
+    }
 }
 
 /// A model retry as Claude Code reports it: what failed, then the retry and its attempt, which
@@ -9017,7 +9050,7 @@ mod tests {
         switch_to_saved_branch, tui_renderer_request,
     };
     use super::{
-        BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
+        BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, ContextWarnings, Receipt,
         UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
         observe_user_shell_record, readable_background_label, recover_background_chat,
         track_run_requests,
@@ -9029,6 +9062,50 @@ mod tests {
     use tickloop_harness::protocol::{Decision, PermissionRule};
     use tickloop_harness::protocol::{ModelRequestKind, RequestOutcome, RequestOwner};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn a_chat_is_warned_once_as_its_context_nears_the_compaction_line_and_again_after_compacting()
+     {
+        let agent = Agent::new_embedded(
+            tickloop_harness::test_support::config_with_window(200_000),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
+        );
+        let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
+        let mut status =
+            tickloop_harness::protocol::ChatStatus::of(&agent.snapshot(chat_id).await.unwrap());
+        status.auto_compact_tokens = Some(167_000);
+        let mut warnings = ContextWarnings::default();
+        let mut observe = |used: u64| {
+            status.context_tokens = Some(used);
+            let gauge = context_usage(&status).unwrap();
+            (gauge.is_nearly_full, warnings.crossing_notice(&status))
+        };
+        assert_eq!(observe(146_999), (false, None), "below the warning");
+        assert_eq!(
+            observe(147_000),
+            (
+                true,
+                Some(
+                    "Context nearly full · auto-compact at 167k tokens · /compact to compact now"
+                        .into()
+                )
+            ),
+            "crossing into the warning buffer warns"
+        );
+        assert_eq!(
+            observe(160_000),
+            (true, None),
+            "the same crossing warns once"
+        );
+        assert_eq!(observe(20_000), (false, None), "compaction resets it");
+        assert!(
+            observe(150_000).1.is_some(),
+            "the next crossing warns again"
+        );
+        agent.shutdown().await;
+    }
 
     #[tokio::test]
     async fn context_starts_at_zero_and_uses_the_effective_model_window() {
@@ -9049,7 +9126,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
 
         let request = snapshot
@@ -9066,7 +9143,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
         let mut without_report = snapshot.clone();
         without_report
@@ -9075,7 +9152,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&without_report)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
         let measurement =
             tickloop_harness::protocol::ContextMeasurement::capture(&snapshot, 1000, 1000);
@@ -9097,7 +9174,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((12_500, 1_000_000))
+            Some((12_500, 1_000_000).into())
         );
         snapshot
             .request_usage
@@ -9117,7 +9194,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((12_500, 1_000_000))
+            Some((12_500, 1_000_000).into())
         );
     }
 

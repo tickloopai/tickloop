@@ -144,7 +144,7 @@ use super::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
     },
-    status_area::{BackgroundStatusNotice, StatusArea},
+    status_area::{BackgroundStatusNotice, ContextGauge, StatusArea},
     style::{ColourDepth, Role, RoleLine, RoleSpan, Span, StyledLine, ThemeName},
     transcript::{Transcript, TranscriptDocument, TranscriptEvent},
 };
@@ -2521,7 +2521,7 @@ impl Console {
         &self,
         mode: String,
         model: String,
-        context: Option<(u64, usize)>,
+        context: Option<ContextGauge>,
         tasks: Option<TaskBoard>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -21194,9 +21194,12 @@ mod tests {
         state.prompt_enabled = true;
         state.insert("inspect current work");
         let draft = state.editor.draft().to_owned();
-        state
-            .status_area
-            .update("Auto".into(), "model".into(), Some((42000, 200000)), None);
+        state.status_area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((42000, 200000).into()),
+            None,
+        );
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
@@ -21472,7 +21475,7 @@ mod tests {
         state.status_area.update(
             "Auto".into(),
             "deepseek-flash".into(),
-            Some((12_500, 1_000_000)),
+            Some((12_500, 1_000_000).into()),
             None,
         );
         state.scrollback.append(
