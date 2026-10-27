@@ -30,13 +30,14 @@ use super::{
 };
 use tickloop_harness::protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
-    OperationRecord, PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME,
-    SUBAGENT_TOOL_NAME, SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine,
-    ToolResult, UserShellRecord, UserShellState, WebSearchFailure, WebSearchSuggestion,
+    OperationRecord, OperationState, PermissionApprovalSource, PermissionRequest,
+    SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentReportMessage,
+    TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord, UserShellState,
+    WebSearchFailure, WebSearchSuggestion,
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
-/// Calls whose own calls a Run makes under them: a Codemode script's and an ExecuteTools batch's.
+// A Codemode script and an ExecuteTools batch make calls of their own under their call.
 const CODEMODE_TOOL_NAME: &str = "Codemode";
 const EXECUTE_TOOLS_NAME: &str = "ExecuteTools";
 const PREVIEW_LINES: usize = 5;
@@ -666,11 +667,10 @@ impl TranscriptWriter {
     fn nested_call(&mut self, operation: &OperationRecord) {
         let hang = RESULT_INDENT + BLOCK_INDENT;
         let dot = match operation.state {
-            tickloop_harness::protocol::OperationState::Completed => Role::Success,
-            tickloop_harness::protocol::OperationState::Failed => Role::Error,
-            tickloop_harness::protocol::OperationState::Unknown => Role::Warning,
-            tickloop_harness::protocol::OperationState::Proposed
-            | tickloop_harness::protocol::OperationState::Admitted => Role::MutedText,
+            OperationState::Completed => Role::Success,
+            OperationState::Failed => Role::Error,
+            OperationState::Unknown => Role::Warning,
+            OperationState::Proposed | OperationState::Admitted => Role::MutedText,
         };
         self.hanging(" ".repeat(RESULT_INDENT), None, hang);
         self.hanging(
@@ -700,12 +700,23 @@ impl TranscriptWriter {
             None,
             None,
         );
-        let hang = RESULT_INDENT * 2;
+        self.result_indented(RESULT_INDENT, lines);
+    }
+
+    /// Rows under a `⎿` connector, every row and its wrapped continuation indented to the
+    /// content, as Claude Code's `MessageResponse` lays a result out.
+    fn result(&mut self, lines: Vec<ResultLine>) {
+        self.result_indented(0, lines);
+    }
+
+    /// [`Self::result`] moved `indent` columns right.
+    fn result_indented(&mut self, indent: usize, lines: Vec<ResultLine>) {
+        let hang = indent + RESULT_INDENT;
         for (index, line) in lines.into_iter().enumerate() {
             let lead = if index == 0 {
                 format!(
                     "{}  {}  ",
-                    " ".repeat(RESULT_INDENT),
+                    " ".repeat(indent),
                     self.display.glyph(Glyph::ToolResult)
                 )
             } else {
@@ -724,35 +735,6 @@ impl TranscriptWriter {
                     role,
                     fill: line.fill,
                     hang,
-                    link: None,
-                });
-            }
-            self.text("\n", None);
-        }
-    }
-
-    /// Rows under a `⎿` connector, every row and its wrapped continuation indented to the
-    /// content, as Claude Code's `MessageResponse` lays a result out.
-    fn result(&mut self, lines: Vec<ResultLine>) {
-        for (index, line) in lines.into_iter().enumerate() {
-            let lead = if index == 0 {
-                format!("  {}  ", self.display.glyph(Glyph::ToolResult))
-            } else {
-                " ".repeat(RESULT_INDENT)
-            };
-            self.document.push(TranscriptPiece::Text {
-                text: lead,
-                role: Some(Role::MutedText),
-                fill: line.fill,
-                hang: RESULT_INDENT,
-                link: None,
-            });
-            for (text, role) in line.spans {
-                self.document.push(TranscriptPiece::Text {
-                    text,
-                    role,
-                    fill: line.fill,
-                    hang: RESULT_INDENT,
                     link: None,
                 });
             }

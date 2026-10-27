@@ -1269,16 +1269,9 @@ fn append_public_message(
                             &history.tick_labels,
                         )
                     };
-                    let mut text = spans
-                        .iter()
-                        .map(|(text, _)| text.as_str())
-                        .collect::<String>();
-                    text.truncate(text.len().saturating_sub(1));
-                    text.push_str(state.suffix());
-                    text.push('\n');
                     history.pieces.push(ConversationPiece::ToolCall {
                         run_id: run.into(),
-                        text,
+                        text: tool_call_text(&spans, state),
                         call_key: presentation::tool_call_key(run.into(), id),
                         spans,
                         state,
@@ -1409,6 +1402,21 @@ fn append_public_message(
     }
 }
 
+/// A call row's plain text: its spans with the state's suffix before the final newline.
+fn tool_call_text(
+    spans: &[(String, Option<super::style::Role>)],
+    state: super::scrollback::ToolCallState,
+) -> String {
+    let mut text = spans
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    text.truncate(text.len().saturating_sub(1));
+    text.push_str(state.suffix());
+    text.push('\n');
+    text
+}
+
 /// The calls a script or batch made, each with its result, under the row of the call that made
 /// them.
 fn append_nested_calls(
@@ -1438,16 +1446,9 @@ fn append_nested_calls(
                 .copied()
                 .unwrap_or(super::scrollback::ToolCallState::Finished),
         };
-        let mut text = spans
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect::<String>();
-        text.truncate(text.len().saturating_sub(1));
-        text.push_str(state.suffix());
-        text.push('\n');
         history.pieces.push(ConversationPiece::ToolCall {
             run_id: run,
-            text,
+            text: tool_call_text(&spans, state),
             call_key: call_key.clone(),
             spans,
             state,

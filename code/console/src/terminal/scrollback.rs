@@ -681,9 +681,6 @@ impl Scrollback {
         }
         if indent > 0 {
             for (line, style) in result.lines.iter_mut().zip(&mut result.line_styles) {
-                if style.markdown.is_some() {
-                    continue;
-                }
                 line.insert_str(0, &" ".repeat(indent));
                 for (range, _) in &mut style.marks {
                     *range = range.start + indent..range.end + indent;

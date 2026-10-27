@@ -3581,8 +3581,6 @@ impl Console {
         Ok(())
     }
 
-    /// Ends one call or the remaining calls of the originating Run.
-    /// Records one call's final display state, or finishes the run's remaining calls.
     /// Puts the row of `call_key`, once written, under the row of `parent_key`.
     pub(super) fn nest_tool_call(&self, call_key: &str, parent_key: &str) -> Result<(), String> {
         self.state
@@ -3593,6 +3591,8 @@ impl Console {
         Ok(())
     }
 
+    /// Ends one call or the remaining calls of the originating Run.
+    /// Records one call's final display state, or finishes the run's remaining calls.
     pub(super) fn finish_tool_call(
         &self,
         run_id: Uuid,

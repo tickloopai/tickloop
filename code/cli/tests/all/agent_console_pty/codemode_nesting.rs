@@ -110,6 +110,86 @@ async fn script_calls_show_under_their_codemode_call(fixture: &PrivateFixture) {
     view.close().await;
 }
 
+const CONFIRM_SCRIPT: &str = "try { await tools.WebFetch({url:'https://confirmation.invalid/', prompt:'Summarize'}); } catch (error) {}\ntext('CONFIRM-DONE');";
+const CONFIRM_PROMPT: &str = "Write a confirmed note with a script.";
+const CONFIRM_REPLY: &str = "CONFIRM-REPLY";
+
+fn shows_script_confirmation(frame: &str) -> bool {
+    frame.contains("From Codemode call") && frame.contains("WebFetch")
+}
+
+async fn a_pending_script_confirmation_outlives_its_view(fixture: &PrivateFixture) {
+    let (url, _requests) = model_http_support::serve_responses(vec![
+        (
+            200,
+            chat_reply(
+                Some(("Codemode", "script", json!({ "code": CONFIRM_SCRIPT }))),
+                "",
+            ),
+        ),
+        (200, chat_reply(None, CONFIRM_REPLY)),
+    ])
+    .await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
+    view.wait_for("Ask View ready", new_input_is_visible).await;
+    view.send(format!("{CONFIRM_PROMPT}\r").as_bytes());
+    let asked = view
+        .wait_for(
+            "the script's WebFetch asks first",
+            shows_script_confirmation,
+        )
+        .await;
+    eprintln!("[codemode-confirmation]\n{asked}\n[/codemode-confirmation]");
+    // The Agent Pane goes away without answering; the Agent keeps waiting in the daemon.
+    view.child.kill().unwrap();
+    view.child.wait().unwrap();
+
+    let mut attached = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
+    attached
+        .wait_for("second View ready", new_input_is_visible)
+        .await;
+    attached.resize(120, 40).await;
+    attached.send(b"\x1b[D");
+    attached
+        .wait_for("Agents lists the waiting conversation", |frame| {
+            frame.contains("Agents · local") && frame.contains(CONFIRM_PROMPT)
+        })
+        .await;
+    select_overview_row(&mut attached, CONFIRM_PROMPT).await;
+    attached.send(b"\r");
+    let returned = attached
+        .wait_for(
+            "the returning View shows the same confirmation",
+            shows_script_confirmation,
+        )
+        .await;
+    eprintln!("[codemode-confirmation-returned]\n{returned}\n[/codemode-confirmation-returned]");
+    attached.send(b"\r");
+    let done = attached
+        .wait_for("the confirmed script finishes", |frame| {
+            frame.contains(CONFIRM_REPLY)
+        })
+        .await;
+    assert!(
+        conversation_body(&done).contains("     ⏺ WebFetch · https://confirmation.invalid/"),
+        "{done}"
+    );
+    attached.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_keeps_a_script_confirmation_for_the_next_view() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(a_pending_script_confirmation_outlives_its_view(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::test]
 async fn actual_cli_nests_script_calls_under_their_codemode_call() {
     let fixture = PrivateFixture::new();
