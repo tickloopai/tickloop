@@ -714,6 +714,13 @@ pub enum ObservationRequest {
         launch: Box<LaunchSpec>,
         draft: Box<ContextDraft>,
     },
+    /// Connects the MCP server `name` a New Agent `launch` would start, as that Agent would, and
+    /// answers with its status and the tools it lists as the one entry of `McpServers`. The
+    /// connection closes once listed; no tool runs.
+    DraftMcpServer {
+        launch: Box<LaunchSpec>,
+        name: String,
+    },
 }
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user

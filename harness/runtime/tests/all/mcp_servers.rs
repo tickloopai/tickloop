@@ -2589,6 +2589,34 @@ async fn statuses_report_each_server_and_a_disabled_server_never_runs() {
 }
 
 #[tokio::test]
+async fn a_settled_status_waits_for_the_connection_and_reports_its_tools_or_its_failure() {
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name":"search","inputSchema":{"type":"object"}}]));
+    server.delay_discover(Duration::from_millis(200));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let mut refused = http_config("refused", &server);
+    refused.transport = McpTransport::Http {
+        url: "http://127.0.0.1:1/mcp".into(),
+        headers: BTreeMap::new(),
+    };
+    connections
+        .reconcile(vec![http_config("notes", &server), refused])
+        .await;
+    assert!(connections.settled_status("absent").await.is_none());
+    let notes = connections.settled_status("notes").await.unwrap();
+    assert_eq!(notes.state, McpServerState::Connected);
+    assert_eq!(notes.tools.len(), 1);
+    let refused = connections.settled_status("refused").await.unwrap();
+    assert_eq!(refused.state, McpServerState::Failed);
+    assert!(refused.failure.is_some());
+    connections.shutdown().await;
+}
+
+#[tokio::test]
 async fn reconnecting_a_server_reads_its_tools_again() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"first","inputSchema":{"type":"object"}}]));

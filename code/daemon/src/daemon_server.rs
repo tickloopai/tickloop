@@ -23,7 +23,9 @@ use tickloop_code_access::{
     Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
     PersistenceState, REPLAY_CAPACITY, ResetReason, RuntimeVersion, TranscriptRef,
 };
-use tickloop_harness::protocol::{ContextBreakdown, ContextDraft, OtherTickhost};
+use tickloop_harness::protocol::{
+    ContextBreakdown, ContextDraft, OtherTickhost, mcp::McpServerStatus,
+};
 use tickloop_harness::protocol::{chat_display_title, chat_has_work, chat_preview};
 
 #[async_trait]
@@ -74,6 +76,17 @@ pub trait WorkerFactory: Send + Sync {
     ) -> Result<ContextBreakdown, AccessError> {
         Err(AccessError::unavailable(
             "this daemon cannot count a New Agent's context",
+        ))
+    }
+    /// Connects the MCP server `name` a New Agent `launch` would start, lists its tools and
+    /// closes the connection.
+    async fn draft_mcp_server(
+        &self,
+        _launch: &LaunchSpec,
+        _name: &str,
+    ) -> Result<McpServerStatus, AccessError> {
+        Err(AccessError::unavailable(
+            "this daemon cannot connect a New Agent's MCP servers",
         ))
     }
 }
@@ -836,6 +849,13 @@ impl AgentAccess for DaemonServer {
                         .draft_context_breakdown(&launch, *draft)
                         .await?,
                 )),
+                self.cursor(),
+                None,
+            )),
+            ObservationRequest::DraftMcpServer { launch, name } => Ok(Observation::single(
+                ObservationValue::McpServers(vec![
+                    self.inner.factory.draft_mcp_server(&launch, &name).await?,
+                ]),
                 self.cursor(),
                 None,
             )),

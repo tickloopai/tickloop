@@ -52,6 +52,7 @@ pub mod daemon_control;
 mod daemon_management;
 mod daemon_server;
 mod draft_context;
+mod draft_mcp;
 mod embedded;
 mod ingress;
 mod ipc;
@@ -168,6 +169,13 @@ impl WorkerFactory for ProcessWorkerFactory {
         draft: tickloop_harness::protocol::ContextDraft,
     ) -> Result<tickloop_harness::protocol::ContextBreakdown, AccessError> {
         draft_context::breakdown(launch, draft).await
+    }
+    async fn draft_mcp_server(
+        &self,
+        launch: &LaunchSpec,
+        name: &str,
+    ) -> Result<tickloop_harness::protocol::mcp::McpServerStatus, AccessError> {
+        draft_mcp::connect(launch, name).await
     }
     async fn start(
         &self,
@@ -792,38 +800,14 @@ pub async fn build_runtime_with_models(
         sources.push(tick_tools);
     }
     if let Some(settings) = settings {
-        use tickloop_harness::runtime::mcp::{
-            HostCapabilities, McpConfiguration, McpConnections, McpToolProvider,
-        };
-        let startup_environment: std::collections::BTreeMap<String, String> = launch
-            .environment
-            .iter()
-            .filter_map(|entry| {
-                Some((
-                    String::from_utf8(entry.name.clone()).ok()?,
-                    String::from_utf8(entry.value.clone()).ok()?,
-                ))
-            })
-            .collect();
-        let log_directory = tickloop_harness::base::private_fs::PrivateDirectory::trusted(
-            settings.root().expect("settings root").to_owned(),
-        )
-        .join("logs")
-        .join("mcp")
-        .join(std::process::id().to_string());
-        let connections = McpConnections::new(
-            HostCapabilities {
-                local_processes: true,
-            },
-            std::collections::BTreeMap::new(),
-            startup_environment.clone(),
-        )
-        .with_stderr_directory(log_directory);
-        let folder = launch.folder.clone();
-        let plugins =
-            tick_plugins::PluginStore::in_config_root(settings.root().expect("settings root"));
-        let credential_connections = connections.clone();
+        use tickloop_harness::runtime::mcp::{McpConfiguration, McpToolProvider};
+        let startup_environment = mcp_configuration::launch_environment(launch);
         let credential_root = settings.root().expect("settings root").to_owned();
+        let connections =
+            mcp_configuration::agent_connections(&credential_root, startup_environment.clone());
+        let folder = launch.folder.clone();
+        let plugins = tick_plugins::PluginStore::in_config_root(&credential_root);
+        let credential_connections = connections.clone();
         let files = std::sync::Mutex::new(mcp_configuration::ConfigurationFiles::default());
         let configuration = Arc::new(move || {
             let mut files = files.lock().unwrap();
@@ -832,47 +816,18 @@ pub async fn build_runtime_with_models(
             }
             let before = files.revision(&credential_root);
             files.paths.clear();
-            let (plugin_servers, mut warnings) =
-                enabled_plugin_mcp_servers(&plugins, &mut files.paths);
-            let mut resolved = settings.load().mcp_servers_with_plugins(
+            let servers = mcp_configuration::agent_servers(
+                &settings,
+                &plugins,
                 &folder,
                 &startup_environment,
-                &plugin_servers,
+                &mut files.paths,
             );
-            let mut credentials = std::collections::BTreeMap::new();
-            for server in &mut resolved.servers {
-                if !matches!(
-                    server.transport,
-                    tickloop_harness::protocol::mcp::McpTransport::Http { .. }
-                ) {
-                    continue;
-                }
-                match tickloop_code_settings::mcp_credentials::FileCredentials::new(
-                    &credential_root,
-                    &server.source,
-                    &server.name,
-                ) {
-                    Ok(adapter) => {
-                        credentials.insert(
-                            server.name.clone(),
-                            Arc::new(adapter)
-                                as Arc<dyn tickloop_harness::connector::ConnectorCredentials>,
-                        );
-                    }
-                    Err(error) => {
-                        warnings.push(format!("MCP {}: {error}", server.name));
-                        server.transport = tickloop_harness::protocol::mcp::McpTransport::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                }
-            }
-            credential_connections.set_credentials(credentials);
-            warnings.extend(resolved.warnings);
+            credential_connections.set_credentials(servers.credentials);
             files.remember(&credential_root, before);
             Some(McpConfiguration {
-                servers: resolved.servers,
-                warnings,
+                servers: servers.servers,
+                warnings: servers.warnings,
             })
         });
         let provider = Arc::new(McpToolProvider::with_configuration_updates(

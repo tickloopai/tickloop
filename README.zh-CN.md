@@ -184,11 +184,11 @@ MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 
 
 ### 管理服务与登录
 
-`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
+`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。登录或重连后服务立即连接，行内先显示 `connecting`，列出工具后显示 `connected · N tools`，失败则显示 `failed`，原因写在操作菜单里。Agent 启动前，打开面板会连接远程服务以列出工具，随后关闭这些连接；本地（stdio）服务显示 `starts with the Agent`，只有选 Connect 或按 `r` 才连接。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。
 
-登录从下一次 Agent 请求起生效，令牌自动续期。`tickloop mcp logout <服务>` 在服务器支持时撤销令牌，并删除本地令牌、保留客户端注册。凭据只保存在本机私有的 `credentials/_mcp/` 或 `credentials/<插件>/mcp/` 目录中；服务地址变化后不使用旧令牌。配置固定 `Authorization` header 的服务不走 OAuth。远程服务支持 `oauth.clientId`、`oauth.callbackPort` 和 `authServerMetadataUrl`（也接受放在 `oauth` 内）。
+在 `/mcp` 登录后立即连接该服务：Agent 运行时由 Agent 连接，启动前由面板连接；其他方式登录从下一次 Agent 请求起生效。令牌自动续期。`tickloop mcp logout <服务>` 在服务器支持时撤销令牌，并删除本地令牌、保留客户端注册。凭据只保存在本机私有的 `credentials/_mcp/` 或 `credentials/<插件>/mcp/` 目录中；服务地址变化后不使用旧令牌。配置固定 `Authorization` header 的服务不走 OAuth。远程服务支持 `oauth.clientId`、`oauth.callbackPort` 和 `authServerMetadataUrl`（也接受放在 `oauth` 内）。
 
 服务配置中的 `${VAR}`、`${VAR:-默认值}` 使用 Agent 的启动环境；缺变量且无默认值时，该服务不启动。`/mcp` 与 CLI 登录使用各自进程的环境。如果 URL 变量与 Agent 启动时的值不同，登录会保存到另一个地址，Agent 无法使用；请让两个终端使用相同的值。模型会请用户添加、配置或登录服务，不会自行执行这些操作。
 

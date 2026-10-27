@@ -897,6 +897,36 @@ impl McpConnections {
             .collect()
     }
 
+    /// The status of the server `name` once it has stopped connecting, with the tools it listed;
+    /// `None` when no server has that name. It waits at most as long as a connection may take, so
+    /// a server still connecting after that is reported as connecting.
+    pub async fn settled_status(&self, name: &str) -> Option<McpServerStatus> {
+        let settled = async {
+            loop {
+                let changed = self.inner.state_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let connecting =
+                    self.inner
+                        .entries
+                        .read()
+                        .unwrap()
+                        .get(name)
+                        .is_some_and(|entry| {
+                            *entry.state.read().unwrap() == McpServerState::Connecting
+                        });
+                if !connecting {
+                    break;
+                }
+                changed.await;
+            }
+        };
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT + REQUEST_TIMEOUT, settled).await;
+        self.statuses()
+            .into_iter()
+            .find(|status| status.name == name)
+    }
+
     /// What a View shows of each server, in name order.
     pub fn statuses(&self) -> Vec<McpServerStatus> {
         let catalog = self.catalog();

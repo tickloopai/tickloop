@@ -2039,6 +2039,17 @@ impl AgentAccess for EmbeddedAgentAccess {
                 },
                 None,
             )),
+            ObservationRequest::DraftMcpServer { launch, name } => Ok(Observation::single(
+                ObservationValue::McpServers(vec![
+                    crate::draft_mcp::connect(&launch, &name).await?,
+                ]),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
             ObservationRequest::OtherTickhost => Ok(Observation::single(
                 ObservationValue::OtherTickhost(None),
                 Cursor {

@@ -2,10 +2,11 @@
 //! transport, state, tools and exposure. Enter opens a server's actions: view its tools, log in
 //! or out, reconnect, and turn it off or on in the Agent's directory. A login happens in the panel:
 //! the authorization link, and a field for the address the browser ends on when it runs on
-//! another machine. The panel keeps what it shows and what the user chose; the Console runs the
-//! work and hands each result back through [`McpPanel::apply`].
+//! another machine. After a login or a reconnect the panel follows the server until it has
+//! connected and listed its tools, or failed. The panel keeps what it shows and what the user
+//! chose; the Console runs the work and hands each result back through [`McpPanel::apply`].
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_code_settings::mcp::{DIRECTORY_SOURCE, GLOBAL_SOURCE, PLUGIN_SOURCE_PREFIX};
@@ -96,6 +97,9 @@ pub(super) struct McpListing {
     /// Whether the states come from the Agent's Worker; before it starts they come from the
     /// configuration, and a server that can run has not connected yet.
     pub(super) live: bool,
+    /// Before the Agent starts: the servers whose state comes from a connection made for the
+    /// panel rather than from the configuration.
+    pub(super) probed: BTreeSet<String>,
     /// The directory the Agent works in, where a server is turned off or on.
     pub(super) directory: PathBuf,
 }
@@ -145,10 +149,11 @@ impl McpResult {
             Self::Servers { .. } | Self::LoginWaiting { .. } | Self::CallbackRefused { .. } => {
                 return None;
             }
-            Self::Reconnected { name, result } => match result {
-                Ok(()) => Notice::success(format!("Reconnecting {name}")),
-                Err(error) => Notice::failure(format!("Cannot reconnect {name}: {error}")),
-            },
+            Self::Reconnected { result: Ok(()), .. } => return None,
+            Self::Reconnected {
+                name,
+                result: Err(error),
+            } => Notice::failure(format!("Cannot reconnect {name}: {error}")),
             Self::DisabledSet {
                 name,
                 disabled,
@@ -160,9 +165,7 @@ impl McpResult {
                 (Err(error), false) => Notice::failure(format!("Cannot enable {name}: {error}")),
             },
             Self::LoginEnded { name, result, .. } => match result {
-                Ok(()) => Notice::success(format!(
-                    "Logged in to {name}; the Agent uses it from its next request"
-                )),
+                Ok(()) => Notice::success(format!("Logged in to {name}")),
                 Err(error) => Notice::failure(format!("Cannot log in to {name}: {error}")),
             },
             Self::LoggedOut { name, result } => match result {
@@ -217,6 +220,41 @@ struct LoginView {
     stage: LoginStage,
 }
 
+/// A server the panel follows after a login or a reconnect, to tell how its connection ends.
+struct Following {
+    name: String,
+    after_login: bool,
+    /// Whether the connection was asked for; a read before that still shows the old state.
+    requested: bool,
+}
+
+impl Following {
+    fn status_text(&self) -> String {
+        if self.after_login {
+            format!("Logged in to {} · connecting…", self.name)
+        } else {
+            format!("Connecting to {}…", self.name)
+        }
+    }
+
+    fn connected(&self, tools: usize) -> Notice {
+        let tools = tool_count(tools);
+        Notice::success(if self.after_login {
+            format!("Logged in to {} · connected · {tools}", self.name)
+        } else {
+            format!("Connected to {} · {tools}", self.name)
+        })
+    }
+
+    fn failed(&self, cause: &str) -> Notice {
+        Notice::failure(if self.after_login {
+            format!("Logged in to {}, but cannot connect: {cause}", self.name)
+        } else {
+            format!("Cannot connect to {}: {cause}", self.name)
+        })
+    }
+}
+
 enum LoginStage {
     /// Finding the authorization server and registering.
     Starting,
@@ -240,6 +278,7 @@ pub(super) struct McpPanel {
     tools: Option<ToolsView>,
     login: Option<LoginView>,
     login_attempts: u64,
+    following: Option<Following>,
     /// The operation under way, as the panel shows it.
     busy: Option<String>,
     notice: Option<Notice>,
@@ -260,6 +299,7 @@ impl McpPanel {
             tools: None,
             login: None,
             login_attempts: 0,
+            following: None,
             busy: None,
             notice: None,
             row_targets: Vec::new(),
@@ -318,6 +358,7 @@ impl McpPanel {
                     .map(|server| server.name.clone());
                 self.read = read;
                 self.listing = listing.map_or_else(Listing::Failed, Listing::Loaded);
+                self.follow_connection();
                 self.selected = shown
                     .and_then(|name| self.servers().iter().position(|server| server.name == name))
                     .unwrap_or(self.selected)
@@ -357,15 +398,78 @@ impl McpPanel {
                     *shown = Some(error);
                 }
             }
-            McpResult::LoginEnded { .. } => {
+            McpResult::LoginEnded { name, result, .. } => {
                 self.login = None;
                 self.busy = None;
+                if result.is_ok() {
+                    self.notice = None;
+                    self.following = Some(Following {
+                        name,
+                        after_login: true,
+                        requested: false,
+                    });
+                }
             }
-            McpResult::Reconnected { .. }
-            | McpResult::DisabledSet { .. }
-            | McpResult::LoggedOut { .. } => self.busy = None,
+            McpResult::Reconnected { name, result } => {
+                self.busy = None;
+                let following = self.following.take_if(|following| following.name == name);
+                match (following, result) {
+                    (Some(mut following), Ok(())) => {
+                        following.requested = true;
+                        self.following = Some(following);
+                    }
+                    (Some(following), Err(error)) if following.after_login => {
+                        self.notice = Some(following.failed(&error));
+                    }
+                    _ => {}
+                }
+            }
+            McpResult::DisabledSet { .. } | McpResult::LoggedOut { .. } => self.busy = None,
         }
         true
+    }
+
+    /// Tells how the followed server's connection ended once a read shows it connected or
+    /// failed; a read that still shows it connecting, or shows its state from the configuration,
+    /// keeps following it.
+    fn follow_connection(&mut self) {
+        let Some(following) = self
+            .following
+            .as_ref()
+            .filter(|following| following.requested)
+        else {
+            return;
+        };
+        let Listing::Loaded(listing) = &self.listing else {
+            return;
+        };
+        let Some(server) = listing
+            .servers
+            .iter()
+            .find(|server| server.name == following.name)
+        else {
+            self.following = None;
+            return;
+        };
+        if !connection_backed(listing, server) {
+            return;
+        }
+        let notice = match &server.state {
+            McpServerState::Connecting => return,
+            McpServerState::Connected => following.connected(server.tools.len()),
+            McpServerState::Failed | McpServerState::NeedsLogin => following.failed(
+                server
+                    .failure
+                    .as_deref()
+                    .unwrap_or(state_label(&server.state, true)),
+            ),
+            _ => {
+                self.following = None;
+                return;
+            }
+        };
+        self.notice = Some(notice);
+        self.following = None;
     }
 
     pub(super) fn report(&mut self, error: String) {
@@ -533,8 +637,10 @@ impl McpPanel {
         }
     }
 
-    fn is_live(&self) -> bool {
-        matches!(&self.listing, Listing::Loaded(listing) if listing.live)
+    /// Whether the state of `server` comes from a connection, the Agent's or one made for the
+    /// panel, rather than from the configuration.
+    fn is_backed(&self, server: &McpServerStatus) -> bool {
+        matches!(&self.listing, Listing::Loaded(listing) if connection_backed(listing, server))
     }
 
     fn choose(&mut self, choice: Choice) -> McpPanelEffect {
@@ -586,6 +692,14 @@ impl McpPanel {
         }
         self.busy = Some(busy);
         self.notice = None;
+        self.following = match &request {
+            McpRequest::Reconnect(name) => Some(Following {
+                name: name.clone(),
+                after_login: false,
+                requested: false,
+            }),
+            _ => None,
+        };
         if let McpRequest::LogIn { name, attempt } = &mut request {
             self.login_attempts += 1;
             *attempt = self.login_attempts;
@@ -602,7 +716,7 @@ impl McpPanel {
     fn actions_menu(&self) -> Option<ActionsMenu> {
         let server = self.servers().get(self.selected)?;
         let name = server.name.clone();
-        let live = self.is_live();
+        let backed = self.is_backed(server);
         let mut options = Vec::new();
         if !server.tools.is_empty() {
             options.push(("View tools".to_owned(), Choice::Tools(name.clone())));
@@ -622,17 +736,18 @@ impl McpPanel {
                 options.push(("Log in".to_owned(), Choice::Run(login)));
             }
         }
-        if live
-            && matches!(
-                server.state,
-                McpServerState::Connected
-                    | McpServerState::Connecting
-                    | McpServerState::Failed
-                    | McpServerState::NeedsLogin
-            )
-        {
+        // Before the Agent starts, a server that can run connects for the panel; one whose
+        // configuration failed cannot connect.
+        let can_connect = match server.state {
+            McpServerState::Connecting => true,
+            McpServerState::Connected | McpServerState::Failed | McpServerState::NeedsLogin => {
+                backed
+            }
+            _ => false,
+        };
+        if can_connect {
             options.push((
-                "Reconnect".to_owned(),
+                if backed { "Reconnect" } else { "Connect" }.to_owned(),
                 Choice::Run(McpRequest::Reconnect(name.clone())),
             ));
         }
@@ -650,7 +765,7 @@ impl McpPanel {
             }),
         ));
         options.push(("Back".to_owned(), Choice::Back));
-        let mut context = vec![row_details(server, live)];
+        let mut context = vec![row_details(server, backed)];
         if let Some(failure) = &server.failure {
             context.push(safe_line(failure));
         }
@@ -676,7 +791,6 @@ impl McpPanel {
         width: usize,
         display: DisplayProfile,
     ) -> Vec<(Option<usize>, Vec<RoleLine>)> {
-        let live = self.is_live();
         let glyph = display.glyph(Glyph::AgentViewed);
         let mut rows = Vec::new();
         let mut heading = None;
@@ -686,13 +800,14 @@ impl McpPanel {
                 rows.push((None, vec![RoleLine::role(safe_line(&group), Role::Accent)]));
                 heading = Some(group);
             }
-            let details = row_details(server, live);
+            let backed = self.is_backed(server);
+            let details = row_details(server, backed);
             let separate_details =
                 glyph.width() + server.name.width() + details.width() + 3 > width;
             let mut lines = ListRow {
                 selected: index == self.selected && self.menu.is_none(),
                 glyph,
-                glyph_role: state_role(&server.state, live),
+                glyph_role: state_role(&server.state, backed),
                 name: &server.name,
                 details: if separate_details {
                     String::new()
@@ -727,6 +842,8 @@ impl McpPanel {
         };
         if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
             add(busy, Role::Accent);
+        } else if let Some(following) = &self.following {
+            add(&following.status_text(), Role::Accent);
         }
         if let Some(notice) = &self.notice {
             add(
@@ -1009,6 +1126,19 @@ fn source_heading(source: &str) -> String {
     }
 }
 
+/// Whether the state of `server` in `listing` comes from a connection rather than from the
+/// configuration.
+fn connection_backed(listing: &McpListing, server: &McpServerStatus) -> bool {
+    listing.live || listing.probed.contains(&server.name)
+}
+
+fn tool_count(count: usize) -> String {
+    match count {
+        1 => "1 tool".to_owned(),
+        count => format!("{count} tools"),
+    }
+}
+
 fn state_label(state: &McpServerState, live: bool) -> &'static str {
     match state {
         McpServerState::Connected => "connected",
@@ -1043,10 +1173,7 @@ fn row_details(server: &McpServerStatus, live: bool) -> String {
         parts.push("logged in".to_owned());
     }
     if live && server.state == McpServerState::Connected {
-        parts.push(match server.tools.len() {
-            1 => "1 tool".to_owned(),
-            count => format!("{count} tools"),
-        });
+        parts.push(tool_count(server.tools.len()));
     }
     parts.push(server.exposure.clone());
     safe_line(&parts.join(" · "))
@@ -1087,6 +1214,7 @@ mod tests {
                 servers,
                 live,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         panel
@@ -1198,6 +1326,231 @@ mod tests {
         let frame = text(&mut panel);
         assert!(!frame.contains("Reconnect"), "{frame}");
         assert!(frame.contains("Log in"), "{frame}");
+        assert!(frame.contains("  Connect\n"), "{frame}");
+    }
+
+    #[test]
+    fn a_server_whose_configuration_failed_cannot_connect_before_the_agent_starts() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Failed, 0)],
+            false,
+        );
+        press(&mut panel, KeyCode::Enter);
+        let frame = text(&mut panel);
+        assert!(!frame.contains("Connect"), "{frame}");
+    }
+
+    /// A listing from the configuration, with `probed` naming the servers connected for the
+    /// panel.
+    fn listing(servers: Vec<McpServerStatus>, live: bool, probed: &[&str]) -> McpListing {
+        McpListing {
+            servers,
+            live,
+            directory: "/work".into(),
+            probed: probed.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn logged_in(mut status: McpServerStatus) -> McpServerStatus {
+        status.logged_in = true;
+        status
+    }
+
+    /// Logs in to the first server from its actions, as the Console would finish it.
+    fn log_in(panel: &mut McpPanel) {
+        press(panel, KeyCode::Enter);
+        assert_eq!(selected(panel), ["❯ Log in"]);
+        let McpRequest::LogIn { attempt, name } = work(press(panel, KeyCode::Enter)) else {
+            panic!("a login starts");
+        };
+        assert!(panel.apply(McpResult::LoginEnded {
+            attempt,
+            name,
+            result: Ok(()),
+        }));
+    }
+
+    fn status_line(panel: &mut McpPanel) -> String {
+        let frame = panel.frame(WIDTH, HEIGHT, DisplayProfile::default());
+        frame.lines[HEIGHT - 2].text().trim().to_owned()
+    }
+
+    #[test]
+    fn after_a_login_the_agent_connects_the_server_and_the_row_shows_its_tools() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::NeedsLogin, 0)],
+            true,
+        );
+        log_in(&mut panel);
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        // A read before the Agent took up the login still shows the old state.
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::NeedsLogin,
+                    0,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        panel.apply(McpResult::Servers {
+            read: 3,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::Connecting,
+                    0,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connecting · logged in · direct"),
+            "{frame}"
+        );
+        assert!(panel.awaits_connections());
+        assert_eq!(status_line(&mut panel), "Logged in to notes · connecting…");
+        panel.apply(McpResult::Servers {
+            read: 4,
+            listing: Ok(listing(
+                vec![logged_in(server(
+                    "notes",
+                    "global",
+                    McpServerState::Connected,
+                    191,
+                ))],
+                true,
+                &[],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connected · 191 tools · direct"),
+            "{frame}"
+        );
+        assert_eq!(
+            status_line(&mut panel),
+            "Logged in to notes · connected · 191 tools"
+        );
+    }
+
+    #[test]
+    fn before_the_agent_starts_a_login_connects_for_the_panel_and_shows_a_failure_with_its_cause() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Connecting, 0)],
+            false,
+        );
+        log_in(&mut panel);
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        let connecting = logged_in(server("notes", "global", McpServerState::Connecting, 0));
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(vec![connecting.clone()], false, &["notes"])),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connecting · logged in · direct"),
+            "{frame}"
+        );
+        assert!(!panel.awaits_connections());
+        let mut failed = logged_in(server("notes", "global", McpServerState::Failed, 0));
+        failed.failure = Some("MCP connection failed: HTTP 500".into());
+        panel.apply(McpResult::Servers {
+            read: 3,
+            listing: Ok(listing(vec![failed], false, &["notes"])),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · failed · logged in · direct"),
+            "{frame}"
+        );
+        assert_eq!(
+            status_line(&mut panel),
+            "Logged in to notes, but cannot connect: MCP connection failed: HTTP 500"
+        );
+        press(&mut panel, KeyCode::Enter);
+        let frame = text(&mut panel);
+        assert!(frame.contains("MCP connection failed: HTTP 500"), "{frame}");
+        assert!(frame.contains("Reconnect"), "{frame}");
+    }
+
+    #[test]
+    fn before_the_agent_starts_a_server_connected_for_the_panel_shows_its_tools() {
+        let mut panel = loaded(
+            vec![
+                server("notes", "global", McpServerState::Connecting, 0),
+                server("local", "directory", McpServerState::Connecting, 0),
+            ],
+            false,
+        );
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![
+                    server("notes", "global", McpServerState::Connected, 2),
+                    server("local", "directory", McpServerState::Connecting, 0),
+                ],
+                false,
+                &["notes"],
+            )),
+        });
+        let frame = text(&mut panel);
+        assert!(
+            row_shows(&frame, "notes", "http · connected · 2 tools · direct"),
+            "{frame}"
+        );
+        assert!(
+            row_shows(&frame, "local", "http · starts with the Agent · direct"),
+            "{frame}"
+        );
+        press(&mut panel, KeyCode::Enter);
+        assert_eq!(selected(&mut panel), ["❯ View tools"]);
+        assert!(text(&mut panel).contains("Reconnect"));
+    }
+
+    #[test]
+    fn a_reconnect_tells_how_the_connection_ended() {
+        let mut panel = loaded(
+            vec![server("notes", "global", McpServerState::Failed, 0)],
+            true,
+        );
+        press(&mut panel, KeyCode::Enter);
+        press(&mut panel, KeyCode::Char('j'));
+        assert_eq!(selected(&mut panel), ["❯ Reconnect"]);
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            McpRequest::Reconnect("notes".into())
+        );
+        assert_eq!(status_line(&mut panel), "Reconnecting notes…");
+        panel.apply(McpResult::Reconnected {
+            name: "notes".into(),
+            result: Ok(()),
+        });
+        assert_eq!(status_line(&mut panel), "Connecting to notes…");
+        panel.apply(McpResult::Servers {
+            read: 2,
+            listing: Ok(listing(
+                vec![server("notes", "global", McpServerState::Connected, 1)],
+                true,
+                &[],
+            )),
+        });
+        assert_eq!(status_line(&mut panel), "Connected to notes · 1 tool");
     }
 
     #[test]
@@ -1233,6 +1586,7 @@ mod tests {
                 servers: vec![server("notes", "global", McpServerState::Connected, 2)],
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         assert_eq!(
@@ -1358,6 +1712,7 @@ mod tests {
                 servers: vec![server("notes", "global", McpServerState::Disabled, 0)],
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         panel.apply(McpResult::Servers {
@@ -1366,6 +1721,7 @@ mod tests {
                 servers: Vec::new(),
                 live: true,
                 directory: "/work".into(),
+                probed: BTreeSet::new(),
             }),
         });
         assert!(row_shows(

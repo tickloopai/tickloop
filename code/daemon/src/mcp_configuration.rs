@@ -3,8 +3,103 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
+
+use tickloop_code_access::LaunchSpec;
+use tickloop_code_settings::{UserSettings, mcp_credentials::FileCredentials};
+use tickloop_harness::{
+    base::private_fs::PrivateDirectory,
+    connector::ConnectorCredentials,
+    protocol::mcp::{McpServerConfig, McpTransport},
+    runtime::mcp::{HostCapabilities, McpConnections},
+};
+
+/// The MCP servers an Agent takes up, with a credential adapter for each remote server.
+pub(crate) struct AgentServers {
+    pub servers: Vec<McpServerConfig>,
+    pub credentials: BTreeMap<String, Arc<dyn ConnectorCredentials>>,
+    pub warnings: Vec<String>,
+}
+
+/// The environment `launch` starts its Agent with, which server configuration expands.
+pub(crate) fn launch_environment(launch: &LaunchSpec) -> BTreeMap<String, String> {
+    launch
+        .environment
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                String::from_utf8(entry.name.clone()).ok()?,
+                String::from_utf8(entry.value.clone()).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Connections as an Agent of this process holds them: local servers may run, and their error
+/// output goes to this process's log directory under `root`.
+pub(crate) fn agent_connections(
+    root: &Path,
+    environment: BTreeMap<String, String>,
+) -> McpConnections {
+    let log_directory = PrivateDirectory::trusted(root.to_owned())
+        .join("logs")
+        .join("mcp")
+        .join(std::process::id().to_string());
+    McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+        },
+        BTreeMap::new(),
+        environment,
+    )
+    .with_stderr_directory(log_directory)
+}
+
+/// The servers `settings` and the enabled plugins of `plugins` give an Agent working in `folder`;
+/// `paths` collects the plugin files they were read from.
+pub(crate) fn agent_servers(
+    settings: &UserSettings,
+    plugins: &tick_plugins::PluginStore,
+    folder: &Path,
+    environment: &BTreeMap<String, String>,
+    paths: &mut Vec<PathBuf>,
+) -> AgentServers {
+    let (plugin_servers, mut warnings) = crate::enabled_plugin_mcp_servers(plugins, paths);
+    let mut resolved =
+        settings
+            .load()
+            .mcp_servers_with_plugins(folder, environment, &plugin_servers);
+    let mut credentials = BTreeMap::new();
+    if let Some(root) = settings.root() {
+        for server in &mut resolved.servers {
+            if !matches!(server.transport, McpTransport::Http { .. }) {
+                continue;
+            }
+            match FileCredentials::new(root, &server.source, &server.name) {
+                Ok(adapter) => {
+                    credentials.insert(
+                        server.name.clone(),
+                        Arc::new(adapter) as Arc<dyn ConnectorCredentials>,
+                    );
+                }
+                Err(error) => {
+                    warnings.push(format!("MCP {}: {error}", server.name));
+                    server.transport = McpTransport::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        }
+    }
+    warnings.extend(resolved.warnings);
+    AgentServers {
+        servers: resolved.servers,
+        credentials,
+        warnings,
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ConfigurationFiles {
