@@ -600,6 +600,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
 async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
     let server = McpService::start().await;
     let secret = "private/token+value";
+    server.set_instructions(format!("Use {secret}"));
     server.set_tools(json!([{"name":"echo","description":format!("description {secret}"),"inputSchema":{"type":"object"}}]));
     server.set_result(
         json!({"content":[{"type":"text","text":"private/token+value private%2Ftoken%2Bvalue"}]}),
@@ -1613,6 +1614,255 @@ fn http_config(name: &str, server: &McpService) -> McpServerConfig {
         oauth: Default::default(),
         timeout_ms: 300_000,
     }
+}
+
+#[tokio::test]
+async fn service_instructions_and_summary_redact_secrets_through_the_host_provider() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
+
+    let server = McpService::start().await;
+    server.set_instructions("Use fixture-private-key\nDetails fixture-private-key");
+    for stdio in [false, true] {
+        for description in ["", "Configured fixture-private-key"] {
+            let mut config = http_config("notes", &server);
+            config.description = description.into();
+            config.transport = if stdio {
+                McpTransport::Stdio {
+                    command: "python3".into(),
+                    args: server.stdio_args(),
+                    env: BTreeMap::from([("FIXTURE_KEY".into(), "fixture-private-key".into())]),
+                    cwd: std::env::temp_dir(),
+                }
+            } else {
+                McpTransport::Http {
+                    url: server.url(),
+                    headers: BTreeMap::from([("x-api-key".into(), "fixture-private-key".into())]),
+                }
+            };
+            let connections = McpConnections::new(
+                HostCapabilities {
+                    local_processes: true,
+                    scripts: false,
+                },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            let provider =
+                McpToolProvider::new(connections, Arc::new(move || vec![config.clone()]));
+            provider.refresh(CancellationToken::new()).await.unwrap();
+            let messages = provider.mcp_instructions();
+            assert_eq!(messages.len(), 1);
+            let text = &messages[0].text;
+            assert!(text.contains("status: Connected"));
+            assert!(!text.contains("fixture-private-key"));
+            assert!(text.ends_with("Use [redacted]\nDetails [redacted]"));
+            let summary = if description.is_empty() {
+                "Use [redacted]"
+            } else {
+                "Configured [redacted]"
+            };
+            assert!(text.contains(&format!("summary: {summary}.")));
+            provider.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_instructions_redact_secrets_before_the_length_limit() {
+    use tickloop_harness_runtime::{host_tools::HostToolProvider, mcp::McpToolProvider};
+
+    let server = McpService::start().await;
+    let prefix = "界".repeat(2030);
+    server.set_instructions(format!(
+        "{prefix}fixture-private-key-crossing-the-limit{}",
+        "x".repeat(100)
+    ));
+    let mut config = http_config("notes", &server);
+    config.transport = McpTransport::Stdio {
+        command: "python3".into(),
+        args: server.stdio_args(),
+        env: BTreeMap::new(),
+        cwd: std::env::temp_dir(),
+    };
+    config.sensitive_values = vec![json!("fixture-private-key-crossing-the-limit")];
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let provider = McpToolProvider::new(connections, Arc::new(move || vec![config.clone()]));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let messages = provider.mcp_instructions();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].text.contains("status: Connected"));
+    let instructions = messages[0]
+        .text
+        .split_once("(untrusted data):\n")
+        .unwrap()
+        .1;
+    assert_eq!(
+        instructions.strip_prefix(&prefix),
+        Some("[redacted]xxxxxxxx")
+    );
+    assert_eq!(instructions.chars().count(), 2048);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn tool_descriptions_redact_secrets_before_the_length_limit() {
+    use tickloop_harness_runtime::{
+        host_tools::HostToolProvider,
+        mcp::McpToolProvider,
+        tool_exposure::{ExposureDirectory, SearchSupport},
+    };
+
+    let server = McpService::start().await;
+    let prefix = "界".repeat(2030);
+    server.set_tools(json!([{"name":"probe","description":format!("{prefix}fixture-private-key-crossing-the-limit{}", "x".repeat(100)),"inputSchema":{"type":"object"}}]));
+    let mut config = http_config("notes", &server);
+    config.transport = McpTransport::Stdio {
+        command: "python3".into(),
+        args: server.stdio_args(),
+        env: BTreeMap::new(),
+        cwd: std::env::temp_dir(),
+    };
+    config.sensitive_values = vec![json!("fixture-private-key-crossing-the-limit")];
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let provider = McpToolProvider::new(connections, Arc::new(move || vec![config.clone()]));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let definitions = provider.definitions();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(
+        definitions[0].description.strip_prefix(&prefix),
+        Some("[redacted]xxxxxxxx")
+    );
+    assert_eq!(definitions[0].description.chars().count(), 2048);
+    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
+    let described = directory
+        .describe(&json!({"names":["mcp__notes__probe"]}))
+        .unwrap();
+    assert_eq!(
+        described["tools"][0]["description"],
+        definitions[0].description
+    );
+    let statuses = provider.mcp_server_statuses(CancellationToken::new()).await;
+    assert_eq!(statuses[0].tools[0].description, definitions[0].description);
+    assert!(matches!(
+        provider
+            .execute(
+                tickloop_harness_protocol::ChatId::new(),
+                "mcp__notes__probe",
+                json!({}),
+                CancellationToken::new()
+            )
+            .await,
+        tickloop_harness_protocol::ToolResult {
+            is_error: false,
+            ..
+        }
+    ));
+    assert_eq!(server.calls().len(), 1);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn discovery_resources_and_failures_redact_server_text() {
+    use tickloop_harness_runtime::{
+        host_tools::HostToolProvider,
+        mcp::McpToolProvider,
+        tool_exposure::{ExposureDirectory, SearchSupport},
+    };
+
+    let server = McpService::start().await;
+    server.set_tools(json!([{
+        "name":"probe", "description":"Find fixture-private-key. More detail.",
+        "inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Query fixture-private-key"}},"required":["query"]},
+        "annotations":{"title":"Title fixture-private-key"}
+    }]));
+    server.set_resources(json!([{"uri":"fixture://text","name":"Resource fixture-private-key"}]));
+    server.set_resource_text("Contents fixture-private-key");
+    let mut config = http_config("notes", &server);
+    config.transport = McpTransport::Stdio {
+        command: "python3".into(),
+        args: server.stdio_args(),
+        env: BTreeMap::new(),
+        cwd: std::env::temp_dir(),
+    };
+    config.sensitive_values = vec![json!("fixture-private-key")];
+    config.tool_exposure = vec![(
+        "probe".into(),
+        tickloop_harness_protocol::mcp::ToolExposure::Search,
+    )];
+    let mut failed = config.clone();
+    failed.name = "broken".into();
+    failed.transport = McpTransport::Failed {
+        reason: "Failure fixture-private-key".into(),
+    };
+    let connections = McpConnections::new(
+        HostCapabilities {
+            local_processes: true,
+            scripts: false,
+        },
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let provider = McpToolProvider::new(
+        connections,
+        Arc::new(move || vec![config.clone(), failed.clone()]),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let definitions = provider.definitions();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].description, "Find [redacted]. More detail.");
+    assert_eq!(
+        definitions[0].input_schema["properties"]["query"]["description"],
+        "Query [redacted]"
+    );
+    let directory = ExposureDirectory::new(provider.discovery_tools(), SearchSupport::Fold, false);
+    let found = directory.search(&json!({"queries":["probe"]})).unwrap();
+    assert_eq!(found["matches"][0]["summary"], "Find [redacted].");
+    let described = directory
+        .describe(&json!({"names":["mcp__notes__probe"]}))
+        .unwrap();
+    assert_eq!(
+        described["tools"][0]["description"],
+        "Find [redacted]. More detail."
+    );
+    assert_eq!(
+        described["tools"][0]["input_schema"]["properties"]["query"]["description"],
+        "Query [redacted]"
+    );
+    assert_eq!(
+        described["tools"][0]["annotations"]["title"],
+        "Title [redacted]"
+    );
+    let resources = provider
+        .list_mcp_resources_for("notes", None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(resources["resources"][0]["name"], "Resource [redacted]");
+    let content = provider
+        .read_mcp_resource_for("notes", "fixture://text", CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(content["contents"][0]["text"], "Contents [redacted]");
+    let statuses = provider.mcp_server_statuses(CancellationToken::new()).await;
+    assert_eq!(statuses[0].failure.as_deref(), Some("Failure [redacted]"));
+    assert_eq!(
+        statuses[1].tools[0].description,
+        "Find [redacted]. More detail."
+    );
+    provider.shutdown().await;
 }
 
 async fn wait_for_state(connections: &McpConnections, name: &str, state: McpServerState) {
