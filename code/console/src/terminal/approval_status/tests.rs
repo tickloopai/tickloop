@@ -633,3 +633,44 @@ fn ordinary_output_with_an_approval_like_prefix_keeps_wrapping() {
     let text = console.test_conversation_text();
     assert!(text.contains("END-OF-LOG"), "{text}");
 }
+
+#[test]
+fn a_final_denial_marks_the_header_failed_without_waiting_for_tool_completed() {
+    let console = Console::test_interactive_for_chat(Uuid::nil());
+    let mut tools = ToolPresentation::new(false);
+    present(
+        &mut tools,
+        &console,
+        &started("call", "Bash", json!({"command":"printf ok"})),
+    );
+    let mut denial = record("call", ApprovalPath::Human, ApprovalResult::Deny);
+    denial.denial_category = Some(DenialCategory::FinalAdmission);
+    present(
+        &mut tools,
+        &console,
+        &event(EventKind::ApprovalRecorded {
+            record: Box::new(denial),
+        }),
+    );
+    present(
+        &mut tools,
+        &console,
+        &event(EventKind::Failed("final admission refused".into())),
+    );
+    let rows = console.test_conversation_rows();
+    let header = rows.iter().find(|row| row.text().contains("Bash")).unwrap();
+    assert!(
+        header
+            .spans
+            .iter()
+            .any(|span| span.text.contains('⏺') && span.role == Some(Role::Error)),
+        "{header:?}"
+    );
+    assert!(
+        !header
+            .spans
+            .iter()
+            .any(|span| span.role == Some(Role::Success)),
+        "{header:?}"
+    );
+}

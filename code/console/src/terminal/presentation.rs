@@ -1286,11 +1286,21 @@ impl ToolPresentation {
                         event.run_id.into(),
                         &key,
                         &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
-                        ToolCallState::Running,
+                        if status.denied() {
+                            ToolCallState::Failed
+                        } else {
+                            ToolCallState::Running
+                        },
                         None,
                     )?;
                 }
                 console.write_tool_approval(&key, &runs)?;
+                if status.denied() {
+                    console.finish_tool_call(
+                        event.run_id.into(),
+                        Some((&key, ToolCallState::Failed)),
+                    )?;
+                }
                 self.present_parent_status(console, event, call_id, display)?;
             }
             return Ok(console.is_interactive()
