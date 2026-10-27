@@ -767,12 +767,7 @@ async fn every_listed_group_is_sorted_by_name_whatever_the_registration_order() 
         );
         assert_eq!(
             group(ListedGroup::HostTools),
-            [
-                "aardvark",
-                "mcp__alpha__lookup",
-                "mcp__alpha__zap",
-                "memo"
-            ]
+            ["aardvark", "mcp__alpha__lookup", "mcp__alpha__zap", "memo"]
         );
     }
     assert!(

@@ -2022,16 +2022,14 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     }];
     connections.reconcile(configs.clone()).await;
     wait_for_state(&connections, "broken", McpServerState::Failed).await;
-    connections
-        .reconcile_keeping_failures(configs.clone())
-        .await;
+    connections.reconcile(configs.clone()).await;
     let status = &connections.statuses()[0];
     assert_eq!(
         (status.state.clone(), status.transport.as_str()),
         (McpServerState::Failed, "stdio")
     );
     assert!(status.failure.is_some());
-    connections.reconcile(configs).await;
+    assert!(connections.reconnect(configs, "broken").await);
     assert_ne!(connections.statuses()[0].state, McpServerState::Failed);
     connections.shutdown().await;
 }

@@ -576,9 +576,7 @@ async fn a_remote_server_reconnects_on_the_backoff_schedule_then_stays_failed() 
         headers: BTreeMap::new(),
     };
     let started = Instant::now();
-    connections
-        .reconcile_keeping_failures(vec![unreachable.clone()])
-        .await;
+    connections.reconcile(vec![unreachable.clone()]).await;
     tokio::time::sleep(Duration::from_secs(300)).await;
     assert_eq!(
         attempts(&connections, "remote", started),
@@ -586,9 +584,7 @@ async fn a_remote_server_reconnects_on_the_backoff_schedule_then_stays_failed() 
         "the first attempt and five reconnects after 1, 2, 4, 8 and 16 seconds"
     );
     assert_eq!(connections.statuses()[0].state, McpServerState::Failed);
-    connections
-        .reconcile_keeping_failures(vec![unreachable.clone()])
-        .await;
+    connections.reconcile(vec![unreachable.clone()]).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert_eq!(
         attempts(&connections, "remote", started).len(),
@@ -617,7 +613,7 @@ async fn a_connection_that_stays_up_restarts_the_backoff() {
         BTreeMap::new(),
     );
     connections
-        .reconcile_keeping_failures(vec![http_server("remote", &server, ToolExposure::Search)])
+        .reconcile(vec![http_server("remote", &server, ToolExposure::Search)])
         .await;
     // Answer from the third attempt on, after two failed ones.
     while connections
@@ -650,7 +646,11 @@ async fn a_connection_that_stays_up_restarts_the_backoff() {
 async fn drop_connection(connections: &McpConnections, server: &McpService, name: &str) {
     server.set_status(404);
     let _ = connections
-        .call(&format!("mcp__{name}__quote"), json!({}), CancellationToken::new())
+        .call(
+            &format!("mcp__{name}__quote"),
+            json!({}),
+            CancellationToken::new(),
+        )
         .await;
     server.set_status(200);
 }
@@ -666,7 +666,7 @@ async fn a_server_that_drops_right_after_connecting_stops_after_the_capped_recon
         BTreeMap::new(),
     );
     connections
-        .reconcile_keeping_failures(vec![http_server("remote", &server, ToolExposure::Search)])
+        .reconcile(vec![http_server("remote", &server, ToolExposure::Search)])
         .await;
     let mut drops = 0;
     while drops < 10 {
