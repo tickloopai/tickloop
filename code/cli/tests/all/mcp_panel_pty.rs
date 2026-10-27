@@ -135,8 +135,8 @@ fn the_panel_groups_servers_shows_tools_reconnects_and_disables_in_this_director
     });
     terminal.press(DOWN, "Log in", |frame| frame.contains("❯ Log in"));
     terminal.press(DOWN, "Reconnect", |frame| frame.contains("❯ Reconnect"));
-    terminal.press(b"\r", "reconnecting", |frame| {
-        frame.contains("Reconnecting notes")
+    terminal.press(b"\r", "reconnected with its tools", |frame| {
+        frame.contains("Connected to notes · 1 tool")
     });
     terminal.press(b"r", "notes connected again", |frame| {
         row_shows(frame, "notes", "http · connected · 1 tool · search")
@@ -223,9 +223,11 @@ fn a_login_takes_the_pasted_callback_and_saves_the_credential() {
     terminal.press(b"jk", "text keys typed", |frame| frame.contains("> jk"));
     terminal.send(b"\x15");
     terminal.send(callback.as_bytes());
-    terminal.press(b"\r", "logged in", |frame| {
-        frame.contains("Logged in to remote")
-            && server_row(frame, "remote").is_some_and(|row| row.contains("logged in"))
+    // The fixture accepts the token but is no MCP server, so the connection after the login
+    // fails and the panel says so.
+    terminal.press(b"\r", "logged in, but not connected", |frame| {
+        frame.contains("Logged in to remote, but cannot connect")
+            && server_row(frame, "remote").is_some_and(|row| row.contains("failed · logged in"))
     });
     let saved: Value = serde_json::from_slice(
         &fs::read(fixture.root.join("config/credentials/_mcp/remote.json")).unwrap(),
@@ -262,6 +264,41 @@ fn a_login_takes_the_pasted_callback_and_saves_the_credential() {
     );
     terminal.press(ESCAPE, "the panel closed", |frame| {
         !shows(frame, "● remote")
+    });
+    terminal.exit();
+}
+
+#[test]
+fn before_the_agent_starts_remote_servers_connect_and_local_ones_wait_for_connect() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let notes = runtime.block_on(McpService::start());
+    notes.set_tools(json!([{"name":"search","inputSchema":{"type":"object"}}]));
+    let local = runtime.block_on(McpService::start());
+    local.set_tools(json!([{"name":"lookup","inputSchema":{"type":"object"}}]));
+    let fixture = Fixture::new();
+    write_settings(
+        &fixture,
+        &json!({"mcpServers":{
+            "notes":{"url":notes.url()},
+            "local":{"command":"python3","args":local.stdio_args()}
+        }}),
+    );
+    let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
+    let mut terminal = Terminal::start(&fixture, &marketplace);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/mcp\r", "the remote server connected", |frame| {
+        row_shows(frame, "notes", "http · connected · 1 tool · search")
+            && row_shows(frame, "local", "stdio · starts with the Agent · search")
+    });
+    assert_eq!(local.request_count(), 0, "no local program starts unasked");
+    assert!(is_selected(&terminal.frame(), "local"));
+    terminal.press(b"\r", "its actions", |frame| frame.contains("❯ Connect"));
+    terminal.press(b"\r", "the local server connected", |frame| {
+        frame.contains("Connected to local · 1 tool")
+            && row_shows(frame, "local", "stdio · connected · 1 tool · search")
+    });
+    terminal.press(ESCAPE, "the panel closed", |frame| {
+        !frame.contains("enter actions · r refresh")
     });
     terminal.exit();
 }

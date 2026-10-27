@@ -1,10 +1,14 @@
 //! Runs the work `/mcp` asks for. The Agent's Worker reports its servers and reconnects one;
 //! turning a server off or on, and logins, happen here as in `tickloop mcp`, and the Worker takes
 //! them up from its next request. A login runs in two tasks: one finds the authorization link the
-//! panel shows, and one waits for the browser's callback or the address the user pastes.
+//! panel shows, and one waits for the browser's callback or the address the user pastes. After a
+//! login the server connects at once: through the Agent when it runs, and otherwise through the
+//! daemon, which connects it as the Agent would, lists its tools and closes the connection. Before
+//! the Agent starts, opening the panel connects its remote servers that way, and `r` or Connect
+//! connects local ones too, so that no local program starts unasked.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
 };
@@ -13,7 +17,11 @@ use tickloop_code_settings::{
     UserSettings,
     mcp::{check_authorization_link, configured_servers, configured_statuses, login_connector},
 };
-use tickloop_harness::{base::oauth_callback::CallbackPaste, connector::PendingLogin};
+use tickloop_harness::{
+    base::oauth_callback::CallbackPaste,
+    connector::PendingLogin,
+    protocol::mcp::{McpServerState, McpServerStatus},
+};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -38,13 +46,37 @@ pub(super) enum Done {
         login: Box<PendingLogin>,
         cancel: CancellationToken,
     },
+    /// The connection numbered `run` made for a panel before the Agent starts has ended.
+    Probed {
+        name: String,
+        run: u64,
+        status: Result<McpServerStatus, String>,
+    },
+}
+
+/// Which servers a listing from the configuration connects for its panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeScope {
+    /// The remote servers, when the panel opens: connecting them starts no local program.
+    Remote,
+    /// Every server that can run, at the user's `r`.
+    All,
+}
+
+/// A connection made for a panel before the Agent starts, and its status once it ended.
+struct Probe {
+    run: u64,
+    status: Option<Result<McpServerStatus, String>>,
 }
 
 /// What a panel works on: its Chat, when the Agent runs, and the directory it works in.
-#[derive(Clone)]
 struct PanelContext {
     chat: Option<Uuid>,
     directory: PathBuf,
+    /// Before the Agent starts: the servers connected for the panel, by name.
+    probes: BTreeMap<String, Probe>,
+    /// The servers the next listing connects for the panel.
+    pending_probe: Option<ProbeScope>,
 }
 
 struct Login {
@@ -63,6 +95,7 @@ pub(super) struct McpTasks {
     logins: HashMap<Uuid, Login>,
     /// The panels with a read under way.
     reading: HashSet<Uuid>,
+    probe_runs: u64,
 }
 
 impl McpTasks {
@@ -92,17 +125,165 @@ impl McpTasks {
     }
 
     fn read(&mut self, root: &Path, agent: &ConsoleExecution, panel: Uuid) {
-        let Some(context) = self.contexts.get(&panel).cloned() else {
+        let Some(context) = self.contexts.get(&panel) else {
             return;
         };
+        let (chat, directory) = (context.chat, context.directory.clone());
         self.reads += 1;
         let read = self.reads;
         self.reading.insert(panel);
         let (root, agent) = (root.to_owned(), agent.clone());
         self.spawn(async move {
-            let listing = read_servers(&root, &agent, context).await;
+            let listing = read_servers(&root, &agent, chat, directory).await;
             (panel, McpResult::Servers { read, listing })
         });
+    }
+
+    /// Connects the servers `names` for `panel` before the Agent starts, unless a connection to
+    /// one is under way.
+    fn probe(&mut self, agent: &ConsoleExecution, panel: Uuid, names: Vec<String>) {
+        let Some(context) = self.contexts.get_mut(&panel) else {
+            return;
+        };
+        for name in names {
+            if context
+                .probes
+                .get(&name)
+                .is_some_and(|probe| probe.status.is_none())
+            {
+                continue;
+            }
+            self.probe_runs += 1;
+            let run = self.probe_runs;
+            context
+                .probes
+                .insert(name.clone(), Probe { run, status: None });
+            let (agent, directory) = (agent.clone(), context.directory.clone());
+            self.running.spawn(async move {
+                let status = agent
+                    .draft_mcp_server(directory, &name)
+                    .await
+                    .map_err(|error| error.to_string());
+                (panel, Done::Probed { name, run, status })
+            });
+        }
+    }
+
+    /// Connects the server `name` of `panel` now: through the Agent when it runs, and for the
+    /// panel before it starts.
+    fn connect(&mut self, agent: &ConsoleExecution, panel: Uuid, name: String) {
+        let Some(chat) = self.contexts.get(&panel).map(|context| context.chat) else {
+            return;
+        };
+        match chat {
+            Some(chat) => {
+                let agent = agent.clone();
+                self.spawn(async move {
+                    let result = agent
+                        .reconnect_mcp_server(chat, &name)
+                        .await
+                        .map_err(|error| error.to_string());
+                    (panel, McpResult::Reconnected { name, result })
+                });
+            }
+            None => {
+                self.probe(agent, panel, vec![name.clone()]);
+                self.spawn(async move {
+                    (
+                        panel,
+                        McpResult::Reconnected {
+                            name,
+                            result: Ok(()),
+                        },
+                    )
+                });
+            }
+        }
+    }
+
+    /// Takes the end of the connection `run` to `name` made for `panel`; false when the panel
+    /// no longer waits for it.
+    fn probed(
+        &mut self,
+        panel: Uuid,
+        name: &str,
+        run: u64,
+        status: Result<McpServerStatus, String>,
+    ) -> bool {
+        let Some(probe) = self
+            .contexts
+            .get_mut(&panel)
+            .and_then(|context| context.probes.get_mut(name))
+            .filter(|probe| probe.run == run)
+        else {
+            return false;
+        };
+        probe.status = Some(status);
+        true
+    }
+
+    /// Before the Agent starts: connects what the panel asked for and shows the connections made
+    /// for it in `listing`, which comes from the configuration.
+    fn take_up_probes(&mut self, agent: &ConsoleExecution, panel: Uuid, listing: &mut McpListing) {
+        if listing.live {
+            return;
+        }
+        let scope = self
+            .contexts
+            .get_mut(&panel)
+            .and_then(|context| context.pending_probe.take());
+        if let Some(scope) = scope {
+            self.probe(agent, panel, probe_targets(&listing.servers, scope));
+        }
+        if let Some(context) = self.contexts.get_mut(&panel) {
+            show_probes(listing, &mut context.probes);
+        }
+    }
+
+    /// Forgets the connection made for `panel` to `name`, whose login or settings change.
+    fn forget_probe(&mut self, panel: Uuid, name: &str) {
+        if let Some(context) = self.contexts.get_mut(&panel) {
+            context.probes.remove(name);
+        }
+    }
+}
+
+/// The servers of a listing from the configuration that `scope` connects: those that can run,
+/// and of them only the remote ones when the panel opens.
+fn probe_targets(servers: &[McpServerStatus], scope: ProbeScope) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|server| {
+            server.state == McpServerState::Connecting
+                && (scope == ProbeScope::All || server.transport == "http")
+        })
+        .map(|server| server.name.clone())
+        .collect()
+}
+
+/// Shows in `listing`, which comes from the configuration, the state of each server connected
+/// for the panel: connecting while that runs, then how it ended. A server that can no longer run
+/// is forgotten.
+fn show_probes(listing: &mut McpListing, probes: &mut BTreeMap<String, Probe>) {
+    probes.retain(|name, _| {
+        listing
+            .servers
+            .iter()
+            .any(|server| server.name == *name && server.state == McpServerState::Connecting)
+    });
+    for server in &mut listing.servers {
+        let Some(probe) = probes.get(&server.name) else {
+            continue;
+        };
+        match &probe.status {
+            None => {}
+            Some(Ok(status)) => *server = status.clone(),
+            Some(Err(error)) => {
+                server.state = McpServerState::Failed;
+                server.failure = Some(error.clone());
+            }
+        }
+        listing.probed.insert(server.name.clone());
     }
 }
 
@@ -118,7 +299,15 @@ pub(super) fn open(
     let panel = McpPanel::new(chat);
     let id = panel.id();
     console.show_user_panel(UserPanel::Mcp(panel))?;
-    tasks.contexts.insert(id, PanelContext { chat, directory });
+    tasks.contexts.insert(
+        id,
+        PanelContext {
+            chat,
+            directory,
+            probes: BTreeMap::new(),
+            pending_probe: chat.is_none().then_some(ProbeScope::Remote),
+        },
+    );
     tasks.read(root, agent, id);
     Ok(())
 }
@@ -133,9 +322,10 @@ pub(super) fn refresh(root: &Path, agent: &ConsoleExecution, panel: Uuid, tasks:
 async fn read_servers(
     root: &Path,
     agent: &ConsoleExecution,
-    context: PanelContext,
+    chat: Option<Uuid>,
+    directory: PathBuf,
 ) -> Result<McpListing, String> {
-    if let Some(chat) = context.chat {
+    if let Some(chat) = chat {
         let servers = agent
             .mcp_servers(chat)
             .await
@@ -145,18 +335,20 @@ async fn read_servers(
             .await
             .ok()
             .and_then(|status| status.folder)
-            .unwrap_or(context.directory);
+            .unwrap_or(directory);
         return Ok(McpListing {
             servers,
             live: true,
             directory,
+            probed: Default::default(),
         });
     }
-    let resolved = configured(root, &context.directory).await?;
+    let resolved = configured(root, &directory).await?;
     Ok(McpListing {
         servers: configured_statuses(root, &resolved.servers).await,
         live: false,
-        directory: context.directory,
+        directory,
+        probed: Default::default(),
     })
 }
 
@@ -195,26 +387,20 @@ pub(super) fn start(
     tasks: &mut McpTasks,
 ) -> Result<(), String> {
     let panel = work.panel;
-    let Some(context) = tasks.contexts.get(&panel).cloned() else {
+    let Some(context) = tasks.contexts.get_mut(&panel) else {
         return Ok(());
     };
     let directory = context.directory.clone();
     match work.request {
-        McpRequest::Load => tasks.read(root, agent, panel),
-        McpRequest::Reconnect(name) => {
-            let agent = agent.clone();
-            tasks.spawn(async move {
-                let result = match context.chat {
-                    Some(chat) => agent
-                        .reconnect_mcp_server(chat, &name)
-                        .await
-                        .map_err(|error| error.to_string()),
-                    None => Err("the Agent has not started".to_owned()),
-                };
-                (panel, McpResult::Reconnected { name, result })
-            });
+        McpRequest::Load => {
+            if context.chat.is_none() {
+                context.pending_probe = Some(ProbeScope::All);
+            }
+            tasks.read(root, agent, panel);
         }
+        McpRequest::Reconnect(name) => tasks.connect(agent, panel, name),
         McpRequest::SetDisabled { name, disabled } => {
+            tasks.forget_probe(panel, &name);
             let root = root.to_owned();
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking({
@@ -239,6 +425,7 @@ pub(super) fn start(
             });
         }
         McpRequest::LogIn { name, attempt } => {
+            tasks.forget_probe(panel, &name);
             let cancel = CancellationToken::new();
             tasks.logins.insert(
                 panel,
@@ -304,6 +491,7 @@ pub(super) fn start(
             }
         }
         McpRequest::LogOut(name) => {
+            tasks.forget_probe(panel, &name);
             let root = root.to_owned();
             tasks.spawn(async move {
                 let result = async {
@@ -332,7 +520,7 @@ pub(super) fn finish(
     done: Done,
     tasks: &mut McpTasks,
 ) -> Result<(), String> {
-    let result = match done {
+    let mut result = match done {
         Done::Result(result) => result,
         Done::LoginStarted {
             attempt,
@@ -340,20 +528,37 @@ pub(super) fn finish(
             login,
             cancel,
         } => return wait_for_callback(console, panel, (attempt, name), *login, cancel, tasks),
+        Done::Probed { name, run, status } => {
+            if tasks.probed(panel, &name, run, status) {
+                tasks.read(root, agent, panel);
+            }
+            return Ok(());
+        }
     };
-    match &result {
+    match &mut result {
         McpResult::LoginEnded { attempt, .. } => {
             tasks.end_login(panel, *attempt);
         }
         McpResult::Servers { listing, .. } => {
             tasks.reading.remove(&panel);
-            // Later work turns servers off where the Agent works, which its status names.
-            if let (Ok(listing), Some(context)) = (listing, tasks.contexts.get_mut(&panel)) {
-                context.directory = listing.directory.clone();
+            if let Ok(listing) = listing {
+                // Later work turns servers off where the Agent works, which its status names.
+                if let Some(context) = tasks.contexts.get_mut(&panel) {
+                    context.directory = listing.directory.clone();
+                }
+                tasks.take_up_probes(agent, panel, listing);
             }
         }
         _ => {}
     }
+    let logged_in_server = match &result {
+        McpResult::LoginEnded {
+            name,
+            result: Ok(()),
+            ..
+        } => Some(name.clone()),
+        _ => None,
+    };
     let changed = matches!(
         &result,
         McpResult::Reconnected { result: Ok(()), .. }
@@ -373,6 +578,9 @@ pub(super) fn finish(
             }
             return Ok(());
         }
+    }
+    if let Some(name) = logged_in_server {
+        tasks.connect(agent, panel, name);
     }
     if changed {
         tasks.read(root, agent, panel);
@@ -429,4 +637,111 @@ fn wait_for_callback(
         )
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured(name: &str, transport: &str, state: McpServerState) -> McpServerStatus {
+        McpServerStatus {
+            name: name.into(),
+            source: "global".into(),
+            transport: transport.into(),
+            state,
+            exposure: "search".into(),
+            tools: Vec::new(),
+            failure: None,
+            oauth: transport == "http",
+            logged_in: false,
+        }
+    }
+
+    fn listing(servers: Vec<McpServerStatus>) -> McpListing {
+        McpListing {
+            servers,
+            live: false,
+            directory: "/work".into(),
+            probed: Default::default(),
+        }
+    }
+
+    #[test]
+    fn opening_the_panel_connects_only_remote_servers_that_can_run_and_r_connects_local_ones_too() {
+        let servers = [
+            configured("remote", "http", McpServerState::Connecting),
+            configured("local", "stdio", McpServerState::Connecting),
+            configured("off", "http", McpServerState::Disabled),
+            configured("broken", "", McpServerState::Failed),
+        ];
+        assert_eq!(probe_targets(&servers, ProbeScope::Remote), ["remote"]);
+        assert_eq!(
+            probe_targets(&servers, ProbeScope::All),
+            ["remote", "local"]
+        );
+    }
+
+    #[test]
+    fn a_listing_from_the_configuration_shows_the_connections_made_for_the_panel() {
+        let mut connected = configured("remote", "http", McpServerState::Connected);
+        connected
+            .tools
+            .push(tickloop_harness::protocol::mcp::McpToolSummary {
+                name: "mcp__remote__search".into(),
+                description: String::new(),
+            });
+        let mut probes = BTreeMap::from([
+            (
+                "remote".to_owned(),
+                Probe {
+                    run: 1,
+                    status: Some(Ok(connected.clone())),
+                },
+            ),
+            (
+                "local".to_owned(),
+                Probe {
+                    run: 2,
+                    status: None,
+                },
+            ),
+            (
+                "other".to_owned(),
+                Probe {
+                    run: 3,
+                    status: Some(Err("MCP connection timed out".into())),
+                },
+            ),
+            (
+                "off".to_owned(),
+                Probe {
+                    run: 4,
+                    status: Some(Ok(connected.clone())),
+                },
+            ),
+        ]);
+        let mut shown = listing(vec![
+            configured("remote", "http", McpServerState::Connecting),
+            configured("local", "stdio", McpServerState::Connecting),
+            configured("other", "http", McpServerState::Connecting),
+            configured("off", "http", McpServerState::Disabled),
+            configured("idle", "stdio", McpServerState::Connecting),
+        ]);
+        show_probes(&mut shown, &mut probes);
+        assert_eq!(shown.servers[0], connected);
+        assert_eq!(shown.servers[1].state, McpServerState::Connecting);
+        assert_eq!(
+            (&shown.servers[2].state, shown.servers[2].failure.as_deref()),
+            (&McpServerState::Failed, Some("MCP connection timed out"))
+        );
+        assert_eq!(shown.servers[3].state, McpServerState::Disabled);
+        assert_eq!(
+            shown.probed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["local", "other", "remote"]
+        );
+        assert!(
+            !probes.contains_key("off"),
+            "a server that can no longer run is forgotten"
+        );
+    }
 }
