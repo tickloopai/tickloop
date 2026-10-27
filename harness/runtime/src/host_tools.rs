@@ -420,6 +420,11 @@ pub trait HostToolProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Servers whose discoverable tools are missing because they are not connected.
+    fn unavailable_tool_servers(&self) -> Vec<crate::tool_exposure::UnavailableServer> {
+        Vec::new()
+    }
+
     fn has_tool_search(&self) -> bool {
         false
     }

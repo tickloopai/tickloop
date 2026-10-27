@@ -30,7 +30,7 @@ use super::{
 };
 use tickloop_harness::protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
-    OperationRecord, OperationState, PermissionApprovalSource, PermissionRequest,
+    OperationRecord, OperationState, PermissionApprovalSource, PermissionRequest, ProposedToolCall,
     SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentReportMessage,
     TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord, UserShellState,
     WebSearchFailure, WebSearchSuggestion,
@@ -40,6 +40,8 @@ const RETAINED_TOOL_EVENTS: usize = 128;
 // A Codemode script and an ExecuteTools batch make calls of their own under their call.
 const CODEMODE_TOOL_NAME: &str = "Codemode";
 const EXECUTE_TOOLS_NAME: &str = "ExecuteTools";
+const SEARCH_TOOLS_NAME: &str = "SearchTools";
+const DESCRIBE_TOOLS_NAME: &str = "DescribeTools";
 const PREVIEW_LINES: usize = 5;
 /// Lines a failed result keeps from its start: the exit code and what ended the command.
 const FAILURE_HEAD_LINES: usize = 2;
@@ -1849,6 +1851,29 @@ pub(super) fn tool_name(name: &str) -> String {
     })
 }
 
+/// Where a nested call came from, in words rather than the parent's internal call id.
+fn nested_call_origin(request: &PermissionRequest, parent: &ProposedToolCall) -> String {
+    match parent.name.as_str() {
+        CODEMODE_TOOL_NAME => "a Codemode script".into(),
+        EXECUTE_TOOLS_NAME => {
+            let calls = parent.input["calls"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut positions = calls.iter().enumerate().filter(|(_, call)| {
+                call["name"] == request.name.as_str() && call["arguments"] == request.input
+            });
+            match (positions.next(), positions.next()) {
+                (Some((index, _)), None) => {
+                    format!("ExecuteTools, call {} of {}", index + 1, calls.len())
+                }
+                _ => format!("an ExecuteTools batch of {} calls", calls.len()),
+            }
+        }
+        other => safe_text(other),
+    }
+}
+
 pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
     let mut lines = vec![format!(
         "{} is waiting for your approval.",
@@ -1856,9 +1881,8 @@ pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
     )];
     if let Some(parent) = &request.parent_call {
         lines.push(format!(
-            "From {} call {} (model-authored; not user authorization)",
-            safe_text(&parent.name),
-            safe_text(&parent.call_id)
+            "From {} (model-authored; not user authorization)",
+            nested_call_origin(request, parent)
         ));
         lines.push(format!(
             "Full parent call: {}",
@@ -2010,6 +2034,8 @@ fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let quickstart;
     let script;
+    let described_tools;
+    let batched_calls;
     let primary = match name {
         CODEMODE_TOOL_NAME => {
             let lines = input["code"]
@@ -2024,6 +2050,34 @@ fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
                 input["intent"].as_str().unwrap_or_default()
             );
             Some(quickstart.as_str())
+        }
+        SEARCH_TOOLS_NAME => input["query"].as_str(),
+        DESCRIBE_TOOLS_NAME => {
+            described_tools = input["names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(described_tools.as_str()).filter(|names| !names.is_empty())
+        }
+        EXECUTE_TOOLS_NAME => {
+            let calls = input["calls"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut names: Vec<&str> = Vec::new();
+            for name in calls.iter().filter_map(|call| call["name"].as_str()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            batched_calls = match calls.len() {
+                0 | 1 => names.join(", "),
+                count => format!("{count} calls: {}", names.join(", ")),
+            };
+            Some(batched_calls.as_str()).filter(|calls| !calls.is_empty())
         }
         "Skill" => input["skill"].as_str(),
         "ReadMcpResourceTool" => input["uri"].as_str(),
@@ -4567,6 +4621,54 @@ mod tests {
     }
 
     #[test]
+    fn fold_calls_show_their_query_described_tools_and_batched_calls() {
+        let call = |name: &str, input: Value| {
+            archived_tool_call(
+                name,
+                &input,
+                Path::new(""),
+                DisplayProfile::default(),
+                &super::super::tick_labels::TickLabels::default(),
+            )
+        };
+        let searched = call("SearchTools", json!({"query":"ui5 tools"}));
+        assert!(searched.contains("SearchTools · ui5 tools"), "{searched}");
+        let long = call("SearchTools", json!({"query":"ui5 ".repeat(100)}));
+        assert!(long.contains('…') && long.chars().count() < 200, "{long}");
+        let described = call(
+            "DescribeTools",
+            json!({"names":["mcp__ui5__get_version_info","mcp__ui5__run_ui5_linter"]}),
+        );
+        assert!(
+            described
+                .contains("DescribeTools · mcp__ui5__get_version_info, mcp__ui5__run_ui5_linter"),
+            "{described}"
+        );
+        let single = call(
+            "ExecuteTools",
+            json!({"calls":[{"name":"mcp__ui5__get_version_info","arguments":{}}]}),
+        );
+        assert!(
+            single.contains("ExecuteTools · mcp__ui5__get_version_info\n"),
+            "{single}"
+        );
+        let batch = call(
+            "ExecuteTools",
+            json!({"calls":[
+                {"name":"mcp__ui5__get_version_info","arguments":{}},
+                {"name":"mcp__ui5__run_ui5_linter","arguments":{}},
+                {"name":"mcp__ui5__get_version_info","arguments":{"x":1}}
+            ]}),
+        );
+        assert!(
+            batch.contains(
+                "ExecuteTools · 3 calls: mcp__ui5__get_version_info, mcp__ui5__run_ui5_linter"
+            ),
+            "{batch}"
+        );
+    }
+
+    #[test]
     fn an_artifact_quickstart_names_its_intent_and_sums_up_the_guidance_it_sent() {
         let input = json!({"action":"quickstart","intent":"page"});
         let call = archived_tool_call(
@@ -4887,6 +4989,53 @@ mod tests {
         assert!(context.contains("Reason: credential access requires human approval"));
         assert!(context.contains("Enforced by: safety check"));
         assert!(context.contains("saved rules cannot bypass"));
+    }
+
+    #[test]
+    fn nested_permission_context_names_the_batch_position_or_script_instead_of_call_ids() {
+        const PARENT_CALL_ID: &str = "call_ba6b11|fc_06ed|7b13";
+        let batch = json!({"calls":[
+            {"name":"mcp__ui5__get_version_info","arguments":{}},
+            {"name":"mcp__ui5__run_ui5_linter","arguments":{"dir":"app"}},
+            {"name":"mcp__office__mail","arguments":{"to":"a"}}
+        ]});
+        let mut request: PermissionRequest = serde_json::from_value(json!({
+            "parent_call": {"call_id":PARENT_CALL_ID,"name":"ExecuteTools","input":batch},
+            "id": Uuid::new_v4(),
+            "loop_id": Uuid::new_v4(),
+            "execution": {"ToolCall":{"run_id":Uuid::new_v4(),"call_id":"nested"}},
+            "name": "mcp__ui5__run_ui5_linter",
+            "input": {"dir":"app"}
+        }))
+        .unwrap();
+        let context = permission_context(&request);
+        assert_eq!(
+            context[1],
+            "From ExecuteTools, call 2 of 3 (model-authored; not user authorization)"
+        );
+        let joined = context.join("\n");
+        assert!(
+            !joined.contains(&format!("call {PARENT_CALL_ID}")),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(&format!("Full parent call: {}", batch)),
+            "{joined}"
+        );
+
+        request.input = json!({"dir":"elsewhere"});
+        assert_eq!(
+            permission_context(&request)[1],
+            "From an ExecuteTools batch of 3 calls (model-authored; not user authorization)"
+        );
+
+        let parent = request.parent_call.as_mut().unwrap();
+        parent.name = "Codemode".into();
+        parent.input = json!({"code":"await tools.mcp__ui5__run_ui5_linter({dir:'app'})"});
+        assert_eq!(
+            permission_context(&request)[1],
+            "From a Codemode script (model-authored; not user authorization)"
+        );
     }
 
     #[test]
