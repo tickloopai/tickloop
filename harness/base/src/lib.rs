@@ -1,7 +1,8 @@
-//! Leaf utilities shared by every Agent crate: private files, credentials, timestamps, HTTP policy, the
-//! loopback OAuth callback, images and output styles.
+//! Leaf utilities shared by every Agent crate: private files, credentials, git worktree links,
+//! timestamps, HTTP policy, the loopback OAuth callback, images and output styles.
 
 pub mod credentials;
+pub mod git_worktree;
 pub mod image;
 pub mod network;
 pub mod oauth_callback;

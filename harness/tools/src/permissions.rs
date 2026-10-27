@@ -326,6 +326,7 @@ impl PermissionPolicyExt for PermissionPolicy {
             return Decision::Ask;
         }
         let accept_edits_admits = operation.is_allowed_in_accept_edits(workspace)
+            || operation.is_allowed_in_accept_edits_with_sibling_worktrees(workspace)
             || !operation.accept_edits_supersedes_read_only() && !operation.requires_permission;
         let passes_fast_path = safety_check.is_none()
             && !content_rule_asks(self, &operation.name, &operation.input, loop_id)
@@ -1088,6 +1089,96 @@ mod tests {
                 &external_read
             ),
             Decision::Deny
+        );
+    }
+
+    fn git(directory: &std::path::Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(arguments)
+            .current_dir(directory)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    /// Auto counts the other linked worktrees of the Folder's repository as the project, the way
+    /// a session in one Herdr worktree edits a sibling it just created; the main checkout,
+    /// unrelated directories, other modes and sensitive paths keep their usual handling.
+    #[test]
+    fn auto_admits_edits_in_sibling_worktrees_of_the_folder_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        let unrelated = root_path.join("unrelated");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        git(&main, &["init", "--quiet"]);
+        git(&main, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        for name in ["current", "sibling"] {
+            let path = root_path.join("worktrees").join(name);
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    name,
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+        let sibling = root_path.join("worktrees/sibling");
+        let workspace = Workspace {
+            folder: Some(root_path.join("worktrees/current")),
+            additional_directories: Vec::new(),
+        };
+        let write = |path: std::path::PathBuf| {
+            prepare_in(&workspace, "Write", json!({"file_path":path,"content":"x"}))
+        };
+        let touch = |path: std::path::PathBuf| {
+            prepare_in(
+                &workspace,
+                "Bash",
+                json!({"command":format!("touch {}", path.display())}),
+            )
+        };
+        let decide = |mode, operation: &PreparedTool| {
+            PermissionPolicy {
+                mode,
+                ..PermissionPolicy::default()
+            }
+            .decide(operation, &workspace, Uuid::nil())
+        };
+        let auto = ExecutionMode::Auto;
+
+        assert_eq!(
+            decide(auto, &write(sibling.join("notes.md"))),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(auto, &touch(sibling.join("new.md"))),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(auto, &write(sibling.join(".gitmodules"))),
+            Decision::Check
+        );
+        assert_eq!(decide(auto, &write(main.join("notes.md"))), Decision::Check);
+        assert_eq!(
+            decide(auto, &write(unrelated.join("notes.md"))),
+            Decision::Check
+        );
+        assert_eq!(
+            decide(auto, &touch(unrelated.join("new.md"))),
+            Decision::Check
+        );
+        assert_eq!(
+            decide(ExecutionMode::AcceptEdits, &write(sibling.join("notes.md"))),
+            Decision::Ask
         );
     }
 

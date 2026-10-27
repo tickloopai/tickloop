@@ -16,6 +16,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::LazyLock,
 };
+use tickloop_harness::base::git_worktree;
 use tickloop_harness::policy::instructions::{InstructionFile, InstructionScope};
 
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
@@ -614,44 +615,13 @@ fn nested_worktree(folder: &Path) -> Option<NestedWorktree> {
         .ancestors()
         .find(|directory| directory.join(GIT_ENTRY).exists())?
         .to_path_buf();
-    let main_root = main_repository_root(&worktree_root)?;
+    let main_root = git_worktree::main_repository_root(&worktree_root)?;
     (main_root != worktree_root && worktree_root.starts_with(&main_root)).then_some(
         NestedWorktree {
             worktree_root,
             main_root,
         },
     )
-}
-
-/// The main working directory of the worktree checked out at `worktree_root`, verified the way
-/// `git worktree add` links them so a cloned repository cannot point elsewhere.
-fn main_repository_root(worktree_root: &Path) -> Option<PathBuf> {
-    let pointer = fs::read_to_string(worktree_root.join(GIT_ENTRY)).ok()?;
-    let worktree_git_directory =
-        normalize(&worktree_root.join(pointer.trim().strip_prefix("gitdir:")?.trim()));
-    let common_directory = normalize(
-        &worktree_git_directory.join(
-            fs::read_to_string(worktree_git_directory.join("commondir"))
-                .ok()?
-                .trim(),
-        ),
-    );
-    if worktree_git_directory.parent()? != common_directory.join("worktrees") {
-        return None;
-    }
-    let backlink = fs::canonicalize(
-        fs::read_to_string(worktree_git_directory.join("gitdir"))
-            .ok()?
-            .trim(),
-    )
-    .ok()?;
-    if backlink != fs::canonicalize(worktree_root).ok()?.join(GIT_ENTRY) {
-        return None;
-    }
-    if common_directory.file_name()? != GIT_ENTRY {
-        return Some(resolve(&common_directory));
-    }
-    common_directory.parent().map(resolve)
 }
 
 #[cfg(test)]

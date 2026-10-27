@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
+use tickloop_harness_base::git_worktree::sibling_linked_worktrees;
 use tickloop_harness_base::image::ImageError;
 use tickloop_harness_base::network::Reach;
 use tickloop_harness_base::private_fs::{
@@ -80,6 +81,21 @@ impl Workspace {
             .chain(&self.additional_directories)
             .filter_map(|directory| directory.canonicalize().ok())
             .any(|directory| path.starts_with(directory))
+    }
+
+    /// This workspace plus the other linked worktrees of the Folder's repository, which Auto
+    /// counts as the same project; `None` when the repository has none.
+    fn with_sibling_worktrees(&self) -> Option<Workspace> {
+        let siblings = sibling_linked_worktrees(self.folder.as_deref()?);
+        (!siblings.is_empty()).then(|| Workspace {
+            folder: self.folder.clone(),
+            additional_directories: self
+                .additional_directories
+                .iter()
+                .cloned()
+                .chain(siblings)
+                .collect(),
+        })
     }
 
     /// `path` below the workspace directory that holds it, as written or in canonical form, or
@@ -226,6 +242,8 @@ pub struct PreparedTool {
     pub is_read_only: bool,
     pub in_workspace: bool,
     pub file_change: Option<PreparedFileChange>,
+    /// Outside the workspace but inside another linked worktree of the Folder's repository.
+    in_sibling_worktree: bool,
     in_family_temp: bool,
     automatic_shell_workspace: Option<Workspace>,
     original_path: PathBuf,
@@ -389,6 +407,21 @@ impl PreparedTool {
             Operation::Shell(input) => {
                 input.is_allowed_in_accept_edits(&self.resolved_path, workspace)
             }
+            _ => false,
+        }
+    }
+
+    /// Accept Edits admission with the other linked worktrees of the Folder's repository counted
+    /// as workspace directories, which Auto applies before asking its classifier.
+    pub fn is_allowed_in_accept_edits_with_sibling_worktrees(&self, workspace: &Workspace) -> bool {
+        if !self.in_workspace && !self.in_sibling_worktree {
+            return false;
+        }
+        match &self.operation {
+            Operation::Write(_) => self.safety_check().is_none(),
+            Operation::Shell(input) => workspace
+                .with_sibling_worktrees()
+                .is_some_and(|scope| input.is_allowed_in_accept_edits(&self.resolved_path, &scope)),
             _ => false,
         }
     }
@@ -1183,6 +1216,7 @@ fn prepare_with_readable_directories(
             is_read_only: true,
             in_workspace: false,
             file_change: None,
+            in_sibling_worktree: false,
             in_family_temp: false,
             automatic_shell_workspace: None,
             original_path: PathBuf::new(),
@@ -1236,9 +1270,14 @@ fn prepare_with_readable_directories(
         )?)),
         other => other,
     };
-    let in_workspace = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_))
-        && workspace.contains(&original_scope)
-        && workspace.contains(&resolved_path);
+    let is_local = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_));
+    let in_workspace =
+        is_local && workspace.contains(&original_scope) && workspace.contains(&resolved_path);
+    let in_sibling_worktree = is_local
+        && !in_workspace
+        && workspace
+            .with_sibling_worktrees()
+            .is_some_and(|scope| scope.contains(&original_scope) && scope.contains(&resolved_path));
     let is_file_operation = matches!(
         operation,
         Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
@@ -1267,6 +1306,7 @@ fn prepare_with_readable_directories(
         is_read_only,
         in_workspace,
         file_change: None,
+        in_sibling_worktree,
         in_family_temp,
         automatic_shell_workspace,
         original_path,

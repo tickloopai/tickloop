@@ -8,6 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tickloop_harness_base::git_worktree::sibling_linked_worktrees;
 use tickloop_harness_protocol::{ScheduledTaskId, ScheduledTaskIdKind};
 use tickloop_ids::{IdContext, ModelRef};
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use input_projection::{InputPurpose, project_tool_input};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v10";
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v11";
 pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v19";
 /// Images carry no review evidence in serialized text; their base64 never enters the snapshot.
 const IMAGE_PLACEHOLDER: &str = "[image omitted from the approval context]";
@@ -448,6 +449,9 @@ pub(super) struct ApprovalSnapshot {
     pub original_user_inputs: Vec<OriginalUserInput>,
     pub working_directory: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    /// Other linked worktrees of the working directory's repository, verified from its git
+    /// metadata: checkouts of the same repository, not other repositories.
+    pub same_repository_worktrees: Vec<PathBuf>,
     pub permission_policy_revision: u64,
 }
 
@@ -797,6 +801,7 @@ pub(super) fn capture(
         original_user_inputs,
         working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),
+        same_repository_worktrees: sibling_linked_worktrees(folder),
         permission_policy_revision: snapshot.policy.revision,
         auto_policy,
     })
