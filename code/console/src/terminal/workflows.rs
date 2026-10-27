@@ -1269,16 +1269,9 @@ fn append_public_message(
                             &history.tick_labels,
                         )
                     };
-                    let mut text = spans
-                        .iter()
-                        .map(|(text, _)| text.as_str())
-                        .collect::<String>();
-                    text.truncate(text.len().saturating_sub(1));
-                    text.push_str(state.suffix());
-                    text.push('\n');
                     history.pieces.push(ConversationPiece::ToolCall {
                         run_id: run.into(),
-                        text,
+                        text: tool_call_text(&spans, state),
                         call_key: presentation::tool_call_key(run.into(), id),
                         spans,
                         state,
@@ -1288,7 +1281,11 @@ fn append_public_message(
                             .is_none()
                             .then(|| presentation::collapsed_call(name, input))
                             .flatten(),
+                        parent_key: None,
                     });
+                    if presentation::makes_nested_calls(name) {
+                        append_nested_calls(history, run.into(), id, display);
+                    }
                 } else {
                     history.push_role(
                         presentation::archived_tool_call(
@@ -1353,6 +1350,7 @@ fn append_public_message(
                             spans,
                             state: super::scrollback::ToolCallState::Failed,
                             collapse: None,
+                            parent_key: None,
                         });
                     }
                 }
@@ -1400,6 +1398,77 @@ fn append_public_message(
             | Content::Thinking { .. }
             | Content::ProtocolData { .. }
             | Content::Image { .. } => {}
+        }
+    }
+}
+
+/// A call row's plain text: its spans with the state's suffix before the final newline.
+fn tool_call_text(
+    spans: &[(String, Option<super::style::Role>)],
+    state: super::scrollback::ToolCallState,
+) -> String {
+    let mut text = spans
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    text.truncate(text.len().saturating_sub(1));
+    text.push_str(state.suffix());
+    text.push('\n');
+    text
+}
+
+/// The calls a script or batch made, each with its result, under the row of the call that made
+/// them.
+fn append_nested_calls(
+    history: &mut PublicHistoryBuilder,
+    run: Uuid,
+    parent: &str,
+    display: DisplayProfile,
+) {
+    let folder = super::shown_folder(history.chat.folder.as_deref());
+    let parent_key = presentation::tool_call_key(run, parent);
+    for operation in presentation::nested_operations(history.chat, run, parent) {
+        let call_key = presentation::tool_call_key(run, &operation.call_id);
+        let spans = presentation::tool_call_roles(
+            &operation.name,
+            &operation.input,
+            folder,
+            display,
+            &history.tick_labels,
+        );
+        let state = match &operation.result {
+            Some(result) => {
+                presentation::tool_result_state(&operation.name, &result.content, result.is_error)
+            }
+            None => history
+                .tool_states
+                .get(&(run, operation.call_id.clone()))
+                .copied()
+                .unwrap_or(super::scrollback::ToolCallState::Finished),
+        };
+        history.pieces.push(ConversationPiece::ToolCall {
+            run_id: run,
+            text: tool_call_text(&spans, state),
+            call_key: call_key.clone(),
+            spans,
+            state,
+            collapse: None,
+            parent_key: Some(parent_key.clone()),
+        });
+        if let Some(result) = &operation.result {
+            let runs = presentation::archived_tool_result(
+                &operation.name,
+                Some(&operation.input),
+                result,
+                folder,
+                display,
+                &presentation::CallFacts::default(),
+            );
+            history.pieces.push(ConversationPiece::ToolResult {
+                call_key,
+                runs,
+                clip_summary: false,
+            });
         }
     }
 }

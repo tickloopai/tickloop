@@ -4418,6 +4418,10 @@ async fn interact_with_herdr(
                     } else {
                         None
                     };
+                    if let Some(call_id) = tools.nested_call_to_learn(&event)
+                        && let Ok(Some(nested)) = agent.operation(event.chat_id.into(), event.run_id.into(), call_id).await {
+                        tools.learn_nested_call(&event, &nested);
+                    }
                     let operation = match &event.kind {
                         EventKind::ToolCompleted { call_id, .. } if result_source == presentation::ResultSource::Operation => {
                             agent.operation(event.chat_id.into(), event.run_id.into(), call_id).await.ok().flatten()
@@ -5859,6 +5863,13 @@ fn render_restored_observation(
                 && console.is_interactive()
             {
                 console.write_pieces(&[presentation::thinking_label()])?;
+            }
+            if let Some(call_id) = tools.nested_call_to_learn(event)
+                && let Some(nested) = observation.snapshot.operations.iter().find(|operation| {
+                    operation.run_id == event.run_id && operation.call_id == call_id
+                })
+            {
+                tools.learn_nested_call(event, nested);
             }
             let facts = tools.call_facts(event, &observation.snapshot);
             let interrupted_by_rejection = tools.ended_with_rejection(event.run_id.into());

@@ -3,6 +3,9 @@
 #[cfg(feature = "codemode")]
 #[path = "all/codemode.rs"]
 mod codemode;
+#[cfg(feature = "codemode")]
+#[path = "all/codemode_store.rs"]
+mod codemode_store;
 
 #[path = "all/advance.rs"]
 mod advance;
