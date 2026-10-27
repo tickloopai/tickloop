@@ -1499,6 +1499,10 @@ fn chain_entry(
             .and_then(HostNote::announced_host_tools)
             .cloned(),
         plan_mode_exit: snapshot.host_notes.get(&index) == Some(&HostNote::PlanModeExit),
+        date_change: match snapshot.host_notes.get(&index) {
+            Some(HostNote::DateChange(date)) => Some(date.clone()),
+            _ => None,
+        },
         guidance: match snapshot.host_notes.get(&index) {
             Some(HostNote::Guidance(note)) => Some(note.clone()),
             _ => None,
@@ -1657,6 +1661,7 @@ fn record_loop(
         is_meta: false,
         host_tools: None,
         plan_mode_exit: false,
+        date_change: None,
         guidance: None,
         execution_mode: None,
         is_inherited_prompt: false,
@@ -1952,6 +1957,10 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::HostTools(announced.clone()));
         } else if entry.plan_mode_exit {
             restored.host_notes.insert(index, HostNote::PlanModeExit);
+        } else if let Some(date) = &entry.date_change {
+            restored
+                .host_notes
+                .insert(index, HostNote::DateChange(date.clone()));
         } else if let Some(note) = &entry.guidance {
             restored
                 .host_notes
@@ -3759,6 +3768,8 @@ impl Agent {
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
+                user_context: Default::default(),
+                announced_date: None,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
                 branch_reservation: None,

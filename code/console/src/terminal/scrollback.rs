@@ -78,6 +78,8 @@ pub(super) struct ScrollCheckpoint {
     following: bool,
     auto_scroll: bool,
     unread: usize,
+    /// The line an older View inserted under the banner for the Agent's build; this View shows
+    /// it in the banner's title line instead, so it never writes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_runtime_line: Option<usize>,
 }
@@ -263,7 +265,6 @@ pub(super) struct Scrollback {
     tool_call_headers: HashMap<String, ToolCallHeader>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
-    agent_runtime_line: Option<usize>,
     model_retries: BTreeMap<(Uuid, ModelRequestKind), ModelRetryNotice>,
     /// Logical lines of each input echo, oldest first.
     inputs: Vec<(u64, Range<usize>)>,
@@ -301,7 +302,6 @@ impl Default for Scrollback {
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
-            agent_runtime_line: None,
             model_retries: BTreeMap::new(),
             inputs: Vec::new(),
             next_input: 0,
@@ -319,38 +319,23 @@ impl Scrollback {
             following: self.following,
             auto_scroll: self.auto_scroll,
             unread: self.unread,
-            agent_runtime_line: self.agent_runtime_line,
+            agent_runtime_line: None,
         }
     }
 
     pub(super) fn restore_upgrade_checkpoint(&mut self, checkpoint: ScrollCheckpoint) {
         let mut anchor = checkpoint.anchor;
-        if !checkpoint.following {
-            if checkpoint.agent_runtime_line == Some(anchor.line) {
+        if !checkpoint.following
+            && let Some(removed) = checkpoint.agent_runtime_line
+        {
+            if removed == anchor.line {
                 anchor = Position {
-                    line: self.agent_runtime_line.map_or(anchor.line, |line| {
-                        if self.line_styles[line].hidden {
-                            line + 1
-                        } else {
-                            line
-                        }
-                    }),
+                    line: removed,
                     byte: 0,
                     tab_cell: 0,
                 };
-            } else {
-                if checkpoint
-                    .agent_runtime_line
-                    .is_some_and(|line| line < anchor.line)
-                {
-                    anchor.line -= 1;
-                }
-                if self
-                    .agent_runtime_line
-                    .is_some_and(|line| line <= anchor.line)
-                {
-                    anchor.line = anchor.line.saturating_add(1);
-                }
+            } else if removed < anchor.line {
+                anchor.line -= 1;
             }
         }
         self.anchor = anchor;
@@ -560,23 +545,25 @@ impl Scrollback {
             .insert(key, ModelRetryNotice { line, attempt });
     }
 
-    pub(super) fn set_agent_runtime_banner(&mut self, at: usize, text: Option<&str>) -> bool {
-        let line = match self.agent_runtime_line {
-            Some(line) => line,
-            None if text.is_none() || at >= self.lines.len() => return false,
-            None => {
-                self.insert_lines(at, vec![String::new()], vec![LineStyle::default()]);
-                self.agent_runtime_line = Some(at);
-                at
-            }
-        };
-        let text_value = text.unwrap_or_default();
-        let hidden = text.is_none();
-        if self.lines[line] == text_value && self.line_styles[line].hidden == hidden {
+    /// Replaces the banner's title at `line` with `spans` in place, provided the line still
+    /// begins with `title`; reports whether it changed.
+    pub(super) fn set_banner_title(
+        &mut self,
+        line: usize,
+        title: &str,
+        spans: &[(&str, Option<Role>)],
+    ) -> bool {
+        if !self
+            .lines
+            .get(line)
+            .is_some_and(|text| text.starts_with(title))
+        {
             return false;
         }
-        self.set_line(line, &[(text_value, Some(Role::MutedText))]);
-        self.line_styles[line].hidden = hidden;
+        if self.lines[line] == spans.iter().map(|(text, _)| *text).collect::<String>() {
+            return false;
+        }
+        self.set_line(line, spans);
         true
     }
 
@@ -704,9 +691,6 @@ impl Scrollback {
             shift(line);
         }
         for line in &mut self.pending_take_in_lines {
-            shift(line);
-        }
-        if let Some(line) = &mut self.agent_runtime_line {
             shift(line);
         }
         for notice in self.model_retries.values_mut() {
@@ -1993,89 +1977,94 @@ fn push_row(
 mod tests {
     use super::*;
 
-    fn runtime_checkpoint_history(slot: Option<bool>) -> Scrollback {
+    const TITLE: &str = "Tickloop v1.0.0";
+
+    fn banner_history(older_runtime_line: bool) -> Scrollback {
         let mut scrollback = Scrollback::new();
-        scrollback.append("View version\nModel\nDirectory\n");
+        scrollback.append(&format!("{TITLE}\nModel\nDirectory\n"));
+        if older_runtime_line {
+            scrollback.append("Agent v1.0.0+old\n");
+        }
         for index in 0..120 {
             scrollback.append(&format!("content {index:03}\n"));
-        }
-        if let Some(visible) = slot {
-            scrollback.set_agent_runtime_banner(3, Some("Agent v1.0.0+old"));
-            if !visible {
-                scrollback.set_agent_runtime_banner(3, None);
-            }
         }
         scrollback.frame(80, 8);
         scrollback
     }
 
+    fn scrolled_to(scrollback: &mut Scrollback, text: &str) {
+        let target = scrollback
+            .row_texts(0..200)
+            .iter()
+            .position(|line| line == text)
+            .unwrap();
+        scrollback.scroll(ScrollAction::First);
+        scrollback.scroll(ScrollAction::LinesDown(target));
+    }
+
     #[test]
-    fn runtime_banner_checkpoint_preserves_content_through_missing_and_hidden_slots() {
-        for old_slot in [None, Some(true), Some(false)] {
-            for new_slot in [None, Some(true), Some(false)] {
-                for following in [false, true] {
-                    let mut original = runtime_checkpoint_history(old_slot);
-                    if following {
-                        original.scroll(ScrollAction::Last);
-                    } else {
-                        let target = original
-                            .row_texts(0..200)
-                            .iter()
-                            .position(|line| line == "content 040")
-                            .unwrap();
-                        original.scroll(ScrollAction::First);
-                        original.scroll(ScrollAction::LinesDown(target));
-                    }
-                    let expected = original.frame(80, 8).lines;
-                    let checkpoint = original.upgrade_checkpoint();
-                    assert_eq!(checkpoint.agent_runtime_line.is_some(), old_slot.is_some());
-                    let mut restored = runtime_checkpoint_history(new_slot);
-                    restored.restore_upgrade_checkpoint(checkpoint);
-                    assert_eq!(
-                        restored.frame(80, 8).lines,
-                        expected,
-                        "old={old_slot:?}, new={new_slot:?}, following={following}"
-                    );
-                    assert_eq!(restored.is_following(), following);
-                    restored.set_agent_runtime_banner(3, Some("Agent v2.0.0+new"));
-                    assert_eq!(
-                        restored.frame(80, 8).lines,
-                        expected,
-                        "learning the new Worker must preserve the restored reading position"
-                    );
-                    assert_eq!(restored.is_following(), following);
-                }
+    fn the_agent_build_changes_the_title_in_place_and_keeps_the_reading_position() {
+        let mut scrollback = banner_history(false);
+        scrolled_to(&mut scrollback, "content 040");
+        let expected = scrollback.frame(80, 8).lines;
+        let different = [
+            (TITLE, Some(Role::Title)),
+            (" (Daemon: v0.9.0+old)", Some(Role::MutedText)),
+        ];
+        assert!(scrollback.set_banner_title(0, TITLE, &different));
+        assert!(!scrollback.set_banner_title(0, TITLE, &different));
+        assert_eq!(scrollback.lines[0], "Tickloop v1.0.0 (Daemon: v0.9.0+old)");
+        assert_eq!(scrollback.frame(80, 8).lines, expected);
+        assert!(scrollback.set_banner_title(0, TITLE, &[(TITLE, Some(Role::Title))]));
+        assert_eq!(scrollback.lines[0], TITLE);
+        assert!(!scrollback.set_banner_title(3, TITLE, &[(TITLE, None)]));
+    }
+
+    #[test]
+    fn an_older_views_runtime_line_is_dropped_without_moving_the_reading_position() {
+        for following in [false, true] {
+            let mut original = banner_history(true);
+            if following {
+                original.scroll(ScrollAction::Last);
+            } else {
+                scrolled_to(&mut original, "content 040");
             }
+            let expected = original.frame(80, 8).lines;
+            let mut checkpoint = original.upgrade_checkpoint();
+            checkpoint.agent_runtime_line = Some(3);
+            let mut restored = banner_history(false);
+            restored.restore_upgrade_checkpoint(checkpoint);
+            assert_eq!(
+                restored.frame(80, 8).lines,
+                expected,
+                "following={following}"
+            );
+            assert_eq!(restored.is_following(), following);
         }
     }
 
     #[test]
-    fn runtime_banner_anchor_restores_to_the_target_slot_or_the_next_content_start() {
-        let mut original = runtime_checkpoint_history(Some(true));
+    fn an_anchor_on_an_older_runtime_line_restores_to_the_next_content_start() {
+        let mut original = banner_history(true);
         original.scroll(ScrollAction::First);
         let mut checkpoint = original.upgrade_checkpoint();
+        checkpoint.agent_runtime_line = Some(3);
         checkpoint.anchor = Position {
             line: 3,
             byte: 9,
             tab_cell: 2,
         };
-        for slot in [None, Some(true), Some(false)] {
-            let mut restored = runtime_checkpoint_history(slot);
-            restored.restore_upgrade_checkpoint(checkpoint);
-            assert_eq!(
-                restored.anchor,
-                Position {
-                    line: if slot == Some(false) { 4 } else { 3 },
-                    byte: 0,
-                    tab_cell: 0,
-                }
-            );
-            if slot != Some(true) {
-                assert_eq!(restored.frame(80, 8).lines[0], "content 000");
-                restored.set_agent_runtime_banner(3, Some("Agent v2.0.0+new"));
-                assert_eq!(restored.frame(80, 8).lines[0], "content 000");
+        let mut restored = banner_history(false);
+        restored.restore_upgrade_checkpoint(checkpoint);
+        assert_eq!(
+            restored.anchor,
+            Position {
+                line: 3,
+                byte: 0,
+                tab_cell: 0,
             }
-        }
+        );
+        assert_eq!(restored.frame(80, 8).lines[0], "content 000");
     }
 
     #[test]

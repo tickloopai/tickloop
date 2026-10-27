@@ -2786,12 +2786,21 @@ async fn model_control_sequences_cannot_change_terminal_state() {
     server.await.unwrap();
 }
 
-/// The tickloop guidance follows the first prompt, whose run loaded it, and stays there.
+/// The user context leads the request; the tickloop guidance follows the first prompt, whose run
+/// loaded it, and stays there.
 fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[(&str, &str)]) {
+    const USER_CONTEXT: usize = 0;
+    const REFERENCE: usize = 2;
     let messages = request["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), expected_messages.len() + 1);
-    assert_eq!(messages[1]["role"], "user");
-    let reference = messages[1]["content"].as_array().unwrap();
+    assert_eq!(messages.len(), expected_messages.len() + 2);
+    assert!(
+        messages[USER_CONTEXT]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(tickloop_harness::policy::instructions::USER_CONTEXT_OPENING)
+    );
+    assert_eq!(messages[REFERENCE]["role"], "user");
+    let reference = messages[REFERENCE]["content"].as_array().unwrap();
     assert_eq!(reference.len(), 1);
     assert_eq!(reference[0]["type"], "text");
     assert!(reference[0]["text"].as_str().unwrap().starts_with(
@@ -2800,7 +2809,7 @@ fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[
     let conversation = messages
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != 1)
+        .filter(|(index, _)| ![USER_CONTEXT, REFERENCE].contains(index))
         .map(|(_, message)| message)
         .map(|message| {
             let content = message["content"].as_array().unwrap();

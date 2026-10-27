@@ -157,7 +157,7 @@ fn conversation_texts(snapshot: &ChatSnapshot) -> Vec<String> {
 fn non_system(messages: &[Message]) -> Vec<Message> {
     messages
         .iter()
-        .filter(|message| message.role != Role::System)
+        .filter(|message| tickloop_harness::test_support::is_conversation(message))
         .cloned()
         .collect()
 }

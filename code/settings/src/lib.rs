@@ -15,6 +15,7 @@
 //! not take effect and the problem is returned as a warning instead of being silently dropped
 //! (users need to know when persistent Deny/Ask rules stop applying).
 
+pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
 mod store;
@@ -173,6 +174,9 @@ pub fn config_root_directory() -> Option<PathBuf> {
 #[derive(Clone, Debug)]
 pub struct UserSettings {
     path: PathBuf,
+    /// The home directory whose Claude Code instructions stand in for a missing `AGENTS.md` in
+    /// the state root; without one, only the state root and the Folder supply instruction files.
+    home_directory: Option<PathBuf>,
 }
 
 /// Settings content from one read, along with the problems found while reading each item.
@@ -656,7 +660,15 @@ fn has_retired_model_settings(settings: &Map<String, Value>, root: &Path) -> boo
 
 impl UserSettings {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            home_directory: None,
+        }
+    }
+
+    pub fn with_home_directory(mut self, home_directory: Option<PathBuf>) -> Self {
+        self.home_directory = home_directory;
+        self
     }
 
     /// The settings file under the Tickloop state root.
@@ -675,6 +687,10 @@ impl UserSettings {
 
     pub fn root(&self) -> Option<&Path> {
         self.path.parent()
+    }
+
+    pub fn home_directory(&self) -> Option<&Path> {
+        self.home_directory.as_deref()
     }
 
     /// Reads the settings file. When the file is invalid or unreadable, the content is empty and

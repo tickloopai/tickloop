@@ -504,7 +504,7 @@ async fn a_delegated_child_uses_its_roots_global_sources() {
         let child = request
             .messages
             .iter()
-            .find(|m| m.role != Role::System)
+            .find(|m| tickloop_harness_test_support::is_conversation(m))
             .is_some_and(|m| {
                 m.content.iter().any(
                     |c| matches!(c, Content::Text{text} if text.starts_with("<agent-message>")),
@@ -624,7 +624,7 @@ async fn background_children_allocate_distinct_numbers_under_concurrent_searches
         let child = request
             .messages
             .iter()
-            .find(|m| m.role != Role::System)
+            .find(|m| tickloop_harness_test_support::is_conversation(m))
             .is_some_and(|m| {
                 m.content.iter().any(
                     |c| matches!(c, Content::Text{text} if text.starts_with("<agent-message>")),
@@ -763,7 +763,7 @@ async fn process_host_does_not_publish_a_childs_number_when_the_root_source_writ
         let child = request
             .messages
             .iter()
-            .find(|m| m.role != Role::System)
+            .find(|m| tickloop_harness_test_support::is_conversation(m))
             .is_some_and(|m| {
                 m.content.iter().any(
                     |c| matches!(c, Content::Text{text} if text.starts_with("<agent-message>")),

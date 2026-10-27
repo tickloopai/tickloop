@@ -1357,6 +1357,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         None => Console::start_with_display(interactive_terminal, display_preferences)?,
     };
     let console = &console;
+    console.set_saves_chats(agent.saves_chats())?;
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_popup(monitor_popup)?;
@@ -1566,10 +1567,7 @@ fn startup_banner_with_model(
         _ => directory,
     };
     let text_lines: [Vec<(String, Role)>; 3] = [
-        vec![
-            ("Tickloop".into(), Role::Title),
-            (format!(" v{}", env!("CARGO_PKG_VERSION")), Role::MutedText),
-        ],
+        banner_title(None),
         vec![(model, Role::MutedText)],
         vec![(safe_text(&directory), Role::MutedText)],
     ];
@@ -1586,6 +1584,36 @@ fn startup_banner_with_model(
         spans.push(("\n".into(), None));
     }
     spans
+}
+
+/// The banner's title: the version this View runs, followed by the Agent's own build when the
+/// Agent runs another one.
+fn banner_title(agent_runtime: Option<&str>) -> Vec<(String, Role)> {
+    let mut title = vec![
+        ("Tickloop".into(), Role::Title),
+        (format!(" v{}", env!("CARGO_PKG_VERSION")), Role::MutedText),
+    ];
+    if let Some(agent_runtime) = agent_runtime {
+        title.push((format!(" ({agent_runtime})"), Role::MutedText));
+    }
+    title
+}
+
+/// The banner line holding the title, and its row within the banner.
+fn banner_title_line(agent_runtime: Option<&str>) -> (usize, Vec<(String, Option<Role>)>) {
+    let mut line = vec![
+        (
+            BANNER_MARK[BANNER_TEXT_FIRST_ROW].into(),
+            Some(Role::BrandMark),
+        ),
+        (BANNER_MARK_GAP.into(), None),
+    ];
+    line.extend(
+        banner_title(agent_runtime)
+            .into_iter()
+            .map(|(text, role)| (text, Some(role))),
+    );
+    (BANNER_TEXT_FIRST_ROW, line)
 }
 
 async fn open_current_plan(
@@ -2629,10 +2657,17 @@ async fn interact_with_herdr(
             let worker =
                 execution.and_then(|execution| runtime_activation.as_ref()?.worker(execution));
             if let Some(chat) = selected_chat.filter(|_| !overview_active) {
+                let pending = worker.is_some_and(|worker| worker.upgrading);
                 let presentation = (
                     chat,
-                    worker.and_then(|worker| worker.build_id.clone()),
-                    worker.is_some_and(|worker| worker.upgrading),
+                    worker
+                        .and_then(|worker| worker.build_id.clone())
+                        .filter(|build| {
+                            pending
+                                || tickloop_code_access::build_identity()
+                                    .is_none_or(|view| view != build.as_str())
+                        }),
+                    pending,
                 );
                 if runtime_presentation.as_ref() != Some(&presentation) {
                     console.set_agent_runtime(
@@ -7253,7 +7288,9 @@ fn show_opened_chat(
 ) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
     console.reset_chat(snapshot.id.into())?;
-    outln!(console, "Chat: {}", snapshot.id.public());
+    if !console.is_interactive() {
+        outln!(console, "Chat: {}", snapshot.id.public());
+    }
     for warning in agent.transcript_load_warnings(snapshot.id.into()) {
         write_warning(console, &warning)?;
     }

@@ -784,6 +784,8 @@ pub(super) struct State {
     /// Agent Colors of every Agent this View has learned of, shared by all its conversations.
     agent_colors: AgentColors,
     pub(super) chat: Option<Uuid>,
+    /// Whether this View's Chats are saved, so leaving it can name the command that resumes one.
+    saves_chats: bool,
     activity_interruptible: bool,
     idle_loop_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
@@ -1987,6 +1989,14 @@ impl Console {
         })
     }
 
+    pub(super) fn set_saves_chats(&self, saves_chats: bool) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .saves_chats = saves_chats;
+        Ok(())
+    }
+
     pub(super) fn set_status_lines(&self, lines: Option<Vec<String>>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.configured_status_lines = lines;
@@ -2697,7 +2707,12 @@ impl Console {
         let line = build
             .map(|build| display_single_line(&build).trim().to_owned())
             .filter(|build| !build.is_empty())
-            .map(|build| format!("Agent v{build}{}", if pending { " · pending" } else { "" }));
+            .map(|build| {
+                format!(
+                    "Daemon: v{build}{}",
+                    if pending { ", upgrade pending" } else { "" }
+                )
+            });
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive || state.agent_runtime_banners.get(&chat) == line.as_ref() {
             return Ok(());
@@ -5218,10 +5233,7 @@ impl Drop for Lifetime {
             let mut reopen_hint = None;
             if let Ok(mut state) = self.state.lock() {
                 let mut output = io::stdout().lock();
-                reopen_hint = state.chat.map(|chat| {
-                    let chat = tickloop_ids::base62::encode(chat);
-                    format!("Chat {chat} · reopen it with /resume {chat}")
-                });
+                reopen_hint = state.chat.filter(|_| state.saves_chats).map(resume_hint);
                 state.transcript = None;
                 let _ = state.draw(&mut output);
                 if !renderer.uses_alternate_screen() {
@@ -5249,6 +5261,13 @@ impl Drop for Lifetime {
             }
         }
     }
+}
+
+/// Like Claude Code's exit hint, the command that resumes the Chat the View showed, dimmed.
+fn resume_hint(chat: Uuid) -> String {
+    let command = format!("tickloop -r {}", tickloop_ids::base62::encode(chat));
+    let hint = format!("Resume this Chat with:\n{command}");
+    format!("\n{}", crossterm::style::Stylize::dim(hint.as_str()))
 }
 
 struct ConsoleFrame {
@@ -5727,27 +5746,28 @@ impl State {
         self.reset_chat_surfaces(chat, preserve_editor_context);
     }
 
+    /// Shows the Agent's build in the banner's title of `chat`, or the title alone.
     fn apply_agent_runtime_banner(&mut self, chat: Uuid) -> bool {
-        let Some(prefix) = self.creation_prefixes.get(&Some(chat)) else {
-            return false;
-        };
-        let mut at = 0;
-        for entry in prefix {
-            let CreationPrefixEntry::Output(ConversationPiece::Styled(text, _)) = entry else {
-                break;
-            };
-            at += text.bytes().filter(|byte| *byte == b'\n').count();
-        }
-        if at == 0 {
+        if !self.creation_prefixes.contains_key(&Some(chat)) {
             return false;
         }
-        let text = self.agent_runtime_banners.get(&chat).map(String::as_str);
+        let (line, plain) = super::banner_title_line(None);
+        let title = plain
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>();
+        let (_, shown) =
+            super::banner_title_line(self.agent_runtime_banners.get(&chat).map(String::as_str));
+        let spans = shown
+            .iter()
+            .map(|(text, role)| (text.as_str(), *role))
+            .collect::<Vec<_>>();
         if self.chat == Some(chat) {
-            self.scrollback.set_agent_runtime_banner(at, text)
+            self.scrollback.set_banner_title(line, &title, &spans)
         } else {
             self.view_cache
                 .get_mut(&Some(chat))
-                .is_some_and(|view| view.scrollback.set_agent_runtime_banner(at, text))
+                .is_some_and(|view| view.scrollback.set_banner_title(line, &title, &spans))
         }
     }
 
@@ -5971,6 +5991,7 @@ impl State {
             awaiting_input_echoes: HashSet::new(),
             agent_colors: AgentColors::default(),
             chat: None,
+            saves_chats: false,
             activity_interruptible: false,
             idle_loop_interruptible: false,
             back_to_bottom_target: None,
@@ -14052,6 +14073,16 @@ fn draft_keeps_context(draft: &str, context: &InputContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exit_hint_names_the_command_that_resumes_the_chat() {
+        let chat = Uuid::from_u128(1);
+        let encoded = tickloop_ids::base62::encode(chat);
+        assert_eq!(
+            resume_hint(chat),
+            format!("\n\u{1b}[2mResume this Chat with:\ntickloop -r {encoded}\u{1b}[0m")
+        );
+    }
     use tickloop_harness::protocol::{Decision, ExecutionMode, PermissionRule};
     use tickloop_harness::protocol::{
         EventKind, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,

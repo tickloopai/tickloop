@@ -1025,6 +1025,8 @@ impl Agent {
                         bookkeeping,
                         client,
                         output_style,
+                        user_context,
+                        announced_date,
                         session_denials,
                         name,
                         ancestors,
@@ -1070,6 +1072,8 @@ impl Agent {
                             chat.bookkeeping.clone(),
                             chat.client.clone(),
                             chat.output_style,
+                            chat.user_context.clone(),
+                            chat.announced_date.clone(),
                             sessions.freeze_denials(parent_owner),
                             unique_agent_name(
                                 requested_name.as_deref().unwrap_or(&fallback_name),
@@ -1227,7 +1231,14 @@ impl Agent {
                         .create_chat_with_delegation(
                             registration.child_chat_id,
                             folder,
-                            Some((metadata.clone(), snapshot, client, output_style)),
+                            Some(super::InheritedChat {
+                                metadata: metadata.clone(),
+                                parent: snapshot,
+                                client,
+                                output_style,
+                                user_context,
+                                announced_date,
+                            }),
                         )
                         .await
                         .map_err(|error| error.to_string())?;

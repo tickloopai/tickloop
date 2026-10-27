@@ -228,6 +228,10 @@ The Agent an Agent View was showing before it opened the Overview, i.e. the one 
 How the Agent expresses its replies to the user (three built-in: Standard, Concise, Detailed); it changes only detail, structure, and tone, not capabilities or authorization.
 _Avoid_: style mode, Mode
 
+**Instruction File**:
+A Markdown file of standing instructions that a Chat reads when it starts and again after compaction: the user's own `AGENTS.md` in the config root, and the `AGENTS.md` of each directory down to the Folder, or that directory's `CLAUDE.md` files when it has none. Its instructions guide the Agent but grant no authorization.
+_Avoid_: memory, rules file
+
 ### Subagent and Family
 
 **Subagent**:

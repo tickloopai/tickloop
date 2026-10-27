@@ -115,9 +115,9 @@ async fn a_followup_keeps_chat_goal_and_shared_history_while_creating_a_new_run(
     assert_eq!(snapshot.chat_loop.id, first.loop_id);
     assert_eq!(snapshot.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap();
-    assert_eq!(requests[1].messages.len(), 4);
+    assert_eq!(requests[1].messages.len(), 5);
     assert_eq!(
-        requests[1].messages[1].content,
+        requests[1].messages[2].content,
         vec![Content::Text {
             text: "My name is Sam".into()
         }]
@@ -151,7 +151,7 @@ async fn opening_an_archive_is_read_only_until_the_user_continues() {
         events.recv().await.unwrap().kind,
         EventKind::Completed { .. }
     ) {}
-    assert_eq!(model.requests.lock().unwrap()[1].messages.len(), 4);
+    assert_eq!(model.requests.lock().unwrap()[1].messages.len(), 5);
     resumed.shutdown().await;
 }
 
@@ -241,7 +241,7 @@ async fn stop_interrupts_the_turn_and_a_new_input_continues_the_loop() {
             _: UnboundedSender<ModelDelta>,
             cancel: CancellationToken,
         ) -> Result<ModelOutput, ModelError> {
-            if request.messages.len() == 2 {
+            if request.messages.len() == 3 {
                 cancel.cancelled().await;
                 return Err(ModelError::Cancelled);
             }
