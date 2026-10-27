@@ -317,7 +317,7 @@ async fn agent_falls_back_to_sse_only_before_websocket_output() {
     completed_agent_turn(&mut events).await;
     let (ws, headers, sse) = captured_rx.await.unwrap();
     assert_eq!(ws["type"], "response.create");
-    assert_eq!(sse["input"][0]["content"], "Hello");
+    assert_eq!(sse["input"][1]["content"], "Hello");
     assert!(headers.to_ascii_lowercase().contains("session-id: "));
     agent.shutdown().await;
 }
@@ -442,7 +442,7 @@ async fn agent_conversation_uses_codex_credentials_and_streams_text_and_reasonin
     assert!(headers.contains("openai-beta: responses=experimental"));
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
-    assert_eq!(body["input"][0]["content"], "Say hello");
+    assert_eq!(body["input"][1]["content"], "Say hello");
     assert!(
         body["instructions"]
             .as_str()

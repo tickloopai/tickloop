@@ -29,6 +29,7 @@ mod goal_runtime;
 mod host_scheduled_tasks;
 mod image_limits;
 mod input_context;
+mod instruction_context;
 mod interaction;
 mod interrupted_prompt;
 mod jev_auto;

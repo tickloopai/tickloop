@@ -6,8 +6,7 @@ use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BackgroundCheck, Build, Installation, Lock, PROGRAMS, Source, UpdateState, bundle, is_due,
-    release, source,
+    Build, Installation, Lock, PROGRAMS, Source, UpdateState, bundle, is_due, release, source,
 };
 
 fn build(version: &str) -> Build {
@@ -253,36 +252,29 @@ async fn update_transport_refuses_plaintext_before_network_access() {
 }
 
 #[test]
-fn periodic_checks_are_throttled_after_success_and_retried_after_failure() {
+fn checks_are_throttled_after_success_and_retried_after_failure() {
     let at = 100_000;
-    assert!(is_due(
-        &UpdateState::default(),
-        at,
-        BackgroundCheck::Periodic
-    ));
+    assert!(is_due(&UpdateState::default(), at));
     assert!(!is_due(
         &UpdateState {
             attempted_at: at - 1,
             ..Default::default()
         },
-        at,
-        BackgroundCheck::Periodic
+        at
     ));
     assert!(is_due(
         &UpdateState {
             attempted_at: at - 3601,
             ..Default::default()
         },
-        at,
-        BackgroundCheck::Periodic
+        at
     ));
     assert!(!is_due(
         &UpdateState {
             checked_at: at - 3601,
             ..Default::default()
         },
-        at,
-        BackgroundCheck::Periodic
+        at
     ));
 }
 
@@ -568,22 +560,27 @@ fn registry_payload_updates_preserve_cargo_entries_and_retained_runtime_versions
 }
 
 #[test]
-fn every_console_start_checks_again_even_after_a_recent_success_or_failure() {
-    let at = 100_000;
-    for state in [
-        UpdateState {
-            checked_at: at,
-            attempted_at: at,
-            ..Default::default()
-        },
-        UpdateState {
-            attempted_at: at,
-            ..Default::default()
-        },
-    ] {
-        assert!(is_due(&state, at, BackgroundCheck::Startup));
-        assert!(!is_due(&state, at, BackgroundCheck::Periodic));
-    }
+fn a_console_start_checks_only_when_a_check_is_due() {
+    let at = 1_000_000;
+    let hour = 60 * 60;
+    let recently_checked = UpdateState {
+        checked_at: at - 19 * hour,
+        attempted_at: at - 19 * hour,
+        ..Default::default()
+    };
+    assert!(!is_due(&recently_checked, at));
+    let checked_a_day_ago = UpdateState {
+        checked_at: at - 20 * hour,
+        attempted_at: at - 20 * hour,
+        ..Default::default()
+    };
+    assert!(is_due(&checked_a_day_ago, at));
+    let failed_just_now = UpdateState {
+        checked_at: at - 30 * hour,
+        attempted_at: at - 60,
+        ..Default::default()
+    };
+    assert!(!is_due(&failed_just_now, at));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
