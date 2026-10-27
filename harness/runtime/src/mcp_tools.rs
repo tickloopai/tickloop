@@ -1607,7 +1607,7 @@ impl McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
-        if result.is_error != Some(true) {
+        if result.is_error != Some(true) && crate::nested_calls::is_script() {
             let mut serialized = serde_json::to_string(&result).unwrap_or_default();
             let mut tokens = vec![current.access_token.clone()];
             if let Ok(Some(latest)) = self.artifact.credential_snapshot() {

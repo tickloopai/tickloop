@@ -14,8 +14,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+const MAX_CONCURRENT_CALLS: usize = 10;
 const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 const INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
+const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
@@ -79,10 +81,21 @@ struct SourceOptions {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Default)]
 pub struct Options {
     pub control: Control,
     pub output_directory: Option<std::path::PathBuf>,
+    /// A host may lower the sandbox budget; values above 256 MB are capped.
+    pub memory_limit_bytes: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            control: Control::default(),
+            output_directory: None,
+            memory_limit_bytes: MEMORY_LIMIT,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -91,6 +104,18 @@ pub struct Outcome {
     pub error: Option<String>,
     pub full_output_path: Option<std::path::PathBuf>,
     pub images: Vec<tickloop_harness_protocol::Image>,
+}
+
+#[derive(Default)]
+struct State {
+    outcome: Outcome,
+    finished: bool,
+    pending_calls: usize,
+    image_bytes: usize,
+}
+struct Limits {
+    timeout: Duration,
+    memory: usize,
 }
 
 struct Call {
@@ -132,6 +157,7 @@ where
             };
         }
     };
+    let memory_limit = options.memory_limit_bytes.min(MEMORY_LIMIT);
     let timeout = source_options
         .timeout_ms
         .map(Duration::from_millis)
@@ -140,12 +166,12 @@ where
         .max_output_tokens
         .unwrap_or(10_000)
         .saturating_mul(4)
-        .min(MEMORY_LIMIT);
+        .min(memory_limit / 4);
     let output_directory = options.output_directory;
     let control = options.control;
     let _cancel_on_drop = control.cancel.clone().drop_guard();
     let worker_control = control.clone();
-    let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (requests, mut incoming) = tokio::sync::mpsc::channel(MAX_CONCURRENT_CALLS);
     let (responses, completed) = mpsc::channel();
     let source = source.to_owned();
     let mut worker = tokio::task::spawn_blocking(move || {
@@ -155,7 +181,10 @@ where
             requests,
             completed,
             worker_control,
-            timeout,
+            Limits {
+                timeout,
+                memory: memory_limit,
+            },
             output::Output::new(output_directory, output_limit),
         )
     });
@@ -165,8 +194,10 @@ where
             biased;
             result = &mut worker => {
                 control.cancel.cancel();
-                while pending.next().await.is_some() {}
-                return result.unwrap_or_else(|error| Outcome {error:Some(error.to_string()), ..Default::default()});
+                let settled = tokio::time::timeout(SETTLEMENT_TIMEOUT, async { while pending.next().await.is_some() {} }).await;
+                let mut outcome = result.unwrap_or_else(|error| Outcome {error:Some(error.to_string()), ..Default::default()});
+                if settled.is_err() { outcome.error.get_or_insert_with(|| "Tool callbacks did not settle after cancellation; their outcomes are unknown".into()); }
+                return outcome;
             },
             Some(request) = incoming.recv() => {
                 let future = call(request.name, request.input, control.cancel.clone());
@@ -180,21 +211,25 @@ where
 fn execute(
     source: String,
     tools: Vec<String>,
-    requests: tokio::sync::mpsc::UnboundedSender<Call>,
+    requests: tokio::sync::mpsc::Sender<Call>,
     completed: mpsc::Receiver<(u32, Result<Value, String>)>,
     control: Control,
-    timeout: Duration,
+    limits: Limits,
     output: output::Output,
 ) -> Outcome {
+    let Limits {
+        timeout,
+        memory: memory_limit,
+    } = limits;
     let output = Rc::new(RefCell::new(output));
-    let state = Rc::new(RefCell::new((Outcome::default(), false, 0usize)));
+    let state = Rc::new(RefCell::new(State::default()));
     let result = (|| -> Result<(), String> {
         let runtime = Runtime::new().map_err(|error| error.to_string())?;
-        runtime.set_memory_limit(MEMORY_LIMIT);
+        runtime.set_memory_limit(memory_limit);
         let interrupted = control.clone();
         let finished = state.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            finished.borrow().1
+            finished.borrow().finished
                 || interrupted.cancel.is_cancelled()
                 || interrupted.elapsed() >= timeout
         })));
@@ -204,9 +239,21 @@ fn execute(
                 let call_state = state.clone();
                 let request =
                     Function::new(ctx.clone(), move |id: u32, name: String, input: String| {
-                        let input = serde_json::from_str(&input).unwrap_or(Value::Null);
-                        call_state.borrow_mut().2 += 1;
-                        let _ = requests.send(Call { id, name, input });
+                        let input = serde_json::from_str(&input).map_err(|error| {
+                            rquickjs::Error::new_from_js_message(
+                                "tool",
+                                "arguments",
+                                format!("Invalid tool JSON: {error}"),
+                            )
+                        })?;
+                        call_state.borrow_mut().pending_calls += 1;
+                        requests.try_send(Call { id, name, input }).map_err(|_| {
+                            rquickjs::Error::new_from_js_message(
+                                "tool",
+                                "request",
+                                "Tool bridge is unavailable",
+                            )
+                        })
                     })?;
                 let output_state = output.clone();
                 let output = Function::new(ctx.clone(), move |text: String| {
@@ -217,8 +264,8 @@ fn execute(
                 let done_state = state.clone();
                 let done = Function::new(ctx.clone(), move |error: Option<String>| {
                     let mut state = done_state.borrow_mut();
-                    state.0.error = error;
-                    state.1 = true;
+                    state.outcome.error = error;
+                    state.finished = true;
                 })?;
                 let image_state = state.clone();
                 let image =
@@ -272,7 +319,20 @@ fn execute(
                                     "Invalid or unsupported image",
                                 )
                             })?;
-                        image_state.borrow_mut().0.images.push(prepared);
+                        let mut state = image_state.borrow_mut();
+                        let size =
+                            prepared.data.len().saturating_add(std::mem::size_of::<
+                                tickloop_harness_protocol::Image,
+                            >());
+                        if state.image_bytes.saturating_add(size) > memory_limit {
+                            return Err(rquickjs::Error::new_from_js_message(
+                                "image",
+                                "output",
+                                "Image output exceeds the memory budget",
+                            ));
+                        }
+                        state.image_bytes += size;
+                        state.outcome.images.push(prepared);
                         Ok(())
                     })?;
                 let bootstrap: Function = ctx.eval(include_str!("codemode/prelude.js"))?;
@@ -282,18 +342,20 @@ fn execute(
                     image,
                     done,
                     serde_json::to_string(&tools).unwrap(),
+                    MAX_CONCURRENT_CALLS,
                 ))?;
                 let run: Function = bridge.get("run")?;
-                let script: Function = ctx.eval(format!("(async function() {{\n{source}\n}})"))?;
+                let constructor: Function = ctx.eval("(async function() {}).constructor")?;
+                let script: Function = constructor.call((source,))?;
                 run.call::<_, ()>((script,))?;
                 loop {
-                    while !state.borrow().1
+                    while !state.borrow().finished
                         && !control.cancel.is_cancelled()
                         && control.elapsed() < timeout
                         && ctx.execute_pending_job()
                     {}
                     if control.cancel.is_cancelled() || control.elapsed() >= timeout {
-                        state.borrow_mut().0.error = Some(
+                        state.borrow_mut().outcome.error = Some(
                             if control.cancel.is_cancelled() {
                                 "Script cancelled"
                             } else {
@@ -303,17 +365,17 @@ fn execute(
                         );
                         break;
                     }
-                    if state.borrow().1 {
+                    if state.borrow().finished {
                         break;
                     }
-                    if state.borrow().2 == 0 {
-                        state.borrow_mut().0.error =
+                    if state.borrow().pending_calls == 0 {
+                        state.borrow_mut().outcome.error =
                             Some("Script is waiting on a promise that can never settle".into());
                         break;
                     }
                     match completed.recv_timeout(INTERRUPT_INTERVAL) {
                         Ok((id, result)) => {
-                            state.borrow_mut().2 -= 1;
+                            state.borrow_mut().pending_calls -= 1;
                             let settle: Function = bridge.get("settle")?;
                             let ok = result.is_ok();
                             let payload = match result {
@@ -332,9 +394,9 @@ fn execute(
     })();
     let mut state = state.borrow_mut();
     if let Err(error) = result
-        && !state.1
+        && !state.finished
     {
-        state.0.error = Some(if control.elapsed() >= timeout {
+        state.outcome.error = Some(if control.elapsed() >= timeout {
             "Script timed out".into()
         } else if control.cancel.is_cancelled() {
             "Script cancelled".into()
@@ -343,7 +405,7 @@ fn execute(
         });
     }
     let (text, path) = Rc::try_unwrap(output).ok().unwrap().into_inner().finish();
-    state.0.output = text;
-    state.0.full_output_path = path;
-    std::mem::take(&mut state.0)
+    state.outcome.output = text;
+    state.outcome.full_output_path = path;
+    std::mem::take(&mut state.outcome)
 }

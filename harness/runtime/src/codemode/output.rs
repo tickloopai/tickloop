@@ -32,9 +32,7 @@ impl Output {
         if let Some(file) = &mut self.file {
             file.write_all(separator.as_bytes())?;
             file.write_all(text.as_bytes())?;
-            self.tail.push_str(separator);
-            self.tail.push_str(text);
-            self.keep_tail();
+            self.tail = Self::tail(&self.tail, separator, text, self.limit - self.limit / 2);
             return Ok(());
         }
         if self
@@ -65,24 +63,27 @@ impl Output {
         file.write_all(self.head.as_bytes())?;
         file.write_all(separator.as_bytes())?;
         file.write_all(text.as_bytes())?;
-        self.head.push_str(separator);
-        self.head.push_str(text);
-        self.tail = self.head.clone();
-        self.head = self.head.chars().take(self.limit / 2).collect();
-        self.keep_tail();
+        self.tail = Self::tail(&self.head, separator, text, self.limit - self.limit / 2);
+        self.head = self
+            .head
+            .chars()
+            .chain(separator.chars())
+            .chain(text.chars())
+            .take(self.limit / 2)
+            .collect();
         self.file = Some(file);
         self.path = Some(path);
         Ok(())
     }
-    fn keep_tail(&mut self) {
-        let keep = self.limit - self.limit / 2;
-        let skip = self.tail.chars().count().saturating_sub(keep);
-        let start = self
-            .tail
-            .char_indices()
-            .nth(skip)
-            .map_or(self.tail.len(), |(index, _)| index);
-        self.tail.drain(..start);
+    fn tail(previous: &str, separator: &str, text: &str, limit: usize) -> String {
+        let reversed: String = text
+            .chars()
+            .rev()
+            .chain(separator.chars().rev())
+            .chain(previous.chars().rev())
+            .take(limit)
+            .collect();
+        reversed.chars().rev().collect()
     }
     pub(super) fn finish(self) -> (String, Option<PathBuf>) {
         if self.path.is_some() {

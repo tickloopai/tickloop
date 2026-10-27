@@ -868,3 +868,85 @@ async fn human_denial_throws_an_error_the_script_can_handle() {
     assert!(server.calls().is_empty());
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn normalized_name_collisions_preserve_unrelated_tools_and_exact_names() {
+    let result = run(
+        "text(await tools.Read({})); text(await tools['a-b']({})); text(await tools.a_b({}));",
+        Options::default(),
+        vec!["a-b".into(), "a_b".into(), "Read".into()],
+        |name, _, _| async move { Ok(json!(name)) },
+    )
+    .await;
+    assert_eq!(result.error, None);
+    assert_eq!(result.output, "Read\na-b\na_b");
+}
+
+#[tokio::test]
+async fn cancellation_settlement_has_a_bound_even_for_unresponsive_callbacks() {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        run(
+            "// @options: {\"timeout_ms\": 20}\nawait tools.wait({});",
+            Options::default(),
+            vec!["wait".into()],
+            |_, _, _| std::future::pending::<Result<serde_json::Value, String>>(),
+        ),
+    )
+    .await
+    .expect("an unresponsive callback must not defeat the script deadline");
+    assert!(result.error.is_some());
+}
+
+#[tokio::test]
+async fn retained_images_obey_the_host_memory_budget() {
+    use base64::Engine;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+    let result = run(
+        &format!("for (let i=0;i<5000;i++) image('data:image/png;base64,{data}');"),
+        Options {
+            memory_limit_bytes: 512 * 1024,
+            ..Default::default()
+        },
+        vec![],
+        |_, _, _| async { unreachable!() },
+    )
+    .await;
+    assert!(result.error.is_some());
+    assert!(result.images.len() < 5000);
+}
+
+#[tokio::test]
+async fn tool_bridge_bounds_concurrency_without_losing_queued_calls() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let seen = peak.clone();
+    let result = run(
+        "return (await Promise.all(Array.from({length:40},()=>tools.read({})))).length;",
+        Options::default(),
+        vec!["read".into()],
+        move |_, _, _| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(json!(true))
+            }
+        },
+    )
+    .await;
+    assert_eq!(result.error, None);
+    assert_eq!(result.output, "40");
+    assert!(seen.load(Ordering::SeqCst) <= 10);
+}

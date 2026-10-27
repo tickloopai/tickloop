@@ -30,6 +30,7 @@ pub(crate) struct NestedOutcome {
     pub name: String,
     pub status: NestedStatus,
     pub result: ToolResult,
+    #[cfg(feature = "codemode")]
     #[serde(skip)]
     pub script_value: Option<Value>,
     #[serde(skip)]
@@ -47,7 +48,7 @@ pub(crate) struct NestedCalls {
     registry: ToolRegistry,
     stop: CancellationToken,
     stop_reason: std::sync::Mutex<Option<String>>,
-    completed: Mutex<Vec<(Value, NestedOutcome)>>,
+    completed: Mutex<Vec<(Value, Value)>>,
     #[cfg(feature = "codemode")]
     script_control: std::sync::Mutex<Option<crate::codemode::Control>>,
 }
@@ -57,8 +58,12 @@ tokio::task_local! {
     static SCRIPT_VALUE: std::sync::Mutex<Option<Value>>;
 }
 
+pub(crate) fn is_script() -> bool {
+    CURRENT.try_with(|scope| !scope.is_batch).unwrap_or(false)
+}
+
 pub(crate) fn capture_script_value(value: Value) {
-    if CURRENT.try_with(|scope| !scope.is_batch).unwrap_or(false) {
+    if is_script() {
         let _ = SCRIPT_VALUE.try_with(|slot| *slot.lock().unwrap() = Some(value));
     }
 }
@@ -174,22 +179,23 @@ impl NestedCalls {
             || self.stop_token().is_cancelled()
             || cancel.is_cancelled();
         let outcome = if unavailable {
-            NestedOutcome { script_value:None, images:vec![],sources:vec![],call_id:call_id.clone(), name:name.clone(), status:NestedStatus::NotExecuted,
+            NestedOutcome { #[cfg(feature = "codemode")] script_value:None, images:vec![],sources:vec![],call_id:call_id.clone(), name:name.clone(), status:NestedStatus::NotExecuted,
                 result:ToolResult {content:"Tool unavailable, prohibited inside a nested call, or batch stopped before dispatch".into(),is_error:true,output_ref:None} }
         } else {
             let invocation =
                 ToolInvocation::new(call_id.clone(), name.clone(), input.clone(), registration);
-            let (result, script_value) = SCRIPT_VALUE
+            let (result, _script_value) = SCRIPT_VALUE
                 .scope(std::sync::Mutex::new(None), async {
                     let result = CURRENT
                         .scope(
                             self.clone(),
-                            Box::pin(self.agent.execute_registered_call(
-                                &self.receipt,
-                                self.message_id,
-                                invocation,
-                                cancel.clone(),
-                            )),
+                            async {
+                                tokio::select! {
+                                    biased;
+                                    result = Box::pin(self.agent.execute_registered_call(&self.receipt, self.message_id, invocation, cancel.clone())) => result,
+                                    _ = cancel.cancelled() => Err("Nested call cancelled; outcome is unknown if already dispatched".into()),
+                                }
+                            },
                         )
                         .await;
                     let value = SCRIPT_VALUE.with(|slot| slot.lock().unwrap().take());
@@ -213,8 +219,11 @@ impl NestedCalls {
                     } else {
                         NestedStatus::Completed
                     };
-                    let script_value = script_value
-                        .or_else(|| Some(Value::String(outcome.result.content.clone())));
+                    #[cfg(feature = "codemode")]
+                    let script_value = (!self.is_batch).then(|| {
+                        _script_value
+                            .unwrap_or_else(|| Value::String(outcome.result.content.clone()))
+                    });
                     let images = outcome.images.clone();
                     let sources = outcome.sources.clone().unwrap_or_default();
                     let result = self
@@ -227,6 +236,7 @@ impl NestedCalls {
                             output_ref: None,
                         });
                     NestedOutcome {
+                        #[cfg(feature = "codemode")]
                         script_value,
                         images,
                         sources,
@@ -252,6 +262,7 @@ impl NestedCalls {
                                 )
                         });
                     NestedOutcome {
+                        #[cfg(feature = "codemode")]
                         script_value: None,
                         images: vec![],
                         sources: vec![],
@@ -274,7 +285,7 @@ impl NestedCalls {
         self.completed
             .lock()
             .await
-            .push((input.clone(), outcome.clone()));
+            .push((input.clone(), serde_json::to_value(&outcome).unwrap()));
         let mut chats = self.agent.inner.chats.lock().await;
         let chat = chats.get_mut(&self.receipt.chat_id).unwrap();
         if !chat.snapshot.operations.iter().any(|operation| {
@@ -300,6 +311,11 @@ impl NestedCalls {
         if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
             operation.run_id == self.receipt.run_id && operation.call_id == call_id
         }) {
+            if outcome.status == NestedStatus::Unknown {
+                operation.state = OperationState::Unknown;
+            } else if outcome.status == NestedStatus::NotExecuted {
+                operation.state = OperationState::Failed;
+            }
             operation.result = Some(outcome.result.clone());
             self.agent
                 .record_nested_operation(self.receipt.chat_id, operation);

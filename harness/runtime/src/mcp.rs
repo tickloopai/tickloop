@@ -816,7 +816,7 @@ impl McpConnections {
                     redact_value(&entry, structured);
                 }
                 redact_value(&entry, &mut value);
-                if value["isError"] != true {
+                if value["isError"] != true && crate::nested_calls::is_script() {
                     crate::nested_calls::capture_script_value(value.clone());
                 }
                 let mut images = Vec::new();
