@@ -59,6 +59,7 @@ mod family_mailbox;
 pub mod family_pauses;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
+mod cache_prefix;
 mod chat_reads;
 mod chat_settings;
 mod chat_title;
@@ -536,6 +537,8 @@ struct Chat {
     loaded_from_history: bool,
     /// When the goal's running time was last settled.
     goal_clock_ms: u64,
+    /// What keeps this Chat's prompt cache prefix stable, kept only in this process.
+    cache_prefix: cache_prefix::CachePrefixState,
 }
 
 enum RunAdmission {
@@ -2380,6 +2383,7 @@ impl Agent {
                 goal_recorded_tokens: 0,
                 loaded_from_history: false,
                 goal_clock_ms: 0,
+                cache_prefix: Default::default(),
             },
         );
         Ok(id)
@@ -3150,7 +3154,7 @@ impl Agent {
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
         drop(timing);
-        {
+        let prefix = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             registry.refresh(chat);
@@ -3233,7 +3237,12 @@ impl Agent {
             );
             request.history_sources.insert(1, None);
             request.messages.insert(1, user_context);
-        }
+            cache_prefix::CachePrefix::of(
+                &chat.snapshot.model.identity(),
+                &request.messages[..2],
+                &request.tools,
+            )
+        };
         let client = self
             .inner
             .chats
@@ -3333,6 +3342,13 @@ impl Agent {
                 }
             }
         };
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id)
+            && let Some(cache_break) = chat
+                .cache_prefix
+                .observe(prefix, response.output.usage.cache_read_input_tokens)
+        {
+            cache_break.log(receipt.chat_id, receipt.run_id);
+        }
         let invalid_call = response.output.content.iter().any(|content| {
             if let Content::ToolUse { id, name, input } = content {
                 id.is_empty()

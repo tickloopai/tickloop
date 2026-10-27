@@ -85,3 +85,6 @@ mod third_party_approval;
 
 #[path = "all/tool_exposure.rs"]
 mod tool_exposure;
+
+#[path = "all/tool_list_stability.rs"]
+mod tool_list_stability;
