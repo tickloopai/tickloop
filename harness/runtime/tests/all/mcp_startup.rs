@@ -347,7 +347,6 @@ async fn a_direct_server_connecting_after_the_grace_is_listed_from_the_next_run(
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "needs ticket 16: the tools array is frozen within a Run"]
 async fn a_direct_server_joining_during_a_run_leaves_that_runs_tools_unchanged() {
     use tickloop_harness_protocol::ExecutionMode;
     let late = McpService::start().await;
