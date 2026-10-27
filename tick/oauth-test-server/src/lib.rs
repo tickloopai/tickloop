@@ -69,6 +69,7 @@ struct Script {
     issuer_path: String,
     userinfo: (u16, Value),
     metadata: Value,
+    resource_metadata_fields: serde_json::Map<String, Value>,
     registration: Option<(u16, Value)>,
     device: Value,
     token_replies: VecDeque<TokenReply>,
@@ -128,6 +129,7 @@ impl AuthorizationServer {
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
             }),
+            resource_metadata_fields: serde_json::Map::new(),
             registration: None,
             device: json!({
                 "user_code": USER_CODE,
@@ -167,6 +169,19 @@ impl AuthorizationServer {
     /// Changes the metadata the server publishes.
     pub fn edit_metadata(&self, edit: impl FnOnce(&mut Value)) {
         edit(&mut self.script.lock().unwrap().metadata);
+    }
+
+    /// Adds `fields` to the protected resource metadata, which otherwise names only the resource
+    /// and this server.
+    pub fn add_resource_metadata_fields(&self, fields: Value) {
+        let Value::Object(fields) = fields else {
+            panic!("protected resource metadata fields must be a JSON object");
+        };
+        self.script
+            .lock()
+            .unwrap()
+            .resource_metadata_fields
+            .extend(fields);
     }
 
     /// Changes the device authorization response, apart from its device code.
@@ -228,7 +243,7 @@ impl AuthorizationServer {
     /// address the server redirects to.
     pub fn approve(&self, authorization_url: &str) -> String {
         let url = url::Url::parse(authorization_url).unwrap();
-        let mut stream = TcpStream::connect(url.socket_addrs(|| None).unwrap()[0]).unwrap();
+        let mut stream = TcpStream::connect(&*url.socket_addrs(|| None).unwrap()).unwrap();
         let target = match url.query() {
             Some(query) => format!("{}?{query}", url.path()),
             None => url.path().to_owned(),
@@ -306,10 +321,13 @@ fn reply(script: &mut Script, request: &Request) -> (u16, Option<Value>, Headers
     let resource_metadata_path = format!("{PROTECTED_RESOURCE_METADATA_PATH}{RESOURCE_PATH}");
     let path_only = request.path.split('?').next().unwrap_or_default();
     if request.method == "GET" && path_only == resource_metadata_path {
-        let metadata = json!({
+        let mut metadata = json!({
             "resource": format!("{origin}{RESOURCE_PATH}"),
             "authorization_servers": [issuer],
         });
+        if let Value::Object(fields) = &mut metadata {
+            fields.extend(script.resource_metadata_fields.clone());
+        }
         return (200, Some(metadata), Vec::new());
     }
     if path_only == RESOURCE_PATH {
