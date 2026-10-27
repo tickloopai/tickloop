@@ -1373,6 +1373,15 @@ impl PermissionsSurface {
                     self.clamp_selection();
                     return PermissionsEffect::None;
                 }
+                if let Some(down) = filtered_list_step(key) {
+                    self.selected = if down {
+                        (self.selected + 1).min(self.row_count().saturating_sub(1))
+                    } else {
+                        self.selected.saturating_sub(1)
+                    };
+                    self.focus = Focus::Search(editor);
+                    return PermissionsEffect::None;
+                }
                 edit_text(&mut editor, key);
                 self.query = editor.draft().to_owned();
                 self.selected = 0;
@@ -1556,6 +1565,16 @@ impl PermissionsSurface {
                     group.query = editor.draft().to_owned();
                     group.selected = 0;
                     self.focus = Focus::AutoGroup(group);
+                    return PermissionsEffect::None;
+                }
+                if let Some(down) = filtered_list_step(key) {
+                    let restore_row = self.auto_group_rules(&group).len() + 2;
+                    group.selected = if down {
+                        (group.selected + 1).min(restore_row)
+                    } else {
+                        group.selected.saturating_sub(1)
+                    };
+                    self.focus = Focus::AutoGroupSearch { group, editor };
                     return PermissionsEffect::None;
                 }
                 edit_text(&mut editor, key);
@@ -2022,7 +2041,8 @@ impl PermissionsSurface {
         )];
         if self.page == Page::Directories {
             for path in self.directory_rows() {
-                let mut row = plain_row(path.display().to_string());
+                let mut row = RoleLine::default();
+                row.push_matching(&path.display().to_string(), None, &self.query);
                 row.push(" · additional", Some(Role::MutedText));
                 rows.push(row);
             }
@@ -2033,20 +2053,17 @@ impl PermissionsSurface {
                 .filter_map(|index| self.view.rules.get(*index))
             {
                 let rule = &entry.rule;
-                let matcher = rule
-                    .specifier
-                    .as_ref()
-                    .map(|content| {
-                        if rule.tool == WEB_FETCH_TOOL_NAME {
-                            content.clone()
-                        } else {
-                            format!("shell: {content}")
-                        }
-                    })
-                    .or_else(|| rule.input.as_ref().map(|input| format!("exact: {input}")))
-                    .unwrap_or_else(|| "whole tool".into());
-                let mut row = RoleLine::role(&rule.tool, Role::Strong);
-                row.push(format!(" · {matcher}"), Some(Role::Text));
+                // The search reads the tool and the matcher's content, not its label.
+                let (label, content) = match (&rule.specifier, &rule.input) {
+                    (Some(content), _) if rule.tool == WEB_FETCH_TOOL_NAME => ("", content.clone()),
+                    (Some(content), _) => ("shell: ", content.clone()),
+                    (None, Some(input)) => ("exact: ", input.to_string()),
+                    (None, None) => ("whole tool", String::new()),
+                };
+                let mut row = RoleLine::default();
+                row.push_matching(&rule.tool, Some(Role::Strong), &self.query);
+                row.push(format!(" · {label}"), Some(Role::Text));
+                row.push_matching(&content, Some(Role::Text), &self.query);
                 row.push(
                     format!(
                         " · {} · {}{}",
@@ -2060,7 +2077,7 @@ impl PermissionsSurface {
             }
         }
         let hint = if matches!(self.focus, Focus::Search(_)) {
-            "Search · enter apply · esc back"
+            "Search · ↑/↓ select · enter apply · esc back"
         } else {
             "enter details · a add · / search · esc back"
         };
@@ -2472,7 +2489,8 @@ impl PermissionsSurface {
                 plain_row("Restore group defaults")
             } else {
                 let rule = &rules[index - 1];
-                let mut row = RoleLine::role(&rule.text, Role::Text);
+                let mut row = RoleLine::default();
+                row.push_matching(&rule.text, Some(Role::Text), &group.query);
                 row.push(
                     format!(" · {}", auto_source_label(&rule.source)),
                     Some(Role::MutedText),
@@ -2484,7 +2502,7 @@ impl PermissionsSurface {
             rows.push(selected);
         }
         let hint = if matches!(self.focus, Focus::AutoGroupSearch { .. }) {
-            "Search · enter apply · esc back"
+            "Search · ↑/↓ select · enter apply · esc back"
         } else {
             "enter details · a add · e edit · d remove · / search · esc back"
         };
@@ -2803,6 +2821,16 @@ pub(super) fn editor_window(editor: &Editor, available_width: usize) -> String {
     visible
 }
 
+/// Which way a key moves the list under a single-line filter or search field: up/down and
+/// ctrl+p/n. `j`/`k` stay text there.
+pub(super) fn filtered_list_step(key: KeyEvent) -> Option<bool> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(false),
+        (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(true),
+        _ => None,
+    }
+}
+
 pub(super) fn edit_text(editor: &mut Editor, key: KeyEvent) {
     match (key.code, key.modifiers) {
         (KeyCode::Backspace, _) => {
@@ -2978,5 +3006,124 @@ mod tests {
             panic!("replace expected")
         };
         assert!(texts.is_empty());
+    }
+
+    fn press(surface: &mut PermissionsSurface, code: KeyCode) {
+        surface.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_text(surface: &mut PermissionsSurface, text: &str) {
+        for character in text.chars() {
+            press(surface, KeyCode::Char(character));
+        }
+    }
+
+    /// An Auto-mode surface whose Soft deny group and Ask page each hold two `zebra` rules.
+    async fn zebra_surface() -> PermissionsSurface {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = crate::terminal::Agent::new_embedded(
+            tickloop_harness::test_support::config(),
+            std::sync::Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut view = agent.permissions_view(chat).await.unwrap();
+        view.execution_mode = ExecutionMode::Auto;
+        for (index, text) in ["zebra crossing", "zebra stripes"].into_iter().enumerate() {
+            view.auto_policy
+                .rules
+                .push(tickloop_harness::protocol::AutoRule {
+                    id: format!("zebra-{index}"),
+                    kind: AutoRuleKind::SoftDeny,
+                    text: text.into(),
+                    source: AutoRuleSource::User,
+                    clears: None,
+                });
+            view.rules.push(PermissionRuleView {
+                rule: PermissionRule {
+                    id: Uuid::new_v4(),
+                    decision: Decision::Ask,
+                    tool: format!("Zebra{index}"),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                },
+                source: PermissionRuleSource::ChatSession,
+                scope: PermissionRuleScope::Chat,
+                editable: true,
+                effective_note: None,
+            });
+        }
+        PermissionsSurface::open(view, PermissionsReturn::ModePicker { settings: false })
+    }
+
+    #[tokio::test]
+    async fn arrows_move_the_auto_group_selection_while_its_search_keeps_j_and_k_as_text() {
+        let mut surface = zebra_surface().await;
+        surface.open_auto();
+        surface.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftDeny));
+        press(&mut surface, KeyCode::Char('/'));
+        type_text(&mut surface, "zebra");
+        let searched = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::AutoGroupSearch { group, editor } => (group.selected, editor.draft().to_owned()),
+            _ => panic!("the group search closed"),
+        };
+        assert_eq!(searched(&surface), (0, "zebra".into()));
+        press(&mut surface, KeyCode::Down);
+        press(&mut surface, KeyCode::Down);
+        assert_eq!(searched(&surface), (2, "zebra".into()));
+        press(&mut surface, KeyCode::Up);
+        assert_eq!(searched(&surface), (1, "zebra".into()));
+        let shown = surface
+            .styled_lines(100, 30)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("❯ zebra crossing"), "{shown}");
+        assert!(shown.contains("↑/↓ select"), "{shown}");
+        type_text(&mut surface, "jk");
+        assert_eq!(searched(&surface), (0, "zebrajk".into()));
+    }
+
+    #[tokio::test]
+    async fn arrows_move_the_rule_selection_while_the_search_keeps_j_and_k_as_text() {
+        let mut surface = zebra_surface().await;
+        surface.page = Page::Ask;
+        press(&mut surface, KeyCode::Char('/'));
+        type_text(&mut surface, "zebra");
+        let draft = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::Search(editor) => editor.draft().to_owned(),
+            _ => panic!("the search closed"),
+        };
+        assert_eq!(surface.selected, 0);
+        press(&mut surface, KeyCode::Down);
+        press(&mut surface, KeyCode::Down);
+        assert_eq!((surface.selected, draft(&surface)), (2, "zebra".into()));
+        press(&mut surface, KeyCode::Down);
+        assert_eq!(surface.selected, 2, "the last rule is the last row");
+        press(&mut surface, KeyCode::Up);
+        assert_eq!((surface.selected, draft(&surface)), (1, "zebra".into()));
+        type_text(&mut surface, "jk");
+        assert_eq!((surface.selected, draft(&surface)), (0, "zebrajk".into()));
+    }
+
+    #[tokio::test]
+    async fn the_auto_group_search_emphasizes_its_matches_in_the_rules() {
+        let mut surface = zebra_surface().await;
+        surface.open_auto();
+        surface.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftDeny));
+        press(&mut surface, KeyCode::Char('/'));
+        type_text(&mut surface, "STRIPE");
+        let matched = surface
+            .styled_lines(100, 30)
+            .iter()
+            .flat_map(|line| line.spans.clone())
+            .filter(|span| span.role == Some(Role::FilterMatch))
+            .map(|span| span.text)
+            .collect::<Vec<_>>();
+        assert_eq!(matched, ["stripe"]);
     }
 }

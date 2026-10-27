@@ -84,10 +84,16 @@ impl ListRow<'_> {
     }
 
     pub(super) fn lines(&self, width: usize) -> Vec<RoleLine> {
-        vec![self.one_line(width)]
+        self.lines_matching(width, "")
     }
 
-    fn one_line(&self, width: usize) -> RoleLine {
+    /// The row with the matches of the list's `filter` emphasized in its name and in the
+    /// leading segment of its details; see [`push_details`].
+    pub(super) fn lines_matching(&self, width: usize, filter: &str) -> Vec<RoleLine> {
+        vec![self.one_line(width, filter)]
+    }
+
+    fn one_line(&self, width: usize, filter: &str) -> RoleLine {
         let mut tail = RoleLine::default();
         let mark_columns = self.subscription.map_or(0, |(mark, _)| mark.width());
         let gap = if mark_columns > 0 && !self.details.is_empty() {
@@ -99,7 +105,7 @@ impl ListRow<'_> {
             &self.details,
             width.saturating_sub(compact_name_column(self.glyph) + mark_columns + gap),
         );
-        tail.push(&details, Some(Role::MutedText));
+        push_details(&mut tail, &details, Role::MutedText, filter);
         if let Some((mark, role)) = self.subscription {
             if !details.is_empty() {
                 tail.push(SUBSCRIPTION_GAP, None);
@@ -114,7 +120,11 @@ impl ListRow<'_> {
             &self.details,
             self.subscription,
         ));
-        line.push(ellipsize(self.name, name_columns), Some(self.role()));
+        line.push_matching(
+            &ellipsize(self.name, name_columns),
+            Some(self.role()),
+            filter,
+        );
         line.push(
             " ".repeat(width.saturating_sub(line.text().width() + tail_columns)),
             None,
@@ -146,6 +156,15 @@ impl ListRow<'_> {
             None => line,
         }
     }
+}
+
+/// Pushes a row's `details` in `role`, emphasizing the matches of `filter` only in their leading
+/// segment, the row's source, which a filter reads; the later segments, such as a version or a
+/// state, are not filtered on.
+pub(super) fn push_details(line: &mut RoleLine, details: &str, role: Role, filter: &str) {
+    let source_end = details.find(SEGMENT_SEPARATOR).unwrap_or(details.len());
+    line.push_matching(&details[..source_end], Some(role), filter);
+    line.push(&details[source_end..], Some(role));
 }
 
 /// The colour of a row's leading glyph, which carries the row's state: accent while running,
@@ -418,7 +437,7 @@ mod tests {
                 subscription: mark,
                 ..row("Quotes", "exit 101")
             }
-            .one_line(30);
+            .one_line(30, "");
             assert!(line.text().starts_with("$ Quotes"), "{line:?}");
             assert!(line.text().ends_with("exit 101 ↻"), "{line:?}");
             let last = line.spans.last().unwrap();
@@ -435,7 +454,7 @@ mod tests {
                     subscription,
                     ..row("Example", "")
                 }
-                .one_line(20);
+                .one_line(20, "");
                 assert!(
                     line.text().starts_with(&format!("{glyph} Example")),
                     "{line:?}"
@@ -451,14 +470,14 @@ mod tests {
                 subscription,
                 ..row("Quotes", "")
             }
-            .one_line(20);
+            .one_line(20, "");
             assert!(line.text().starts_with("$ Quotes"), "{line:?}");
             for width in 7..=60 {
                 let line = ListRow {
                     subscription,
                     ..row("python3 -q with a long name", "14s")
                 }
-                .one_line(width);
+                .one_line(width, "");
                 assert_eq!(line.text().width(), width, "{line:?}");
                 assert!(
                     line.text().ends_with(if subscription.is_some() {
@@ -479,7 +498,7 @@ mod tests {
                 subscription: Some(("↻", Role::SubscriptionLow)),
                 ..row("python3 -q", "exit 101 · SIGTERM")
             }
-            .one_line(width);
+            .one_line(width, "");
             assert_eq!(line.text().width(), width, "{line:?}");
             assert!(
                 line.text().starts_with("$ ") && line.text().ends_with('↻'),
@@ -494,7 +513,7 @@ mod tests {
             glyph_role: Role::UpdateMark,
             ..row("Quotes", "")
         }
-        .one_line(20);
+        .one_line(20, "");
         assert_eq!(lead(&unread, 1), [("$".to_owned(), Some(Role::UpdateMark))]);
         assert_eq!(unread.band, None);
         for columns in [0, 10, 20, 30] {
@@ -504,7 +523,7 @@ mod tests {
                 subscription: Some(("↻", Role::SubscriptionMedium)),
                 ..row("Quotes", "")
             }
-            .one_line(20);
+            .one_line(20, "");
             assert_eq!(
                 held.band.clone().map(|band| (band.columns, band.role)),
                 Some((0..columns.clamp(1, 20), Role::UpdateProgress))
@@ -547,7 +566,7 @@ mod tests {
                     fill: Some(Role::UseFlashStrong),
                     ..row("Run the console tests in the worktree", "12s")
                 }
-                .one_line(30);
+                .one_line(30, "");
                 assert_eq!((line.fill, line.fill_start), (Some(fill), 0));
                 assert!(line.text().starts_with("$ Run the console"), "{line:?}");
                 assert!(line.text().contains('…'), "{line:?}");
@@ -596,7 +615,7 @@ mod tests {
             fill: Some(Role::UseFlashStrong),
             ..waiting
         };
-        let line = flashing.one_line(30);
+        let line = flashing.one_line(30, "");
         assert_eq!(
             (line.fill, line.fill_start, line.band),
             (Some(Role::UseFlashStrong), 0, None)
@@ -605,7 +624,7 @@ mod tests {
             selected: true,
             ..flashing
         }
-        .one_line(30);
+        .one_line(30, "");
         assert_eq!(selected.fill, Some(Role::Selection));
         assert_eq!(
             selected.band.map(|band| (band.columns, band.role)),
@@ -623,7 +642,7 @@ mod tests {
                 subscription: subscription_mark(Some(subscription), DisplayProfile::default()),
                 ..row("中文 long name 👩‍💻", "22s")
             }
-            .one_line(width);
+            .one_line(width, "");
             assert!(line.text().width() <= width, "{line:?}");
             assert_eq!((line.fill, line.fill_start), (Some(Role::Selection), 0));
             if width >= 3 {
