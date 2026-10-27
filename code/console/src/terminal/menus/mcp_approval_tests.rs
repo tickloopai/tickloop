@@ -211,7 +211,11 @@ async fn nested_file_change_confirmation_shows_the_entire_parent_batch() {
         .unwrap();
     let menu = console.menu_snapshot(request.id).unwrap().unwrap();
     let context = menu.context.join("\n");
-    assert!(context.contains("batch-context"));
+    assert!(
+        context.contains("From ExecuteTools, call 1 of 2"),
+        "{context}"
+    );
+    assert!(!context.contains("batch-context"), "{context}");
     assert!(context.contains("second-operation-marker"));
     core.shutdown().await;
 }
