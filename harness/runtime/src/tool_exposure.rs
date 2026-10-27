@@ -521,7 +521,7 @@ pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinitio
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them. A server's exposure decides whether its tools are listed directly, found here or hidden (never callable); only the user changes it, in /mcp, and a change applies from your next request.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
         ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Use ExecuteTools to call tools.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]
@@ -619,6 +619,17 @@ mod server_status_tests {
                 false
             ),
             None
+        );
+    }
+
+    #[test]
+    fn search_tells_the_model_that_only_the_user_changes_a_servers_exposure() {
+        let search = &fold_definitions()[0].description;
+        assert!(
+            search.contains(
+                "only the user changes it, in /mcp, and a change applies from your next request"
+            ),
+            "{search}"
         );
     }
 
