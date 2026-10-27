@@ -202,6 +202,60 @@ async fn malformed_responses_and_empty_sse_streams_are_legacy() {
 }
 
 #[tokio::test]
+async fn http_probe_deadline_closes_the_actual_post_and_sse_stream() {
+    for sse in [false, true] {
+        let server = McpService::start().await;
+        if sse {
+            server.stall_discover_stream();
+        } else {
+            server.delay_discover(Duration::from_secs(60));
+        }
+        let mut config = http_config("blocked", &server);
+        config.timeout_ms = 6000;
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        connections.reconcile(vec![config]).await;
+        wait_for_state(&connections, "blocked", McpServerState::Failed).await;
+        assert!(
+            connections.statuses()[0]
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("probe timed out after 2000ms")
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.discover_disconnected())
+            .await
+            .expect("the probe must close its socket before the 6s HTTP timeout");
+        assert_eq!(server.methods(), ["server/discover"]);
+        connections.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_inflight_discover_without_waiting_for_its_deadline() {
+    let server = McpService::start().await;
+    server.stall_discover_stream();
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![http_config("blocked", &server)])
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), server.discover_started())
+        .await
+        .unwrap();
+    connections.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), server.discover_disconnected())
+        .await
+        .expect("shutdown must close the discover stream before its 10s probe deadline");
+}
+
+#[tokio::test]
 async fn truncated_probe_sse_is_a_network_error_and_never_falls_back() {
     let server = McpService::start().await;
     server.reject_discover_over_sse();

@@ -49,6 +49,10 @@ pub(crate) enum McpHttpError {
     Status(StatusCode),
     #[error("MCP credential unavailable")]
     CredentialUnavailable,
+    #[error("MCP discover probe timed out after {0}ms")]
+    ProbeTimedOut(u128),
+    #[error("MCP discover probe cancelled")]
+    ProbeCancelled,
 }
 
 impl From<reqwest::Error> for McpHttpError {
@@ -399,6 +403,143 @@ impl McpHttpClient {
         self.insufficient_scope.load(Ordering::SeqCst)
     }
 
+    async fn post_exchange(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpHttpError>> {
+        let discover = self.probe.is_some()
+            && session_id.is_none()
+            && matches!(&message,
+            ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::DiscoverRequest(_)));
+        if let Some(probe) = &self.probe {
+            probe.sending(&message);
+        }
+        let directory_request = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
+        if self.redactor.is_some()
+            && let Some(id) = &directory_request
+        {
+            let mut pending = self.directory_requests.lock().unwrap();
+            pending.retain(|_, started| started.elapsed() <= REQUEST_TIMEOUT);
+            pending.insert(id.clone(), tokio::time::Instant::now());
+        }
+        let preserve_custom_result = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::CustomRequest(_))
+        );
+        let mut request = self.request(Method::POST, &uri, auth_header, custom_headers)?;
+        if let Some(session_id) = session_id {
+            request = request.header("Mcp-Session-Id", session_id.as_ref());
+        }
+        let response = self.send(request.json(&message)).await?;
+        let status = response.status();
+        if discover && !status.is_success() && !matches!(status.as_u16(), 401 | 403) {
+            let body = json_bytes(response).await?;
+            if let Ok(message @ ServerJsonRpcMessage::Error(_)) = self.decode_probe_body(&body) {
+                self.probe
+                    .as_ref()
+                    .unwrap()
+                    .http_error_response(status.as_u16());
+                return Ok(StreamableHttpPostResponse::Json(message, None));
+            }
+            return Err(StreamableHttpError::Client(McpHttpError::Status(status)));
+        }
+        self.verify_status(&response)?;
+        if matches!(
+            response.status(),
+            StatusCode::ACCEPTED | StatusCode::NO_CONTENT
+        ) {
+            if discover {
+                return Err(unexpected("MCP discover returned no response"));
+            }
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        let session_id = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let (Some(id), Some(redact)) = (&session_id, &self.redactor) {
+            let mut redacted = serde_json::Value::String(id.clone());
+            redact(&mut redacted, ResponsePart::Data);
+            if redacted.as_str() != Some(id.as_str()) {
+                return Err(unexpected("MCP session identifier contains a credential"));
+            }
+        }
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if content_type.starts_with("text/event-stream") {
+            let response = StreamableHttpPostResponse::Sse(
+                sse_stream(
+                    response,
+                    max_sse_event_size,
+                    self.redactor.clone(),
+                    self.directory_requests.clone(),
+                    self.probe.clone(),
+                ),
+                session_id,
+            );
+            if discover {
+                let (message, session_id) = response.expect_initialized::<McpHttpError>().await?;
+                return Ok(StreamableHttpPostResponse::Json(message, session_id));
+            }
+            return Ok(response);
+        }
+        if !content_type.starts_with("application/json") {
+            return Err(unexpected("invalid MCP content type"));
+        }
+        let mut body = json_bytes(response).await?;
+        if let Some(redact) = &self.redactor {
+            let text =
+                String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
+            body = redact_message(&text, redact, &self.directory_requests, self.probe.as_ref())
+                .map_err(|_| unexpected("invalid MCP JSON response"))?
+                .into_bytes();
+        }
+        // The SDK's untagged result decoder mistakes extension metadata for a tool result.
+        let decoded = if preserve_custom_result {
+            serde_json::from_slice::<JsonRpcResponse<serde_json::Value>>(&body)
+                .map(|response| {
+                    ServerJsonRpcMessage::Response(JsonRpcResponse {
+                        jsonrpc: response.jsonrpc,
+                        id: response.id,
+                        result: ServerResult::CustomResult(CustomResult::new(response.result)),
+                    })
+                })
+                .or_else(|_| serde_json::from_slice::<ServerJsonRpcMessage>(&body))
+        } else {
+            serde_json::from_slice::<ServerJsonRpcMessage>(&body)
+        };
+        match decoded {
+            Ok(message)
+                if discover
+                    && !matches!(
+                        message,
+                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                    ) =>
+            {
+                Err(unexpected("invalid MCP discover response"))
+            }
+            Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+            Err(_) => Err(unexpected("invalid MCP JSON response")),
+        }
+    }
+
     fn verify_status(
         &self,
         response: &reqwest::Response,
@@ -631,131 +772,26 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let discover = self.probe.is_some()
-            && session_id.is_none()
-            && matches!(&message,
-            ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::DiscoverRequest(_)));
-        if let Some(probe) = &self.probe {
-            probe.sending(&message);
-        }
-        let directory_request = match &message {
-            ClientJsonRpcMessage::Request(request)
-                if matches!(request.request, ClientRequest::ListToolsRequest(_)) =>
-            {
-                Some(request.id.clone())
-            }
-            _ => None,
-        };
-        if self.redactor.is_some()
-            && let Some(id) = &directory_request
-        {
-            let mut pending = self.directory_requests.lock().unwrap();
-            pending.retain(|_, started| started.elapsed() <= REQUEST_TIMEOUT);
-            pending.insert(id.clone(), tokio::time::Instant::now());
-        }
-        let preserve_custom_result = matches!(
-            &message,
-            ClientJsonRpcMessage::Request(request)
-                if matches!(&request.request, ClientRequest::CustomRequest(_))
+        let probe = self.probe.as_ref().filter(|_| session_id.is_none() && matches!(
+            &message, ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::DiscoverRequest(_))
+        ));
+        let exchange = self.post_exchange(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            max_sse_event_size,
         );
-        let mut request = self.request(Method::POST, &uri, auth_header, custom_headers)?;
-        if let Some(session_id) = session_id {
-            request = request.header("Mcp-Session-Id", session_id.as_ref());
-        }
-        let response = self.send(request.json(&message)).await?;
-        let status = response.status();
-        if discover && !status.is_success() && !matches!(status.as_u16(), 401 | 403) {
-            let body = json_bytes(response).await?;
-            if let Ok(message @ ServerJsonRpcMessage::Error(_)) = self.decode_probe_body(&body) {
-                self.probe
-                    .as_ref()
-                    .unwrap()
-                    .http_error_response(status.as_u16());
-                return Ok(StreamableHttpPostResponse::Json(message, None));
+        if let Some(probe) = probe
+            && let Some((deadline, budget)) = probe.limit()
+        {
+            tokio::select! {
+                result = tokio::time::timeout_at(deadline, exchange) => result.map_err(|_| StreamableHttpError::Client(McpHttpError::ProbeTimedOut(budget.as_millis())))?,
+                _ = probe.cancelled() => Err(StreamableHttpError::Client(McpHttpError::ProbeCancelled)),
             }
-            return Err(StreamableHttpError::Client(McpHttpError::Status(status)));
-        }
-        self.verify_status(&response)?;
-        if matches!(
-            response.status(),
-            StatusCode::ACCEPTED | StatusCode::NO_CONTENT
-        ) {
-            if discover {
-                return Err(unexpected("MCP discover returned no response"));
-            }
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-        let session_id = response
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        if let (Some(id), Some(redact)) = (&session_id, &self.redactor) {
-            let mut redacted = serde_json::Value::String(id.clone());
-            redact(&mut redacted, ResponsePart::Data);
-            if redacted.as_str() != Some(id.as_str()) {
-                return Err(unexpected("MCP session identifier contains a credential"));
-            }
-        }
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if content_type.starts_with("text/event-stream") {
-            let response = StreamableHttpPostResponse::Sse(
-                sse_stream(
-                    response,
-                    max_sse_event_size,
-                    self.redactor.clone(),
-                    self.directory_requests.clone(),
-                    self.probe.clone(),
-                ),
-                session_id,
-            );
-            if discover {
-                let (message, session_id) = response.expect_initialized::<McpHttpError>().await?;
-                return Ok(StreamableHttpPostResponse::Json(message, session_id));
-            }
-            return Ok(response);
-        }
-        if !content_type.starts_with("application/json") {
-            return Err(unexpected("invalid MCP content type"));
-        }
-        let mut body = json_bytes(response).await?;
-        if let Some(redact) = &self.redactor {
-            let text =
-                String::from_utf8(body).map_err(|_| unexpected("invalid MCP JSON response"))?;
-            body = redact_message(&text, redact, &self.directory_requests, self.probe.as_ref())
-                .map_err(|_| unexpected("invalid MCP JSON response"))?
-                .into_bytes();
-        }
-        // The SDK's untagged result decoder mistakes extension metadata for a tool result.
-        let decoded = if preserve_custom_result {
-            serde_json::from_slice::<JsonRpcResponse<serde_json::Value>>(&body)
-                .map(|response| {
-                    ServerJsonRpcMessage::Response(JsonRpcResponse {
-                        jsonrpc: response.jsonrpc,
-                        id: response.id,
-                        result: ServerResult::CustomResult(CustomResult::new(response.result)),
-                    })
-                })
-                .or_else(|_| serde_json::from_slice::<ServerJsonRpcMessage>(&body))
         } else {
-            serde_json::from_slice::<ServerJsonRpcMessage>(&body)
-        };
-        match decoded {
-            Ok(message)
-                if discover
-                    && !matches!(
-                        message,
-                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
-                    ) =>
-            {
-                Err(unexpected("invalid MCP discover response"))
-            }
-            Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
-            Err(_) => Err(unexpected("invalid MCP JSON response")),
+            exchange.await
         }
     }
 

@@ -12,6 +12,8 @@ pub struct McpService {
     url: String,
     state: Arc<Mutex<State>>,
     cancel: CancellationToken,
+    discover_started: Arc<tokio::sync::Notify>,
+    discover_disconnected: Arc<tokio::sync::Notify>,
 }
 struct State {
     instructions: String,
@@ -39,6 +41,7 @@ struct State {
     discover_delay: std::time::Duration,
     close_discover: bool,
     truncate_discover: bool,
+    stall_discover_stream: bool,
     http_responses: std::collections::HashMap<String, (u16, String)>,
     protocol_version: Option<String>,
     initialize_error: Option<Value>,
@@ -75,15 +78,20 @@ impl McpService {
                 discover_delay: std::time::Duration::ZERO,
                 close_discover: false,
                 truncate_discover: false,
+                stall_discover_stream: false,
                 http_responses: Default::default(),
                 protocol_version: None,
                 initialize_error: None,
                 messages: Vec::new(),
             })),
             cancel: CancellationToken::new(),
+            discover_started: Arc::default(),
+            discover_disconnected: Arc::default(),
         };
         let state = server.state.clone();
         let cancel = server.cancel.clone();
+        let discover_started = server.discover_started.clone();
+        let discover_disconnected = server.discover_disconnected.clone();
         tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -92,6 +100,8 @@ impl McpService {
                     accepted = listener.accept() => {
                         let Ok((mut stream, _)) = accepted else { break };
                         let state = state.clone();
+                        let discover_started = discover_started.clone();
+                        let discover_disconnected = discover_disconnected.clone();
                         tasks.spawn(async move {
                             let mut bytes = Vec::new();
                             let header_end = loop {
@@ -137,6 +147,7 @@ impl McpService {
                                 state.requests += 1;
                                 let method = request["method"].as_str().unwrap_or("");
                                 state.messages.push((request.clone(), protocol_version));
+                                if method == "server/discover" { discover_started.notify_one(); }
                                 if method == "server/discover" && state.close_discover { return; }
                                 let result = match method {
                                     "initialize" => {
@@ -157,7 +168,22 @@ impl McpService {
                                 if call && let Some(notification) = state.notification.take() { notifications.push(notification); }
                                 (if state.bearer.as_ref().is_some_and(|token| authorization.as_deref() != Some(format!("Bearer {token}").as_str())) {401} else {state.status}, if method == "server/discover" {state.discover_delay} else if call {state.delay} else if method == "tools/list" {state.directory_delay} else {std::time::Duration::ZERO}, result, if call {state.error.clone()} else if method == "initialize" {state.initialize_error.clone()} else {None}, notifications, state.challenge.clone())
                             };
-                            tokio::time::sleep(delay).await;
+                            if request["method"] == "server/discover" && state.lock().unwrap().stall_discover_stream {
+                                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: waiting\n\n").await;
+                                let mut byte = [0];
+                                if stream.read(&mut byte).await.is_ok_and(|size| size == 0) { discover_disconnected.notify_one(); }
+                                return;
+                            }
+                            if request["method"] == "server/discover" && !delay.is_zero() {
+                                let mut byte = [0];
+                                tokio::select! {
+                                    _ = tokio::time::sleep(delay) => {}
+                                    read = stream.read(&mut byte) => {
+                                        if read.is_ok_and(|size| size == 0) { discover_disconnected.notify_one(); }
+                                        return;
+                                    }
+                                }
+                            } else { tokio::time::sleep(delay).await; }
                             let error = if request["method"] == "server/discover" {Some(json!({"code":-32601,"message":"Method not found"}))} else {error};
                             let response = if let Some(error) = error {json!({"jsonrpc":"2.0","id":request["id"],"error":error})} else {json!({"jsonrpc":"2.0","id":request["id"],"result":result})};
                             let (status, response) = if request["method"] == "server/discover"
@@ -257,6 +283,15 @@ impl McpService {
     }
     pub fn truncate_discover(&self) {
         self.state.lock().unwrap().truncate_discover = true;
+    }
+    pub fn stall_discover_stream(&self) {
+        self.state.lock().unwrap().stall_discover_stream = true;
+    }
+    pub async fn discover_started(&self) {
+        self.discover_started.notified().await;
+    }
+    pub async fn discover_disconnected(&self) {
+        self.discover_disconnected.notified().await;
     }
     pub fn resume_tool_directory_once(&self) {
         self.state.lock().unwrap().resume_directory = true;

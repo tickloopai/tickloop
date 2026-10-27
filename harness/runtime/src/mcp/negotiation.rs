@@ -14,24 +14,48 @@ use std::{
 };
 
 #[derive(Clone, Default)]
-pub(crate) struct ProbeState(Arc<Mutex<ProbeObservation>>);
+pub(crate) struct ProbeState {
+    observation: Arc<Mutex<ProbeObservation>>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
 
 #[derive(Default)]
 struct ProbeObservation {
     request_id: Option<RequestId>,
     modern_version_rejected: bool,
     http_status: Option<u16>,
+    deadline: Option<tokio::time::Instant>,
+    budget: Duration,
 }
 
 impl ProbeState {
+    fn start(&self, budget: Duration) -> tokio::time::Instant {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut observation = self.observation.lock().unwrap();
+        observation.deadline = Some(deadline);
+        observation.budget = budget;
+        deadline
+    }
+
+    pub(crate) fn limit(&self) -> Option<(tokio::time::Instant, Duration)> {
+        let observation = self.observation.lock().unwrap();
+        observation
+            .deadline
+            .map(|deadline| (deadline, observation.budget))
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
     pub(crate) fn sending(&self, message: &ClientJsonRpcMessage) {
         if let ClientJsonRpcMessage::Request(request) = message {
             match &request.request {
                 ClientRequest::DiscoverRequest(_) => {
-                    *self.0.lock().unwrap() = ProbeObservation {
-                        request_id: Some(request.id.clone()),
-                        ..Default::default()
-                    };
+                    let mut observation = self.observation.lock().unwrap();
+                    observation.request_id = Some(request.id.clone());
+                    observation.modern_version_rejected = false;
+                    observation.http_status = None;
                 }
                 ClientRequest::InitializeRequest(_) => self.finish(),
                 _ => {}
@@ -40,16 +64,18 @@ impl ProbeState {
     }
 
     pub(crate) fn finish(&self) {
-        self.0.lock().unwrap().request_id = None;
+        let mut observation = self.observation.lock().unwrap();
+        observation.request_id = None;
+        observation.deadline = None;
     }
 
     pub(crate) fn http_error_response(&self, status: u16) {
-        self.0.lock().unwrap().http_status = Some(status);
+        self.observation.lock().unwrap().http_status = Some(status);
     }
 
     // Keep only routing facts across redaction, never an arbitrary server string.
     pub(crate) fn prepare_response(&self, message: &mut Value) -> Vec<(String, Value)> {
-        let mut observation = self.0.lock().unwrap();
+        let mut observation = self.observation.lock().unwrap();
         let Some(id) = &observation.request_id else {
             return Vec::new();
         };
@@ -93,10 +119,10 @@ impl ProbeState {
     fn legacy(&self, error: &ClientInitializeError, http: bool) -> bool {
         match error {
             ClientInitializeError::NoCompatibleProtocolVersion { .. } => {
-                !self.0.lock().unwrap().modern_version_rejected
+                !self.observation.lock().unwrap().modern_version_rejected
             }
             ClientInitializeError::JsonRpcError(_) => {
-                !self.0.lock().unwrap().modern_version_rejected
+                !self.observation.lock().unwrap().modern_version_rejected
             }
             ClientInitializeError::ExpectedInitResponse(_)
             | ClientInitializeError::ExpectedInitResult(_)
@@ -134,7 +160,7 @@ impl ProbeState {
 
     fn failure(&self, entry: &Entry, error: &ClientInitializeError) -> String {
         let cause = initialize_failure(error, &|text| redact(entry, text));
-        match self.0.lock().unwrap().http_status {
+        match self.observation.lock().unwrap().http_status {
             Some(status) => format!("MCP returned HTTP {status}: {cause}"),
             None => cause,
         }
@@ -148,12 +174,14 @@ pub(super) async fn connect<T: Transport<RoleClient> + 'static>(
     http: bool,
     mut transport: impl FnMut() -> Result<T, String>,
 ) -> Result<RunningService<RoleClient, Handler>, String> {
+    let _probe_guard = probe.cancellation.clone().drop_guard();
     let discover_failure = if entry.legacy.load(Ordering::SeqCst) {
         None
     } else {
         let budget = Duration::from_millis(entry.config.timeout_ms).min(CONNECT_TIMEOUT) / 3;
-        let result = tokio::time::timeout(
-            budget,
+        let deadline = probe.start(budget);
+        let result = tokio::time::timeout_at(
+            deadline,
             handler.clone().serve_with_lifecycle(
                 transport()?,
                 ClientLifecycleMode::Discover {
