@@ -75,7 +75,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"mail","description":"Send email","inputSchema":{"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]}},{"name":"secret","inputSchema":{"type":"object"}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
-    let configs = vec![McpServerConfig {
+    let mut configs = vec![McpServerConfig {
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -90,7 +90,6 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         tool_exposure: vec![("secret".into(), ToolExposure::Hidden)],
         description: "Office tools".into(),
     }];
-    let mut configs = configs;
     configs.push(McpServerConfig {
         name: "ui5".into(),
         transport: McpTransport::Failed {
@@ -1547,11 +1546,23 @@ fn queries_made_only_of_unrelated_or_generic_words_match_nothing() {
         "weather forecast",
         "mcp server tools",
         "the tool for a server",
+        "this server",
+        "mcp__",
     ] {
         let found = directory.search(&json!({"query":query})).unwrap();
         assert_eq!(found["matches"], json!([]), "{query:?}");
         assert!(found["note"].is_string());
     }
+    let guidelines = ExposureDirectory::new(
+        vec![server_tool(
+            "ui5",
+            "get_guidelines",
+            "This tool MUST be called once to retrieve UI5 guidelines",
+        )],
+        SearchSupport::Fold,
+        false,
+    );
+    assert!(found_names(&guidelines, "this").is_empty());
 }
 
 #[test]
@@ -1583,6 +1594,19 @@ fn exact_names_server_prefixes_selections_and_required_words_pick_tools() {
         ["mcp__ui5__run_ui5_linter"]
     );
     assert!(found_names(&directory, "+weather ui5").is_empty());
+    assert_eq!(
+        found_names(&directory, "mcp__ui5__get_version")[0],
+        "mcp__ui5__get_version_info"
+    );
+    let eleven_names = (0..11)
+        .map(|index| format!("mcp__office__tool_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        directory
+            .search(&json!({"query":format!("select:{eleven_names}")}))
+            .is_err()
+    );
 }
 
 #[test]
@@ -1655,6 +1679,20 @@ fn searches_name_servers_that_cannot_offer_tools_yet() {
     assert_eq!(
         found["unavailable_servers"],
         json!([{"name":"ui5","state":"connecting"}])
+    );
+    let note = found["note"].as_str().unwrap();
+    assert!(
+        note.contains("ui5 (connecting)") && !note.contains("No tool matched"),
+        "{note}"
+    );
+    let without_unavailable = ExposureDirectory::new(
+        vec![server_tool("office", "mail", "Send an email message")],
+        SearchSupport::Fold,
+        false,
+    );
+    assert_eq!(
+        serde_json::to_vec(&directory.definitions()).unwrap(),
+        serde_json::to_vec(&without_unavailable.definitions()).unwrap()
     );
     assert!(
         ui5_directory().search(&json!({"query":"ui5"})).unwrap()["unavailable_servers"].is_null()

@@ -17,6 +17,7 @@ const MAX_SUMMARY_CHARACTERS: usize = 160;
 const SELECT_PREFIX: &str = "select:";
 const SERVER_PREFIX: &str = "mcp__";
 const REQUIRED_PREFIX: char = '+';
+const NO_MATCH_NOTE: &str = "No tool matched.";
 const NAME_WEIGHT: f64 = 2.0;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
@@ -159,12 +160,18 @@ impl ExposureDirectory {
             .collect();
         let mut not_found = Vec::new();
         let found = if let Some(names) = query.strip_prefix(SELECT_PREFIX) {
-            let mut selected: Vec<&ExposureTool> = Vec::new();
-            for name in names
+            let names: Vec<_> = names
                 .split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
-            {
+                .collect();
+            if !(1..=MAX_SEARCH_MATCHES).contains(&names.len()) {
+                return Err(format!(
+                    "select: takes 1–{MAX_SEARCH_MATCHES} exact tool names"
+                ));
+            }
+            let mut selected: Vec<&ExposureTool> = Vec::new();
+            for name in names {
                 if selected.iter().any(|tool| tool.definition.name == name)
                     || not_found.contains(&name)
                 {
@@ -175,26 +182,33 @@ impl ExposureDirectory {
                     None => not_found.push(name),
                 }
             }
-            if selected.is_empty() && not_found.is_empty() {
-                return Err("select: needs at least one exact tool name".into());
-            }
             selected
-        } else if tools
-            .iter()
-            .any(|tool| tool.definition.name == query || tool.original_name == query)
-        {
-            tools
-                .into_iter()
-                .filter(|tool| tool.definition.name == query || tool.original_name == query)
-                .collect()
-        } else if query.starts_with(SERVER_PREFIX) && !query.contains(char::is_whitespace) {
-            let prefix = format!("{}__", query.trim_end_matches('_'));
-            tools
-                .into_iter()
-                .filter(|tool| tool.definition.name.starts_with(&prefix))
-                .collect()
         } else {
-            ranked(&tools, query).into_iter().take(limit).collect()
+            let exact: Vec<_> = tools
+                .iter()
+                .copied()
+                .filter(|tool| tool.definition.name == query || tool.original_name == query)
+                .collect();
+            let server_tools: Vec<_> = query
+                .strip_prefix(SERVER_PREFIX)
+                .map(|server| server.trim_end_matches('_'))
+                .filter(|server| !server.is_empty() && !server.contains(char::is_whitespace))
+                .map(|server| {
+                    let prefix = format!("{SERVER_PREFIX}{server}__");
+                    tools
+                        .iter()
+                        .copied()
+                        .filter(|tool| tool.definition.name.starts_with(&prefix))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !exact.is_empty() {
+                exact
+            } else if !server_tools.is_empty() {
+                server_tools
+            } else {
+                ranked(&tools, query).into_iter().take(limit).collect()
+            }
         };
         let matches: Vec<_> = found
             .iter()
@@ -211,25 +225,37 @@ impl ExposureDirectory {
         if !self.unavailable_servers.is_empty() {
             output["unavailable_servers"] = json!(self.unavailable_servers);
         }
-        if matches.is_empty() {
-            output["note"] = json!(self.no_match_note());
+        if let Some(note) = self.search_note(matches.is_empty()) {
+            output["note"] = json!(note);
         }
         Ok(output)
     }
 
-    fn no_match_note(&self) -> String {
-        if self.unavailable_servers.is_empty() {
-            return "No tool matched. Try another wording or an exact tool name; check the MCP server status for unavailable services.".into();
+    fn search_note(&self, nothing_matched: bool) -> Option<String> {
+        let unavailable = (!self.unavailable_servers.is_empty()).then(|| {
+            let servers = self
+                .unavailable_servers
+                .iter()
+                .map(|server| {
+                    format!(
+                        "{} ({})",
+                        server.name,
+                        json!(server.state).as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "These MCP servers cannot offer tools right now: {servers}. Search again shortly for a connecting server; check the MCP server status for the others."
+            )
+        });
+        match (nothing_matched, unavailable) {
+            (true, Some(unavailable)) => Some(format!("{NO_MATCH_NOTE} {unavailable}")),
+            (true, None) => Some(format!(
+                "{NO_MATCH_NOTE} Try another wording or an exact tool name; check the MCP server status for unavailable services."
+            )),
+            (false, unavailable) => unavailable,
         }
-        let servers = self
-            .unavailable_servers
-            .iter()
-            .map(|server| format!("{} ({})", server.name, server_state_text(&server.state)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "No tool matched. These MCP servers cannot offer tools right now: {servers}. Search again shortly for a connecting server; check the MCP server status for the others."
-        )
     }
 
     pub fn describe(&self, input: &Value) -> Result<Value, String> {
@@ -250,11 +276,6 @@ impl ExposureDirectory {
         }
         Ok(json!({"tools":tools,"not_found":not_found}))
     }
-}
-
-/// The state as the search result spells it, such as `connecting`.
-fn server_state_text(state: &McpServerState) -> String {
-    json!(state).as_str().unwrap_or_default().to_owned()
 }
 
 fn strings<'a>(input: &'a Value, field: &str) -> Result<Vec<&'a str>, String> {
@@ -397,8 +418,12 @@ fn tokens(text: &str) -> Vec<String> {
     separated
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .map(|term| singular(&term.to_lowercase()))
-        .filter(|term| !SEARCH_STOP_WORDS.contains(&term.as_str()))
+        .filter_map(|term| {
+            let term = term.to_lowercase();
+            let singular = singular(&term);
+            let is_stop_word = |word: &str| SEARCH_STOP_WORDS.contains(&word);
+            (!is_stop_word(&term) && !is_stop_word(&singular)).then_some(singular)
+        })
         .collect()
 }
 
@@ -509,7 +534,7 @@ pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinitio
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
         ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Call script-only tools through Codemode; use ExecuteTools for other tools when offered.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]

@@ -51,6 +51,8 @@ pub struct McpServerSnapshot {
     pub warnings: Vec<String>,
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the first request waits, once, for servers that are still starting.
+const STARTUP_WAIT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
@@ -259,7 +261,7 @@ impl McpConnections {
                 changed.await;
             }
         };
-        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(Duration::from_secs(10), wait) => {} }
+        tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::timeout(STARTUP_WAIT, wait) => {} }
     }
 
     pub fn with_stderr_directory(
