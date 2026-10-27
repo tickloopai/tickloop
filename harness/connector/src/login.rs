@@ -403,26 +403,24 @@ fn authorization_error(error: &AuthError, redaction: &CauseRedaction) -> LoginEr
 const MAX_CAUSE_CHARS: usize = 400;
 const CAUSED_BY: &str = "Caused by:";
 const UNREADABLE_ADDRESS: &str = "<address>";
+const TRAILING_PUNCTUATION: &[char] = &[')', ']', '>', '\'', '"', '`', ',', ';', ':', '.'];
 
 /// Turns error texts into the one-line cause of a discovery failure. Each address keeps only
 /// its origin, since a server address may carry a credential in its user information, path or
-/// query: the addresses this login knows are replaced exactly first, then every word that
-/// contains `://` is replaced whole by the origin of the address in it, so no character of
-/// that word after the host can survive.
+/// query: every word that contains `://` is replaced whole, by the origin of the known address
+/// it consists of, else by the origin parsed from it, so no other character of that word can
+/// survive.
 struct CauseRedaction {
-    /// Each known address with its origin, longest first so that none is replaced inside
-    /// another.
+    /// Each address this login knows, with its origin.
     known: Vec<(String, String)>,
 }
 
 impl CauseRedaction {
     fn new(addresses: impl IntoIterator<Item = Url>) -> Self {
-        let mut known: Vec<(String, String)> = addresses
+        let known = addresses
             .into_iter()
             .map(|address| (address.to_string(), origin_of(&address)))
             .collect();
-        known.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()).then(left.cmp(right)));
-        known.dedup();
         Self { known }
     }
 
@@ -467,37 +465,37 @@ impl CauseRedaction {
     }
 
     fn redact(&self, line: &str) -> String {
-        let mut line = line.to_owned();
-        for (address, origin) in &self.known {
-            line = line.replace(address.as_str(), origin);
-        }
         line.split_whitespace()
-            .map(|word| {
-                if word.contains("://") {
-                    address_origin(word)
-                } else {
-                    word.to_owned()
-                }
+            .map(|word| match word.find("://") {
+                Some(separator) => self.address_origin(word, separator),
+                None => word.to_owned(),
             })
             .collect::<Vec<_>>()
             .join(" ")
     }
-}
 
-/// The origin of the first address in `word`, which may be wrapped in punctuation.
-fn address_origin(word: &str) -> String {
-    let Some(separator) = word.find("://") else {
-        return UNREADABLE_ADDRESS.to_owned();
-    };
-    let start = word[..separator]
-        .char_indices()
-        .rev()
-        .take_while(|(_, character)| {
-            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-        })
-        .last()
-        .map_or(separator, |(index, _)| index);
-    Url::parse(&word[start..]).map_or_else(|_| UNREADABLE_ADDRESS.to_owned(), |url| origin_of(&url))
+    /// The origin that replaces `word`, whose address, possibly wrapped in punctuation, has its
+    /// `://` at `separator`.
+    fn address_origin(&self, word: &str, separator: usize) -> String {
+        let start = word[..separator]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+            .last()
+            .map_or(separator, |(index, _)| index);
+        let address = &word[start..];
+        let unwrapped = address.trim_end_matches(TRAILING_PUNCTUATION);
+        if let Some((_, origin)) = self
+            .known
+            .iter()
+            .find(|(known, _)| known == address || known == unwrapped)
+        {
+            return origin.clone();
+        }
+        Url::parse(address).map_or_else(|_| UNREADABLE_ADDRESS.to_owned(), |url| origin_of(&url))
+    }
 }
 
 /// `url`'s origin, when its host is an ordinary name or IP address.
@@ -566,8 +564,31 @@ mod tests {
             "at https://mcp.example.test and https://mcp.example.test"
         );
         assert_eq!(
+            redaction.line("(https://mcp.example.test/key-1/mcp): failed"),
+            "https://mcp.example.test failed"
+        );
+        assert_eq!(
             redaction.line("issuer https://a.test,https://b.test/?k=secret"),
             "issuer <address>"
         );
+    }
+
+    #[test]
+    fn a_known_address_inside_a_longer_one_leaves_nothing_of_the_longer_one() {
+        let redaction = CauseRedaction::new([
+            Url::parse("https://mcp.example.com/").unwrap(),
+            Url::parse("https://mcp.example.com/key-1").unwrap(),
+        ]);
+        for text in [
+            "at https://mcp.example.com/oauth2/token?code=SECRET#SECRET",
+            "at https://mcp.example.com/key-1/oauth2/token?code=SECRET",
+            "at prefix-SECRET(https://mcp.example.com/)SECRET?code=SECRET",
+            "at (https://mcp.example.com/key-1)/SECRET",
+            "at https://mcp.example.com/\"SECRET",
+            "at https://mcp.example.com/,SECRET;SECRET>SECRET)SECRET",
+        ] {
+            let line = redaction.line(text);
+            assert_eq!(line, "at https://mcp.example.com", "{text}");
+        }
     }
 }
