@@ -1,4 +1,5 @@
 mod auto_policy;
+pub mod instructions;
 pub mod loop_skill;
 pub mod settings;
 pub mod skills;

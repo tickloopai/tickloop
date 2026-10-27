@@ -17,9 +17,11 @@ percent-encoding = "2"
 tokio = { version = "1", features = ["time"] }
 tickloop-harness = { path = "../../harness/sdk", features = ["model", "policy", "tools", "connector"] }
 tickloop-tick-installer = { path = "../../tick/installer" }
+regex = "1"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tickloop-tick-packages = { path = "../../tick/packages" }

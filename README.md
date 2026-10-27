@@ -71,6 +71,18 @@ Keys:
 
 Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
 
+## Instructions
+
+The agent follows standing instructions from Markdown files, read in this order (later files weigh more):
+
+1. Your own instructions for every project: `~/.tickloop/AGENTS.md`. Without it, `~/.claude/CLAUDE.md` and `~/.claude/rules/*.md` are used instead.
+2. Each directory from the top of the filesystem down to the working directory: its `AGENTS.md`, or, in a directory without one, its `CLAUDE.md`, `.claude/CLAUDE.md` and `.claude/rules/*.md`. An `AGENTS.md` in a parent folder therefore applies to every project below it.
+3. A directory's `CLAUDE.local.md`, your private notes that stay out of Git, is always read.
+
+To keep a directory's `CLAUDE.md` from being read, put an `AGENTS.md` there; an empty one is enough. Likewise, any `~/.tickloop/AGENTS.md`, even an empty one, keeps `~/.claude` from being read. A rule file with `paths` in its frontmatter is left out. Write `@path` to bring in another file (`@docs/style.md`, `@~/notes.md`); a project's files can only bring in files inside the working directory, while your own instructions can bring in any file. Files are read when a conversation starts and again after `/compact`.
+
+To reuse instructions written for another tool, bring them in from `~/.tickloop/AGENTS.md` (for example `@~/.codex/AGENTS.md`), or add an `AGENTS.md` to the project that brings in its existing file (for example `@GEMINI.md`).
+
 ## Ticks
 
 A Tick is a live program the agent can open, watch and act on, such as a market data feed or a document reader. Ticks are installed like plugins and share their marketplaces and storage, but you manage them on their own: open `/ticks` to find, install and log in to them, or use the command line:

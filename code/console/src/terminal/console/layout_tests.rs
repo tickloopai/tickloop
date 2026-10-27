@@ -1285,16 +1285,28 @@ fn agent_layout_reopened_banner_survives_rebuilds_and_scrolls_with_the_conversat
     }
 }
 
+fn real_banner() -> Vec<(String, Option<Role>)> {
+    super::super::startup_banner_spans(
+        &tickloop_harness::test_support::config(),
+        std::path::Path::new("/fixture/runtime-banner"),
+    )
+}
+
+/// The frame line showing the banner's title.
+fn title_line(console: &Console) -> String {
+    let title = format!("Tickloop v{}", env!("CARGO_PKG_VERSION"));
+    frame_lines(console)
+        .into_iter()
+        .find(|line| line.contains(&title))
+        .unwrap()
+}
+
 #[test]
 fn agent_layout_runtime_banner_uses_each_chats_known_worker_build_without_duplicates() {
-    let mut state = State::new(true, 100, 24);
+    let mut state = State::new(true, 100, 32);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
-    let banner = vec![
-        ("Tickloop v0.2.12\n".into(), Some(Role::Title)),
-        ("fixture-model · Messages\n".into(), Some(Role::MutedText)),
-        ("/fixture/conversation\n".into(), Some(Role::MutedText)),
-    ];
+    let banner = real_banner();
     console.ensure_chat_banner(ROOT_AGENT, &banner).unwrap();
     console.reset_chat(ROOT_AGENT).unwrap();
     console.record_input("keep this conversation").unwrap();
@@ -1304,43 +1316,33 @@ fn agent_layout_runtime_banner_uses_each_chats_known_worker_build_without_duplic
             .unwrap();
     }
     let old = frame_lines(&console).join("\n");
-    assert_eq!(
-        old.matches("Agent v0.2.11+aaaaaaaaaaaaaaaa · pending")
-            .count(),
-        1,
+    assert_eq!(old.matches("Daemon: v").count(), 1, "{old}");
+    assert!(
+        title_line(&console).ends_with(" (Daemon: v0.2.11+aaaaaaaaaaaaaaaa, upgrade pending)"),
         "{old}"
     );
-    assert_eq!(old.matches("Tickloop v0.2.12").count(), 1, "{old}");
     assert!(old.contains("keep this conversation"));
     console.ensure_chat_banner(CHILD_AGENT, &banner).unwrap();
     console.reset_chat(CHILD_AGENT).unwrap();
     console.set_agent_runtime(CHILD_AGENT, None, true).unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
     console
         .set_agent_runtime(ROOT_AGENT, Some("0.2.12+bbbbbbbbbbbbbbbb".into()), false)
         .unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
     console.select_chat(Some(ROOT_AGENT)).unwrap();
     let updated = frame_lines(&console).join("\n");
-    assert_eq!(
-        updated.matches("Agent v0.2.12+bbbbbbbbbbbbbbbb").count(),
-        1,
-        "{updated}"
-    );
+    assert_eq!(updated.matches("Daemon: v").count(), 1, "{updated}");
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     assert!(!updated.contains("aaaaaaaaaaaaaaaa") && !updated.contains("pending"));
     assert!(updated.contains("keep this conversation"));
     console.reset_chat(ROOT_AGENT).unwrap();
-    assert!(
-        frame_lines(&console)
-            .join("\n")
-            .contains("Agent v0.2.12+bbbbbbbbbbbbbbbb")
-    );
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     console.set_agent_runtime(ROOT_AGENT, None, false).unwrap();
     let unknown = frame_lines(&console).join("\n");
-    assert!(!unknown.contains("Agent v") && !unknown.contains("bbbbbbbbbbbbbbbb"));
-    assert!(unknown.contains("Tickloop v0.2.12"));
+    assert!(!unknown.contains("Daemon: v") && !unknown.contains("bbbbbbbbbbbbbbbb"));
     console.clear_visible_agent().unwrap();
-    assert!(!frame_lines(&console).join("\n").contains("Agent v"));
+    assert!(!frame_lines(&console).join("\n").contains("Daemon: v"));
 }
 
 #[test]
@@ -1348,11 +1350,9 @@ fn agent_layout_runtime_banner_updates_preserve_the_reading_anchor_and_full_buil
     let mut state = State::new(true, 100, 24);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
-    let banner = vec![
-        ("Tickloop v0.2.12\n".into(), Some(Role::Title)),
-        ("/fixture/conversation\n".into(), Some(Role::MutedText)),
-    ];
-    console.ensure_chat_banner(ROOT_AGENT, &banner).unwrap();
+    console
+        .ensure_chat_banner(ROOT_AGENT, &real_banner())
+        .unwrap();
     console.reset_chat(ROOT_AGENT).unwrap();
     console
         .write(
@@ -1401,26 +1401,23 @@ fn agent_layout_runtime_banner_updates_preserve_the_reading_anchor_and_full_buil
         .scrollback
         .scroll(ScrollAction::First);
     let beginning = frame_lines(&console).join("\n");
-    assert_eq!(
-        beginning.matches("Agent v0.2.12+bbbbbbbbbbbbbbbb").count(),
-        1,
-        "{beginning}"
-    );
+    assert_eq!(beginning.matches("Daemon: v").count(), 1, "{beginning}");
+    assert!(title_line(&console).ends_with(" (Daemon: v0.2.12+bbbbbbbbbbbbbbbb)"));
     assert!(!beginning.contains("aaaaaaaaaaaaaaaa") && !beginning.contains("pending"));
 }
 
 #[test]
-fn agent_layout_runtime_version_follows_the_complete_real_startup_banner() {
-    let config = tickloop_harness::test_support::config();
-    let banner = super::super::startup_banner_spans(
-        &config,
-        std::path::Path::new("/fixture/runtime-banner"),
-    );
+fn agent_layout_runtime_version_follows_the_title_and_keeps_the_banner_rows() {
+    let banner = real_banner();
     let banner_text = banner
         .iter()
         .map(|(text, _)| text.as_str())
         .collect::<String>();
     let banner_rows = banner_text.lines().map(str::trim_end).collect::<Vec<_>>();
+    let title_row = banner_rows
+        .iter()
+        .position(|row| row.contains("Tickloop v"))
+        .unwrap();
     for created in [false, true] {
         let mut state = State::new(true, 100, 32);
         state.prompt_enabled = true;
@@ -1443,20 +1440,27 @@ fn agent_layout_runtime_version_follows_the_complete_real_startup_banner() {
                 .iter()
                 .position(|line| line.trim_end() == banner_rows[0])
                 .unwrap();
+            let mut expected = banner_rows
+                .iter()
+                .map(|row| (*row).to_owned())
+                .collect::<Vec<_>>();
+            expected[title_row] = format!(
+                "{} (Daemon: v{build}, upgrade pending)",
+                banner_rows[title_row]
+            );
             assert_eq!(
                 frame[start..start + banner_rows.len()]
                     .iter()
-                    .map(|line| line.trim_end())
+                    .map(|line| line.trim_end().to_owned())
                     .collect::<Vec<_>>(),
-                banner_rows,
-                "the full logo and adjacent View/model/directory rows remain consecutive: {frame:#?}"
+                expected,
+                "the logo and banner rows stay together, the build after the title: {frame:#?}"
             );
             assert_eq!(
-                frame[start + banner_rows.len()].trim(),
-                format!("Agent v{build} · pending")
-            );
-            assert_eq!(
-                frame.iter().filter(|line| line.contains("Agent v")).count(),
+                frame
+                    .iter()
+                    .filter(|line| line.contains("Daemon: v"))
+                    .count(),
                 1
             );
         }
@@ -1464,7 +1468,7 @@ fn agent_layout_runtime_version_follows_the_complete_real_startup_banner() {
         assert!(
             !frame_lines(&console)
                 .iter()
-                .any(|line| line.contains("Agent v"))
+                .any(|line| line.contains("Daemon: v"))
         );
     }
 }

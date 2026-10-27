@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness::protocol::{
     AgentHostOptions, ChatId, Content, ExecutionMode, FamilyCompletion, LoopState, PromptPolicy,
-    QuestionAnswer, QuestionRequest, Role, SearchConfig, SearchProviderKind,
+    QuestionAnswer, QuestionRequest, SearchConfig, SearchProviderKind,
     SubagentNotificationDelivery,
 };
 use tickloop_harness::runtime::transcript::{
@@ -130,7 +130,7 @@ fn task_of(request: &ModelRequest) -> Option<String> {
     let first = request
         .messages
         .iter()
-        .find(|message| message.role != Role::System)?;
+        .find(|message| tickloop_harness::test_support::is_conversation(message))?;
     let Content::Text { text } = first.content.first()? else {
         return None;
     };

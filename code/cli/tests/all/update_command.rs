@@ -34,7 +34,6 @@ fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
     for arguments in [
         vec!["update", "--unknown"],
         vec!["update", "--check"],
-        vec!["update", "--background-startup"],
         vec!["update", "--background"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))

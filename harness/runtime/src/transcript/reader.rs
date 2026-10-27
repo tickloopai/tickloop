@@ -636,6 +636,7 @@ mod tests {
             is_meta: false,
             host_tools: None,
             plan_mode_exit: false,
+            date_change: None,
             guidance: None,
             execution_mode: None,
             is_inherited_prompt: false,

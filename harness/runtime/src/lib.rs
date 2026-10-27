@@ -78,6 +78,7 @@ mod feedback_inbox;
 #[cfg(test)]
 mod file_read_tests;
 mod input_context;
+mod instruction_context;
 mod interaction;
 mod monitor_members;
 mod nested_calls;
@@ -129,7 +130,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -449,6 +450,16 @@ struct ChatBookkeeping {
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
 }
 
+/// What a Subagent's Chat takes from its parent's.
+struct InheritedChat {
+    metadata: DelegationMetadata,
+    parent: ChatSnapshot,
+    client: Arc<dyn ModelClient>,
+    output_style: OutputStyle,
+    user_context: OnceLock<String>,
+    announced_date: Option<String>,
+}
+
 #[derive(Clone)]
 struct Chat {
     /// How this Chat's Loop writes ids into model text and resolves the ids the model passes
@@ -505,6 +516,12 @@ struct Chat {
     user_cancelled_runs: HashSet<RunId>,
     /// Loaded when the Chat opens in this process and unaffected by later settings changes.
     output_style: OutputStyle,
+    /// Claude Code's user context: the instruction files and the date, read at the first
+    /// conversation request and kept until compaction or until the Chat loads again.
+    user_context: OnceLock<String>,
+    /// The date the model was last told, by the user context or a date change note; `None` until
+    /// the user context is read.
+    announced_date: Option<String>,
     /// Claude Code-style Auto classifier denial counts for this in-process Chat.
     auto_denials: auto_mode::DenialTracking,
     denial_window: denials::DenialWindow,
@@ -2181,12 +2198,7 @@ impl Agent {
         &self,
         id: ChatId,
         folder: Option<PathBuf>,
-        inherited: Option<(
-            DelegationMetadata,
-            ChatSnapshot,
-            Arc<dyn ModelClient>,
-            OutputStyle,
-        )>,
+        inherited: Option<InheritedChat>,
     ) -> Result<ChatId, AgentError> {
         let _upgrade = self.inner.upgrade_gate.read().await;
         let folder = self.admit_folder(folder)?;
@@ -2205,22 +2217,30 @@ impl Agent {
             ..Default::default()
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style) =
-            if let Some((metadata, parent, client, output_style)) = inherited {
-                snapshot.model = parent.model;
-                snapshot.reasoning_effort = parent.reasoning_effort;
-                snapshot.thinking_enabled = parent.thinking_enabled;
-                snapshot.search_config = parent.search_config;
-                snapshot.task_tools_enabled = parent.task_tools_enabled;
-                snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
-                let mut metadata = metadata;
-                self.apply_host_rules(&mut metadata.ceiling.policy);
-                snapshot.policy = metadata.ceiling.policy.clone();
-                snapshot.delegation = Some(metadata);
-                (client, output_style)
-            } else {
-                self.apply_chat_defaults(&mut snapshot, &mut bookkeeping)
-            };
+        let (client, output_style, user_context, announced_date) = if let Some(InheritedChat {
+            metadata,
+            parent,
+            client,
+            output_style,
+            user_context,
+            announced_date,
+        }) = inherited
+        {
+            snapshot.model = parent.model;
+            snapshot.reasoning_effort = parent.reasoning_effort;
+            snapshot.thinking_enabled = parent.thinking_enabled;
+            snapshot.search_config = parent.search_config;
+            snapshot.task_tools_enabled = parent.task_tools_enabled;
+            snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
+            let mut metadata = metadata;
+            self.apply_host_rules(&mut metadata.ceiling.policy);
+            snapshot.policy = metadata.ceiling.policy.clone();
+            snapshot.delegation = Some(metadata);
+            (client, output_style, user_context, announced_date)
+        } else {
+            let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+            (client, output_style, OnceLock::new(), None)
+        };
         if let SearchDefaults::Fixed(config) = &self.inner.search {
             snapshot.search_config = config.clone();
         }
@@ -2289,6 +2309,8 @@ impl Agent {
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
+                user_context,
+                announced_date,
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
                 branch_reservation: None,
@@ -3054,6 +3076,8 @@ impl Agent {
         )
         .await?;
         let family_roster = self.family_agents(receipt.chat_id).await?;
+        let user_context = self.user_context(receipt.chat_id).await?;
+        Box::pin(self.announce_date_change(receipt)).await?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -3141,6 +3165,8 @@ impl Agent {
                     }],
                 },
             );
+            request.history_sources.insert(1, None);
+            request.messages.insert(1, user_context);
         }
         let client = self
             .inner

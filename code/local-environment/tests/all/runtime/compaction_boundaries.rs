@@ -141,7 +141,7 @@ fn conversation(request: &ModelRequest) -> Vec<Message> {
     request
         .messages
         .iter()
-        .filter(|message| message.role != Role::System)
+        .filter(|message| tickloop_harness::test_support::is_conversation(message))
         .cloned()
         .collect()
 }
