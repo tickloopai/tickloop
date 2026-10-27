@@ -1,10 +1,10 @@
 use super::{
     ModelDelta, ModelError, ModelOutput, ModelRequest, ModelResponseRejection,
-    image_outside_user_message, invalid_response, observe_usage, required_string,
-    stream_provider_error, validate_reasoning_effort,
+    image_outside_user_message, invalid_response, native_tool_search, observe_usage,
+    required_string, stream_provider_error, validate_reasoning_effort,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tickloop_harness_protocol::{
     Content, ModelConfig, Protocol, ReasoningEffort, Role, ToolResultBlock, ToolResultContent,
     Usage,
@@ -19,6 +19,8 @@ pub(super) fn encode_request(
 ) -> Result<Value, ModelError> {
     validate_reasoning_effort(config, request.reasoning_effort)?;
     let reasoning_effort = request.reasoning_effort;
+    let offers_search = !request.deferred_tools.is_empty();
+    let mut namespaces = HashMap::new();
     let mut input = Vec::new();
     for message in request.messages {
         let has_image = message
@@ -38,6 +40,31 @@ pub(super) fn encode_request(
                     value,
                 } if value["type"] == ASSISTANT_PHASE_TYPE && message.role == Role::Assistant => {
                     assistant_phase = Some(required_string(&value, "phase")?.to_owned());
+                }
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value,
+                } if native_tool_search::is_record(Protocol::Responses, &value) => {
+                    push_user_parts(&mut input, &mut user_parts);
+                    if value["type"] == native_tool_search::RESPONSES_CALL_NAMESPACE {
+                        if offers_search {
+                            namespaces.insert(
+                                required_string(&value, "call_id")?.to_owned(),
+                                value["namespace"].clone(),
+                            );
+                        }
+                    } else if offers_search {
+                        input.push(value);
+                    } else if let Some(text) = native_tool_search::readable_text(&value) {
+                        input.push(assistant_text_item(text, None));
+                    }
+                }
+                Content::ToolUse { ref id, .. } if namespaces.contains_key(id) => {
+                    push_user_parts(&mut input, &mut user_parts);
+                    let namespace = namespaces.remove(id);
+                    let mut call = input_item(message.role, content)?;
+                    call["namespace"] = namespace.unwrap_or_default();
+                    input.push(call);
                 }
                 Content::Text { text } if message.role == Role::Assistant => {
                     input.push(assistant_text_item(text, assistant_phase.take()));
@@ -70,8 +97,8 @@ pub(super) fn encode_request(
             _ => effort.label(),
         }});
     }
-    if !request.tools.is_empty() {
-        body["tools"] = json!(request.tools.into_iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>());
+    if !request.tools.is_empty() || offers_search {
+        body["tools"] = native_tool_search::responses_tools(request.tools, request.deferred_tools);
     }
     if let Some(format) = request.structured_output {
         body["text"] = json!({
@@ -528,6 +555,14 @@ impl ResponsesStream {
                             protocol: Protocol::Responses,
                             value: item.clone(),
                         }),
+                        "tool_search_call" | "tool_search_output"
+                            if item["execution"] == "server" =>
+                        {
+                            content.push(Content::ProtocolData {
+                                protocol: Protocol::Responses,
+                                value: item.clone(),
+                            })
+                        }
                         "function_call" => {
                             let invalid_call = || {
                                 ModelError::ResponseRejected(
@@ -554,6 +589,12 @@ impl ResponsesStream {
                             .map_err(|_| invalid_call())?;
                             if !input.is_object() {
                                 return Err(invalid_call());
+                            }
+                            if let Some(namespace) = item["namespace"].as_str() {
+                                content.push(Content::ProtocolData {
+                                    protocol: Protocol::Responses,
+                                    value: json!({"type":native_tool_search::RESPONSES_CALL_NAMESPACE,"call_id":model_id,"namespace":namespace}),
+                                });
                             }
                             content.push(Content::ToolUse {
                                 id: model_id,

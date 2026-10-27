@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 fn request(effort: Option<ReasoningEffort>) -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![None],
         messages: vec![Message {
             role: Role::User,

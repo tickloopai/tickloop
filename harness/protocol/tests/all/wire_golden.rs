@@ -101,6 +101,7 @@ fn model_config() -> ModelConfig {
             input_modalities: vec![InputModality::Text, InputModality::Image],
             temperature_control: None,
             thinking_off: None,
+            native_tool_search: None,
             thinking_budgets: Some(ThinkingBudgets {
                 low: 2048,
                 medium: 8192,

@@ -92,6 +92,7 @@ fn request(
     history_sources: Vec<Option<PrivateHistorySource>>,
 ) -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources,
         messages,
         tools: Vec::new(),

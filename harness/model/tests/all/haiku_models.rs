@@ -62,6 +62,7 @@ fn reply(blocks: Vec<Value>, stop: &str) -> String {
 
 fn request(effort: Option<ReasoningEffort>) -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         messages: vec![Message {
             role: Role::User,
             content: vec![Content::Text {

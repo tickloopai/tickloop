@@ -1,0 +1,151 @@
+//! The records vendor tool search leaves in history and how each request replays them.
+//!
+//! The same model gets its own records back verbatim while its request still offers the search;
+//! any other request reads them as plain text, so a conversation continues across models.
+
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use tickloop_harness_protocol::{Content, ModelConfig, NativeToolSearch, Protocol, ToolDefinition};
+
+use crate::ModelError;
+
+pub(crate) const MESSAGES_SEARCH_TOOL: &str = "tool_search_tool_bm25";
+const MESSAGES_SEARCH_TOOL_TYPE: &str = "tool_search_tool_bm25_20251119";
+const MESSAGES_SEARCH_CALL: &str = "server_tool_use";
+const MESSAGES_SEARCH_RESULT: &str = "tool_search_tool_result";
+const RESPONSES_SEARCH_CALL: &str = "tool_search_call";
+const RESPONSES_SEARCH_OUTPUT: &str = "tool_search_output";
+/// Responses loads each found function into a namespace its later calls must name again.
+pub(crate) const RESPONSES_CALL_NAMESPACE: &str = "_tickloop_function_namespace";
+
+/// The native tool search the model's card offers on the adapter it is used with.
+pub fn offered(config: &ModelConfig) -> Option<NativeToolSearch> {
+    crate::cards::model_card(config)
+        .and_then(|card| card.native_tool_search.flatten())
+        .filter(|search| search.adapter() == config.adapter())
+}
+
+pub(crate) fn check_request(
+    config: &ModelConfig,
+    request: &crate::ModelRequest,
+) -> Result<(), ModelError> {
+    if request.deferred_tools.is_empty() || offered(config).is_some() {
+        Ok(())
+    } else {
+        Err(ModelError::Configuration(
+            "this model offers no native tool search for deferred tools".into(),
+        ))
+    }
+}
+
+pub(crate) fn is_record(protocol: Protocol, value: &Value) -> bool {
+    match protocol {
+        Protocol::Messages => matches!(
+            value["type"].as_str(),
+            Some(MESSAGES_SEARCH_CALL | MESSAGES_SEARCH_RESULT)
+        ),
+        Protocol::Responses => matches!(
+            value["type"].as_str(),
+            Some(RESPONSES_SEARCH_CALL | RESPONSES_SEARCH_OUTPUT | RESPONSES_CALL_NAMESPACE)
+        ),
+        _ => false,
+    }
+}
+
+/// What a record says, for a model that cannot replay it; namespaces say nothing.
+pub(crate) fn readable_text(value: &Value) -> Option<String> {
+    let found = |names: Vec<&str>| {
+        if names.is_empty() {
+            "Tool search found no tools.".to_owned()
+        } else {
+            format!("Tool search found: {}.", names.join(", "))
+        }
+    };
+    match value["type"].as_str()? {
+        MESSAGES_SEARCH_CALL => Some(format!(
+            "Searched tools for {}.",
+            value["input"]["query"].as_str().map_or_else(
+                || value["input"].to_string(),
+                |query| format!("\"{query}\"")
+            )
+        )),
+        MESSAGES_SEARCH_RESULT => Some(match value["content"]["error_code"].as_str() {
+            Some(code) => format!("Tool search failed: {code}."),
+            None => found(
+                value["content"]["tool_references"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|reference| reference["tool_name"].as_str())
+                    .collect(),
+            ),
+        }),
+        RESPONSES_SEARCH_CALL => Some(format!("Searched tools for {}.", value["arguments"])),
+        RESPONSES_SEARCH_OUTPUT => Some(found(
+            value["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn as_text(value: &Value) -> Vec<Content> {
+    readable_text(value)
+        .map(|text| Content::Text { text })
+        .into_iter()
+        .collect()
+}
+
+pub(crate) fn messages_tools(tools: &[ToolDefinition], deferred: &[ToolDefinition]) -> Value {
+    let definition = |tool: &ToolDefinition| json!({"name": tool.name, "description": tool.description, "input_schema": tool.input_schema});
+    let mut encoded: Vec<_> = tools.iter().map(definition).collect();
+    if !deferred.is_empty() {
+        encoded.push(json!({"type": MESSAGES_SEARCH_TOOL_TYPE, "name": MESSAGES_SEARCH_TOOL}));
+        encoded.extend(deferred.iter().map(|tool| {
+            let mut tool = definition(tool);
+            tool["defer_loading"] = json!(true);
+            tool
+        }));
+    }
+    json!(encoded)
+}
+
+/// A replayed search may name a tool the request no longer offers, which Messages refuses.
+pub(crate) fn messages_replay(mut value: Value, deferred: &[ToolDefinition]) -> Value {
+    let offered: BTreeSet<_> = deferred.iter().map(|tool| tool.name.as_str()).collect();
+    if let Some(references) = value
+        .pointer_mut("/content/tool_references")
+        .and_then(Value::as_array_mut)
+    {
+        references.retain(|reference| {
+            reference["tool_name"]
+                .as_str()
+                .is_some_and(|name| offered.contains(name))
+        });
+    }
+    value
+}
+
+pub(crate) fn responses_tools(tools: Vec<ToolDefinition>, deferred: Vec<ToolDefinition>) -> Value {
+    let function = |tool: ToolDefinition, deferred: bool| {
+        let mut function = json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema});
+        if deferred {
+            function["defer_loading"] = json!(true);
+        }
+        function
+    };
+    let has_deferred = !deferred.is_empty();
+    let mut encoded: Vec<_> = tools
+        .into_iter()
+        .map(|tool| function(tool, false))
+        .collect();
+    if has_deferred {
+        encoded.push(json!({"type": "tool_search"}));
+        encoded.extend(deferred.into_iter().map(|tool| function(tool, true)));
+    }
+    json!(encoded)
+}

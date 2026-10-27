@@ -33,6 +33,7 @@ models:
   - id: "gpt-6-astra"
     display_name: "GPT-6 Astra"
     adapter: "responses"
+    native_tool_search: "openai"
     max_output_tokens: 128000
     context_window_tokens: 1050000
     thinking: "always_on"
@@ -41,6 +42,7 @@ models:
   - id: "gpt-6.1-sol"
     display_name: "GPT-6.1 Sol"
     adapter: "responses"
+    native_tool_search: "openai"
     max_output_tokens: 128000
     context_window_tokens: 1050000
     thinking: "always_on"
@@ -49,6 +51,7 @@ models:
   - id: "gpt-5.6-terra"
     display_name: "GPT-5.6 Terra"
     adapter: "responses"
+    native_tool_search: "openai"
     max_output_tokens: 128000
     context_window_tokens: 1050000
     thinking: "toggle"
@@ -57,6 +60,7 @@ models:
   - id: "gpt-6-luna"
     display_name: "GPT-6 Luna"
     adapter: "responses"
+    native_tool_search: "openai"
     max_output_tokens: 128000
     context_window_tokens: 1050000
     thinking: "toggle"

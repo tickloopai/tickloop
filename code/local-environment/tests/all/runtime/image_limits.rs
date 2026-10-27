@@ -203,6 +203,7 @@ fn image(index: usize) -> Content {
 
 fn request_with_images(count: usize) -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: (0..count)
             .map(|index| Message {
@@ -442,6 +443,7 @@ async fn a_failed_retry_reports_the_normal_error_without_retrying_again() {
 #[tokio::test]
 async fn other_rejections_and_requests_without_images_are_not_retried() {
     let text_only = ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,

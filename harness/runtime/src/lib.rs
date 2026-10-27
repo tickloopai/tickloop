@@ -3770,6 +3770,7 @@ impl Agent {
         let (messages, history_sources) =
             context::model_history(chat).map_err(|error| error.to_string())?;
         Ok(ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources,
             messages,
             tools: self.tool_definitions(chat),
@@ -4445,6 +4446,7 @@ impl Agent {
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources,
                 messages,
                 tools: self.tool_definitions(&candidate),

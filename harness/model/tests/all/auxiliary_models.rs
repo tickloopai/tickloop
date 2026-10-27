@@ -165,6 +165,7 @@ async fn auxiliary_http_clients_share_credentials_and_transport_but_leave_chat_m
             let (events, _) = mpsc::unbounded_channel();
             fast.complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     messages: vec![Message {
                         role: Role::User,
                         content: vec![Content::Text {
@@ -193,6 +194,7 @@ async fn auxiliary_http_clients_share_credentials_and_transport_but_leave_chat_m
         client
             .complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     messages: vec![Message {
                         role: Role::User,
                         content: vec![Content::Text {

@@ -134,6 +134,7 @@ fn stream(output: Vec<Value>) -> String {
 
 fn request() -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         messages: vec![Message {
             role: Role::User,
             content: vec![

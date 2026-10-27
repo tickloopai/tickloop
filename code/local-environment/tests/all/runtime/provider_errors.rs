@@ -25,6 +25,7 @@ async fn failure(
     client
         .complete(
             ModelRequest {
+                deferred_tools: Vec::new(),
                 history_sources: vec![],
                 messages: vec![],
                 tools: vec![],
@@ -63,6 +64,7 @@ async fn kimi_monthly_limit_explains_the_account_problem() {
         let error = client
             .complete(
                 ModelRequest {
+                    deferred_tools: Vec::new(),
                     history_sources: vec![],
                     messages: vec![],
                     tools: vec![],
@@ -253,6 +255,7 @@ async fn rate_limit_preserves_retry_after_and_billing_ignores_server_retry_true(
 
 fn request() -> ModelRequest {
     ModelRequest {
+        deferred_tools: Vec::new(),
         history_sources: vec![],
         messages: vec![],
         tools: vec![],

@@ -224,6 +224,7 @@ mod tests {
         // A receipt for another Loop breaks the one-Loop invariant inside completion, after
         // execution has ended.
         let request = ModelRequest {
+            deferred_tools: Vec::new(),
             history_sources: vec![],
             messages: vec![],
             tools: vec![],
