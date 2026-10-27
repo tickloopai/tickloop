@@ -56,6 +56,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/resume`、`/clear` | 重新打开以前的对话；开始新对话 |
 | `/permissions`、`/settings` | 设置 Agent 可以自行做多少事；其他偏好 |
 | `/ticks`、`/plugins` | 安装并登录 Tick；管理其他插件 |
+| `/mcp` | 查看 MCP 服务，管理登录及当前目录的启用状态 |
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 
@@ -142,23 +143,55 @@ tickloop plugin install --path ./my-plugin
 
 输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目以及已启用插件和 Tick 的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
 
-已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装不运行程序，也不增加权限；插件 Skill 的工具调用照常审批。本版本支持 Skill、Tick 程序、MCP 服务和插件用户配置，其余组件列为暂不支持；npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
+已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装放置文件；已启用的 MCP 服务随 Agent 启动，或从下一次请求起运行。插件 Skill 和 MCP 工具的调用照常审批。本版本支持 Skill、Tick 程序、MCP 服务和插件用户配置，其余组件列为暂不支持；npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
+
+### MCP 服务
 
 已启用插件可在 `.mcp.json` 中声明 MCP 服务（服务映射或带 `mcpServers` 外层），也可在清单的 `mcpServers` 中使用对象、相对路径或数组。支持 stdio 与 streamable HTTP，工具名为 `mcp__plugin_<插件>_<服务>__<工具>`；名称各部分的连续下划线合并为一个；过长或碰撞的工具名补哈希并保留服务／工具分隔符，规范化后同名的插件服务会跳过并警告。`validate`、安装与启用会列出命令、地址及缺少的配置。启用即同意从下一次 Agent 请求起以用户身份运行服务；禁用或卸载后从下一次请求起停止，工具调用仍按用户权限审批。
 
 你自己的 MCP 服务写在 `settings.json` 的 `mcpServers` 中（所有目录生效），或 `projects[<目录>].mcpServers` 中（只对该目录生效）；`tickloop-artifacts` 和以 `plugin_` 开头的名字保留，用户服务名包含 `__` 时拒绝并提示。`tickloop mcp add <名> <URL> [--header 'Name: value']...` 添加远程服务，`tickloop mcp add <名> [--env NAME=value]... -- <命令> [参数...]` 添加本地服务；默认写入全局设置，加 `--dir` 写入当前目录。`tickloop mcp remove <名> [--dir]` 删除服务。`tickloop mcp list` 按来源列出在当前目录启动的 Agent 会有的全部服务，及其连接方式、暴露方式、是否在此停用、是否已登录，不启动任何服务。
 
-MCP 工具默认采用 `exposure: "search"`：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
+例如，将下面内容合入配置目录中的 `settings.json`，把命令和 URL 换成你的服务：
 
-本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。`store(key, value)` 与 `load(key)` 在同一对话的后续脚本之间保留小量 JSON 值（如分页游标）；只有脚本成功时保存，Rewind 后或在 Branch 中，脚本只看到自己路径上保存的值。脚本运行中 Agent 进程退出时不会重跑：载入的历史列出脚本里每次调用的结局。对话中脚本内的每次调用显示在它的 Codemode 调用之下，ctrl+o 可查看整段脚本。
+```json
+{
+  "mcpServers": {
+    "local": {
+      "type": "stdio",
+      "command": "my-mcp-server",
+      "args": []
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp"
+    }
+  }
+}
+```
 
-`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。在 `/mcp` 中登录时显示链接，本机时打开浏览器；浏览器在其他机器上时，把跳转后的地址粘贴到输入框；Esc 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
+目录配置覆盖同名全局服务。用户服务名可用字母、数字、`_` 和 `-`；仓库中的 `.mcp.json` 不会自动加载。远程地址要求 HTTPS，仅本机回环地址允许 HTTP；旧式 SSE 与 WebSocket 列为暂不支持。可选 `timeout` 是单次工具调用上限，单位毫秒，默认 300000，小于 1000 的值忽略。每个根 Agent 分别运行服务，子 Agent 共用；MCP 服务不是 Tick，不出现在 Monitor 中。
+
+第三方工具默认逐次询问，包括 Auto 模式，服务自称只读也不例外。确认时可只允许一次、在当前目录总是允许该工具或整个服务，或拒绝。Plan 模式不执行它们；Full Access 与显式权限规则保持原有含义。调用发出后超时、取消或断线，可能无法确定是否已执行，重试修改前应先核实结果。资源与 Artifacts 共用 `ListMcpResourcesTool` 和 `ReadMcpResourceTool`。
+
+### Tool Search 与 Codemode
+
+MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 时，模型用自身搜索找到工具后直接调用；其他模型采用 Fold：通过 `SearchTools` 搜索、`DescribeTools` 查看完整参数，再用 `ExecuteTools` 并发执行 1–10 个独立调用，每次调用分别审批。切换模型时自动选择可用方式。设为 `direct` 可直接列入模型工具列表，`hidden` 则不可调用。`toolExposure` 按工具原名覆盖：精确名优先，其次取按声明顺序第一个匹配的 `*` 通配模式。服务变化以新上下文消息追加，Fold 工具定义保持不变。
+
+本机宿主的 `Codemode` 通过 `code` 字段接收 async JavaScript 函数体。脚本用 `tools.<名>(参数)` 调用工具，经 `text()`、`image()` 或 `return` 返回筛选后的结果。沙箱不能直接访问文件、网络或定时器；每次工具调用沿用普通审批，人工确认期间暂停脚本计时，Auto 拒绝则结束脚本。`exposure: "codemode"` 使 MCP 工具只能从脚本调用；不支持脚本的宿主将其按 `search` 处理。可选首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 300000}` 设置输出上限和有效运行时限，超长输出保留首尾，全文保存到 Family 临时目录。`store(key, value)` 与 `load(key)` 在同一对话的后续脚本之间保留小量 JSON 值（如分页游标）；只有脚本成功时保存，各 Branch 的值独立。Rewind 恢复所选路径上的值，但压缩保留了对话前缀后，再 Rewind 到该前缀内，仍可能看到压缩时保存的较晚值。`store(key, undefined)` 删除值，`load(key)` 返回副本或 `undefined`。单个 JSON 值最多 262144 个 UTF-16 字符，键和值合计最多 1048576 个，最多 4096 个键。脚本运行中 Agent 进程退出时不会重跑：载入的历史列出脚本里每次调用的结局。对话中脚本内的每次调用显示在它的 Codemode 调用之下，ctrl+o 可查看整段脚本。
+
+### 管理服务与登录
+
+`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连，以及在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`）。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。
 
 登录从下一次 Agent 请求起生效，令牌自动续期。`tickloop mcp logout <服务>` 在服务器支持时撤销令牌，并删除本地令牌、保留客户端注册。凭据只保存在本机私有的 `credentials/_mcp/` 或 `credentials/<插件>/mcp/` 目录中；服务地址变化后不使用旧令牌。配置固定 `Authorization` header 的服务不走 OAuth。远程服务支持 `oauth.clientId`、`oauth.callbackPort` 和 `authServerMetadataUrl`（也接受放在 `oauth` 内）。
 
-插件可声明 `userConfig`（字符串、数字、布尔、目录或文件）。安装、启用时在终端询问尚未填写的项；无终端时提示运行 `tickloop plugin configure NAME`。此命令与 `/plugins` 的 Configure 操作均可重新配置。敏感输入不回显或以 `*` 遮掩，保存到仅当前用户可读写的 `credentials/NAME/user-config.json`；其他值保存在 `settings.json` 的 `plugins.NAME.options`。卸载保留这两类配置。MCP 配置使用实际值；Skill 使用非敏感值，敏感值替换为占位文字。修改从下一次请求起生效。
+服务配置中的 `${VAR}`、`${VAR:-默认值}` 使用 Agent 的启动环境；缺变量且无默认值时，该服务不启动。`/mcp` 与 CLI 登录使用各自进程的环境。如果 URL 变量与 Agent 启动时的值不同，登录会保存到另一个地址，Agent 无法使用；请让两个终端使用相同的值。模型会请用户添加、配置或登录服务，不会自行执行这些操作。
+
+### 插件用户配置
+
+插件可声明 `userConfig`（字符串、数字、布尔、目录或文件）。安装、启用时在终端询问尚未填写的项；无终端时提示运行 `tickloop plugin configure NAME`。此命令与 `/plugins` 的 Configure 操作均可重新配置。敏感输入不回显或以 `*` 遮掩，`Ctrl+G` 不打开外部编辑器；值保存到仅当前用户可读写的 `credentials/NAME/user-config.json`；其他值保存在 `settings.json` 的 `plugins.NAME.options`。卸载保留这两类配置。MCP 配置使用实际值；Skill 使用非敏感值，敏感值替换为占位文字。修改从下一次请求起生效。
 
 命令和参数或 URL 相同时，优先保留用户自己配置的服务；插件之间按插件名排序，保留在前者，并提示跳过的重复项。连接时替换插件根和数据目录变量（`${TICKLOOP_PLUGIN_ROOT}`、`${TICKLOOP_PLUGIN_DATA}` 及其 `CLAUDE_` 别名），以及启动环境中的 `${VAR}`、`${VAR:-默认值}`。引用了缺失的 `${user_config.*}` 值时，服务显示需要配置且不启动。HTTP 是否需要登录在连接时发现，静态验证不能确定。
 

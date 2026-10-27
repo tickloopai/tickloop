@@ -92,6 +92,14 @@ impl HostToolProvider for McpToolProvider {
             .collect()
     }
 
+    fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
+        let validator =
+            jsonschema::validator_for(schema).map_err(|_| format!("invalid {name} schema"))?;
+        validator
+            .validate(input)
+            .map_err(|_| format!("invalid {name} input"))
+    }
+
     fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
         HostToolPermission::ThirdParty
     }

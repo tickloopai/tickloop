@@ -2804,7 +2804,7 @@ fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[
     assert_eq!(reference.len(), 1);
     assert_eq!(reference[0]["type"], "text");
     assert!(reference[0]["text"].as_str().unwrap().starts_with(
-        "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop Ticks\n"
+        "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop tools and Ticks\n"
     ));
     let conversation = messages
         .iter()
