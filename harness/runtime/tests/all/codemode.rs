@@ -1205,7 +1205,7 @@ async fn auto_reviews_script_mcp_calls_against_the_script_and_earlier_redacted_r
         result.content
     );
     assert!(!result.content.contains("SCRIPT_FINISHED"));
-    let reviews = reviewer.requests.lock().unwrap();
+    let reviews = reviewer.requests.lock().unwrap().clone();
     assert_eq!(reviews.len(), 3);
     let first = serde_json::to_string(&reviews[0].messages).unwrap();
     assert!(first.contains("Model-authored nested calls"));
@@ -1223,6 +1223,5 @@ async fn auto_reviews_script_mcp_calls_against_the_script_and_earlier_redacted_r
         .map(|review| serde_json::to_string(&review.messages).unwrap())
         .collect::<String>();
     assert!(!every_review.contains("SENSITIVE_FIXTURE"));
-    drop(reviews);
     agent.shutdown().await;
 }

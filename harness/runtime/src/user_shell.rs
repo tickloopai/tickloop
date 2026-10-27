@@ -505,8 +505,10 @@ impl Agent {
                 (authority, evaluation)
             };
             let mut policy_revision = authority.policy_revision;
-            let decision = self
-                .apply_prompt_policy_with_explicit_ask(authority.decision, authority.explicit_ask);
+            let decision = self.apply_prompt_policy_keeping_required_approval(
+                authority.decision,
+                authority.explicit_ask,
+            );
             if decision == Decision::Deny {
                 return Err(AgentError::Invalid(
                     "delegated permission authority denies this Shell".into(),

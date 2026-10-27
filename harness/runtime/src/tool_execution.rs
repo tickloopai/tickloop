@@ -1491,7 +1491,7 @@ impl Agent {
             };
             let prompts_unavailable = decision == Decision::Ask
                 && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
-            let mut decision = self.apply_prompt_policy_with_explicit_ask(
+            let mut decision = self.apply_prompt_policy_keeping_required_approval(
                 decision,
                 explicit_ask
                     || matches!(
@@ -2085,7 +2085,8 @@ impl Agent {
                     let bypassed_by_unrestricted_host = !explicit_ask
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision = self.apply_prompt_policy_with_explicit_ask(decision, explicit_ask);
+                    decision =
+                        self.apply_prompt_policy_keeping_required_approval(decision, explicit_ask);
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {

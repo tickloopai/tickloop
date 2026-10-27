@@ -480,8 +480,9 @@ struct Chat {
     /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
     /// plan, so the next request owes the model the exited-plan-mode notice.
     needs_plan_mode_exit_notice: bool,
-    /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from in this process. A load,
-    /// rewind or branch switch that changes the mode leaves it unknown.
+    /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
+    /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
+    /// it unknown.
     mode_before_plan: Option<ExecutionMode>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
@@ -760,7 +761,8 @@ fn host_tool_decision(
     has_human_input: bool,
 ) -> Decision {
     if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
-        // As in Claude Code, Plan decides third-party calls as the mode it was entered from.
+        // As in Claude Code, Plan decides third-party calls as the mode it was entered from; an
+        // unknown one is treated as Ask.
         let mode = match execution_mode {
             ExecutionMode::Plan => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
             mode => mode,
@@ -859,16 +861,25 @@ fn host_tool_decision(
     })
 }
 
+/// The mode Plan was entered from once the mode changes from `from` to `to`: known only while in
+/// Plan, and kept while Plan is entered again.
+fn mode_before_plan_after(
+    remembered: Option<ExecutionMode>,
+    from: ExecutionMode,
+    to: ExecutionMode,
+) -> Option<ExecutionMode> {
+    match (from, to) {
+        (_, ExecutionMode::AcceptEdits | ExecutionMode::Auto | ExecutionMode::FullAccess) => None,
+        (ExecutionMode::Plan, ExecutionMode::Plan) => remembered,
+        (from, ExecutionMode::Plan) => Some(from),
+    }
+}
+
 impl Chat {
     /// Changes the execution mode, remembering the mode Plan is entered from.
     fn change_execution_mode(&mut self, mode: ExecutionMode) {
-        self.mode_before_plan = match (self.snapshot.policy.mode, mode) {
-            (_, ExecutionMode::AcceptEdits | ExecutionMode::Auto | ExecutionMode::FullAccess) => {
-                None
-            }
-            (ExecutionMode::Plan, ExecutionMode::Plan) => self.mode_before_plan,
-            (current, ExecutionMode::Plan) => Some(current),
-        };
+        self.mode_before_plan =
+            mode_before_plan_after(self.mode_before_plan, self.snapshot.policy.mode, mode);
         self.snapshot.policy.mode = mode;
     }
 
@@ -2119,12 +2130,12 @@ impl Agent {
 
     /// `apply_prompt_policy`, except that an Unrestricted host cannot waive a person or a reviewer
     /// that an explicit Ask rule or the tool's own permission class requires.
-    fn apply_prompt_policy_with_explicit_ask(
+    fn apply_prompt_policy_keeping_required_approval(
         &self,
         decision: Decision,
-        is_explicit_ask: bool,
+        is_approval_required: bool,
     ) -> Decision {
-        if is_explicit_ask
+        if is_approval_required
             && matches!(decision, Decision::Ask | Decision::Check)
             && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
         {

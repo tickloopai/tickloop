@@ -909,7 +909,11 @@ impl Agent {
                             output_ref: None,
                         }));
                     }
-                    chat.mode_before_plan = Some(snapshot.policy.mode);
+                    chat.mode_before_plan = super::mode_before_plan_after(
+                        chat.mode_before_plan,
+                        snapshot.policy.mode,
+                        ExecutionMode::Plan,
+                    );
                     snapshot.policy.mode = ExecutionMode::Plan;
                     snapshot.policy.revision += 1;
                     (None, Some(prompts::entered_plan_mode()))

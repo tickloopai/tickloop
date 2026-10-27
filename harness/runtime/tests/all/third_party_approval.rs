@@ -894,7 +894,7 @@ async fn auto_review_decides_unruled_mcp_calls_and_escalates_repeated_rejections
         "the third rejection in a row goes to a person"
     );
     assert_eq!(server.calls().len(), 2);
-    let reviews = reviewer.requests.lock().unwrap();
+    let reviews = reviewer.requests.lock().unwrap().clone();
     assert_eq!(reviews.len(), 7);
     let first_review = serde_json::to_string(&reviews[0].messages).unwrap();
     assert!(first_review.contains(&tool));
@@ -905,7 +905,6 @@ async fn auto_review_decides_unruled_mcp_calls_and_escalates_repeated_rejections
         .map(|request| serde_json::to_string(&request.messages).unwrap())
         .collect::<String>();
     assert!(!every_request.contains(SECRET));
-    drop(reviews);
     agent.shutdown().await;
 }
 
@@ -1059,14 +1058,13 @@ async fn auto_reviews_each_batched_mcp_call_against_the_whole_model_authored_bat
             }
         }
         assert_eq!(server.calls().len(), if admitted { 2 } else { 0 });
-        let reviews = reviewer.requests.lock().unwrap();
+        let reviews = reviewer.requests.lock().unwrap().clone();
         assert!(!reviews.is_empty());
         for review in reviews.iter() {
             let review = serde_json::to_string(&review.messages).unwrap();
             assert!(review.contains("Model-authored nested calls"));
             assert!(review.contains("BATCH_FIRST") && review.contains("BATCH_SECOND"));
         }
-        drop(reviews);
         let last = serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages)
             .unwrap();
         assert_eq!(last.contains("external-code restriction"), !admitted);
@@ -1255,6 +1253,151 @@ async fn reentering_plan_forgets_the_mode_an_earlier_plan_was_entered_from() {
         }
     }
     assert!(asked, "Plan was last entered from Ask");
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
+}
+
+async fn run_until_idle(
+    agent: &Agent,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    root: tickloop_harness_protocol::ChatId,
+) -> Vec<String> {
+    let mut prompts = Vec::new();
+    loop {
+        let event = next_event(events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } => {
+                prompts.push(request.name.clone());
+                agent
+                    .answer_permission(event.chat_id, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::Completed { .. } if event.chat_id == root => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    prompts
+}
+
+#[tokio::test]
+async fn a_plan_entered_from_auto_returns_review_rejections_to_the_model() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("read", &tool, json!({})),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let reviewer = Arc::new(ScriptedModel::new(vec![
+        text(
+            &auto_classification(true).to_string()
+        );
+        2
+    ]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    assert!(run_until_idle(&agent, &mut events, chat).await.is_empty());
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 2);
+    assert!(server.calls().is_empty());
+    let last =
+        serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages).unwrap();
+    assert!(last.contains("external-code restriction"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("delegate", "Subagent", json!({"task":"Look it up"})),
+        call("read", &tool, json!({})),
+        text("child done"),
+        text("parent done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    // Creating the child in Plan is itself reviewed.
+    let reviewer = Arc::new(ScriptedModel::new(vec![text(
+        &auto_classification(false).to_string(),
+    )]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = agent.create_chat(dir.path().into()).await.unwrap();
+    for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
+        agent.set_execution_mode(parent, mode).await.unwrap();
+    }
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, "Delegate the lookup".into())
+        .await
+        .unwrap();
+    let prompts = run_until_idle(&agent, &mut events, parent).await;
+    assert_eq!(
+        prompts,
+        [tool.as_str()],
+        "the frozen ceiling does not record the earlier mode"
+    );
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(server.calls().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn rewinding_into_plan_leaves_the_earlier_mode_unknown() {
+    use tickloop_harness_protocol::RewindMode;
+    let server = McpService::start().await;
+    let (provider, tool) = provider(&server, "review").await;
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            text("planned"),
+            text("ran"),
+            call("read", &tool, json!({})),
+            text("done"),
+        ])),
+    );
+    agent.install_host_tools(provider).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(dir.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    agent.submit(chat, "Plan".into()).await.unwrap();
+    run_until_idle(&agent, &mut events, chat).await;
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent.submit(chat, "Run".into()).await.unwrap();
+    run_until_idle(&agent, &mut events, chat).await;
+    let plan_prompt = agent.snapshot(chat).await.unwrap().rewind_points()[0].message_id;
+    agent
+        .rewind(chat, plan_prompt, RewindMode::Conversation)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    let prompts = run_until_idle(&agent, &mut events, chat).await;
+    assert_eq!(
+        prompts,
+        [tool.as_str()],
+        "Full Access before the rewind is not Plan's origin"
+    );
     assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
 }
