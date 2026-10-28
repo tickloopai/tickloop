@@ -15,6 +15,8 @@ pub(super) struct PreparedSandbox {
     pub policy: Option<SandboxPolicy>,
     pub isolation: ExecutionIsolation,
     pub warning: Option<String>,
+    pub requires_approval: bool,
+    pub escape_guidance: bool,
 }
 
 pub(super) async fn prepare(
@@ -28,6 +30,20 @@ pub(super) async fn prepare(
     if !config.enabled {
         return Ok(PreparedSandbox::default());
     }
+    if config.allow_unsandboxed_commands
+        && (spec.dangerously_disable_sandbox
+            || config.excluded_commands.iter().any(|pattern| {
+                tickloop_harness::tools::permissions::shell_command_matches_pattern(
+                    pattern,
+                    &spec.command,
+                )
+            }))
+    {
+        return Ok(PreparedSandbox {
+            requires_approval: true,
+            ..Default::default()
+        });
+    }
     if let Err(reason) = tickhost::sandbox::availability().await {
         if config.fail_if_unavailable {
             return Err(ExecutionError::new("SandboxUnavailable", reason));
@@ -37,6 +53,7 @@ pub(super) async fn prepare(
             ..Default::default()
         });
     }
+    let escape_guidance = config.allow_unsandboxed_commands;
     let settings = settings.clone();
     let spec = spec.clone();
     let policy = tokio::task::spawn_blocking(move || prepare_policy(&settings, &spec, &config))
@@ -49,6 +66,8 @@ pub(super) async fn prepare(
             network: NetworkIsolation::Disconnected,
         },
         warning: None,
+        requires_approval: false,
+        escape_guidance,
     })
 }
 
@@ -218,4 +237,27 @@ fn configuration_error(message: impl Into<String>) -> ExecutionError {
 }
 fn path_error(error: std::io::Error) -> ExecutionError {
     configuration_error(error.to_string())
+}
+
+/// Keep optional guidance in Code so a running 10.1 Tickhost receives its unchanged policy.
+pub(super) fn annotate_escape_guidance(output: &std::fs::File) {
+    use std::{io::Write, os::unix::fs::FileExt};
+    let Ok(length) = output.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    let note = tickhost::sandbox::DENIAL_NOTE;
+    let mut bytes = vec![0; length.min((note.len() + 2) as u64) as usize];
+    let offset = length.saturating_sub(bytes.len() as u64);
+    let Ok(read) = output.read_at(&mut bytes, offset) else {
+        return;
+    };
+    if String::from_utf8_lossy(&bytes[..read])
+        .trim_end()
+        .ends_with(note)
+    {
+        let _ = writeln!(
+            &mut &*output,
+            "可用 dangerouslyDisableSandbox: true 申请在沙箱外运行，仍须正常审批"
+        );
+    }
 }

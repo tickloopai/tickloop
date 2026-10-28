@@ -1,3 +1,6 @@
+mod command_selection;
+pub use command_selection::shell_command_matches_pattern;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -308,9 +311,11 @@ impl PermissionPolicyExt for PermissionPolicy {
         let is_accept_edits = self.mode == ExecutionMode::AcceptEdits;
         let decision = if safety_check.is_some() {
             Decision::Ask
-        } else if explicit == Some(ExplicitPermissionDecision::Allow)
-            || is_accept_edits && operation.is_allowed_in_accept_edits(workspace)
-        {
+        } else if explicit == Some(ExplicitPermissionDecision::Allow) {
+            Decision::Allow
+        } else if operation.requires_environment_approval() && self.mode != ExecutionMode::Plan {
+            Decision::Ask
+        } else if is_accept_edits && operation.is_allowed_in_accept_edits(workspace) {
             Decision::Allow
         } else if is_accept_edits && operation.accept_edits_supersedes_read_only() {
             Decision::Ask
@@ -331,7 +336,8 @@ impl PermissionPolicyExt for PermissionPolicy {
         let accept_edits_admits = operation.is_allowed_in_accept_edits(workspace)
             || operation.is_allowed_in_accept_edits_with_sibling_worktrees(workspace)
             || !operation.accept_edits_supersedes_read_only() && !operation.requires_permission;
-        let passes_fast_path = safety_check.is_none()
+        let passes_fast_path = !operation.requires_environment_approval()
+            && safety_check.is_none()
             && !content_rule_asks(self, &operation.name, &operation.input, loop_id)
             && accept_edits_admits;
         if passes_fast_path || AUTO_ALLOWLISTED_TOOLS.contains(&operation.name.as_str()) {
@@ -803,6 +809,10 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 }
 
 fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
+    split_shell_parts(command, false)
+}
+
+fn split_shell_parts(command: &str, allow_special_syntax: bool) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
     let mut commands = Vec::new();
     let mut start = 0;
@@ -831,8 +841,9 @@ fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
             continue;
         }
         if quote.is_none() {
-            if matches!(byte, b'`' | b'(' | b')' | b'{' | b'}' | b'<' | b'>')
-                || (byte == b'$' && bytes.get(index + 1) == Some(&b'('))
+            if !allow_special_syntax
+                && (matches!(byte, b'`' | b'(' | b')' | b'{' | b'}' | b'<' | b'>')
+                    || (byte == b'$' && bytes.get(index + 1) == Some(&b'(')))
             {
                 return None;
             }

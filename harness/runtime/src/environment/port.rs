@@ -281,6 +281,7 @@ pub struct OpenSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellSpec {
+    pub dangerously_disable_sandbox: bool,
     pub additional_directories: Vec<String>,
     pub family_temp: Option<String>,
     pub operation: Uuid,
@@ -417,6 +418,15 @@ impl PreparedExecution {
             lifetime: Arc::new(()),
             cleanup: None,
         }
+    }
+
+    pub fn with_required_approval(mut self, required: bool) -> Self {
+        self.facts.approval.requires_approval = required.then_some(true);
+        self
+    }
+
+    pub fn requires_approval(&self) -> bool {
+        self.facts.approval.requires_approval.unwrap_or(false)
     }
 
     pub fn with_isolation(mut self, isolation: ExecutionIsolation) -> Self {

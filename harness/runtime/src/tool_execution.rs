@@ -2235,11 +2235,13 @@ impl Agent {
                         deterministic_denial_reason =
                             Some(auto_mode::prompts_unavailable_message(&prepared.name));
                     }
-                    let bypassed_by_unrestricted_host = !explicit_ask
+                    let approval_required =
+                        explicit_ask || prepared.requires_environment_approval();
+                    let bypassed_by_unrestricted_host = !approval_required
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision =
-                        self.apply_prompt_policy_keeping_required_approval(decision, explicit_ask);
+                    decision = self
+                        .apply_prompt_policy_keeping_required_approval(decision, approval_required);
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
