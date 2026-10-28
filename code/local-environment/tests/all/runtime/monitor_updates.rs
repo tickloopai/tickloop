@@ -4,7 +4,6 @@
 
 use std::{sync::Arc, time::Duration};
 use tickloop_code_local_environment::AgentLocalExt;
-use tickloop_code_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -293,44 +292,6 @@ async fn every_successful_tick_tool_use_marks_the_instance_used_and_only_a_read_
         None,
         "closing an instance is not using it"
     );
-}
-
-#[tokio::test]
-async fn the_user_opening_a_row_handles_it_and_the_mark_survives_resume() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = directory.path().join("archive");
-    let instance: InstanceRef = "calendar:quotes".parse().unwrap();
-    let agent = Agent::open_embedded(
-        store.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(vec![text("ok")])),
-    )
-    .unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    // A Chat is saved once it has a conversation.
-    let mut events = agent.subscribe();
-    agent.submit(chat, "hello".into()).await.unwrap();
-    finish_run(&agent, chat, &mut events).await;
-    let membership = agent
-        .mark_monitor_handled(chat, instance.clone())
-        .await
-        .unwrap();
-    let handled = membership
-        .handled_at(&instance)
-        .expect("opening the row handles it");
-    assert_eq!(
-        membership.taken_in_at(&instance),
-        None,
-        "no turn took the updates in"
-    );
-    agent.shutdown().await;
-    drop(agent);
-
-    let restored =
-        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
-    let snapshot = restored.resume_chat(chat).await.unwrap();
-    assert_eq!(snapshot.monitor.handled_at(&instance), Some(handled));
-    restored.shutdown().await;
 }
 
 #[tokio::test]

@@ -482,6 +482,8 @@ pub struct OpenedExecution {
     pub is_terminal: bool,
     /// The fewest terminal rows the Tick declared it stays usable at, when it declared any.
     pub min_rows: Option<u16>,
+    /// The most terminal rows the Tick declared it can use, when it declared any.
+    pub max_rows: Option<u16>,
 }
 
 #[derive(Clone, Debug)]

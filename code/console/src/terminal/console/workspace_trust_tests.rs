@@ -105,6 +105,7 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
                 tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
                 update: None,
+                ended: None,
                 resources: None,
                 actions: Vec::new(),
             }],

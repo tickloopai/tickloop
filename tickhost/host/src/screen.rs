@@ -1,14 +1,19 @@
 //! The terminal model of a hidden Tick. Output is parsed continuously so the screen stays current
 //! while nobody watches; no raw output log is kept, only the screen and bounded scrollback.
+//! Key-bubbling sequences and focus-report modes in the output are taken out as signals.
 
-use crate::pty::TerminalSize;
+use crate::{
+    pty::TerminalSize,
+    screen_signals::{OscLimit, ScreenSignals, SignalCollector},
+};
 
 pub const SCROLLBACK_ROWS: usize = 1000;
 pub const SNAPSHOT_MAX_LINES: usize = 200;
 pub const SNAPSHOT_MAX_BYTES: usize = 64 * 1024;
 
 pub struct Screen {
-    parser: vt100::Parser,
+    parser: vt100::Parser<SignalCollector>,
+    osc_limit: OscLimit,
 }
 
 /// The latest visible text, newest lines kept when the limits cut it.
@@ -21,12 +26,21 @@ pub struct ScreenSnapshot {
 impl Screen {
     pub fn new(size: TerminalSize) -> Self {
         Self {
-            parser: vt100::Parser::new(size.rows, size.columns, SCROLLBACK_ROWS),
+            parser: vt100::Parser::new_with_callbacks(
+                size.rows,
+                size.columns,
+                SCROLLBACK_ROWS,
+                SignalCollector::default(),
+            ),
+            osc_limit: OscLimit::default(),
         }
     }
 
-    pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+    /// Parses the program's output and returns what it asked of the views.
+    pub fn process(&mut self, bytes: &[u8]) -> ScreenSignals {
+        let bytes = self.osc_limit.filter(bytes);
+        self.parser.process(&bytes);
+        self.parser.callbacks_mut().take()
     }
 
     /// Shrinking keeps each screen's cursor on screen as a terminal does: the rows above it that
@@ -50,6 +64,8 @@ impl Screen {
             b"\x1b[?47l"
         });
         self.parser.screen_mut().set_size(size.rows, size.columns);
+        // The sequences written above end any OSC the parser was inside.
+        self.osc_limit = OscLimit::default();
     }
 
     /// Scrolls the shown screen up until its cursor fits in `rows` rows, leaving the cursor on

@@ -40,6 +40,7 @@ impl MonitorRows for HostedRows {
                     descriptor.kind = "Terminal".into();
                 }
                 TickDescriptor {
+                    joined_at_ms: None,
                     instance: row.instance.clone(),
                     group: TickGroup::Ticks,
                     glyph: descriptor.glyph,
@@ -68,6 +69,11 @@ impl MonitorRows for HostedRows {
                     updated_at_ms: row.updated_at_ms,
                     update: subscription_update(row),
                     running: run == HostedRun::Running && row.link == TickLinkState::Live,
+                    ended: match run {
+                        HostedRun::Running => None,
+                        HostedRun::Exited => row.program_exit.map(terminal_exit_status),
+                        HostedRun::Ended => Some(TICK_ENDED.into()),
+                    },
                     resources: None,
                     actions: hosted_actions(&row.instance, is_opened_here, run),
                 }
@@ -93,16 +99,19 @@ impl MonitorRows for HostedRows {
             Some(MemberState::Exited(status)) => {
                 row.status = status.clone();
                 row.tone = StatusTone::Neutral;
+                row.ended = Some(status.clone());
                 HostedRun::Exited
             }
             Some(MemberState::Lost) => {
                 row.status = "lost".into();
                 row.tone = StatusTone::Gone;
+                row.ended = Some(row.status.clone());
                 HostedRun::Ended
             }
             Some(MemberState::Gone) => {
                 row.status = link_status(TickLinkState::InstanceGone).into();
                 row.tone = link_tone(TickLinkState::InstanceGone);
+                row.ended = Some(TICK_ENDED.into());
                 HostedRun::Ended
             }
             Some(MemberState::Unavailable) => {
@@ -237,6 +246,7 @@ impl MonitorRows for ArtifactRows {
                 rows.insert(
                     instance.clone(),
                     TickDescriptor {
+                        joined_at_ms: Some(tick.added_at_ms),
                         instance,
                         group: TickGroup::Artifacts,
                         glyph: TickGlyph::Artifact,
@@ -269,6 +279,7 @@ impl MonitorRows for ArtifactRows {
                         updated_at_ms,
                         update,
                         running: false,
+                        ended: None,
                         resources: None,
                         actions: artifact_actions(&id, binding.is_some()),
                     },
@@ -305,6 +316,7 @@ impl MonitorRows for ShellRows {
             .map(|task| {
                 let instance = InstanceRef::shell(task.id);
                 TickDescriptor {
+                    joined_at_ms: None,
                     actions: shell_actions(task, &instance),
                     instance,
                     group: TickGroup::Shells,
@@ -323,6 +335,7 @@ impl MonitorRows for ShellRows {
                     updated_at_ms: task.updated_at_ms,
                     update: task.ended_at().map(RowUpdate::new),
                     running: !task.state.is_terminal(),
+                    ended: None,
                     resources: None,
                 }
             })
@@ -1139,11 +1152,11 @@ mod tests {
         };
         assert_eq!(taken_in(&quote), Some(5_000), "a turn took the delivery in");
         assert_eq!(taken_in(&shell), Some(8_000));
-        assert_eq!(taken_in(&artifact), None, "the user opened it");
+        assert_eq!(taken_in(&artifact), None, "the Agent read it");
         assert_eq!(
             taken_in(&calendar),
             None,
-            "an earlier take-in does not cover the later update the user opened"
+            "an earlier take-in does not cover the later update the Agent read"
         );
         let quote_row = rows.iter().find(|row| row.instance == quote).unwrap();
         assert_eq!(quote_row.status, "live");
@@ -1381,6 +1394,7 @@ mod tests {
         assert_eq!(row.status, "exited 3");
         assert!(!row.running);
         assert_eq!(row.tone, StatusTone::Neutral);
+        assert_eq!(row.ended.as_deref(), Some("exited 3"), "its card says how");
     }
 
     #[test]
@@ -1405,6 +1419,12 @@ mod tests {
         assert_eq!(rows.len(), 2, "however long ago they ended: {rows:?}");
         for row in rows {
             assert_eq!(row.tone, StatusTone::Gone, "{}", row.instance);
+            let ended = if row.instance == gone {
+                "ended"
+            } else {
+                "lost"
+            };
+            assert_eq!(row.ended.as_deref(), Some(ended), "{}", row.instance);
             assert_eq!(
                 row.actions
                     .iter()
@@ -1415,6 +1435,32 @@ mod tests {
                 row.instance
             );
         }
+    }
+
+    #[test]
+    fn a_subscribed_hosted_tick_that_ended_says_how_for_its_card() {
+        let live = InstanceRef::new("hosted", "live-run").unwrap();
+        let exited = InstanceRef::new("hosted", "exited-run").unwrap();
+        let gone = InstanceRef::new("hosted", "gone-run").unwrap();
+        let mut exited_row = subscription(&exited, None, 0);
+        exited_row.program_exit = Some(tickloop_harness::protocol::HostedProgramExit {
+            code: Some(101),
+            signal: None,
+        });
+        let mut gone_row = subscription(&gone, None, 0);
+        gone_row.link = TickLinkState::InstanceGone;
+        let context = MonitorContext {
+            subscriptions: vec![subscription(&live, None, 0), exited_row, gone_row],
+            ..Default::default()
+        };
+        let ended = MonitorRowsRegistry::builtin()
+            .list(&context)
+            .into_iter()
+            .map(|row| (row.instance, row.ended))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(ended[&live], None);
+        assert_eq!(ended[&exited].as_deref(), Some("exited 101"));
+        assert_eq!(ended[&gone].as_deref(), Some("ended"));
     }
 
     #[test]
@@ -1432,6 +1478,7 @@ mod tests {
         assert_eq!(row.status, "unavailable");
         assert_eq!(row.tone, StatusTone::Degraded);
         assert!(!row.running);
+        assert_eq!(row.ended, None, "it may still run");
         let actions = row
             .actions
             .iter()

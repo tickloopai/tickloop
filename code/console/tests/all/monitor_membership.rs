@@ -59,6 +59,7 @@ impl HostToolProvider for OpeningHost {
             },
             Box::new(HostEffect::OpenedTick {
                 min_rows: None,
+                max_rows: None,
                 is_terminal: false,
                 instance: calendar("opened"),
                 title: Some("Earnings calendar".into()),
@@ -91,6 +92,7 @@ impl MonitorRows for CalendarRows {
             .iter()
             .filter(|row| row.instance.access() == "cal")
             .map(|row| TickDescriptor {
+                joined_at_ms: None,
                 instance: row.instance.clone(),
                 group: TickGroup::Ticks,
                 glyph: TickGlyph::Protocol,
@@ -104,6 +106,7 @@ impl MonitorRows for CalendarRows {
                 updated_at_ms: row.last_delivery_ms,
                 update: None,
                 running: true,
+                ended: None,
                 resources: None,
                 actions: vec![MonitorAction {
                     key: 'o',
@@ -631,4 +634,49 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
         "no separate close or reopen key"
     );
     agent.shutdown().await;
+}
+
+/// `u` sends an update of a running Tick this Chat opened, also while periodic subscriptions
+/// follow it, when it hands over what they hold; an immediate subscription offers no `u`.
+#[test]
+fn send_update_is_offered_beside_periodic_subscriptions_only() {
+    use std::collections::HashMap;
+    use tickloop_code_console::monitor_rows::MemberState;
+    let instance = InstanceRef::hosted(uuid::Uuid::new_v4());
+    let mut snapshot: tickloop_harness::protocol::ChatSnapshot = serde_json::from_value(json!({
+        "id": uuid::Uuid::new_v4(), "folder":"/fixture", "messages":[],
+        "chat_loop":{"id":uuid::Uuid::nil(),"state":"Idle"}
+    }))
+    .unwrap();
+    snapshot
+        .monitor
+        .record_opened(instance.clone(), Some("Counter".into()));
+    let offers_send_update = |frequency: &str| {
+        let subscription: tickloop_harness::protocol::TickSubscriptionStatus =
+            serde_json::from_value(json!({"id":uuid::Uuid::new_v4(),"loop_id":uuid::Uuid::new_v4(),"loop_state":"Idle","instance":instance,"frequency":frequency,"accumulated":2,"last_delivery_ms":null,"last_delivery":null,"title":"Counter","link":"Live"}))
+                .unwrap();
+        MonitorRowsRegistry::builtin()
+            .list(&MonitorContext {
+                chat: Some(Arc::new(tickloop_harness::protocol::ChatStatus::of(
+                    &snapshot,
+                ))),
+                subscriptions: vec![subscription],
+                member_states: HashMap::from([(instance.clone(), MemberState::Live)]),
+                ..Default::default()
+            })
+            .iter()
+            .find(|row| row.instance == instance)
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| {
+                action.key == 'u'
+                    && action.label == "send update"
+                    && action.intent == TickIntent::SendUpdate(instance.clone())
+            })
+    };
+    for periodic in ["high", "medium", "low"] {
+        assert!(offers_send_update(periodic), "{periodic}");
+    }
+    assert!(!offers_send_update("immediate"));
 }

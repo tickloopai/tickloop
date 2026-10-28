@@ -49,12 +49,6 @@ use tickloop_harness_transcript::{
     SubagentsEntry, SummarizeMetadataEntry,
 };
 
-/// Following Claude Code: when the conversation ends with a tool result on resume, this meta user
-/// message is appended to continue from where it was interrupted.
-const CONTINUE_FROM_INTERRUPTION: &str = "Continue from where you left off.";
-/// Claude Code's default `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS`: a turn interrupted
-/// longer ago than this is not told to continue when its Chat is loaded.
-const INTERRUPTED_TURN_MAX_AGE_MILLISECONDS: i64 = 60 * 60 * 1000;
 /// Following Claude Code's `NO_RESPONSE_REQUESTED`: the assistant sentinel appended when the
 /// conversation ends with a user message.
 const NO_RESPONSE_REQUESTED: &str = "No response requested.";
@@ -2432,31 +2426,13 @@ fn recover_transcript(
     }
     snapshot.operations.extend(nested.into_values());
 
-    let interruption_is_recent = interrupted_turn_is_recent(loaded, scheduled_now);
     recover_snapshot_for_resume(
         snapshot,
         bookkeeping,
         kept.meta_messages.clone(),
         waits,
         family,
-        interruption_is_recent,
     )
-}
-
-/// Following Claude Code's resume of an interrupted turn: the latest timestamped entry is less
-/// than an hour old. A chain without a readable timestamp is not recent.
-fn interrupted_turn_is_recent(
-    loaded: &LoadedTranscript,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    loaded
-        .chain
-        .iter()
-        .rev()
-        .find_map(|entry| tickloop_harness_base::timestamp::parse_timestamp_ms(&entry.timestamp))
-        .is_some_and(|at| {
-            now.timestamp_millis().saturating_sub(at) < INTERRUPTED_TURN_MAX_AGE_MILLISECONDS
-        })
 }
 
 /// Branch origin metadata belongs to the Chat that wrote this Transcript; the name is the title, or
@@ -2616,10 +2592,9 @@ impl RestoredChain {
 fn recover_snapshot_for_resume(
     mut snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
-    mut meta_messages: HashSet<usize>,
+    meta_messages: HashSet<usize>,
     waits: WaitHosting,
     family: Option<&super::family_load::FamilyRecords>,
-    interruption_is_recent: bool,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let rebuilt_runs = |snapshot: &ChatSnapshot| {
         super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
@@ -2648,7 +2623,7 @@ fn recover_snapshot_for_resume(
         .and_then(|index| snapshot.message_runs.get(&index))
         .is_some_and(|run| rebuilt.contains(run));
     if !ends_with_rebuilt_run {
-        append_interruption_messages(&mut snapshot, &mut meta_messages, interruption_is_recent);
+        append_no_response_sentinel(&mut snapshot);
     }
     super::branch::validate_snapshot(&snapshot)?;
     super::shared_tasks::validate_restored_boards(&snapshot).map_err(AgentError::Invalid)?;
@@ -2715,41 +2690,18 @@ fn no_store_to_switch() -> AgentError {
     AgentError::Invalid("this Chat keeps no Transcript to select another branch from".into())
 }
 
-/// Following Claude Code's `deserializeMessagesWithInterruptDetection`: when the conversation ends
-/// with a tool result of a `recent` interruption, first append the "continue from where it was
-/// interrupted" meta message; then, whenever it ends with a user message, append the
-/// no-response-requested sentinel. Meta messages do not count toward interrupt detection.
-fn append_interruption_messages(
-    snapshot: &mut ChatSnapshot,
-    meta_messages: &mut HashSet<usize>,
-    recent: bool,
-) {
-    let last_turn_message = |snapshot: &ChatSnapshot| {
-        (0..snapshot.messages.len())
-            .rev()
-            .find(|index| snapshot.messages[*index].role != Role::System)
-    };
-    if let Some(index) = last_turn_message(snapshot) {
-        let message = &snapshot.messages[index];
-        if recent
-            && message.role == Role::User
-            && !meta_messages.contains(&index)
-            && message
-                .content
-                .iter()
-                .any(|content| matches!(content, Content::ToolResult { .. }))
-        {
-            meta_messages.insert(snapshot.messages.len());
-            snapshot.messages.push(Message {
-                role: Role::User,
-                content: vec![Content::Text {
-                    text: CONTINUE_FROM_INTERRUPTION.into(),
-                }],
-            });
-        }
-    }
-    if last_turn_message(snapshot).is_some_and(|index| snapshot.messages[index].role == Role::User)
-    {
+/// Following Claude Code's `deserializeMessagesWithInterruptDetection` on a resume the user starts
+/// (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN` unset): no "continue from where you left off" message is
+/// added and no Run starts; when the conversation ends with a user message, including a tool
+/// result, the hidden no-response-requested sentinel keeps the next request well formed.
+fn append_no_response_sentinel(snapshot: &mut ChatSnapshot) {
+    let ends_with_user_message = snapshot
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != Role::System)
+        .is_some_and(|message| message.role == Role::User);
+    if ends_with_user_message {
         snapshot.messages.push(Message {
             role: Role::Assistant,
             content: vec![Content::Text {
@@ -3958,64 +3910,6 @@ mod transcript_replay_tests;
 #[cfg(test)]
 mod history_tests {
     use super::*;
-
-    fn ending_with_a_tool_result() -> ChatSnapshot {
-        let mut snapshot = crate::empty_snapshot(
-            tickloop_ids::generate().into(),
-            Some("/work".into()),
-            tickloop_harness_protocol::ModelConfig {
-                provider: tickloop_harness_protocol::ModelProvider::Api,
-                auth_source: tickloop_harness_protocol::ModelAuthSource::ApiKeyEnv,
-                name: "fixture".into(),
-                protocol: tickloop_harness_protocol::Protocol::Messages,
-                base_url: "http://127.0.0.1".into(),
-                model: "fixture".into(),
-                api_key_env: String::new(),
-                max_output_tokens: 32,
-                provider_id: String::new(),
-                provider_name: String::new(),
-                model_id: String::new(),
-                connection: None,
-                card: None,
-                input_modalities: vec![tickloop_harness_protocol::InputModality::Text],
-            },
-        );
-        snapshot.messages = vec![Message {
-            role: Role::User,
-            content: vec![Content::ToolResult {
-                tool_use_id: "call".into(),
-                content: tickloop_harness_protocol::ToolResultContent::Text("done".into()),
-                is_error: false,
-            }],
-        }];
-        snapshot
-    }
-
-    fn texts(snapshot: &ChatSnapshot) -> Vec<&str> {
-        snapshot
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn only_a_recent_interruption_is_told_to_continue() {
-        let mut recent = ending_with_a_tool_result();
-        append_interruption_messages(&mut recent, &mut HashSet::new(), true);
-        assert_eq!(
-            texts(&recent),
-            [CONTINUE_FROM_INTERRUPTION, NO_RESPONSE_REQUESTED]
-        );
-
-        let mut old = ending_with_a_tool_result();
-        append_interruption_messages(&mut old, &mut HashSet::new(), false);
-        assert_eq!(texts(&old), [NO_RESPONSE_REQUESTED]);
-    }
 
     #[test]
     fn recovery_keeps_private_only_history_for_source_projection() {

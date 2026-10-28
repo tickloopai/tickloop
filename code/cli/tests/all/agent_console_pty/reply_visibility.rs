@@ -792,9 +792,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         let chat_id = evicted.conversation.id.uuid().to_string();
         let mut resumed = PtyView::launch(fixture, &["--resume", &chat_id], &[], true);
         resumed
-            .wait_for("resumed history is ready", |frame| {
-                frame.contains("History opened.")
-            })
+            .wait_for("resumed history is ready", |frame| frame.contains(CALL))
             .await;
         resumed.resize(120, 60).await;
         let restarted = resumed

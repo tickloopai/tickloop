@@ -268,10 +268,7 @@ fn thinking_stream_pty_fixture() {
                 let startup = StartupState {
                     model_selected: true,
                     launch_arguments: Vec::new(),
-                    chat: StartupChat::Resumed(
-                        Box::new(agent.snapshot(chat).await.unwrap()),
-                        false,
-                    ),
+                    chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
                                 user_settings: None,
                 };
                 interact(&agent, workdir, &console, input, startup, None)
@@ -366,7 +363,7 @@ fn run_thinking_stream(route: &str) {
     let stage = |stage: &str| {
         std::fs::write(directory.path().join(THINKING_STAGE_FILE), stage).unwrap();
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"Continue the same Thinking stream.\r");
     fixture.wait_until_shown("the thinking preview behind the spinner", |frame| {
         tickloop_ui::icons::WORKING_DOT_FRAMES

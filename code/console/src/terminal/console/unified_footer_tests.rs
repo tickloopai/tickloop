@@ -448,6 +448,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
             update: None,
+            ended: None,
             resources: None,
             actions: Vec::new(),
         }],

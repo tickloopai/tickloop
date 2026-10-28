@@ -69,6 +69,7 @@ impl EnvironmentPreparedCall {
                     title: opened.title,
                     is_terminal: opened.is_terminal,
                     min_rows: opened.min_rows,
+                    max_rows: opened.max_rows,
                 }),
             ),
             ExecutionOutcome::Completed(ExecutionResult { result, .. }) => {

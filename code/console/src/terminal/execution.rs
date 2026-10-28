@@ -3453,26 +3453,6 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
-    pub(super) async fn mark_monitor_handled(
-        &self,
-        chat: Uuid,
-        instance: tick_protocol::InstanceRef,
-    ) -> Result<MonitorMembership, AccessError> {
-        let execution = self.reference(chat).await?;
-        match self
-            .command(
-                AgentCommand::MarkMonitorHandled {
-                    execution,
-                    instance,
-                },
-                None,
-            )
-            .await?
-        {
-            CommandResult::MonitorMembership(membership) => Ok(membership),
-            _ => Err(unexpected()),
-        }
-    }
     pub(super) async fn artifact_ticks(
         &self,
         chat: Uuid,

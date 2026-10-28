@@ -1163,6 +1163,83 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(results, [Some("result a".into()), Some("result b".into())]);
     }
+
+    /// Earlier Tickloop versions wrote a meta "Continue from where you left off." and a
+    /// "No response requested." sentinel on resume; like Claude Code, neither is shown.
+    #[test]
+    fn resume_placeholders_from_older_transcripts_are_not_shown() {
+        let prompt = Uuid::new_v4();
+        let response = Uuid::new_v4();
+        let mut prompt_entry = entry(
+            prompt,
+            None,
+            Role::User,
+            vec![Content::Text {
+                text: "read the notes".into(),
+            }],
+        );
+        prompt_entry.execution_mode = Some(serde_json::json!("default"));
+        let call_id = Uuid::new_v4();
+        let mut call = entry(call_id, Some(prompt), Role::Assistant, vec![tool_use("a")]);
+        call.response_id = Some(response);
+        let result_id = Uuid::new_v4();
+        let mut result = entry(result_id, Some(call_id), Role::User, vec![tool_result("a")]);
+        result.response_id = Some(response);
+        let continue_id = Uuid::new_v4();
+        let mut continue_prompt = entry(
+            continue_id,
+            Some(result_id),
+            Role::User,
+            vec![Content::Text {
+                text: "Continue from where you left off.".into(),
+            }],
+        );
+        continue_prompt.is_meta = true;
+        let sentinel_id = Uuid::new_v4();
+        let sentinel = entry(
+            sentinel_id,
+            Some(continue_id),
+            Role::Assistant,
+            vec![Content::Text {
+                text: "No response requested.".into(),
+            }],
+        );
+        let mut next_prompt = entry(
+            Uuid::new_v4(),
+            Some(sentinel_id),
+            Role::User,
+            vec![Content::Text {
+                text: "next prompt".into(),
+            }],
+        );
+        next_prompt.execution_mode = Some(serde_json::json!("default"));
+
+        let nodes = project(
+            &[
+                prompt_entry,
+                call,
+                result,
+                continue_prompt,
+                sentinel,
+                next_prompt,
+            ]
+            .into_iter()
+            .map(|entry| Line::chain(entry.message.role, entry))
+            .collect::<Vec<_>>(),
+        );
+        let serialized = serde_json::to_string(&nodes).unwrap();
+        assert!(!serialized.contains("Continue from where you left off."));
+        assert!(!serialized.contains("No response requested."));
+        let prompts = nodes
+            .iter()
+            .filter_map(|node| match (&node.kind, node.blocks.as_slice()) {
+                (DisplayKind::Prompt { .. }, [DisplayBlock::Text { text }]) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["read the notes", "next prompt"]);
+        assert_eq!(nodes[2].parent, Some(response));
+    }
 }
 
 #[cfg(test)]

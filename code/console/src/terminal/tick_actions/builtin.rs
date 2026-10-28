@@ -269,15 +269,6 @@ impl TickActionBackend for NoBackend {
         Ok(())
     }
 }
-/// The user has seen `row` up to now, such as by closing its open detail.
-pub(in crate::terminal) fn seen(row: tick_protocol::InstanceRef) -> PreparedTickAction {
-    PreparedTickAction::new(
-        row.to_string(),
-        crate::monitor_rows::MONITOR_ENTER_KEY,
-        Arc::new(NoBackend),
-    )
-    .opening(row)
-}
 /// Hides a row in this Chat and cancels its Tick Subscriptions.
 struct RemoveFromMonitor {
     instance: tick_protocol::InstanceRef,

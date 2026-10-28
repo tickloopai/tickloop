@@ -3552,6 +3552,77 @@ async fn manual_tick_updates_queue_without_subscribing_and_preserve_newer_unread
     agent.shutdown().await;
 }
 
+/// Send Update on a Tick with a periodic subscription hands the Loop what the subscription holds
+/// now, through the subscription's own delivery, instead of waiting for its check; the next check
+/// then delivers only what comes later. Holding nothing, it sends the current state as for an
+/// unsubscribed Tick.
+#[tokio::test(start_paused = true)]
+async fn send_update_on_a_periodic_subscription_delivers_what_it_holds_now() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("held update received"),
+        text("current state received"),
+        text("later update received"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let instance = InstanceRef::hosted(Uuid::new_v4());
+    agent
+        .record_reopened_tick(chat, &InstanceRef::hosted(Uuid::new_v4()), instance.clone())
+        .await
+        .unwrap();
+    subscribe_loop(&agent, chat.uuid(), std::slice::from_ref(&instance)).await;
+    let observation = |sequence, phase| TickObservation {
+        instance: instance.clone(),
+        ..update(80, sequence, phase)
+    };
+    stream.push(observation(1, "held content"));
+    settle().await;
+    let held = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(held[0].accumulated, 1, "the subscription holds the update");
+
+    let sent = agent
+        .tick_send_update_for_user(chat, instance.clone())
+        .await
+        .unwrap();
+    assert!(sent.is_none(), "the subscription's own delivery carries it");
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("held content"));
+    let after = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(after[0].accumulated, 0);
+    assert!(!after[0].has_pending_change);
+
+    let sent = agent
+        .tick_send_update_for_user(chat, instance.clone())
+        .await
+        .unwrap();
+    assert!(
+        sent.is_some(),
+        "holding nothing, it reads the current state"
+    );
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("held content"));
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+
+    stream.push(observation(2, "later content"));
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    wait_for_completion(&mut events).await;
+    let last = last_user_text(&model);
+    assert!(
+        last.contains("later content") && !last.contains("held content"),
+        "the next check delivers only what came after: {last}"
+    );
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn manual_tick_update_rejects_foreign_instances_and_keeps_unread_on_failed_reads() {
     let directory = tempfile::tempdir().unwrap();

@@ -1346,7 +1346,15 @@ fn terminal_screen(view: &PtyView) -> String {
 
 /// Whether a Monitor card has the focus: the key hints are its own.
 fn card_focused(frame: &str) -> bool {
-    frame.lines().any(|line| line.starts_with("esc leave"))
+    frame.lines().any(|line| {
+        [
+            "esc back to list",
+            "esc esc back to list",
+            "esc or esc esc back",
+        ]
+        .iter()
+        .any(|hint| line.starts_with(hint))
+    })
 }
 
 /// Waits until a Monitor card has the focus and the screen shows every one of `texts`.

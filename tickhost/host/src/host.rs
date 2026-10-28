@@ -19,7 +19,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tick_protocol::InstanceRef;
+use tick_protocol::{BubbledKey, InstanceRef};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
@@ -38,7 +38,7 @@ use tokio::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
     process::{Child, Command},
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -48,11 +48,12 @@ use crate::{
     process,
     pty::{Pty, READ_CHUNK_BYTES, TerminalSize},
     screen::Screen,
+    screen_signals::ScreenSignals,
     shell::{
         CANCELLED_REASON, ShellIdentity, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants,
         SpawnRequest, environment_digest,
     },
-    views::{ViewGrants, Views},
+    views::{ViewGrants, ViewModes, Views},
 };
 
 /// A host that was never used exits after this grace.
@@ -88,6 +89,12 @@ const UNTITLED_TICK: &str = "an opening Tick";
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// The focus reports a Tick that set DEC private mode 1004 reads: gained and lost.
+const FOCUS_GAINED: &[u8] = b"\x1b[I";
+const FOCUS_LOST: &[u8] = b"\x1b[O";
+/// The bubbled keys a view may have waiting; a view that reads none of them misses the keys after
+/// them, never a change of the Tick's modes.
+const VIEW_SIGNALS: usize = 16;
 /// How long a terminal Tick's program may hold off input written for it before the write is
 /// abandoned, well within the reader's control timeout.
 const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -379,6 +386,20 @@ impl HostedTick {
             self.screen_changes.send_replace(());
         }
         changed
+    }
+
+    /// Writes a focus report to the Tick's terminal: `ESC [ I` when a view has the keyboard,
+    /// `ESC [ O` when none has. Only a Tick that asked for focus reports is ever sent one.
+    async fn report_focus(&self, focused: bool) -> Result<(), HostError> {
+        if let Adapter::Terminal(program) = &self.adapter
+            && program.exit().is_some()
+        {
+            return Ok(());
+        }
+        self.pty
+            .write_all(if focused { FOCUS_GAINED } else { FOCUS_LOST })
+            .await
+            .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
     }
 
     /// Records how a terminal Tick's program ended, once; the Tick itself keeps running until it
@@ -1463,10 +1484,22 @@ async fn drain_terminal(tick: Arc<HostedTick>) {
             read = tick.pty.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
+                    let mut signals = ScreenSignals::default();
                     tick.change_screen(|screen| {
-                        screen.process(&buffer[..count]);
+                        signals = screen.process(&buffer[..count]);
                         true
                     });
+                    let focus_report = (signals != ScreenSignals::default()).then(|| {
+                        let mut views = tick.views.lock().unwrap();
+                        signals.keys.into_iter().for_each(|signal| views.signal(signal));
+                        if let Some(enabled) = signals.focus_reports {
+                            views.focus_reports(enabled);
+                        }
+                        views.due_focus_report()
+                    });
+                    if let Some(Some(focused)) = focus_report {
+                        let _ = tick.report_focus(focused).await;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -3018,6 +3051,8 @@ impl Viewed {
 struct ViewLease {
     viewed: Viewed,
     view: u64,
+    /// The keys a Tick bubbles to this view and the Tick's modes; a Shell's screen has none.
+    signals: Option<(mpsc::Receiver<BubbledKey>, watch::Receiver<ViewModes>)>,
 }
 
 impl ViewLease {
@@ -3028,18 +3063,24 @@ impl ViewLease {
             size: TerminalSize,
         }
         let Attach { size } = parameters(params)?;
-        let (view, followed) = match &viewed {
+        let (view, signals, followed) = match &viewed {
             Viewed::Tick(tick) => {
                 if tick.terminal_closed.is_cancelled() {
                     return Err(HostError::before("TargetGone", "the Tick has ended"));
                 }
                 let mut views = tick.views.lock().unwrap();
                 let view = views.attach(size);
-                (view, tick.follow_views(&views))
+                let (sender, receiver) = mpsc::channel(VIEW_SIGNALS);
+                let modes = views.listen(view, sender);
+                (view, Some((receiver, modes)), tick.follow_views(&views))
             }
-            Viewed::Shell(task) => (task.change_views(|views| views.attach(size)), Ok(())),
+            Viewed::Shell(task) => (task.change_views(|views| views.attach(size)), None, Ok(())),
         };
-        let lease = Self { viewed, view };
+        let lease = Self {
+            viewed,
+            view,
+            signals,
+        };
         followed.map(|()| lease)
     }
 
@@ -3080,6 +3121,21 @@ impl ViewLease {
             .await
             .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
     }
+
+    /// The view says whether it has the keyboard; the Tick gets the focus report that changes.
+    async fn focus(&self, focused: bool) -> Result<(), HostError> {
+        let Viewed::Tick(tick) = &self.viewed else {
+            return Ok(());
+        };
+        let due = tick.change_views(|views| {
+            views.focused(self.view, focused);
+            views.due_focus_report()
+        })?;
+        match due {
+            Some(focused) => tick.report_focus(focused).await,
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for ViewLease {
@@ -3088,7 +3144,19 @@ impl Drop for ViewLease {
             // The leaving view cannot be told of a failed resize; the terminal then keeps its
             // size.
             Viewed::Tick(tick) => {
-                let _ = tick.change_views(|views| views.detach(self.view));
+                let due = tick.change_views(|views| {
+                    views.detach(self.view);
+                    views.due_focus_report()
+                });
+                // The last view with the keyboard left: the Tick hears it lost the focus.
+                if let Ok(Some(focused)) = due
+                    && let Ok(runtime) = tokio::runtime::Handle::try_current()
+                {
+                    let tick = tick.clone();
+                    runtime.spawn(async move {
+                        let _ = tick.report_focus(focused).await;
+                    });
+                }
             }
             Viewed::Shell(task) => task.change_views(|views| views.detach(self.view)),
         }
@@ -3103,7 +3171,7 @@ async fn attach_view(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     host: &Arc<Host>,
-    lease: ViewLease,
+    mut lease: ViewLease,
     id: &Value,
 ) -> Result<(), HostError> {
     let viewed = lease.viewed.clone();
@@ -3116,6 +3184,25 @@ async fn attach_view(
         CONTROL_TIMEOUT,
     )
     .await?;
+    // A view takes a Tick's modes to be off until it is told otherwise.
+    let (mut keys, mut modes) = match lease.signals.take() {
+        Some((keys, modes)) => (Some(keys), Some(modes)),
+        None => (None, None),
+    };
+    let mut told = ViewModes::default();
+    if let Some(modes) = &mut modes {
+        let current = *modes.borrow_and_update();
+        for event in mode_events(told, current) {
+            write_within(
+                &mut writer,
+                &event,
+                BUSINESS_FRAME_BYTES,
+                STREAM_WRITE_TIMEOUT,
+            )
+            .await?;
+        }
+        told = current;
+    }
     let output = async {
         let mut shown = None;
         loop {
@@ -3136,8 +3223,41 @@ async fn attach_view(
                 )
                 .await?;
             }
-            if changes.changed().await.is_err() {
-                return Ok(());
+            let next_key = async {
+                match &mut keys {
+                    Some(keys) => keys.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let next_modes = async {
+                let Some(modes) = &mut modes else {
+                    return std::future::pending().await;
+                };
+                if modes.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+                *modes.borrow_and_update()
+            };
+            tokio::select! {
+                changed = changes.changed() => if changed.is_err() {
+                    return Ok(());
+                },
+                Some(key) = next_key => {
+                    write_within(
+                        &mut writer,
+                        &json!({"event":"bubble","key":key.name()}),
+                        BUSINESS_FRAME_BYTES,
+                        STREAM_WRITE_TIMEOUT,
+                    )
+                    .await?;
+                }
+                current = next_modes => {
+                    for event in mode_events(told, current) {
+                        write_within(&mut writer, &event, BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT)
+                            .await?;
+                    }
+                    told = current;
+                }
             }
         }
     };
@@ -3147,6 +3267,7 @@ async fn attach_view(
         enum ViewRequest {
             Input { data: Vec<u8> },
             Resize { size: TerminalSize },
+            Focus { focused: bool },
             Detach,
         }
         while let Some(request) =
@@ -3155,6 +3276,7 @@ async fn attach_view(
             match parameters(request)? {
                 ViewRequest::Input { data } => lease.input(&data).await?,
                 ViewRequest::Resize { size } => lease.resize(size)?,
+                ViewRequest::Focus { focused } => lease.focus(focused).await?,
                 ViewRequest::Detach => break,
             }
         }
@@ -3184,6 +3306,19 @@ async fn attach_view(
         .await;
     }
     outcome
+}
+
+/// The view events telling a view that the Tick's modes went from `told` to `current`:
+/// `bubbling` whether it bubbles keys, `focus_reports` whether it wants focus reports.
+fn mode_events(told: ViewModes, current: ViewModes) -> Vec<Value> {
+    let mut events = Vec::new();
+    if told.bubbling != current.bubbling {
+        events.push(json!({"event":"bubbling","enabled":current.bubbling}));
+    }
+    if told.focus_reports != current.focus_reports {
+        events.push(json!({"event":"focus_reports","enabled":current.focus_reports}));
+    }
+    events
 }
 
 /// Writes one frame unless its reader leaves it unread for `limit`; a stalled reader then loses

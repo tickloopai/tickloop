@@ -32,6 +32,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         .unwrap();
         snapshot.monitor.members.push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             is_terminal: false,
             instance: instance.clone(),
             title: Some("Counter".into()),
@@ -84,20 +85,19 @@ fn monitor_membership_commands_cross_the_wire_unchanged() {
         agent_id: Uuid::new_v4(),
         generation: 1,
     };
-    let instance: InstanceRef = "hosted:counter".parse().unwrap();
-    for command in [
-        AgentCommand::RemoveMonitorMember {
-            execution,
-            instance: instance.clone(),
-        },
-        AgentCommand::MarkMonitorHandled {
-            execution,
-            instance: instance.clone(),
-        },
-    ] {
-        let wire = serde_json::to_value(&command).unwrap();
-        let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
-        assert_eq!(decoded.execution(), Some(execution));
-    }
+    let command = AgentCommand::RemoveMonitorMember {
+        execution,
+        instance: "hosted:counter".parse::<InstanceRef>().unwrap(),
+    };
+    let wire = serde_json::to_value(&command).unwrap();
+    let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+    assert_eq!(decoded.execution(), Some(execution));
+    assert!(
+        serde_json::from_value::<AgentCommand>(serde_json::json!({
+            "MarkMonitorHandled": {"execution": execution, "instance": "hosted:counter"}
+        }))
+        .is_err(),
+        "a View no longer marks rows handled"
+    );
 }

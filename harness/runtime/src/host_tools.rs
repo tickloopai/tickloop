@@ -235,6 +235,8 @@ pub enum HostEffect {
         title: Option<String>,
         /// The fewest terminal rows the Tick declared it stays usable at.
         min_rows: Option<u16>,
+        /// The most terminal rows the Tick declared it can use.
+        max_rows: Option<u16>,
     },
 }
 

@@ -324,10 +324,7 @@ fn working_activity_pty_fixture() {
                 let startup = StartupState {
                     model_selected: true,
                     launch_arguments: Vec::new(),
-                    chat: StartupChat::Resumed(
-                        Box::new(agent.snapshot(chat).await.unwrap()),
-                        route.starts_with("attach-"),
-                    ),
+                    chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
                     user_settings: None,
                 };
                 let (console, input) = Console::start_with_display(true, tickloop_code_settings::DisplayPreferences {
@@ -397,7 +394,7 @@ fn start_activity_fixture(route: &str) -> (RecoveryPty, tempfile::TempDir) {
 #[test]
 fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_interrupts() {
     let (mut fixture, directory) = start_activity_fixture("live");
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"Continue the same controlled activity\r");
     fixture.wait_until_shown("Working elapsed and actual Esc action", |frame| {
         frame.contains("Working (0s · esc to interrupt)")
@@ -495,7 +492,7 @@ fn attached_working_activity_does_not_invent_a_run_start_time() {
 #[test]
 fn overview_dispatch_records_a_live_observed_run_clock_before_opening_the_agent() {
     let (mut fixture, directory) = start_activity_fixture("overview-dispatch");
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"\x1b[D");
     fixture.wait_for("Agents · local");
     fixture.send(b"\t");
@@ -548,7 +545,7 @@ fn overview_dispatch_records_a_live_observed_run_clock_before_opening_the_agent(
 #[test]
 fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_running() {
     let (mut fixture, directory) = start_activity_fixture("observe-only");
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"Activity without advertised control\r");
     fixture.wait_until_shown("Working without an unavailable Esc action", |frame| {
         working_seconds(frame).is_some() && !frame.contains("esc to interrupt")
@@ -625,7 +622,7 @@ fn lose_completed_events(
 #[test]
 fn a_run_whose_end_event_was_lost_stops_working_once_the_snapshot_shows_it_ended() {
     let (mut fixture, directory) = start_activity_fixture(LOST_END_ROUTE);
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"Watch for updates\r");
     fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-1");
     fixture.wait_until_shown("the live run", |frame| frame.contains("Working ("));
@@ -661,7 +658,7 @@ fn idle_escape_pauses_an_active_goal_without_a_running_turn() {
 fn idle_escape_cancels_a_self_paced_wakeup_and_also_pauses_an_active_goal() {
     for route in ["live", "idle-both"] {
         let (mut fixture, directory) = start_activity_fixture(route);
-        fixture.wait_for("Enter a message to");
+        fixture.wait_for("Tickloop v");
         fixture.send(b"/loop Check the controlled activity\r");
         fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-1");
         std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
@@ -693,7 +690,7 @@ fn idle_escape_cancels_a_self_paced_wakeup_and_also_pauses_an_active_goal() {
 #[test]
 fn idle_escape_without_a_goal_or_wakeup_sends_no_interrupt() {
     let (mut fixture, directory) = start_activity_fixture("live");
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"\x1b");
     fixture.wait_for("Press esc again");
     fixture.send(b"idle Escape processed");
@@ -706,19 +703,24 @@ fn idle_escape_without_a_goal_or_wakeup_sends_no_interrupt() {
     assert_eq!(proof["count"], 0);
 }
 
+/// Like Claude Code, opened history is followed by no line inviting the next message, whether or
+/// not receiving is paused; a paused Chat still offers to continue receiving, or a message.
 #[test]
-fn attaching_history_only_promises_to_resume_triggers_when_receiving_is_paused() {
+fn attaching_history_adds_no_line_after_it() {
     for route in ["attach-receiving", "attach-paused"] {
         let (mut fixture, _directory) = start_activity_fixture(route);
-        fixture.wait_for("History opened.");
-        fixture.repaint_after_recovery("attached history", |frame| {
-            frame.contains("History opened.")
-        });
+        fixture.wait_for("Tickloop v");
+        let frame = fixture
+            .repaint_after_recovery("attached history", |frame| frame.contains("Tickloop v"));
         let output = fixture.raw_output();
-        assert_eq!(
-            output.contains("sending it resumes"),
-            route == "attach-paused",
+        assert!(
+            !output.contains("History opened") && !output.contains("Enter a message to"),
             "{route}: {output}"
+        );
+        assert_eq!(
+            frame.contains("Trigger receiving is paused") && frame.contains("type a message"),
+            route == "attach-paused",
+            "{route}: {frame}"
         );
     }
 }

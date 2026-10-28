@@ -1889,7 +1889,7 @@ async fn assert_family_hold_crash_during_append(continuing: bool, with_source_st
         hold_release: hold_released,
     });
     original
-        .mark_monitor_handled(root, tick_protocol::InstanceRef::shell(Uuid::new_v4()))
+        .remove_monitor_member(root, tick_protocol::InstanceRef::shell(Uuid::new_v4()))
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), old_waiting)

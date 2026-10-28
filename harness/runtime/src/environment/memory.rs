@@ -903,6 +903,10 @@ impl ExecutionPort for MemoryPort {
                         .as_ref()
                         .filter(|_| open.protocol)
                         .map(|tick| tick.descriptor.min_rows());
+                    let max_rows = tick
+                        .as_ref()
+                        .filter(|_| open.protocol)
+                        .and_then(|tick| tick.descriptor.max_rows());
                     let terminal = state.terminal_programs.get(&open.command[0]).cloned();
                     let screen = terminal
                         .as_ref()
@@ -944,6 +948,7 @@ impl ExecutionPort for MemoryPort {
                             title: Some(open.command.join(" ")),
                             is_terminal: !open.protocol,
                             min_rows,
+                            max_rows,
                         }),
                         shell: None,
                         handoff: None,

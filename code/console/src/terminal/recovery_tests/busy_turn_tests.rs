@@ -278,7 +278,7 @@ fn busy_turn_pty_fixture() {
                 let startup = StartupState {
                     model_selected: true,
                     launch_arguments: Vec::new(),
-                    chat: StartupChat::Resumed(Box::new(restored), true),
+                    chat: StartupChat::Resumed(Box::new(restored)),
                     user_settings: Some(settings),
                 };
                 interact(&agent, workdir, &console, input, startup, None)
@@ -367,7 +367,9 @@ fn a_busy_turn_in_a_long_chat_reads_no_whole_chat() {
         // loaded test run that alone can take most of a minute.
         timeout: Duration::from_secs(60),
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_until_shown("the opened long history", |frame| {
+        frame.contains(&"h".repeat(40))
+    });
     fixture.send(b"Work through the busy input.\r");
     fixture.wait_until_shown("the busy turn running", |frame| frame.contains("Working"));
     let before = settled_traffic(directory.path());

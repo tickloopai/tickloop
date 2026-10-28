@@ -162,8 +162,8 @@ pub struct RowUpdate {
     pub at_ms: u64,
     /// `None` once the Chat handled the update.
     pub unread: Option<Unread>,
-    /// When one of the Chat's Agent turns took the update in, once one did; the user opening the
-    /// row handles it without one.
+    /// When one of the Chat's Agent turns took the update in, once one did; an Agent read
+    /// handles it without one.
     pub taken_in_at_ms: Option<u64>,
 }
 
@@ -287,8 +287,14 @@ pub struct TickDescriptor {
     /// human edit or feedback request, or a background Shell's end.
     pub update: Option<RowUpdate>,
     pub running: bool,
+    /// How a hosted Tick ended once its process no longer runs, as its card's rule says it:
+    /// `exited 3`, `ended` or `lost`. A Shell's own screen tells how it ended.
+    pub ended: Option<String>,
     pub resources: Option<TickResources>,
     pub actions: Vec<MonitorAction>,
+    /// When the row joined the Monitor, as far as its source tells: when an Artifact was linked
+    /// to the Chat. Listing fills it in from a time-ordered identity otherwise.
+    pub joined_at_ms: Option<u64>,
 }
 #[derive(Default)]
 pub struct MonitorContext {
@@ -310,6 +316,9 @@ pub struct MonitorContext {
     pub retained: Option<InstanceRef>,
     pub now_ms: u64,
 }
+
+/// A hosted Tick's card says `ended` once the Tick is gone with no exit status to tell.
+pub(crate) const TICK_ENDED: &str = "ended";
 
 pub(crate) fn terminal_exit_status(exit: tickloop_harness::protocol::HostedProgramExit) -> String {
     match (exit.code, exit.signal) {
@@ -346,7 +355,13 @@ pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
 /// match what a key does.
 pub const MONITOR_PAUSE_KEY: char = 'p';
-pub const MONITOR_KEYS: [char; 2] = [MONITOR_REFRESH_KEY, MONITOR_PAUSE_KEY];
+/// Selects the next row with an unseen update.
+pub const MONITOR_NEXT_UNSEEN_KEY: char = 'n';
+pub const MONITOR_KEYS: [char; 3] = [
+    MONITOR_REFRESH_KEY,
+    MONITOR_PAUSE_KEY,
+    MONITOR_NEXT_UNSEEN_KEY,
+];
 
 /// The Monitor half of an access. Rows are computed from the View's own Chat snapshot,
 /// subscriptions, Shell tasks, artifact metadata and host probes; they never read Tick content,
@@ -405,6 +420,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         Some(tickloop_harness::protocol::ObservationKind::Terminal { .. })
     );
     TickDescriptor {
+        joined_at_ms: None,
         instance: row.instance.clone(),
         group: TickGroup::Ticks,
         glyph: if terminal {
@@ -425,6 +441,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         updated_at_ms: row.updated_at_ms,
         update: builtin::subscription_update(row),
         running: row.link == tickloop_harness::protocol::TickLinkState::Live,
+        ended: None,
         resources: None,
         actions: vec![remove_from_monitor(&row.instance)],
     }
@@ -493,7 +510,7 @@ fn offer_subscribing(entry: &mut TickDescriptor) {
 }
 
 /// Settles whether the Chat still has the row's latest update to handle: handled once a turn
-/// took it in or the user opened the row at or after it, and taken in only by the turn; while
+/// took it in or the Agent read the instance at or after it, and taken in only by the turn; while
 /// unread, a subscription's count of updates waiting for delivery counts it.
 fn resolve_unread(
     entry: &mut TickDescriptor,
@@ -525,6 +542,7 @@ fn resolve_unread(
 /// A member row with only the facts the Chat recorded: no invented status, time or resources.
 pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
     TickDescriptor {
+        joined_at_ms: None,
         title: member
             .title
             .clone()
@@ -550,6 +568,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         updated_at_ms: None,
         update: None,
         running: false,
+        ended: None,
         resources: None,
         actions: vec![
             MonitorAction {
@@ -664,7 +683,8 @@ impl MonitorRowsRegistry {
             if !rows.is_empty() {
                 mark_subscribed(entry, rows);
             }
-            if rows.is_empty()
+            // Beside periodic subscriptions, Send Update hands over what they hold at once.
+            if rows.iter().all(|row| row.frequency.period().is_some())
                 && entry.instance.access() == "hosted"
                 && entry.running
                 && entry.owner == TickOwner::ThisChat
@@ -684,11 +704,16 @@ impl MonitorRowsRegistry {
                 accumulated,
             );
         }
+        for entry in &mut entries {
+            entry.joined_at_ms = entry
+                .joined_at_ms
+                .or_else(|| identity_time_ms(&entry.instance));
+        }
         entries.sort_by(descriptor_order);
         entries
     }
-    /// One page of [`Self::list`]. Pages partition the set in a stable group-and-identity order,
-    /// so updates never move a row to another page; within a page rows keep the display order.
+    /// One page of [`Self::list`]. Pages partition the set in the display order, which updates
+    /// never change, so no update moves a row to another page or within one.
     /// A page never stands for the complete set, and a membership change expires older cursors.
     pub fn page(
         &self,
@@ -713,9 +738,17 @@ pub fn page_of(
     cursor: Option<&tickhost_connect::page::PageCursor>,
     limit: Option<usize>,
 ) -> Result<tickhost_connect::page::Page<TickDescriptor>, tickhost_connect::page::PageError> {
+    // The key sorts as the display order does: no join time sorts after every join time.
     let mut page = tickhost_connect::page::paginate(
         entries,
-        |entry| format!("{:05}:{}", entry.group.order, entry.instance),
+        |entry| {
+            format!(
+                "{:05}:{:020}:{}",
+                entry.group.order,
+                entry.joined_at_ms.unwrap_or(u64::MAX),
+                entry.instance
+            )
+        },
         cursor,
         limit,
     )?;
@@ -725,20 +758,37 @@ pub fn page_of(
 
 fn descriptor_order(left: &TickDescriptor, right: &TickDescriptor) -> std::cmp::Ordering {
     display_order(
-        (left.group, left.updated_at_ms, &left.instance),
-        (right.group, right.updated_at_ms, &right.instance),
+        (left.group, left.joined_at_ms, &left.instance),
+        (right.group, right.joined_at_ms, &right.instance),
     )
 }
 
-/// Groups in their declared order; within a group the most recently updated first.
+/// Groups in their declared order; within a group rows in the order they joined, oldest first,
+/// rows without a join time after them by identity. Updates never move a row.
 pub(crate) fn display_order(
     left: (TickGroup, Option<u64>, &InstanceRef),
     right: (TickGroup, Option<u64>, &InstanceRef),
 ) -> std::cmp::Ordering {
+    let joined = |time: Option<u64>| time.unwrap_or(u64::MAX);
     left.0
         .cmp(&right.0)
-        .then_with(|| right.1.cmp(&left.1))
+        .then_with(|| joined(left.1).cmp(&joined(right.1)))
         .then_with(|| left.2.cmp(right.2))
+}
+
+/// When a hosted Tick or a Shell task was created, from the UUID v7 of its identity, which is
+/// when it joined the Monitor of the Chat that started it.
+pub(crate) fn identity_time_ms(instance: &InstanceRef) -> Option<u64> {
+    let uuid = instance
+        .hosted_run()
+        .map(|run| run.uuid())
+        .or_else(|| instance.shell_task().map(|task| task.uuid()))?;
+    (uuid.get_version_num() == 7).then(|| {
+        let bytes = uuid.as_bytes();
+        bytes[..6]
+            .iter()
+            .fold(0_u64, |time, byte| time << 8 | u64::from(*byte))
+    })
 }
 
 /// Folds every projection of one instance into one row without losing facts: the newest
@@ -774,6 +824,10 @@ fn merge_descriptors(
                     lead.update = other.update.clone();
                 }
                 lead.running |= other.running;
+                lead.joined_at_ms = match (lead.joined_at_ms, other.joined_at_ms) {
+                    (Some(lead), Some(other)) => Some(lead.min(other)),
+                    (lead, other) => lead.or(other),
+                };
                 if lead.title == lead.instance.as_str() {
                     lead.title = other.title;
                 }
@@ -800,4 +854,110 @@ fn merge_descriptors(
         }
     }
     merged
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// A hosted instance whose UUID v7 says it was created at `created_ms`.
+    fn hosted_created_at(created_ms: u64) -> InstanceRef {
+        let mut bytes = [0_u8; 16];
+        bytes[..6].copy_from_slice(&created_ms.to_be_bytes()[2..]);
+        bytes[6] = 0x70;
+        bytes[8] = 0x80;
+        bytes[15] = 1;
+        format!("hosted:{}", Uuid::from_bytes(bytes))
+            .parse()
+            .unwrap()
+    }
+
+    fn row(instance: InstanceRef, group: TickGroup, updated_at_ms: u64) -> TickDescriptor {
+        let mut row = member_descriptor(&MonitorMember {
+            instance,
+            title: None,
+            is_terminal: false,
+            min_rows: None,
+            max_rows: None,
+        });
+        row.group = group;
+        row.updated_at_ms = Some(updated_at_ms);
+        row.update = Some(RowUpdate::new(updated_at_ms));
+        row
+    }
+
+    struct FixedRows(Vec<TickDescriptor>);
+    impl MonitorRows for FixedRows {
+        fn access(&self) -> &'static str {
+            "hosted"
+        }
+        fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
+            self.0.clone()
+        }
+    }
+
+    fn listed(rows: Vec<TickDescriptor>) -> Vec<InstanceRef> {
+        MonitorRowsRegistry::new([Arc::new(FixedRows(rows)) as Arc<dyn MonitorRows>])
+            .unwrap()
+            .list(&MonitorContext::default())
+            .into_iter()
+            .map(|row| row.instance)
+            .collect()
+    }
+
+    #[test]
+    fn rows_keep_the_order_they_joined_in_whatever_updates_later() {
+        let (oldest, middle, newest) = (
+            hosted_created_at(1_000),
+            hosted_created_at(2_000),
+            hosted_created_at(3_000),
+        );
+        let mut linked_late = row(hosted_created_at(500), TickGroup::Artifacts, 1);
+        linked_late.joined_at_ms = Some(9_000);
+        let mut linked_early = row(hosted_created_at(600), TickGroup::Artifacts, 99_999);
+        linked_early.joined_at_ms = Some(8_000);
+        let untimed: InstanceRef = "hosted:not-a-uuid".parse().unwrap();
+        let rows = |updates: [u64; 3]| {
+            vec![
+                row(newest.clone(), TickGroup::Ticks, updates[0]),
+                row(untimed.clone(), TickGroup::Ticks, 50_000),
+                row(oldest.clone(), TickGroup::Ticks, updates[1]),
+                row(middle.clone(), TickGroup::Ticks, updates[2]),
+                linked_late.clone(),
+                linked_early.clone(),
+            ]
+        };
+        let expected = vec![
+            linked_early.instance.clone(),
+            linked_late.instance.clone(),
+            oldest.clone(),
+            middle.clone(),
+            newest.clone(),
+            untimed.clone(),
+        ];
+        assert_eq!(listed(rows([10, 20, 30])), expected);
+        assert_eq!(
+            listed(rows([90_000, 10, 70_000])),
+            expected,
+            "an update never moves a row"
+        );
+
+        let all =
+            MonitorRowsRegistry::new(
+                [Arc::new(FixedRows(rows([5, 6, 7]))) as Arc<dyn MonitorRows>],
+            )
+            .unwrap()
+            .list(&MonitorContext::default());
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = page_of(all.clone(), cursor.as_ref(), Some(2)).unwrap();
+            paged.extend(page.items.into_iter().map(|row| row.instance));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(paged, expected, "pages follow the display order");
+    }
 }

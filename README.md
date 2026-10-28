@@ -41,7 +41,7 @@ Want to see a Tick in action? Ask the agent:
 
 > Open `python3 tick/examples/counter.py` with `protocol: true` and subscribe to it.
 
-Then select the Counter in the Monitor and press Enter to step into its card, type `+` and press Enter: the agent receives the new count and responds. Press `esc` to step out again.
+Then select the Counter in the Monitor and press Enter to step into its card, type `+` and press Enter: the agent receives the new count and responds. Press `esc` twice to step out again.
 
 ## Everyday use
 
@@ -69,7 +69,10 @@ Keys:
 - `ctrl+j` inserts a new line; `ctrl+g` edits your message in an external editor.
 - In lists and menus, use `j`/`k` or the arrow keys, `enter` to choose and `esc` to go back.
 - Ticks appear as cards in the Monitor column, inside Herdr or any other terminal. In the Monitor list, `space` (or a click on the row) shows or hides a Tick's card; `enter` (or a click on an open card) steps into the Tick, so your keys go to it, `ctrl+c` included. Several cards can be open at once.
-- Inside a card, `esc` steps out and the card stays open; `esc esc` sends one `esc` to the Tick. Clicking outside the card also steps out. Shell cards are read only. The program keeps running when you hide its card or step out.
+- In the Monitor list, `tab` and `shift+tab` move through every row in turn and preview the card of each Tick they pass; the preview closes when you move on, unless you step into it (`space` hides it, as on any card). `n` jumps to the next row with an update you have not seen; when such rows are scrolled out of view, a `↑ 2 updated` or `↓ 1 updated` line says so, and clicking it jumps there too. Rows stay in the order they joined, so an update never moves them.
+- Inside a card, a single `esc` goes to the Tick; `esc esc` steps back to the list and the card stays open. Ticks that support it hand back keys they do not use: then `esc` alone steps out, the arrows move to the card above or below, `tab` to the next Tick, and left back to your input. Clicking outside the card also steps out, and the click then does what it does there: on another Tick's row it shows that Tick's card. Shell cards are read only, and `esc` steps out of them. The program keeps running when you hide its card or step out.
+- When the agent uses a Tick or reads its update, the Tick's card opens by itself, unless you hid it.
+- When a Tick ends, its card keeps the last screen and its rule says how, such as `exited 101` or `ended`.
 - `←` on an empty input opens the Agents overview. As in Claude Code's agent view, Agents are grouped under Needs input (with how long each has waited), Working and Completed; Completed holds Idle, Completed, Failed and Stopped Agents, newest end first, and folds what the screen cannot hold behind `… N more`. An Agent that holds nothing is not listed. Agents whose process ended stay listed until `cleanupPeriodDays` (30 days by default) passes: Failed when the daemon stopped within 48 hours of their last activity, Stopped when it was longer; nothing restarts them. `enter` on such a row loads its saved conversation without running anything, and your next message continues it; a row that ended while the daemon was off asks for a second `enter`. `space` on a row opens its peek panel: the Agent's state, its latest sentence and what it waits on, with a reply box below. `enter` sends the reply without leaving the overview (a number answers the Agent's question or permission request, and replying to an ended row loads it first), `↑`/`↓` move the panel to the next Agent, `→` opens the Agent and `esc` (or `space` on an empty reply) closes the panel; `enter` or `→` folds a group heading. `x` twice on a running Agent stops it (it stays listed as Stopped); `x` twice on an ended row removes the row and keeps the conversation. `r` (or `/resume`) in the overview lists the saved conversations not in the list yet and adds the one you choose.
 - To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
@@ -196,7 +199,14 @@ To uninstall in the panel, press `x` twice on the same Installed row within thre
 
 Once a Tick is installed (and logged in, if it needs a login), ask the agent to open it by name, for example "open the NAME Tick and watch it". Installation runs nothing: a Tick's program runs as you only when opened under your permission settings. A disabled Tick cannot be opened by name. Installing, updating, removing and logging in are your actions; the agent only asks you to do them.
 
-Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py). A Tick is shown in a Monitor card at least 30 columns wide: it must stay usable at that width, redraw its whole screen when resized, and can ask for 6 to 14 rows with `screen.min_rows` in its description (6 by default). Go back a level with Backspace; a single `esc` never reaches the Tick.
+Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py). A Tick is shown in a Monitor card at least 30 columns wide: it must stay usable at that width, redraw its whole screen when resized, and can ask for 6 to 14 rows with `screen.min_rows` in its description (6 by default) and for more when the Monitor has room with `screen.max_rows`. A Tick may use `esc` but must not need a double `esc`, which steps out of the card. It should hand back the keys it does not use by writing `\x1b]7777;tickloop;bubble=on\x07` once at startup and `\x1b]7777;tickloop;key=<name>\x07` (`esc`, `up`, `down`, `left`, `right`, `tab`, `backtab`) for each unused key; see the specification. In Neovim, for example:
+
+```lua
+vim.api.nvim_create_autocmd('VimEnter', {
+  callback = function() io.stdout:write('\27]7777;tickloop;bubble=on\7') end,
+})
+vim.keymap.set('n', '<Esc>', function() io.stdout:write('\27]7777;tickloop;key=esc\7') end)
+```
 
 ## Plugins
 

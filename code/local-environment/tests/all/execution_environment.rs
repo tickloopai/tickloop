@@ -1448,3 +1448,141 @@ async fn local_and_reference_hosts_report_isolation_at_preparation() {
     })
     .await;
 }
+
+/// Hosted tools whose daemon is never reached: an open refused before dispatch asks nothing.
+fn unreached_ticks(directory: &std::path::Path) -> LocalEnvironment {
+    LocalEnvironment::with_ticks(Arc::new(HostedTickTools::new(
+        DaemonControl::new(WorkerControlGrant {
+            endpoint: directory.join("absent.sock"),
+            host_endpoint: directory.join("host.sock"),
+            daemon_epoch: tickloop_ids::generate(),
+            binding: tickloop_ids::generate(),
+            capability: "test-only".into(),
+        }),
+        Vec::new(),
+    )))
+}
+
+fn write_program(path: &std::path::Path, script: &str) {
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// A program opened through a link runs by the link, so the approval binds the file the link
+/// names when approved: a link pointed at another program afterwards runs nothing.
+#[tokio::test]
+async fn a_prepared_open_refuses_a_link_pointed_at_another_program() {
+    let directory = tempfile::tempdir().unwrap();
+    let approved = directory.path().join("approved");
+    let other = directory.path().join("other");
+    write_program(&approved, "#!/bin/sh\nexit 0\n");
+    write_program(&other, "#!/bin/sh\nexit 1\n");
+    let link = directory.path().join("program");
+    std::os::unix::fs::symlink(&approved, &link).unwrap();
+    tickloop_harness::test_support::execution_contracts::program_change_contract(
+        &unreached_ticks(directory.path()),
+        ExecutionScope {
+            chat: tickloop_ids::generate().into(),
+            folder: None,
+        },
+        OpenSpec {
+            command: vec![link.to_string_lossy().into_owned()],
+            cwd: Some(directory.path().to_string_lossy().into_owned()),
+            protocol: false,
+        },
+        || {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_prepared_open_through_a_link_refuses_a_change_to_the_program_it_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    write_program(&target, "#!/bin/sh\nexit 0\n");
+    let link = directory.path().join("program");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    tickloop_harness::test_support::execution_contracts::program_change_contract(
+        &unreached_ticks(directory.path()),
+        ExecutionScope {
+            chat: tickloop_ids::generate().into(),
+            folder: None,
+        },
+        OpenSpec {
+            command: vec![link.to_string_lossy().into_owned()],
+            cwd: Some(directory.path().to_string_lossy().into_owned()),
+            protocol: false,
+        },
+        || write_program(&target, "#!/bin/sh\nexit 1\n"),
+    )
+    .await;
+}
+
+/// A Shell reached through a link runs by the link's path, as its `$0` shows.
+#[tokio::test]
+async fn a_shell_reached_through_a_link_runs_by_the_links_path() {
+    use tickloop_harness::runtime::environment::{ExecutionInspection, ShellSpec};
+    let directory = tempfile::Builder::new()
+        .prefix("esl")
+        .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
+        .unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let shell = root.join("bin/linked-sh");
+    std::fs::create_dir(root.join("bin")).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let output = root.join("output");
+    let environment = LocalEnvironment::with_shells(Arc::new(OwnTickhost::with_idle_timeout(
+        std::time::Duration::ZERO,
+    )));
+    let chat = tickloop_ids::generate().into();
+    let authority = ExecutionAuthority::new(chat);
+    let port = environment
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: Some(root.to_string_lossy().into_owned()),
+            },
+            authority.clone(),
+        )
+        .unwrap();
+    let prepared = port
+        .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            folder: None,
+            dangerously_disable_sandbox: false,
+            additional_directories: Vec::new(),
+            family_temp: None,
+            operation: tickloop_ids::generate(),
+            shell: shell.to_string_lossy().into_owned(),
+            command: "printf '%s' \"$0\"".into(),
+            cwd: root.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            description: None,
+        }))
+        .await
+        .unwrap();
+    let ExecutionIntent::SpawnShell(spec) = &prepared.facts().intent else {
+        panic!("a Shell spawn prepares a Shell spawn");
+    };
+    assert_eq!(spec.shell, shell.to_string_lossy());
+    let admission = authority.admit(&prepared).unwrap();
+    let ExecutionOutcome::Completed(started) = port
+        .execute(prepared, admission, CancellationToken::new())
+        .await
+    else {
+        panic!("spawn failed");
+    };
+    let instance = started.shell.unwrap().instance;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(port.inspect(ExecutionQuery::ShellStatus(instance.clone())).await.unwrap(), ExecutionInspection::Shell(status) if status.state == tickloop_harness::protocol::CommandState::Completed) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        shell.to_string_lossy()
+    );
+}

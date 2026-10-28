@@ -2969,7 +2969,7 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     let text = String::from_utf8(result.stdout).unwrap();
     assert!(text.contains(&format!("Chat: {chat}")));
     assert!(text.contains("Start a report"), "{text}");
-    assert!(text.contains("History opened"), "{text}");
+    assert!(!text.contains("History opened"), "{text}");
     assert!(!text.contains("Accepted:"));
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())

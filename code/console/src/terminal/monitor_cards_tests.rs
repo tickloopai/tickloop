@@ -10,54 +10,113 @@ fn after(start: Instant, milliseconds: u64) -> Instant {
 }
 
 #[test]
-fn a_lone_escape_leaves_once_nothing_follows_it_within_the_window() {
+fn a_lone_escape_reaches_the_tick_as_soon_as_it_is_known_to_be_alone() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
-    assert_eq!(keys.feed(b"ab\x1b", start, false), bytes(b"ab"));
+    assert_eq!(keys.feed(b"ab\x1b", start, false, false), bytes(b"ab"));
     assert_eq!(keys.deadline(), Some(after(start, 50)));
-    assert!(keys.expire(after(start, 60)).is_empty(), "still waiting");
-    assert_eq!(keys.deadline(), Some(after(start, 400)));
-    assert!(keys.expire(after(start, 390)).is_empty());
-    assert_eq!(keys.expire(after(start, 400)), vec![CardInput::Leave]);
-    assert_eq!(keys.deadline(), None);
-}
-
-#[test]
-fn escape_escape_sends_one_escape_and_keeps_the_focus() {
-    let start = Instant::now();
-    let mut keys = CardKeys::default();
-    assert!(keys.feed(b"\x1b\x1b", start, false).is_empty());
-    let mut sent = keys.expire(after(start, 60));
-    sent.extend(keys.expire(after(start, 500)));
-    assert_eq!(sent, bytes(b"\x1b"), "one Esc and no leaving");
-
-    let mut keys = CardKeys::default();
-    assert!(keys.feed(b"\x1b", start, false).is_empty());
-    assert!(keys.expire(after(start, 60)).is_empty());
-    assert!(keys.feed(b"\x1b", after(start, 300), false).is_empty());
-    let mut sent = keys.expire(after(start, 360));
-    sent.extend(keys.expire(after(start, 800)));
-    assert_eq!(sent, bytes(b"\x1b"), "a second Esc 300 ms later");
-}
-
-#[test]
-fn escape_followed_by_another_key_sends_both() {
-    let start = Instant::now();
-    let mut keys = CardKeys::default();
-    assert!(keys.feed(b"\x1b", start, false).is_empty());
-    assert!(keys.expire(after(start, 60)).is_empty());
-    assert_eq!(keys.feed(b"x", after(start, 200), false), bytes(b"\x1bx"));
     assert!(
-        keys.expire(after(start, 1000)).is_empty(),
+        keys.expire(after(start, 40), false).is_empty(),
+        "maybe an arrow"
+    );
+    assert_eq!(keys.expire(after(start, 50), false), bytes(b"\x1b"));
+    assert_eq!(keys.deadline(), None, "nothing waits to leave");
+    assert!(
+        keys.expire(after(start, 5000), false).is_empty(),
         "the focus stays"
     );
+}
 
+#[test]
+fn a_second_escape_within_300_ms_leaves_and_never_reaches_the_tick() {
+    let start = Instant::now();
+    let mut keys = CardKeys::default();
+    let mut items = keys.feed(b"\x1b\x1b", start, false, false);
+    items.extend(keys.expire(after(start, 60), false));
     assert_eq!(
-        keys.feed(b"\x1b\x1b[A", start, false),
+        items,
+        vec![CardInput::Bytes(b"\x1b".to_vec()), CardInput::Leave],
+        "Esc Esc in one read: the first reaches the Tick, the second leaves"
+    );
+
+    let mut keys = CardKeys::default();
+    assert!(keys.feed(b"\x1b", start, false, false).is_empty());
+    assert_eq!(keys.expire(after(start, 60), false), bytes(b"\x1b"));
+    assert!(
+        keys.feed(b"\x1b", after(start, 299), false, false)
+            .is_empty()
+    );
+    assert_eq!(
+        keys.expire(after(start, 360), false),
+        vec![CardInput::Leave],
+        "a second Esc 299 ms later"
+    );
+
+    let mut keys = CardKeys::default();
+    assert!(keys.feed(b"\x1b", start, false, false).is_empty());
+    assert_eq!(keys.expire(after(start, 60), false), bytes(b"\x1b"));
+    assert!(
+        keys.feed(b"\x1b", after(start, 300), false, false)
+            .is_empty()
+    );
+    assert_eq!(
+        keys.expire(after(start, 360), false),
+        bytes(b"\x1b"),
+        "300 ms later it is another first Esc"
+    );
+    assert!(
+        keys.feed(b"\x1b", after(start, 400), false, false)
+            .is_empty()
+    );
+    assert_eq!(
+        keys.expire(after(start, 460), false),
+        vec![CardInput::Leave],
+        "and the next one leaves"
+    );
+}
+
+#[test]
+fn another_key_between_two_escapes_keeps_them_both_for_the_tick() {
+    let start = Instant::now();
+    let mut keys = CardKeys::default();
+    assert!(keys.feed(b"\x1b", start, false, false).is_empty());
+    assert_eq!(keys.expire(after(start, 60), false), bytes(b"\x1b"));
+    assert_eq!(
+        keys.feed(b"i", after(start, 100), false, false),
+        bytes(b"i")
+    );
+    assert!(
+        keys.feed(b"\x1b", after(start, 150), false, false)
+            .is_empty()
+    );
+    assert_eq!(keys.expire(after(start, 210), false), bytes(b"\x1b"));
+
+    let mut keys = CardKeys::default();
+    assert_eq!(
+        keys.feed(b"\x1bx", start, false, false),
+        bytes(b"\x1bx"),
+        "Esc and a key in one read are Alt and that key"
+    );
+    assert_eq!(
+        keys.feed(b"\x1b\x1b[A", start, false, false),
         bytes(b"\x1b\x1b[A"),
         "Esc then an arrow"
     );
-    assert!(keys.expire(after(start, 1000)).is_empty());
+    assert!(keys.expire(after(start, 1000), false).is_empty());
+}
+
+#[test]
+fn a_read_only_card_leaves_on_a_lone_escape() {
+    let start = Instant::now();
+    let mut keys = CardKeys::default();
+    assert!(keys.feed(b"\x1b", start, false, true).is_empty());
+    assert_eq!(keys.expire(after(start, 60), true), vec![CardInput::Leave]);
+    assert_eq!(
+        keys.feed(b"\x1b[A", start, false, true),
+        bytes(b"\x1b[A"),
+        "an arrow is no Esc"
+    );
+    assert_eq!(keys.escape(start, true), vec![CardInput::Leave]);
 }
 
 #[test]
@@ -65,11 +124,11 @@ fn sequences_and_control_keys_reach_the_tick_unchanged() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
     let typed = b"\x02\x03\x1d\x1bOA\x1b[1;5C\x1bjq\x7f\xe8\x85\xbe";
-    assert_eq!(keys.feed(typed, start, false), bytes(typed));
-    let mut split = keys.feed(b"\x1b", start, false);
-    split.extend(keys.feed(b"[B", after(start, 5), false));
+    assert_eq!(keys.feed(typed, start, false, false), bytes(typed));
+    let mut split = keys.feed(b"\x1b", start, false, false);
+    split.extend(keys.feed(b"[B", after(start, 5), false, false));
     assert_eq!(split, bytes(b"\x1b[B"), "an arrow split across reads");
-    assert!(keys.expire(after(start, 1000)).is_empty());
+    assert!(keys.expire(after(start, 1000), false).is_empty());
 }
 
 #[test]
@@ -77,7 +136,7 @@ fn focus_reports_go_to_the_console_and_a_kitty_escape_counts_as_escape() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
     assert_eq!(
-        keys.feed(b"a\x1b[Ib\x1b[O", start, false),
+        keys.feed(b"a\x1b[Ib\x1b[O", start, false, false),
         vec![
             CardInput::Bytes(b"a".to_vec()),
             CardInput::Focus(true),
@@ -85,8 +144,12 @@ fn focus_reports_go_to_the_console_and_a_kitty_escape_counts_as_escape() {
             CardInput::Focus(false),
         ]
     );
-    assert!(keys.feed(b"\x1b[27u", start, false).is_empty());
-    assert_eq!(keys.expire(after(start, 400)), vec![CardInput::Leave]);
+    assert_eq!(keys.feed(b"\x1b[27u", start, false, false), bytes(b"\x1b"));
+    assert_eq!(
+        keys.feed(b"\x1b[27;1:2u", after(start, 100), false, false),
+        vec![CardInput::Leave],
+        "a repeated kitty Esc is the second of a pair"
+    );
 }
 
 #[test]
@@ -94,14 +157,14 @@ fn pasted_text_is_never_a_key_and_its_markers_reach_only_a_tick_that_asked_for_t
     let start = Instant::now();
     let mut keys = CardKeys::default();
     assert_eq!(
-        keys.feed(b"\x1b[200~a\x1bb\x1b[201~", start, true),
+        keys.feed(b"\x1b[200~a\x1bb\x1b[201~", start, true, false),
         bytes(b"\x1b[200~a\x1bb\x1b[201~")
     );
     assert_eq!(keys.deadline(), None, "an Esc inside the paste is text");
 
     let mut keys = CardKeys::default();
-    let mut sent = keys.feed(b"\x1b[200~one\x1b[2", start, false);
-    sent.extend(keys.feed(b"01~two", start, false));
+    let mut sent = keys.feed(b"\x1b[200~one\x1b[2", start, false, false);
+    sent.extend(keys.feed(b"01~two", start, false, false));
     assert_eq!(
         sent,
         vec![
@@ -113,13 +176,13 @@ fn pasted_text_is_never_a_key_and_its_markers_reach_only_a_tick_that_asked_for_t
 }
 
 #[test]
-fn mouse_and_focus_reports_after_an_escape_neither_send_it_nor_stop_it_leaving() {
+fn mouse_and_focus_reports_between_two_escapes_neither_reach_the_tick_nor_break_the_pair() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
-    assert!(keys.feed(b"\x1b", start, false).is_empty());
-    assert!(keys.expire(after(start, 60)).is_empty());
+    assert!(keys.feed(b"\x1b", start, false, false).is_empty());
+    assert_eq!(keys.expire(after(start, 60), false), bytes(b"\x1b"));
     assert_eq!(
-        keys.feed(b"\x1b[<64;3;4M", after(start, 100), false),
+        keys.feed(b"\x1b[<64;3;4M", after(start, 100), false, false),
         vec![CardInput::Mouse(SgrMouse {
             code: 64,
             column: 3,
@@ -129,25 +192,32 @@ fn mouse_and_focus_reports_after_an_escape_neither_send_it_nor_stop_it_leaving()
         "a wheel sends no Esc to the Tick"
     );
     assert_eq!(
-        keys.feed(b"\x1b[O", after(start, 150), false),
+        keys.feed(b"\x1b[O", after(start, 150), false, false),
         vec![CardInput::Focus(false)]
     );
     assert_eq!(
-        keys.expire(after(start, 400)),
+        keys.feed(b"\x1b", after(start, 200), false, false),
+        Vec::new()
+    );
+    assert_eq!(
+        keys.expire(after(start, 260), false),
         vec![CardInput::Leave],
-        "the lone Esc still leaves"
+        "the second Esc still leaves"
     );
 
     let mut keys = CardKeys::default();
     assert_eq!(
-        keys.feed(b"\x1b\x1b[<0;1;1M", start, false),
-        vec![CardInput::Mouse(SgrMouse {
-            code: 0,
-            column: 1,
-            row: 1,
-            pressed: true
-        })],
-        "an Esc and a click in one read: no Esc for the Tick"
+        keys.feed(b"\x1b\x1b[<0;1;1M", start, false, false),
+        vec![
+            CardInput::Bytes(b"\x1b".to_vec()),
+            CardInput::Mouse(SgrMouse {
+                code: 0,
+                column: 1,
+                row: 1,
+                pressed: true
+            })
+        ],
+        "an Esc and a click in one read: the Esc was alone, the click is the Console's"
     );
 }
 
@@ -156,33 +226,45 @@ fn a_paste_whose_end_never_arrives_ends_once_it_goes_quiet() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
     assert_eq!(
-        keys.feed(b"\x1b[200~text\x1b[20", start, true),
+        keys.feed(b"\x1b[200~text\x1b[20", start, true, false),
         bytes(b"\x1b[200~text")
     );
     assert_eq!(keys.deadline(), Some(start + PASTE_IDLE));
     assert!(
-        keys.expire(start + PASTE_IDLE - Duration::from_millis(1))
+        keys.expire(start + PASTE_IDLE - Duration::from_millis(1), false)
             .is_empty()
     );
     assert_eq!(
-        keys.expire(start + PASTE_IDLE),
+        keys.expire(start + PASTE_IDLE, false),
         bytes(b"\x1b[20\x1b[201~"),
         "the held tail and the end marker the Tick waits for"
     );
     assert_eq!(keys.deadline(), None);
-    assert_eq!(keys.feed(b"x\x1b", start + PASTE_IDLE, false), bytes(b"x"));
+    assert_eq!(
+        keys.feed(b"x\x1b", start + PASTE_IDLE, false, false),
+        bytes(b"x")
+    );
     assert!(keys.deadline().is_some(), "keys are keys again");
 
     let mut keys = CardKeys::default();
-    assert_eq!(keys.feed(b"\x1b[200~a", start, false), bytes(b"a"));
-    assert_eq!(keys.feed(b"b", after(start, 1200), false), bytes(b"b"));
+    assert_eq!(keys.feed(b"\x1b[200~a", start, false, false), bytes(b"a"));
+    assert_eq!(
+        keys.feed(b"b", after(start, 1200), false, false),
+        bytes(b"b")
+    );
     assert_eq!(
         keys.deadline(),
         Some(after(start, 1200) + PASTE_IDLE),
         "each pasted read restarts the wait"
     );
-    assert!(keys.expire(after(start, 1200) + PASTE_IDLE).is_empty());
-    assert_eq!(keys.feed(b"c", after(start, 5000), false), bytes(b"c"));
+    assert!(
+        keys.expire(after(start, 1200) + PASTE_IDLE, false)
+            .is_empty()
+    );
+    assert_eq!(
+        keys.feed(b"c", after(start, 5000), false, false),
+        bytes(b"c")
+    );
     assert_eq!(keys.deadline(), None, "the paste ended");
 }
 
@@ -191,7 +273,7 @@ fn mouse_reports_are_parsed_and_never_forwarded_as_they_came() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
     assert_eq!(
-        keys.feed(b"a\x1b[<0;12;5Mb\x1b[<0;12;5m", start, false),
+        keys.feed(b"a\x1b[<0;12;5Mb\x1b[<0;12;5m", start, false, false),
         vec![
             CardInput::Bytes(b"a".to_vec()),
             CardInput::Mouse(SgrMouse {
@@ -271,7 +353,19 @@ fn a_mouse_report_reaches_the_tick_only_as_its_mode_and_encoding_ask() {
 }
 
 fn demand(min_rows: u16, priority: u64) -> CardDemand {
-    CardDemand { min_rows, priority }
+    CardDemand {
+        min_rows,
+        max_rows: None,
+        priority,
+    }
+}
+
+fn growing(min_rows: u16, max_rows: u16, priority: u64) -> CardDemand {
+    CardDemand {
+        min_rows,
+        max_rows: Some(max_rows),
+        priority,
+    }
 }
 
 fn rows(screen: u16) -> Option<CardRows> {
@@ -282,21 +376,47 @@ fn rows(screen: u16) -> Option<CardRows> {
 }
 
 #[test]
-fn open_cards_get_their_minimum_and_share_what_the_list_leaves() {
+fn cards_get_exactly_their_minimum_and_leave_the_rest_below_the_list() {
     assert_eq!(
         allocate(30, 4, &[demand(6, 1), demand(9, 2)]),
         CardAllocation {
-            // 30 - 4 list rows - (1 + 6) - (1 + 9) = 9 spare rows, shared evenly.
-            cards: vec![rows(11), rows(13)],
+            cards: vec![rows(6), rows(9)],
             collapsed: 0,
         }
     );
     assert_eq!(
-        allocate(16, 2, &[demand(6, 1)]),
+        allocate(16, 2, &[demand(6, 1)]).cards,
+        vec![rows(6)],
+        "a card that declares no maximum never grows"
+    );
+}
+
+#[test]
+fn spare_height_goes_fairly_to_cards_that_declare_a_maximum() {
+    // 40 - 4 list rows - (1 + 6) - (1 + 6) - (1 + 8) = 13 spare rows.
+    assert_eq!(
+        allocate(40, 4, &[growing(6, 60, 1), demand(6, 2), growing(8, 60, 3)]).cards,
+        vec![rows(13), rows(6), rows(14)],
+        "shared evenly between the growing cards, the first ones taking what is left"
+    );
+    assert_eq!(
+        allocate(40, 4, &[growing(6, 8, 1), demand(6, 2), growing(8, 60, 3)]).cards,
+        vec![rows(8), rows(6), rows(19)],
+        "a card stops at its maximum and the other takes the rest"
+    );
+    assert_eq!(
+        allocate(40, 4, &[growing(6, 7, 1), growing(8, 9, 2)]).cards,
+        vec![rows(7), rows(9)],
+        "what no card can use stays empty"
+    );
+    assert_eq!(
+        allocate(15, 3, &[growing(6, 60, 1), growing(6, 60, u64::MAX)]),
         CardAllocation {
-            cards: vec![rows(13)],
-            collapsed: 0,
-        }
+            // 15 - 3 list rows - (1 + 6) - the collapsed line = 4 spare rows.
+            cards: vec![None, rows(10)],
+            collapsed: 1,
+        },
+        "no card grows into another one's minimum: the other collapses"
     );
 }
 
@@ -313,7 +433,7 @@ fn cards_that_do_not_fit_collapse_keeping_the_highest_priority() {
     assert_eq!(
         allocate(16, 3, &[demand(6, 1), demand(6, u64::MAX), demand(6, 2)]),
         CardAllocation {
-            cards: vec![None, rows(11), None],
+            cards: vec![None, rows(6), None],
             collapsed: 2,
         },
         "the focused card stays first"
@@ -406,7 +526,12 @@ fn the_focused_card_rule_is_heavy_and_accented() {
             .iter()
             .all(|span| span.role == Some(Role::Accent))
     );
-    let noted = rule_line(24, false, Some("terminal too short"), display);
+    let noted = rule_line(
+        24,
+        false,
+        Some(&CardNote::plain("terminal too short")),
+        display,
+    );
     assert_eq!(noted.text(), "── terminal too short ──");
 }
 
@@ -462,15 +587,16 @@ async fn a_view_whose_tickhost_stops_reading_ends_and_closes_its_connection() {
     use tokio::io::AsyncReadExt;
     let (local, mut remote) = tokio::net::UnixStream::pair().unwrap();
     let (_unread, writer) = local.into_split();
-    let screen = Arc::new(Mutex::new(CardScreen {
-        parser: vt100::Parser::new(6, 30, 0),
-        ended: None,
-    }));
+    let screen = Arc::new(Mutex::new(CardScreen::new(vt100::Parser::new(6, 30, 0))));
     let (requests, queued) = mpsc::channel(CARD_REQUESTS);
     let reader = tokio::spawn(std::future::pending::<()>());
     let writing = tokio::spawn(write_requests(
         writer,
         queued,
+        CardSize {
+            rows: 6,
+            columns: 30,
+        },
         reader.abort_handle(),
         screen.clone(),
         Arc::new(Notify::new()),
@@ -498,4 +624,171 @@ async fn a_view_whose_tickhost_stops_reading_ends_and_closes_its_connection() {
         .await
         .expect("the view's connection closes, which detaches it")
         .unwrap();
+}
+
+fn size(columns: u16) -> CardSize {
+    CardSize { rows: 6, columns }
+}
+
+#[test]
+fn a_lone_resize_goes_at_once_and_a_burst_sends_only_its_latest_size_per_interval() {
+    let start = tokio::time::Instant::now();
+    let at = |milliseconds| start + Duration::from_millis(milliseconds);
+    let mut pacing = ResizePacing::new(size(40));
+    assert_eq!(pacing.request(size(40), at(0)), None, "the Tick has it");
+    assert_eq!(
+        pacing.request(size(39), at(0)),
+        Some(size(39)),
+        "a lone change"
+    );
+    assert_eq!(pacing.request(size(38), at(10)), None);
+    assert_eq!(pacing.request(size(37), at(20)), None);
+    assert_eq!(pacing.deadline(), Some(at(100)));
+    assert_eq!(pacing.due(at(99)), None);
+    assert_eq!(pacing.due(at(100)), Some(size(37)), "only the latest size");
+    assert_eq!(pacing.deadline(), None);
+    assert_eq!(
+        pacing.request(size(36), at(150)),
+        None,
+        "still within the interval"
+    );
+    assert_eq!(
+        pacing.request(size(37), at(160)),
+        None,
+        "back to the size the Tick has"
+    );
+    assert_eq!(pacing.deadline(), None, "so nothing waits");
+    assert_eq!(
+        pacing.request(size(30), at(400)),
+        Some(size(30)),
+        "a quiet spell ended"
+    );
+}
+
+#[test]
+fn a_flush_sends_the_waiting_size_at_once() {
+    let start = tokio::time::Instant::now();
+    let at = |milliseconds| start + Duration::from_millis(milliseconds);
+    let mut pacing = ResizePacing::new(size(40));
+    assert_eq!(pacing.flush(at(0)), None, "nothing waits");
+    pacing.request(size(39), at(0));
+    pacing.request(size(30), at(5));
+    assert_eq!(pacing.flush(at(6)), Some(size(30)));
+    assert_eq!(pacing.deadline(), None);
+    assert_eq!(
+        pacing.request(size(29), at(50)),
+        None,
+        "the flush counts as a send"
+    );
+}
+
+/// The resizes a view sent its Tickhost, read from the other end of its connection.
+async fn sent_resizes(
+    remote: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Vec<u64> {
+    let mut columns = Vec::new();
+    while let Ok(Ok(Some(frame))) = tokio::time::timeout(
+        Duration::from_millis(1),
+        hosted::read_frame(remote, ATTACH_REQUEST_FRAME_BYTES),
+    )
+    .await
+    {
+        if frame["method"] == "resize" {
+            columns.push(frame["params"]["size"]["columns"].as_u64().unwrap());
+        }
+    }
+    columns
+}
+
+fn spawn_writer(
+    local: tokio::net::UnixStream,
+) -> (mpsc::Sender<CardRequest>, tokio::task::JoinHandle<()>) {
+    let (_unread, writer) = local.into_split();
+    let screen = Arc::new(Mutex::new(CardScreen::new(vt100::Parser::new(6, 40, 0))));
+    let (requests, queued) = mpsc::channel(CARD_REQUESTS);
+    let reader = tokio::spawn(std::future::pending::<()>());
+    let writing = tokio::spawn(write_requests(
+        writer,
+        queued,
+        size(40),
+        reader.abort_handle(),
+        screen,
+        Arc::new(Notify::new()),
+        CARD_WRITE_TIMEOUT,
+    ));
+    (requests, writing)
+}
+
+#[tokio::test(start_paused = true)]
+async fn dragging_across_many_columns_sends_a_few_resizes_ending_with_the_final_size() {
+    let (local, remote) = tokio::net::UnixStream::pair().unwrap();
+    let (remote, _remote_writer) = remote.into_split();
+    let mut remote = tokio::io::BufReader::new(remote);
+    let (requests, _writing) = spawn_writer(local);
+    let columns: Vec<u16> = (20..60).collect();
+    for column in &columns {
+        requests
+            .send(CardRequest::Resize(size(*column)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(CARD_RESIZE_INTERVAL).await;
+    let sent = sent_resizes(&mut remote).await;
+    assert!(
+        sent.len() <= 1 + columns.len() * 10 / 100 + 1,
+        "{} changes over {}ms sent {sent:?}",
+        columns.len(),
+        columns.len() * 10
+    );
+    assert_eq!(sent.first(), Some(&20), "the first change goes at once");
+    assert_eq!(
+        sent.last(),
+        Some(&59),
+        "the final size goes once the drag stops"
+    );
+    assert_eq!(sent.iter().filter(|column| **column == 59).count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_release_sends_the_final_size_at_once_and_a_lone_change_never_waits() {
+    let (local, remote) = tokio::net::UnixStream::pair().unwrap();
+    let (remote, _remote_writer) = remote.into_split();
+    let mut remote = tokio::io::BufReader::new(remote);
+    let (requests, _writing) = spawn_writer(local);
+    requests.send(CardRequest::Resize(size(30))).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        [30],
+        "a lone change goes at once"
+    );
+    requests.send(CardRequest::Resize(size(31))).await.unwrap();
+    requests.send(CardRequest::Resize(size(32))).await.unwrap();
+    requests.send(CardRequest::FlushResize).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        [32],
+        "the release sends the final size without waiting out the interval"
+    );
+    tokio::time::sleep(CARD_RESIZE_INTERVAL * 2).await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        Vec::<u64>::new(),
+        "and only once"
+    );
+}
+
+#[test]
+fn an_ended_ticks_note_takes_its_rows_state_colour() {
+    let display = DisplayProfile::default();
+    let note = CardNote::ended("exited 101".into(), Role::ErrorMark);
+    let rule = rule_line(24, false, Some(&note), display);
+    assert_eq!(rule.text(), "── exited 101 ──────────");
+    assert!(
+        rule.spans
+            .iter()
+            .any(|span| span.text.contains("exited 101") && span.role == Some(Role::ErrorMark))
+    );
 }

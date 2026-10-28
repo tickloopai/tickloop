@@ -111,10 +111,12 @@ impl Agent {
         title: Option<String>,
         is_terminal: bool,
         min_rows: Option<u16>,
+        max_rows: Option<u16>,
     ) {
         let member = chat.snapshot.monitor.record_opened(instance.clone(), title);
         member.is_terminal = is_terminal;
         member.min_rows = min_rows;
+        member.max_rows = max_rows;
         // What the instance did before it joined is no news for this Chat.
         chat.snapshot.monitor.mark_handled(instance, now_ms());
         self.record_monitor_membership(
@@ -139,16 +141,17 @@ impl Agent {
                     .iter()
                     .find(|member| &member.instance == lost)
                     .and_then(|member| member.title.clone());
-                let (is_terminal, min_rows) = membership
+                let (is_terminal, min_rows, max_rows) = membership
                     .members
                     .iter()
                     .find(|member| &member.instance == lost)
-                    .map_or((false, None), |member| {
-                        (member.is_terminal, member.min_rows)
+                    .map_or((false, None, None), |member| {
+                        (member.is_terminal, member.min_rows, member.max_rows)
                     });
                 let member = membership.record_opened(reopened.clone(), title);
                 member.is_terminal = is_terminal;
                 member.min_rows = min_rows;
+                member.max_rows = max_rows;
                 membership.mark_handled(reopened, now_ms());
                 membership.remove(lost.clone());
             })
@@ -170,14 +173,16 @@ impl Agent {
         Ok(membership)
     }
 
-    /// The user opened the instance's Monitor row: its updates so far count as handled.
-    pub async fn mark_monitor_handled(
+    /// Records that a turn of the Chat took in the instance's updates so far, as a delivery does;
+    /// for tests that need the Agent's read state without running a turn.
+    #[doc(hidden)]
+    pub async fn take_in_monitor_updates_for_tests(
         &self,
         chat_id: ChatId,
         instance: InstanceRef,
     ) -> Result<MonitorMembership, AgentError> {
         self.update_monitor(chat_id, |membership| {
-            membership.mark_handled(instance, now_ms());
+            membership.mark_taken_in(instance, now_ms());
         })
         .await
     }

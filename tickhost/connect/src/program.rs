@@ -20,7 +20,10 @@ const INVALID_ARGUMENTS: &str = "InvalidArguments";
 /// The program an open runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedExecutable {
-    /// The canonical path of the program.
+    /// The absolute path the program is invoked by, with its symbolic links kept: a program may
+    /// dispatch on the name or directory it was invoked by, like a virtual environment's
+    /// `bin/python` or MacVim's `vim` link to `mvim`. What it runs is bound by the identity of
+    /// the file this path names, never by the path.
     pub path: PathBuf,
     /// The installed Tick package whose program it is.
     pub plugin: Option<InstalledPlugin>,
@@ -62,12 +65,18 @@ fn resolve_executable_from(
 ) -> Result<ResolvedExecutable, HostError> {
     if program.contains('/') {
         let path = executable_file(&cwd.join(program)).ok_or_else(|| not_found(program))?;
-        let package = packages.and_then(|packages| installed_plugin_of(&path, packages));
+        let package = packages.and_then(|packages| installed_plugin_named_by(&path, packages));
         if let Some(plugin) = &package
             && !plugin.enabled
         {
             return Err(plugin_disabled(plugin.name()));
         }
+        // A package's program runs by the path its package declares, the only one its
+        // credentials go to, however the open named it.
+        let path = package
+            .as_ref()
+            .and_then(|plugin| plugin_program(plugin).map(|(invoked, _)| invoked))
+            .unwrap_or(path);
         return Ok(ResolvedExecutable {
             path,
             plugin: package,
@@ -145,27 +154,47 @@ pub fn uninstalled_plugin_of(path: &Path, plugins: &PluginStore) -> Option<Strin
     matches!(plugins.get(name), Err(PluginError::NotInstalled(_))).then(|| name.to_owned())
 }
 
-/// The installed plugin whose canonical program path is exactly `path`.
+/// The installed plugin whose program is exactly `path`: the path an open runs it by, or its
+/// canonical path that earlier opens recorded. A link to the program or another path that
+/// leads to it is none: it could name another program by the time it runs.
 pub fn installed_plugin_of(path: &Path, plugins: &PluginStore) -> Option<InstalledPlugin> {
+    installed_plugin_where(plugins, |invoked, canonical| {
+        path == invoked || path == canonical
+    })
+}
+
+/// The installed plugin whose program `path` leads to, through links or not.
+fn installed_plugin_named_by(path: &Path, plugins: &PluginStore) -> Option<InstalledPlugin> {
+    let canonical = path.canonicalize().ok()?;
+    installed_plugin_where(plugins, |_, program| canonical == program)
+}
+
+fn installed_plugin_where(
+    plugins: &PluginStore,
+    matches: impl Fn(&Path, &Path) -> bool,
+) -> Option<InstalledPlugin> {
     plugins
         .installed()
         .ok()?
         .plugins
         .into_iter()
         .find(|plugin| {
-            plugin
-                .executable()
-                .and_then(|program| executable_file(&program))
-                .as_deref()
-                == Some(path)
+            plugin_program(plugin).is_some_and(|(invoked, canonical)| matches(&invoked, &canonical))
         })
 }
 
-/// The canonical path of `path` when it is an executable file.
+/// The path an open runs `plugin`'s program by, and its canonical path.
+fn plugin_program(plugin: &InstalledPlugin) -> Option<(PathBuf, PathBuf)> {
+    let invoked = executable_file(&plugin.executable()?)?;
+    let canonical = invoked.canonicalize().ok()?;
+    Some((invoked, canonical))
+}
+
+/// The absolute path of `path`, its links kept, when it names an executable file.
 fn executable_file(path: &Path) -> Option<PathBuf> {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .then(|| path.canonicalize().ok())
+        .then(|| std::path::absolute(path).ok())
         .flatten()
 }
 
@@ -242,7 +271,7 @@ mod tests {
         assert_eq!(
             resolve("tick-other").unwrap(),
             ResolvedExecutable {
-                path: path_bin.join("tick-other").canonicalize().unwrap(),
+                path: path_bin.join("tick-other"),
                 plugin: None,
             }
         );
@@ -251,7 +280,7 @@ mod tests {
         assert_eq!(
             resolve("tick-sample").unwrap(),
             ResolvedExecutable {
-                path: path_bin.join("tick-sample").canonicalize().unwrap(),
+                path: path_bin.join("tick-sample"),
                 plugin: None,
             }
         );
@@ -267,6 +296,113 @@ mod tests {
             "executable not found: tick-",
             "only a Tick package name gets the install hint"
         );
+    }
+
+    /// A program may dispatch on the name or directory it was invoked by, like a virtual
+    /// environment's `bin/python` link or MacVim's `vim` link to `mvim`, so its links stay.
+    #[test]
+    fn a_program_keeps_the_path_it_is_invoked_by_with_its_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("real/report-invocation");
+        write_executable(&target);
+        let venv_bin = directory.path().join("venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let invoked = venv_bin.join("python");
+        std::os::unix::fs::symlink(&target, &invoked).unwrap();
+        let resolve = |program: &str, search_path: &str| {
+            resolve_executable_from(program, directory.path(), OsStr::new(search_path), None)
+                .unwrap()
+                .path
+        };
+
+        assert_eq!(resolve("python", venv_bin.to_str().unwrap()), invoked);
+        assert_eq!(
+            resolve("python", "venv/bin"),
+            invoked,
+            "a relative PATH entry"
+        );
+        assert_eq!(resolve("venv/bin/python", ""), invoked);
+        assert_eq!(resolve("./venv/bin/python", ""), invoked);
+        assert_eq!(resolve(invoked.to_str().unwrap(), ""), invoked);
+        assert_ne!(
+            invoked.canonicalize().unwrap(),
+            invoked,
+            "the program is reached through a link"
+        );
+    }
+
+    #[test]
+    fn a_link_to_an_installed_program_is_still_that_packages() {
+        let directory = tempfile::tempdir().unwrap();
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
+        let sample = install_package(&packages, &directory.path().join("sources"), "sample");
+        let program = sample.executable().unwrap();
+        let link = directory.path().join("links/sample-tick");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&program, &link).unwrap();
+
+        let resolved = resolve_executable_from(
+            "links/sample-tick",
+            directory.path(),
+            OsStr::new(""),
+            Some(&packages),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.path, program,
+            "it runs by the path its package declares"
+        );
+        assert_eq!(resolved.plugin.map(|plugin| plugin.id()), Some(sample.id()));
+        assert_eq!(
+            installed_plugin_of(&program, &packages).map(|plugin| plugin.id()),
+            Some(sample.id())
+        );
+        assert_eq!(
+            installed_plugin_of(&link, &packages),
+            None,
+            "credentials never go to a link that could be pointed elsewhere"
+        );
+    }
+
+    /// A package program that is itself a link inside its package runs by the declared path,
+    /// which, like the canonical path earlier opens recorded, is the package's.
+    #[test]
+    fn a_package_program_linked_inside_its_package_runs_by_its_declared_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sources/linked");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(
+            source.join(tick_packages::MANIFEST_FILE_NAME),
+            serde_json::json!({
+                "name": "linked",
+                "version": "1.0.0",
+                "description": "A test package",
+                "executable": "bin/tick-linked",
+                "protocol": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_executable(&source.join("lib/main"));
+        std::os::unix::fs::symlink("../lib/main", source.join("bin/tick-linked")).unwrap();
+        let packages = PluginStore::in_config_root(&directory.path().join("config"));
+        let linked = packages.install_path(&source).unwrap().plugin;
+        let declared = linked.executable().unwrap();
+        let canonical = declared.canonicalize().unwrap();
+        assert_ne!(declared, canonical);
+
+        for program in ["tick-linked", canonical.to_str().unwrap()] {
+            let resolved =
+                resolve_executable_from(program, directory.path(), OsStr::new(""), Some(&packages))
+                    .unwrap();
+            assert_eq!(resolved.path, declared, "{program}");
+        }
+        for recorded in [&declared, &canonical] {
+            assert_eq!(
+                installed_plugin_of(recorded, &packages).map(|plugin| plugin.id()),
+                Some(linked.id())
+            );
+        }
     }
 
     #[test]

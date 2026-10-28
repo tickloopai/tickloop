@@ -942,7 +942,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c included, go to the Tick until a lone esc leaves the card, which stays shown while the Tick keeps running; esc esc sends esc and a click outside leaves too; a Shell's screen only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card; a Shell's screen only shows it, and esc leaves it. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; n selects the next row with an unseen update. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -1427,16 +1427,14 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             .into_iter()
             .next()
             .ok_or("No conversation found to continue")?;
-        StartupChat::Resumed(
-            Box::new(open_saved_chat(&agent, recent.id, fork_session).await?),
-            true,
-        )
+        StartupChat::Resumed(Box::new(
+            open_saved_chat(&agent, recent.id, fork_session).await?,
+        ))
     } else if let Some(requested) = resume {
         match requested {
-            Some(chat) => StartupChat::Resumed(
-                Box::new(open_saved_chat(&agent, chat, fork_session).await?),
-                true,
-            ),
+            Some(chat) => {
+                StartupChat::Resumed(Box::new(open_saved_chat(&agent, chat, fork_session).await?))
+            }
             None => StartupChat::Picker {
                 as_new_chat: fork_session,
             },
@@ -1517,7 +1515,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
 /// before startup; `-r` opens the picker.
 enum StartupChat {
     New,
-    Resumed(Box<tickloop_harness::protocol::ChatSnapshot>, bool),
+    Resumed(Box<tickloop_harness::protocol::ChatSnapshot>),
     Picker {
         as_new_chat: bool,
     },
@@ -1542,7 +1540,7 @@ async fn open_exact_chat(
         agent.resume_chat(chat.into()).await
     };
     match opened {
-        Ok(snapshot) => Ok(StartupChat::Resumed(Box::new(snapshot), true)),
+        Ok(snapshot) => Ok(StartupChat::Resumed(Box::new(snapshot))),
         Err(error) if error.code == AccessErrorCode::NotFound => {
             if let Some(console) = handoff {
                 console.leave_chat();
@@ -1556,7 +1554,7 @@ async fn open_exact_chat(
                 .snapshot(chat.into())
                 .await
                 .map_err(|error| format!("Failed to open Chat {}: {error}", chat.public()))?;
-            Ok(StartupChat::Resumed(Box::new(snapshot), false))
+            Ok(StartupChat::Resumed(Box::new(snapshot)))
         }
         Err(error) => Err(format!("Failed to resume Chat {}: {error}", chat.public())),
     }
@@ -2126,9 +2124,9 @@ async fn interact_with_herdr(
                 console.set_status(&safe_text(&error))?;
             }
         }
-        StartupChat::Resumed(snapshot, has_history) => {
+        StartupChat::Resumed(snapshot) => {
             learn_agent_colors(console, agent, &snapshot).await?;
-            show_opened_chat(console, agent, &snapshot, has_history)?;
+            show_opened_chat(console, agent, &snapshot)?;
             selected_chat = Some(snapshot.id);
             displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
             tools.restore_snapshot(&snapshot);
@@ -3254,7 +3252,7 @@ async fn interact_with_herdr(
                     match agent.resume_chat(chat).await {
                         Ok(snapshot)=>{
                             console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                            overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot,true)?;
+                            overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot)?;
                             selected_chat=Some(snapshot.id);message_groups=MessageGroups::default();
                             displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
                             tools.restore_snapshot(&snapshot);
@@ -3907,7 +3905,7 @@ async fn interact_with_herdr(
                             match open_chat(agent,line.trim(),None).await {
                                 Ok(snapshot)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
+                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot)?;selected_chat=Some(snapshot.id);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
@@ -4535,7 +4533,7 @@ async fn interact_with_herdr(
                             match open_chat(agent, &line, selected_chat).await {
                                 Ok(snapshot) => {
                                     learn_agent_colors(console,agent,&snapshot).await?;
-                                    show_opened_chat(console,agent,&snapshot,true)?;
+                                    show_opened_chat(console,agent,&snapshot)?;
                                     selected_chat=Some(snapshot.id);
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
@@ -7775,12 +7773,13 @@ fn write_warning(console: &Console, warning: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes the history of the Chat just brought to the foreground into the view.
+/// Writes the history of the Chat just brought to the foreground into the view. Like Claude Code,
+/// no line follows the history: the input itself invites the next message, and sending it still
+/// resumes receiving Triggers when they were paused.
 fn show_opened_chat(
     console: &Console,
     agent: &Agent,
     snapshot: &tickloop_harness::protocol::ChatSnapshot,
-    has_history: bool,
 ) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
     console.reset_chat(snapshot.id.into())?;
@@ -7791,21 +7790,7 @@ fn show_opened_chat(
         write_warning(console, &warning)?;
     }
     show_settings_warnings(console, agent.user_settings_warnings(snapshot.id.into()))?;
-    workflows::write_public_history(console, snapshot)?;
-    if has_history {
-        let receiving_hint = if snapshot.chat_loop.receiving.is_receiving() {
-            "."
-        } else {
-            "; sending it resumes receiving Triggers."
-        };
-        outln!(
-            console,
-            "\nHistory opened. Enter a message to continue this Chat{receiving_hint}"
-        );
-    } else {
-        outln!(console, "Enter a message to continue this Chat.");
-    }
-    Ok(())
+    workflows::write_public_history(console, snapshot)
 }
 
 /// What a background notice calls an Agent before this View has received its snapshot.
@@ -11277,7 +11262,10 @@ mod status_agents_help_tests {
         }
 
         assert!(help.contains(
-            "a lone esc leaves the card, which stays shown while the Tick keeps running; esc esc sends esc"
+            "esc esc leaves the card back to the list, which shows other cards with space"
+        ));
+        assert!(help.contains(
+            "a click outside leaves too and then acts where it landed, so a click on another row shows its card"
         ));
     }
 }

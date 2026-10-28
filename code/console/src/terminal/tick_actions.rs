@@ -120,8 +120,6 @@ pub struct PreparedTickAction {
     pub instance: String,
     pub key: char,
     pub(super) backend: Arc<dyn TickActionBackend>,
-    /// The Monitor row the user opened with this action; its updates so far become handled.
-    opened: Option<tick_protocol::InstanceRef>,
 }
 impl std::fmt::Debug for PreparedTickAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,14 +139,7 @@ impl PreparedTickAction {
             instance: instance.into(),
             key,
             backend,
-            opened: None,
         }
-    }
-
-    /// Marks this as the user opening `row` in Monitor.
-    pub(super) fn opening(mut self, row: tick_protocol::InstanceRef) -> Self {
-        self.opened = Some(row);
-        self
     }
 }
 #[derive(Clone, Copy)]
@@ -174,21 +165,10 @@ impl TickActionContext<'_> {
     }
 }
 
-/// Runs the action. Opening a Monitor row counts as the user handling the instance's updates so
-/// far.
+/// Runs the action. Opening a row never handles its updates: read state belongs to the Agent.
 pub(super) async fn execute(
     action: PreparedTickAction,
     context: TickActionContext<'_>,
 ) -> Result<(), String> {
-    let opened = action.opened.clone();
-    let (agent, console, chat) = (context.agent, context.console, context.chat);
-    action.backend.execute(context).await?;
-    if let Some(instance) = opened {
-        let membership = agent
-            .mark_monitor_handled(chat, instance)
-            .await
-            .map_err(|error| format!("Cannot mark the update as seen: {error}"))?;
-        console.update_monitor_membership(chat, membership)?;
-    }
-    Ok(())
+    action.backend.execute(context).await
 }

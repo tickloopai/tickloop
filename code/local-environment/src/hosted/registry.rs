@@ -1035,4 +1035,33 @@ mod tests {
         drop(held);
         assert_eq!(locked(&root), 0, "a waiter that gave up leaves nothing");
     }
+
+    /// A record names the program by the path it was invoked with, and an earlier one by its
+    /// canonical path; both bind the file the path names, so either reopens only that file.
+    #[test]
+    fn a_launch_through_a_link_has_the_identity_of_the_program_it_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("program");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let other = directory.path().join("other");
+        std::fs::write(&other, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&program, &link).unwrap();
+        let identity = |path: &Path| {
+            LaunchIdentity::of(&[path.to_string_lossy().into_owned()], directory.path()).unwrap()
+        };
+
+        let invoked = identity(&link);
+        assert_eq!(invoked, identity(&program.canonicalize().unwrap()));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_ne!(
+            identity(&link),
+            invoked,
+            "a retargeted link names another program"
+        );
+    }
 }

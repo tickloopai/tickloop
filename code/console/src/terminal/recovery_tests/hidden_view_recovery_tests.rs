@@ -245,7 +245,7 @@ async fn run_hidden_view_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
         user_settings: None,
     };
     let interaction_agent = agent.clone();
@@ -538,7 +538,7 @@ fn run_hidden_view_pty(route: &str) {
         _master: pair.master,
         timeout: LAGGED_DRAIN_TIMEOUT,
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"Continue the same bounded cadence task.\r");
     fixture.wait_for("Buffered hidden reply ready");
     fixture.send(b"\x1b[D");

@@ -270,7 +270,7 @@ async fn run_child_config_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(root).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(root).await.unwrap())),
         user_settings: config_root
             .as_deref()
             .map(tickloop_code_settings::UserSettings::in_root),

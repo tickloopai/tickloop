@@ -297,7 +297,7 @@ async fn run_late_receipt_fixture() {
         let chat = agent.create_chat(workdir.clone()).await.unwrap();
         let execution = agent.reference(chat).await.unwrap();
         tokio::task::spawn_local(answer_daemon_probes(adapter.clone(), execution));
-        StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false)
+        StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()))
     };
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();

@@ -41,6 +41,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         tone: crate::monitor_rows::StatusTone::Neutral,
         updated_at_ms: Some(1000),
         update: None,
+        ended: None,
         resources: None,
         actions: vec![
             crate::monitor_rows::MonitorAction {
@@ -211,6 +212,7 @@ fn monitor_selection_restores_per_agent_and_ignores_obsolete_mouse_targets() {
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
             update: None,
+            ended: None,
             resources: None,
             actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b", true),
         }],
@@ -298,7 +300,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::Tick(tick.instance.clone()),
             "exit 0",
-            "enter open · x remove · esc input",
+            "enter open · x remove · tab next · esc input",
         ),
         (
             MonitorTarget::ScheduledTask(TASK_ID),
@@ -328,6 +330,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             }
             MonitorTarget::MoreScheduled => panic!("one scheduled task has no overflow row"),
             MonitorTarget::Card { .. } => panic!("no card is open"),
+            MonitorTarget::Unseen { .. } => panic!("no update is unseen"),
             MonitorTarget::Goal => {
                 assert!(state.monitor.is_goal_selected());
                 assert!(state.monitor.selected().is_none());
@@ -1379,6 +1382,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
             let instance = tick_protocol::InstanceRef::new("cal", "remote").unwrap();
             vec![TickDescriptor {
+                joined_at_ms: None,
                 instance: instance.clone(),
                 group: TickGroup {
                     order: 4,
@@ -1396,6 +1400,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
                 update: None,
                 resources: None,
                 running: true,
+                ended: None,
                 actions: vec![MonitorAction {
                     key: MONITOR_ENTER_KEY,
                     label: "details",
@@ -1554,6 +1559,7 @@ fn each_access_probes_its_own_members_beside_the_others() {
     ] {
         snapshot.monitor.members.push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             is_terminal: false,
             instance,
             title: Some(title.into()),
@@ -1610,6 +1616,7 @@ fn monitor_scrolls_continuously_across_pages_and_caches_earlier_rows() {
             .members
             .push(MonitorMember {
                 min_rows: None,
+                max_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: Some(format!("Tick {index:03}")),
@@ -1672,6 +1679,7 @@ fn probed_members_report_their_host_state_and_owner() {
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             is_terminal: false,
             instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
@@ -1729,6 +1737,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     let mut snapshot = chat_status(chat);
     snapshot.monitor.members.push(MonitorMember {
         min_rows: None,
+        max_rows: None,
         is_terminal: false,
         instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
@@ -2631,8 +2640,10 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
     core.shutdown().await;
 }
 
+/// Read state belongs to the Agent: the user opening a row, its detail or its card, and closing
+/// the detail again, leaves the row's updates unhandled.
 #[tokio::test]
-async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
+async fn opening_a_row_or_closing_its_detail_never_marks_its_updates_handled() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
@@ -2683,27 +2694,29 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
         action
     };
     execute(opened, context).await.unwrap();
-    let handled = agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .monitor
-        .handled_at(&quotes)
-        .unwrap();
-    assert!(handled > joined, "opening the row handled its updates");
+    {
+        let mut state = console.state.lock().unwrap();
+        assert!(
+            state.monitor.detail.is_some(),
+            "Enter opened the row's detail"
+        );
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none(),
+            "closing the detail asks the Agent nothing"
+        );
+        assert!(state.monitor.detail.is_none());
+    }
     assert_eq!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .monitor
-            .chat_status
-            .as_ref()
+        agent
+            .snapshot(chat)
+            .await
             .unwrap()
             .monitor
             .handled_at(&quotes),
-        Some(handled),
-        "the View shows the handled row at once"
+        Some(joined),
+        "the user opening the row left its updates to the Agent"
     );
     core.shutdown().await;
 }
@@ -4042,6 +4055,7 @@ fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_height
         for index in 0..130 {
             status.monitor.members.push(MonitorMember {
                 min_rows: None,
+                max_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: None,
@@ -4516,6 +4530,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
         }
         "hosted" | "terminal" => snapshot.monitor.members.push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
             is_terminal: content == "terminal",
             title: Some("New Tick".into()),
@@ -4688,6 +4703,7 @@ fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
             .members
             .push(MonitorMember {
                 min_rows: None,
+                max_rows: None,
                 instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
                 is_terminal: false,
                 title: Some("Later Tick".into()),
@@ -4765,6 +4781,7 @@ fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monit
         .members
         .push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             instance: row.instance.clone(),
             is_terminal: false,
             title: None,
@@ -5524,6 +5541,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
             let instance = tick_protocol::InstanceRef::new("calendar", "stream").unwrap();
             snapshot.monitor.members.push(MonitorMember {
                 min_rows: None,
+                max_rows: None,
                 instance: instance.clone(),
                 is_terminal: false,
                 title: Some("Stream Tick".into()),

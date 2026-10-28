@@ -107,7 +107,7 @@ async fn run_daemon_loss_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
         user_settings: None,
     };
     let result = interact(&agent, workdir, &console, input, startup, None).await;

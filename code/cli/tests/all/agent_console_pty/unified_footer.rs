@@ -150,7 +150,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     resumed
         .wait_for(
             "shared Task survives history load without model execution",
-            |frame| frame.contains("History opened.") && frame.contains("1 tasks (0 done, 1 open)"),
+            |frame| frame.contains("1 tasks (0 done, 1 open)"),
         )
         .await;
     assert!(requests.try_recv().is_err());
@@ -380,7 +380,15 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("Shells (2)")
     })
     .await;
+    // Rows keep the order they joined: Shift+Down selects the older Shell, `j` the newer one.
     pty.send(b"\x1b[1;2B");
+    pty.wait_for("the older Shell selected first", |frame| {
+        frame.lines().any(|line| {
+            line.contains(SELECTED_MARK) && line.contains("while [ ! -f first-finish ]")
+        })
+    })
+    .await;
+    pty.send(b"j");
     pty.wait_for("newest exact Shell selected", |frame| {
         frame.lines().any(|line| {
             line.contains(SELECTED_MARK) && line.contains("while [ ! -f second-finish ]")

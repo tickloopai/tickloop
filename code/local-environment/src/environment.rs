@@ -494,11 +494,13 @@ impl ExecutionPort for LocalPort {
                             title,
                             is_terminal,
                             min_rows,
+                            max_rows,
                         } => Some(OpenedExecution {
                             instance,
                             title,
                             is_terminal,
                             min_rows,
+                            max_rows,
                         }),
                         _ => None,
                     };
