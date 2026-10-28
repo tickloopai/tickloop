@@ -12,8 +12,8 @@ use tickloop_harness_protocol::mcp::ToolExposure;
 use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, CompactionMarker, Content, ContextBreakdown, ContextCategory,
     ContextCategoryUsage, ContextDraft, ContextItem, ContextTokenCounter, ContextToolServer,
-    GuidanceNote, HostNote, Message, Role, ToolDefinition, ToolSearchMode, ToolSearchPool,
-    UnavailableToolServer, message_content_tokens,
+    GuidanceNote, HostNote, Message, Protocol, Role, ToolDefinition, ToolSearchMode,
+    ToolSearchPool, UnavailableToolServer, message_content_tokens,
 };
 
 use crate::tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS, SearchSupport};
@@ -165,6 +165,7 @@ impl Agent {
             };
             SearchParts {
                 mode,
+                protocol: chat.snapshot.model.adapter().protocol(),
                 pool: discovery
                     .iter()
                     .filter(|tool| tool.exposure == ToolExposure::Search)
@@ -307,6 +308,8 @@ struct ContextParts {
 
 struct SearchParts {
     mode: ToolSearchMode,
+    /// The protocol that carries the deferred tools, which decides what native search counts.
+    protocol: Protocol,
     /// Tools only search reaches, with their servers, as a load would send them.
     pool: Vec<(String, ToolDefinition)>,
     unavailable: Vec<UnavailableToolServer>,
@@ -366,6 +369,29 @@ impl ContextParts {
                 )
             })
             .collect::<Vec<_>>();
+        let tool_search_index = self
+            .search
+            .as_ref()
+            .filter(|search| search.mode == ToolSearchMode::Native)
+            .map(|search| {
+                search
+                    .pool
+                    .iter()
+                    .map(|(server, definition)| {
+                        (
+                            server.clone(),
+                            definition.name.clone(),
+                            native_tool_search::deferred_tool_context_tokens(
+                                search.protocol,
+                                counter,
+                                definition,
+                            ),
+                        )
+                    })
+                    .filter(|(_, _, tokens)| *tokens > 0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let instruction_files = self
             .instruction_files
             .iter()
@@ -386,6 +412,10 @@ impl ContextParts {
                 mcp_tools.iter().map(|(_, _, tokens)| tokens).sum(),
             ),
             (
+                ContextCategory::ToolSearchIndex,
+                tool_search_index.iter().map(|(_, _, tokens)| tokens).sum(),
+            ),
+            (
                 ContextCategory::InstructionFiles,
                 counter.message_tokens(&self.user_context),
             ),
@@ -399,8 +429,7 @@ impl ContextParts {
             .sum::<u64>();
         let used_tokens = self.reported_total.unwrap_or(counted_total);
         // Service usage close to the count calibrates it; a total well beyond it holds something
-        // the count cannot see, such as definitions a vendor loads, so that part stands apart
-        // instead of inflating every category.
+        // the count cannot see, so that part stands apart instead of inflating every category.
         let unattributed = used_tokens
             .saturating_sub(counted_total.saturating_mul(100 + MAX_CALIBRATION_GAP_PERCENT) / 100);
         let unattributed = if unattributed > 0 {
@@ -468,6 +497,7 @@ impl ContextParts {
             free_tokens,
             system_tools: items(system_tools),
             mcp_tools: scale.servers(mcp_tools),
+            tool_search_index: scale.servers(tool_search_index),
             instruction_files: items(instruction_files),
             skills: items(skills),
             tool_search_results: items(split.search),
