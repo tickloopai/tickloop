@@ -179,3 +179,46 @@ async fn valid_settings_without_sandbox_or_with_it_disabled_keep_unsandboxed_she
         );
     }
 }
+
+#[tokio::test]
+async fn sandbox_linked_worktree_cwd_requires_approval_but_keeps_trusted_writable_roots() {
+    let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let folder = fixture.workspace.folder.as_ref().unwrap();
+    let sibling = fixture.root.path().join("linked");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet", "--template="])
+            .arg(folder)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(folder)
+            .args(["worktree", "add", "--quiet", "--orphan"])
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (agent, chat) = fixture.agent(
+        serde_json::json!({"command":"printf linked > note; printf folder > ../folder/note", "cwd":sibling}),
+        ExecutionMode::AcceptEdits,
+    ).await;
+    let (asked, result) = fixture.run_with_human_approval(&agent, chat, true).await;
+    assert!(
+        asked,
+        "a linked cwd outside Folder/additional directories needs ordinary approval"
+    );
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("note")).unwrap(),
+        "linked"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("note")).unwrap(),
+        "folder"
+    );
+}

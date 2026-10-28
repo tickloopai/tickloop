@@ -143,7 +143,7 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 
 Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`allowUnsandboxedCommands` 设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。
 
-`filesystem.allowWrite` 与 `denyWrite` 写字面路径：相对路径以 Chat 的 Folder 为基准，不随 Bash 的 `cwd` 改变，`~/` 指你的主目录。`cwd` 位于 Folder、附加目录和已验证 linked worktree 之外时走正常审批，沙箱仍保持原有可写范围。禁写规则和敏感路径优先。读取不受限制，但沙箱中的命令不能穿过敏感符号链接（读取也不行），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。
+`filesystem.allowWrite` 与 `denyWrite` 写字面路径：相对路径以 Chat 的 Folder 为基准，不随 Bash 的 `cwd` 改变，`~/` 指你的主目录。`cwd` 位于 Folder 和附加目录之外时走正常审批，沙箱仍保持原有可写范围。禁写规则和敏感路径优先。读取不受限制，但沙箱中的命令不能穿过敏感符号链接（读取也不行），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。
 
 HTTP 与 HTTPS（CONNECT）经过本机代理，沙箱中的命令从标准代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`）得到它；不遵循这些变量的命令也不能直连。`*.github.com` 这样的通配只匹配子域名，不包含域名本身。被拒的目标会写入命令输出，方便你知道该加哪条白名单。每个 Tickhost 的认证回环代理在其整个生命周期内保持端口绑定，每个 Shell 使用启动时冻结的白名单。
 

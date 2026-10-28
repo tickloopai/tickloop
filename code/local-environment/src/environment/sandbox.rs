@@ -93,9 +93,9 @@ fn prepare_policy(
     for path in &spec.additional_directories {
         writable_roots.push(Path::new(path).canonicalize().map_err(path_error)?);
     }
-    writable_roots.extend(tickloop_harness::base::git_worktree::sibling_linked_worktrees(&folder));
     let cwd = Path::new(&spec.cwd).canonicalize().map_err(path_error)?;
     let requires_approval = !writable_roots.iter().any(|root| cwd.starts_with(root));
+    writable_roots.extend(tickloop_harness::base::git_worktree::sibling_linked_worktrees(&folder));
     let mut protected_paths = Vec::new();
     for path in &config.filesystem.allow_write {
         let (resolved, anchors) =
