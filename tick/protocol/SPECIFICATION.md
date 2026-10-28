@@ -492,6 +492,17 @@ vim.api.nvim_create_autocmd('VimEnter', {
 vim.keymap.set('n', '<Esc>', function() io.stdout:write('\27]7777;tickloop;key=esc\7') end)
 ```
 
+<a id="s5-9"></a>
+
+### 5.9 Focus reports
+
+A Tick shown in a card can tell whether the person is typing into it, for example to show its key hints only then, with standard xterm focus reporting:
+
+- A Tick enables it by writing `CSI ? 1004 h` (`\x1b[?1004h`) to its terminal, alone or in a combined list such as `CSI ? 1004 ; 2004 h`, and disables it with `CSI ? 1004 l`.
+- While it is enabled, the host writes `ESC [ I` to the Tick's terminal when one of its views gains the keyboard, as a card does when the person enters it, and `ESC [ O` when none of its views has the keyboard any more. Right after the Tick enables it, the host writes the current state once.
+- With several views, the Tick has the focus while any of them has the keyboard.
+- The host never writes either sequence to a Tick that has not enabled focus reporting, and it never passes on the focus reports of the client's own terminal.
+
 <a id="s6"></a>
 
 ## 6. tick/read

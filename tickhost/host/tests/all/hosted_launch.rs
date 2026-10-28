@@ -1389,10 +1389,7 @@ async fn a_tick_that_wants_focus_reports_hears_whether_any_view_has_the_keyboard
     .unwrap();
     let python = which("python3");
     let opened = fixture
-        .open_terminal(
-            &mut controller,
-            &[&python, "-u", &script.to_string_lossy()],
-        )
+        .open_terminal(&mut controller, &[&python, "-u", &script.to_string_lossy()])
         .await;
     let (mut first_events, mut first_requests) =
         attach(&fixture, &opened, initial_size()).await.into_parts();

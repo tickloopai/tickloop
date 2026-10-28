@@ -325,6 +325,46 @@ async fn actual_cli_bubbled_keys_move_between_cards_and_back_to_the_list() {
             card_shows(frame, "keys 71 1b") && !card_focused(frame) && frame.contains("space hide")
         })
         .await;
+        // An Esc right after it would end the Esc pair on the list; a later one leaves the list.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        view.send(CLOSE);
+        view.wait_for("input focused again", input_focused).await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A Tick that asks for focus reports hears `ESC [ O` while its card does not have the keyboard
+/// and `ESC [ I` once the card is entered, and `ESC [ O` again when the card is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_a_tick_that_wants_focus_reports_hears_its_card_gain_and_lose_the_keyboard() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view =
+            view_with_keys_ticks_progress(&fixture, &[], 1, &["--focus-reports"], None, None).await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        view.send(b" ");
+        view.wait_for("the Tick starts out of focus", |frame| {
+            card_shows(frame, "keys 1b 5b 4f") && !card_focused(frame)
+        })
+        .await;
+        view.send(b"\r");
+        view.wait_for("entering tells it it has the keyboard", |frame| {
+            card_focused(frame) && card_shows(frame, "keys 1b 5b 4f 1b 5b 49")
+        })
+        .await;
+        view.send(LEAVE_CARD);
+        view.wait_for("leaving tells it it lost the keyboard", |frame| {
+            !card_focused(frame) && card_shows(frame, "keys 1b 5b 4f 1b 5b 49 1b 1b 5b 4f")
+        })
+        .await;
         view.send(CLOSE);
         view.wait_for("input focused again", input_focused).await;
         view.close().await;

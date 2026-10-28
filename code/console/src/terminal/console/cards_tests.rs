@@ -1162,3 +1162,100 @@ fn the_agents_use_shows_a_card_whose_row_is_not_loaded_or_not_listed_yet() {
     let (_, inputs) = state.settle_card_signals();
     attaches(inputs.into_iter().next(), chat, &arriving);
 }
+
+/// The focus requests among what a card's view asked of the Tickhost.
+fn focus_requests(
+    requests: &mut tokio::sync::mpsc::Receiver<crate::terminal::monitor_cards::CardRequest>,
+) -> Vec<bool> {
+    queued_requests(requests)
+        .into_iter()
+        .filter_map(|request| match request {
+            crate::terminal::monitor_cards::CardRequest::Focus(focused) => Some(focused),
+            _ => None,
+        })
+        .collect()
+}
+
+fn wants_focus_reports(state: &State, instance: &tick_protocol::InstanceRef) {
+    let Some(card) = state.cards.card(instance) else {
+        panic!("no card for {instance}");
+    };
+    let CardState::Attached(view) = &card.state else {
+        panic!("{instance} is not attached");
+    };
+    let mut screen = view.screen.lock().unwrap();
+    screen.focus_reports = true;
+    screen.focus_reports_announced = true;
+}
+
+#[test]
+fn a_card_tells_its_tick_it_has_the_keyboard_only_when_the_tick_wants_focus_reports() {
+    let mut state = cards_fixture();
+    let (instance, mut requests) = attached_hosted_card(&mut state);
+    state.enter_card(instance.clone());
+    state.leave_card();
+    assert!(
+        focus_requests(&mut requests).is_empty(),
+        "a Tick that asked for no focus reports hears nothing"
+    );
+
+    state.enter_card(instance.clone());
+    wants_focus_reports(&state, &instance);
+    state.settle_card_signals();
+    assert_eq!(
+        focus_requests(&mut requests),
+        [true],
+        "asking while its card is focused tells it so"
+    );
+    let start = Instant::now();
+    state.card_input(b"\x1b\x1b", start, &mut Vec::new());
+    state.expire_card_keys(start + Duration::from_millis(60));
+    assert!(!state.card_focused());
+    assert_eq!(focus_requests(&mut requests), [false], "Esc Esc");
+
+    state.enter_card(instance.clone());
+    state.card_input(b"\x1b[<0;2;2M", Instant::now(), &mut Vec::new());
+    assert_eq!(
+        focus_requests(&mut requests),
+        [true, false],
+        "a click outside"
+    );
+
+    state.enter_card(instance.clone());
+    state.cards.close(&instance);
+    assert_eq!(
+        focus_requests(&mut requests),
+        [true, false],
+        "closing the focused card, as when its row leaves"
+    );
+}
+
+#[test]
+fn moving_between_cards_and_switching_chats_tell_each_tick_its_focus() {
+    use tick_protocol::BubbledKey;
+    let (mut state, rows) = tab_fixture();
+    let [one, two] = [&rows[1], &rows[2]];
+    let chat = state.chat.unwrap();
+    let mut queues = Vec::new();
+    for row in [one, two] {
+        state.monitor.select(row);
+        attaches(state.key(key(KeyCode::Char(' '))), chat, row);
+        let (view, requests) =
+            crate::terminal::monitor_cards::CardView::detached(state.card_size(row));
+        view.screen.lock().unwrap().bubbling = true;
+        assert!(state.cards.attached(chat, row, view));
+        wants_focus_reports(&state, row);
+        queues.push(requests);
+    }
+    state.settle_card_signals();
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.enter_card(one.clone());
+    bubble(&mut state, one, BubbledKey::Down);
+    state.settle_card_signals();
+    assert_eq!(state.cards.focused(), Some(two));
+    assert_eq!(focus_requests(&mut queues[0]), [true, false]);
+    assert_eq!(focus_requests(&mut queues[1]), [true]);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(focus_requests(&mut queues[1]), [false], "a Chat switch");
+}

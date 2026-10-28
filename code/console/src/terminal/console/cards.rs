@@ -287,6 +287,7 @@ impl State {
     /// What cards settle apart from the user's own input: keys a focused card's Tick bubbled,
     /// and cards the Agent's use shows. Returns whether the screen changed, and what to send.
     pub(super) fn settle_card_signals(&mut self) -> (bool, Vec<InputEvent>) {
+        self.cards.announce_focus();
         let (bubbled, event) = self.settle_bubbled_keys();
         let shown = self.show_agent_cards();
         let mut inputs = std::mem::take(&mut self.queued_card_inputs);

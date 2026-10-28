@@ -108,6 +108,11 @@ pub(super) struct CardScreen {
     pub(super) bubbling: bool,
     /// The keys the Tick bubbled that the Console has not acted on yet, oldest first.
     pub(super) bubbled: Vec<BubbledKey>,
+    /// Whether the Tick wants focus reports (DEC private mode 1004).
+    pub(super) focus_reports: bool,
+    /// The Tick asked for focus reports since the Console last looked: a focused card tells it
+    /// it has the keyboard.
+    pub(super) focus_reports_announced: bool,
 }
 
 impl CardScreen {
@@ -117,6 +122,8 @@ impl CardScreen {
             ended: None,
             bubbling: false,
             bubbled: Vec::new(),
+            focus_reports: false,
+            focus_reports_announced: false,
         }
     }
 }
@@ -164,6 +171,9 @@ pub(super) enum CardRequest {
     Resize(CardSize),
     /// Sends a resize still waiting for [`CARD_RESIZE_INTERVAL`] at once, as when a drag ends.
     FlushResize,
+    /// Whether the card has the keyboard, which the Tickhost turns into a focus report for a
+    /// Tick that wants them.
+    Focus(bool),
 }
 
 /// Spaces one view's resizes [`CARD_RESIZE_INTERVAL`] apart: the first change after a quiet
@@ -323,6 +333,14 @@ impl CardView {
             let _ = self.requests.try_send(CardRequest::Input(bytes));
         }
     }
+
+    /// Tells the Tick whether this card has the keyboard, when the Tick wants focus reports;
+    /// a Tick that does not never hears of it.
+    fn focus(&self, focused: bool) {
+        if self.screen.lock().is_ok_and(|screen| screen.focus_reports) {
+            let _ = self.requests.try_send(CardRequest::Focus(focused));
+        }
+    }
 }
 
 /// Paints every frame into the card's terminal model at the size the frame names and asks for a
@@ -364,6 +382,14 @@ async fn read_frames(
                 };
                 screen.bubbling = event["enabled"].as_bool().unwrap_or(false);
                 screen.bubbled.clear();
+            }
+            Some("focus_reports") => {
+                let enabled = event["enabled"].as_bool().unwrap_or(false);
+                let Ok(mut screen) = screen.lock() else {
+                    return;
+                };
+                screen.focus_reports = enabled;
+                screen.focus_reports_announced = enabled;
             }
             Some("bubble") => {
                 let key = event["key"].as_str().and_then(BubbledKey::from_name);
@@ -454,6 +480,14 @@ async fn write_requests(
                 .await
             }
             CardRequest::FlushResize => Ok(()),
+            CardRequest::Focus(focused) => {
+                send(
+                    &mut writer,
+                    json!({"method":"focus","params":{"focused":focused}}),
+                    write_timeout,
+                )
+                .await
+            }
         };
         if let Err(error) = sent {
             if let Ok(mut screen) = screen.lock() {
@@ -634,15 +668,15 @@ impl MonitorCards {
 
     /// Closes the card, which detaches its view; a focused card loses the focus.
     pub(super) fn close(&mut self, instance: &InstanceRef) {
-        self.open.retain(|card| &card.instance != instance);
         if self.focused.as_ref() == Some(instance) {
             self.leave_focus();
         }
+        self.open.retain(|card| &card.instance != instance);
     }
 
     pub(super) fn close_all(&mut self) {
-        self.open.clear();
         self.leave_focus();
+        self.open.clear();
     }
 
     /// Closes the cards that do not belong to `chat`, or whose rows `listed` no longer has.
@@ -710,10 +744,33 @@ impl MonitorCards {
 
     /// Gives the card the focus; the keys its Tick bubbled before are dropped.
     pub(super) fn focus(&mut self, instance: InstanceRef) {
-        if self.is_open(&instance) {
-            self.focused = Some(instance);
-            self.keys = CardKeys::default();
-            self.take_bubbled();
+        if !self.is_open(&instance) {
+            return;
+        }
+        if self.focused.as_ref() != Some(&instance) {
+            self.leave_focus();
+            if let Some(CardState::Attached(view)) = self.card(&instance).map(|card| &card.state) {
+                view.focus(true);
+            }
+        }
+        self.focused = Some(instance);
+        self.keys = CardKeys::default();
+        self.take_bubbled();
+    }
+
+    /// Tells each Tick that just asked for focus reports whether its card has the keyboard; one
+    /// that has not is told by the Tickhost already.
+    pub(super) fn announce_focus(&mut self) {
+        for card in &self.open {
+            if let CardState::Attached(view) = &card.state {
+                let announced = view
+                    .screen
+                    .lock()
+                    .is_ok_and(|mut screen| std::mem::take(&mut screen.focus_reports_announced));
+                if announced && self.focused.as_ref() == Some(&card.instance) {
+                    view.focus(true);
+                }
+            }
         }
     }
 
@@ -743,6 +800,9 @@ impl MonitorCards {
     }
 
     pub(super) fn leave_focus(&mut self) {
+        if let Some(view) = self.focused_view() {
+            view.focus(false);
+        }
         self.focused = None;
         self.keys = CardKeys::default();
     }
