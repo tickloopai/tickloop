@@ -469,6 +469,9 @@ pub enum GuidanceNote {
     /// The instructions and states of the MCP servers one note announced, each with the digest
     /// of what it said.
     McpServers { servers: BTreeMap<String, String> },
+    /// The MCP configuration warnings one note announced, by the digest of their text; the
+    /// digest of no warnings withdraws earlier ones.
+    McpWarnings { digest: String },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]

@@ -496,6 +496,7 @@ impl ToolRegistry {
             .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
             .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
             .collect();
+        state.order_deferred(&mut self.deferred);
         let Some(offer) = state.hold(
             run_id,
             self.native_search,

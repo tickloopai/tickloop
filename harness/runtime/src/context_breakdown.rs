@@ -255,6 +255,9 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
                 servers.keys().cloned().collect::<Vec<_>>().join(", ")
             ),
             HostNote::Guidance(GuidanceNote::Withdrawn { .. }) => "Withdrawn guidance".into(),
+            HostNote::Guidance(GuidanceNote::McpWarnings { .. }) => {
+                "MCP configuration warnings".into()
+            }
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),
             HostNote::PlanModeExit => "Plan mode exit".into(),

@@ -383,7 +383,7 @@ async fn a_tool_that_vanishes_mid_run_keeps_its_declaration_and_is_not_executed(
 }
 
 #[tokio::test]
-async fn native_search_keeps_the_listed_tools_while_deferred_tools_grow_sorted_at_the_end() {
+async fn native_search_keeps_the_listed_tools_while_deferred_tools_grow_at_the_end() {
     use tickloop_harness_model::cards::ModelCatalog;
     use tickloop_harness_protocol::{Content, Protocol};
     use tickloop_harness_test_support::{config, text};
@@ -467,10 +467,11 @@ async fn native_search_keeps_the_listed_tools_while_deferred_tools_grow_sorted_a
         tool_names(&requests[0].deferred_tools),
         ["mcp__gamma__beta", "mcp__gamma__zeta"]
     );
+    // The server that connected later appends its tool after those already offered.
     for request in &requests[1..] {
         assert_eq!(
             tool_names(&request.deferred_tools),
-            ["mcp__delta__omega", "mcp__gamma__beta", "mcp__gamma__zeta"]
+            ["mcp__gamma__beta", "mcp__gamma__zeta", "mcp__delta__omega"]
         );
     }
     agent.shutdown().await;

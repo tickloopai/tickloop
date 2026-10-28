@@ -11,6 +11,10 @@ use tickloop_harness_protocol::{Message, ModelIdentity, RunId, ToolDefinition};
 #[derive(Clone, Default)]
 pub(crate) struct CachePrefixState {
     held_host_tools: Option<HeldHostTools>,
+    /// The deferred tools in the order this Chat first offered them. A tool search loads deferred
+    /// tools by name, and the vendor keeps their definitions in the cached prefix, so a server
+    /// connecting later appends its tools instead of inserting them among the earlier ones.
+    deferred_order: Vec<String>,
     last_request: Option<ObservedRequest>,
     compacted_since_last_request: bool,
     exposure_changed_since_last_request: bool,
@@ -78,13 +82,28 @@ pub(crate) struct HeldOffer {
     pub(crate) withheld: Vec<String>,
     /// The tools the Run's first request listed, with the definitions it listed them with.
     pub(crate) listed: Vec<(ListingGroup, ToolDefinition)>,
-    /// Every deferred tool the Run has offered so far, sorted by name: deferred tools are only
-    /// added to, after the native search tool, so searches still find a server that connected
-    /// during the Run.
+    /// Every deferred tool the Run has offered so far, in the order the Chat first offered them:
+    /// deferred tools are only added to, after the native search tool, so searches still find a
+    /// server that connected during the Run.
     pub(crate) deferred: Vec<ToolDefinition>,
 }
 
 impl CachePrefixState {
+    /// Puts `deferred` in the order this Chat first offered each tool, a tool it never offered
+    /// after them all.
+    pub(crate) fn order_deferred(&mut self, deferred: &mut [ToolDefinition]) {
+        for tool in deferred.iter() {
+            if !self.deferred_order.contains(&tool.name) {
+                self.deferred_order.push(tool.name.clone());
+            }
+        }
+        deferred.sort_by_key(|tool| {
+            self.deferred_order
+                .iter()
+                .position(|name| *name == tool.name)
+        });
+    }
+
     /// Holds the MCP tools a request of `run_id` would offer, `listed` and `deferred`, to what the
     /// Run's first request offered, except the tools of the servers whose exposure the user
     /// changed since the last request, which take the offer of this request. `None` when this
@@ -152,9 +171,6 @@ impl CachePrefixState {
         current
             .deferred
             .retain(|tool| !held_names.contains(&tool.name));
-        current
-            .deferred
-            .sort_by(|first, second| first.name.cmp(&second.name));
         Some(HeldOffer {
             withheld,
             listed: current.listed.clone(),
@@ -456,5 +472,73 @@ mod tests {
             .observe(CachePrefix::of(&model(), &system("s"), &before), Some(10))
             .unwrap();
         assert_eq!(unexplained.reason, CacheBreakReason::PrefixChanged);
+    }
+}
+
+#[cfg(test)]
+mod deferred_order_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn names(tools: &[ToolDefinition]) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    /// A server that connects later appends its deferred tools after those offered before, in
+    /// this Run and the next, so the definitions already sent keep their place.
+    #[test]
+    fn deferred_tools_keep_the_order_they_were_first_offered_in() {
+        let mut state = CachePrefixState::default();
+        let first_run = RunId::new();
+        let mut deferred = vec![tool("mcp__b__one"), tool("mcp__d__two")];
+        state.order_deferred(&mut deferred);
+        assert!(
+            state
+                .hold(
+                    first_run,
+                    true,
+                    Vec::new(),
+                    deferred,
+                    UserExposure::default()
+                )
+                .is_none()
+        );
+        let mut deferred = vec![
+            tool("mcp__a__new"),
+            tool("mcp__b__one"),
+            tool("mcp__d__two"),
+        ];
+        state.order_deferred(&mut deferred);
+        let held = state
+            .hold(
+                first_run,
+                true,
+                Vec::new(),
+                deferred,
+                UserExposure::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            names(&held.deferred),
+            ["mcp__b__one", "mcp__d__two", "mcp__a__new"]
+        );
+        let mut next_run = vec![
+            tool("mcp__a__new"),
+            tool("mcp__b__one"),
+            tool("mcp__c__later"),
+            tool("mcp__d__two"),
+        ];
+        state.order_deferred(&mut next_run);
+        assert_eq!(
+            names(&next_run),
+            ["mcp__b__one", "mcp__d__two", "mcp__a__new", "mcp__c__later"]
+        );
     }
 }

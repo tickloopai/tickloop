@@ -959,6 +959,7 @@ impl HostedTickTools {
                 view,
                 ..
             } => {
+                let plugin_login = self.plugin_login_note(&command);
                 let request = WorkerRequest::OpenHostedTick {
                     chat: chat.into(),
                     operation,
@@ -980,6 +981,10 @@ impl HostedTickTools {
                     Ok(opened) => opened,
                     Err(unresolved) => return unresolved,
                 };
+                if let Some((state, note)) = plugin_login {
+                    opened.result["plugin_login"] = json!(state);
+                    opened.result["note"] = json!(note);
+                }
                 if let Some(view) = view {
                     if let Some(dispatch) = dispatch {
                         if dispatch.check().is_err()
@@ -1201,6 +1206,29 @@ impl HostedTickTools {
                 "{lost}; its receipt is unreadable: {error}"
             ))),
         }
+    }
+
+    /// What an open of a plugin's Tick program says of a login the plugin lacks. The system prompt
+    /// leaves out plugin logins, which change without the model, so the open that needs one tells.
+    fn plugin_login_note(&self, command: &[String]) -> Option<(&'static str, String)> {
+        let packages = self.plugins.as_ref()?;
+        let plugin =
+            tickhost_connect::program::installed_plugin_of(Path::new(command.first()?), packages)?;
+        let state = match packages.login_state(&plugin) {
+            tick_packages::LoginState::LoggedIn | tick_packages::LoginState::NotRequired => {
+                return None;
+            }
+            tick_packages::LoginState::LoggedOut => "logged_out",
+            tick_packages::LoginState::Expired => "expired",
+            tick_packages::LoginState::Unknown => "unknown",
+        };
+        Some((
+            state,
+            format!(
+                "plugin {} is not logged in ({state}); if its Tick reports a refused login, ask the user to log in to it from /ticks, then open it again",
+                plugin.name()
+            ),
+        ))
     }
 
     /// The verified facts of an open, or of a reopen in place of `replaces`.

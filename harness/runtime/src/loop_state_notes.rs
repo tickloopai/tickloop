@@ -1,10 +1,11 @@
 //! Host notes about a Chat's Loop and Subagents. The system prompt never names the Loop's Tick
-//! Subscriptions or the family's members, so that changing them keeps the prompt cache. Whether
-//! the Loop receives needs no note: continuing the Chat or sending it an input, which every
-//! request the user starts follows, makes it receive again. The model's own subscribe and unsubscribe calls and its Subagent calls answer in
-//! their tool results, and Subagent completions arrive as task notifications; a note at the end
-//! of the conversation tells the model only what changed without it, and after a compaction or a
-//! load, Claude Code's `task_status` reminder of what still runs.
+//! Subscriptions, the artifacts linked to the Chat or the family's members, so that changing them
+//! keeps the prompt cache. The model's own subscribe and unsubscribe calls and its Subagent calls
+//! answer in their tool results, and Subagent completions arrive as task notifications; a note at
+//! the end of the conversation tells the model only what changed without it, and after a
+//! compaction or a load, what the Loop holds and, as Claude Code's `task_status` reminder, what
+//! still runs. Whether the Loop receives needs no note: continuing the Chat or sending it an
+//! input, which every request the user starts follows, makes it receive again.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,8 @@ use tickloop_ids::IdContext;
 use uuid::Uuid;
 
 use crate::{Agent, AgentError, Chat, FamilyAgent, FamilyAvailability};
+
+const ARTIFACTS_HEADING: &str = "Artifacts linked to this Chat";
 
 /// What the model was last told of the Loop, and where in the history: a compaction or a shorter
 /// history, as after a rewind, leaves it untold again.
@@ -29,6 +32,8 @@ pub(super) struct AnnouncedLoopState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LoopStateView {
     subscriptions: BTreeMap<Uuid, SubscriptionView>,
+    /// Each linked artifact's Tick reference and how a line names it; a rename changes nothing.
+    artifacts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +58,16 @@ impl LoopStateView {
                             frequency: subscription.frequency,
                             paused: subscription.paused,
                         },
+                    )
+                })
+                .collect(),
+            artifacts: snapshot
+                .artifact_ticks
+                .iter()
+                .map(|tick| {
+                    (
+                        tick.instance_id(),
+                        format!("\"{}\" ({}), {}", tick.title, tick.url, tick.instance_id()),
                     )
                 })
                 .collect(),
@@ -127,11 +142,11 @@ fn snapshot_text(
     running: &[&FamilyAgent],
     ids: &IdContext,
 ) -> Option<String> {
-    if current.subscriptions.is_empty() && running.is_empty() {
+    if current.subscriptions.is_empty() && current.artifacts.is_empty() && running.is_empty() {
         return None;
     }
     let mut lines = vec![
-        "Host notice: the current state of this Chat's Tick Subscriptions and running Subagents, which replaces earlier statements about them.".to_owned(),
+        "Host notice: the current state of this Chat's Tick Subscriptions, linked artifacts and running Subagents, which replaces earlier statements about them.".to_owned(),
     ];
     if !current.subscriptions.is_empty() {
         lines.push("Tick Subscriptions:".into());
@@ -140,6 +155,10 @@ fn snapshot_text(
                 format!("- {}", subscription_line(*id, subscription, ids))
             }),
         );
+    }
+    if !current.artifacts.is_empty() {
+        lines.push(format!("{ARTIFACTS_HEADING}:"));
+        lines.extend(current.artifacts.values().map(|line| format!("- {line}")));
     }
     // Claude Code's `task_status` reminder for a background agent still running.
     lines.extend(running.iter().map(|child| {
@@ -186,6 +205,23 @@ fn change_text(
             "Host notice: this Chat's Tick Subscriptions changed outside your tool calls:".into(),
         );
     }
+    let linked = current
+        .artifacts
+        .iter()
+        .filter(|(id, _)| !announced.artifacts.contains_key(*id))
+        .map(|(_, line)| format!("- Linked: {line}"));
+    let unlinked = announced
+        .artifacts
+        .iter()
+        .filter(|(id, _)| !current.artifacts.contains_key(*id))
+        .map(|(_, line)| format!("- Unlinked: {line}"));
+    let artifact_lines = linked.chain(unlinked).collect::<Vec<_>>();
+    if !artifact_lines.is_empty() {
+        lines.push(format!(
+            "Host notice: {ARTIFACTS_HEADING} changed; each @tickloop feedback request on a linked artifact arrives here:"
+        ));
+        lines.extend(artifact_lines);
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
@@ -212,6 +248,7 @@ mod tests {
 
     fn view(subscriptions: &[(u128, &str, bool)]) -> LoopStateView {
         LoopStateView {
+            artifacts: BTreeMap::new(),
             subscriptions: subscriptions
                 .iter()
                 .map(|(id, run, paused)| {
@@ -265,6 +302,30 @@ mod tests {
                 "- Cancelled: {}",
                 ids.model_text(SubscriptionId::from(Uuid::from_u128(1)))
             )
+        );
+    }
+
+    #[test]
+    fn linking_and_unlinking_an_artifact_is_told_once_and_a_rename_is_not() {
+        let ids = IdContext::new();
+        let with = |artifacts: &[(&str, &str)]| LoopStateView {
+            subscriptions: BTreeMap::new(),
+            artifacts: artifacts
+                .iter()
+                .map(|(id, title)| ((*id).to_owned(), format!("\"{title}\", {id}")))
+                .collect(),
+        };
+        let before = with(&[("artifact:a", "Plan"), ("artifact:b", "Notes")]);
+        let renamed = with(&[("artifact:a", "Plan"), ("artifact:b", "Renamed")]);
+        assert_eq!(
+            change_text(&before, &renamed, &ids),
+            None,
+            "a rename only changes how a line names the artifact"
+        );
+        let after = with(&[("artifact:a", "Plan"), ("artifact:c", "Deck")]);
+        assert_eq!(
+            change_text(&before, &after, &ids).unwrap(),
+            "Host notice: Artifacts linked to this Chat changed; each @tickloop feedback request on a linked artifact arrives here:\n- Linked: \"Deck\", artifact:c\n- Unlinked: \"Notes\", artifact:b"
         );
     }
 

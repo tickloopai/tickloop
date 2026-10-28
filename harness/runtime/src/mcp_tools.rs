@@ -42,7 +42,7 @@ use tickloop_harness_protocol::{
 pub const ARTIFACT_READ_TOOL: &str = "ArtifactRead";
 pub const ARTIFACT_EDIT_TOOL: &str = "ArtifactEdit";
 pub const ARTIFACT_COMMENT_TOOL: &str = "ArtifactComment";
-/// Offered instead of the Artifact tools while no account is signed in.
+/// Starts sign-in; listed with the Artifact tools whether or not an account is signed in.
 pub const ARTIFACT_LOGIN_TOOL: &str = "ArtifactLogin";
 /// Uploads a local image to a Slides artifact; the host defines it and offers it along with the
 /// directory's tools.
@@ -75,7 +75,14 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
 /// The service is busy with this Slides artifact's other uploads; a later upload may succeed.
 const UPLOAD_BUSY_STATUS: u16 = 429;
-const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc, page or slides (a PPT, deck or presentation means slides); it starts sign-in and returns a link and code: give the user both, and do not write local files instead. After the user approves, ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload become available automatically.";
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Start sign-in to Tickloop Artifacts. Call this when the user wants a doc, page or slides (a PPT, deck or presentation means slides) and ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload are not listed or report that Tickloop Artifacts is signed out; it returns a link and code: give the user both, and do not write local files instead. After the user approves, those tools work without further steps. While an account is signed in, it starts nothing.";
+/// The result of an Artifact tool call while no account is signed in. The tools stay listed so
+/// signing in or out never changes the prompt cache prefix; the call explains instead.
+const ARTIFACT_SIGNED_OUT: &str = "Tickloop Artifacts is signed out, so this call was not executed. Call ArtifactLogin to start sign-in, give the user the link and code it returns, and retry once they have approved. Do not sign in another way or write local files instead.";
+/// The result of an Artifact tool call while the signed-in account's tools have not loaded.
+const ARTIFACT_DIRECTORY_UNAVAILABLE: &str = "Tickloop Artifacts is signed in, but its tools are unavailable right now, so this call was not executed. Tell the user, and try again later; do not sign in again or write local files instead.";
+/// The result of an ArtifactLogin call while an account is signed in.
+const ARTIFACT_ALREADY_SIGNED_IN: &str = "Tickloop Artifacts is already signed in, so sign-in was not started. Use ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload.";
 /// What the host adds to the service's own ArtifactEdit description.
 const ARTIFACT_EDIT_NOTE: &str = " A slides artifact's PPTX download holds one picture per Slide, so its text cannot be edited there.";
 /// What the host adds to the service's own ArtifactComment description.
@@ -350,6 +357,9 @@ pub struct McpHostToolProvider {
     artifact: Arc<ArtifactClient>,
     native: Option<Arc<dyn HostToolProvider>>,
     directory: RwLock<Option<Directory>>,
+    /// The Artifact tools the last loaded directory offered, still listed while signed out or
+    /// while the directory is unavailable, so the listed tools stay the same.
+    listed_artifact_tools: RwLock<Vec<ToolDefinition>>,
     catalog_generation: std::sync::atomic::AtomicU64,
     service_status: RwLock<ArtifactServiceStatus>,
     skill_files: RwLock<BTreeMap<SkillFileKey, String>>,
@@ -493,6 +503,7 @@ impl McpHostToolProvider {
             artifact: Arc::new(artifact),
             native,
             directory: RwLock::new(None),
+            listed_artifact_tools: RwLock::new(Vec::new()),
             catalog_generation: std::sync::atomic::AtomicU64::new(0),
             service_status: RwLock::new(ArtifactServiceStatus::default()),
             skill_files: RwLock::new(BTreeMap::new()),
@@ -1733,9 +1744,16 @@ impl HostToolProvider for McpHostToolProvider {
                 && definition.name != ARTIFACT_LOGIN_TOOL
         });
         if let Some(directory) = self.directory.read().unwrap().as_ref() {
-            definitions.extend(directory.tools.iter().map(|tool| tool.definition.clone()));
-            definitions.push(upload_definition());
-        } else if self.offers_login() {
+            let mut listed = directory
+                .tools
+                .iter()
+                .map(|tool| tool.definition.clone())
+                .collect::<Vec<_>>();
+            listed.push(upload_definition());
+            *self.listed_artifact_tools.write().unwrap() = listed;
+        }
+        definitions.extend(self.listed_artifact_tools.read().unwrap().iter().cloned());
+        if !self.artifact.is_host_managed() {
             definitions.push(login_definition());
         }
         definitions
@@ -2111,6 +2129,14 @@ impl HostToolProvider for McpHostToolProvider {
     }
 
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
+        if ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) && self.directory.read().unwrap().is_none() {
+            return Err(if self.offers_login() {
+                ARTIFACT_SIGNED_OUT
+            } else {
+                ARTIFACT_DIRECTORY_UNAVAILABLE
+            }
+            .into());
+        }
         if name == ARTIFACT_LOGIN_TOOL {
             return input
                 .as_object()
@@ -2185,7 +2211,7 @@ impl HostToolProvider for McpHostToolProvider {
                 return Err("Sign-in was cancelled".into());
             }
             if !self.offers_login() {
-                return Err("Tickloop Artifacts is not signed out; sign-in is unavailable".into());
+                return Err(ARTIFACT_ALREADY_SIGNED_IN.into());
             }
             return Ok(PreparedHostCall::new(
                 name.to_owned(),

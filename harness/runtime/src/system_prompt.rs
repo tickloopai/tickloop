@@ -272,8 +272,6 @@ impl crate::Agent {
         };
         let family_temp = chat.tools.family_temp_directory();
         let mut state = serde_json::json!({
-            "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-            "artifact_ticks": chat.snapshot.artifact_ticks,
             "delegation": chat.snapshot.delegation.as_ref().map(fixed_delegation),
         });
         if let Some(folder) = &chat.snapshot.folder {
@@ -281,7 +279,7 @@ impl crate::Agent {
                 "workdir": folder,
                 "family_temp_directory": family_temp,
                 "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
-                "workspace_host": workspace_host,
+                "workspace_host": workspace_host.map(fixed_workspace_host),
             }).as_object().unwrap().clone());
         }
         let state = tickloop_harness_protocol::model_ids::model_json(&chat.ids, state);
@@ -292,6 +290,22 @@ impl crate::Agent {
             }],
         }
     }
+}
+
+/// The workspace host as the system prompt shows it. A plugin's login changes without the model,
+/// so its Tick reports a refused login when opened instead.
+fn fixed_workspace_host(
+    workspace_host: &crate::host_tools::WorkspaceHostContext,
+) -> serde_json::Value {
+    let mut value = serde_json::json!(workspace_host);
+    if let Some(plugins) = value["plugins"].as_array_mut() {
+        for plugin in plugins {
+            if let Some(plugin) = plugin.as_object_mut() {
+                plugin.remove("login");
+            }
+        }
+    }
+    value
 }
 
 /// What a Subagent's system prompt says of its delegation: only what was fixed when it was

@@ -861,7 +861,7 @@ mod tests {
             };
             chat.active_run = Some(receipt.run_id);
             assert!(crate::host_notes::announce_guidance_notes(
-                chat, &receipt, None
+                chat, &receipt, None, None
             ));
             let messages = model_messages(chat).unwrap();
             let guidance = messages
