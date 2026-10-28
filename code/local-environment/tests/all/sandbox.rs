@@ -509,7 +509,7 @@ async fn sandbox_protects_denied_paths_and_user_settings_through_symlinks() {
 }
 
 #[tokio::test]
-async fn sandbox_protects_the_targets_of_sensitive_symlink_names() {
+async fn sandbox_blocks_sensitive_symlink_traversal() {
     let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
     let folder = fixture.workspace.folder.as_ref().unwrap();
     std::fs::create_dir(folder.join("ordinary")).unwrap();
@@ -534,6 +534,41 @@ async fn sandbox_does_not_treat_the_folder_name_as_a_sensitive_child_path() {
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(
         std::fs::read_to_string(folder.join("ordinary.txt")).unwrap(),
+        "allowed"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_blocks_sensitive_symlinks_reached_through_an_ordinary_bridge() {
+    let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let folder = fixture.workspace.folder.as_ref().unwrap();
+    let outside = fixture.root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(folder.join("ordinary")).unwrap();
+    std::os::unix::fs::symlink(&outside, folder.join("bridge")).unwrap();
+    std::os::unix::fs::symlink(folder.join("ordinary"), outside.join(".git")).unwrap();
+    let result = fixture
+        .run(fixture.prepare("printf bypass > bridge/.git/config").await)
+        .await;
+    assert!(result.is_error, "{}", result.content);
+    assert!(!folder.join("ordinary/config").exists());
+}
+
+#[tokio::test]
+async fn sandbox_ignores_sensitive_ancestors_above_a_folder_inside_the_temp_root() {
+    let mut fixture =
+        SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("secret-parent/project");
+    std::fs::create_dir_all(folder.join("ordinary")).unwrap();
+    std::os::unix::fs::symlink("ordinary", folder.join("link")).unwrap();
+    fixture.workspace.folder = Some(folder.clone());
+    let result = fixture
+        .run(fixture.prepare("printf allowed > link/note").await)
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read_to_string(folder.join("ordinary/note")).unwrap(),
         "allowed"
     );
 }

@@ -91,7 +91,7 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
     for path in &policy.deny_write {
         let quoted = quote_path(path)?;
         profile.push_str(&format!(
-            "(deny file-write* (literal {quoted}) (subpath {quoted}))\n"
+            "(deny file-write* (literal {quoted}) (subpath {quoted}))\n(deny file-read-metadata (require-all (vnode-type SYMLINK) (require-any (literal {quoted}) (subpath {quoted}))))\n"
         ));
         // A rename of an ancestor must not move a protected path out of its deny rule.
         for ancestor in path.ancestors().skip(1) {
@@ -114,7 +114,8 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
                 " (require-not (literal {path})) (require-not (subpath {path}))"
             ));
         }
-        profile.push_str(&format!("(deny file-write* (require-all {filters}))\n"));
+        // Metadata checks run before following a symlink; write checks see only its final target.
+        profile.push_str(&format!("(deny file-write* (require-all {filters}))\n(deny file-read-metadata (require-all (vnode-type SYMLINK) {filters}))\n"));
     }
     let mut command = tokio::process::Command::new(SANDBOX_EXEC);
     command.args(["-p", &profile]).arg(shell);

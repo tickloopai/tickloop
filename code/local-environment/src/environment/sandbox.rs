@@ -1,6 +1,5 @@
-use regex::RegexSet;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     path::{Component, Path, PathBuf},
 };
 use tickhost::sandbox::{ProtectedPathPattern, SandboxNetwork, SandboxPolicy};
@@ -10,7 +9,6 @@ use tickloop_harness::runtime::environment::{
 };
 
 const MAX_SYMLINK_HOPS: usize = 40;
-const MAX_POLICY_ENTRIES: usize = 1_000_000;
 
 #[derive(Default)]
 pub(super) struct PreparedSandbox {
@@ -93,37 +91,32 @@ fn prepare_policy(
     protected_paths.extend(anchors);
 
     let patterns = tickloop_harness::tools::sensitive_write_path_patterns();
-    let absolute = RegexSet::new(
-        patterns
-            .absolute_components
-            .iter()
-            .map(|component| format!("(^|/){component}(/|$)")),
-    )
-    .map_err(|error| configuration_error(error.to_string()))?;
-    let relative = RegexSet::new(
-        patterns
-            .relative_components
-            .iter()
-            .map(|component| format!("(^|/){component}(/|$)")),
-    )
-    .map_err(|error| configuration_error(error.to_string()))?;
-    protect_sensitive_aliases(
-        &writable_roots,
-        &absolute,
-        &relative,
-        &mut deny_write,
-        &mut protected_paths,
-    )?;
-    let mut denied_path_patterns = absolute
-        .patterns()
+    let mut denied_path_patterns = patterns
+        .absolute_components
         .iter()
-        .map(|pattern| ProtectedPathPattern {
-            pattern: pattern.clone(),
+        .map(|component| ProtectedPathPattern {
+            pattern: format!("(^|/){component}(/|$)"),
             excluded_roots: vec![],
         })
         .collect::<Vec<_>>();
-    for (index, root) in writable_roots.iter().enumerate() {
-        if writable_roots[..index]
+    let pattern_roots = writable_roots
+        .iter()
+        .map(|root| {
+            if root.is_dir() {
+                root.clone()
+            } else {
+                root.parent().unwrap_or(root).to_path_buf()
+            }
+        })
+        .collect::<Vec<_>>();
+    for component in &patterns.relative_components {
+        denied_path_patterns.push(ProtectedPathPattern {
+            pattern: format!("(^|/){component}(/|$)"),
+            excluded_roots: pattern_roots.clone(),
+        });
+    }
+    for (index, root) in pattern_roots.iter().enumerate() {
+        if pattern_roots[..index]
             .iter()
             .any(|earlier| root.starts_with(earlier))
         {
@@ -132,7 +125,7 @@ fn prepare_policy(
         let prefix = root
             .to_str()
             .ok_or_else(|| configuration_error("unsupported writable path"))?;
-        let excluded_roots = writable_roots[..index]
+        let excluded_roots = pattern_roots[..index]
             .iter()
             .filter(|earlier| earlier.starts_with(root))
             .cloned()
@@ -158,88 +151,6 @@ fn prepare_policy(
         denied_path_patterns,
         network: SandboxNetwork::Disconnected,
     })
-}
-
-fn protect_sensitive_aliases(
-    roots: &[PathBuf],
-    absolute: &RegexSet,
-    relative: &RegexSet,
-    deny_write: &mut Vec<PathBuf>,
-    protected_paths: &mut Vec<PathBuf>,
-) -> Result<(), ExecutionError> {
-    let mut pending = roots
-        .iter()
-        .cloned()
-        .map(|root| (root, false))
-        .collect::<Vec<_>>();
-    let mut visited = HashMap::new();
-    let mut entries = 0;
-    while let Some((directory, inherited_sensitive)) = pending.pop() {
-        if visited
-            .get(&directory)
-            .is_some_and(|sensitive| *sensitive || !inherited_sensitive)
-        {
-            continue;
-        }
-        visited.insert(directory.clone(), inherited_sensitive);
-        let children = match std::fs::read_dir(&directory) {
-            Ok(children) => children,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(configuration_error(format!(
-                    "cannot inspect sandbox directory {}: {error}",
-                    directory.display()
-                )));
-            }
-        };
-        for child in children {
-            entries += 1;
-            if entries > MAX_POLICY_ENTRIES {
-                return Err(configuration_error(
-                    "sandbox path inspection limit exceeded",
-                ));
-            }
-            let child = match child {
-                Ok(child) => child,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(path_error(error)),
-            };
-            let path = child.path();
-            let kind = match child.file_type() {
-                Ok(kind) => kind,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(path_error(error)),
-            };
-            if !kind.is_dir() && !kind.is_symlink() {
-                continue;
-            }
-            let below = roots
-                .iter()
-                .find_map(|root| path.strip_prefix(root).ok())
-                .unwrap_or(&path);
-            let sensitive = inherited_sensitive
-                || absolute.is_match(&path.to_string_lossy())
-                || relative.is_match(&below.to_string_lossy());
-            if kind.is_dir() {
-                pending.push((path, sensitive));
-            } else if sensitive {
-                let (resolved, anchors) = resolve_path(&path)?;
-                protected_paths.extend(anchors);
-                deny_write.push(resolved.clone());
-                if resolved != Path::new("/") {
-                    pending.push((resolved, true));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn resolve_configured_path(
