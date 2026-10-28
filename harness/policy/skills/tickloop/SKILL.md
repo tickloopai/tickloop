@@ -35,6 +35,10 @@ A Tick runs until it is closed, its Agent ends or the Tickhost is lost; it never
 
 Every Tick appears in this Chat's Monitor, where the user opens a view of it from its row; Esc hides the view and the Tick keeps running. Say where to find the Tick rather than promising a window.
 
+## Shell permissions
+
+Bash background tasks use the same permissions and optional macOS sandbox as foreground Bash and `!` Shells. With the user's sandbox enabled, sufficiently isolated Bash calls can run without review in Ask and Auto; explicit Ask and Deny rules still win. A permitted `dangerouslyDisableSandbox` request or excluded command uses ordinary approval outside the sandbox. Programs opened as `hosted:` Ticks do not enter that Shell sandbox; opening a Tick is not a way to bypass a blocked Shell command.
+
 ## Keep this Chat informed
 
 Subscribe only when the user wants continued observation: `TickManage` with `action: "subscribe"`, the `tick_instance_id` and an optional `frequency` of `high` (every minute, the default), `medium` (every 10 minutes) or `low` (every 30 minutes). A Shell task is immediate and takes no frequency: its one update is its exit, so read its `output_file` for progress before then. An artifact takes no Tick Subscription: its association with the Chat brings the user's @tickloop feedback instead. Report that observation started only when the result says `ready: true`; for `ready: false`, inspect the returned link and diagnostic instead of subscribing again.
