@@ -13,6 +13,15 @@ pub struct SandboxSettings {
     pub fail_if_unavailable: bool,
     #[serde(default)]
     pub filesystem: SandboxFilesystem,
+    #[serde(default)]
+    pub network: SandboxNetwork,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxNetwork {
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -33,13 +42,20 @@ impl LoadedSettings {
             self.warn_unsupported_sandbox_fields(
                 "sandbox",
                 object,
-                &["enabled", "failIfUnavailable", "filesystem"],
+                &["enabled", "failIfUnavailable", "filesystem", "network"],
             );
             if let Some(filesystem) = object.get("filesystem").and_then(Value::as_object) {
                 self.warn_unsupported_sandbox_fields(
                     "sandbox.filesystem",
                     filesystem,
                     &["allowWrite", "denyWrite"],
+                );
+            }
+            if let Some(network) = object.get("network").and_then(Value::as_object) {
+                self.warn_unsupported_sandbox_fields(
+                    "sandbox.network",
+                    network,
+                    &["allowedDomains"],
                 );
             }
         }

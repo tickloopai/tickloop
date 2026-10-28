@@ -424,6 +424,7 @@ pub(crate) struct ShellTask {
     pub(crate) pid: u32,
     ownership: std::sync::Mutex<ShellOwnership>,
     output: std::fs::File,
+    network_proxy: Option<crate::sandbox::NetworkProxy>,
     /// The first reason it was asked to stop for.
     stop: watch::Sender<Option<String>>,
     exit: watch::Sender<Option<ShellExit>>,
@@ -480,6 +481,14 @@ impl ShellTask {
         let output = std::fs::File::from(output);
         let launch_failed =
             |error: std::io::Error| HostError::before("LaunchFailed", error.to_string());
+        let network_proxy = binding
+            .approval
+            .sandbox
+            .as_ref()
+            .map(|policy| crate::sandbox::NetworkProxy::start(&policy.network))
+            .transpose()
+            .map_err(launch_failed)?
+            .flatten();
         let mut command = match &binding.approval.sandbox {
             Some(policy) => {
                 crate::sandbox::command(policy, &binding.approval.shell).map_err(launch_failed)?
@@ -501,6 +510,9 @@ impl ShellTask {
             .stderr(output.try_clone().map_err(launch_failed)?)
             .process_group(0)
             .kill_on_drop(true);
+        if let Some(proxy) = &network_proxy {
+            proxy.configure(&mut command);
+        }
         let directory_descriptor = directory.as_raw_fd();
         unsafe {
             command.pre_exec(move || {
@@ -538,6 +550,7 @@ impl ShellTask {
                 is_handoff_pending: false,
             }),
             output,
+            network_proxy,
             stop: watch::channel(None).0,
             exit: watch::channel(None).0,
             released: CancellationToken::new(),
@@ -878,6 +891,9 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
         exit.reason = Some(UNRESOLVED_DESCENDANTS_REASON.into());
         terminate_process_group(pid).await;
     }
+    if let Some(proxy) = &task.network_proxy {
+        proxy.stop();
+    }
     if task.cut_output() && exit.reason.is_none() {
         exit.reason = Some(OUTPUT_LIMIT_REASON.into());
         exit.outcome = ShellOutcome::Failed;
@@ -888,6 +904,9 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
     }
     if task.binding.approval.sandbox.is_some() && exit.outcome == ShellOutcome::Failed {
         crate::sandbox::annotate_denial(&task.output);
+    }
+    if let Some(proxy) = &task.network_proxy {
+        proxy.annotate_denials(&task.output);
     }
     exit.ended_at_ms = now_ms();
     task.follow_output();

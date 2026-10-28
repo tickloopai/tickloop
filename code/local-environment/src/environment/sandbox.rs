@@ -42,11 +42,15 @@ pub(super) async fn prepare(
     let policy = tokio::task::spawn_blocking(move || prepare_policy(&settings, &spec, &config))
         .await
         .map_err(|error| configuration_error(error.to_string()))??;
+    let network = match &policy.network {
+        SandboxNetwork::Disconnected => NetworkIsolation::Disconnected,
+        SandboxNetwork::Allowlist { .. } => NetworkIsolation::Allowlist,
+    };
     Ok(PreparedSandbox {
         policy: Some(policy),
         isolation: ExecutionIsolation {
             writes: WriteIsolation::FolderAndDirectories,
-            network: NetworkIsolation::Disconnected,
+            network,
         },
         warning: None,
     })
@@ -149,7 +153,16 @@ fn prepare_policy(
         deny_write,
         protected_paths,
         denied_path_patterns,
-        network: SandboxNetwork::Disconnected,
+        network: if config.network.allowed_domains.is_empty() {
+            SandboxNetwork::Disconnected
+        } else {
+            // Tickhost must bind this frozen port before spawning; a collision fails closed.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(path_error)?;
+            SandboxNetwork::Allowlist {
+                allowed_domains: config.network.allowed_domains.clone(),
+                proxy_port: listener.local_addr().map_err(path_error)?.port(),
+            }
+        },
     })
 }
 
