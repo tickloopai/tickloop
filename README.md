@@ -43,8 +43,6 @@ Want to see a Tick in action? Ask the agent:
 
 Then press Enter on the Counter in the Monitor, type `+` and press Enter: the agent receives the new count and responds.
 
-To add temporary tool rules for a new Agent, run `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`. The aliases `--allowed-tools` and `--disallowed-tools` also work. Repeat a flag or separate rules with spaces or commas. These flags cannot be combined with `--continue`, `--resume` or `--chat-id`. `/permissions` lists these as read-only **Launch arguments**. They apply to that Agent and its Subagents until restart, never to settings or other Agents. Deny and Ask rules and sensitive-path checks still take precedence; broad Bash allows still require Auto review. Add `--deny-on-prompt` to reject operations that would need human approval.
-
 ## Everyday use
 
 | Command | What it does |
@@ -63,18 +61,6 @@ To add temporary tool rules for a new Agent, run `tickloop --allowedTools "Bash(
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
 
-Use `tickloop --add-dir ../shared --add-dir /path/to/docs` to add directories for Agents created by this launch, or `/add-dir PATH` within a Chat. For new Agents to include them by default, put `"permissions": {"additionalDirectories": ["../shared"]}` in your own `settings.json`. The same field under `projects["/absolute/project/path"]` applies only to that exact working directory and adds to the global list. Relative paths resolve from the launch working directory (`--cwd` when supplied); unavailable paths are warned about and skipped.
-
-These sources merge into the Chat's existing additional directories, with duplicates removed. They support reads, edits and `@` file mentions; sensitive-file checks and explicit Ask/Deny rules still apply. `/cwd` shows each directory's sources. Repository settings cannot add directories, and `--add-dir` and `/add-dir` do not write them to settings.
-
-In `/permissions` → Auto mode, you can preview and select a one-time import of custom Auto rules. Built-in rules stay in place; imported rules do not override explicit Ask or Deny. Use `space` to toggle entries, `enter` to save and `esc` to cancel without changes.
-
-On macOS, set `"sandbox": {"enabled": true}` in your own `settings.json` to isolate Bash, background Shells and `!` Shells. Commands may write the Folder, additional directories, verified linked worktrees, the system temporary directory and the family's scratchpad; networking is blocked unless `sandbox.network.allowedDomains` lists destinations such as `registry.npmjs.org` or `*.github.com`. HTTP and HTTPS CONNECT use a local proxy; commands that ignore proxy settings cannot connect directly. Wildcards match subdomains, not the domain itself, and denied destinations are reported in the command output. `sandbox.filesystem.allowWrite` adds literal paths and `denyWrite` protects paths, with deny rules and sensitive paths taking precedence. Relative paths resolve from the Folder. Sandboxed commands cannot traverse sensitive symlinks, including for reads; this prevents aliases from bypassing write protection. Configured deny paths and the user settings file also protect their resolved targets. The sandbox is off by default. While it is on, Accept Edits and Auto run sandboxed Bash and background Shell commands without asking or Auto review; explicit Ask and Deny rules still apply, Plan is unchanged, and `sandbox.autoAllowBashIfSandboxed: false` keeps the isolation but restores ordinary approval. `/permissions` shows the configured state.
-
-For a single call, Bash can request `dangerouslyDisableSandbox: true`. With the sandbox enabled, that call runs without isolation and goes through ordinary approval; Auto reviews it instead of using the read-only or local-edit fast paths. `sandbox.excludedCommands` selects calls that should use the same route: exact commands, prefixes such as `"docker:*"`, and `*` patterns are supported. A matching part of a compound command selects the whole invocation. Leading literal environment assignments and safe wrapper commands are recognized. `sandbox.allowUnsandboxedCommands` defaults to true; setting it to false ignores both escape requests and exclusions. With the sandbox off, the Bash parameter has no effect. A suspected sandbox denial suggests the parameter only when escape requests are allowed; no failed command is retried automatically.
-
-When the sandbox is unavailable, including inside another sandbox or on a different platform, commands warn and run without isolation. Set `sandbox.failIfUnavailable` to `true` to refuse execution instead. One authenticated loopback proxy stays bound for the lifetime of each Tickhost; each Shell keeps its own frozen allowlist. Known limitation: a detached descendant can outlive a Tickhost restart. Its OS sandbox still permits the former proxy's loopback port, so it may reach a different service that later binds that port. Other sandbox fields produce an unsupported-setting warning. A failed sandboxed command whose output indicates a permission denial receives a diagnostic note; its exit status is preserved.
-
 Keys:
 
 - `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.
@@ -87,9 +73,83 @@ Keys:
 
 When a conversation nears the end of the model's context window, the agent summarizes it before its next request. That happens once the context passes the window less room for the summary (the model's output limit, at most 20,000 tokens) and a 13,000-token buffer, but never below half the window; `/context` shows the space past that point as the Autocompact buffer. From 20,000 tokens before that point the status line's `Context N% used` turns to the warning color and the conversation says once how near it is; `/compact` compacts at any time. To compact earlier, set `autoCompactWindow` in `settings.json` to a number of tokens, for example `"autoCompactWindow": 400000`; when it is smaller than the model's window, the point is measured in it instead. Conversations started or reopened afterwards use it.
 
+Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
+
+## Permissions and sandbox
+
+### Execution modes
+
+The mode decides how the agent gets permission to act. **Auto** (the default) lets a reviewer model approve routine actions and asks you about risky ones; **Ask** allows reads and edits in the working directory and asks about other protected operations; **Plan** only plans; **Full Access** skips ordinary approval but keeps explicit Ask and Deny rules. Switch with `/permissions`, `/mode` or `shift+tab`, start with `--mode MODE`, or set the mode new Chats start in with `defaultMode` in your `settings.json`.
+
+`--permission-mode` is an alias of `--mode`; giving both is accepted only when they name the same mode. Both flags and `defaultMode` take Claude Code's names:
+
+| Value | In Tickloop |
+| --- | --- |
+| `acceptEdits` (or `ask`) | Ask |
+| `auto` | Auto |
+| `plan` | Plan |
+| `fullAccess` | Full Access |
+| `default` | Ask, with a warning to use `ask` instead |
+| `dontAsk` | Not a mode: use `--deny-on-prompt`, which refuses every operation that would need your approval |
+| `bypassPermissions` | Not a mode: use `--dangerously-skip-permissions`, which requires external isolation |
+
+A launch flag with an unusable value refuses to start and names the replacement; the same value in `defaultMode` produces the same note as a warning, and new Chats start in Auto.
+
 Plan mode still refuses file edits and commands that change something, except the plan file the agent writes; that file stays writable without asking in every mode. When the agent asks to leave Plan mode without a plan, answer yes to return to the mode you planned from, or no to keep planning. What it would otherwise ask you about, such as `WebFetch`, reads outside the working directory or MCP tool calls, it handles as Auto mode does: allowed directly when Auto would allow it, otherwise decided by the Auto reviewer, which asks you only when it does not allow the call. Explicit Ask and Deny rules still take precedence, and broad shell Allow rules do not skip the review, as in Auto. To be asked instead, set `"useAutoModeDuringPlan": false` in `settings.json`; conversations started or reopened afterwards use it.
 
-Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
+### Rules for one launch
+
+To add temporary tool rules for a new Agent, run `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`. The aliases `--allowed-tools` and `--disallowed-tools` also work. Repeat a flag or separate rules with spaces or commas; a rule that cannot be parsed stops the launch. These flags cannot be combined with `--continue`, `--resume` or `--chat-id`. `/permissions` lists these as read-only **Launch arguments**. They apply to that Agent and its Subagents until restart, never to settings or other Agents. Allowed tools are added to your rules, not an exclusive list: tools you do not name keep their ordinary handling. Deny and Ask rules and sensitive-path checks still take precedence; broad Bash allows still require Auto review. Add `--deny-on-prompt` to reject operations that would need human approval.
+
+### Additional directories
+
+Use `tickloop --add-dir ../shared --add-dir /path/to/docs` to add directories for Agents created by this launch, or `/add-dir PATH` within a Chat. For new Agents to include them by default, put `"permissions": {"additionalDirectories": ["../shared"]}` in your own `settings.json`. The same field under `projects["/absolute/project/path"]` applies only to that exact working directory and adds to the global list. Relative paths resolve from the launch working directory (`--cwd` when supplied); unavailable paths are warned about and skipped.
+
+These sources merge into the Chat's existing additional directories, with duplicates removed. They support reads, edits and `@` file mentions; sensitive-file checks and explicit Ask/Deny rules still apply. `/cwd` shows each directory's sources. Repository settings cannot add directories, and `--add-dir` and `/add-dir` do not write them to settings.
+
+### Importing Auto rules from Claude Code
+
+In `/permissions` → Auto mode, choose **Import from Claude Code** to copy the `autoMode` rules from your Claude Code user settings (`~/.claude/settings.json`, or `settings.json` in `CLAUDE_CONFIG_DIR` when it is set) once. No project file is read and the Claude Code file is not changed. `allow` entries become Soft allow rules, `soft_deny` (or the older `deny`) entries Soft deny rules, and `environment` entries global Environment entries marked as imported. The preview lists what will be added and what will be skipped, and why: text already among your rules, rules named like a Tickloop built-in, and empty or oversized entries are skipped unless you select them. Soft allow entries are marked **Will relax review**. Use `j`/`k` to move, `space` to toggle entries, `enter` to save and `esc` to cancel without changes. Built-in rules stay in place; imported rules are ordinary custom rules afterwards and do not override explicit Ask or Deny. Only you can start an import; the agent has no tool for it.
+
+### Sandbox (macOS)
+
+On macOS, Bash, background Shells and `!` Shells can run in an OS sandbox. It is off by default and is read only from your own `settings.json`; repository content cannot turn it on, off or widen it. For example:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "network": { "allowedDomains": ["registry.npmjs.org", "*.github.com"] }
+  }
+}
+```
+
+Sandboxed commands may write the Folder, additional directories, verified linked worktrees, the system temporary directory and the family's scratchpad. They cannot write your configuration directory, your settings file or sensitive paths such as Git hooks, and networking is blocked unless the allowlist names the destination. `/permissions` shows whether the sandbox is on. Ticks, MCP servers and the file tools (`Read`, `Write`, `Edit`) do not run in the sandbox; your permission rules govern them as before.
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `enabled` | `false` | Run Bash, background Shells and `!` Shells in the sandbox |
+| `failIfUnavailable` | `false` | When the sandbox is unavailable (another platform, or already inside a sandbox): `false` warns and runs without isolation, `true` refuses to run |
+| `autoAllowBashIfSandboxed` | `true` | In Ask and Auto, sandboxed Bash and background Shell commands run without asking or Auto review |
+| `allowUnsandboxedCommands` | `true` | Allow commands to leave the sandbox through `dangerouslyDisableSandbox` or `excludedCommands`; `false` ignores both |
+| `excludedCommands` | `[]` | Commands that always run outside the sandbox, with ordinary approval |
+| `filesystem.allowWrite` | `[]` | More writable paths |
+| `filesystem.denyWrite` | `[]` | Paths kept read-only; wins over `allowWrite` |
+| `network.allowedDomains` | `[]` | Destinations reachable through the local proxy |
+
+Other `sandbox` fields produce an unsupported-setting warning. A `sandbox` value that cannot be read refuses Shell commands until you fix it.
+
+While the sandbox is on, Ask and Auto run sandboxed Bash and background Shell commands, a Subagent's included, without asking or Auto review: the sandbox, not the reviewer, bounds what they can write and reach. Explicit Ask and Deny rules still apply first, Plan and Full Access are unchanged, and `autoAllowBashIfSandboxed: false` keeps the isolation but restores ordinary approval.
+
+For a single call, Bash can request `dangerouslyDisableSandbox: true`. With the sandbox enabled, that call runs without isolation and goes through ordinary approval; Auto reviews it instead of using the read-only or local-edit fast paths. `sandbox.excludedCommands` selects calls that should use the same route: exact commands, prefixes such as `"docker:*"`, and `*` patterns are supported. A matching part of a compound command selects the whole invocation. Leading literal environment assignments and safe wrapper commands are recognized. Setting `allowUnsandboxedCommands` to false ignores both escape requests and exclusions. With the sandbox off, the Bash parameter has no effect.
+
+`filesystem.allowWrite` and `denyWrite` take literal paths: relative paths resolve from the Folder and `~/` from your home directory. Deny rules and sensitive paths take precedence. Reads are not restricted, except that sandboxed commands cannot traverse sensitive symlinks, even to read; this prevents aliases from bypassing write protection. Configured deny paths and the user settings file also protect their resolved targets.
+
+HTTP and HTTPS (CONNECT) go through a local proxy that sandboxed commands receive in the standard proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`); commands that ignore them cannot connect directly. Wildcards such as `*.github.com` match subdomains, not the domain itself. A denied destination is named in the command output, so you know which domain to add. One authenticated loopback proxy stays bound for the lifetime of each Tickhost; each Shell keeps the allowlist it started with.
+
+A failed sandboxed command whose output indicates a permission denial gets a note that the sandbox probably blocked it, which suggests `dangerouslyDisableSandbox` only when escapes are allowed. Its exit status is kept, and no command is retried automatically.
+
+Known limitation: a detached descendant can outlive a Tickhost restart. Its OS sandbox still permits the former proxy's loopback port, so it may reach a different service that later binds that port.
 
 ## Instructions
 

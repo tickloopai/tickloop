@@ -168,7 +168,8 @@ request has no effect. These controls are read only from the user's settings by 
 repository content or Harness Settings Store configuration.
 
 No rules are added or removed: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, with eight
-inapplicable native entries. Policy and built-in group version **10** records this mapping change.
+inapplicable native entries. Policy and built-in group version **10** covers this mapping and the
+Sandbox Network Callback remapping above.
 Portable Agent tests in `harness/runtime/tests/all/environment_approval.rs` use the reference
 Execution Environment, ScriptedModel and a reviewer double. Local integration tests in
 `code/local-environment/tests/all/sandbox.rs` cover the settings and actual macOS execution.

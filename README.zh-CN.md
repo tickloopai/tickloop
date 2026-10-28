@@ -43,8 +43,6 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 然后在 Monitor 中对 Counter 按 Enter，输入 `+` 再按 Enter：Agent 会收到新的计数并作出回应。
 
-为新 Agent 添加临时工具规则，可运行 `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`，也支持别名 `--allowed-tools` 和 `--disallowed-tools`。参数可重复，规则以空格或逗号分隔。这些参数不能与 `--continue`、`--resume` 或 `--chat-id` 同用。`/permissions` 中这些规则标为只读的 **Launch arguments（启动参数）**，只作用于该 Agent 及其 Subagent，重启后失效，不写入设置，也不影响其他 Agent。Deny、Ask 和敏感路径检查仍优先；宽泛的 Bash allow 仍需 Auto 审查。加上 `--deny-on-prompt`，需要人工确认的操作将直接拒绝。
-
 ## 日常使用
 
 | 命令 | 作用 |
@@ -63,18 +61,6 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 | `/artifacts` | 登录 Artifacts，把 Artifact 加入对话 |
 | `/exit` | 离开界面（Agent 继续运行） |
 
-用 `tickloop --add-dir ../shared --add-dir /path/to/docs` 为这次启动创建的 Agent 添加目录，或在 Chat 中使用 `/add-dir PATH`。要让新 Agent 默认包含这些目录，在用户自己的 `settings.json` 中写 `"permissions": {"additionalDirectories": ["../shared"]}`；同一字段也可放在 `projects["/项目绝对路径"]` 下，仅对这个工作目录精确生效，并与全局列表合并。相对路径按启动工作目录（指定时为 `--cwd`）解析，不可用的目录会警告并跳过。
-
-这些来源合并到 Chat 现有的附加目录中并去重，支持读取、编辑和 `@` 文件提及；敏感文件检查和显式 Ask/Deny 规则仍然生效。`/cwd` 会显示每个目录的来源。仓库设置不能添加目录，`--add-dir` 与 `/add-dir` 也不会把目录写入设置。
-
-在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
-
-在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad，网络默认断开；可在 `sandbox.network.allowedDomains` 中列出 `registry.npmjs.org`、`*.github.com` 等目标。HTTP 与 HTTPS CONNECT 经过本机代理，不遵循代理设置的命令也不能直连。通配规则只匹配子域名、不包含域名本身；被拒的目标会写入命令输出。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱中的命令不能穿过敏感符号链接（包括读取），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。沙箱默认关闭。开启后，Accept Edits 与 Auto 下在沙箱里运行的 Bash 和后台 Shell 直接执行，不问人也不送 Auto 审查；显式 Ask/Deny 规则照常生效，Plan 不变；设置 `sandbox.autoAllowBashIfSandboxed: false` 保留隔离但恢复正常审批。`/permissions` 显示配置状态。
-
-Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`sandbox.allowUnsandboxedCommands` 默认为真，设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。疑似被沙箱拦截的失败仅在允许越出时提示该参数，不会自动重试命令。
-
-在已有沙箱中或其他平台上不可用时，命令会警告并按无隔离运行；设置 `sandbox.failIfUnavailable: true` 则拒绝执行。每个 Tickhost 的认证回环代理在其整个生命周期内保持端口绑定，每个 Shell 使用独立冻结的白名单。已知限制：脱离原进程组的后代可能在 Tickhost 重启后仍存活；其 OS 沙箱仍允许连接原代理的回环端口，因此可能访问之后占用该端口的其他服务。其余沙箱字段会提示“暂不支持”。沙箱内失败且输出包含权限拒绝特征的命令会附加诊断说明，退出状态保持不变。
-
 按键：
 
 - `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。
@@ -88,6 +74,82 @@ Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙�
 对话接近模型的上下文窗口上限时，Agent 会在下一次请求前先把对话压缩成摘要。触发点是窗口减去摘要所需的输出空间（模型的输出上限，最多 20,000 tokens）再减去 13,000 tokens 的缓冲，但不低于窗口的一半；触发点之后的空间就是 `/context` 中显示的 Autocompact buffer。距触发点不到 20,000 tokens 时，状态行的 `Context N% used` 改为警示色，对话中也会提示一次；随时可以用 `/compact` 手动压缩。想更早压缩，可在 `settings.json` 中把 `autoCompactWindow` 设为 token 数，例如 `"autoCompactWindow": 400000`；它小于模型窗口时，触发点改按它计算。此后新建或重新打开的对话生效。
 
 Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop` 继续使用 `tickloop.monitor` 和 `~/.tickloop/herdr-popup-plugin`；其他根（包括 `make dev` 的 `~/.tickloop-dev`）使用 `tickloop.monitor.<root-key>`，目录仍为 `<配置根>/herdr-popup-plugin`，显示名包含根路径。稳定的 root key 与 daemon、Tickhost 共用，两套插件可在同一 Herdr 会话共存。每个根首次使用时接受 Monitor 的注册提示，或执行 `tickloop monitor popup install --herdr-socket SOCKET`；`remove` 只移除当前根的插件。默认根已有注册无需重做。
+
+## 权限与沙箱
+
+### 执行模式
+
+执行模式决定 Agent 如何获得操作许可。**Auto**（默认）由审查模型批准常规操作，有风险的才问你；**Ask** 允许读取和编辑工作目录内的文件，其他受保护操作逐次询问；**Plan** 只做计划；**Full Access** 跳过普通审批，但显式 Ask 与 Deny 规则仍然生效。可用 `/permissions`、`/mode` 或 `shift+tab` 切换，用 `--mode 模式` 启动，或在 `settings.json` 中用 `defaultMode` 设置新 Chat 的初始模式。
+
+`--permission-mode` 是 `--mode` 的别名；两者同时给出时必须指向同一模式。两个参数与 `defaultMode` 都接受 Claude Code 的取值：
+
+| 取值 | 在 Tickloop 中 |
+| --- | --- |
+| `acceptEdits`（或 `ask`） | Ask |
+| `auto` | Auto |
+| `plan` | Plan |
+| `fullAccess` | Full Access |
+| `default` | Ask，并警告改用 `ask` |
+| `dontAsk` | 不是模式：改用 `--deny-on-prompt`，凡需你批准的操作一律拒绝 |
+| `bypassPermissions` | 不是模式：改用 `--dangerously-skip-permissions`，需要外部隔离 |
+
+启动参数的取值不可用时拒绝启动，并说明替代写法；同样的值写在 `defaultMode` 中只给出同样的警告，新 Chat 以 Auto 启动。
+
+Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写的计划文件例外；该文件在任何模式下都可直接读写、不需询问。Agent 在没有计划时请求离开 Plan，回答“是”回到进入 Plan 前的模式，回答“否”继续计划。原本要问你的操作，如 `WebFetch`、读取工作目录外的文件或调用 MCP 工具，按 Auto 处理：Auto 会直接允许的就直接允许，其余交给 Auto 审查，审查不放行时才问你。显式 Ask 与 Deny 规则仍然优先，宽泛的 Shell Allow 规则与 Auto 下一样不能跳过审查。若想改为询问，在 `settings.json` 中设置 `"useAutoModeDuringPlan": false`，此后新建或重新打开的对话生效。
+
+### 单次启动的规则
+
+为新 Agent 添加临时工具规则，可运行 `tickloop --allowedTools "Bash(git:*) Edit" --disallowedTools "Bash(rm:*)"`，也支持别名 `--allowed-tools` 和 `--disallowed-tools`。参数可重复，规则以空格或逗号分隔；无法解析的规则会让启动失败。这些参数不能与 `--continue`、`--resume` 或 `--chat-id` 同用。`/permissions` 中这些规则标为只读的 **Launch arguments（启动参数）**，只作用于该 Agent 及其 Subagent，重启后失效，不写入设置，也不影响其他 Agent。允许的工具是追加到现有规则上的，不是排他的白名单：未列出的工具照常处理。Deny、Ask 和敏感路径检查仍优先；宽泛的 Bash allow 仍需 Auto 审查。加上 `--deny-on-prompt`，需要人工确认的操作将直接拒绝。
+
+### 附加目录
+
+用 `tickloop --add-dir ../shared --add-dir /path/to/docs` 为这次启动创建的 Agent 添加目录，或在 Chat 中使用 `/add-dir PATH`。要让新 Agent 默认包含这些目录，在用户自己的 `settings.json` 中写 `"permissions": {"additionalDirectories": ["../shared"]}`；同一字段也可放在 `projects["/项目绝对路径"]` 下，仅对这个工作目录精确生效，并与全局列表合并。相对路径按启动工作目录（指定时为 `--cwd`）解析，不可用的目录会警告并跳过。
+
+这些来源合并到 Chat 现有的附加目录中并去重，支持读取、编辑和 `@` 文件提及；敏感文件检查和显式 Ask/Deny 规则仍然生效。`/cwd` 会显示每个目录的来源。仓库设置不能添加目录，`--add-dir` 与 `/add-dir` 也不会把目录写入设置。
+
+### 从 Claude Code 导入 Auto 规则
+
+在 `/permissions` → Auto mode 中选择 **Import from Claude Code**，可把 Claude Code 用户设置（`~/.claude/settings.json`；设置了 `CLAUDE_CONFIG_DIR` 时为该目录中的 `settings.json`）里 `autoMode` 的规则一次性复制过来。不读取任何项目文件，也不修改 Claude Code 的文件。`allow` 条目成为 Soft allow 规则，`soft_deny`（或旧名 `deny`）成为 Soft deny 规则，`environment` 成为标明“导入”来源的全局 Environment 条目。预览按“将添加 / 将跳过”列出每条及原因：与已有规则文字相同的、与 Tickloop 内置规则同名的、空的或超出长度与数量上限的默认跳过，可以手动勾回。Soft allow 条目标有 **Will relax review**（会放宽审查）。`j`/`k` 移动，空格勾选，`enter` 保存，`esc` 取消且不改动。内置规则会保留；导入后的规则就是普通的自定义规则，不能覆盖显式 Ask 或 Deny。只有你能发起导入，Agent 没有对应的工具。
+
+### 沙箱（macOS）
+
+在 macOS 上，Bash、后台 Shell 和 `!` Shell 可以在操作系统沙箱中运行。沙箱默认关闭，只读取你自己的 `settings.json`；仓库内容不能打开、关闭或放宽它。例如：
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "network": { "allowedDomains": ["registry.npmjs.org", "*.github.com"] }
+  }
+}
+```
+
+沙箱中的命令可以写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad；不能写配置目录、用户设置文件和 Git hooks 等敏感路径；网络默认断开，只能访问白名单中的目标。`/permissions` 显示沙箱是否开启。Tick、MCP 服务以及文件工具（`Read`、`Write`、`Edit`）不在沙箱中运行，仍由权限规则管理。
+
+| 字段 | 默认 | 作用 |
+| --- | --- | --- |
+| `enabled` | `false` | 让 Bash、后台 Shell 和 `!` Shell 在沙箱中运行 |
+| `failIfUnavailable` | `false` | 沙箱不可用时（其他平台，或已在另一个沙箱中）：`false` 警告后按无隔离运行，`true` 拒绝执行 |
+| `autoAllowBashIfSandboxed` | `true` | Ask 与 Auto 下，在沙箱里运行的 Bash 和后台 Shell 直接执行，不问人也不送 Auto 审查 |
+| `allowUnsandboxedCommands` | `true` | 允许命令经 `dangerouslyDisableSandbox` 或 `excludedCommands` 越出沙箱；`false` 同时忽略两者 |
+| `excludedCommands` | `[]` | 总在沙箱外运行并走正常审批的命令 |
+| `filesystem.allowWrite` | `[]` | 追加可写路径 |
+| `filesystem.denyWrite` | `[]` | 保持只读的路径，优先于 `allowWrite` |
+| `network.allowedDomains` | `[]` | 经本机代理可以访问的目标 |
+
+其余 `sandbox` 字段会提示“暂不支持”。`sandbox` 的值无法读取时，Shell 命令一律拒绝执行，直到你改正。
+
+沙箱开启后，Ask 与 Auto 下在沙箱里运行的 Bash 和后台 Shell（包括 Subagent 的）直接执行，不问人也不送 Auto 审查：能写什么、能连什么由沙箱限定，而不是审查器。显式 Ask/Deny 规则仍先生效，Plan 与 Full Access 不变；设置 `autoAllowBashIfSandboxed: false` 保留隔离但恢复正常审批。
+
+Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`allowUnsandboxedCommands` 设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。
+
+`filesystem.allowWrite` 与 `denyWrite` 写字面路径：相对路径以 Folder 为基准，`~/` 指你的主目录。禁写规则和敏感路径优先。读取不受限制，但沙箱中的命令不能穿过敏感符号链接（读取也不行），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。
+
+HTTP 与 HTTPS（CONNECT）经过本机代理，沙箱中的命令从标准代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`）得到它；不遵循这些变量的命令也不能直连。`*.github.com` 这样的通配只匹配子域名，不包含域名本身。被拒的目标会写入命令输出，方便你知道该加哪条白名单。每个 Tickhost 的认证回环代理在其整个生命周期内保持端口绑定，每个 Shell 使用启动时冻结的白名单。
+
+沙箱内失败且输出包含权限拒绝特征的命令会附加一行“被沙箱拦截”的推测说明；只有允许越出时才提示 `dangerouslyDisableSandbox`。退出状态保持不变，不会自动重试命令。
+
+已知限制：脱离原进程组的后代可能在 Tickhost 重启后仍存活；其 OS 沙箱仍允许连接原代理的回环端口，因此可能访问之后占用该端口的其他服务。
 
 ## Tick
 

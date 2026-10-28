@@ -43,4 +43,4 @@ The adaptation adds configurable ambiguous width, grapheme-aware truncation, and
 - Adapted files: `tickhost/host/src/sandbox_base.sbpl` and `sandbox.rs`.
 - License: Apache License, Version 2.0; retained in [licenses/Codex-Apache-2.0.txt](./licenses/Codex-Apache-2.0.txt), with the upstream [NOTICE](./licenses/Codex-NOTICE.txt).
 
-The base profile is retained; the policy builder uses Tickhost's immutable spawn policy, blocks networking, and adds protected write paths and boundary-rename restrictions. OpenAI Codex, Copyright 2025 OpenAI.
+The base profile is retained; the policy builder uses Tickhost's immutable spawn policy, blocks networking except the Tickhost's loopback proxy port when a domain allowlist is set, and adds protected write paths and boundary-rename restrictions. OpenAI Codex, Copyright 2025 OpenAI.
