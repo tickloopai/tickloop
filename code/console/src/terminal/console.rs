@@ -1,4 +1,3 @@
-use super::sandbox_surface::SandboxSurface;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
@@ -142,6 +141,7 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
+    sandbox_surface::SandboxSurface,
     scrollback::{
         CollapsedCall, ForegroundCommandHint, InputEcho, ScrollAction, Scrollback, ToolCallState,
     },
@@ -3329,7 +3329,6 @@ impl Console {
     pub(super) fn close_permissions(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.permissions_surface = None;
-        state.sandbox_surface = None;
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -6565,7 +6564,6 @@ impl State {
                                 let effect = surface.click(body_row, self.width, capacity);
                                 if let PermissionsEffect::Close { .. } = effect {
                                     self.permissions_surface = None;
-                                    self.sandbox_surface = None;
                                 }
                                 if !matches!(effect, PermissionsEffect::None) {
                                     self.pointer_input = Some(InputEvent::Permissions(effect));
@@ -12833,7 +12831,6 @@ impl State {
                 PermissionsEffect::None => None,
                 PermissionsEffect::Close { destination } => {
                     self.permissions_surface = None;
-                    self.sandbox_surface = None;
                     Some(InputEvent::Permissions(PermissionsEffect::Close {
                         destination,
                     }))

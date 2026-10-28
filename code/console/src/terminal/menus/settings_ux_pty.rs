@@ -248,6 +248,7 @@ struct Fixture {
     _master: Box<dyn portable_pty::MasterPty + Send>,
     directory: tempfile::TempDir,
     height: usize,
+    width: usize,
     timeout: Duration,
 }
 
@@ -261,6 +262,10 @@ impl Fixture {
     }
 
     fn start_at(mode: &str, height: u16) -> Self {
+        Self::start_size(mode, 100, height)
+    }
+
+    fn start_size(mode: &str, width: u16, height: u16) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runtime_directories = crate::terminal::test_runtime::RuntimeDirectories::of_config_root(
             &directory.path().join("config"),
@@ -268,7 +273,7 @@ impl Fixture {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: height,
-                cols: 100,
+                cols: width,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -312,6 +317,7 @@ impl Fixture {
             _master: pair.master,
             directory,
             height: height as usize,
+            width: width as usize,
             timeout: TIMEOUT,
         };
         fixture
@@ -331,7 +337,7 @@ impl Fixture {
         loop {
             let mut frame = screen::visible_screen(
                 &String::from_utf8_lossy(&self.output.lock().unwrap()),
-                100,
+                self.width,
                 self.height,
             );
             assert!(
@@ -345,7 +351,7 @@ impl Fixture {
                 thread::sleep(Duration::from_millis(30));
                 frame = screen::visible_screen(
                     &String::from_utf8_lossy(&self.output.lock().unwrap()),
-                    100,
+                    self.width,
                     self.height,
                 );
                 if !predicate(&frame)
@@ -926,7 +932,17 @@ fn sandbox_pty_mode_and_overrides_save_for_this_folder() {
         assert!(!settings.load().sandbox().unwrap().enabled);
     }
     #[cfg(not(target_os = "macos"))]
-    fixture.wait(|frame| frame.contains("本平台暂不支持"));
+    {
+        fixture.wait(|frame| frame.contains("Cannot enable sandbox: 本平台暂不支持"));
+        let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+        assert!(
+            !settings
+                .load()
+                .sandbox_for(&fixture.directory.path().canonicalize().unwrap())
+                .unwrap()
+                .enabled
+        );
+    }
     fixture.send(b"\x1b[C");
     fixture.wait(|frame| frame.contains("[Overrides]") && frame.contains("Strict sandbox"));
     fixture.send(b"\x0e\r");
@@ -1091,4 +1107,69 @@ fn sandbox_pty_failed_save_keeps_file_intact_and_dialog_open() {
     );
     fixture.send(b"\x1b");
     fixture.wait(|frame| !frame.contains("[Overrides]"));
+}
+
+#[test]
+fn sandbox_pty_config_default_protections_follow_allow_git_config() {
+    for allow_git_config in [false, true] {
+        let mut fixture = Fixture::start_at("ordinary", 40);
+        let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+        let folder = fixture.directory.path().canonicalize().unwrap();
+        std::fs::write(
+            settings.file_path(),
+            serde_json::json!({"projects":{folder.to_str().unwrap():{
+                "sandbox":{"filesystem":{"allowGitConfig":allow_git_config}}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        fixture.send(b"/sandbox\r");
+        fixture.wait(|frame| frame.contains("[Mode]"));
+        fixture.send(b"\x1b[D");
+        let frame = fixture.wait(|frame| {
+            frame.contains("[Config]")
+                && frame.contains("Default protected paths")
+                && frame.contains(".git/hooks")
+        });
+        assert_eq!(frame.contains(".git/config"), !allow_git_config, "{frame}");
+        assert!(
+            frame.contains(&format!("allowGitConfig: {allow_git_config} [this Folder]")),
+            "{frame}"
+        );
+    }
+}
+
+#[test]
+fn sandbox_pty_short_narrow_panel_keeps_the_selected_option_visible_after_saving() {
+    let mut fixture = Fixture::start_size("ordinary", 40, 9);
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]"));
+    fixture.send(b"\x1b[C");
+    fixture.wait(|frame| frame.contains("[Overrides]"));
+    fixture.send(b"j\r");
+    fixture.wait(|frame| {
+        frame.contains("Saved for this Folder") && frame.contains("❯ Strict sandbox · Current")
+    });
+}
+
+#[test]
+fn sandbox_pty_empty_lists_keep_their_configured_source() {
+    let mut fixture = Fixture::start_at("ordinary", 50);
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    let folder = fixture.directory.path().canonicalize().unwrap();
+    std::fs::write(
+        settings.file_path(),
+        serde_json::json!({
+            "sandbox":{"excludedCommands":[]},
+            "projects":{folder.to_str().unwrap():{"sandbox":{"network":{"allowedDomains":[]}}}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]"));
+    fixture.send(b"\x1b[D");
+    fixture.wait(|frame| {
+        frame.contains("None [global]") && frame.contains("None; disconnected [this Folder]")
+    });
 }

@@ -148,7 +148,7 @@ impl LoadedSettings {
     }
 
     pub fn sandbox_for(&mut self, folder: &std::path::Path) -> Result<SandboxSettings, String> {
-        self.sandbox()?;
+        let global = self.sandbox()?;
         let project = self
             .settings
             .get("projects")
@@ -156,7 +156,7 @@ impl LoadedSettings {
             .and_then(|value| value.get("sandbox"))
             .cloned();
         let Some(project) = project else {
-            return self.sandbox();
+            return Ok(global);
         };
         let mut project_settings = self.clone();
         project_settings
@@ -202,20 +202,7 @@ fn merge_sandbox(global: &mut Value, project: Value) {
                 merge_sandbox(global.entry(key).or_insert(Value::Null), value);
             }
         }
-        (Value::Array(global), Value::Array(project)) => {
-            for value in project {
-                if !global.contains(&value) {
-                    global.push(value);
-                }
-            }
-            let mut unique = Vec::new();
-            for value in global.drain(..) {
-                if !unique.contains(&value) {
-                    unique.push(value);
-                }
-            }
-            *global = unique;
-        }
+        (Value::Array(global), Value::Array(project)) => global.extend(project),
         (global, project) => *global = project,
     }
 }

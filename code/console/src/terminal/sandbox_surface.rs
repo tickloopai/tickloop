@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_code_settings::{
     SettingsError, UserSettings,
-    sandbox::{SandboxChange, SandboxMode, SandboxSnapshot},
+    sandbox::{SandboxChange, SandboxMode, SandboxSettings, SandboxSnapshot},
 };
 
 use super::{
@@ -11,11 +11,66 @@ use super::{
     style::{Role, RoleLine},
 };
 
+const MODE_AUTO_ALLOW: usize = 0;
+const MODE_REGULAR: usize = 1;
+const MODE_DISABLED: usize = 2;
+const OVERRIDE_ALLOW: usize = 0;
+const OVERRIDE_STRICT: usize = 1;
+const PANEL_CHROME_ROWS: usize = 2;
+const MINIMUM_FRAME_ROWS: usize = 5;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Mode,
+    Overrides,
+    Config,
+}
+
+impl Page {
+    fn adjacent(self, backwards: bool) -> Self {
+        match (self, backwards) {
+            (Self::Mode, true) | (Self::Overrides, false) => Self::Config,
+            (Self::Mode, false) | (Self::Config, true) => Self::Overrides,
+            (Self::Overrides, true) | (Self::Config, false) => Self::Mode,
+        }
+    }
+
+    fn options(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Mode => &[
+                (
+                    "Sandbox with auto-allow",
+                    "Sandboxed Bash skips ordinary approval; Ask/Deny still apply.",
+                ),
+                (
+                    "Sandbox with regular permissions",
+                    "Keep isolation and normal approval.",
+                ),
+                (
+                    "No sandbox",
+                    "Commands use normal approval without sandbox isolation.",
+                ),
+            ],
+            Self::Overrides => &[
+                (
+                    "Allow unsandboxed commands",
+                    "Model escape requests and excluded commands use normal approval.",
+                ),
+                (
+                    "Strict sandbox",
+                    "All commands invoked by the model must run in the sandbox unless explicitly listed in excludedCommands.",
+                ),
+            ],
+            Self::Config => &[],
+        }
+    }
+}
+
 pub(super) struct SandboxSurface {
     settings: UserSettings,
     folder: PathBuf,
     snapshot: SandboxSnapshot,
-    page: usize,
+    page: Page,
     selected: usize,
     message: String,
     roots: Vec<String>,
@@ -31,16 +86,12 @@ impl SandboxSurface {
         availability: Result<(), String>,
     ) -> Result<Self, String> {
         let snapshot = settings.load().sandbox_snapshot(&folder)?;
-        let selected = if !snapshot.settings.enabled {
-            2
-        } else {
-            usize::from(!snapshot.settings.auto_allow_bash_if_sandboxed)
-        };
+        let selected = Self::current_selection(Page::Mode, &snapshot.settings);
         Ok(Self {
             settings,
             folder,
             snapshot,
-            page: 0,
+            page: Page::Mode,
             selected,
             message: String::new(),
             roots,
@@ -55,30 +106,25 @@ impl SandboxSurface {
             KeyCode::Esc => return true,
             KeyCode::Char('c') if control => return true,
             KeyCode::Left | KeyCode::Right => {
-                self.page = (self.page + if key.code == KeyCode::Right { 1 } else { 2 }) % 3;
-                self.selected = match self.page {
-                    0 if !self.snapshot.settings.enabled => 2,
-                    0 => usize::from(!self.snapshot.settings.auto_allow_bash_if_sandboxed),
-                    1 => usize::from(!self.snapshot.settings.allow_unsandboxed_commands),
-                    _ => 0,
-                };
+                self.page = self.page.adjacent(key.code == KeyCode::Left);
+                self.selected = Self::current_selection(self.page, &self.snapshot.settings);
                 self.message.clear();
                 self.offset = 0;
             }
-            KeyCode::Char('j') | KeyCode::Down if self.page == 2 && !control => {
+            KeyCode::Char('j') | KeyCode::Down if self.page == Page::Config && !control => {
                 self.offset = self.offset.saturating_add(1)
             }
-            KeyCode::Char('n') if self.page == 2 && control => {
+            KeyCode::Char('n') if self.page == Page::Config && control => {
                 self.offset = self.offset.saturating_add(1)
             }
-            KeyCode::Char('k') | KeyCode::Up if self.page == 2 && !control => {
+            KeyCode::Char('k') | KeyCode::Up if self.page == Page::Config && !control => {
                 self.offset = self.offset.saturating_sub(1)
             }
-            KeyCode::Char('p') if self.page == 2 && control => {
+            KeyCode::Char('p') if self.page == Page::Config && control => {
                 self.offset = self.offset.saturating_sub(1)
             }
-            KeyCode::Home if self.page == 2 => self.offset = 0,
-            KeyCode::End if self.page == 2 => self.offset = usize::MAX,
+            KeyCode::Home if self.page == Page::Config => self.offset = 0,
+            KeyCode::End if self.page == Page::Config => self.offset = usize::MAX,
             KeyCode::Char('j') | KeyCode::Down if !control => {
                 self.selected = (self.selected + 1).min(self.option_count().saturating_sub(1))
             }
@@ -89,19 +135,22 @@ impl SandboxSurface {
                 self.selected = self.selected.saturating_sub(1)
             }
             KeyCode::Char('p') if control => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Enter if self.page < 2 => {
-                if self.page == 0 && self.selected < 2 && !cfg!(target_os = "macos") {
-                    self.message = "本平台暂不支持，不能打开沙箱".into();
+            KeyCode::Enter if self.page != Page::Config => {
+                if self.page == Page::Mode
+                    && self.selected != MODE_DISABLED
+                    && !cfg!(target_os = "macos")
+                {
+                    self.message = "Cannot enable sandbox: 本平台暂不支持".into();
                     return false;
                 }
-                let change = if self.page == 0 {
+                let change = if self.page == Page::Mode {
                     SandboxChange::Mode(match self.selected {
-                        0 => SandboxMode::AutoAllow,
-                        1 => SandboxMode::Regular,
+                        MODE_AUTO_ALLOW => SandboxMode::AutoAllow,
+                        MODE_REGULAR => SandboxMode::Regular,
                         _ => SandboxMode::Disabled,
                     })
                 } else {
-                    SandboxChange::AllowUnsandboxed(self.selected == 0)
+                    SandboxChange::AllowUnsandboxed(self.selected == OVERRIDE_ALLOW)
                 };
                 self.message =
                     match self
@@ -125,12 +174,19 @@ impl SandboxSurface {
         false
     }
 
-    fn option_count(&self) -> usize {
-        match self.page {
-            0 => 3,
-            1 => 2,
-            _ => 0,
+    fn current_selection(page: Page, settings: &SandboxSettings) -> usize {
+        match page {
+            Page::Mode if !settings.enabled => MODE_DISABLED,
+            Page::Mode if settings.auto_allow_bash_if_sandboxed => MODE_AUTO_ALLOW,
+            Page::Mode => MODE_REGULAR,
+            Page::Overrides if settings.allow_unsandboxed_commands => OVERRIDE_ALLOW,
+            Page::Overrides => OVERRIDE_STRICT,
+            Page::Config => 0,
         }
+    }
+
+    fn option_count(&self) -> usize {
+        self.page.options().len()
     }
 
     fn config_lines(&self) -> Vec<String> {
@@ -155,7 +211,10 @@ impl SandboxSurface {
         }
         lines.push("Excluded commands (normal approval outside sandbox):".into());
         if config.excluded_commands.is_empty() {
-            lines.push("  None [default]".into());
+            lines.push(format!(
+                "  None [{}]",
+                self.snapshot.source("/excludedCommands", None)
+            ));
         }
         for pattern in &config.excluded_commands {
             lines.push(format!(
@@ -172,6 +231,19 @@ impl SandboxSurface {
             ));
         }
         lines.push("Relative paths resolve from this Folder; ~/ resolves from your home.".into());
+        lines.push(format!(
+            "allowGitConfig: {} [{}]",
+            config.filesystem.allow_git_config,
+            self.snapshot.source("/filesystem/allowGitConfig", None)
+        ));
+        lines.push(format!(
+            "Default protected paths [built-in]: {}",
+            config
+                .filesystem
+                .default_deny_write_paths()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         lines.push(format!(
             "Sensitive paths [built-in]: {}",
             tickloop_harness::tools::credential_write_path_descriptions().join(", ")
@@ -191,7 +263,10 @@ impl SandboxSurface {
         lines.push("Deny rules take precedence over writable scope.".into());
         lines.push("Network allowlist:".into());
         if config.network.allowed_domains.is_empty() {
-            lines.push("  None; disconnected [default]".into());
+            lines.push(format!(
+                "  None; disconnected [{}]",
+                self.snapshot.source("/network/allowedDomains", None)
+            ));
         }
         for domain in &config.network.allowed_domains {
             lines.push(format!(
@@ -223,7 +298,7 @@ impl SandboxSurface {
 
     fn body(&self, width: usize) -> (Vec<RoleLine>, Option<std::ops::Range<usize>>) {
         use super::loop_view_text::wrapped;
-        if self.page == 2 {
+        if self.page == Page::Config {
             return (
                 self.config_lines()
                     .iter()
@@ -244,38 +319,8 @@ impl SandboxSurface {
                 Role::Warning,
             ));
         }
-        let current = match self.page {
-            0 if !self.snapshot.settings.enabled => 2,
-            0 => usize::from(!self.snapshot.settings.auto_allow_bash_if_sandboxed),
-            _ => usize::from(!self.snapshot.settings.allow_unsandboxed_commands),
-        };
-        let options: &[(&str, &str)] = if self.page == 0 {
-            &[
-                (
-                    "Sandbox with auto-allow",
-                    "Sandboxed Bash skips ordinary approval; Ask/Deny still apply.",
-                ),
-                (
-                    "Sandbox with regular permissions",
-                    "Keep isolation and normal approval.",
-                ),
-                (
-                    "No sandbox",
-                    "Commands use normal approval without sandbox isolation.",
-                ),
-            ]
-        } else {
-            &[
-                (
-                    "Allow unsandboxed commands",
-                    "Model escape requests and excluded commands use normal approval.",
-                ),
-                (
-                    "Strict sandbox",
-                    "All commands invoked by the model must run in the sandbox unless explicitly listed in excludedCommands.",
-                ),
-            ]
-        };
+        let current = Self::current_selection(self.page, &self.snapshot.settings);
+        let options = self.page.options();
         let mut selected_rows = None;
         for (index, (label, description)) in options.iter().enumerate() {
             let start = lines.len();
@@ -292,27 +337,34 @@ impl SandboxSurface {
                     Role::Text
                 },
             ));
-            lines.extend(wrapped(&format!("  {description}"), width, Role::MutedText));
             if index == self.selected {
                 selected_rows = Some(start..lines.len());
             }
+            lines.extend(wrapped(&format!("  {description}"), width, Role::MutedText));
         }
         (lines, selected_rows)
     }
 
+    pub(super) fn minimum_frame_rows(&self, width: usize) -> usize {
+        let label_rows = self.body(width).1.map_or(1, |rows| rows.len());
+        MINIMUM_FRAME_ROWS
+            .max(PANEL_CHROME_ROWS + label_rows + usize::from(!self.message.is_empty()))
+    }
+
     pub(super) fn content_rows(&self, width: usize) -> usize {
-        2 + self.body(width).0.len() + usize::from(!self.message.is_empty())
+        PANEL_CHROME_ROWS + self.body(width).0.len() + usize::from(!self.message.is_empty())
     }
 
     pub(super) fn styled_lines(&mut self, width: usize, height: usize) -> Vec<RoleLine> {
         let mut lines = vec![tab_header_line(
             "Sandbox",
-            self.page,
+            self.page as usize,
             &["Mode", "Overrides", "Config"],
             width,
         )];
         let (body, selected) = self.body(width);
-        let available = height.saturating_sub(2 + usize::from(!self.message.is_empty()));
+        let available =
+            height.saturating_sub(PANEL_CHROME_ROWS + usize::from(!self.message.is_empty()));
         if let Some(selected) = selected {
             if selected.start < self.offset {
                 self.offset = selected.start;
@@ -330,10 +382,10 @@ impl SandboxSurface {
             ));
         }
         lines.push(RoleLine::role(
-            if self.page == 2 {
+            if self.page == Page::Config {
                 "←/→ page · j/k ctrl+n/p scroll · home/end · esc close"
             } else {
-                "←/→ page · j/k ctrl+n/p move · enter save · esc close"
+                "enter save · esc close"
             },
             Role::MutedText,
         ));

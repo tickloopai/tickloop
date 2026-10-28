@@ -702,8 +702,8 @@ impl State {
             panel.minimum_frame_rows(self.width)
         } else if self.conversation_picker.is_some() {
             4
-        } else if self.sandbox_surface.is_some() {
-            5
+        } else if let Some(surface) = &self.sandbox_surface {
+            surface.minimum_frame_rows(self.width)
         } else if let Some(surface) = &self.permissions_surface {
             surface.minimum_frame_rows(self.width)
         } else {

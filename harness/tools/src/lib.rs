@@ -513,10 +513,21 @@ pub struct SensitiveWritePathPatterns {
 }
 
 pub fn credential_write_path_descriptions() -> Vec<String> {
-    let mut paths = SENSITIVE_PATH_NAMES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+    let mut paths = SENSITIVE_PATH_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
     paths.push(".env.*".into());
-    paths.extend(SENSITIVE_PATH_SIGNALS.iter().map(|name| format!("*{name}*")));
-    paths.extend(SENSITIVE_PATH_EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
+    paths.extend(
+        SENSITIVE_PATH_SIGNALS
+            .iter()
+            .map(|name| format!("*{name}*")),
+    );
+    paths.extend(
+        SENSITIVE_PATH_EXTENSIONS
+            .iter()
+            .map(|extension| format!("*.{extension}")),
+    );
     paths.sort();
     paths.dedup();
     paths
