@@ -61,5 +61,6 @@ impl State {
             .map(|(_, candidates)| candidates);
         self.completion
             .set_skills(candidates.unwrap_or(&BUILTIN_CANDIDATES).clone());
+        self.completion.offer_debug(self.shows_debug_details);
     }
 }

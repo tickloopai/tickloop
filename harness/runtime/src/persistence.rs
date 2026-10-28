@@ -1611,6 +1611,8 @@ fn loop_entry_content(snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) ->
             progress: None,
             state_since: chat_loop.state_since.map(serde_json::Value::from),
             run_started_at: chat_loop.run_started_at,
+            runs_started: chat_loop.runs_started,
+            compactions: chat_loop.compactions,
         },
         chat_loop.run_id,
     )
@@ -2578,6 +2580,8 @@ impl RestoredChain {
                     .state_since
                     .as_ref()
                     .and_then(serde_json::Value::as_u64),
+                runs_started: record.runs_started,
+                compactions: record.compactions,
             };
         }
     }

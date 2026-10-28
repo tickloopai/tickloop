@@ -65,6 +65,7 @@ function fixture(t) {
       environment: Object.fromEntries(Object.entries(process.env).filter(([name]) => name.endsWith('_RUNTIME_DIR'))),
       config: process.env.TICKLOOP_CONFIG_DIR, home: process.env.HOME,
       artifactOrigin: process.env.TICKLOOP_ARTIFACT_ORIGIN, devArtifactOrigin: process.env.TICKLOOP_DEV_ARTIFACT_ORIGIN,
+      debug: process.env.TICKLOOP_DEBUG,
       shellStartupFile: process.env.ENV }));
   `;
   executable('cargo', `
@@ -97,7 +98,7 @@ function fixture(t) {
     const env = { ...process.env, HOME: home, PATH: `${commands}:/usr/bin:/bin`,
       TICKLOOP_CONFIG_DIR: join(root, 'global configuration') };
     // An enclosing `make test` passes its own variables and command line down to every sub-make.
-    for (const name of ['TICKLOOP_DEV_CONFIG_DIR', 'TICKLOOP_TICK_RUNTIME_DIR', 'CARGO_TARGET_DIR', 'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
+    for (const name of ['TICKLOOP_DEV_CONFIG_DIR', 'TICKLOOP_TICK_RUNTIME_DIR', 'CARGO_TARGET_DIR', 'TICKLOOP_ARTIFACT_ORIGIN', 'TICKLOOP_DEV_ARTIFACT_ORIGIN', 'TICKLOOP_DEBUG', 'ENV', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKELEVEL'])
       delete env[name];
     return Object.assign(env, overrides);
   }
@@ -164,6 +165,24 @@ test('an explicit CARGO_TARGET_DIR is the build target', t => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.reported.buildTarget, realpathSync(shared));
   assert.equal(result.reported.compiledFor, realpathSync(checkout));
+});
+
+test('make dev shows the debug details by default and keeps the caller\'s choice', t => {
+  const f = fixture(t);
+  const checkout = f.checkout('debug details');
+  const byDefault = f.runMake(checkout);
+  assert.equal(byDefault.status, 0, byDefault.stderr);
+  assert.equal(byDefault.reported.debug, '1');
+  for (const [choice, launch] of [
+    ['0', () => f.runMake(checkout, [], { TICKLOOP_DEBUG: '0' })],
+    ['0', () => f.runMake(checkout, ['TICKLOOP_DEBUG=0'])],
+    ['0', () => f.run(checkout, { TICKLOOP_DEBUG: '0' })],
+    ['1', () => f.run(checkout)],
+  ]) {
+    const result = launch();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.reported.debug, choice);
+  }
 });
 
 test('make dev talks to production Tickloop Cloud by default, over any configured origin', t => {

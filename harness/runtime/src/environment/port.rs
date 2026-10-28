@@ -281,6 +281,8 @@ pub struct OpenSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellSpec {
+    /// The trusted Chat Folder; cwd never grants write access.
+    pub folder: Option<String>,
     pub dangerously_disable_sandbox: bool,
     pub additional_directories: Vec<String>,
     pub family_temp: Option<String>,

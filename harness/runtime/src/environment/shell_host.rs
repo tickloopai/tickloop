@@ -360,6 +360,7 @@ fn unknown_exit(reason: &str) -> ShellExit {
 
 pub fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
     ShellSpec {
+        folder: None,
         dangerously_disable_sandbox: false,
         additional_directories: Vec::new(),
         family_temp: None,
@@ -379,6 +380,9 @@ pub async fn prepare_shell(
     delivery: ShellOutputDelivery,
 ) -> Result<ShellPreparation, ToolError> {
     let spec = ShellSpec {
+        folder: request
+            .folder
+            .map(|path| path.to_string_lossy().into_owned()),
         dangerously_disable_sandbox: request.dangerously_disable_sandbox,
         additional_directories: request
             .additional_directories

@@ -465,6 +465,10 @@ pub struct LoopRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_since: Option<serde_json::Value>,
     pub run_started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_started: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<u64>,
 }
 
 impl LoopRecord {

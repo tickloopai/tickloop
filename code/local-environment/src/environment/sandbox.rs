@@ -58,9 +58,10 @@ pub(super) async fn prepare(
     let skips_approval_when_isolated = config.auto_allow_bash_if_sandboxed;
     let settings = settings.clone();
     let spec = spec.clone();
-    let policy = tokio::task::spawn_blocking(move || prepare_policy(&settings, &spec, &config))
-        .await
-        .map_err(|error| configuration_error(error.to_string()))??;
+    let (policy, requires_approval) =
+        tokio::task::spawn_blocking(move || prepare_policy(&settings, &spec, &config))
+            .await
+            .map_err(|error| configuration_error(error.to_string()))??;
     let network = match &policy.network {
         SandboxNetwork::Disconnected => NetworkIsolation::Disconnected,
         SandboxNetwork::Allowlist { .. } => NetworkIsolation::Allowlist,
@@ -72,7 +73,7 @@ pub(super) async fn prepare(
             network,
         },
         warning: None,
-        requires_approval: false,
+        requires_approval,
         skips_approval_when_isolated,
         escape_guidance,
     })
@@ -82,12 +83,18 @@ fn prepare_policy(
     settings: &UserSettings,
     spec: &ShellSpec,
     config: &SandboxSettings,
-) -> Result<SandboxPolicy, ExecutionError> {
-    let folder = Path::new(&spec.cwd).canonicalize().map_err(path_error)?;
+) -> Result<(SandboxPolicy, bool), ExecutionError> {
+    let folder = spec
+        .folder
+        .as_deref()
+        .ok_or_else(|| configuration_error("sandbox requires a trusted Chat Folder"))?;
+    let folder = Path::new(folder).canonicalize().map_err(path_error)?;
     let mut writable_roots = vec![folder.clone()];
     for path in &spec.additional_directories {
         writable_roots.push(Path::new(path).canonicalize().map_err(path_error)?);
     }
+    let cwd = Path::new(&spec.cwd).canonicalize().map_err(path_error)?;
+    let requires_approval = !writable_roots.iter().any(|root| cwd.starts_with(root));
     writable_roots.extend(tickloop_harness::base::git_worktree::sibling_linked_worktrees(&folder));
     let mut protected_paths = Vec::new();
     for path in &config.filesystem.allow_write {
@@ -170,20 +177,23 @@ fn prepare_policy(
     deny_write.dedup();
     protected_paths.sort();
     protected_paths.dedup();
-    Ok(SandboxPolicy {
-        writable_roots,
-        deny_write,
-        protected_paths,
-        denied_path_patterns,
-        network: if config.network.allowed_domains.is_empty() {
-            SandboxNetwork::Disconnected
-        } else {
-            SandboxNetwork::Allowlist {
-                allowed_domains: config.network.allowed_domains.clone(),
-                proxy_port: 0,
-            }
+    Ok((
+        SandboxPolicy {
+            writable_roots,
+            deny_write,
+            protected_paths,
+            denied_path_patterns,
+            network: if config.network.allowed_domains.is_empty() {
+                SandboxNetwork::Disconnected
+            } else {
+                SandboxNetwork::Allowlist {
+                    allowed_domains: config.network.allowed_domains.clone(),
+                    proxy_port: 0,
+                }
+            },
         },
-    })
+        requires_approval,
+    ))
 }
 
 fn resolve_configured_path(

@@ -3376,6 +3376,9 @@ impl Agent {
                 .observe(prefix, response.output.usage.cache_read_input_tokens)
         {
             cache_break.log(receipt.chat_id, receipt.run_id);
+            chat.snapshot
+                .request_usage
+                .record_cache_break(response.sequence, cache_break.note())?;
         }
         let invalid_call = response.output.content.iter().any(|content| {
             if let Content::ToolUse { id, name, input } = content {
@@ -4566,6 +4569,9 @@ impl Agent {
             chat_loop.run_id = Some(pending.receipt.run_id);
             chat_loop.run_started_at =
                 Some(tickloop_harness_base::private_fs::unix_time_milliseconds());
+            if let Some(runs_started) = &mut chat_loop.runs_started {
+                *runs_started += 1;
+            }
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);

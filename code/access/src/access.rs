@@ -91,8 +91,10 @@ use tickloop_harness::protocol::{
 /// configuration warnings guidance note, which older readers reject as unknown, in the Chat
 /// snapshot's host notes; the host state of the system prompt no longer carries what changes
 /// during a Chat.
+/// 34.1 adds the prompt cache break a request caused to its request usage record, and to the
+/// Loop how many Runs it started and how many times the Chat was compacted.
 pub const PROTOCOL_MAJOR: u16 = 34;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

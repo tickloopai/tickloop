@@ -581,8 +581,28 @@ async fn cache_breaks_are_logged_only_when_the_prefix_changes_or_cache_reads_col
     assert_eq!(field(changed, "previous_cache_read"), "1200");
     assert_eq!(field(changed, "cache_read"), "1300");
     run_turn(&agent, chat, "Once more").await;
+    let ledger = agent.snapshot(chat).await.unwrap().request_usage;
     agent.shutdown().await;
     let breaks = breaks(&log);
+    let notes = ledger
+        .entries()
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record.usage.cache_read_input_tokens?,
+                record.cache_break.clone()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notes.len(), breaks.len(), "{notes:#?}");
+    let (tool_change_read, tool_change) = &notes[0];
+    assert_eq!(*tool_change_read, 1300);
+    assert_eq!(tool_change.likely_cause, "prefix_changed");
+    assert!(tool_change.first_changed.is_some(), "{tool_change:?}");
+    let (collapse_read, collapse) = notes.last().unwrap();
+    assert_eq!(*collapse_read, 100);
+    assert_eq!(collapse.likely_cause, "vendor_side");
+    assert_eq!(collapse.first_changed, None);
     let collapsed = breaks.last().unwrap();
     assert_eq!(field(collapsed, "reason"), "cache_read_dropped");
     assert_eq!(field(collapsed, "changed"), "none");

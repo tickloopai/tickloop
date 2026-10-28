@@ -36,6 +36,13 @@ pub struct LoopSnapshot {
     pub subscriptions: Vec<TickSubscription>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_sources: Vec<EventSourceBinding>,
+    /// How many Runs the Loop has started, compactions notwithstanding; unknown for a Loop
+    /// restored from records written before the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_started: Option<u64>,
+    /// How many times the Chat's conversation was compacted; unknown as `runs_started` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<u64>,
 }
 
 impl LoopSnapshot {
@@ -50,6 +57,8 @@ impl LoopSnapshot {
             receiving: Receiving::Receiving,
             subscriptions: Vec::new(),
             event_sources: Vec::new(),
+            runs_started: Some(0),
+            compactions: Some(0),
         }
     }
 

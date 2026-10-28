@@ -126,6 +126,16 @@ impl Fixture {
         height: u16,
         fixture_name: &str,
     ) -> Self {
+        Self::start_with_environment(directory, width, height, fixture_name, &[])
+    }
+
+    pub(super) fn start_with_environment(
+        directory: &std::path::Path,
+        width: u16,
+        height: u16,
+        fixture_name: &str,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let runtime_directories =
             crate::terminal::test_runtime::RuntimeDirectories::of_config_root(directory);
         let pair = native_pty_system()
@@ -143,6 +153,9 @@ impl Fixture {
         command.env("TERM", "xterm-256color");
         command.env("TICKLOOP_CONFIG_DIR", directory);
         command.env("TICKLOOP_TMPDIR", directory);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         command.cwd(directory);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);

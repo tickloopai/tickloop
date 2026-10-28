@@ -154,11 +154,22 @@ fn followed_view(
     colors: AgentColors,
 ) -> Console {
     let console = Console::test_interactive_for_chat(chat);
+    follow_in(&console, chat, workdir, snapshot, colors);
+    console
+}
+
+fn follow_in(
+    console: &Console,
+    chat: Uuid,
+    workdir: &std::path::Path,
+    snapshot: &ChatSnapshot,
+    colors: AgentColors,
+) {
     console.remember_agent_colors(colors).unwrap();
     console.set_input_context(Some(chat), workdir, &[]).unwrap();
     let mut tools = ToolPresentation::new(false);
     render_restored_observation(
-        &console,
+        console,
         &mut tools,
         chat.into(),
         0,
@@ -176,7 +187,6 @@ fn followed_view(
         },
     )
     .unwrap();
-    console
 }
 
 /// The conversation of `snapshot` as a View reopening its history draws it.
@@ -189,6 +199,78 @@ fn reopened_view(chat: Uuid, snapshot: &ChatSnapshot, colors: AgentColors) -> Co
     console.remember_agent_colors(colors).unwrap();
     workflows::write_public_history(&console, snapshot).unwrap();
     console
+}
+
+#[tokio::test]
+async fn the_cache_summary_ends_the_finished_line_whether_followed_or_reopened() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let model = StreamedScript {
+        replies: Mutex::new(
+            [Reply::of(vec![tickloop_harness::test_support::text(
+                "Checked.",
+            )])]
+            .into(),
+        ),
+    };
+    let agent = Agent::new_embedded(tickloop_harness::test_support::config(), Arc::new(model));
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, "Check it".into()).await.unwrap();
+    finish_run(&agent, chat, &mut events).await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let conversation =
+        |finished: &str| ["", "❯ Check it", "", "⏺ Checked.", "", finished, ""].join("\n");
+
+    let followed = Console::test_interactive_for_chat(chat);
+    followed.test_show_debug_details();
+    follow_in(&followed, chat, &workdir, &snapshot, AgentColors::default());
+    let reopened = Console::test_interactive_for_chat(chat);
+    reopened.test_show_debug_details();
+    workflows::write_public_history(&reopened, &snapshot).unwrap();
+    for view in [&followed, &reopened] {
+        // The fixture reports no cache counters, and a View without mouse capture has no button.
+        assert_eq!(
+            view.test_conversation_text(),
+            conversation("⏺ Done · cache n/a")
+        );
+        let finished = view
+            .test_conversation_rows()
+            .into_iter()
+            .find(|row| row.spans.iter().any(|span| span.text.contains("Done")))
+            .unwrap();
+        assert!(
+            finished
+                .spans
+                .iter()
+                .all(|span| span.text.trim().is_empty() || span.role == Some(Role::MutedText)),
+            "{:?}",
+            finished.spans
+        );
+        let details = view.test_debug_details().unwrap();
+        assert!(
+            details.starts_with(&format!(
+                "chat: {}\nrun: {}\nturn: 1\nmodel: fixture\n",
+                ChatId::from(chat).public(),
+                receipt.run_id.public()
+            )),
+            "{details}"
+        );
+    }
+    assert_eq!(
+        followed_view(chat, &workdir, &snapshot, AgentColors::default()).test_conversation_text(),
+        conversation("⏺ Done"),
+        "without the switch the finished line stays as it was"
+    );
+
+    // A Chat whose ledger no longer holds the run, as after the Agent's process restarted.
+    let mut forgotten = snapshot.clone();
+    forgotten.request_usage = Default::default();
+    let restored = Console::test_interactive_for_chat(chat);
+    restored.test_show_debug_details();
+    workflows::write_public_history(&restored, &forgotten).unwrap();
+    assert_eq!(restored.test_conversation_text(), conversation("⏺ Done"));
+    assert_eq!(restored.test_debug_details(), None);
 }
 
 #[tokio::test]

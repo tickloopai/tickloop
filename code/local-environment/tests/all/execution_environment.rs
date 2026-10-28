@@ -266,6 +266,7 @@ async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() 
         0,
     );
     let first = ShellSpec {
+        folder: None,
         dangerously_disable_sandbox: false,
         additional_directories: Vec::new(),
         family_temp: None,
@@ -355,6 +356,7 @@ async fn ended_shell_releases_its_output_fd_and_refuses_fifo_replacement_without
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -534,6 +536,7 @@ async fn local_and_memory_shells_share_the_stop_contract() {
             folder: Some("/".into()),
         },
         ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -560,6 +563,7 @@ async fn local_and_memory_shells_share_the_stop_contract() {
             folder: Some(cwd.to_string_lossy().into_owned()),
         },
         ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -589,6 +593,7 @@ async fn local_and_memory_shells_share_the_exit_contract() {
             folder: Some("/".into()),
         },
         ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -627,6 +632,7 @@ async fn local_and_memory_shells_share_the_exit_contract() {
             folder: Some(cwd.to_string_lossy().into_owned()),
         },
         ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -665,6 +671,7 @@ async fn shell_observation_reports_one_exit_and_late_observers_only_get_a_baseli
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            folder: None,
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -1419,6 +1426,7 @@ async fn local_and_reference_hosts_report_isolation_at_preparation() {
         folder: Some(directory.path().display().to_string()),
     };
     let spec = ShellSpec {
+        folder: None,
         dangerously_disable_sandbox: false,
         additional_directories: Vec::new(),
         family_temp: None,

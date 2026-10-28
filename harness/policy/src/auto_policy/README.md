@@ -198,6 +198,11 @@ fallback without isolation) reports unrestricted isolation and keeps ordinary ap
 Full Access are unchanged. A whole-environment isolation report, as a future virtual machine would
 give, does not qualify. Sensitive paths stay unwritable inside the sandbox itself.
 
+The local policy derives its writable roots and relative filesystem settings from the trusted Chat
+Folder, never from Bash `cwd`. A cwd outside the Folder and additional directories requires ordinary
+approval, including Auto review, while retaining the same sandbox.
+Temporary roots and configured `allowWrite` paths do not by themselves qualify a cwd for fast admission.
+
 No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**,
 eight inapplicable native entries, and policy and built-in group version **10** are unchanged.
 `harness/runtime/tests/all/sandbox_auto_approval.rs` covers the routing with the reference
