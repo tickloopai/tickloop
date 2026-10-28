@@ -180,10 +180,39 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
         })
         .await;
         let frame = view.frame();
+        let (column, row) = monitor_position(&frame, "size 40x");
+        view.send(&click(column, row));
+        view.wait_for("a click in the shown card enters it", card_focused)
+            .await;
+        let frame = view.frame();
+        let hidden_row = frame
+            .lines()
+            .position(|line| {
+                monitor_part(line)
+                    .is_some_and(|part| part.contains("Keys") && !part.contains(SELECTED_MARK))
+            })
+            .unwrap_or_else(|| panic!("the hidden card's row: {frame}"));
+        let column = frame
+            .lines()
+            .nth(hidden_row)
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .0
+            .chars()
+            .count()
+            + 4;
+        view.send(&click(column, hidden_row + 1));
+        view.wait_for(
+            "a click on another row leaves the focused card and shows that row's card",
+            |frame| !card_focused(frame) && keys_cards(frame) == 2,
+        )
+        .await;
+        let frame = view.frame();
         let (column, row) = monitor_position(&frame, "Keys");
         view.send(&click(column, row));
         view.wait_for("a click on the row toggles its card", |frame| {
-            keys_cards(frame) != 1
+            keys_cards(frame) == 1
         })
         .await;
         view.send(b"\x1b");
@@ -823,6 +852,91 @@ async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell
         assert!(!view.frame().contains("Shell stopped"), "{}", view.frame());
         assert!(!input_focused(&view.frame()), "{}", view.frame());
         view.send(b"\x1b");
+        view.wait_for("input focused again", input_focused).await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A card whose Tick ends keeps its last screen, says how the Tick ended on its rule and gives
+/// the focus back to the list: a terminal Tick whose program exited tells its exit status, an
+/// extension Tick whose process died says it ended. Space still hides the ended Tick's card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_a_card_whose_tick_ends_keeps_its_last_screen_and_says_how() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_local_ticks(&fixture, &[], false).await;
+        let client = fixture.client().await;
+        let execution = catalog(&client).await[0].execution;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+
+        select_row(&mut view, "cat").await;
+        view.send(b"\r");
+        view.wait_for("the cat card has the focus", card_focused)
+            .await;
+        view.send(b"last words\r");
+        view.wait_for("cat echoes in its card", |frame| {
+            monitor_shows(frame, "last words")
+        })
+        .await;
+        view.send(b"\x04");
+        let exited = view
+            .wait_for("the cat card says how its program ended", |frame| {
+                monitor_shows(frame, " exited 0 ")
+            })
+            .await;
+        assert!(
+            monitor_shows(&exited, "last words"),
+            "the last screen stays: {exited}"
+        );
+        assert!(
+            !card_focused(&exited),
+            "the focus leaves the ended card: {exited}"
+        );
+
+        let keys = hosted_members(&client, execution)
+            .await
+            .into_iter()
+            .find(|member| !member.is_terminal)
+            .expect("the keys Tick");
+        select_row(&mut view, "Keys").await;
+        view.send(b"\r");
+        view.wait_for("the keys card has the focus", |frame| {
+            card_focused(frame) && monitor_shows(frame, "size ")
+        })
+        .await;
+        let pid = keys
+            .resources
+            .as_ref()
+            .expect("a process sample")
+            .business_pid;
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let ended = view
+            .wait_for("the keys card says its Tick ended", |frame| {
+                monitor_shows(frame, " ended ")
+                    && frame
+                        .lines()
+                        .any(|line| line.starts_with("enter reopen") && line.contains("space hide"))
+            })
+            .await;
+        assert!(
+            monitor_shows(&ended, "size "),
+            "the last screen stays: {ended}"
+        );
+        assert!(!card_focused(&ended), "{ended}");
+        view.send(b" ");
+        view.wait_for("Space hides the ended Tick's card", |frame| {
+            !monitor_shows(frame, " ended ")
+        })
+        .await;
+        view.send(CLOSE);
         view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })

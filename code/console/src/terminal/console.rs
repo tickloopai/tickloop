@@ -942,6 +942,8 @@ pub(super) struct State {
     cards: super::monitor_cards::MonitorCards,
     /// The Tick screen size the last frame gave each shown card.
     card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
+    /// The next frame sends each card's size at once, as when a separator drag ends.
+    card_resizes_due: bool,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
@@ -6277,6 +6279,7 @@ impl State {
             monitor_separator: None,
             cards: Default::default(),
             card_sizes: HashMap::new(),
+            card_resizes_due: false,
             card_press: None,
             member_probes: Vec::new(),
             member_probe_running: false,
@@ -6316,7 +6319,8 @@ impl State {
     }
 
     /// Drags Monitor's separator: a press on it starts, motion resizes the column within its
-    /// bounds and the release asks to save the width. `None` leaves the event to other handling;
+    /// bounds and the release asks to save the width and draws the cards' final sizes, which
+    /// reach their Ticks at once. `None` leaves the event to other handling;
     /// otherwise whether the frame changed.
     fn resize_monitor(&mut self, kind: MouseEventKind, at: Cell) -> Option<bool> {
         match kind {
@@ -6347,7 +6351,8 @@ impl State {
                 self.pointer_input = self
                     .monitor_width
                     .map(|columns| InputEvent::SaveMonitorWidth { columns });
-                Some(false)
+                self.card_resizes_due = true;
+                Some(true)
             }
             _ => None,
         }
@@ -7350,11 +7355,13 @@ impl State {
         {
             self.frames_drawn += 1;
         }
-        // A dialog, a menu or anything covering Monitor takes the keys from a focused card.
+        // A dialog, a menu or anything covering Monitor takes the keys from a focused card, and
+        // a card whose Tick or view ended takes none.
         if self.card_focused()
             && (self.input_dialog_visible()
                 || !self.monitor_visible()
-                || self.monitor.detail.is_some())
+                || self.monitor.detail.is_some()
+                || self.focused_card_ended())
         {
             self.leave_card();
         }
@@ -12593,7 +12600,7 @@ impl State {
                     if self
                         .monitor
                         .selected()
-                        .is_some_and(|entry| self.has_card(&entry.instance)) =>
+                        .is_some_and(|entry| self.row_toggles_card(&entry.instance)) =>
                 {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
@@ -13801,7 +13808,7 @@ fn read_keys(
                 state.card_focused().then(|| state.card_deadline())
             };
             if let Some(deadline) = card {
-                let read = read_card_input(state, deadline)?;
+                let read = read_card_input(state, deadline, stop, sender)?;
                 // The card's keys are the Tick's, so the Console's own input counts as idle.
                 if (!read && !idle_tick(state, stop, sender)?)
                     || !settle_background_work(state, stop, sender, true, &mut deferred_frame)?
@@ -13956,10 +13963,15 @@ fn idle_tick(
 }
 
 /// Reads the user's raw input for the focused Monitor card, waiting at most until `deadline`,
-/// when a held Esc is due to be settled. Returns whether anything was read; with nothing read the
-/// held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
+/// when a held Esc is due to be settled; what a click that left the card asks goes to `sender`. Returns whether input arrived, read for the card or left
+/// to the Console once the card lost the focus; with nothing arrived the held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
 /// meanwhile.
-fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::Result<bool> {
+fn read_card_input(
+    state: &Arc<Mutex<State>>,
+    deadline: Option<Instant>,
+    stop: &AtomicBool,
+    sender: &mpsc::Sender<InputEvent>,
+) -> io::Result<bool> {
     let wait = deadline.map_or(INPUT_POLL_INTERVAL, |deadline| {
         deadline
             .saturating_duration_since(Instant::now())
@@ -13993,6 +14005,12 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
         }
         return Ok(false);
     }
+    // The focus can leave the card meanwhile, as when its Tick ends; the input is then the
+    // Console's, so it stays unread for crossterm. Reading under the lock keeps the focus fixed.
+    let mut state = lock()?;
+    if !state.card_focused() {
+        return Ok(true);
+    }
     let mut buffer = [0_u8; CARD_INPUT_READ_BYTES];
     let count = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
     if count < 0 {
@@ -14006,14 +14024,23 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
             Err(error)
         };
     }
-    let mut state = lock()?;
     if count == 0 {
         // The input ended; the Console's own reader reports it.
         state.leave_card();
     } else {
-        state.card_input(&buffer[..count as usize], Instant::now());
+        state.card_input(
+            &buffer[..count as usize],
+            Instant::now(),
+            &mut io::stdout().lock(),
+        );
     }
     state.draw(&mut io::stdout().lock())?;
+    // A click that left the card acts in the Console, such as showing another row's card.
+    let clicked = state.pointer_input.take();
+    drop(state);
+    if let Some(input) = clicked {
+        send_input(sender, stop, input);
+    }
     Ok(true)
 }
 

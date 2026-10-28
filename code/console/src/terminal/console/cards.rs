@@ -4,8 +4,8 @@
 use super::*;
 use crate::terminal::monitor::MonitorTarget;
 use crate::terminal::monitor_cards::{
-    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardScreen, CardSize, CardState,
-    CardView, DEFAULT_CARD_ROWS, SgrMouse,
+    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardScreen, CardSize,
+    CardState, CardView, DEFAULT_CARD_ROWS, SgrMouse, ViewEnd,
 };
 use tick_protocol::InstanceRef;
 
@@ -15,7 +15,7 @@ pub(super) struct CardSource {
     pub(super) demand: CardDemand,
     pub(super) focused: bool,
     pub(super) screen: Option<Arc<Mutex<CardScreen>>>,
-    pub(super) note: Option<String>,
+    pub(super) note: Option<CardNote>,
 }
 
 const OPENING_NOTE: &str = "opening";
@@ -23,6 +23,12 @@ const OPENING_NOTE: &str = "opening";
 impl State {
     pub(super) fn card_focused(&self) -> bool {
         self.cards.focused().is_some()
+    }
+
+    /// Whether Space and a click on `instance`'s row toggle its card: its view opens, or its
+    /// card is still shown after its Tick ended.
+    pub(super) fn row_toggles_card(&self, instance: &InstanceRef) -> bool {
+        self.has_card(instance) || self.cards.is_open(instance)
     }
 
     /// Whether `instance`'s row shows a live screen: a hosted Tick or a Shell whose view opens.
@@ -141,14 +147,15 @@ impl State {
             .flatten()
     }
 
-    /// Hands the user's raw input bytes, read while a card has the focus, to its Tick.
-    pub(super) fn card_input(&mut self, input: &[u8], now: Instant) {
+    /// Hands the user's raw input bytes, read while a card has the focus, to its Tick; a click
+    /// outside the card and the mouse reports after it are the Console's, drawn to `output`.
+    pub(super) fn card_input(&mut self, input: &[u8], now: Instant, output: &mut impl Write) {
         let paste_markers = self.focused_card_screen(|screen| screen.bracketed_paste());
         let items = self
             .cards
             .keys_mut()
             .feed(input, now, paste_markers.unwrap_or(false));
-        self.apply_card_inputs(items, now);
+        self.apply_card_inputs(items, now, output);
     }
 
     /// Settles a held Esc once its time passed; returns whether the screen changed.
@@ -158,7 +165,7 @@ impl State {
         }
         let items = self.cards.keys_mut().expire(now);
         let leaves = items.contains(&CardInput::Leave);
-        self.apply_card_inputs(items, now);
+        self.apply_card_inputs(items, now, &mut io::sink());
         leaves
     }
 
@@ -168,15 +175,25 @@ impl State {
         Some(read(screen.parser.screen()))
     }
 
-    fn apply_card_inputs(&mut self, items: Vec<CardInput>, now: Instant) {
-        for item in items {
+    fn apply_card_inputs(&mut self, items: Vec<CardInput>, now: Instant, output: &mut impl Write) {
+        let mut items = items.into_iter();
+        while let Some(item) = items.next() {
             match item {
                 CardInput::Bytes(bytes) => self.cards.input(bytes),
                 CardInput::Focus(true) => self.focus_gained(now),
                 CardInput::Focus(false) => self.focus_lost(),
                 CardInput::Mouse(mouse) => {
                     if !self.card_mouse(mouse) {
+                        // The click leaves the card and then acts where it landed, as do the
+                        // reports after it, such as its release; keys after it are dropped.
                         self.leave_card();
+                        let console_reports = items.filter_map(|item| match item {
+                            CardInput::Mouse(mouse) => Some(mouse),
+                            _ => None,
+                        });
+                        for report in std::iter::once(mouse).chain(console_reports) {
+                            self.pointer(report.console_event(), output);
+                        }
                         return;
                     }
                 }
@@ -268,7 +285,8 @@ impl State {
 
     /// The open cards of the shown Chat whose rows are still listed, for the next frame. A Chat
     /// switch or a row leaving the list closes its cards; a row on a page not loaded yet is
-    /// still listed.
+    /// still listed. A card whose Tick ended, as its row or its view tells, keeps its last screen
+    /// and says how on its rule.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
         let monitor = &self.monitor;
         self.cards
@@ -281,14 +299,15 @@ impl State {
             .iter()
             .map(|card| {
                 let (screen, note) = match &card.state {
-                    CardState::Opening => (None, Some(OPENING_NOTE.to_owned())),
-                    CardState::Failed(reason) => (None, Some(reason.clone())),
+                    CardState::Opening => (None, Some(CardNote::plain(OPENING_NOTE))),
+                    CardState::Failed(reason) => (None, Some(CardNote::plain(reason.clone()))),
                     CardState::Attached(view) => (
                         Some(view.screen.clone()),
-                        view.screen
-                            .lock()
-                            .ok()
-                            .and_then(|screen| screen.ended.clone()),
+                        self.row_end_note(&card.instance).or_else(|| {
+                            view.screen.lock().ok().and_then(|screen| {
+                                screen.ended.as_ref().map(|ended| self.view_end_note(ended))
+                            })
+                        }),
                     ),
                 };
                 CardSource {
@@ -305,14 +324,64 @@ impl State {
             .collect()
     }
 
-    /// After a frame: each shown card's view takes the size the frame gave it, and the focus
-    /// leaves a card the frame did not show, such as when a menu covers Monitor.
+    /// Whether the focused card takes no more input: its Tick ended, as its row tells, or its
+    /// view ended.
+    pub(super) fn focused_card_ended(&self) -> bool {
+        let Some(view) = self.cards.focused_view() else {
+            return false;
+        };
+        self.cards
+            .focused()
+            .is_some_and(|instance| self.row_end_note(instance).is_some())
+            || view
+                .screen
+                .lock()
+                .is_ok_and(|screen| screen.ended.is_some())
+    }
+
+    /// How `instance`'s row says its Tick ended, in its state mark's colour.
+    fn row_end_note(&self, instance: &InstanceRef) -> Option<CardNote> {
+        let entry = self
+            .monitor
+            .entries()
+            .iter()
+            .find(|entry| &entry.instance == instance)?;
+        let ended = entry.ended.clone()?;
+        Some(CardNote::ended(
+            ended,
+            crate::terminal::list_row::state_mark(entry.tone, self.display, 0),
+        ))
+    }
+
+    /// Why a card's view ended, before its row tells: its Tick ended, as a gone row will say, or
+    /// the view failed by itself.
+    fn view_end_note(&self, ended: &ViewEnd) -> CardNote {
+        match ended {
+            ViewEnd::TickEnded => CardNote::ended(
+                crate::monitor_rows::TICK_ENDED.into(),
+                crate::terminal::list_row::state_mark(
+                    crate::monitor_rows::StatusTone::Gone,
+                    self.display,
+                    0,
+                ),
+            ),
+            ViewEnd::Failed(reason) => CardNote::plain(reason.clone()),
+        }
+    }
+
+    /// After a frame: each shown card's view takes the size the frame gave it, paced while the
+    /// size keeps changing, or at once after a separator drag ends; the focus leaves a card the
+    /// frame did not show, such as when a menu covers Monitor.
     pub(super) fn settle_cards(&mut self, sizes: Vec<(InstanceRef, CardSize)>) {
+        let resizes_due = std::mem::take(&mut self.card_resizes_due);
         for (instance, size) in &sizes {
             if let Some(card) = self.cards.card_mut(instance)
                 && let CardState::Attached(view) = &mut card.state
             {
                 view.resize(*size);
+                if resizes_due {
+                    view.flush_resize();
+                }
             }
             self.card_sizes.insert(instance.clone(), *size);
         }
@@ -380,7 +449,7 @@ impl State {
         };
         let is_card = match &target {
             MonitorTarget::Card { .. } => true,
-            MonitorTarget::Tick(instance) => self.has_card(instance),
+            MonitorTarget::Tick(instance) => self.row_toggles_card(instance),
             _ => false,
         };
         if is_card {
@@ -422,7 +491,7 @@ impl State {
         let Some(entry) = self.monitor.selected() else {
             return hint;
         };
-        if !self.has_card(&entry.instance) {
+        if !self.row_toggles_card(&entry.instance) {
             return hint;
         }
         let space = if self.cards.is_open(&entry.instance) {
