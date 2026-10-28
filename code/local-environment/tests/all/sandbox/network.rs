@@ -4,7 +4,10 @@ use super::*;
 async fn sandbox_network_allowlist_reaches_http_service() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = TestHttpServer::start(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\nallowlisted hello");
+    let server = TestHttpServer::start(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\nallowlisted hello",
+    );
     let fixture = SandboxFixture::new(serde_json::json!({
         "enabled":true,"failIfUnavailable":true,
         "network":{"allowedDomains":["localhost"]}
@@ -48,7 +51,10 @@ async fn sandbox_network_allowlist_reports_denied_domain_even_when_shell_succeed
 async fn sandbox_network_allowlist_tunnels_wildcard_destinations_but_blocks_bypasses() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = TestHttpServer::start(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ntunnel hello");
+    let server = TestHttpServer::start(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ntunnel hello",
+    );
     let fixture = SandboxFixture::new(serde_json::json!({
         "enabled":true,"failIfUnavailable":true,
         "network":{"allowedDomains":["*.LOCALHOST"]}
@@ -122,7 +128,10 @@ async fn sandbox_network_allowlist_does_not_expose_ipv6_at_the_proxy_port() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
             .await
             .unwrap();
-        let server = TestHttpServer::start(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbypass hello");
+        let server = TestHttpServer::start(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbypass hello",
+        );
         std::fs::write(folder.join("ready"), "").unwrap();
         server
     };
@@ -274,7 +283,6 @@ async fn sandbox_network_allowlist_installs_a_small_npm_package() {
     assert!(!result.is_error, "{}", result.content);
 }
 
-
 struct TestHttpServer {
     task: tokio::task::JoinHandle<()>,
 }
@@ -299,6 +307,10 @@ os.setsid()
 (root / 'detached-ready').write_text(str(port))
 while not (root / 'probe-now').exists() and time.monotonic() < deadline:
     time.sleep(0.01)
+if not (root / 'probe-now').exists():
+    (root / 'detached-result').write_text('fixture synchronization timed out')
+    (root / 'detached-done').touch()
+    os._exit(1)
 try:
     with socket.create_connection(('127.0.0.1', port), timeout=1) as stream:
         stream.sendall(b'GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n')
@@ -314,26 +326,44 @@ except OSError as error:
 (root / 'detached-done').touch()
 os._exit(0)
 "#).unwrap();
-    let result = fixture.run(fixture.prepare("/usr/bin/python3 detached.py").await).await;
+    let result = fixture
+        .run(fixture.prepare("/usr/bin/python3 detached.py").await)
+        .await;
     assert!(!result.is_error, "{}", result.content);
-    let port = std::fs::read_to_string(folder.join("detached-ready")).unwrap().parse::<u16>().unwrap();
+    let port = std::fs::read_to_string(folder.join("detached-ready"))
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
     let listener = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if let Ok(listener) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            if let Ok(listener) =
+                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+            {
                 break listener;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
-    let server = TestHttpServer::start(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nretired proxy bypass");
+    })
+    .await
+    .unwrap();
+    let server = TestHttpServer::start(
+        listener,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nretired proxy bypass",
+    );
     std::fs::write(folder.join("probe-now"), "").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !folder.join("detached-done").exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     drop(server);
     let result = std::fs::read_to_string(folder.join("detached-result")).unwrap();
+    assert!(
+        !result.contains("fixture synchronization timed out"),
+        "{result}"
+    );
     assert!(!result.contains("retired proxy bypass"), "{result}");
 }
 

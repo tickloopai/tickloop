@@ -6,6 +6,7 @@ use tickloop_code_settings::UserSettings;
 use tickloop_harness::runtime::environment::*;
 use tokio_util::sync::CancellationToken;
 
+#[path = "sandbox/network.rs"]
 mod network;
 
 #[tokio::test]
