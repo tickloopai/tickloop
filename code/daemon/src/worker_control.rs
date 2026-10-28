@@ -618,7 +618,7 @@ fn with_plugin_environment(
     config_root: &Path,
 ) -> Result<Vec<(String, String)>, HostError> {
     let packages = tick_plugins::PluginStore::in_config_root(config_root);
-    // Only the exact canonical path of an installed package's program gets its credentials.
+    // Only the exact path of an installed package's program gets its credentials.
     let package = command
         .first()
         .and_then(|program| program::installed_plugin_of(Path::new(program), &packages));

@@ -1725,10 +1725,57 @@ mod tests {
         else {
             panic!("an open prepares an open");
         };
-        // The approved command runs its canonical program, `/usr/bin/echo` where `/bin` is a link.
-        let echo = std::fs::canonicalize("/bin/echo").unwrap();
-        assert_eq!(command, &[echo.to_str().unwrap().to_owned(), argument]);
+        // The approved command runs the program by the path it was named with, even where
+        // `/bin` is a link.
+        assert_eq!(command, &["/bin/echo".to_owned(), argument]);
         assert_eq!(title, &tickhost::host::display_title(&named));
+    }
+
+    /// A program reached through a link runs by the link's path, so one that dispatches on its
+    /// invocation name or directory behaves as it would in a terminal; the approval names the
+    /// command as written.
+    #[tokio::test]
+    async fn an_open_through_a_link_runs_the_program_by_the_links_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .prefix("htl")
+            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
+            .unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let target = cwd.join("mvim");
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(cwd.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&target, cwd.join("bin/vim")).unwrap();
+        let chat = Uuid::new_v4();
+        let tools = HostedTickTools::new(listing_daemon(&cwd, chat.into(), &[]), Vec::new());
+        let prepared = tools
+            .prepare(
+                chat.into(),
+                TICK_MANAGE,
+                &json!({"action":"open","command":["bin/vim", "notes.txt"],"cwd":cwd}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            prepared.approval_summary().contains("`bin/vim notes.txt`"),
+            "{}",
+            prepared.approval_summary()
+        );
+        let Some(HostedPrepared {
+            operation: Operation::Open { command, .. },
+        }) = prepared.payload::<HostedPrepared>()
+        else {
+            panic!("an open prepares an open");
+        };
+        assert_eq!(
+            command,
+            &[
+                cwd.join("bin/vim").to_string_lossy().into_owned(),
+                "notes.txt".to_owned()
+            ]
+        );
     }
 
     #[test]
