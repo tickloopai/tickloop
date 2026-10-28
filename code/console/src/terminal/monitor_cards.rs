@@ -46,6 +46,8 @@ const EARLY_INPUT_BYTES: usize = 64 * 1024;
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
+/// A Shell's card is read-only, so leaving is all its keys do.
+pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc leave";
 
 const ESCAPE: u8 = 0x1b;
 /// A control sequence still unfinished at this length is no key's.

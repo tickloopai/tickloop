@@ -420,8 +420,13 @@ impl State {
 
     /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card.
     pub(super) fn monitor_list_hint(&self) -> String {
-        if self.card_focused() {
-            return crate::terminal::monitor_cards::FOCUSED_CARD_HINT.to_owned();
+        if let Some(focused) = self.cards.focused() {
+            return if focused.shell_task().is_some() {
+                crate::terminal::monitor_cards::FOCUSED_SHELL_CARD_HINT
+            } else {
+                crate::terminal::monitor_cards::FOCUSED_CARD_HINT
+            }
+            .to_owned();
         }
         let hint = self.monitor.hint();
         let Some(entry) = self.monitor.selected() else {

@@ -111,7 +111,11 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
         shown.contains("━━"),
         "the focused card's rule is heavy: {shown}"
     );
-    assert_eq!(state.monitor_list_hint(), FOCUSED_CARD_HINT);
+    assert_eq!(
+        state.monitor_list_hint(),
+        "esc leave",
+        "a Shell's card is read-only, so only leaving is hinted"
+    );
 
     let start = Instant::now();
     state.card_input(b"\x1b", start);
@@ -176,7 +180,10 @@ fn focus_reports_read_by_a_focused_card_reach_the_console() {
     state.key(key(KeyCode::Enter));
     state.file_index_focused = true;
     state.card_input(b"\x1b[O", Instant::now());
-    assert!(!state.file_index_focused, "the Console lost the terminal's focus");
+    assert!(
+        !state.file_index_focused,
+        "the Console lost the terminal's focus"
+    );
     state.card_input(b"\x1b[I", Instant::now());
     assert!(state.file_index_focused && state.card_focused());
 }
@@ -323,4 +330,19 @@ fn a_focused_card_and_an_unfocused_card_render_their_rows_rules_and_screens() {
             .all(|span| span.role == Some(Role::Accent))
     );
     assert_eq!(line_of(&focused, "━").text(), "━".repeat(30));
+}
+
+#[test]
+fn a_focused_hosted_card_hints_sending_esc() {
+    let mut state = cards_fixture();
+    let mut hosted = shell_entry("hosted tick");
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    hosted.instance = instance.clone();
+    hosted.group = TickGroup::Ticks;
+    hosted.actions[0].intent = crate::monitor_rows::TickIntent::OpenView(instance.clone());
+    state.monitor.replace(TickGroup::Ticks, vec![hosted]);
+    state.monitor.select(&instance);
+    state.key(key(KeyCode::Enter));
+    assert!(state.card_focused());
+    assert_eq!(state.monitor_list_hint(), FOCUSED_CARD_HINT);
 }
