@@ -13,6 +13,8 @@ pub struct SandboxSettings {
     pub fail_if_unavailable: bool,
     #[serde(default)]
     pub filesystem: SandboxFilesystem,
+    #[serde(default)]
+    pub network: SandboxNetwork,
     pub auto_allow_bash_if_sandboxed: bool,
     pub allow_unsandboxed_commands: bool,
     pub excluded_commands: Vec<String>,
@@ -24,11 +26,19 @@ impl Default for SandboxSettings {
             enabled: false,
             fail_if_unavailable: false,
             filesystem: SandboxFilesystem::default(),
+            network: SandboxNetwork::default(),
             auto_allow_bash_if_sandboxed: true,
             allow_unsandboxed_commands: true,
             excluded_commands: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxNetwork {
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -53,6 +63,7 @@ impl LoadedSettings {
                     "enabled",
                     "failIfUnavailable",
                     "filesystem",
+                    "network",
                     "autoAllowBashIfSandboxed",
                     "allowUnsandboxedCommands",
                     "excludedCommands",
@@ -63,6 +74,13 @@ impl LoadedSettings {
                     "sandbox.filesystem",
                     filesystem,
                     &["allowWrite", "denyWrite"],
+                );
+            }
+            if let Some(network) = object.get("network").and_then(Value::as_object) {
+                self.warn_unsupported_sandbox_fields(
+                    "sandbox.network",
+                    network,
+                    &["allowedDomains"],
                 );
             }
         }

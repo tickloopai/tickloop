@@ -13,6 +13,9 @@ use tickloop_harness::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "sandbox/network.rs"]
+mod network;
+
 #[tokio::test]
 async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
     let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
@@ -277,6 +280,7 @@ impl SandboxFixture {
 }
 
 struct NoSecondaryModel;
+
 #[async_trait::async_trait]
 impl tickloop_harness::tools::SecondaryModel for NoSecondaryModel {
     async fn respond(

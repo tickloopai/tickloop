@@ -316,7 +316,13 @@ impl ExecutionPort for LocalPort {
                     .ok_or_else(|| {
                         ExecutionError::new("Unsupported", "this environment cannot run Shells")
                     })?
-                    .prepare(self.identity, &self.authority, spec, staged)
+                    .prepare(
+                        self.identity,
+                        self.scope.chat,
+                        &self.authority,
+                        spec,
+                        staged,
+                    )
                     .await?;
                 self.authority.check(self.scope.chat)?;
                 return Ok(prepared);

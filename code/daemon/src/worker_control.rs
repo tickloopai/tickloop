@@ -273,6 +273,13 @@ impl WorkerControl {
             chat,
         };
         match envelope.request {
+            WorkerRequest::SandboxProxyPort { .. } => {
+                return self
+                    .controller
+                    .sandbox_proxy_port()
+                    .await
+                    .map(|port| json!(port));
+            }
             WorkerRequest::AllowShellSpawn {
                 operation,
                 approval,
@@ -592,7 +599,9 @@ impl WorkerControl {
                 .allow_view(&tick_owner, &instance)
                 .await
                 .map(|grant| json!(grant)),
-            WorkerRequest::AllowShellSpawn { .. } | WorkerRequest::AllowShellView { .. } => {
+            WorkerRequest::AllowShellSpawn { .. }
+            | WorkerRequest::AllowShellView { .. }
+            | WorkerRequest::SandboxProxyPort { .. } => {
                 unreachable!("Shell spawns and views are granted before a config root is required")
             }
         }
