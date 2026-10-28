@@ -2640,8 +2640,10 @@ async fn removing_a_subscribed_row_after_confirmation_cancels_its_subscriptions_
     core.shutdown().await;
 }
 
+/// Read state belongs to the Agent: the user opening a row, its detail or its card, and closing
+/// the detail again, leaves the row's updates unhandled.
 #[tokio::test]
-async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
+async fn opening_a_row_or_closing_its_detail_never_marks_its_updates_handled() {
     use crate::terminal::{
         execution::ConsoleExecution,
         tick_actions::{TickActionContext, execute},
@@ -2692,27 +2694,29 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
         action
     };
     execute(opened, context).await.unwrap();
-    let handled = agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .monitor
-        .handled_at(&quotes)
-        .unwrap();
-    assert!(handled > joined, "opening the row handled its updates");
+    {
+        let mut state = console.state.lock().unwrap();
+        assert!(
+            state.monitor.detail.is_some(),
+            "Enter opened the row's detail"
+        );
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none(),
+            "closing the detail asks the Agent nothing"
+        );
+        assert!(state.monitor.detail.is_none());
+    }
     assert_eq!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .monitor
-            .chat_status
-            .as_ref()
+        agent
+            .snapshot(chat)
+            .await
             .unwrap()
             .monitor
             .handled_at(&quotes),
-        Some(handled),
-        "the View shows the handled row at once"
+        Some(joined),
+        "the user opening the row left its updates to the Agent"
     );
     core.shutdown().await;
 }

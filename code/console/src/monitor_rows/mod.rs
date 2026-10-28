@@ -162,8 +162,8 @@ pub struct RowUpdate {
     pub at_ms: u64,
     /// `None` once the Chat handled the update.
     pub unread: Option<Unread>,
-    /// When one of the Chat's Agent turns took the update in, once one did; the user opening the
-    /// row handles it without one.
+    /// When one of the Chat's Agent turns took the update in, once one did; an Agent read
+    /// handles it without one.
     pub taken_in_at_ms: Option<u64>,
 }
 
@@ -510,7 +510,7 @@ fn offer_subscribing(entry: &mut TickDescriptor) {
 }
 
 /// Settles whether the Chat still has the row's latest update to handle: handled once a turn
-/// took it in or the user opened the row at or after it, and taken in only by the turn; while
+/// took it in or the Agent read the instance at or after it, and taken in only by the turn; while
 /// unread, a subscription's count of updates waiting for delivery counts it.
 fn resolve_unread(
     entry: &mut TickDescriptor,

@@ -86,16 +86,10 @@ fn monitor_membership_commands_cross_the_wire_unchanged() {
         generation: 1,
     };
     let instance: InstanceRef = "hosted:counter".parse().unwrap();
-    for command in [
-        AgentCommand::RemoveMonitorMember {
-            execution,
-            instance: instance.clone(),
-        },
-        AgentCommand::MarkMonitorHandled {
-            execution,
-            instance: instance.clone(),
-        },
-    ] {
+    for command in [AgentCommand::RemoveMonitorMember {
+        execution,
+        instance: instance.clone(),
+    }] {
         let wire = serde_json::to_value(&command).unwrap();
         let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);

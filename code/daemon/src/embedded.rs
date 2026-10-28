@@ -761,19 +761,6 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?,
                 ))
             }),
-            AgentCommand::MarkMonitorHandled {
-                execution,
-                instance,
-            } => Box::pin(async move {
-                let chat = self.chat(execution).await?;
-                Ok(CommandResult::MonitorMembership(
-                    self.inner
-                        .agent
-                        .mark_monitor_handled(chat.into(), instance)
-                        .await
-                        .map_err(agent_access_error)?,
-                ))
-            }),
             AgentCommand::Create {
                 launch_rules,
                 launch,

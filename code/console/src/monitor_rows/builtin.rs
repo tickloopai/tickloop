@@ -1152,11 +1152,11 @@ mod tests {
         };
         assert_eq!(taken_in(&quote), Some(5_000), "a turn took the delivery in");
         assert_eq!(taken_in(&shell), Some(8_000));
-        assert_eq!(taken_in(&artifact), None, "the user opened it");
+        assert_eq!(taken_in(&artifact), None, "the Agent read it");
         assert_eq!(
             taken_in(&calendar),
             None,
-            "an earlier take-in does not cover the later update the user opened"
+            "an earlier take-in does not cover the later update the Agent read"
         );
         let quote_row = rows.iter().find(|row| row.instance == quote).unwrap();
         assert_eq!(quote_row.status, "live");

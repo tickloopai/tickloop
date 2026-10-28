@@ -173,14 +173,16 @@ impl Agent {
         Ok(membership)
     }
 
-    /// The user opened the instance's Monitor row: its updates so far count as handled.
-    pub async fn mark_monitor_handled(
+    /// Records that a turn of the Chat took in the instance's updates so far, as a delivery does;
+    /// for tests that need the Agent's read state without running a turn.
+    #[doc(hidden)]
+    pub async fn take_in_monitor_updates_for_tests(
         &self,
         chat_id: ChatId,
         instance: InstanceRef,
     ) -> Result<MonitorMembership, AgentError> {
         self.update_monitor(chat_id, |membership| {
-            membership.mark_handled(instance, now_ms());
+            membership.mark_taken_in(instance, now_ms());
         })
         .await
     }

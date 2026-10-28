@@ -762,7 +762,7 @@ impl Monitor {
     }
     /// Notes new update glyphs, arriving Shell or Artifact content, updates taken into an Agent
     /// turn, and instances the Agent has just
-    /// used. A row the user opened does not flash, nor one taken in or used before this View
+    /// used. A row handled without a take-in does not flash, nor one taken in or used before this View
     /// showed the Chat, nor the same recorded delivery listed again. Each new delivery can flash even when a read already handled its content.
     fn note_flashes(&mut self, listed: &[TickDescriptor], now_ms: u64) {
         let flashes_since = *self.flashes_since.get_or_insert(now_ms);

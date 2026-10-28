@@ -95,8 +95,10 @@ use tickloop_harness::protocol::{
 /// Loop how many Runs it started and how many times the Chat was compacted.
 /// 34.2 adds the reasoning tokens a response reported to its usage.
 /// 34.3 adds the total tokens of a Subagent run's last request to its family completion.
-pub const PROTOCOL_MAJOR: u16 = 34;
-pub const PROTOCOL_MINOR: u16 = 3;
+/// 35.0 removes `MarkMonitorHandled`, which older daemons expect from a View opening a row (read
+/// state belongs to the Agent), and adds the most rows a Tick can use to its Monitor member.
+pub const PROTOCOL_MAJOR: u16 = 35;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -314,11 +316,6 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: InstanceRef,
     },
-    /// The user opened the instance's Monitor row: its updates so far count as handled.
-    MarkMonitorHandled {
-        execution: ExecutionRef,
-        instance: InstanceRef,
-    },
     /// The Chat's running hosted Ticks with a resource sample of each, for its Monitor.
     ListHostedTicks {
         execution: ExecutionRef,
@@ -459,7 +456,6 @@ impl AgentCommand {
             | Self::LinkArtifact { execution, .. }
             | Self::ListArtifactTicks { execution }
             | Self::RemoveMonitorMember { execution, .. }
-            | Self::MarkMonitorHandled { execution, .. }
             | Self::ListHostedTicks { execution }
             | Self::CloseHostedTick { execution, .. }
             | Self::ReopenHostedTick { execution, .. }

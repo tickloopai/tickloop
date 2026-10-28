@@ -526,9 +526,9 @@ async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
     assert!(opens(&shells, chat.uuid(), &background).await);
     assert!(!opens(&shells, chat.uuid(), &foreground).await);
 
-    // Once its end was handled Monitor shows it a while longer, past the worker's next check.
+    // Once a turn took its end in, Monitor shows it a while longer, past the worker's next check.
     agent
-        .mark_monitor_handled(chat, background.clone())
+        .take_in_monitor_updates_for_tests(chat, background.clone())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;

@@ -12531,14 +12531,9 @@ impl State {
                 return match result {
                     super::tick_actions::TickDetailKey::None => None,
                     super::tick_actions::TickDetailKey::Back => {
-                        let row = detail.instance();
                         self.monitor.close_detail();
                         self.rendered_region = None;
-                        // The open detail showed the row live, so what it showed counts as seen.
-                        row.map(|row| InputEvent::TickAction {
-                            chat,
-                            action: super::tick_actions::builtin::seen(row),
-                        })
+                        None
                     }
                     super::tick_actions::TickDetailKey::Action(action) => {
                         Some(InputEvent::TickAction { chat, action })
@@ -12682,15 +12677,7 @@ impl State {
                         match executor
                             .prepare(&mut super::tick_actions::TickActionUi { state: self })
                         {
-                            Ok(action) => {
-                                let action = if action_key == crate::monitor_rows::MONITOR_ENTER_KEY
-                                {
-                                    action.opening(entry.instance.clone())
-                                } else {
-                                    action
-                                };
-                                return Some(InputEvent::TickAction { chat, action });
-                            }
+                            Ok(action) => return Some(InputEvent::TickAction { chat, action }),
                             Err(error) => {
                                 self.monitor.action_error = Some(super::safe_line(&error))
                             }

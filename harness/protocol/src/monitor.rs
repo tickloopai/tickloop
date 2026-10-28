@@ -31,8 +31,8 @@ pub struct MonitorMembership {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub removed: BTreeSet<InstanceRef>,
     /// When this Chat last handled each instance's updates, in Unix milliseconds: an Agent turn
-    /// took them in or read the instance with a tool, the user opened the instance's row, or the
-    /// instance joined Monitor. A later update is unread.
+    /// took them in or read the instance with a tool, or the instance joined Monitor. A later
+    /// update is unread. Records saved when the user opening a row also counted still load.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub handled: BTreeMap<InstanceRef, u64>,
     /// Latest content change known to this Chat, independent of automatic delivery.

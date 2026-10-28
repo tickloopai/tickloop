@@ -126,8 +126,7 @@ impl State {
         }
         Some(InputEvent::TickAction {
             chat,
-            action: super::super::tick_actions::builtin::attach_card(instance.clone())
-                .opening(instance),
+            action: super::super::tick_actions::builtin::attach_card(instance),
         })
     }
 
