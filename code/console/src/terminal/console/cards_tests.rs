@@ -80,7 +80,11 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
     assert!(!state.card_focused() && state.monitor.focused);
     state.draw_frame(&mut Vec::new()).unwrap();
     let shown = screen(&state);
-    assert!(shown.contains(&format!("▾ {title}")), "{shown}");
+    assert!(
+        shown.contains(&format!("$ {title}")),
+        "the row keeps its own glyph: {shown}"
+    );
+    assert!(!shown.contains('▾') && !shown.contains('▸'), "{shown}");
     assert!(shown.contains("── opening ──"), "{shown}");
     assert!(state.monitor_list_hint().contains("space hide"));
 
@@ -95,7 +99,13 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
     assert!(state.key(key(KeyCode::Char(' '))).is_none());
     assert!(!state.cards.is_open(&second) && state.cards.is_open(&first));
     state.draw_frame(&mut Vec::new()).unwrap();
-    assert!(!screen(&state).contains(&format!("▾ {second_title}")));
+    let shown = screen(&state);
+    assert!(shown.contains(&format!("$ {second_title}")), "{shown}");
+    assert_eq!(
+        shown.matches("── opening ──").count(),
+        1,
+        "only the first card shows: {shown}"
+    );
 }
 
 #[test]
@@ -305,7 +315,7 @@ fn a_focused_card_and_an_unfocused_card_render_their_rows_rules_and_screens() {
 
     let quiet = frame(false);
     let row = line_of(&quiet, "tail log");
-    assert!(row.text().starts_with("▾ tail log"), "{:?}", row.text());
+    assert!(row.text().starts_with("$ tail log"), "{:?}", row.text());
     assert!(!row.text().contains("input"));
     assert!(row.spans.iter().all(|span| span.role != Some(Role::Accent)));
     let rule = line_of(&quiet, "───");
@@ -652,5 +662,47 @@ fn a_view_that_saw_its_tick_end_says_so_before_the_row_does() {
     assert!(
         state.key(key(KeyCode::Char(' '))).is_none() && !state.cards.is_open(&instance),
         "and never shows it again"
+    );
+}
+
+#[test]
+fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_collapsed() {
+    let mut monitor = crate::terminal::monitor::Monitor::default();
+    let (first, second) = (shell_entry("first log"), shell_entry("second log"));
+    let instances = [first.instance.clone(), second.instance.clone()];
+    monitor.replace(TickGroup::Shells, vec![first, second]);
+    let cards = instances.each_ref().map(|instance| CardFrame {
+        instance,
+        demand: CardDemand {
+            min_rows: 6,
+            priority: 1,
+        },
+        focused: false,
+        screen: None,
+        note: None,
+    });
+    let frame = monitor.frame_with_cards(30, 12, DisplayProfile::default(), 0, &cards);
+    let texts = frame
+        .lines
+        .iter()
+        .map(|line| line.text())
+        .collect::<Vec<_>>();
+    assert!(
+        texts.iter().any(|line| line.contains("+1 collapsed")),
+        "{texts:?}"
+    );
+    let rows = texts
+        .iter()
+        .filter(|line| line.starts_with("$ "))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{texts:?}");
+    assert!(
+        rows.iter().any(|row| row.trim_end().ends_with("collapsed")),
+        "the collapsed card's row says so: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|line| !line.contains('▸') && !line.contains('▾'))
     );
 }

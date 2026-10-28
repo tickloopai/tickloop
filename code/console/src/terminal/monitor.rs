@@ -37,7 +37,10 @@ const FOCUSED_CARD_MARK: &str = "input";
 /// The rule of a card cropped because not even its minimum fits.
 const TOO_SHORT_NOTE: &str = "terminal too short";
 
-/// How a row shows that its card is open.
+/// A row whose card other cards took the room from says so at its end.
+const COLLAPSED_CARD_NOTE: &str = "collapsed";
+
+/// How a row shows that its card is open; its glyph stays its own state mark either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CardMark {
     Shown,
@@ -1339,9 +1342,9 @@ impl Monitor {
         self.entry_lines_with_card(entry, width, display, now_ms, None)
     }
 
-    /// The row of `entry`, marked `▾` while its card shows, `▸` while it is open but collapsed,
-    /// and in the accent colour on the selection background, ending with `input`, while its card
-    /// has the focus.
+    /// The row of `entry` with its own glyph whether its card shows or not: ending with
+    /// `collapsed` while its card is open but other cards took the room, and in the accent colour
+    /// on the selection background, ending with `input`, while its card has the focus.
     fn entry_lines_with_card(
         &self,
         entry: &MonitorEntry,
@@ -1354,17 +1357,18 @@ impl Monitor {
         let paused = entry.subscription.is_some_and(|mark| mark.paused);
         let focused_card = card == Some(CardMark::Focused);
         let mut details = list_row::row_details(entry.tone, &entry.notes, now_ms);
-        if focused_card {
+        let card_note = match card {
+            Some(CardMark::Focused) => Some(FOCUSED_CARD_MARK),
+            Some(CardMark::Collapsed) => Some(COLLAPSED_CARD_NOTE),
+            Some(CardMark::Shown) | None => None,
+        };
+        if let Some(card_note) = card_note {
             if !details.is_empty() {
                 details.push_str(" · ");
             }
-            details.push_str(FOCUSED_CARD_MARK);
+            details.push_str(card_note);
         }
-        let glyph = match card {
-            None => display.glyph(entry.glyph),
-            Some(CardMark::Collapsed) => display.glyph(Glyph::Collapsed),
-            Some(CardMark::Shown | CardMark::Focused) => display.glyph(Glyph::Expanded),
-        };
+        let glyph = display.glyph(entry.glyph);
         let mut lines = ListRow {
             selected: self.focused
                 && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
