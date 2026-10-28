@@ -414,9 +414,10 @@ fn input_typed_before_the_view_attaches_is_held_for_it() {
     cards.focus(card.clone());
     cards.input(b"ab".to_vec());
     cards.input(vec![b'c'; EARLY_INPUT_BYTES]);
+    cards.input(b"d".to_vec());
     assert_eq!(
         cards.card(&card).unwrap().early_input,
         b"ab",
-        "input beyond the limit is dropped"
+        "input beyond the limit is dropped, and everything after it"
     );
 }

@@ -40,7 +40,8 @@ pub(super) const ESCAPE_WINDOW: Duration = Duration::from_millis(400);
 /// The bytes of one key's escape sequence arrive together; an Esc with nothing after it for this
 /// long was pressed alone.
 const SEQUENCE_DELAY: Duration = Duration::from_millis(50);
-/// The most input a card holds while its view attaches; more is dropped.
+/// The most input a card holds while its view attaches; more, and all input after it, is
+/// dropped.
 const EARLY_INPUT_BYTES: usize = 64 * 1024;
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -273,6 +274,9 @@ pub(super) struct OpenCard {
     early_input: Vec<u8>,
 }
 
+    /// Typed input outgrew [`EARLY_INPUT_BYTES`]; everything after it is dropped too, so the
+    /// Tick never gets later keys without the earlier ones.
+    early_input_overflowed: bool,
 /// The cards open in the current Chat, the one with the focus, and the terminal modes a focused
 /// card set on the real terminal.
 #[derive(Default)]
@@ -329,6 +333,7 @@ impl MonitorCards {
             sequence: self.next_sequence,
             state: CardState::Opening,
             early_input: Vec::new(),
+            early_input_overflowed: false,
         });
         true
     }
@@ -399,7 +404,9 @@ impl MonitorCards {
         match &card.state {
             CardState::Attached(view) => view.input(bytes),
             CardState::Opening => {
-                if card.early_input.len() + bytes.len() <= EARLY_INPUT_BYTES {
+                card.early_input_overflowed |=
+                    card.early_input.len() + bytes.len() > EARLY_INPUT_BYTES;
+                if !card.early_input_overflowed {
                     card.early_input.extend(bytes);
                 }
             }
