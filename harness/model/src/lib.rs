@@ -1705,6 +1705,10 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
                         ));
                     }
                 }
+                Content::ProtocolData {
+                    protocol: Protocol::Messages,
+                    value,
+                } if value["type"] == MESSAGES_REDACTED_THINKING => content.push(value),
                 Content::ProtocolData { .. } => {
                     return Err(ModelError::Configuration("history contains protocol-specific content that needs migration before using Messages".into()));
                 }
@@ -1717,6 +1721,7 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
             messages.push(json!({"role":message.role,"content":content}));
         }
     }
+    native_tool_search::settle_unpaired_messages_records(&mut messages);
     let mut body = json!({"model":config.model,"max_tokens":config.max_output_tokens,"stream":true,"messages":messages});
     if config.adapter() == Adapter::MinimaxMessages {
         match request.reasoning_effort {
@@ -1860,6 +1865,9 @@ fn finish_structured_response(
         None => Ok(output),
     }
 }
+
+/// Thinking Messages returns sealed in `data`, replayed unchanged like a thinking signature.
+pub(crate) const MESSAGES_REDACTED_THINKING: &str = "redacted_thinking";
 
 fn messages_content(content: &Content) -> Value {
     match content {
@@ -2009,19 +2017,35 @@ impl MessagesStream {
                             value: block.clone(),
                         }
                     }
+                    native_tool_search::MESSAGES_SEARCH_CALL => {
+                        return Err(invalid_response(&format!(
+                            "unsupported server tool call: {}",
+                            block["name"]
+                        )));
+                    }
+                    // A search Claude called beside a client tool runs at the start of the
+                    // next request, so its result can open a response the call is not in.
                     native_tool_search::MESSAGES_SEARCH_RESULT
-                        if self.content.iter().any(|earlier| {
-                            matches!(earlier, Content::ProtocolData { value, .. }
-                                if value["type"] == native_tool_search::MESSAGES_SEARCH_CALL
-                                    && value["id"] == block["tool_use_id"])
-                        }) =>
+                        if block["tool_use_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty()) =>
                     {
                         Content::ProtocolData {
                             protocol: Protocol::Messages,
                             value: block.clone(),
                         }
                     }
-                    _ => return Err(invalid_response("unsupported content block type")),
+                    MESSAGES_REDACTED_THINKING if block["data"].is_string() => {
+                        Content::ProtocolData {
+                            protocol: Protocol::Messages,
+                            value: block.clone(),
+                        }
+                    }
+                    other => {
+                        return Err(invalid_response(&format!(
+                            "unsupported content block type: {other}"
+                        )));
+                    }
                 };
                 self.current = Some(PendingBlock {
                     content,

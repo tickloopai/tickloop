@@ -34,7 +34,8 @@ fn is_reasoning_record(protocol: Protocol, value: &Value) -> bool {
     match protocol {
         Protocol::Responses => value["type"] == "reasoning",
         Protocol::Google => value["part"].get("thoughtSignature").is_some(),
-        Protocol::Messages | Protocol::ChatCompletions | Protocol::SystemOne => false,
+        Protocol::Messages => value["type"] == crate::MESSAGES_REDACTED_THINKING,
+        Protocol::ChatCompletions | Protocol::SystemOne => false,
     }
 }
 
@@ -174,6 +175,15 @@ mod tests {
         assert!(is_reasoning(&Content::ProtocolData {
             protocol: Protocol::Responses,
             value: sealed,
+        }));
+        let redacted = serde_json::json!({"type": "redacted_thinking", "data": "EmwK".repeat(400)});
+        assert_eq!(
+            TOKEN_COUNTER.protocol_data_tokens(Protocol::Messages, &redacted),
+            0
+        );
+        assert!(is_reasoning(&Content::ProtocolData {
+            protocol: Protocol::Messages,
+            value: redacted,
         }));
         let phase = serde_json::json!({
             "type": responses::ASSISTANT_PHASE_TYPE,

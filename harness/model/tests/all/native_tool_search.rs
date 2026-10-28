@@ -846,3 +846,318 @@ async fn a_change_of_deferred_tools_leaves_the_tools_before_native_search_byte_i
         assert_ne!(first["tools"], second["tools"]);
     }
 }
+
+const PENDING_SEARCH: &str = "srvtoolu_pending";
+
+fn pending_search() -> Value {
+    json!({"type":"server_tool_use","id":PENDING_SEARCH,"name":"tool_search_tool_bm25","input":{"query":"invoices","limit":4}})
+}
+
+fn pending_found() -> Value {
+    json!({"type":"tool_search_tool_result","tool_use_id":PENDING_SEARCH,"content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":INVOICES}]}})
+}
+
+fn redacted_thinking() -> Value {
+    json!({"type":"redacted_thinking","data":"sealed-reasoning"})
+}
+
+/// The shape `claude-opus-5-5` streamed on 2026-10-28 with thinking display omitted: a search
+/// answered in the same response, a direct call, and a second search made beside that call,
+/// which Messages leaves without its result until the call is answered.
+fn messages_mixed_turn() -> String {
+    [
+        messages_event("message_start", json!({"message":{"role":"assistant","content":[]}})),
+        messages_event("content_block_start", json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}})),
+        messages_event("content_block_delta", json!({"index":0,"delta":{"type":"thinking_delta","thinking":""}})),
+        messages_event("content_block_delta", json!({"index":0,"delta":{"type":"signature_delta","signature":"signed-thinking"}})),
+        messages_event("content_block_stop", json!({"index":0})),
+        messages_event("content_block_start", json!({"index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_bm25","input":{}}})),
+        messages_event("content_block_delta", json!({"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"weather forecast\"}"}})),
+        messages_event("content_block_stop", json!({"index":1})),
+        messages_event("content_block_start", json!({"index":2,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":WEATHER}]}}})),
+        messages_event("content_block_stop", json!({"index":2})),
+        messages_event("content_block_start", json!({"index":3,"content_block":{"type":"tool_use","id":"toolu_1","name":WEATHER,"input":{}}})),
+        messages_event("content_block_delta", json!({"index":3,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}})),
+        messages_event("content_block_stop", json!({"index":3})),
+        messages_event("content_block_start", json!({"index":4,"content_block":{"type":"server_tool_use","id":PENDING_SEARCH,"name":"tool_search_tool_bm25","input":{}}})),
+        messages_event("content_block_delta", json!({"index":4,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"invoices\",\"limit\":4}"}})),
+        messages_event("content_block_stop", json!({"index":4})),
+        messages_event("message_delta", json!({"delta":{"stop_reason":"tool_use"}})),
+        messages_event("message_stop", json!({})),
+    ]
+    .concat()
+}
+
+/// The response to the request that answers the call: it opens with the result of the search
+/// the previous response left waiting.
+fn messages_deferred_search_result() -> String {
+    [
+        messages_event(
+            "message_start",
+            json!({"message":{"role":"assistant","content":[]}}),
+        ),
+        messages_event(
+            "content_block_start",
+            json!({"index":0,"content_block":pending_found()}),
+        ),
+        messages_event("content_block_stop", json!({"index":0})),
+        messages_event(
+            "content_block_start",
+            json!({"index":1,"content_block":redacted_thinking()}),
+        ),
+        messages_event("content_block_stop", json!({"index":1})),
+        messages_event(
+            "content_block_start",
+            json!({"index":2,"content_block":{"type":"text","text":"Sunny, no invoices due."}}),
+        ),
+        messages_event("content_block_stop", json!({"index":2})),
+        messages_event("message_delta", json!({"delta":{"stop_reason":"end_turn"}})),
+        messages_event("message_stop", json!({})),
+    ]
+    .concat()
+}
+
+fn assistant(content: Vec<Content>) -> Message {
+    Message {
+        role: Role::Assistant,
+        content,
+    }
+}
+
+/// A request's messages as the service compares them for its cache: breakpoints move with every
+/// request and are not part of the prefix.
+fn without_cache_marks(mut messages: Value) -> Value {
+    for block in messages
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .flat_map(|message| message["content"].as_array_mut().unwrap())
+    {
+        block.as_object_mut().unwrap().remove("cache_control");
+    }
+    messages
+}
+
+fn wire_blocks(wire: &Value) -> Vec<&Value> {
+    wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_search_left_waiting_beside_a_call_runs_with_the_call_result_and_replays_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (endpoint, mut captured) = serve_responses(vec![
+        (200, messages_mixed_turn()),
+        (200, messages_deferred_search_result()),
+        (200, messages_text()),
+    ])
+    .await;
+    let config = catalog_model(&root, "anthropic-api", "claude-opus-5-5", endpoint);
+    let deferred = [WEATHER, INVOICES];
+    let first = complete(
+        &config,
+        &root,
+        request(vec![(user("Weather?"), None)], &deferred),
+    )
+    .await;
+    captured.recv().await.unwrap();
+    assert_eq!(first.stop_reason, "tool_use");
+    assert_eq!(
+        first.content[0],
+        Content::Thinking {
+            thinking: String::new(),
+            signature: Some("signed-thinking".into())
+        }
+    );
+    assert_eq!(
+        first.content[4],
+        Content::ProtocolData {
+            protocol: Protocol::Messages,
+            value: pending_search()
+        }
+    );
+
+    let answered = vec![
+        (user("Weather?"), None),
+        (
+            assistant(first.content.clone()),
+            first.private_source.clone(),
+        ),
+        (weather_result(), None),
+    ];
+    let second = complete(&config, &root, request(answered.clone(), &deferred)).await;
+    let answer_wire = captured.recv().await.unwrap().1;
+    assert_eq!(
+        answer_wire["messages"][1]["content"][0],
+        json!({"type":"thinking","thinking":"","signature":"signed-thinking"})
+    );
+    assert_eq!(answer_wire["messages"][1]["content"][4], pending_search());
+    assert_eq!(
+        second.content,
+        vec![
+            Content::ProtocolData {
+                protocol: Protocol::Messages,
+                value: pending_found()
+            },
+            Content::ProtocolData {
+                protocol: Protocol::Messages,
+                value: redacted_thinking()
+            },
+            Content::Text {
+                text: "Sunny, no invoices due.".into()
+            },
+        ]
+    );
+
+    let mut followed = answered;
+    followed.push((assistant(second.content), second.private_source));
+    followed.push((user("Thanks"), None));
+    complete(&config, &root, request(followed, &deferred)).await;
+    let next_wire = captured.recv().await.unwrap().1;
+    assert_eq!(next_wire["messages"][1]["content"][4], pending_search());
+    assert_eq!(
+        next_wire["messages"][3]["content"],
+        json!([pending_found(), redacted_thinking(), {"type":"text","text":"Sunny, no invoices due."}])
+    );
+    assert_eq!(
+        serde_json::to_vec(&without_cache_marks(answer_wire["messages"].clone())).unwrap(),
+        serde_json::to_vec(&without_cache_marks(json!(
+            next_wire["messages"].as_array().unwrap()[..3]
+        )))
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_moved_on_before_its_waiting_search_ran_sends_the_search_as_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (endpoint, mut captured) = serve_responses(vec![
+        (200, messages_mixed_turn()),
+        (200, messages_text()),
+        (200, messages_text()),
+    ])
+    .await;
+    let config = catalog_model(&root, "anthropic-api", "claude-opus-5-5", endpoint);
+    let deferred = [WEATHER, INVOICES];
+    let first = complete(
+        &config,
+        &root,
+        request(vec![(user("Weather?"), None)], &deferred),
+    )
+    .await;
+    captured.recv().await.unwrap();
+    // The response answering the call failed, and the user asked again.
+    let mut moved_on = vec![
+        (user("Weather?"), None),
+        (
+            assistant(first.content.clone()),
+            first.private_source.clone(),
+        ),
+        (weather_result(), None),
+        (user("Weather again?"), None),
+    ];
+    let reply = complete(&config, &root, request(moved_on.clone(), &deferred)).await;
+    let settled_wire = captured.recv().await.unwrap().1;
+    let settled = &settled_wire["messages"][1]["content"];
+    assert_eq!(
+        settled[0],
+        json!({"type":"thinking","thinking":"","signature":"signed-thinking"})
+    );
+    assert_eq!(settled[1]["type"], "server_tool_use");
+    assert_eq!(settled[2]["type"], "tool_search_tool_result");
+    assert_eq!(settled[3]["type"], "tool_use");
+    assert_eq!(
+        settled[4],
+        json!({"type":"text","text":"Searched tools for \"invoices\"."})
+    );
+    assert!(
+        wire_blocks(&settled_wire)
+            .iter()
+            .all(|block| block["id"] != PENDING_SEARCH),
+        "{settled_wire}"
+    );
+
+    moved_on.push((assistant(reply.content), reply.private_source));
+    moved_on.push((user("And tomorrow?"), None));
+    complete(&config, &root, request(moved_on, &deferred)).await;
+    let later_wire = captured.recv().await.unwrap().1;
+    assert_eq!(
+        serde_json::to_vec(&without_cache_marks(settled_wire["messages"].clone())).unwrap(),
+        serde_json::to_vec(&without_cache_marks(json!(
+            later_wire["messages"].as_array().unwrap()[..4]
+        )))
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_search_result_whose_call_is_gone_is_sent_as_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (endpoint, mut captured) = serve_responses(vec![(200, messages_text())]).await;
+    let config = catalog_model(&root, "anthropic-api", "claude-opus-5-5", endpoint);
+    let orphan = Content::ProtocolData {
+        protocol: Protocol::Messages,
+        value: pending_found(),
+    };
+    complete(
+        &config,
+        &root,
+        request(
+            vec![
+                (user("Invoices?"), None),
+                (assistant(vec![orphan]), None),
+                (user("Go on"), None),
+            ],
+            &[WEATHER, INVOICES],
+        ),
+    )
+    .await;
+    let wire = captured.recv().await.unwrap().1;
+    assert_eq!(
+        wire["messages"][1]["content"],
+        json!([{"type":"text","text":format!("Tool search found: {INVOICES}.")}])
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_messages_block_fails_the_response_naming_its_type() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let stream = [
+        messages_event("message_start", json!({"message":{"role":"assistant","content":[]}})),
+        messages_event("content_block_start", json!({"index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_bm25","input":{"query":"weather"}}})),
+        messages_event("content_block_stop", json!({"index":0})),
+        messages_event("content_block_start", json!({"index":1,"content_block":{"type":"mystery_tool_result","tool_use_id":"srvtoolu_1"}})),
+        messages_event("content_block_stop", json!({"index":1})),
+        messages_event("message_delta", json!({"delta":{"stop_reason":"end_turn"}})),
+        messages_event("message_stop", json!({})),
+    ]
+    .concat();
+    let (endpoint, _captured) = serve_responses(vec![(200, stream)]).await;
+    let config = catalog_model(&root, "anthropic-api", "claude-opus-5-5", endpoint);
+    let client = LocalModelClients::new(Some(root.clone()))
+        .client(&config)
+        .unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    let error = client
+        .complete(
+            request(vec![(user("Weather?"), None)], &[WEATHER]),
+            events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported content block type: mystery_tool_result"),
+        "{error}"
+    );
+}
