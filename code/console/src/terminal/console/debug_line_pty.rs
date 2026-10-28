@@ -48,7 +48,7 @@ fn debug_line_pty_fixture() {
                         crate::terminal::StartupState {
                             model_selected: true,
                             launch_arguments: Vec::new(),
-                            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
+                            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot)),
                             user_settings: None,
                         },
                         None,
@@ -92,7 +92,7 @@ fn finished_turn(debug: &str) -> (Vec<String>, Option<String>) {
         "terminal::console::debug_line_pty::debug_line_pty_fixture",
         &[("TICKLOOP_DEBUG", debug)],
     );
-    fixture.wait(|frame| frame.contains("continue this Chat"));
+    fixture.wait(|frame| frame.contains("Tickloop v"));
     fixture.send(b"Check the fixture\r");
     let frame =
         fixture.wait(|frame| frame.contains(REPLY) && super::super::shows_turn_summary(frame));

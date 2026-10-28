@@ -140,7 +140,7 @@ async fn run_mode_cycle_fixture() {
         StartupChat::New
     } else {
         let chat = agent.create_chat(workdir.clone()).await.unwrap();
-        StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false)
+        StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()))
     };
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();

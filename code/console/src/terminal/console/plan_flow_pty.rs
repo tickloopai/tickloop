@@ -218,7 +218,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         crate::terminal::StartupState {
             model_selected: true,
             launch_arguments: Vec::new(),
-            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
+            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot)),
             user_settings: Some(tickloop_code_settings::UserSettings::in_root(&directory)),
         },
         Some(directory.clone()),

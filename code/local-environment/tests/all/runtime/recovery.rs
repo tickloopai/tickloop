@@ -302,9 +302,9 @@ async fn a_tool_running_at_a_crash_is_never_replayed_and_resume_needs_no_acknowl
                 && *error
                 && content.contains("unknown"))
     );
-    // Following Claude Code: when the conversation ends with a tool result on resume, append
-    // "continue from where it left off" first, then the no-reply sentinel.
-    assert!(requests[0].messages.iter().flat_map(|message| &message.content).any(
+    // Following Claude Code's resume the user starts: a conversation that ends with a tool result
+    // gets only the no-reply sentinel, never a "continue from where you left off" prompt.
+    assert!(!requests[0].messages.iter().flat_map(|message| &message.content).any(
         |content| matches!(content, Content::Text { text } if text == "Continue from where you left off.")
     ));
     assert!(requests[0].messages.iter().flat_map(|message| &message.content).any(

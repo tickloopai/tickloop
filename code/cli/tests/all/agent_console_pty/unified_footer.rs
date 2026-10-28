@@ -150,7 +150,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     resumed
         .wait_for(
             "shared Task survives history load without model execution",
-            |frame| frame.contains("History opened.") && frame.contains("1 tasks (0 done, 1 open)"),
+            |frame| frame.contains("1 tasks (0 done, 1 open)"),
         )
         .await;
     assert!(requests.try_recv().is_err());
