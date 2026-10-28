@@ -17,6 +17,7 @@ fn shell_entry(title: &str) -> MonitorEntry {
         tone: crate::monitor_rows::StatusTone::Live,
         updated_at_ms: None,
         update: None,
+        ended: None,
         resources: None,
         actions: vec![crate::monitor_rows::MonitorAction {
             key: crate::monitor_rows::MONITOR_ENTER_KEY,
@@ -557,4 +558,99 @@ fn releasing_the_monitor_separator_sends_the_cards_final_size_at_once() {
     assert_eq!(queued_requests(&mut requests), [CardRequest::FlushResize]);
     state.draw_frame(&mut Vec::new()).unwrap();
     assert!(queued_requests(&mut requests).is_empty(), "flushed once");
+}
+
+fn card_screen(
+    state: &State,
+    instance: &tick_protocol::InstanceRef,
+) -> Arc<Mutex<crate::terminal::monitor_cards::CardScreen>> {
+    match &state.cards.card(instance).unwrap().state {
+        crate::terminal::monitor_cards::CardState::Attached(view) => view.screen.clone(),
+        _ => panic!("the card's view is attached"),
+    }
+}
+
+/// The row of `instance` as the Monitor's next listing reports it, changed by `change`.
+fn change_row(
+    state: &mut State,
+    instance: &tick_protocol::InstanceRef,
+    change: impl FnOnce(&mut MonitorEntry),
+) {
+    let mut entry = state
+        .monitor
+        .entries()
+        .iter()
+        .find(|entry| &entry.instance == instance)
+        .unwrap()
+        .clone();
+    change(&mut entry);
+    state.monitor.replace(TickGroup::Ticks, vec![entry]);
+}
+
+#[test]
+fn a_card_whose_tick_exited_keeps_its_last_screen_says_how_on_its_rule_and_loses_the_focus() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    card_screen(&state, &instance)
+        .lock()
+        .unwrap()
+        .parser
+        .process(b"thread 'main' panicked");
+    state.key(key(KeyCode::Enter));
+    assert!(state.card_focused());
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "exited 101".into();
+        entry.tone = crate::monitor_rows::StatusTone::Neutral;
+        entry.ended = Some("exited 101".into());
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let shown = screen(&state);
+    assert!(shown.contains("── exited 101 ──"), "{shown}");
+    assert!(
+        shown.contains("thread 'main' panicked"),
+        "the last screen stays: {shown}"
+    );
+    assert!(!state.card_focused(), "an ended Tick takes no keys");
+    assert!(state.cards.is_open(&instance));
+    assert!(state.monitor_list_hint().contains("space hide"));
+}
+
+#[test]
+fn a_view_that_saw_its_tick_end_says_so_before_the_row_does() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    state.key(key(KeyCode::Enter));
+    card_screen(&state, &instance).lock().unwrap().ended =
+        Some(crate::terminal::monitor_cards::ViewEnd::TickEnded);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let shown = screen(&state);
+    assert!(shown.contains("── ended ──"), "{shown}");
+    assert!(!state.card_focused());
+
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "gone".into();
+        entry.tone = crate::monitor_rows::StatusTone::Gone;
+        entry.ended = Some("ended".into());
+        entry.actions = vec![crate::monitor_rows::MonitorAction {
+            key: crate::monitor_rows::MONITOR_ENTER_KEY,
+            label: "reopen",
+            intent: crate::monitor_rows::TickIntent::ReopenHosted(instance.clone()),
+        }];
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(screen(&state).contains("── ended ──"), "the row agrees");
+    assert!(
+        state.monitor_list_hint().contains("space hide"),
+        "{}",
+        state.monitor_list_hint()
+    );
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(
+        !state.cards.is_open(&instance),
+        "Space still hides the card of a Tick that no longer opens a view"
+    );
+    assert!(
+        state.key(key(KeyCode::Char(' '))).is_none() && !state.cards.is_open(&instance),
+        "and never shows it again"
+    );
 }

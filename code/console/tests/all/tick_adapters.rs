@@ -52,6 +52,7 @@ impl MonitorRows for CalendarRows {
             update: None,
             resources: None,
             running: true,
+            ended: None,
             actions: vec![MonitorAction {
                 key: 'o',
                 label: "open",

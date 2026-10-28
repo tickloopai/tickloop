@@ -406,7 +406,12 @@ fn the_focused_card_rule_is_heavy_and_accented() {
             .iter()
             .all(|span| span.role == Some(Role::Accent))
     );
-    let noted = rule_line(24, false, Some("terminal too short"), display);
+    let noted = rule_line(
+        24,
+        false,
+        Some(&CardNote::plain("terminal too short")),
+        display,
+    );
     assert_eq!(noted.text(), "── terminal too short ──");
 }
 
@@ -658,5 +663,18 @@ async fn a_release_sends_the_final_size_at_once_and_a_lone_change_never_waits() 
         sent_resizes(&mut remote).await,
         Vec::<u64>::new(),
         "and only once"
+    );
+}
+
+#[test]
+fn an_ended_ticks_note_takes_its_rows_state_colour() {
+    let display = DisplayProfile::default();
+    let note = CardNote::ended("exited 101".into(), Role::ErrorMark);
+    let rule = rule_line(24, false, Some(&note), display);
+    assert_eq!(rule.text(), "── exited 101 ──────────");
+    assert!(
+        rule.spans
+            .iter()
+            .any(|span| span.text.contains("exited 101") && span.role == Some(Role::ErrorMark))
     );
 }

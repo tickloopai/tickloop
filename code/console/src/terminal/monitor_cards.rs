@@ -95,7 +95,44 @@ impl CardSize {
 pub(super) struct CardScreen {
     pub(super) parser: vt100::Parser,
     /// Why the view ended, once it did.
-    pub(super) ended: Option<String>,
+    pub(super) ended: Option<ViewEnd>,
+}
+
+/// Why a card's view ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ViewEnd {
+    /// The Tickhost said the Tick ended.
+    TickEnded,
+    /// The view itself ended, for this reason; its Tick may run on.
+    Failed(String),
+}
+
+/// What a card's rule says about its view, in the colour it says it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CardNote {
+    pub(super) text: String,
+    pub(super) role: Role,
+    /// The card's Tick ended: this outranks anything else the rule could say.
+    pub(super) ended: bool,
+}
+
+impl CardNote {
+    pub(super) fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: Role::MutedText,
+            ended: false,
+        }
+    }
+
+    /// How the card's Tick ended, in the colour of its row's state mark.
+    pub(super) fn ended(text: String, role: Role) -> Self {
+        Self {
+            text,
+            role,
+            ended: true,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -273,8 +310,8 @@ async fn read_frames(
     let ended = loop {
         let event = match hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES).await {
             Ok(Some(event)) => event,
-            Ok(None) => break "the Tickhost closed this view".to_owned(),
-            Err(error) => break error.message,
+            Ok(None) => break ViewEnd::Failed("the Tickhost closed this view".to_owned()),
+            Err(error) => break ViewEnd::Failed(super::safe_line(&error.message)),
         };
         match event["event"].as_str() {
             Some("frame") => {
@@ -295,18 +332,17 @@ async fn read_frames(
                 }
                 screen.parser.process(data.as_bytes());
             }
-            Some("gone") => break "Tick ended".to_owned(),
+            Some("gone") => break ViewEnd::TickEnded,
             _ => {
-                break event["error"]["message"]
-                    .as_str()
-                    .unwrap_or("view ended")
-                    .to_owned();
+                break ViewEnd::Failed(super::safe_line(
+                    event["error"]["message"].as_str().unwrap_or("view ended"),
+                ));
             }
         }
         redraw.notify_one();
     };
     if let Ok(mut screen) = screen.lock() {
-        screen.ended = Some(super::safe_line(&ended));
+        screen.ended = Some(ended);
     }
     redraw.notify_one();
 }
@@ -377,7 +413,9 @@ async fn write_requests(
         };
         if let Err(error) = sent {
             if let Ok(mut screen) = screen.lock() {
-                screen.ended.get_or_insert(super::safe_line(&error.message));
+                screen
+                    .ended
+                    .get_or_insert(ViewEnd::Failed(super::safe_line(&error.message)));
             }
             redraw.notify_one();
             reader.abort();
@@ -676,8 +714,8 @@ pub(super) struct CardFrame<'a> {
     pub(super) focused: bool,
     /// The Tick's screen once the view attached.
     pub(super) screen: Option<&'a vt100::Screen>,
-    /// What the rule says about the view, such as that it is opening or why it ended.
-    pub(super) note: Option<String>,
+    /// What the rule says about the view, such as that it is opening or how its Tick ended.
+    pub(super) note: Option<CardNote>,
 }
 
 /// The rows a shown card gets: the Tick's screen rows and how many of them fit on screen; fewer
@@ -767,11 +805,11 @@ pub(super) fn collapsed_line(collapsed: usize) -> RoleLine {
 }
 
 /// The rule between a card's row and the Tick's screen: light, or heavy in the accent colour
-/// for the focused card, with a short `note` such as why the view ended.
+/// for the focused card, with a short `note` such as how its Tick ended.
 pub(super) fn rule_line(
     width: usize,
     focused: bool,
-    note: Option<&str>,
+    note: Option<&CardNote>,
     display: DisplayProfile,
 ) -> RoleLine {
     let (glyph, role) = if focused {
@@ -783,8 +821,10 @@ pub(super) fn rule_line(
     let lead = glyph.repeat(2.min(width));
     line.push(lead, Some(role));
     if let Some(note) = note.filter(|_| width > 6) {
-        let note = super::conversation_picker::ellipsize(note, width.saturating_sub(5));
-        line.push(format!(" {note} "), Some(Role::MutedText));
+        let text = super::conversation_picker::ellipsize(&note.text, width.saturating_sub(5));
+        line.push(" ", Some(role));
+        line.push(text, Some(note.role));
+        line.push(" ", Some(role));
     }
     let rest = width.saturating_sub(line.text().width());
     line.push(glyph.repeat(rest), Some(role));

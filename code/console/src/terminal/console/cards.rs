@@ -4,8 +4,8 @@
 use super::*;
 use crate::terminal::monitor::MonitorTarget;
 use crate::terminal::monitor_cards::{
-    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardScreen, CardSize, CardState,
-    CardView, DEFAULT_CARD_ROWS, SgrMouse,
+    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardScreen, CardSize,
+    CardState, CardView, DEFAULT_CARD_ROWS, SgrMouse, ViewEnd,
 };
 use tick_protocol::InstanceRef;
 
@@ -15,7 +15,7 @@ pub(super) struct CardSource {
     pub(super) demand: CardDemand,
     pub(super) focused: bool,
     pub(super) screen: Option<Arc<Mutex<CardScreen>>>,
-    pub(super) note: Option<String>,
+    pub(super) note: Option<CardNote>,
 }
 
 const OPENING_NOTE: &str = "opening";
@@ -23,6 +23,12 @@ const OPENING_NOTE: &str = "opening";
 impl State {
     pub(super) fn card_focused(&self) -> bool {
         self.cards.focused().is_some()
+    }
+
+    /// Whether Space and a click on `instance`'s row toggle its card: its view opens, or its
+    /// card is still shown after its Tick ended.
+    pub(super) fn row_toggles_card(&self, instance: &InstanceRef) -> bool {
+        self.has_card(instance) || self.cards.is_open(instance)
     }
 
     /// Whether `instance`'s row shows a live screen: a hosted Tick or a Shell whose view opens.
@@ -268,7 +274,8 @@ impl State {
 
     /// The open cards of the shown Chat whose rows are still listed, for the next frame. A Chat
     /// switch or a row leaving the list closes its cards; a row on a page not loaded yet is
-    /// still listed.
+    /// still listed. A card whose Tick ended, as its row or its view tells, keeps its last screen
+    /// and says how on its rule.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
         let monitor = &self.monitor;
         self.cards
@@ -281,14 +288,15 @@ impl State {
             .iter()
             .map(|card| {
                 let (screen, note) = match &card.state {
-                    CardState::Opening => (None, Some(OPENING_NOTE.to_owned())),
-                    CardState::Failed(reason) => (None, Some(reason.clone())),
+                    CardState::Opening => (None, Some(CardNote::plain(OPENING_NOTE))),
+                    CardState::Failed(reason) => (None, Some(CardNote::plain(reason.clone()))),
                     CardState::Attached(view) => (
                         Some(view.screen.clone()),
-                        view.screen
-                            .lock()
-                            .ok()
-                            .and_then(|screen| screen.ended.clone()),
+                        self.row_end_note(&card.instance).or_else(|| {
+                            view.screen.lock().ok().and_then(|screen| {
+                                screen.ended.as_ref().map(|ended| self.view_end_note(ended))
+                            })
+                        }),
                     ),
                 };
                 CardSource {
@@ -303,6 +311,50 @@ impl State {
                 }
             })
             .collect()
+    }
+
+    /// Whether the focused card's Tick ended, as its row or its view tells.
+    pub(super) fn focused_card_ended(&self) -> bool {
+        let Some(view) = self.cards.focused_view() else {
+            return false;
+        };
+        self.cards
+            .focused()
+            .is_some_and(|instance| self.row_end_note(instance).is_some())
+            || view
+                .screen
+                .lock()
+                .is_ok_and(|screen| screen.ended.is_some())
+    }
+
+    /// How `instance`'s row says its Tick ended, in its state mark's colour.
+    fn row_end_note(&self, instance: &InstanceRef) -> Option<CardNote> {
+        let entry = self
+            .monitor
+            .entries()
+            .iter()
+            .find(|entry| &entry.instance == instance)?;
+        let ended = entry.ended.clone()?;
+        Some(CardNote::ended(
+            ended,
+            crate::terminal::list_row::state_mark(entry.tone, self.display, 0),
+        ))
+    }
+
+    /// Why a card's view ended, before its row tells: its Tick ended, as a gone row will say, or
+    /// the view failed by itself.
+    fn view_end_note(&self, ended: &ViewEnd) -> CardNote {
+        match ended {
+            ViewEnd::TickEnded => CardNote::ended(
+                crate::monitor_rows::TICK_ENDED.into(),
+                crate::terminal::list_row::state_mark(
+                    crate::monitor_rows::StatusTone::Gone,
+                    self.display,
+                    0,
+                ),
+            ),
+            ViewEnd::Failed(reason) => CardNote::plain(reason.clone()),
+        }
     }
 
     /// After a frame: each shown card's view takes the size the frame gave it, paced while the
@@ -385,7 +437,7 @@ impl State {
         };
         let is_card = match &target {
             MonitorTarget::Card { .. } => true,
-            MonitorTarget::Tick(instance) => self.has_card(instance),
+            MonitorTarget::Tick(instance) => self.row_toggles_card(instance),
             _ => false,
         };
         if is_card {
@@ -427,7 +479,7 @@ impl State {
         let Some(entry) = self.monitor.selected() else {
             return hint;
         };
-        if !self.has_card(&entry.instance) {
+        if !self.row_toggles_card(&entry.instance) {
             return hint;
         }
         let space = if self.cards.is_open(&entry.instance) {

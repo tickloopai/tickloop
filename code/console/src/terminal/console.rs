@@ -7355,11 +7355,13 @@ impl State {
         {
             self.frames_drawn += 1;
         }
-        // A dialog, a menu or anything covering Monitor takes the keys from a focused card.
+        // A dialog, a menu or anything covering Monitor takes the keys from a focused card, and
+        // a card whose Tick or view ended takes none.
         if self.card_focused()
             && (self.input_dialog_visible()
                 || !self.monitor_visible()
-                || self.monitor.detail.is_some())
+                || self.monitor.detail.is_some()
+                || self.focused_card_ended())
         {
             self.leave_card();
         }
@@ -12598,7 +12600,7 @@ impl State {
                     if self
                         .monitor
                         .selected()
-                        .is_some_and(|entry| self.has_card(&entry.instance)) =>
+                        .is_some_and(|entry| self.row_toggles_card(&entry.instance)) =>
                 {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
@@ -13961,8 +13963,8 @@ fn idle_tick(
 }
 
 /// Reads the user's raw input for the focused Monitor card, waiting at most until `deadline`,
-/// when a held Esc is due to be settled. Returns whether anything was read; with nothing read the
-/// held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
+/// when a held Esc is due to be settled. Returns whether input arrived, read for the card or left
+/// to the Console once the card lost the focus; with nothing arrived the held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
 /// meanwhile.
 fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::Result<bool> {
     let wait = deadline.map_or(INPUT_POLL_INTERVAL, |deadline| {
@@ -13998,6 +14000,12 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
         }
         return Ok(false);
     }
+    // The focus can leave the card meanwhile, as when its Tick ends; the input is then the
+    // Console's, so it stays unread for crossterm. Reading under the lock keeps the focus fixed.
+    let mut state = lock()?;
+    if !state.card_focused() {
+        return Ok(true);
+    }
     let mut buffer = [0_u8; CARD_INPUT_READ_BYTES];
     let count = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
     if count < 0 {
@@ -14011,7 +14019,6 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
             Err(error)
         };
     }
-    let mut state = lock()?;
     if count == 0 {
         // The input ended; the Console's own reader reports it.
         state.leave_card();

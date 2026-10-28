@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{
     display::{DisplayProfile, Glyph},
     list_row::{self, ListRow, RowFlash},
-    monitor_cards::{CardAllocation, CardFrame, CardRows, CardSize},
+    monitor_cards::{CardAllocation, CardFrame, CardNote, CardRows, CardSize},
     style::{Role, RoleLine},
     subscription_detail::SubscriptionDetail,
 };
@@ -92,6 +92,8 @@ pub(super) struct MonitorEntry {
     pub(super) updated_at_ms: Option<u64>,
     /// The latest update that counts for unread, and whether this Chat still has to handle it.
     pub(super) update: Option<RowUpdate>,
+    /// How its hosted Tick ended, in the words its card's rule shows.
+    pub(super) ended: Option<String>,
     pub(super) resources: Option<TickResources>,
     pub(super) actions: Vec<MonitorAction>,
 }
@@ -1521,10 +1523,11 @@ impl Monitor {
                     row_ids.push(Some(MonitorTarget::Tick(entry.instance.clone())));
                 }
                 if let Some((card, Some(card_rows))) = card {
-                    let note = if card_rows.is_cropped() {
-                        Some(TOO_SHORT_NOTE)
-                    } else {
-                        card.note.as_deref()
+                    let too_short = CardNote::plain(TOO_SHORT_NOTE);
+                    let note = match &card.note {
+                        Some(note) if note.ended => Some(note),
+                        _ if card_rows.is_cropped() => Some(&too_short),
+                        note => note.as_ref(),
                     };
                     rows.push(super::monitor_cards::rule_line(
                         cards.columns,
@@ -2087,6 +2090,7 @@ impl From<TickDescriptor> for MonitorEntry {
             tone: row.tone,
             updated_at_ms: row.updated_at_ms,
             update: row.update,
+            ended: row.ended,
             resources: row.resources,
             actions: row.actions,
         }
@@ -2122,6 +2126,7 @@ mod registered_rows_tests {
                 updated_at_ms: None,
                 update: None,
                 running: true,
+                ended: None,
                 resources: None,
                 actions: [('o', "inspect"), ('z', "expand")]
                     .into_iter()
@@ -2203,6 +2208,7 @@ mod signal_tests {
                 updated_at_ms: at,
                 update: at.map(RowUpdate::new),
                 running: true,
+                ended: None,
                 resources: None,
                 actions: Vec::new(),
             }]

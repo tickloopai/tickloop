@@ -265,6 +265,7 @@ pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
             update: None,
+            ended: None,
             resources: None,
             actions: vec![MonitorAction {
                 key: 'o',
@@ -1210,6 +1211,7 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
             update: None,
+            ended: None,
             resources: None,
             actions: Vec::new(),
         }],

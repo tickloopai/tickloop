@@ -287,6 +287,9 @@ pub struct TickDescriptor {
     /// human edit or feedback request, or a background Shell's end.
     pub update: Option<RowUpdate>,
     pub running: bool,
+    /// How a hosted Tick ended once its process no longer runs, as its card's rule says it:
+    /// `exited 3`, `ended` or `lost`. A Shell's own screen tells how it ended.
+    pub ended: Option<String>,
     pub resources: Option<TickResources>,
     pub actions: Vec<MonitorAction>,
 }
@@ -310,6 +313,9 @@ pub struct MonitorContext {
     pub retained: Option<InstanceRef>,
     pub now_ms: u64,
 }
+
+/// A hosted Tick's card says `ended` once the Tick is gone with no exit status to tell.
+pub(crate) const TICK_ENDED: &str = "ended";
 
 pub(crate) fn terminal_exit_status(exit: tickloop_harness::protocol::HostedProgramExit) -> String {
     match (exit.code, exit.signal) {
@@ -425,6 +431,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         updated_at_ms: row.updated_at_ms,
         update: builtin::subscription_update(row),
         running: row.link == tickloop_harness::protocol::TickLinkState::Live,
+        ended: None,
         resources: None,
         actions: vec![remove_from_monitor(&row.instance)],
     }
@@ -550,6 +557,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         updated_at_ms: None,
         update: None,
         running: false,
+        ended: None,
         resources: None,
         actions: vec![
             MonitorAction {
