@@ -33,7 +33,7 @@ Null `data` means no content yet, not empty content: a Tick just opened may stil
 
 A Tick runs until it is closed, its Agent ends or the Tickhost is lost; it never ends for idling, and a terminal Tick whose program exited keeps its last screen readable. Reopen a lost Tick only when the user asks.
 
-Every Tick appears in this Chat's Monitor, where the user shows its live screen as a card under its row and types into it; Esc leaves the card and the Tick keeps running. Say where to find the Tick rather than promising a window.
+Every Tick appears in this Chat's Monitor, where the user shows its live screen as a card under its row and types into it; Esc Esc leaves the card and the Tick keeps running. Say where to find the Tick rather than promising a window.
 
 ## Shell permissions
 
