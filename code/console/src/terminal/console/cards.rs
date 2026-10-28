@@ -334,7 +334,7 @@ impl State {
         let wanted = self
             .card_focused()
             .then(|| self.focused_card_screen(CardModes::of).unwrap_or_default());
-        self.cards.apply_modes(wanted)
+        self.surface.apply_card_modes(wanted)
     }
 
     /// Where the terminal cursor goes for the focused card: the Tick's cursor inside the card,

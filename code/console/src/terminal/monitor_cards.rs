@@ -274,13 +274,12 @@ pub(super) struct OpenCard {
     pub(super) state: CardState,
     /// Input typed into the focused card before its view attached; it reaches the Tick then.
     early_input: Vec<u8>,
-}
-
     /// Typed input outgrew [`EARLY_INPUT_BYTES`]; everything after it is dropped too, so the
     /// Tick never gets later keys without the earlier ones.
     early_input_overflowed: bool,
-/// The cards open in the current Chat, the one with the focus, and the terminal modes a focused
-/// card set on the real terminal.
+}
+
+/// The cards open in the current Chat and the one with the focus.
 #[derive(Default)]
 pub(super) struct MonitorCards {
     chat: Option<Uuid>,
@@ -290,7 +289,6 @@ pub(super) struct MonitorCards {
     keys: CardKeys,
     redraw: Arc<Notify>,
     painter_started: bool,
-    applied_modes: Option<CardModes>,
 }
 
 impl MonitorCards {
@@ -458,15 +456,6 @@ impl MonitorCards {
     pub(super) fn keys_mut(&mut self) -> &mut CardKeys {
         &mut self.keys
     }
-
-    /// The escape sequences that bring the real terminal to `wanted`: a focused card's legacy
-    /// keys and its Tick's cursor and keypad modes, or the Console's own once no card has the
-    /// focus.
-    pub(super) fn apply_modes(&mut self, wanted: Option<CardModes>) -> String {
-        let changes = mode_changes(self.applied_modes, wanted);
-        self.applied_modes = wanted;
-        changes
-    }
 }
 
 /// The input modes a focused card's Tick asked its terminal for; the real terminal takes them
@@ -483,6 +472,20 @@ impl CardModes {
             application_cursor: screen.application_cursor(),
             application_keypad: screen.application_keypad(),
         }
+    }
+
+    /// `modes` as one byte, so they can be held in an atomic: bit 0 says a card has them.
+    pub(super) fn to_bits(modes: Option<Self>) -> u8 {
+        modes.map_or(0, |modes| {
+            1 | u8::from(modes.application_cursor) << 1 | u8::from(modes.application_keypad) << 2
+        })
+    }
+
+    pub(super) fn from_bits(bits: u8) -> Option<Self> {
+        (bits & 1 != 0).then_some(Self {
+            application_cursor: bits & 2 != 0,
+            application_keypad: bits & 4 != 0,
+        })
     }
 }
 

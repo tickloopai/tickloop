@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::monitor_cards::{CardModes, mode_changes};
 use super::workspace_trust::{TRUST_ACCEPT_CHOICE_INDEX, TrustDecision, WorkspaceTrust};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -213,6 +214,10 @@ struct ForegroundCommand {
 struct TerminalSurface {
     alternate_screen: Arc<AtomicBool>,
     mouse: bool,
+    /// The input modes a focused Monitor card set on the terminal. They are held here rather than
+    /// in the Console's state so that every release of the terminal undoes them, also when no
+    /// frame is drawn first or the state's lock is poisoned.
+    card_modes: Arc<AtomicU8>,
 }
 
 impl TerminalSurface {
@@ -220,7 +225,17 @@ impl TerminalSurface {
         Self {
             alternate_screen: Arc::new(AtomicBool::new(false)),
             mouse,
+            card_modes: Arc::new(AtomicU8::new(CardModes::to_bits(None))),
         }
+    }
+
+    /// The escape sequences that bring the terminal to a focused card's `wanted` modes, or with
+    /// `None` back to the Console's own.
+    fn apply_card_modes(&self, wanted: Option<CardModes>) -> String {
+        let applied = self
+            .card_modes
+            .swap(CardModes::to_bits(wanted), Ordering::AcqRel);
+        mode_changes(CardModes::from_bits(applied), wanted)
     }
 
     fn renderer(&self) -> Renderer {
@@ -241,12 +256,13 @@ impl TerminalSurface {
     /// Leaves the screen even when input reporting cannot be turned off, so a failed write never
     /// strands the terminal on the alternate screen.
     fn release(&self, renderer: Renderer, output: &mut impl Write) -> io::Result<()> {
+        let card = output.write_all(self.apply_card_modes(None).as_bytes());
         let reporting = disable_input_reporting(output);
         let left = renderer.leave(self.mouse, output);
         if left.is_ok() {
             self.alternate_screen.store(false, Ordering::Release);
         }
-        reporting.and(left)
+        card.and(reporting).and(left)
     }
 }
 
@@ -5362,7 +5378,8 @@ impl Drop for Lifetime {
                 let mut output = io::stdout().lock();
                 reopen_hint = state.chat.filter(|_| state.saves_chats).map(resume_hint);
                 state.transcript = None;
-                // Closing the cards detaches their views and gives the terminal its own keys back.
+                // Closing the cards detaches their views; releasing the terminal below undoes the
+                // keys a focused card turned on, whether or not this frame is drawn.
                 state.cards.close_all();
                 let _ = state.draw(&mut output);
                 if !renderer.uses_alternate_screen() {
@@ -7341,6 +7358,8 @@ impl State {
         {
             self.leave_card();
         }
+        // Views that cover Monitor return early below; the keys go back to the Console first.
+        write!(output, "{}", self.card_terminal_modes())?;
         self.monitor_row_targets.clear();
         self.monitor_tick_area = None;
         self.monitor_separator = None;
@@ -20645,6 +20664,41 @@ mod tests {
     /// Terminals such as kitty and Ghostty keep a stack of keyboard flags for each screen, so the
     /// console pops its flags from the screen it pushed them on, and a renderer switch moves
     /// them to the new screen.
+    /// A focused card's legacy keys and its Tick's cursor and keypad modes are undone wherever the
+    /// terminal is handed back: on exit, suspend and a renderer switch, also when no frame is
+    /// drawn first or the Console's state is poisoned.
+    #[test]
+    fn releasing_the_terminal_undoes_a_focused_cards_keys_and_modes_without_a_frame() {
+        use tickloop_harness::test_support::kitty_keyboard::KittyKeyboard;
+        let modes = super::super::monitor_cards::CardModes {
+            application_cursor: true,
+            application_keypad: true,
+        };
+        let surface = TerminalSurface::new(true);
+        let mut output = Vec::new();
+        surface.take(Renderer::Inline, &mut output).unwrap();
+        output.extend(surface.apply_card_modes(Some(modes)).into_bytes());
+        surface.release(Renderer::Inline, &mut output).unwrap();
+        let released = KittyKeyboard::after(&output);
+        assert!(
+            released.main().is_empty() && released.alternate().is_empty(),
+            "no keyboard flags are left behind: {released:?}"
+        );
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("\x1b[?1l") && text.contains("\x1b>"),
+            "{text:?}"
+        );
+
+        surface.take(Renderer::Inline, &mut Vec::new()).unwrap();
+        assert!(
+            surface
+                .apply_card_modes(Some(modes))
+                .starts_with("\x1b[>0u"),
+            "the next frame turns them on again"
+        );
+    }
+
     #[test]
     fn keyboard_flags_are_pushed_and_popped_on_the_screen_the_console_draws_on() {
         use tickloop_harness::test_support::kitty_keyboard::{

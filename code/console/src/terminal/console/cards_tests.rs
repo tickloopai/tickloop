@@ -384,3 +384,34 @@ fn a_card_stays_open_while_its_row_is_on_a_page_the_monitor_has_not_loaded() {
     state.card_sources();
     assert!(state.cards.is_open(&last));
 }
+
+#[test]
+fn a_frame_that_covers_the_monitor_gives_the_terminal_its_own_keys_back() {
+    let mut state = cards_fixture();
+    state.key(key(KeyCode::Enter));
+    let mut output = Vec::new();
+    state.draw_frame(&mut output).unwrap();
+    assert!(
+        String::from_utf8_lossy(&output).contains("\x1b[>0u"),
+        "a focused card turns on legacy keys"
+    );
+    state.diff_screen = Some(DiffScreen {
+        chat_id: state.chat.unwrap(),
+        catalog: ChangeCatalog {
+            sources: vec![crate::terminal::diff_catalog::ChangeSource {
+                id: ChangeSourceId::Current,
+                state: ChangeSourceState::Clean,
+                user_prompt: None,
+                files: Vec::new(),
+            }],
+        },
+        dialog: DiffDialog::new(),
+    });
+    let mut output = Vec::new();
+    state.draw_frame(&mut output).unwrap();
+    assert!(!state.card_focused());
+    assert!(
+        String::from_utf8_lossy(&output).contains("\x1b[<u"),
+        "the card's keys are popped although the frame shows no Monitor"
+    );
+}
