@@ -5,7 +5,7 @@ use super::*;
 use crate::terminal::monitor::MonitorTarget;
 use crate::terminal::monitor_cards::{
     CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardOrigin, CardScreen,
-    CardSize, CardState, CardView, DEFAULT_CARD_ROWS, SgrMouse, ViewEnd,
+    CardSize, CardState, CardView, DEFAULT_CARD_ROWS, DOUBLE_ESCAPE_WINDOW, SgrMouse, ViewEnd,
 };
 use tick_protocol::{BubbledKey, InstanceRef};
 
@@ -179,6 +179,11 @@ impl State {
             match key {
                 BubbledKey::Right => continue,
                 BubbledKey::Esc => {
+                    self.paired_escape_until = self
+                        .cards
+                        .keys_mut()
+                        .escape_sent_at()
+                        .map(|at| at + DOUBLE_ESCAPE_WINDOW);
                     self.leave_card();
                     self.monitor.focus(self.monitor.overlay, None);
                 }

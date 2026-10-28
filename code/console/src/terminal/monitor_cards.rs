@@ -1339,6 +1339,12 @@ impl CardKeys {
         items
     }
 
+    /// When the lone Esc the Tick last got was pressed, while a second one would still pair
+    /// with it.
+    pub(super) fn escape_sent_at(&self) -> Option<Instant> {
+        self.escape_at
+    }
+
     /// An Esc crossterm decoded before the raw input took over, pressed at `at`.
     pub(super) fn escape(&mut self, at: Instant, read_only: bool) -> Vec<CardInput> {
         let mut items = Vec::new();

@@ -1037,6 +1037,29 @@ fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
 }
 
 #[test]
+fn esc_esc_on_a_tick_that_bubbles_esc_lands_on_the_list() {
+    use tick_protocol::BubbledKey;
+    let (mut state, rows) = tab_fixture();
+    let one = &rows[1];
+    attach_cards(&mut state, std::slice::from_ref(one));
+    state.enter_card(one.clone());
+    let start = Instant::now();
+    state.card_input(b"\x1b", start, &mut Vec::new());
+    state.expire_card_keys(start + Duration::from_millis(60));
+    assert!(state.card_focused(), "the first Esc went to the Tick");
+    bubble(&mut state, one, BubbledKey::Esc);
+    state.settle_card_signals();
+    assert!(!state.card_focused() && state.monitor.focused);
+    assert!(state.key(key(KeyCode::Esc)).is_none());
+    assert!(
+        state.monitor.focused,
+        "the second Esc of the pair is the card's, not the list's"
+    );
+    assert!(state.key(key(KeyCode::Esc)).is_none());
+    assert!(!state.monitor.focused, "a later Esc leaves the list");
+}
+
+#[test]
 fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it() {
     let (mut state, rows) = tab_fixture();
     let chat = state.chat.unwrap();

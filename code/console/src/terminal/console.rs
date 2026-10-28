@@ -944,6 +944,9 @@ pub(super) struct State {
     card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
     /// The next frame sends each card's size at once, as when a separator drag ends.
     card_resizes_due: bool,
+    /// Until when an Esc on the list is the second of a pair whose first Esc a card's Tick
+    /// bubbled back, so it ends there instead of leaving the list too.
+    paired_escape_until: Option<Instant>,
     /// The cards the last frame showed, collapsed ones left out.
     shown_cards: Vec<tick_protocol::InstanceRef>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
@@ -6285,6 +6288,7 @@ impl State {
             cards: Default::default(),
             card_sizes: HashMap::new(),
             card_resizes_due: false,
+            paired_escape_until: None,
             shown_cards: Vec::new(),
             queued_card_inputs: Vec::new(),
             card_press: None,
@@ -12369,6 +12373,15 @@ impl State {
         }
         if self.card_focused() {
             return self.card_key(key);
+        }
+        if self
+            .paired_escape_until
+            .take()
+            .is_some_and(|until| Instant::now() < until)
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+        {
+            return None;
         }
         if key.code != KeyCode::Char('x')
             || key.modifiers != KeyModifiers::NONE
