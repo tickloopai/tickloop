@@ -461,6 +461,8 @@ struct InheritedChat {
     client: Arc<dyn ModelClient>,
     output_style: OutputStyle,
     user_context: OnceLock<String>,
+    /// The parent's environment: a child works in its parent's Folder.
+    environment: OnceLock<environment_info::ChatEnvironment>,
     announced_date: Option<String>,
 }
 
@@ -2354,33 +2356,42 @@ impl Agent {
             ..Default::default()
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style, user_context, announced_date) = if let Some(InheritedChat {
-            additional_directory_sources,
-            metadata,
-            parent,
-            client,
-            output_style,
-            user_context,
-            announced_date,
-        }) = inherited
-        {
-            bookkeeping.additional_directory_sources = additional_directory_sources;
-            snapshot.model = parent.model;
-            snapshot.reasoning_effort = parent.reasoning_effort;
-            snapshot.thinking_enabled = parent.thinking_enabled;
-            snapshot.search_config = parent.search_config;
-            snapshot.task_tools_enabled = parent.task_tools_enabled;
-            snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
-            let mut metadata = metadata;
-            self.apply_host_rules(&mut metadata.ceiling.policy);
-            snapshot.policy = metadata.ceiling.policy.clone();
-            snapshot.delegation = Some(metadata);
-            (client, output_style, user_context, announced_date)
-        } else {
-            let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
-            snapshot.policy.launch_rules = launch_rules;
-            (client, output_style, OnceLock::new(), None)
-        };
+        let (client, output_style, user_context, environment, announced_date) =
+            if let Some(InheritedChat {
+                additional_directory_sources,
+                metadata,
+                parent,
+                client,
+                output_style,
+                user_context,
+                environment,
+                announced_date,
+            }) = inherited
+            {
+                bookkeeping.additional_directory_sources = additional_directory_sources;
+                snapshot.model = parent.model;
+                snapshot.reasoning_effort = parent.reasoning_effort;
+                snapshot.thinking_enabled = parent.thinking_enabled;
+                snapshot.search_config = parent.search_config;
+                snapshot.task_tools_enabled = parent.task_tools_enabled;
+                snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
+                let mut metadata = metadata;
+                self.apply_host_rules(&mut metadata.ceiling.policy);
+                snapshot.policy = metadata.ceiling.policy.clone();
+                snapshot.delegation = Some(metadata);
+                (
+                    client,
+                    output_style,
+                    user_context,
+                    environment,
+                    announced_date,
+                )
+            } else {
+                let (client, output_style) =
+                    self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+                snapshot.policy.launch_rules = launch_rules;
+                (client, output_style, OnceLock::new(), OnceLock::new(), None)
+            };
         if let SearchDefaults::Fixed(config) = &self.inner.search {
             snapshot.search_config = config.clone();
         }
@@ -2422,6 +2433,7 @@ impl Agent {
                 client,
                 output_style,
                 user_context,
+                environment,
                 announced_date,
                 tools,
                 skills,
@@ -5680,6 +5692,7 @@ pub(crate) struct NewChat {
     client: Arc<dyn ModelClient>,
     output_style: tickloop_harness_base::output_style::OutputStyle,
     user_context: OnceLock<String>,
+    environment: OnceLock<environment_info::ChatEnvironment>,
     announced_date: Option<String>,
     tools: Arc<tickloop_harness_tools::Tools>,
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
@@ -5694,6 +5707,7 @@ impl NewChat {
             client,
             output_style,
             user_context,
+            environment,
             announced_date,
             tools,
             skills,
@@ -5734,7 +5748,7 @@ impl NewChat {
             user_cancelled_runs: HashSet::new(),
             output_style,
             user_context,
-            environment: OnceLock::new(),
+            environment,
             announced_date,
             auto_denials: auto_mode::DenialTracking::default(),
             denial_window: denials::DenialWindow::default(),

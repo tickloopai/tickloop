@@ -292,6 +292,25 @@ async fn a_subagents_delegation_stays_fixed_through_denials() {
             serde_json::to_vec(&requests[0].tools).unwrap()
         );
     }
+    // The child reads its own environment once, into its fixed system prompt.
+    let system = match &requests[0].messages[0].content[0] {
+        tickloop_harness::protocol::Content::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    let folder = core.snapshot(child).await.unwrap().folder.unwrap();
+    for expected in [
+        format!(
+            "# Environment\nYou have been invoked in the following environment:\n - Primary working directory: {}\n - Is a git repository: false\n - Platform: {}",
+            folder.display(),
+            std::env::consts::OS
+        ),
+        format!(
+            "The exact model ID is {}.",
+            core.snapshot(child).await.unwrap().model.model
+        ),
+    ] {
+        assert!(system.contains(&expected), "{expected}\n{system}");
+    }
     let delegation = state(requests.last().unwrap())["delegation"].clone();
     assert_eq!(delegation["task"], "Inspect bounded evidence");
     assert_eq!(delegation["depth"], 1);

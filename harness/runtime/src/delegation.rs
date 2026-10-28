@@ -1039,6 +1039,7 @@ impl Agent {
                         client,
                         output_style,
                         user_context,
+                        environment,
                         announced_date,
                         session_denials,
                         name,
@@ -1086,6 +1087,7 @@ impl Agent {
                             chat.client.clone(),
                             chat.output_style,
                             chat.user_context.clone(),
+                            chat.environment.clone(),
                             chat.announced_date.clone(),
                             sessions.freeze_denials(parent_owner),
                             unique_agent_name(
@@ -1254,6 +1256,7 @@ impl Agent {
                                 client,
                                 output_style,
                                 user_context,
+                                environment,
                                 announced_date,
                             }),
                             Vec::new(),

@@ -103,6 +103,7 @@ impl Agent {
             bookkeeping: Default::default(),
             client,
             user_context: Default::default(),
+            environment: Default::default(),
             announced_date: None,
             file_history: None,
         }
