@@ -84,7 +84,7 @@ impl CommandSpec {
             .then_some(OVERVIEW_AGENT_COMMAND),
             CommandScope::Child => match self.command {
                 "/clear" | "/branch" | "/rewind" | "/compact" => Some(CHILD_HISTORY_FIXED),
-                "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" => {
+                "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" | "/sandbox" => {
                     Some(CHILD_AUTHORIZATION_FIXED)
                 }
                 "/plan" => Some(CHILD_PLAN_REPORTED),
@@ -276,6 +276,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/auto-mode-setup",
         arguments: "",
         description: "Generate and review directory-scoped Auto Environment facts.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
+        command: "/sandbox",
+        arguments: "[exclude \"COMMAND PATTERN\"]",
+        description: "Configure this Folder's sandbox mode, overrides and rules.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -756,8 +762,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 29);
-        assert_eq!(builtin_commands().len(), 45);
+        assert_eq!(completion.candidates().len(), 30);
+        assert_eq!(builtin_commands().len(), 46);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -779,6 +785,7 @@ mod tests {
             "/ticks",
             "/mcp",
             "/context",
+            "/sandbox",
         ] {
             assert!(command_names(&completion).contains(&command));
         }
@@ -837,7 +844,7 @@ mod tests {
         completion.update("/s");
         assert_eq!(
             command_names(&completion),
-            vec!["/settings", "/stop", "/slides"]
+            vec!["/settings", "/sandbox", "/stop", "/slides"]
         );
         completion.update("/operations");
         assert!(!completion.is_open());

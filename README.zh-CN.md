@@ -115,6 +115,10 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 
 在 macOS 上，Bash、后台 Shell 和 `!` Shell 可以在操作系统沙箱中运行。沙箱默认关闭，只读取你自己的 `settings.json`；仓库内容不能打开、关闭或放宽它。例如：
 
+用 `/sandbox` 打开 **Mode**（沙箱且免审、沙箱但正常审批、关闭）、**Overrides**（允许申请越出或严格模式）与只读的 **Config** 页。左右键切页，`j`/`k` 或 `Ctrl+N`/`Ctrl+P` 移动或滚动，Enter 保存，Esc 关闭。`/sandbox exclude "docker:*"` 为本 Folder 添加排除命令；排除命令仍走正常审批。非 macOS 平台可以查看设置，但不能通过此命令开启沙箱。
+
+改动只保存到用户自己的 `settings.json` 的 `projects["<规范化 Folder 路径>"].sandbox`，下一条命令起生效，无需重启。目录标量覆盖全局 `sandbox`；`excludedCommands`、`filesystem.allowWrite`/`denyWrite`、`network.allowedDomains` 合并两层并去重。Config 标出每项来源，并展示可写范围、受保护路径、网络规则与本机支持情况。其他窗口同时修改沙箱设置时，页面刷新并要求重新确认，不覆盖别人的改动。`/permissions` 提示可用 `/sandbox` 修改。
+
 ```json
 {
   "sandbox": {

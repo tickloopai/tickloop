@@ -5,6 +5,7 @@ pub(super) mod providers;
 pub(super) use providers::ProviderUpdate;
 #[cfg(test)]
 mod mcp_approval_tests;
+mod sandbox;
 mod search;
 #[cfg(test)]
 mod settings_ux_pty;
@@ -2151,9 +2152,22 @@ impl Menus {
         } else {
             "Choose a mode for this Chat, or view activity without changing it."
         };
+        let sandbox_folder = match target {
+            ConfigTarget::Agent(chat) => {
+                agent
+                    .status(chat)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .folder
+            }
+            ConfigTarget::NewDraft => Some(agent.launch_spec().folder),
+        };
         let sandbox = self.user_settings.as_ref().map_or_else(
             || Ok(tickloop_code_settings::sandbox::SandboxSettings::default()),
-            |settings| settings.load().sandbox(),
+            |settings| match sandbox_folder.as_deref() {
+                Some(folder) => settings.load().sandbox_for(folder),
+                None => settings.load().sandbox(),
+            },
         );
         let sandbox_status = match sandbox {
             Ok(settings) if settings.enabled && settings.fail_if_unavailable => {
@@ -2171,7 +2185,10 @@ impl Menus {
             Menu {
                 id: tickloop_ids::generate(),
                 title: "Permissions · Choose mode".into(),
-                context: vec![context.into(), sandbox_status.into()],
+                context: vec![
+                    context.into(),
+                    format!("{sandbox_status} · 用 /sandbox 修改"),
+                ],
                 markdown: None,
                 options,
                 selected,

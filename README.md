@@ -115,6 +115,10 @@ In `/permissions` → Auto mode, choose **Import from Claude Code** to copy the 
 
 On macOS, Bash, background Shells and `!` Shells can run in an OS sandbox. It is off by default and is read only from your own `settings.json`; repository content cannot turn it on, off or widen it. For example:
 
+Use `/sandbox` to choose **Mode** (sandbox with auto-allow, sandbox with regular permissions, or off), **Overrides** (allow escape requests or strict sandbox), and the read-only **Config** page. Left/right switches pages; `j`/`k` or `Ctrl+N`/`Ctrl+P` moves or scrolls, Enter saves, and Esc closes. `/sandbox exclude "docker:*"` adds an exclusion for this Folder; excluded commands still use normal approval. Non-macOS hosts can inspect settings but cannot enable the sandbox through this command.
+
+Changes are saved only in your own `settings.json`, under `projects["<canonical Folder>"].sandbox`, and apply to the next command without restarting. Folder scalars override global `sandbox` settings; `excludedCommands`, `filesystem.allowWrite`/`denyWrite`, and `network.allowedDomains` merge and deduplicate across both scopes. Config labels each setting's source and shows writable scope, protected paths, network rules and host support. Concurrent sandbox edits refresh the page instead of overwriting the other edit. `/permissions` links back to `/sandbox`.
+
 ```json
 {
   "sandbox": {
