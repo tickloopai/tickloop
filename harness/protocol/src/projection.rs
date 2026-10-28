@@ -16,6 +16,8 @@ use crate::{
 pub struct VisibleGuidance {
     pub skills: BTreeMap<String, (String, bool)>,
     pub mcp_servers: BTreeMap<String, String>,
+    /// The digest of the MCP configuration warnings the model was last told.
+    pub mcp_warnings: Option<String>,
 }
 
 /// A conversation whose tool calls and results cannot be paired into one model history.
@@ -105,6 +107,9 @@ impl ChatSnapshot {
                 HostNote::Guidance(GuidanceNote::McpServers { servers }) => {
                     visible.mcp_servers.extend(servers.clone());
                 }
+                HostNote::Guidance(GuidanceNote::McpWarnings { digest }) => {
+                    visible.mcp_warnings = Some(digest.clone());
+                }
                 HostNote::Guidance(GuidanceNote::Withdrawn {
                     skills,
                     mcp_servers,
@@ -114,7 +119,11 @@ impl ChatSnapshot {
                         .mcp_servers
                         .retain(|server, _| !mcp_servers.contains(server));
                 }
-                HostNote::HostTools(_) | HostNote::PlanModeExit | HostNote::DateChange(_) => {}
+                HostNote::HostTools(_)
+                | HostNote::PlanModeExit
+                | HostNote::ExecutionMode(_)
+                | HostNote::LoopState
+                | HostNote::DateChange(_) => {}
             }
         }
         visible

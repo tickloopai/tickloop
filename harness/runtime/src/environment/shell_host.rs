@@ -360,6 +360,7 @@ fn unknown_exit(reason: &str) -> ShellExit {
 
 pub fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
     ShellSpec {
+        dangerously_disable_sandbox: false,
         additional_directories: Vec::new(),
         family_temp: None,
         operation: launch.operation_id,
@@ -378,6 +379,7 @@ pub async fn prepare_shell(
     delivery: ShellOutputDelivery,
 ) -> Result<ShellPreparation, ToolError> {
     let spec = ShellSpec {
+        dangerously_disable_sandbox: request.dangerously_disable_sandbox,
         additional_directories: request
             .additional_directories
             .iter()
@@ -398,6 +400,7 @@ pub async fn prepare_shell(
         .await
         .map_err(|error| ToolError::Rejected(error.to_string()))?;
     let isolation = prepared.isolation();
+    let requires_approval = prepared.requires_approval();
     Ok(ShellPreparation::new(
         request.operation,
         delivery == ShellOutputDelivery::CallerFile,
@@ -408,7 +411,8 @@ pub async fn prepare_shell(
             delivery,
         }),
     )
-    .with_isolation(isolation))
+    .with_isolation(isolation)
+    .with_required_approval(requires_approval))
 }
 
 struct PreparedEnvironmentShell {

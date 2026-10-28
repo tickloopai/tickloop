@@ -31,7 +31,9 @@ use tickloop_harness_tools::{
 };
 
 mod prompts;
-pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reminder};
+pub(super) use prompts::{
+    enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reentry, plan_mode_rules,
+};
 
 /// Components of the plan file's directory and file name `<slug>-loop-<loopId>.md`.
 const PLANS_DIRECTORY: &str = "plans";
@@ -904,8 +906,6 @@ impl Agent {
         snapshot.policy.revision += 1;
         self.save(&snapshot);
         chat.replace_snapshot(snapshot);
-        // The approval result or continuation carries the approved plan; no exit notice follows.
-        chat.needs_plan_mode_exit_notice = false;
         if let Some(request) = request {
             let pending = approvals
                 .remove(&request.id)
@@ -959,41 +959,21 @@ impl Agent {
         }
     }
 
-    /// The plan mode section of a conversation request while the Chat is in Plan mode. It names
-    /// the Loop's plan file, choosing the Chat's plan file prefix on first use. A delegated child
-    /// has no plan file: it researches read-only and reports in its final reply.
-    pub(super) fn plan_mode_section(&self, chat: &mut Chat, loop_id: LoopId) -> Option<String> {
-        if chat.snapshot.policy.mode != ExecutionMode::Plan {
+    /// The Loop's plan file for a request of a root Chat with a Folder in Plan mode, choosing the
+    /// Chat's plan file prefix on first use. A delegated child or a Chat without a Folder has
+    /// none.
+    pub(super) fn prepare_plan_file(&self, chat: &mut Chat, loop_id: LoopId) -> Option<PathBuf> {
+        if chat.snapshot.delegation.is_some() {
             return None;
         }
-        if chat.snapshot.delegation.is_some() {
-            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
-        }
-        // A Chat without a Folder has no plan file; Plan mode there only reads.
-        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
+        let directory = self.plans_directory(&chat.snapshot.folder.clone()?);
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
         if ensure_plan_slug(&mut chat.bookkeeping, directory.path()) {
             self.save(&chat.snapshot);
         }
-        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)?;
-        Some(plan_mode_reminder(&plan_file, plan_file.exists()))
-    }
-
-    /// The Plan mode section as the next request would send it, without preparing the plan file
-    /// it names: a Chat without a plan file prefix yet reads with a stand-in name.
-    pub(super) fn plan_mode_preview(&self, chat: &Chat, loop_id: LoopId) -> Option<String> {
-        if chat.snapshot.policy.mode != ExecutionMode::Plan {
-            return None;
-        }
-        if chat.snapshot.delegation.is_some() {
-            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
-        }
-        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
-        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
-            .unwrap_or_else(|| directory.path().join(format!("plan{PLAN_FILE_EXTENSION}")));
-        Some(plan_mode_reminder(&plan_file, plan_file.exists()))
+        current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
     }
 
     pub(super) async fn control_tool(

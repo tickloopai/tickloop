@@ -103,15 +103,7 @@ async fn send_message_reaches_a_child_by_the_id_the_model_read_or_by_its_uuid() 
         let written = launched[key].as_str().unwrap();
         assert!(!written.contains('-'), "{key} {written}");
     }
-    let members = state(last)["family_members"].clone();
-    assert!(
-        members
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|member| member["chat_id"] == ids.model_text(child)),
-        "{members}"
-    );
+    assert_eq!(launched["child_chat_id"], ids.model_text(child));
     for call_id in ["as-read", "as-uuid"] {
         let accepted: Value = serde_json::from_str(&tool_text(last, call_id)).unwrap();
         assert_eq!(accepted["status"], "accepted", "{call_id}: {accepted}");

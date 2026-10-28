@@ -46,6 +46,7 @@ struct ShellPlan {
     directory_identity: FileIdentity,
     sandbox: Option<tickhost::sandbox::SandboxPolicy>,
     warning: Option<String>,
+    escape_guidance: bool,
 }
 
 enum PreparedOutput {
@@ -65,16 +66,18 @@ struct ShellEntry {
 }
 
 struct BoundOutput {
+    escape_guidance: bool,
     path: std::path::PathBuf,
     identity: FileIdentity,
     open: std::sync::Mutex<Option<Arc<File>>>,
 }
 
 impl BoundOutput {
-    fn new(file: File, path: String) -> Result<Self, ExecutionError> {
+    fn new(file: File, path: String, escape_guidance: bool) -> Result<Self, ExecutionError> {
         let identity = FileIdentity::opened(&file).map_err(preparation_error)?;
         Ok(Self {
             path: path.into(),
+            escape_guidance,
             identity,
             open: std::sync::Mutex::new(Some(Arc::new(file))),
         })
@@ -262,7 +265,9 @@ impl LocalShells {
                 },
             },
         );
-        let prepared = prepared.with_isolation(sandbox.isolation);
+        let prepared = prepared
+            .with_isolation(sandbox.isolation)
+            .with_required_approval(sandbox.requires_approval);
         let preparation = prepared.preparation();
         let prepared = prepared.with_cleanup(move || {
             if let Some(owner) = owner.upgrade() {
@@ -287,6 +292,7 @@ impl LocalShells {
                 directory_identity,
                 sandbox: sandbox.policy,
                 warning: sandbox.warning,
+                escape_guidance: sandbox.escape_guidance,
             },
         );
         Ok(prepared)
@@ -524,7 +530,7 @@ impl LocalShells {
         let output = match output_file
             .try_clone()
             .map_err(io_error)
-            .and_then(|file| BoundOutput::new(file, spec.output.clone()))
+            .and_then(|file| BoundOutput::new(file, spec.output.clone(), plan.escape_guidance))
         {
             Ok(output) => Arc::new(output),
             Err(error) => {
@@ -649,6 +655,13 @@ impl LocalShells {
                     }
                 }
             };
+            if exit.state == CommandState::Failed
+                && let Some(output) = &output
+                && output.escape_guidance
+                && let Ok(file) = output.file()
+            {
+                super::sandbox::annotate_escape_guidance(&file);
+            }
             updates.send_modify(|status| {
                 status.state = exit.state;
                 status.exit_code = exit.exit_code;

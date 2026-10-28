@@ -60,6 +60,7 @@ pub enum ShellStopError {
 pub type ShellStopAdmission = dyn Fn() -> Result<(), ShellStopError> + Send + Sync;
 
 pub struct ShellPreparationRequest {
+    pub dangerously_disable_sandbox: bool,
     pub additional_directories: Vec<PathBuf>,
     pub family_temp: Option<PathBuf>,
     pub operation: Uuid,
@@ -84,6 +85,7 @@ pub struct ShellPreparation {
     operation: Uuid,
     creates_output: bool,
     isolation: tickloop_harness_protocol::ExecutionIsolation,
+    requires_approval: bool,
     action: Arc<Mutex<Option<Box<dyn PreparedShellStart>>>>,
 }
 
@@ -102,8 +104,16 @@ impl ShellPreparation {
             operation,
             creates_output,
             isolation: Default::default(),
+            requires_approval: false,
             action: Arc::new(Mutex::new(Some(action))),
         }
+    }
+    pub fn with_required_approval(mut self, required: bool) -> Self {
+        self.requires_approval = required;
+        self
+    }
+    pub fn requires_approval(&self) -> bool {
+        self.requires_approval
     }
     pub fn with_isolation(
         mut self,

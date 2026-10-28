@@ -10,7 +10,7 @@ pub(crate) use network::{NetworkProxy, NetworkSession};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DENIAL_SCAN_BYTES: u64 = 64 * 1024;
-const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
+pub const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

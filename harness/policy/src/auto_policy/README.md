@@ -100,7 +100,7 @@ rules and the separate sandboxed-Bash admission path retain their own conditions
 Not applicable means only that the specific entry point does not exist; it does not exempt real side effects of the same kind. Data exfiltration,
 persistence or out-of-scope actions carried out through Bash or other exposed tools are still judged by the corresponding general rules. When a corresponding product entry point is added, it must be remapped.
 
-There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 9.
+There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 10.
 One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently eight native entry points that are not applicable.
 Custom rules and group replacements stay independent; users who replace the built-in Soft allow are not forced to have the Scheduling exception added back.
 
@@ -138,3 +138,35 @@ Nested calls record their parent call and their individual permission decisions.
 Claude Code 2.1.302 has a linked-worktree Accept Edits fast path behind a flag that is off by default, and it applies only when the session starts in the main checkout. Tickloop applies it in Auto whenever the Folder belongs to a git repository: the other linked worktrees registered in that repository count as workspace directories when Auto checks its Accept Edits fast path, so `Write`, `Edit` and Accept-Edits-admissible `Bash` into a sibling worktree run without review. Each worktree must link back to the same common git directory (`harness/base/src/git_worktree.rs`); the main checkout, worktrees enclosing the Folder or the git directory, unverified entries and more than 32 worktrees are left out. Sensitive paths, explicit Ask and Deny rules and the other fast-path conditions still apply, Accept Edits and Plan are unchanged. Delegated children still cannot `Write` or `Edit` outside their frozen workspace; their `Bash` gets the same Auto decision as the parent's.
 
 Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
+
+## Commands outside the sandbox
+
+Bash's per-call escape request uses ordinary command approval; it does not add a callback tool or grant a proxy domain.
+When the user enables the local sandbox, `dangerouslyDisableSandbox: true` or a matching
+`sandbox.excludedCommands` entry prepares that invocation with unrestricted writes and networking,
+and with an execution-environment requirement for ordinary approval. The immutable preparation is
+used for approval and execution; neither a model argument nor an exclusion is an approval grant.
+Auto sends such calls to its reviewer instead of the read-only or Accept Edits fast paths; Ask
+requires human approval. Explicit Permission Rules retain their precedence, Full Access retains its
+normal behavior, and Plan retains its existing read-only handling. An Unrestricted prompt host does
+not waive a required reviewer or human decision. No sandbox-based fast path is introduced here.
+
+The ordinary frozen policy judges the command's actual effects and the user's authorization.
+Routine authorized builds are not automatically a Containment Escape merely because they request
+this per-call route. Unauthorized reach, exfiltration and standing permission changes remain subject
+to Containment Escape, the exfiltration rules and Self-Modification. Permission Rule Ask/Deny and
+non-classifier-approvable safety checks cannot be cleared by the reviewer.
+
+`sandbox.allowUnsandboxedCommands` defaults to true. When false, both the model's request and the
+exclusion list are ignored and the command retains its sandbox. When the sandbox is disabled, the
+request has no effect. These controls are read only from the user's settings by Code, never from
+repository content or Harness Settings Store configuration.
+
+No rules are added or removed: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, with eight
+inapplicable native entries. Policy and built-in group version **10** records this mapping change.
+Portable Agent tests in `harness/runtime/tests/all/environment_approval.rs` use the reference
+Execution Environment, ScriptedModel and a reviewer double. Local integration tests in
+`code/local-environment/tests/all/sandbox.rs` cover the settings and actual macOS execution.
+Both verify admission and rejection, including normally safe commands. This is routing evidence,
+not semantic acceptance by a real review model. The conditional escape hint is appended by Code
+using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.

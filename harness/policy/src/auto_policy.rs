@@ -4,8 +4,8 @@ use tickloop_harness_protocol::{
 
 use crate::AutoSettings;
 
-const AUTO_POLICY_VERSION: u64 = 9;
-const BUILTIN_GROUP_VERSION: u64 = 9;
+const AUTO_POLICY_VERSION: u64 = 10;
+const BUILTIN_GROUP_VERSION: u64 = 10;
 
 #[derive(serde::Deserialize)]
 struct BuiltinRule {
@@ -207,7 +207,7 @@ mod tests {
             policy
                 .rules
                 .iter()
-                .all(|rule| matches!(rule.source, AutoRuleSource::Builtin { version: 9 }))
+                .all(|rule| matches!(rule.source, AutoRuleSource::Builtin { version: 10 }))
         );
     }
 }

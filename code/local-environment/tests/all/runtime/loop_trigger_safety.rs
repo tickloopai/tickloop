@@ -85,7 +85,10 @@ impl ModelClient for EchoModel {
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
         if !request.tools.is_empty()
-            && let Some(last) = request.messages.last()
+            && let Some(last) = request
+                .messages
+                .iter()
+                .rfind(|message| !tickloop_harness::test_support::is_host_note(message))
         {
             self.prompts.lock().unwrap().push(message_text(last));
         }

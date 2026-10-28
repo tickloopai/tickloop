@@ -76,7 +76,7 @@ fn last_user_text(model: &ScriptedModel) -> String {
     )
 }
 
-/// The newest user text of the model request at `index`.
+/// The newest user text of the model request at `index` that is not a host note.
 fn user_text(model: &ScriptedModel, index: usize) -> String {
     let requests = model.requests.lock().unwrap();
     let request = &requests[index];
@@ -84,6 +84,7 @@ fn user_text(model: &ScriptedModel, index: usize) -> String {
         .messages
         .iter()
         .rev()
+        .filter(|message| !is_host_note(message))
         .find_map(|message| {
             message.content.iter().find_map(|content| match content {
                 tickloop_harness::protocol::Content::Text { text }
@@ -3946,4 +3947,114 @@ async fn individual_subscription_pause_survives_restart() {
     assert_eq!(restored.accumulated, 0);
     assert!(restored.next_check_at_ms.is_none());
     reopened.shutdown().await;
+}
+
+/// The Loop's subscriptions stay out of the request prefix: the model's own TickManage call
+/// answers in its result, a change the user makes reaches the model as one note at the end of
+/// the conversation, and a compaction is followed by a note of what the Loop still watches.
+#[tokio::test(start_paused = true)]
+async fn subscription_changes_keep_the_prefix_and_reach_the_model_as_notes() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching"),
+        text("noted"),
+        text("still noted"),
+        text("Summary of the work so far."),
+        text("after compaction"),
+    ]));
+    let (agent, _stream, chat, _loop_id) = subscribed_agent(directory.path(), model.clone()).await;
+    let chat = tickloop_ids::Id::from(chat);
+    let mut events = agent.subscribe();
+    agent
+        .tick_subscribe_for_user(chat, fixture_instance(8))
+        .await
+        .unwrap();
+    let first = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    agent
+        .update_tick_subscription(chat, first, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
+    for prompt in ["what changed", "anything else"] {
+        agent.submit(chat, prompt.into()).await.unwrap();
+        wait_for_completion(&mut events).await;
+    }
+    agent.compact(chat).await.unwrap();
+    agent.submit(chat, "go on".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+
+    let requests = model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| !request.tools.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_vec(&request.messages[0]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[0]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let system = serde_json::to_string(&requests[0].messages[0]).unwrap();
+    for absent in ["subscriptions", "receiving", "\"loop\""] {
+        assert!(!system.contains(absent), "{absent}");
+    }
+    let new_note = |index: usize| {
+        let last = requests[index].messages.last().unwrap();
+        is_host_note(last).then(|| match &last.content[0] {
+            tickloop_harness::protocol::Content::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        })
+    };
+    assert_eq!(
+        new_note(1),
+        None,
+        "the model's own subscription answers in its result"
+    );
+    let changed = new_note(2).unwrap();
+    assert!(
+        changed.contains("Tick Subscriptions changed outside your tool calls"),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("- Added: ") && changed.contains("fixture-run-8"),
+        "{changed}"
+    );
+    assert_eq!(changed.matches("- Cancelled: ").count(), 1, "{changed}");
+    assert!(!changed.contains("fixture-run-7"), "{changed}");
+    assert_eq!(
+        new_note(3),
+        None,
+        "an unchanged Loop is not announced again"
+    );
+    let after_compaction = requests[4]
+        .messages
+        .iter()
+        .filter(|message| is_host_note(message))
+        .filter_map(|message| match &message.content[0] {
+            tickloop_harness::protocol::Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .find(|text| text.contains("the current state of this Chat's Tick Subscriptions"))
+        .expect("the compacted conversation is told what the Loop still watches");
+    assert!(
+        after_compaction.contains("fixture-run-8"),
+        "{after_compaction}"
+    );
+    assert!(
+        !after_compaction.contains("fixture-run-7"),
+        "{after_compaction}"
+    );
+    agent.shutdown().await;
 }

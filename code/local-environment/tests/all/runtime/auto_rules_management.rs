@@ -119,7 +119,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
     );
     assert!(matches!(
         initial.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 9 }
+        AutoEnvironmentSource::Builtin { version: 10 }
     ));
 
     let added = agent
@@ -218,6 +218,6 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         .unwrap();
     assert!(matches!(
         final_view.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 9 }
+        AutoEnvironmentSource::Builtin { version: 10 }
     ));
 }
