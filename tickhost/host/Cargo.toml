@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+base64 = "0.22"
 hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

@@ -2,6 +2,42 @@
 use super::*;
 
 #[tokio::test]
+async fn bang_shell_uses_the_daemon_tickhost_authenticated_network_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fixture = PrivateFixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(stream.read_u8().await.unwrap());
+        }
+        assert!(
+            !String::from_utf8_lossy(&header)
+                .to_ascii_lowercase()
+                .contains("\r\nproxy-authorization:")
+        );
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndaemon-proxy-ok").await.unwrap();
+    });
+    let result = AssertUnwindSafe(async {
+        std::fs::write(fixture.path("config/settings.json"), serde_json::to_vec(&json!({
+            "sandbox":{"enabled":true,"failIfUnavailable":true,"network":{"allowedDomains":["localhost"]}}
+        })).unwrap()).unwrap();
+        let mut view = PtyView::start(&fixture);
+        view.wait_for("new input ready", new_input_is_visible).await;
+        view.send(format!("!/usr/bin/curl --silent --show-error --fail --max-time 5 http://localhost:{port}/\r").as_bytes());
+        view.wait_for("authenticated proxy response through daemon and worker", |frame| frame.contains("daemon-proxy-ok")).await;
+        view.close().await;
+    }).catch_unwind().await;
+    server.abort();
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn permissions_shows_sandbox_setting_and_bang_shell_obeys_it() {
     for enabled in [true, false] {
         let fixture = PrivateFixture::new();

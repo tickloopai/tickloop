@@ -80,9 +80,9 @@ without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harne
 This native entry is remapped to Tickhost's deterministic HTTP/HTTPS CONNECT proxy.
 The user's `sandbox.network.allowedDomains` is frozen with each prepared Shell and its
 single-use spawn authorization. Only matching destinations are reachable through that
-Shell's loopback proxy port; direct network access remains blocked. A denied domain is
+Shell's authenticated route through the Tickhost's lifetime-bound loopback proxy; direct network access remains blocked. A denied domain is
 reported in the Shell output. The proxy neither asks a model nor grants a new domain;
-only the user can change the allowlist in their settings. There is no model-callable
+only the user can change the allowlist in their settings. The proxy checks a random per-Tickhost token and a private per-Shell routing identity; a Shell's route is revoked at exit without releasing the listener. Detached descendants surviving a Tickhost restart retain the old OS port permission, as documented in the README sandbox limitation. There is no model-callable
 SandboxNetworkAccess tool, and this mapping adds no policy rule. Existing permission
 rules and the separate sandboxed-Bash admission path retain their own conditions.
 

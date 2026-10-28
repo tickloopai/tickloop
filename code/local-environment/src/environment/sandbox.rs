@@ -156,11 +156,9 @@ fn prepare_policy(
         network: if config.network.allowed_domains.is_empty() {
             SandboxNetwork::Disconnected
         } else {
-            // Tickhost must bind this frozen port before spawning; a collision fails closed.
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(path_error)?;
             SandboxNetwork::Allowlist {
                 allowed_domains: config.network.allowed_domains.clone(),
-                proxy_port: listener.local_addr().map_err(path_error)?.port(),
+                proxy_port: 0,
             }
         },
     })

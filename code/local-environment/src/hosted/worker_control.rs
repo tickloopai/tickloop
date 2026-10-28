@@ -56,6 +56,9 @@ impl std::fmt::Debug for WorkerControlGrant {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerRequest {
+    SandboxProxyPort {
+        chat: Uuid,
+    },
     OpenHostedTick {
         chat: Uuid,
         operation: Uuid,
@@ -151,6 +154,7 @@ impl WorkerRequest {
             | Self::CloseHostedTick { admission, .. }
             | Self::ReopenHostedTick { admission, .. } => Some(admission),
             Self::ListHostedTicks { .. }
+            | Self::SandboxProxyPort { .. }
             | Self::GetHostedOperationReceipt { .. }
             | Self::AllowHostedView { .. }
             | Self::AllowShellSpawn { .. }
@@ -161,6 +165,7 @@ impl WorkerRequest {
     pub fn chat(&self) -> Uuid {
         match self {
             Self::OpenHostedTick { chat, .. }
+            | Self::SandboxProxyPort { chat }
             | Self::CloseHostedTick { chat, .. }
             | Self::ReopenHostedTick { chat, .. }
             | Self::ListHostedTicks { chat, .. }

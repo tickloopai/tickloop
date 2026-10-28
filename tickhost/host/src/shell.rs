@@ -424,7 +424,7 @@ pub(crate) struct ShellTask {
     pub(crate) pid: u32,
     ownership: std::sync::Mutex<ShellOwnership>,
     output: std::fs::File,
-    network_proxy: Option<crate::sandbox::NetworkProxy>,
+    network_proxy: Option<crate::sandbox::NetworkSession>,
     /// The first reason it was asked to stop for.
     stop: watch::Sender<Option<String>>,
     exit: watch::Sender<Option<ShellExit>>,
@@ -464,6 +464,7 @@ impl ShellTask {
         directory: OwnedFd,
         output: OwnedFd,
         data_token: String,
+        network_proxy: Option<crate::sandbox::NetworkSession>,
     ) -> Result<Arc<Self>, HostError> {
         let SpawnRequest {
             binding,
@@ -481,14 +482,6 @@ impl ShellTask {
         let output = std::fs::File::from(output);
         let launch_failed =
             |error: std::io::Error| HostError::before("LaunchFailed", error.to_string());
-        let network_proxy = binding
-            .approval
-            .sandbox
-            .as_ref()
-            .map(|policy| crate::sandbox::NetworkProxy::start(&policy.network))
-            .transpose()
-            .map_err(launch_failed)?
-            .flatten();
         let mut command = match &binding.approval.sandbox {
             Some(policy) => {
                 crate::sandbox::command(policy, &binding.approval.shell).map_err(launch_failed)?

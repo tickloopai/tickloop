@@ -6,7 +6,7 @@ use std::{
 };
 
 mod network;
-pub(crate) use network::NetworkProxy;
+pub(crate) use network::{NetworkProxy, NetworkSession};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DENIAL_SCAN_BYTES: u64 = 64 * 1024;

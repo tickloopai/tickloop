@@ -4689,6 +4689,7 @@ dependencies = [
 name = "tickloop-tickhost"
 version = "0.2.25"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "http-body-util",
  "hyper",

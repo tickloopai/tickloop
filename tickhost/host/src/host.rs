@@ -512,6 +512,7 @@ impl Diagnostics {
 }
 
 pub struct HostState {
+    sandbox_proxy_requested: bool,
     ticks: HashMap<Uuid, Arc<HostedTick>>,
     /// Shell tasks by operation, each until it was released and nobody viewed it for the idle
     /// timeout.
@@ -605,6 +606,7 @@ mod milliseconds {
 }
 
 pub struct Host {
+    network_proxy: std::sync::OnceLock<Result<crate::sandbox::NetworkProxy, String>>,
     paths: HostPaths,
     epoch: Uuid,
     controller_key: String,
@@ -630,6 +632,28 @@ enum ShutdownState {
 }
 
 impl Host {
+    async fn sandbox_proxy_port(&self) -> Result<Value, HostError> {
+        let mut state = self.state.lock().await;
+        if self.shutdown.is_cancelled() || state.exiting {
+            return Err(HostError::before(
+                "ShuttingDown",
+                "the Tickhost is stopping",
+            ));
+        }
+        let port = self.network_proxy()?.port();
+        state.sandbox_proxy_requested = true;
+        Ok(json!({"port":port,"epoch":self.epoch}))
+    }
+
+    fn network_proxy(&self) -> Result<&crate::sandbox::NetworkProxy, HostError> {
+        self.network_proxy
+            .get_or_init(|| {
+                crate::sandbox::NetworkProxy::start().map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|message| HostError::before("SandboxUnavailable", message.clone()))
+    }
+
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1179,7 +1203,20 @@ impl Host {
                 "this operation already runs a Shell task",
             ));
         }
-        let task = ShellTask::start(request, directory, output, random_token())?;
+        let network = match request.binding.approval.sandbox.as_ref() {
+            Some(policy)
+                if matches!(
+                    policy.network,
+                    crate::sandbox::SandboxNetwork::Allowlist { .. }
+                ) =>
+            {
+                self.network_proxy()?
+                    .register(&policy.network)
+                    .map_err(|error| HostError::before("SandboxUnavailable", error.to_string()))?
+            }
+            _ => None,
+        };
+        let task = ShellTask::start(request, directory, output, random_token(), network)?;
         state.shells.insert(operation, task.clone());
         Ok(task)
     }
@@ -1236,6 +1273,7 @@ impl Host {
             .retain(|_, task| !task.is_forgotten(now_ms, self.idle_timeout));
         let pending_spawns = state.spawn_grants.pending(Instant::now());
         state.exiting = state.ticks.is_empty()
+            && !(state.sandbox_proxy_requested && state.controllers > 0)
             && state.shells.is_empty()
             && state.spawners == 0
             && pending_spawns == 0
@@ -1552,6 +1590,7 @@ pub async fn serve_until(
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let identity = paths::file_identity(&socket)?;
     let host = Arc::new(Host {
+        network_proxy: std::sync::OnceLock::new(),
         paths,
         epoch: tickloop_ids::generate(),
         controller_key: config.controller_key,
@@ -1560,6 +1599,7 @@ pub async fn serve_until(
         session_serial: AtomicU64::new(0),
         connections: AtomicUsize::new(0),
         state: Mutex::new(HostState {
+            sandbox_proxy_requested: false,
             ticks: HashMap::new(),
             shells: HashMap::new(),
             spawn_grants: SpawnGrants::default(),
@@ -1579,6 +1619,7 @@ pub async fn serve_until(
         shutdown_requests: std::sync::Mutex::new(HashSet::new()),
         shutdown_state: watch::channel(ShutdownState::Running).0,
     });
+    let _ = host.network_proxy();
     let mut sweep = tokio::time::interval(REAP_INTERVAL);
     let mut connections = tokio::task::JoinSet::new();
     tokio::pin!(stop);
@@ -2251,6 +2292,7 @@ async fn controller_request(
         }
         "reconcile_owners" => host.reconcile_owners(parameters(params)?).await,
         "allow_spawn" => host.allow_spawn(parameters(params)?).await,
+        "sandbox_proxy_port" => host.sandbox_proxy_port().await,
         "end_owner" => {
             #[derive(Deserialize)]
             struct End {
@@ -3224,6 +3266,7 @@ mod tests {
 
     fn test_host(directory: &tempfile::TempDir) -> Arc<Host> {
         Arc::new(Host {
+            network_proxy: std::sync::OnceLock::new(),
             paths: HostPaths {
                 runtime: directory.path().join("host"),
             },
@@ -3234,6 +3277,7 @@ mod tests {
             session_serial: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
             state: Mutex::new(HostState {
+                sandbox_proxy_requested: false,
                 ticks: HashMap::new(),
                 shells: HashMap::new(),
                 spawn_grants: SpawnGrants::default(),

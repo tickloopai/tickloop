@@ -1,11 +1,12 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     convert::Infallible,
     io,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -23,6 +24,7 @@ use super::SandboxNetwork;
 
 const MAX_CONNECTIONS: usize = 64;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DENIED_DOMAINS: usize = 32;
 const MAX_DOMAIN_NAME_BYTES: usize = 253;
@@ -31,43 +33,53 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 pub(crate) struct NetworkProxy {
     port: u16,
     state: Arc<ProxyState>,
+    // Keep the port reserved even if the accept task stops unexpectedly.
+    _listener: Arc<TcpListener>,
 }
 
 struct ProxyState {
+    token: String,
+    stop: CancellationToken,
+    sessions: Mutex<HashMap<String, Weak<SessionState>>>,
+}
+
+struct SessionState {
     allowed_domains: Vec<String>,
     stop: CancellationToken,
     denied_domains: Mutex<BTreeSet<String>>,
 }
 
+pub(crate) struct NetworkSession {
+    identity: String,
+    port: u16,
+    proxy: Arc<ProxyState>,
+    state: Arc<SessionState>,
+}
+
 impl NetworkProxy {
-    pub(crate) fn start(network: &SandboxNetwork) -> io::Result<Option<Self>> {
-        let SandboxNetwork::Allowlist {
-            allowed_domains,
-            proxy_port,
-        } = network
-        else {
-            return Ok(None);
-        };
-        if *proxy_port == 0 || allowed_domains.is_empty() {
-            return Err(io::Error::other("invalid sandbox network policy"));
-        }
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *proxy_port))?;
+    pub(crate) fn start() -> io::Result<Self> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(listener)?;
+        let listener = Arc::new(TcpListener::from_std(listener)?);
         let state = Arc::new(ProxyState {
-            allowed_domains: allowed_domains.clone(),
+            token: crate::host::random_token(),
             stop: CancellationToken::new(),
-            denied_domains: Mutex::new(BTreeSet::new()),
+            sessions: Mutex::new(HashMap::new()),
         });
         let listener_state = state.clone();
+        let accepting = listener.clone();
         tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             loop {
                 let accepted = tokio::select! {
                     _ = listener_state.stop.cancelled() => break,
-                    accepted = listener.accept() => accepted,
+                    accepted = accepting.accept() => accepted,
                 };
-                let Ok((stream, _)) = accepted else { break };
+                let Ok((stream, _)) = accepted else {
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     continue;
                 };
@@ -78,7 +90,7 @@ impl NetworkProxy {
                     let service = service_fn(move |request| {
                         let state = state.clone();
                         let permit = permit.clone();
-                        async move { Ok::<_, Infallible>(forward(request, state, permit).await) }
+                        async move { Ok::<_, Infallible>(authenticate(request, state, permit).await) }
                     });
                     tokio::select! {
                         _ = cancelled.cancelled() => {},
@@ -92,14 +104,55 @@ impl NetworkProxy {
                 });
             }
         });
-        Ok(Some(Self {
-            port: *proxy_port,
+        Ok(Self {
+            port,
+            state,
+            _listener: listener,
+        })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn register(&self, network: &SandboxNetwork) -> io::Result<Option<NetworkSession>> {
+        let SandboxNetwork::Allowlist {
+            allowed_domains,
+            proxy_port,
+        } = network
+        else {
+            return Ok(None);
+        };
+        if *proxy_port != self.port || allowed_domains.is_empty() || self.state.stop.is_cancelled()
+        {
+            return Err(io::Error::other("sandbox proxy changed after preparation"));
+        }
+        let identity = crate::host::random_token();
+        let state = Arc::new(SessionState {
+            allowed_domains: allowed_domains.clone(),
+            stop: self.state.stop.child_token(),
+            denied_domains: Mutex::new(BTreeSet::new()),
+        });
+        self.state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(identity.clone(), Arc::downgrade(&state));
+        Ok(Some(NetworkSession {
+            identity,
+            port: self.port,
+            proxy: self.state.clone(),
             state,
         }))
     }
+}
 
+impl NetworkSession {
     pub(crate) fn configure(&self, command: &mut tokio::process::Command) {
-        let proxy = format!("http://127.0.0.1:{}", self.port);
+        let proxy = format!(
+            "http://{}:{}@127.0.0.1:{}",
+            self.identity, self.proxy.token, self.port
+        );
         for name in [
             "http_proxy",
             "https_proxy",
@@ -117,6 +170,7 @@ impl NetworkProxy {
 
     pub(crate) fn stop(&self) {
         self.state.stop.cancel();
+        self.proxy.sessions.lock().unwrap().remove(&self.identity);
     }
 
     pub(crate) fn annotate_denials(&self, output: &std::fs::File) {
@@ -129,13 +183,67 @@ impl NetworkProxy {
 
 impl Drop for NetworkProxy {
     fn drop(&mut self) {
+        self.state.stop.cancel();
+    }
+}
+
+impl Drop for NetworkSession {
+    fn drop(&mut self) {
         self.stop();
     }
 }
 
+async fn authenticate(
+    request: Request<Incoming>,
+    proxy: Arc<ProxyState>,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Response<ProxyBody> {
+    let session = request
+        .headers()
+        .get("proxy-authorization")
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .and_then(|(_, encoded)| STANDARD.decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|credentials| {
+            let (identity, token) = credentials.split_once(':')?;
+            if !tickhost_connect::hosted::same_secret(token, &proxy.token) {
+                return None;
+            }
+            proxy
+                .sessions
+                .lock()
+                .unwrap()
+                .get(identity)
+                .and_then(Weak::upgrade)
+        })
+        .filter(|session| !session.stop.is_cancelled());
+    let Some(session) = session else {
+        return authentication_required();
+    };
+    let cancelled = session.stop.clone();
+    tokio::select! {
+        _ = cancelled.cancelled() => authentication_required(),
+        response = forward(request, session, permit) => response,
+    }
+}
+
+fn authentication_required() -> Response<ProxyBody> {
+    let mut response = response(
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        "proxy authentication required",
+    );
+    response.headers_mut().insert(
+        "proxy-authenticate",
+        "Basic realm=\"Tickhost\"".parse().unwrap(),
+    );
+    response
+}
+
 async fn forward(
     mut request: Request<Incoming>,
-    state: Arc<ProxyState>,
+    state: Arc<SessionState>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
     let is_connect = request.method() == Method::CONNECT;
@@ -212,6 +320,7 @@ async fn forward(
         return response(StatusCode::BAD_GATEWAY, "sandbox proxy handshake failed");
     };
     tokio::spawn(async move {
+        let _permit = permit;
         tokio::select! {
             _ = state.stop.cancelled() => {},
             _ = connection => {},

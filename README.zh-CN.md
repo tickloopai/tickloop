@@ -71,7 +71,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad，网络默认断开；可在 `sandbox.network.allowedDomains` 中列出 `registry.npmjs.org`、`*.github.com` 等目标。HTTP 与 HTTPS CONNECT 经过本机代理，不遵循代理设置的命令也不能直连。通配规则只匹配子域名、不包含域名本身；被拒的目标会写入命令输出。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱中的命令不能穿过敏感符号链接（包括读取），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。沙箱默认关闭，不改变审批规则；`/permissions` 显示配置状态。
 
-在已有沙箱中或其他平台上不可用时，命令会警告并按无隔离运行；设置 `sandbox.failIfUnavailable: true` 则拒绝执行。其余沙箱字段会提示“暂不支持”。沙箱内失败且输出包含权限拒绝特征的命令会附加诊断说明，退出状态保持不变。
+在已有沙箱中或其他平台上不可用时，命令会警告并按无隔离运行；设置 `sandbox.failIfUnavailable: true` 则拒绝执行。每个 Tickhost 的认证回环代理在其整个生命周期内保持端口绑定，每个 Shell 使用独立冻结的白名单。已知限制：脱离原进程组的后代可能在 Tickhost 重启后仍存活；其 OS 沙箱仍允许连接原代理的回环端口，因此可能访问之后占用该端口的其他服务。其余沙箱字段会提示“暂不支持”。沙箱内失败且输出包含权限拒绝特征的命令会附加诊断说明，退出状态保持不变。
 
 按键：
 
