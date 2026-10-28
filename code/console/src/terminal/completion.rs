@@ -84,7 +84,7 @@ impl CommandSpec {
             .then_some(OVERVIEW_AGENT_COMMAND),
             CommandScope::Child => match self.command {
                 "/clear" | "/branch" | "/rewind" | "/compact" => Some(CHILD_HISTORY_FIXED),
-                "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" => {
+                "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" | "/sandbox" => {
                     Some(CHILD_AUTHORIZATION_FIXED)
                 }
                 "/plan" => Some(CHILD_PLAN_REPORTED),
@@ -276,6 +276,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/auto-mode-setup",
         arguments: "",
         description: "Generate and review directory-scoped Auto Environment facts.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
+        command: "/sandbox",
+        arguments: "[exclude \"COMMAND PATTERN\"]",
+        description: "Configure this Folder's sandbox mode, overrides and rules.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {

@@ -94,10 +94,12 @@ fn settings_ux_pty_fixture() {
                 writeln!(std::fs::OpenOptions::new().create(true).append(true).open(directory.join("trace")).unwrap(), "{event:?}").unwrap();
                 match event {
                     super::super::console::InputEvent::Line(line) | super::super::console::InputEvent::Prompt { text: line, .. } => match line.as_str() {
+                        "/permissions" => menus.permission_modes(&agent, &console, ConfigTarget::Agent(chat), false).await.unwrap(),
                         "/settings" => menus.settings(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/websearch" => menus.search_settings(&agent, &console, ConfigTarget::Agent(chat), false).await.unwrap(),
                         "/model" => menus.models(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/provider" => menus.providers(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
+                        command if command == "/sandbox" || command.starts_with("/sandbox ") => menus.sandbox_command(&agent, &console, ConfigTarget::Agent(chat), command).await.unwrap(),
                         "/exit" => break,
                         _ => panic!("unexpected fixture line {line:?}"),
                     },
@@ -905,4 +907,188 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     assert_eq!(UserSettings::in_root(&root).load().search_config(), None);
+}
+
+#[test]
+fn sandbox_pty_mode_and_overrides_save_for_this_folder() {
+    let mut fixture = Fixture::start();
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]") && frame.contains("No sandbox"));
+    fixture.send(b"k\r");
+    #[cfg(target_os = "macos")]
+    {
+        fixture.wait(|frame| frame.contains("Saved for this Folder"));
+        let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+        let folder = fixture.directory.path().canonicalize().unwrap();
+        let config = settings.load().sandbox_for(&folder).unwrap();
+        assert!(config.enabled);
+        assert!(!config.auto_allow_bash_if_sandboxed);
+        assert!(!settings.load().sandbox().unwrap().enabled);
+    }
+    #[cfg(not(target_os = "macos"))]
+    fixture.wait(|frame| frame.contains("本平台暂不支持"));
+    fixture.send(b"\x1b[C");
+    fixture.wait(|frame| frame.contains("[Overrides]") && frame.contains("Strict sandbox"));
+    fixture.send(b"\x0e\r");
+    fixture.wait(|frame| frame.contains("Saved for this Folder"));
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    assert!(
+        !settings
+            .load()
+            .sandbox_for(&fixture.directory.path().canonicalize().unwrap())
+            .unwrap()
+            .allow_unsandboxed_commands
+    );
+    fixture.send(b"\x1b[C");
+    fixture.wait(|frame| frame.contains("[Config]") && frame.contains("read-only"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| !frame.contains("[Config]"));
+}
+
+#[test]
+fn sandbox_pty_config_shows_effective_rules_sources_and_scrolls_without_writing() {
+    let mut fixture = Fixture::start_at("ordinary", 32);
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    let folder = fixture.directory.path().canonicalize().unwrap();
+    std::fs::write(settings.file_path(), serde_json::json!({
+        "sandbox":{"enabled":true,"excludedCommands":["docker:*"],"filesystem":{"allowWrite":["cache"]}},
+        "projects":{folder.to_str().unwrap():{"sandbox":{"failIfUnavailable":true,"network":{"allowedDomains":["*.github.com"]}}}}
+    }).to_string()).unwrap();
+    let before = std::fs::read(settings.file_path()).unwrap();
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]"));
+    fixture.send(b"\x1b[D");
+    fixture.wait(|frame| {
+        frame.contains("[Config]")
+            && frame.contains("docker:* [global]")
+            && frame.contains("cache [global]")
+    });
+    fixture.send(b"\x1b[F");
+    fixture.wait(|frame| {
+        frame.contains("*.github.com [this Folder]")
+            && frame.contains("failIfUnavailable: true [this Folder]")
+            && frame.contains("暂不支持")
+    });
+    fixture.send(b"\r\x1b");
+    fixture.wait(|frame| !frame.contains("[Config]"));
+    assert_eq!(std::fs::read(settings.file_path()).unwrap(), before);
+}
+
+#[test]
+fn sandbox_pty_exclude_parses_quotes_preserves_scopes_and_reports_usage() {
+    let mut fixture = Fixture::start();
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    fixture.send(b"/sandbox exclude\r");
+    fixture.wait(|frame| frame.contains("Usage: /sandbox exclude"));
+    assert!(
+        settings
+            .load()
+            .sandbox()
+            .unwrap()
+            .excluded_commands
+            .is_empty()
+    );
+    fixture.send(b"/sandbox exclude \"docker compose:*\"\r");
+    fixture.wait(|frame| frame.contains("Added exclusion for this Folder"));
+    let folder = fixture.directory.path().canonicalize().unwrap();
+    assert_eq!(
+        settings
+            .load()
+            .sandbox_for(&folder)
+            .unwrap()
+            .excluded_commands,
+        ["docker compose:*"]
+    );
+    assert!(
+        settings
+            .load()
+            .sandbox()
+            .unwrap()
+            .excluded_commands
+            .is_empty()
+    );
+    fixture.send(b"/sandbox exclude \"docker compose:*\"\r");
+    fixture.wait(|frame| frame.contains("Exclusion already present"));
+    assert_eq!(
+        settings
+            .load()
+            .sandbox_for(&folder)
+            .unwrap()
+            .excluded_commands
+            .len(),
+        1
+    );
+    fixture.send(b"/sandbox exclude \"\"\r");
+    fixture.wait(|frame| frame.contains("Usage: /sandbox exclude"));
+}
+
+#[test]
+fn sandbox_pty_permissions_status_uses_this_folder_and_points_to_sandbox() {
+    let mut fixture = Fixture::start();
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    let folder = fixture.directory.path().canonicalize().unwrap();
+    std::fs::write(
+        settings.file_path(),
+        serde_json::json!({"projects":{folder.to_str().unwrap():{"sandbox":{"enabled":true}}}})
+            .to_string(),
+    )
+    .unwrap();
+    fixture.send(b"/permissions\r");
+    fixture.wait(|frame| frame.contains("Sandbox: on") && frame.contains("用 /sandbox 修改"));
+}
+
+#[test]
+fn sandbox_pty_conflict_refreshes_and_requires_another_confirmation() {
+    let mut fixture = Fixture::start();
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]"));
+    fixture.send(b"\x1b[C");
+    fixture.wait(|frame| frame.contains("[Overrides]"));
+    let external = r#"{"sandbox":{"allowUnsandboxedCommands":false},"keep":"external edit"}"#;
+    std::fs::write(settings.file_path(), external).unwrap();
+    fixture.send(b"\x0e\r");
+    fixture.wait(|frame| {
+        frame.contains("Permissions changed elsewhere")
+            && frame.contains("Strict sandbox · Current")
+    });
+    assert_eq!(
+        std::fs::read_to_string(settings.file_path()).unwrap(),
+        external
+    );
+    fixture.send(b"\x10\r");
+    fixture.wait(|frame| {
+        frame.contains("Saved for this Folder")
+            && frame.contains("Allow unsandboxed commands · Current")
+    });
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(settings.file_path()).unwrap()).unwrap();
+    assert_eq!(saved["keep"], "external edit");
+    assert_eq!(saved["sandbox"]["allowUnsandboxedCommands"], false);
+    assert!(
+        settings
+            .load()
+            .sandbox_for(&fixture.directory.path().canonicalize().unwrap())
+            .unwrap()
+            .allow_unsandboxed_commands
+    );
+}
+
+#[test]
+fn sandbox_pty_failed_save_keeps_file_intact_and_dialog_open() {
+    let mut fixture = Fixture::start();
+    let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
+    fixture.send(b"/sandbox\r");
+    fixture.wait(|frame| frame.contains("[Mode]"));
+    fixture.send(b"\x1b[C");
+    fixture.wait(|frame| frame.contains("[Overrides]"));
+    std::fs::write(settings.file_path(), "{broken settings").unwrap();
+    fixture.send(b"j\r");
+    fixture.wait(|frame| frame.contains("not valid JSON") && frame.contains("[Overrides]"));
+    assert_eq!(
+        std::fs::read_to_string(settings.file_path()).unwrap(),
+        "{broken settings"
+    );
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| !frame.contains("[Overrides]"));
 }

@@ -512,6 +512,27 @@ pub struct SensitiveWritePathPatterns {
     pub relative_components: Vec<String>,
 }
 
+pub fn sensitive_write_path_descriptions() -> Vec<String> {
+    let mut paths = shell::sensitive_write_names()
+        .chain(SENSITIVE_PATH_NAMES.iter().copied())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    paths.push(".env.*".into());
+    paths.extend(
+        SENSITIVE_PATH_SIGNALS
+            .iter()
+            .map(|name| format!("*{name}*")),
+    );
+    paths.extend(
+        SENSITIVE_PATH_EXTENSIONS
+            .iter()
+            .map(|extension| format!("*.{extension}")),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 pub fn sensitive_write_path_patterns() -> SensitiveWritePathPatterns {
     let literal = |value: &str| -> String {
         value

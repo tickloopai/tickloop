@@ -27,7 +27,12 @@ pub(super) async fn prepare(
     let Some(settings) = settings else {
         return Ok(PreparedSandbox::default());
     };
-    let config = settings.load().sandbox().map_err(configuration_error)?;
+    let mut loaded = settings.load();
+    let config = match spec.folder.as_deref() {
+        Some(folder) => loaded.sandbox_for(Path::new(folder)),
+        None => loaded.sandbox(),
+    }
+    .map_err(configuration_error)?;
     if !config.enabled {
         return Ok(PreparedSandbox::default());
     }

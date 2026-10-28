@@ -88,6 +88,7 @@ mod renderer;
 mod reply_lines;
 mod running_shimmer;
 mod runtime_upgrade;
+mod sandbox_surface;
 mod scheduled_task_rows;
 mod scheduled_tasks;
 mod scrollback;
@@ -479,6 +480,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/mcp"
                 | "/settings"
                 | "/permissions"
+                | "/sandbox"
                 | "/auto-mode-setup"
                 | "/mode"
                 | "/model"
@@ -961,6 +963,7 @@ Each user invocation shows a Skill row with its source, also in reopened history
 /mcp shows the Agent's MCP servers by source with their state, tools and exposure; enter opens a server's tools, login, logout, reconnect, and turning it off or on in this directory.
 /model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
+/sandbox opens Mode, Overrides and Config; changes apply to this Folder on the next command.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
 /permissions → Auto opens Auto settings, where you can select LLM or Judgment, manage review rules and Environment, and open the shared Jev (TypeSafe) key settings.
 Explicit Ask rules always require a human once-only answer. Auto defaults to this Chat's model; Jev technical failure falls back to it without changing the saved choice.
@@ -1296,6 +1299,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
         settings.additional_directories(&workdir);
+        if let Err(error) = settings.sandbox_for(&workdir) {
+            settings.warn(error);
+        }
     }
     let saved_execution_mode = saved_settings
         .as_mut()
@@ -4077,6 +4083,11 @@ async fn interact_with_herdr(
                                     Err(error) => outln!(console, "Cannot open Environment setup: {}", safe_text(&error.to_string())),
                                 }
                             } else { outln!(console, "Enter a task before generating an Environment draft."); }
+                        },
+                        command if command == "/sandbox" || command.starts_with("/sandbox ") => {
+                            if let Err(error) = menus.sandbox_command(agent, console, ConfigTarget::visible(selected_chat.map(Into::into)), command).await {
+                                outln!(console, "Cannot open Sandbox: {}", safe_text(&error));
+                            }
                         },
                         "/permissions" => {
                             if console.is_interactive() {

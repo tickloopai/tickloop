@@ -52,6 +52,7 @@ pub(super) struct DialogState {
     context_offset: usize,
     history_search: Option<HistorySearch>,
     pub(super) permissions_surface: Option<PermissionsSurface>,
+    pub(super) sandbox_surface: Option<SandboxSurface>,
     help_open: bool,
     help_offset: usize,
 }
@@ -65,6 +66,7 @@ impl DialogState {
             || self.conversation_picker.is_some()
             || self.menu_comment.is_some()
             || self.question_menu.is_some()
+            || self.sandbox_surface.is_some()
             || self.permissions_surface.is_some()
             || self.history_search.is_some()
     }
@@ -264,6 +266,7 @@ impl State {
                 &mut self.permissions_surface,
                 next.permissions_surface,
             ),
+            sandbox_surface: std::mem::replace(&mut self.sandbox_surface, next.sandbox_surface),
             help_open: std::mem::replace(&mut self.help_open, next.help_open),
             help_offset: std::mem::replace(&mut self.help_offset, next.help_offset),
         }
@@ -699,6 +702,8 @@ impl State {
             panel.minimum_frame_rows(self.width)
         } else if self.conversation_picker.is_some() {
             4
+        } else if self.sandbox_surface.is_some() {
+            5
         } else if let Some(surface) = &self.permissions_surface {
             surface.minimum_frame_rows(self.width)
         } else {
@@ -717,6 +722,8 @@ impl State {
                     panel.title()
                 } else if let Some(picker) = &self.conversation_picker {
                     picker.title()
+                } else if self.sandbox_surface.is_some() {
+                    "Sandbox"
                 } else if self.permissions_surface.is_some() {
                     "Permissions"
                 } else if self.help_open {
@@ -767,6 +774,8 @@ impl State {
             panel.content_rows(self.width)
         } else if let Some(picker) = &self.conversation_picker {
             picker.content_rows()
+        } else if let Some(surface) = &self.sandbox_surface {
+            surface.content_rows(self.width)
         } else if let Some(surface) = &self.permissions_surface {
             surface.content_rows(self.width, maximum)
         } else if self.help_open {
@@ -780,6 +789,7 @@ impl State {
     pub(super) fn input_dialog_visible(&self) -> bool {
         self.menu.is_some()
             || self.workspace_trust.is_some()
+            || self.sandbox_surface.is_some()
             || self.permissions_surface.is_some()
             || self.artifacts_picker.is_some()
             || self.user_panel.is_some()
@@ -849,6 +859,14 @@ impl State {
                 row.min(capacity - 1),
                 column.min(self.width.saturating_sub(1)),
             );
+        }
+        if let Some(surface) = &mut self.sandbox_surface {
+            let mut lines = surface.styled_lines(self.width, capacity);
+            pad_dialog(&mut lines, capacity);
+            for line in &mut lines {
+                line.truncate(self.width);
+            }
+            return (lines, 0, 0);
         }
         let mut surface_lines = self
             .permissions_surface

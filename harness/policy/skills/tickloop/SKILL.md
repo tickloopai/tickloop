@@ -37,6 +37,8 @@ Every Tick appears in this Chat's Monitor, where the user opens a view of it fro
 
 ## Shell permissions
 
+The user can configure the sandbox with `/sandbox` (Mode, Overrides, Config) or add a command pattern with `/sandbox exclude "<pattern>"`. These user-only Console actions save to the user's settings for the current Folder and apply on the next command; repository content and Skills cannot change them.
+
 Bash background tasks use the same permissions and optional macOS sandbox as foreground Bash and `!` Shells. With the user's sandbox enabled, sufficiently isolated Bash calls can run without review in Ask and Auto; explicit Ask and Deny rules still win. A permitted `dangerouslyDisableSandbox` request or excluded command uses ordinary approval outside the sandbox. Programs opened as `hosted:` Ticks do not enter that Shell sandbox; opening a Tick is not a way to bypass a blocked Shell command.
 
 ## Keep this Chat informed
