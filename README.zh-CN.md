@@ -41,7 +41,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 > 以 `protocol: true` 打开 `python3 tick/examples/counter.py`，并订阅它。
 
-然后在 Monitor 中对 Counter 按 Enter，输入 `+` 再按 Enter：Agent 会收到新的计数并作出回应。
+然后在 Monitor 中选中 Counter，按 Enter 进入它的卡片，输入 `+` 再按 Enter：Agent 会收到新的计数并作出回应。按 `esc` 离开卡片。
 
 ## 日常使用
 
@@ -68,12 +68,11 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - `shift+tab` 在 Auto 与 Plan 模式之间切换。
 - `ctrl+j` 换行；`ctrl+g` 用外部编辑器编辑消息。
 - 列表和菜单中用 `j`／`k` 或方向键移动，`enter` 选择，`esc` 返回。
-- 在 Monitor 中 `enter` 打开 Tick，`esc` 再隐藏；程序会继续运行。
+- Tick 以卡片显示在 Monitor 列中，在 Herdr 内外都一样。在 Monitor 列表中按 `space`（或点击该行）显示或隐藏 Tick 的卡片；按 `enter`（或点击已打开的卡片）进入 Tick，之后按键都交给它，`ctrl+c` 也一样。可以同时打开多张卡片。
+- 在卡片中按 `esc` 离开，卡片保持打开；连按 `esc esc` 把一个 `esc` 发给 Tick。点击卡片以外的地方也会离开。Shell 卡片只读。隐藏卡片或离开都不会结束程序。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
 
 对话接近模型的上下文窗口上限时，Agent 会在下一次请求前先把对话压缩成摘要。触发点是窗口减去摘要所需的输出空间（模型的输出上限，最多 20,000 tokens）再减去 13,000 tokens 的缓冲，但不低于窗口的一半；触发点之后的空间就是 `/context` 中显示的 Autocompact buffer。距触发点不到 20,000 tokens 时，状态行的 `Context N% used` 改为警示色，对话中也会提示一次；随时可以用 `/compact` 手动压缩。想更早压缩，可在 `settings.json` 中把 `autoCompactWindow` 设为 token 数，例如 `"autoCompactWindow": 400000`；它小于模型窗口时，触发点改按它计算。此后新建或重新打开的对话生效。
-
-Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop` 继续使用 `tickloop.monitor` 和 `~/.tickloop/herdr-popup-plugin`；其他根（包括 `make dev` 的 `~/.tickloop-dev`）使用 `tickloop.monitor.<root-key>`，目录仍为 `<配置根>/herdr-popup-plugin`，显示名包含根路径。稳定的 root key 与 daemon、Tickhost 共用，两套插件可在同一 Herdr 会话共存。每个根首次使用时接受 Monitor 的注册提示，或执行 `tickloop monitor popup install --herdr-socket SOCKET`；`remove` 只移除当前根的插件。默认根已有注册无需重做。
 
 ## 权限与沙箱
 
@@ -184,7 +183,7 @@ tickloop tick install --path ./my-tick    # 本地 Tick 目录或 .tar.gz 压缩
 
 装好 Tick（需要登录的先登录）后，让 Agent 按名字打开它，例如"打开 NAME 这个 Tick 并盯着它"。安装不运行任何程序：Tick 程序只在按你的权限设置打开时以你的身份运行。禁用的 Tick 不能按名字打开。安装、更新、卸载和登录由你发起，Agent 只会请你去做。
 
-程序实现 [Tick 协议](tick/protocol/SPECIFICATION.md) 就能成为扩展 Tick；可从 [Counter 示例](tick/examples/counter.py) 开始。
+程序实现 [Tick 协议](tick/protocol/SPECIFICATION.md) 就能成为扩展 Tick；可从 [Counter 示例](tick/examples/counter.py) 开始。Tick 显示在至少 30 列宽的 Monitor 卡片中：要在这个宽度下可用，尺寸变化后重画整个屏幕，并可在描述中用 `screen.min_rows` 要求 6 到 14 行（默认 6）。返回上一层用 Backspace；单按的 `esc` 不会送到 Tick。
 
 ## 插件
 

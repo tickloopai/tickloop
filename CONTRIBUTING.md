@@ -84,7 +84,7 @@ Hosts migrate `tickloop-agent-{runtime,protocol,transcript,model,tools,cron,arti
 
 - Domain terms follow [CONTEXT.md](CONTEXT.md). Read it before designing a change, and use its terms in code and discussion. If your change conflicts with documented behavior, say so in the pull request.
 - [`AGENTS.md`](AGENTS.md) holds the working rules for coding agents and doubles as a compact summary of the core behavior contracts. Design records and ADRs are kept by the maintainers outside the repository; ask in an issue when you need the background of a decision.
-- Interaction conventions for input, lists, menus and Tick views are in [AGENTS.md](AGENTS.md) under "Interaction rules".
+- Interaction conventions for input, lists, menus and Tick cards are in [AGENTS.md](AGENTS.md) under "Interaction rules".
 - Keep comments for non-obvious logic; prefer clear names and small, focused functions.
 - `.scratch/` is ignored by Git. It is a local workspace for maintainers' specs, tickets and evidence and is not part of the project. Public discussion happens in GitHub issues and pull requests.
 
