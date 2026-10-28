@@ -401,6 +401,7 @@ pub async fn prepare_shell(
         .map_err(|error| ToolError::Rejected(error.to_string()))?;
     let isolation = prepared.isolation();
     let requires_approval = prepared.requires_approval();
+    let skips_approval_when_isolated = prepared.skips_approval_when_isolated();
     Ok(ShellPreparation::new(
         request.operation,
         delivery == ShellOutputDelivery::CallerFile,
@@ -412,7 +413,8 @@ pub async fn prepare_shell(
         }),
     )
     .with_isolation(isolation)
-    .with_required_approval(requires_approval))
+    .with_required_approval(requires_approval)
+    .with_approval_skipped_when_isolated(skips_approval_when_isolated))
 }
 
 struct PreparedEnvironmentShell {

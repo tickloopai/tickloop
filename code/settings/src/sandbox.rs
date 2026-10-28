@@ -13,6 +13,7 @@ pub struct SandboxSettings {
     pub fail_if_unavailable: bool,
     #[serde(default)]
     pub filesystem: SandboxFilesystem,
+    pub auto_allow_bash_if_sandboxed: bool,
     pub allow_unsandboxed_commands: bool,
     pub excluded_commands: Vec<String>,
 }
@@ -23,6 +24,7 @@ impl Default for SandboxSettings {
             enabled: false,
             fail_if_unavailable: false,
             filesystem: SandboxFilesystem::default(),
+            auto_allow_bash_if_sandboxed: true,
             allow_unsandboxed_commands: true,
             excluded_commands: Vec::new(),
         }
@@ -51,6 +53,7 @@ impl LoadedSettings {
                     "enabled",
                     "failIfUnavailable",
                     "filesystem",
+                    "autoAllowBashIfSandboxed",
                     "allowUnsandboxedCommands",
                     "excludedCommands",
                 ],

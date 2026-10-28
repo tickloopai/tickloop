@@ -168,6 +168,15 @@ impl SandboxFixture {
             call("tested", "Bash", input),
             text("done"),
         ]));
+        self.agent_with_model(model, config(), mode).await
+    }
+
+    async fn agent_with_model(
+        &self,
+        model: Arc<dyn tickloop_harness::model::ModelClient>,
+        model_config: tickloop_harness::protocol::ModelConfig,
+        mode: ExecutionMode,
+    ) -> (Agent, ChatId) {
         let agent = Agent::with_seams(
             HarnessSeams {
                 search: None,
@@ -177,7 +186,7 @@ impl SandboxFixture {
             },
             HarnessOptions {
                 settings: Some(Arc::new(self.settings.clone())),
-                ..HarnessOptions::local(config())
+                ..HarnessOptions::local(model_config)
             },
         )
         .unwrap();
@@ -344,7 +353,8 @@ async fn unsandboxed_settings_control_explicit_and_excluded_commands() {
             )
             .await;
         let (asked, result) = fixture.run_with_human_approval(&agent, chat, true).await;
-        assert!(asked, "{result:?}");
+        // Calls kept in the sandbox run without approval; only unsandboxed ones ask.
+        assert_eq!(asked, outside, "settings={settings}, result={result:?}");
         assert_eq!(
             fixture.root.path().join("outside").exists(),
             outside,
@@ -1089,4 +1099,288 @@ async fn unsandboxed_exclusions_recognize_assignments_and_safe_wrappers() {
             "{command}"
         );
     }
+}
+
+const BUILD_MAKEFILE: &str = "build/out.txt:\n\tmkdir -p build\n\tprintf built > build/out.txt\n";
+
+fn blocking_reviewer() -> Arc<ScriptedModel> {
+    let block = tickloop_harness::test_support::auto_classification(true).to_string();
+    Arc::new(ScriptedModel::new(vec![text(&block), text(&block)]))
+}
+
+struct AutoApprovalRun {
+    reviewed: bool,
+    asked: bool,
+    result: ToolResult,
+    direct_reason: Option<tickloop_harness::protocol::DirectApprovalReason>,
+}
+
+impl SandboxFixture {
+    async fn run_without_approval_answers(
+        &self,
+        command: &str,
+        mode: ExecutionMode,
+    ) -> AutoApprovalRun {
+        let (agent, chat) = self
+            .agent(serde_json::json!({"command":command}), mode)
+            .await;
+        let blocking_reviewer = blocking_reviewer();
+        agent.set_auto_reviewer(blocking_reviewer.clone()).await;
+        let mut events = agent.subscribe();
+        let receipt = agent
+            .submit(chat, "Build the project.".into())
+            .await
+            .unwrap();
+        let mut asked = false;
+        let mut result = None;
+        let mut direct_reason = None;
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, false)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ApprovalRecorded { record } => direct_reason = record.direct_reason,
+                EventKind::ToolCompleted { result: value, .. } => result = Some(value),
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        agent.shutdown().await;
+        let reviewed = !blocking_reviewer.requests.lock().unwrap().is_empty();
+        AutoApprovalRun {
+            reviewed,
+            asked,
+            result: result.expect("Bash returns a result"),
+            direct_reason,
+        }
+    }
+}
+
+#[tokio::test]
+async fn sandboxed_build_runs_without_review_unless_auto_allow_is_turned_off() {
+    use tickloop_harness::protocol::DirectApprovalReason;
+    for auto_allow in [None, Some(true), Some(false)] {
+        for mode in [ExecutionMode::Auto, ExecutionMode::AcceptEdits] {
+            let mut sandbox = serde_json::json!({"enabled":true, "failIfUnavailable":true});
+            if let Some(auto_allow) = auto_allow {
+                sandbox["autoAllowBashIfSandboxed"] = auto_allow.into();
+            }
+            let fixture = SandboxFixture::new(sandbox);
+            let folder = fixture.workspace.folder.clone().unwrap();
+            std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
+            let run = fixture.run_without_approval_answers("make", mode).await;
+            let case = format!("autoAllowBashIfSandboxed={auto_allow:?} mode={mode:?}");
+            let skips_approval = auto_allow != Some(false);
+            assert_eq!(
+                run.reviewed,
+                !skips_approval && mode == ExecutionMode::Auto,
+                "{case}"
+            );
+            assert_eq!(
+                run.asked,
+                !skips_approval && mode == ExecutionMode::AcceptEdits,
+                "{case}"
+            );
+            assert_eq!(
+                run.result.is_error, !skips_approval,
+                "{case}: {:?}",
+                run.result
+            );
+            assert_eq!(
+                folder.join("build/out.txt").exists(),
+                skips_approval,
+                "{case}"
+            );
+            assert_eq!(
+                run.direct_reason,
+                skips_approval.then_some(DirectApprovalReason::Sandbox),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sandboxed_commands_without_review_still_cannot_write_sensitive_or_outside_paths() {
+    let fixture =
+        SandboxFixture::new(serde_json::json!({"enabled":true, "failIfUnavailable":true}));
+    let folder = fixture.workspace.folder.clone().unwrap();
+    std::fs::create_dir_all(folder.join(".git/hooks")).unwrap();
+    for (command, target) in [
+        (
+            "printf hook > .git/hooks/pre-commit",
+            folder.join(".git/hooks/pre-commit"),
+        ),
+        (
+            "printf outside > ../outside",
+            fixture.root.path().join("outside"),
+        ),
+    ] {
+        let run = fixture
+            .run_without_approval_answers(command, ExecutionMode::Auto)
+            .await;
+        assert!(!run.reviewed && !run.asked, "{command}");
+        assert!(run.result.is_error, "{command}: {:?}", run.result);
+        assert!(
+            run.result.content.contains("被沙箱拦截"),
+            "{}",
+            run.result.content
+        );
+        assert!(!target.exists(), "{command}");
+    }
+}
+
+#[tokio::test]
+async fn unsandboxed_routes_keep_ordinary_approval_when_auto_allow_is_on() {
+    for (sandbox, input) in [
+        (
+            serde_json::json!({"enabled":true, "failIfUnavailable":true}),
+            serde_json::json!({"command":"make", "dangerouslyDisableSandbox":true}),
+        ),
+        (
+            serde_json::json!({"enabled":true, "failIfUnavailable":true, "excludedCommands":["make"]}),
+            serde_json::json!({"command":"make"}),
+        ),
+        (
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"command":"make"}),
+        ),
+    ] {
+        let fixture = SandboxFixture::new(sandbox.clone());
+        let folder = fixture.workspace.folder.clone().unwrap();
+        std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
+        let (agent, chat) = fixture.agent(input, ExecutionMode::Auto).await;
+        let blocking_reviewer = blocking_reviewer();
+        agent.set_auto_reviewer(blocking_reviewer.clone()).await;
+        let (asked, result) = fixture.run_with_human_approval(&agent, chat, false).await;
+        assert!(!asked, "{sandbox}");
+        assert!(
+            !blocking_reviewer.requests.lock().unwrap().is_empty(),
+            "{sandbox}"
+        );
+        assert!(result.is_error, "{sandbox}: {result:?}");
+        assert!(!folder.join("build/out.txt").exists(), "{sandbox}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DeepSeek credentials and runs a real model against the macOS sandbox"]
+async fn live_model_runs_an_ordinary_build_in_the_sandbox_without_review() {
+    use tickloop_harness::{
+        model::{LocalModelClients, ModelClients},
+        protocol::{
+            DirectApprovalReason, InputModality, ModelAuthSource, ModelConfig, ModelProvider,
+            Protocol,
+        },
+    };
+    let model_config = ModelConfig {
+        provider: ModelProvider::Api,
+        auth_source: ModelAuthSource::ApiKeyEnv,
+        name: "DeepSeek sandbox validation".into(),
+        protocol: Protocol::Messages,
+        base_url: "https://api.deepseek.com/anthropic".into(),
+        model: "deepseek-flash".into(),
+        api_key_env: "DEEPSEEK_API_KEY".into(),
+        max_output_tokens: 4096,
+        provider_id: String::new(),
+        provider_name: String::new(),
+        model_id: String::new(),
+        connection: None,
+        card: None,
+        input_modalities: vec![InputModality::Text],
+    };
+    let model = LocalModelClients::new(None)
+        .client(&model_config)
+        .expect("valid DeepSeek configuration and credentials");
+    let fixture =
+        SandboxFixture::new(serde_json::json!({"enabled":true, "failIfUnavailable":true}));
+    let folder = fixture.workspace.folder.clone().unwrap();
+    std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
+    let (agent, chat) = fixture
+        .agent_with_model(model, model_config, ExecutionMode::Auto)
+        .await;
+    let reviewer = Arc::new(ScriptedModel::new(vec![]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(
+            chat,
+            "Use the Bash tool to run exactly `make` in the current working directory to build \
+             this project, then reply with one short sentence. Use no other tool or command."
+                .into(),
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let mut bash_calls = Vec::new();
+        let mut direct_reasons = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::ToolStarted { name, input, .. } => {
+                    eprintln!("tool started: {name} {input}");
+                    bash_calls.push((name, input));
+                }
+                EventKind::ApprovalReviewStarted { .. } | EventKind::ApprovalAssessed { .. } => {
+                    panic!("the sandboxed build reached the Auto reviewer")
+                }
+                EventKind::PermissionRequested { .. } => {
+                    panic!("the sandboxed build asked a person")
+                }
+                EventKind::ApprovalRecorded { record } => {
+                    eprintln!(
+                        "approval: path={:?} direct_reason={:?} reason={}",
+                        record.path, record.direct_reason, record.reason
+                    );
+                    direct_reasons.push(record.direct_reason);
+                }
+                EventKind::ToolCompleted { result, .. } => {
+                    eprintln!(
+                        "tool result: is_error={} content={}",
+                        result.is_error, result.content
+                    );
+                }
+                EventKind::Completed { usage } => {
+                    eprintln!("completed: usage={usage:?}");
+                    break;
+                }
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        (bash_calls, direct_reasons)
+    })
+    .await
+    .expect("the live run finished in time");
+    agent.shutdown().await;
+    let (bash_calls, direct_reasons) = observed;
+    assert!(
+        bash_calls
+            .iter()
+            .all(|(name, input)| name == "Bash" && input["command"] == "make"),
+        "{bash_calls:?}"
+    );
+    assert!(!bash_calls.is_empty());
+    assert!(
+        direct_reasons
+            .iter()
+            .all(|reason| *reason == Some(DirectApprovalReason::Sandbox))
+    );
+    assert!(reviewer.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(folder.join("build/out.txt")).unwrap(),
+        "built"
+    );
 }
