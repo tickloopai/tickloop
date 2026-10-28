@@ -8859,6 +8859,7 @@ mod tests {
         let completion = tickloop_harness::protocol::FamilyCompletion {
             notification: tickloop_harness::protocol::SubagentNotificationDelivery::Pending,
             usage: Default::default(),
+            total_tokens: None,
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
@@ -8961,6 +8962,7 @@ mod tests {
         let completion = tickloop_harness::protocol::FamilyCompletion {
             notification: tickloop_harness::protocol::SubagentNotificationDelivery::Foreground,
             usage: Default::default(),
+            total_tokens: None,
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
@@ -9068,6 +9070,7 @@ mod tests {
                 },
             ),
             usage: Default::default(),
+            total_tokens: None,
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id.into(),
             child_run_id: run.into(),
@@ -9180,6 +9183,7 @@ mod tests {
             triggering_message_ids: Vec::new(),
             notification: tickloop_harness::protocol::SubagentNotificationDelivery::Queued,
             usage: Default::default(),
+            total_tokens: None,
             run_status: None,
         };
         for report_first in [true, false] {

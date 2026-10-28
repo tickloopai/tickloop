@@ -1384,9 +1384,21 @@ impl EmbeddedAgentAccess {
         command_id: Uuid,
     ) -> Result<CommandResult, AccessError> {
         let chat = self.chat(execution).await?;
+        self.history_action(execution, chat, action, command_id)
+            .await
+    }
+
+    /// Each history action is its own boxed future, as in `dispatch`.
+    fn history_action(
+        &self,
+        execution: ExecutionRef,
+        chat: Uuid,
+        action: HistoryAction,
+        command_id: Uuid,
+    ) -> CommandFuture<'_> {
         let agent = &self.inner.agent;
         match action {
-            HistoryAction::Branch { name } => {
+            HistoryAction::Branch { name } => Box::pin(async move {
                 let result = agent
                     .branch_chat(BranchRequest {
                         request_id: command_id,
@@ -1415,8 +1427,8 @@ impl EmbeddedAgentAccess {
                     snapshot: Box::new(self.snapshot(execution).await?),
                     session_permissions: result.session_permissions,
                 })
-            }
-            HistoryAction::Compact { instructions } => {
+            }),
+            HistoryAction::Compact { instructions } => Box::pin(async move {
                 let result = agent
                     .compact_with_instructions(chat.into(), instructions)
                     .await
@@ -1425,8 +1437,8 @@ impl EmbeddedAgentAccess {
                     summary: result.summary,
                     snapshot: Box::new(self.snapshot(execution).await?),
                 })
-            }
-            HistoryAction::DirectedSummary { request } => {
+            }),
+            HistoryAction::DirectedSummary { request } => Box::pin(async move {
                 let result = agent
                     .summarize_checkpoint(chat.into(), request)
                     .await
@@ -1440,8 +1452,8 @@ impl EmbeddedAgentAccess {
                     draft: result.draft,
                     continuation_error: result.continuation_error,
                 })
-            }
-            HistoryAction::Rewind { message_id, mode } => {
+            }),
+            HistoryAction::Rewind { message_id, mode } => Box::pin(async move {
                 let result = agent
                     .rewind(chat.into(), message_id, mode)
                     .await
@@ -1453,8 +1465,8 @@ impl EmbeddedAgentAccess {
                     conversation_restored: result.conversation_restored,
                     draft: result.draft,
                 })
-            }
-            HistoryAction::TakeBackInterruptedPrompt { run_id } => {
+            }),
+            HistoryAction::TakeBackInterruptedPrompt { run_id } => Box::pin(async move {
                 match agent
                     .take_back_interrupted_prompt(chat.into(), run_id.into())
                     .await
@@ -1466,7 +1478,7 @@ impl EmbeddedAgentAccess {
                     }),
                     None => Ok(CommandResult::Done),
                 }
-            }
+            }),
         }
     }
 

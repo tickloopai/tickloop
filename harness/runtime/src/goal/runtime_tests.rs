@@ -105,11 +105,11 @@ fn a_report_of_the_goal_adds_its_remaining_budget() {
     assert!(goal_report(&unbudgeted).get("tokens_remaining").is_none());
 }
 
-/// Messages reports cache writes apart from `input_tokens` and they are fresh input; the other
-/// protocols count cached input within `input_tokens`.
+/// Messages reports cache reads and writes apart from `input_tokens`, and the writes are fresh
+/// input; the other protocols count cached input within `input_tokens`, so it comes off.
 #[test]
 fn only_fresh_input_and_output_are_charged() {
-    let charged = |protocol| {
+    let charged = |protocol, input_tokens, cache_write_input_tokens| {
         charged_tokens(&tickloop_harness_protocol::RequestUsageRecord {
             sequence: tickloop_harness_protocol::RequestSequence(1),
             chat_id: tickloop_ids::generate().into(),
@@ -124,10 +124,10 @@ fn only_fresh_input_and_output_are_charged() {
             },
             outcome: tickloop_harness_protocol::RequestOutcome::Accepted,
             usage: tickloop_harness_protocol::Usage {
-                input_tokens: Some(100),
+                input_tokens: Some(input_tokens),
                 output_tokens: Some(20),
                 cache_read_input_tokens: Some(5_000),
-                cache_write_input_tokens: Some(300),
+                cache_write_input_tokens,
                 reasoning_output_tokens: None,
             },
             serialized_request_bytes: None,
@@ -135,8 +135,27 @@ fn only_fresh_input_and_output_are_charged() {
             cache_break: None,
         })
     };
-    assert_eq!(charged(tickloop_harness_protocol::Protocol::Messages), 420);
-    assert_eq!(charged(tickloop_harness_protocol::Protocol::Responses), 120);
+    assert_eq!(
+        charged(
+            tickloop_harness_protocol::Protocol::Messages,
+            100,
+            Some(300)
+        ),
+        420
+    );
+    assert_eq!(
+        charged(tickloop_harness_protocol::Protocol::Responses, 5_100, None),
+        120
+    );
+    assert_eq!(
+        charged(
+            tickloop_harness_protocol::Protocol::ChatCompletions,
+            5_100,
+            Some(300)
+        ),
+        120,
+        "a cache write reported in the details is already within the prompt tokens"
+    );
 }
 
 /// A planned upgrade can take its checkpoint between a turn's end and the goal's continuation,

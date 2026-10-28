@@ -1,4 +1,4 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -12,6 +12,8 @@ use super::path::TRANSCRIPT_FILE_SUFFIX;
 /// each file.
 pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
+/// A Subagent's Transcript opens with its delegation; the line can outgrow the listing's head read.
+const DELEGATION_LINE_PREFIX: &str = "{\"type\":\"delegation\"";
 
 #[derive(Clone, Debug)]
 pub struct TranscriptSummary {
@@ -25,8 +27,9 @@ pub struct TranscriptSummary {
     pub forked_from: Option<ForkedFrom>,
 }
 
-/// Lists Transcripts in the project directory, newest modification time first; empty when the
-/// directory does not exist.
+/// Lists the Transcripts of Chats of their own in the project directory, newest modification time
+/// first; empty when the directory does not exist. A Subagent's Transcript belongs to its family,
+/// which opens with the root, so it is not listed.
 pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<TranscriptSummary>> {
     let entries = match std::fs::read_dir(project_directory) {
         Ok(entries) => entries,
@@ -54,6 +57,9 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
         let Ok((head, tail)) = read_head_and_tail(&path, metadata.len()) else {
             continue;
         };
+        if head.starts_with(DELEGATION_LINE_PREFIX) {
+            continue;
+        }
         summaries.push(TranscriptSummary {
             chat_id,
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -62,13 +68,7 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
                 .or_else(|| last_json_string_field(&head, "customTitle"))
                 .or_else(|| last_json_string_field(&tail, "aiTitle"))
                 .or_else(|| last_json_string_field(&head, "aiTitle")),
-            first_prompt: first_prompt(&head).or_else(|| {
-                head.lines()
-                    .find_map(|line| match serde_json::from_str::<Line>(line).ok()? {
-                        Line::Delegation(entry) => Some(entry.delegation.task),
-                        _ => None,
-                    })
-            }),
+            first_prompt: first_prompt(&head),
             last_prompt: last_json_string_field(&tail, "lastPrompt"),
             git_branch: last_json_string_field(&tail, "gitBranch")
                 .or_else(|| first_json_string_field(&head, "gitBranch")),
@@ -77,6 +77,20 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
     }
     summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
     Ok(summaries)
+}
+
+/// The root Chat of the family whose Subagent wrote the Transcript at `path`; `None` for a Chat of
+/// its own.
+pub(super) fn family_root(path: &Path) -> io::Result<Option<Uuid>> {
+    let mut first_line = String::new();
+    BufReader::new(std::fs::File::open(path)?).read_line(&mut first_line)?;
+    if !first_line.starts_with(DELEGATION_LINE_PREFIX) {
+        return Ok(None);
+    }
+    match serde_json::from_str::<Line>(&first_line)? {
+        Line::Delegation(entry) => Ok(Some(entry.delegation.root_chat_id().uuid())),
+        _ => Ok(None),
+    }
 }
 
 fn read_head_and_tail(path: &Path, length: u64) -> io::Result<(String, String)> {

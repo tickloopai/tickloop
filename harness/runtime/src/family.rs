@@ -372,6 +372,7 @@ impl Agent {
                 .request_usage
                 .run_conversation_usage(child.run_id)
                 .unwrap_or_default(),
+            total_tokens: snapshot.request_usage.run_final_total_tokens(child.run_id),
             child_chat_id: child.chat_id,
             child_loop_id: child.loop_id,
             child_run_id: child.run_id,
