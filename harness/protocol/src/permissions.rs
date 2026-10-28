@@ -53,12 +53,21 @@ impl ExecutionMode {
     }
 
     /// Whether Auto's admission and review decide what this mode would otherwise ask about: in
-    /// Auto, and in Plan with Claude Code's `useAutoModeDuringPlan`, which is on by default.
-    pub const fn uses_auto_admission(self, use_auto_mode_during_plan: bool) -> bool {
+    /// Auto, and in Plan that continues in Auto when left ([`Self::leaving_plan`]) with Claude
+    /// Code's `useAutoModeDuringPlan`, which is on by default. Unlike Claude Code, Plan entered
+    /// from another mode, or from one no longer known, never uses Auto's review, so entering Plan
+    /// never hands a person's approval to the reviewer.
+    pub const fn uses_auto_admission(
+        self,
+        mode_before_plan: Option<Self>,
+        use_auto_mode_during_plan: bool,
+    ) -> bool {
         match self {
-            Self::Auto => true,
-            Self::Plan => use_auto_mode_during_plan,
-            Self::AcceptEdits | Self::FullAccess => false,
+            Self::Plan => {
+                use_auto_mode_during_plan
+                    && matches!(self.leaving_plan(mode_before_plan), Self::Auto)
+            }
+            mode => matches!(mode, Self::Auto),
         }
     }
 }
@@ -133,12 +142,29 @@ pub struct PermissionPolicy {
     /// review. Filled in from settings like [`Self::host_rules`] and never recorded.
     #[serde(skip)]
     pub plan_without_auto: bool,
+    /// Claude Code's `prePlanMode`: the mode Plan was entered from, known only in Plan. It is kept
+    /// in this process, by the policies cloned from it and across a planned upgrade, and never
+    /// recorded, so a load leaves it unknown.
+    #[serde(skip)]
+    pub mode_before_plan: Option<ExecutionMode>,
     pub revision: u64,
 }
 
 impl PermissionPolicy {
-    /// [`ExecutionMode::uses_auto_admission`] with the user's `useAutoModeDuringPlan`.
+    /// [`ExecutionMode::uses_auto_admission`] with the mode Plan was entered from and the user's
+    /// `useAutoModeDuringPlan`.
     pub fn uses_auto_admission(&self) -> bool {
-        self.mode.uses_auto_admission(!self.plan_without_auto)
+        self.mode
+            .uses_auto_admission(self.mode_before_plan, !self.plan_without_auto)
+    }
+
+    /// The mode whose admission decides what is not refused outright: the mode leaving Plan
+    /// continues in ([`ExecutionMode::leaving_plan`]), so Ask when unknown, except that Plan after
+    /// Auto decides as Ask when the user turned Auto in Plan off. Outside Plan, the mode itself.
+    pub fn admission_mode(&self) -> ExecutionMode {
+        match self.mode.leaving_plan(self.mode_before_plan) {
+            ExecutionMode::Auto if !self.uses_auto_admission() => ExecutionMode::AcceptEdits,
+            mode => mode,
+        }
     }
 }

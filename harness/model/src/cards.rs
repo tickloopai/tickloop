@@ -30,6 +30,10 @@ pub struct ProviderDefinition {
     #[serde(default)]
     pub api_key_env: String,
     pub endpoints: BTreeMap<Adapter, String>,
+    /// The prompt caching the Provider's Messages endpoint accepts; unset sends no cache markers.
+    /// Only the bundled catalog sets it, so a Provider added in settings never receives them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<crate::prompt_cache::PromptCache>,
     pub models: Vec<ModelCard>,
 }
 
@@ -171,6 +175,16 @@ impl ModelCatalog {
             }
             if provider.models.is_empty() {
                 return Err(format!("{location}.models: at least one model is required"));
+            }
+            if provider.prompt_cache.is_some()
+                && !provider
+                    .models
+                    .iter()
+                    .any(|model| model.adapter == Adapter::Messages)
+            {
+                return Err(format!(
+                    "{location}.prompt_cache: requires a model on the Messages adapter"
+                ));
             }
             let mut env_chars = provider.api_key_env.chars();
             let credentialless_loopback = provider.api_key_env.is_empty()
@@ -425,6 +439,7 @@ impl ModelCatalog {
                     endpoints: patch.endpoints.ok_or_else(|| {
                         format!("{location}.endpoints: required for new provider")
                     })?,
+                    prompt_cache: None,
                     models,
                 });
             }
@@ -478,16 +493,27 @@ pub fn built_in_model_profiles() -> Vec<ModelConfig> {
         .clone()
 }
 
-/// The connection is the sole authority for vendor/product organization.
-pub fn provider_connection(provider_id: &str) -> Option<&'static ProviderConnection> {
+fn bundled_provider(provider_id: &str) -> Option<&'static ProviderDefinition> {
     static DEFAULTS: OnceLock<ModelCatalog> = OnceLock::new();
     DEFAULTS
         .get_or_init(ModelCatalog::defaults)
         .providers
         .iter()
-        .find(|provider| provider.id == provider_id)?
-        .connection
-        .as_ref()
+        .find(|provider| provider.id == provider_id)
+}
+
+/// The connection is the sole authority for vendor/product organization.
+pub fn provider_connection(provider_id: &str) -> Option<&'static ProviderConnection> {
+    bundled_provider(provider_id)?.connection.as_ref()
+}
+
+/// The prompt caching a request to `config` carries: its bundled Provider's, and only on the
+/// Messages adapter that Provider declared it for.
+pub fn prompt_cache(config: &ModelConfig) -> Option<crate::prompt_cache::PromptCache> {
+    if config.adapter() != Adapter::Messages {
+        return None;
+    }
+    bundled_provider(&config.provider_id)?.prompt_cache
 }
 
 pub fn provider_group(provider_id: &str) -> Option<&'static str> {

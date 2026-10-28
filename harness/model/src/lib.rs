@@ -52,6 +52,7 @@ mod image_limits;
 mod kimi;
 mod model_clients;
 pub mod native_tool_search;
+pub mod prompt_cache;
 use model_clients::PrivateProvenance;
 pub use model_clients::{HttpModelClients, LocalModelClients, ModelClients};
 mod provider_directory;
@@ -1803,8 +1804,12 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
             });
         }
     }
-    if !request.tools.is_empty() || !request.deferred_tools.is_empty() {
+    let offers_tools = !request.tools.is_empty() || !request.deferred_tools.is_empty();
+    if offers_tools {
         body["tools"] = native_tool_search::messages_tools(&request.tools, &request.deferred_tools);
+    }
+    if cards::prompt_cache(config) == Some(prompt_cache::PromptCache::Anthropic) {
+        prompt_cache::place_breakpoints(&mut body, offers_tools);
     }
     Ok(body)
 }

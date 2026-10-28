@@ -233,11 +233,11 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                         .await
                         .unwrap();
                 }
-                // Plan uses Auto's review by default, whichever mode it was entered from.
-                let should_review =
-                    matches!(mode, ExecutionMode::Auto | ExecutionMode::Plan) && decision.is_none();
+                // Plan entered from Ask, the embedded default, decides as Ask and never reviews.
+                let should_review = mode == ExecutionMode::Auto && decision.is_none();
                 let should_ask = decision == Some(Decision::Ask)
-                    || (decision.is_none() && mode == ExecutionMode::AcceptEdits);
+                    || (decision.is_none()
+                        && matches!(mode, ExecutionMode::AcceptEdits | ExecutionMode::Plan));
                 let mut events = agent.subscribe();
                 agent.submit(chat, "Read the service".into()).await.unwrap();
                 let mut asked = false;
@@ -1078,7 +1078,7 @@ async fn auto_reviews_each_batched_mcp_call_against_the_whole_model_authored_bat
 async fn plan_decides_mcp_calls_as_auto_or_as_the_mode_it_was_entered_from() {
     for (use_auto, before_plan, rule_decision, expect_review, expect_ask, expect_call) in [
         (true, ExecutionMode::Auto, None, true, false, true),
-        (true, ExecutionMode::AcceptEdits, None, true, false, true),
+        (true, ExecutionMode::AcceptEdits, None, false, true, true),
         (true, ExecutionMode::FullAccess, None, false, false, true),
         (
             true,
@@ -1096,7 +1096,7 @@ async fn plan_decides_mcp_calls_as_auto_or_as_the_mode_it_was_entered_from() {
             false,
             false,
         ),
-        (false, ExecutionMode::Auto, None, true, false, true),
+        (false, ExecutionMode::Auto, None, false, true, true),
         (false, ExecutionMode::FullAccess, None, false, false, true),
         (false, ExecutionMode::AcceptEdits, None, false, true, true),
         (
@@ -1186,17 +1186,72 @@ async fn plan_decides_mcp_calls_as_auto_or_as_the_mode_it_was_entered_from() {
     }
 }
 
+/// The model's EnterPlanMode asks nothing, and Plan then decides MCP calls as the mode it was
+/// entered from: Auto's review only after Auto, a person after Ask, no one after Full Access.
 #[tokio::test]
-async fn entering_plan_through_the_tool_asks_nothing_and_keeps_the_auto_review_for_mcp_calls() {
+async fn entering_plan_through_the_tool_asks_nothing_and_reviews_mcp_calls_only_after_auto() {
+    for (before_plan, expect_review, expect_ask) in [
+        (ExecutionMode::Auto, true, false),
+        (ExecutionMode::AcceptEdits, false, true),
+        (ExecutionMode::FullAccess, false, false),
+    ] {
+        let server = McpService::start().await;
+        let (provider, tool) = provider(&server, "review").await;
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("plan", "EnterPlanMode", json!({})),
+                call("read", &tool, json!({})),
+                text("done"),
+            ])),
+        );
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(
+            &auto_classification(false).to_string(),
+        )]));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        agent.install_host_tools(provider).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent.set_execution_mode(chat, before_plan).await.unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Plan the lookup".into()).await.unwrap();
+        let prompts = run_until_idle(&agent, &mut events, chat).await;
+        let expected_prompts = if expect_ask {
+            vec![tool.clone()]
+        } else {
+            vec![]
+        };
+        assert_eq!(prompts, expected_prompts, "{before_plan:?}");
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            usize::from(expect_review),
+            "{before_plan:?}"
+        );
+        assert_eq!(server.calls().len(), 1, "{before_plan:?}");
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Plan
+        );
+        agent.shutdown().await;
+    }
+}
+
+/// A Chat that starts in Plan entered it from no known mode, so its MCP calls ask as in Ask and
+/// the reviewer never runs, although the user left Auto in Plan on.
+#[tokio::test]
+async fn a_chat_that_starts_in_plan_asks_for_mcp_calls_without_review() {
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
-    let agent = Agent::new_embedded(
+    let agent = Agent::new_with_options(
         config(),
         Arc::new(ScriptedModel::new(vec![
-            call("plan", "EnterPlanMode", json!({})),
             call("read", &tool, json!({})),
             text("done"),
         ])),
+        tickloop_harness_protocol::AgentHostOptions {
+            execution_mode_override: Some(ExecutionMode::Plan),
+            ..tickloop_harness_protocol::AgentHostOptions::embedded_defaults()
+        },
     );
     let reviewer = Arc::new(ScriptedModel::new(vec![text(
         &auto_classification(false).to_string(),
@@ -1205,34 +1260,14 @@ async fn entering_plan_through_the_tool_asks_nothing_and_keeps_the_auto_review_f
     agent.install_host_tools(provider).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(dir.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::Auto)
-        .await
-        .unwrap();
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.policy.mode, ExecutionMode::Plan);
+    assert!(!snapshot.policy.plan_without_auto);
     let mut events = agent.subscribe();
-    agent.submit(chat, "Plan the lookup".into()).await.unwrap();
-    let mut prompts = Vec::new();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::PermissionRequested { request } => {
-                prompts.push(request.name.clone());
-                agent
-                    .answer_permission(chat, request.id, true)
-                    .await
-                    .unwrap();
-            }
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert!(prompts.is_empty(), "{prompts:?}");
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    agent.submit(chat, "Look it up".into()).await.unwrap();
+    assert_eq!(run_until_idle(&agent, &mut events, chat).await, [tool]);
+    assert!(reviewer.requests.lock().unwrap().is_empty());
     assert_eq!(server.calls().len(), 1);
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().policy.mode,
-        ExecutionMode::Plan
-    );
     agent.shutdown().await;
 }
 
@@ -1339,7 +1374,7 @@ async fn a_plan_entered_from_auto_returns_review_rejections_to_the_model() {
 }
 
 #[tokio::test]
-async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
+async fn children_of_a_plan_entered_from_full_access_decide_mcp_calls_as_full_access() {
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1349,10 +1384,7 @@ async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
         text("parent done"),
     ]));
     let agent = agent_with_plan_setting(model, false);
-    // Creating the child in Plan is itself reviewed.
-    let reviewer = Arc::new(ScriptedModel::new(vec![text(
-        &auto_classification(false).to_string(),
-    )]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![]));
     agent.set_auto_reviewer(reviewer.clone()).await;
     agent.install_host_tools(provider).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1366,12 +1398,11 @@ async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
         .await
         .unwrap();
     let prompts = run_until_idle(&agent, &mut events, parent).await;
-    assert_eq!(
-        prompts,
-        [tool.as_str()],
-        "the frozen ceiling does not record the earlier mode"
+    assert!(
+        prompts.is_empty(),
+        "the child and its frozen ceiling keep the mode the parent's Plan was entered from: {prompts:?}"
     );
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert!(reviewer.requests.lock().unwrap().is_empty());
     assert_eq!(server.calls().len(), 1);
     agent.shutdown().await;
 }

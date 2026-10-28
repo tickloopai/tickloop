@@ -8,6 +8,8 @@ mod chat_status;
 mod goal;
 #[path = "all/local_messages.rs"]
 mod local_messages;
+#[path = "all/plan_admission.rs"]
+mod plan_admission;
 #[path = "all/scheduled_tasks.rs"]
 mod scheduled_tasks;
 #[path = "all/trigger_sources.rs"]
