@@ -56,6 +56,12 @@ struct ChatCheckpoint {
     mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
     #[serde(default)]
     ceiling_mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
+    /// The launch rules of the Chat and of its frozen ceiling. No record carries them and the
+    /// successor never sees the launch, so the checkpoint is their only way across.
+    #[serde(default)]
+    launch_rules: Vec<PermissionRule>,
+    #[serde(default)]
+    ceiling_launch_rules: Vec<PermissionRule>,
     deferred_messages: Vec<Message>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     output_style: OutputStyle,
@@ -153,6 +159,13 @@ impl Agent {
                     .delegation
                     .as_ref()
                     .and_then(|delegation| delegation.ceiling.policy.mode_before_plan),
+                launch_rules: chat.snapshot.policy.launch_rules.clone(),
+                ceiling_launch_rules: chat
+                    .snapshot
+                    .delegation
+                    .as_ref()
+                    .map(|delegation| delegation.ceiling.policy.launch_rules.clone())
+                    .unwrap_or_default(),
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
                 deferred_messages: chat.deferred_messages.clone(),
@@ -297,9 +310,18 @@ impl Agent {
             .store(checkpoint.task_tools_enabled, Ordering::SeqCst);
         for saved in &checkpoint.chats {
             let mut snapshot = saved.snapshot.clone();
+            // What a policy never records comes back from where a load fills it in, except what
+            // only the checkpoint carries.
+            self.apply_host_rules(&mut snapshot.policy);
+            snapshot.policy.plan_without_auto = self.plan_without_auto(snapshot.folder.as_deref());
+            snapshot.policy.launch_rules = saved.launch_rules.clone();
             snapshot.policy.mode_before_plan = saved.mode_before_plan;
             if let Some(delegation) = &mut snapshot.delegation {
-                delegation.ceiling.policy.mode_before_plan = saved.ceiling_mode_before_plan;
+                let ceiling = &mut delegation.ceiling.policy;
+                self.apply_host_rules(ceiling);
+                ceiling.plan_without_auto = snapshot.policy.plan_without_auto;
+                ceiling.launch_rules = saved.ceiling_launch_rules.clone();
+                ceiling.mode_before_plan = saved.ceiling_mode_before_plan;
             }
             if let Some(folder) = &snapshot.folder {
                 self.require_working_directory_trust(folder)?;
