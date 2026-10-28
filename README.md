@@ -109,7 +109,7 @@ These sources merge into the Chat's existing additional directories, with duplic
 
 ### Importing Auto rules from Claude Code
 
-In `/permissions` → Auto mode, choose **Import from Claude Code** to copy the `autoMode` rules from your Claude Code user settings (`~/.claude/settings.json`, or `settings.json` in `CLAUDE_CONFIG_DIR` when it is set) once. No project file is read and the Claude Code file is not changed. `allow` entries become Soft allow rules, `soft_deny` (or the older `deny`) entries Soft deny rules, and `environment` entries global Environment entries marked as imported. The preview lists what will be added and what will be skipped, and why: text already among your rules, rules named like a Tickloop built-in, and empty or oversized entries are skipped unless you select them. Soft allow entries are marked **Will relax review**. Use `j`/`k` to move, `space` to toggle entries, `enter` to save and `esc` to cancel without changes. Built-in rules stay in place; imported rules are ordinary custom rules afterwards and do not override explicit Ask or Deny. Only you can start an import; the agent has no tool for it.
+In `/permissions` → Auto mode, choose **Import from Claude Code** to copy the `autoMode` rules from your Claude Code user settings (`~/.claude/settings.json`, or `settings.json` in `CLAUDE_CONFIG_DIR` when it is set) once. No project file is read and the Claude Code file is not changed. `allow` entries become Soft allow rules, `soft_deny` (or the older `deny`) entries Soft deny rules, and `environment` entries global Environment entries marked as imported. The preview lists what will be added and what will be skipped, and why: text already among your custom rules and rules named like a Tickloop built-in are skipped unless you select them; empty entries, entries over 4096 bytes and additions that would take a group past 256 entries cannot be saved. Soft allow entries are marked **Will relax review**. Use `j`/`k` to move, `space` to toggle entries, `enter` to save and `esc` to cancel without changes. Built-in rules stay in place; imported rules are ordinary custom rules afterwards and do not override explicit Ask or Deny. Only you can start an import; the agent has no tool for it.
 
 ### Sandbox (macOS)
 
@@ -124,7 +124,7 @@ On macOS, Bash, background Shells and `!` Shells can run in an OS sandbox. It is
 }
 ```
 
-Sandboxed commands may write the Folder, additional directories, verified linked worktrees, the system temporary directory and the family's scratchpad. They cannot write your configuration directory, your settings file or sensitive paths such as Git hooks, and networking is blocked unless the allowlist names the destination. `/permissions` shows whether the sandbox is on. Ticks, MCP servers and the file tools (`Read`, `Write`, `Edit`) do not run in the sandbox; your permission rules govern them as before.
+Sandboxed commands may write the Folder, additional directories, verified linked worktrees, the system temporary directory and the family's temp space (shared by an Agent and its Subagents). They cannot write your configuration directory, your settings file or sensitive paths such as Git hooks, and networking is blocked unless the allowlist names the destination. `/permissions` shows whether the sandbox is on. Ticks, MCP servers and the file tools (such as `Read`, `Write` and `Edit`) do not run in the sandbox; your permission rules govern them as before.
 
 | Field | Default | Effect |
 | --- | --- | --- |

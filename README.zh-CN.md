@@ -109,7 +109,7 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 
 ### 从 Claude Code 导入 Auto 规则
 
-在 `/permissions` → Auto mode 中选择 **Import from Claude Code**，可把 Claude Code 用户设置（`~/.claude/settings.json`；设置了 `CLAUDE_CONFIG_DIR` 时为该目录中的 `settings.json`）里 `autoMode` 的规则一次性复制过来。不读取任何项目文件，也不修改 Claude Code 的文件。`allow` 条目成为 Soft allow 规则，`soft_deny`（或旧名 `deny`）成为 Soft deny 规则，`environment` 成为标明“导入”来源的全局 Environment 条目。预览按“将添加 / 将跳过”列出每条及原因：与已有规则文字相同的、与 Tickloop 内置规则同名的、空的或超出长度与数量上限的默认跳过，可以手动勾回。Soft allow 条目标有 **Will relax review**（会放宽审查）。`j`/`k` 移动，空格勾选，`enter` 保存，`esc` 取消且不改动。内置规则会保留；导入后的规则就是普通的自定义规则，不能覆盖显式 Ask 或 Deny。只有你能发起导入，Agent 没有对应的工具。
+在 `/permissions` → Auto mode 中选择 **Import from Claude Code**，可把 Claude Code 用户设置（`~/.claude/settings.json`；设置了 `CLAUDE_CONFIG_DIR` 时为该目录中的 `settings.json`）里 `autoMode` 的规则一次性复制过来。不读取任何项目文件，也不修改 Claude Code 的文件。`allow` 条目成为 Soft allow 规则，`soft_deny`（或旧名 `deny`）成为 Soft deny 规则，`environment` 成为标明“导入”来源的全局 Environment 条目。预览按“将添加 / 将跳过”列出每条及原因：与已有自定义规则文字相同的、与 Tickloop 内置规则同名的默认跳过，可以手动勾回；空的、超过 4096 字节的，或会让某组超过 256 条的条目不能保存。Soft allow 条目标有 **Will relax review**（会放宽审查）。`j`/`k` 移动，空格勾选，`enter` 保存，`esc` 取消且不改动。内置规则会保留；导入后的规则就是普通的自定义规则，不能覆盖显式 Ask 或 Deny。只有你能发起导入，Agent 没有对应的工具。
 
 ### 沙箱（macOS）
 
@@ -124,7 +124,7 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 }
 ```
 
-沙箱中的命令可以写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad；不能写配置目录、用户设置文件和 Git hooks 等敏感路径；网络默认断开，只能访问白名单中的目标。`/permissions` 显示沙箱是否开启。Tick、MCP 服务以及文件工具（`Read`、`Write`、`Edit`）不在沙箱中运行，仍由权限规则管理。
+沙箱中的命令可以写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族临时空间（Agent 与其 Subagent 共用）；不能写配置目录、用户设置文件和 Git hooks 等敏感路径；网络默认断开，只能访问白名单中的目标。`/permissions` 显示沙箱是否开启。Tick、MCP 服务以及文件工具（如 `Read`、`Write`、`Edit`）不在沙箱中运行，仍由权限规则管理。
 
 | 字段 | 默认 | 作用 |
 | --- | --- | --- |
