@@ -19,7 +19,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tick_protocol::{InstanceRef, KeySignal};
+use tick_protocol::{BubbledKey, InstanceRef};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
@@ -52,7 +52,7 @@ use crate::{
         CANCELLED_REASON, ShellIdentity, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants,
         SpawnRequest, environment_digest,
     },
-    views::{ViewGrants, Views},
+    views::{ViewGrants, ViewModes, Views},
 };
 
 /// A host that was never used exits after this grace.
@@ -88,8 +88,8 @@ const UNTITLED_TICK: &str = "an opening Tick";
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
-/// The key-bubbling signals a view may have waiting; a view that reads none of them misses the
-/// signals after them.
+/// The bubbled keys a view may have waiting; a view that reads none of them misses the keys after
+/// them, never a change of the Tick's modes.
 const VIEW_SIGNALS: usize = 16;
 /// How long a terminal Tick's program may hold off input written for it before the write is
 /// abandoned, well within the reader's control timeout.
@@ -3026,9 +3026,8 @@ impl Viewed {
 struct ViewLease {
     viewed: Viewed,
     view: u64,
-    /// A Tick's key-bubbling signals for this view, and whether it bubbled keys when the view
-    /// attached; a Shell's screen has none.
-    signals: Option<(mpsc::Receiver<KeySignal>, bool)>,
+    /// The keys a Tick bubbles to this view and the Tick's modes; a Shell's screen has none.
+    signals: Option<(mpsc::Receiver<BubbledKey>, watch::Receiver<ViewModes>)>,
 }
 
 impl ViewLease {
@@ -3047,8 +3046,8 @@ impl ViewLease {
                 let mut views = tick.views.lock().unwrap();
                 let view = views.attach(size);
                 let (sender, receiver) = mpsc::channel(VIEW_SIGNALS);
-                let bubbling = views.listen(view, sender);
-                (view, Some((receiver, bubbling)), tick.follow_views(&views))
+                let modes = views.listen(view, sender);
+                (view, Some((receiver, modes)), tick.follow_views(&views))
             }
             Viewed::Shell(task) => (task.change_views(|views| views.attach(size)), None, Ok(())),
         };
@@ -3133,22 +3132,25 @@ async fn attach_view(
         CONTROL_TIMEOUT,
     )
     .await?;
-    // A view takes a Tick to bubble no keys until it is told otherwise.
-    let mut signals = match lease.signals.take() {
-        Some((signals, bubbling)) => {
-            if bubbling {
-                write_within(
-                    &mut writer,
-                    &view_signal_event(KeySignal::Bubbling(true)),
-                    BUSINESS_FRAME_BYTES,
-                    STREAM_WRITE_TIMEOUT,
-                )
-                .await?;
-            }
-            Some(signals)
-        }
-        None => None,
+    // A view takes a Tick's modes to be off until it is told otherwise.
+    let (mut keys, mut modes) = match lease.signals.take() {
+        Some((keys, modes)) => (Some(keys), Some(modes)),
+        None => (None, None),
     };
+    let mut told = ViewModes::default();
+    if let Some(modes) = &mut modes {
+        let current = *modes.borrow_and_update();
+        for event in mode_events(told, current) {
+            write_within(
+                &mut writer,
+                &event,
+                BUSINESS_FRAME_BYTES,
+                STREAM_WRITE_TIMEOUT,
+            )
+            .await?;
+        }
+        told = current;
+    }
     let output = async {
         let mut shown = None;
         loop {
@@ -3169,24 +3171,40 @@ async fn attach_view(
                 )
                 .await?;
             }
-            let next_signal = async {
-                match &mut signals {
-                    Some(signals) => signals.recv().await,
+            let next_key = async {
+                match &mut keys {
+                    Some(keys) => keys.recv().await,
                     None => std::future::pending().await,
                 }
+            };
+            let next_modes = async {
+                let Some(modes) = &mut modes else {
+                    return std::future::pending().await;
+                };
+                if modes.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+                *modes.borrow_and_update()
             };
             tokio::select! {
                 changed = changes.changed() => if changed.is_err() {
                     return Ok(());
                 },
-                Some(signal) = next_signal => {
+                Some(key) = next_key => {
                     write_within(
                         &mut writer,
-                        &view_signal_event(signal),
+                        &json!({"event":"bubble","key":key.name()}),
                         BUSINESS_FRAME_BYTES,
                         STREAM_WRITE_TIMEOUT,
                     )
                     .await?;
+                }
+                current = next_modes => {
+                    for event in mode_events(told, current) {
+                        write_within(&mut writer, &event, BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT)
+                            .await?;
+                    }
+                    told = current;
                 }
             }
         }
@@ -3236,13 +3254,17 @@ async fn attach_view(
     outcome
 }
 
-/// The view event that tells a view a Tick's key-bubbling signal: `bubbling` whether it bubbles
-/// keys, `bubble` a key it bubbled.
-fn view_signal_event(signal: KeySignal) -> Value {
-    match signal {
-        KeySignal::Bubbling(enabled) => json!({"event":"bubbling","enabled":enabled}),
-        KeySignal::Key(key) => json!({"event":"bubble","key":key.name()}),
+/// The view events telling a view that the Tick's modes went from `told` to `current`:
+/// `bubbling` whether it bubbles keys, `focus_reports` whether it wants focus reports.
+fn mode_events(told: ViewModes, current: ViewModes) -> Vec<Value> {
+    let mut events = Vec::new();
+    if told.bubbling != current.bubbling {
+        events.push(json!({"event":"bubbling","enabled":current.bubbling}));
     }
+    if told.focus_reports != current.focus_reports {
+        events.push(json!({"event":"focus_reports","enabled":current.focus_reports}));
+    }
+    events
 }
 
 /// Writes one frame unless its reader leaves it unread for `limit`; a stalled reader then loses

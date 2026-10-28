@@ -6,9 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tick_protocol::KeySignal;
+use tick_protocol::{BubbledKey, KeySignal};
 use tickhost_connect::hosted::CONTROL_TIMEOUT;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::pty::TerminalSize;
@@ -38,25 +38,42 @@ impl ViewGrants {
     }
 }
 
+/// What a Tick asked of the terminal its views show that views act on: whether it bubbles the
+/// keys it does not use, and whether it wants focus reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewModes {
+    pub(crate) bubbling: bool,
+    pub(crate) focus_reports: bool,
+}
+
 /// The views attached to one screen. The screen takes the size of the view that typed last, or
 /// of the newest view while none of them typed; without views it keeps its size. The same view
-/// gets the keys a Tick bubbles; every listening view learns whether it bubbles keys.
-#[derive(Default)]
+/// gets the keys a Tick bubbles. Every listening view watches the Tick's [`ViewModes`]: a change
+/// is never lost, however many keys a view leaves unread.
 pub(crate) struct Views {
     /// Orders attaches and input; a view is named by the moment it attached.
     clock: u64,
     attached: HashMap<u64, AttachedView>,
-    /// Whether the Tick declared it bubbles the keys it does not use.
-    bubbling: bool,
+    modes: watch::Sender<ViewModes>,
+}
+
+impl Default for Views {
+    fn default() -> Self {
+        Self {
+            clock: 0,
+            attached: HashMap::new(),
+            modes: watch::channel(ViewModes::default()).0,
+        }
+    }
 }
 
 struct AttachedView {
     size: TerminalSize,
     attached_at: u64,
     typed_at: Option<u64>,
-    /// Where this view takes key-bubbling signals, once it listens; a view that does not take
-    /// them in time misses them.
-    signals: Option<mpsc::Sender<KeySignal>>,
+    /// Where this view takes the keys the Tick bubbles, once it listens; a view that does not
+    /// take them in time misses them.
+    keys: Option<mpsc::Sender<BubbledKey>>,
 }
 
 impl Views {
@@ -68,7 +85,7 @@ impl Views {
                 size,
                 attached_at: view,
                 typed_at: None,
-                signals: None,
+                keys: None,
             },
         );
         view
@@ -109,32 +126,43 @@ impl Views {
             .max_by_key(|view| (view.typed_at, view.attached_at))
     }
 
-    /// Sends `view` the key-bubbling signals from now on; returns whether the Tick bubbles keys
-    /// now, which no signal sent later repeats.
-    pub(crate) fn listen(&mut self, view: u64, signals: mpsc::Sender<KeySignal>) -> bool {
+    /// Sends `view` the keys the Tick bubbles from now on, and watches its modes.
+    pub(crate) fn listen(
+        &mut self,
+        view: u64,
+        keys: mpsc::Sender<BubbledKey>,
+    ) -> watch::Receiver<ViewModes> {
         if let Some(attached) = self.attached.get_mut(&view) {
-            attached.signals = Some(signals);
+            attached.keys = Some(keys);
         }
-        self.bubbling
+        self.modes.subscribe()
     }
 
-    /// Records a key-bubbling signal of the Tick: a change of whether it bubbles keys reaches
-    /// every listening view, and a bubbled key, while it bubbles keys, the leading view.
+    /// Records a key-bubbling signal of the Tick: whether it bubbles keys becomes one of its
+    /// modes, and a bubbled key, while it bubbles keys, goes to the leading view.
     pub(crate) fn signal(&mut self, signal: KeySignal) {
-        let send = |view: &AttachedView| {
-            if let Some(signals) = &view.signals {
-                let _ = signals.try_send(signal);
-            }
-        };
         match signal {
-            KeySignal::Bubbling(enabled) if enabled != self.bubbling => {
-                self.bubbling = enabled;
-                self.attached.values().for_each(send);
+            KeySignal::Bubbling(enabled) => self.change_modes(|modes| modes.bubbling = enabled),
+            KeySignal::Key(key) if self.modes.borrow().bubbling => {
+                if let Some(keys) = self.leading().and_then(|view| view.keys.as_ref()) {
+                    let _ = keys.try_send(key);
+                }
             }
-            KeySignal::Bubbling(_) => {}
-            KeySignal::Key(_) if self.bubbling => self.leading().into_iter().for_each(send),
             KeySignal::Key(_) => {}
         }
+    }
+
+    /// Records whether the Tick wants focus reports.
+    pub(crate) fn focus_reports(&mut self, enabled: bool) {
+        self.change_modes(|modes| modes.focus_reports = enabled);
+    }
+
+    fn change_modes(&self, change: impl FnOnce(&mut ViewModes)) {
+        self.modes.send_if_modified(|modes| {
+            let before = *modes;
+            change(modes);
+            *modes != before
+        });
     }
 
     fn advance(&mut self) -> u64 {
@@ -219,30 +247,35 @@ mod tests {
     }
 
     #[test]
-    fn bubbled_keys_go_to_the_leading_view_and_bubbling_to_every_view() {
-        use tick_protocol::BubbledKey;
+    fn bubbled_keys_go_to_the_leading_view_and_every_view_watches_the_modes() {
         let size = TerminalSize::validated(10, 40).unwrap();
         let mut views = Views::default();
         let first = views.attach(size);
-        let (first_signals, mut first_received) = mpsc::channel(8);
-        assert!(!views.listen(first, first_signals));
+        let (first_keys, mut first_received) = mpsc::channel(8);
+        let mut first_modes = views.listen(first, first_keys);
+        assert_eq!(*first_modes.borrow_and_update(), ViewModes::default());
         views.signal(KeySignal::Key(BubbledKey::Down));
         assert!(
             first_received.try_recv().is_err(),
             "a key bubbled while bubbling is off goes nowhere"
         );
         views.signal(KeySignal::Bubbling(true));
-        assert_eq!(first_received.try_recv(), Ok(KeySignal::Bubbling(true)));
+        assert!(first_modes.has_changed().unwrap());
+        assert!(first_modes.borrow_and_update().bubbling);
         views.signal(KeySignal::Bubbling(true));
-        assert!(first_received.try_recv().is_err(), "only changes are sent");
+        assert!(!first_modes.has_changed().unwrap(), "only changes count");
 
         let second = views.attach(size);
-        let (second_signals, mut second_received) = mpsc::channel(8);
-        assert!(views.listen(second, second_signals), "a new view learns it");
+        let (second_keys, mut second_received) = mpsc::channel(8);
+        let mut second_modes = views.listen(second, second_keys);
+        assert!(
+            second_modes.borrow_and_update().bubbling,
+            "a new view learns it"
+        );
         views.signal(KeySignal::Key(BubbledKey::Down));
         assert_eq!(
             second_received.try_recv(),
-            Ok(KeySignal::Key(BubbledKey::Down)),
+            Ok(BubbledKey::Down),
             "the newest view while none typed"
         );
         assert!(first_received.try_recv().is_err());
@@ -250,15 +283,38 @@ mod tests {
         views.signal(KeySignal::Key(BubbledKey::Esc));
         assert_eq!(
             first_received.try_recv(),
-            Ok(KeySignal::Key(BubbledKey::Esc)),
+            Ok(BubbledKey::Esc),
             "the view that typed last"
         );
         assert!(second_received.try_recv().is_err());
 
+        views.focus_reports(true);
+        assert_eq!(
+            *second_modes.borrow_and_update(),
+            ViewModes {
+                bubbling: true,
+                focus_reports: true
+            }
+        );
         views.signal(KeySignal::Bubbling(false));
-        assert_eq!(first_received.try_recv(), Ok(KeySignal::Bubbling(false)));
-        assert_eq!(second_received.try_recv(), Ok(KeySignal::Bubbling(false)));
+        assert!(!first_modes.borrow_and_update().bubbling);
         views.signal(KeySignal::Key(BubbledKey::Esc));
         assert!(first_received.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_flood_of_bubbled_keys_never_hides_a_change_of_modes() {
+        let size = TerminalSize::validated(10, 40).unwrap();
+        let mut views = Views::default();
+        let view = views.attach(size);
+        let (keys, _unread) = mpsc::channel(2);
+        let mut modes = views.listen(view, keys);
+        views.signal(KeySignal::Bubbling(true));
+        for _ in 0..100 {
+            views.signal(KeySignal::Key(BubbledKey::Tab));
+        }
+        views.signal(KeySignal::Bubbling(false));
+        assert!(modes.has_changed().unwrap());
+        assert_eq!(*modes.borrow_and_update(), ViewModes::default());
     }
 }
