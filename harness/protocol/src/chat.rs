@@ -417,6 +417,9 @@ pub enum HostNote {
     /// attachments: the execution mode the note told the model, which the system prompt never
     /// names so that changing it keeps the prompt cache.
     ExecutionMode(ExecutionModeNote),
+    /// The Loop's Tick Subscriptions, its receiving or its running Subagents, as they changed
+    /// without the model's own calls or stand after a compaction or a load.
+    LoopState,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
@@ -440,6 +443,7 @@ impl HostNote {
             Self::HostTools(announced) => Some(announced),
             Self::PlanModeExit
             | Self::ExecutionMode(_)
+            | Self::LoopState
             | Self::Guidance(_)
             | Self::DateChange(_) => None,
         }

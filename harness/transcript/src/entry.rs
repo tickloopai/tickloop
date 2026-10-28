@@ -303,6 +303,10 @@ pub struct ChainEntry {
     /// `execution_mode`, so an unknown mode cannot invalidate the entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode_note: Option<serde_json::Value>,
+    /// Tickloop extension: marks the host note telling the model the state of its Loop and
+    /// Subagents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_state_note: bool,
     /// Tickloop extension: marks the host note telling the model the date it now is, Claude
     /// Code's `date_change` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]

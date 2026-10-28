@@ -340,6 +340,7 @@ impl Agent {
                     family_finishing: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
                     mode_before_plan: saved.mode_before_plan,
+                    announced_loop_state: None,
                     active: saved
                         .waiting
                         .as_ref()

@@ -149,3 +149,61 @@ async fn background_completion_after_esc_starts_a_new_parent_turn() {
     assert_eq!(delivered.family_completions.len(), 1);
     core.shutdown().await;
 }
+
+/// Creating, running and finishing a Subagent keeps the parent's request prefix byte for byte the
+/// same: the family roster stays out of the system prompt, the Subagent result names the child
+/// and its completion arrives as a task notification.
+#[tokio::test]
+async fn a_subagents_life_keeps_the_parents_prefix() {
+    let model = Arc::new(SubagentTimingModel::new(true));
+    let core = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let initial = core
+        .submit(root, "Start a background audit".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
+        .await
+        .unwrap();
+    completed(&mut events, &initial).await;
+    let follow_up = core.submit(root, "How is it going?".into()).await.unwrap();
+    completed(&mut events, &follow_up).await;
+    model.release.notify_one();
+    wait_for_snapshot(&core, root.uuid(), "the completion turn", |snapshot| {
+        task_notifications(snapshot).len() == 1
+            && snapshot.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
+    })
+    .await;
+    let requests = model
+        .routed
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            tickloop_harness::test_support::routed::state(request)["delegation"].is_null()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        4,
+        "launch, finish, follow-up and completion"
+    );
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_vec(&request.messages[..2]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[..2]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let system = serde_json::to_string(&requests[0].messages[0]).unwrap();
+    assert!(!system.contains("family_members"));
+    assert!(!system.contains("\"audit\""));
+    core.shutdown().await;
+}

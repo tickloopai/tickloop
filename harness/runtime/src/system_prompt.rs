@@ -253,7 +253,6 @@ impl crate::Agent {
     pub(super) fn conversation_system_message(
         &self,
         chat: &crate::Chat,
-        family_roster: &[crate::family::FamilyAgent],
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
     ) -> tickloop_harness_protocol::Message {
         let environment = chat
@@ -276,11 +275,6 @@ impl crate::Agent {
             "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
             "artifact_ticks": chat.snapshot.artifact_ticks,
             "delegation": chat.snapshot.delegation,
-            "family_members": family_roster.iter().map(|member| serde_json::json!({
-                "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                "name": member.handle, "depth": member.depth, "state": member.availability,
-                })).collect::<Vec<_>>(),
-            "loop": loop_state(&chat.snapshot.chat_loop),
             "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
         if let Some(folder) = &chat.snapshot.folder {
@@ -299,21 +293,6 @@ impl crate::Agent {
             }],
         }
     }
-}
-
-/// The Loop as the system prompt shows it. The Loop is always running while it asks the model,
-/// so its state, Run and timing would only change the system prompt, the start of the prompt
-/// cache prefix, at every Run.
-fn loop_state(chat_loop: &tickloop_harness_protocol::LoopSnapshot) -> serde_json::Value {
-    let mut state = serde_json::json!({
-        "id": chat_loop.id,
-        "receiving": chat_loop.receiving,
-        "subscriptions": chat_loop.subscriptions,
-    });
-    if !chat_loop.event_sources.is_empty() {
-        state["event_sources"] = serde_json::json!(chat_loop.event_sources);
-    }
-    state
 }
 
 #[cfg(test)]

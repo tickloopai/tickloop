@@ -117,6 +117,7 @@ impl ChatSnapshot {
                 HostNote::HostTools(_)
                 | HostNote::PlanModeExit
                 | HostNote::ExecutionMode(_)
+                | HostNote::LoopState
                 | HostNote::DateChange(_) => {}
             }
         }

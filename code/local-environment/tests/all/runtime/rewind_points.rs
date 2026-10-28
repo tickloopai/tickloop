@@ -20,7 +20,7 @@ use tickloop_harness::protocol::{
 };
 use tickloop_harness::runtime::Agent;
 use tickloop_harness::test_support::shell_ticks::ShellTick;
-use tickloop_harness::test_support::{ScriptedModel, call, config, text};
+use tickloop_harness::test_support::{ScriptedModel, call, config, is_host_note, text};
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -420,7 +420,9 @@ async fn trigger_deliveries_preserve_the_single_real_user_checkpoint() {
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(checkpoints(&agent, chat).await, before);
     assert_eq!(snapshot.rewind_points().len(), 1);
-    assert_eq!(snapshot.messages.len(), 4);
+    // The delivery, the note that the user subscribed the Loop, and the reply.
+    assert_eq!(snapshot.messages.len(), 5);
+    assert!(is_host_note(&snapshot.messages[3]));
     assert_eq!(support::model_script_requests(&snapshot).len(), 2);
     assert_eq!(
         support::model_script_requests(&snapshot)[1].run_id,

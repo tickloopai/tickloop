@@ -440,7 +440,7 @@ async fn a_subagent_counts_only_the_tools_its_ceiling_grants() {
     });
     let child = chats.get(&chat).unwrap();
     let breakdown = agent
-        .context_parts(child, &[], &[], "2026-10-27")
+        .context_parts(child, &[], "2026-10-27")
         .unwrap()
         .count(&WordCounter);
     drop(chats);
@@ -515,7 +515,7 @@ async fn host_notes_count_apart_from_what_the_user_typed() {
     push(chat, Role::Assistant, "Hello there", None);
     let chat = chats.get(&chat_id).unwrap();
     let breakdown = agent
-        .context_parts(chat, &[], &[], "2026-10-27")
+        .context_parts(chat, &[], "2026-10-27")
         .unwrap()
         .count(&WordCounter);
     drop(chats);
@@ -569,7 +569,7 @@ async fn host_notes_keep_their_labels_after_compaction() {
     push(chat, Role::User, "你好", None);
     let chat = chats.get(&chat_id).unwrap();
     let breakdown = agent
-        .context_parts(chat, &[], &[], "2026-10-27")
+        .context_parts(chat, &[], "2026-10-27")
         .unwrap()
         .count(&WordCounter);
     drop(chats);

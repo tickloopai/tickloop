@@ -6609,20 +6609,20 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         .unwrap();
     let state: Value =
         serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
-    for field in [
-        "loop",
-        "service_connections",
-        "artifact_ticks",
-        "delegation",
-        "family_members",
-    ] {
+    for field in ["service_connections", "artifact_ticks", "delegation"] {
         assert!(state.get(field).is_some(), "{field}");
     }
     assert_eq!(
         state["service_connections"]["artifacts"]["authentication"],
         "signed_in"
     );
-    for absent in ["web_search", "execution_mode", "plan"] {
+    for absent in [
+        "web_search",
+        "execution_mode",
+        "plan",
+        "loop",
+        "family_members",
+    ] {
         assert!(state.get(absent).is_none(), "{absent}");
     }
     assert!(!prompt.contains("/websearch"));

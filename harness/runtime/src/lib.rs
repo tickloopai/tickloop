@@ -35,6 +35,7 @@ mod host_notes;
 pub mod host_tools;
 mod jev_review;
 mod lifecycle;
+mod loop_state_notes;
 pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
 mod loop_lease;
@@ -479,6 +480,8 @@ struct Chat {
     /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
     /// it unknown.
     mode_before_plan: Option<ExecutionMode>,
+    /// What the model was last told of the Loop in this process; a load starts untold.
+    announced_loop_state: Option<loop_state_notes::AnnouncedLoopState>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     upgrade_wait: Option<Receipt>,
@@ -3182,10 +3185,12 @@ impl Agent {
                     self.inner.host_tools.read().unwrap().as_deref(),
                 )
             });
+        let timing = timing::Phase::new("announce_loop_state");
+        Box::pin(self.announce_loop_state(receipt)).await?;
+        drop(timing);
         let timing = timing::Phase::new("announce_guidance");
         Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
-        let family_roster = self.family_agents(receipt.chat_id).await?;
         let user_context = self.user_context(receipt.chat_id).await?;
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
@@ -3214,7 +3219,7 @@ impl Agent {
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
-                self.conversation_system_message(chat, &family_roster, workspace_host.as_ref()),
+                self.conversation_system_message(chat, workspace_host.as_ref()),
             );
             request.history_sources.insert(1, None);
             request.messages.insert(1, user_context);
@@ -5704,6 +5709,7 @@ impl NewChat {
             bookkeeping,
             start_new_tool_result_message: false,
             mode_before_plan: None,
+            announced_loop_state: None,
             active: None,
             active_run: None,
             upgrade_wait: None,

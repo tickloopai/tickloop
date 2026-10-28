@@ -124,7 +124,9 @@ pub(crate) fn capture(
                 && entry.agent_message_origin.is_none(),
             is_agent: entry.agent_message_origin.is_some(),
             is_summary: entry.is_compact_summary,
-            is_guidance: entry.guidance.is_some() || entry.execution_mode_note.is_some(),
+            is_guidance: entry.guidance.is_some()
+                || entry.execution_mode_note.is_some()
+                || entry.loop_state_note,
             is_proposed_batch: false,
             message: &entry.message,
         });
@@ -167,7 +169,7 @@ pub(crate) fn capture(
                 ),
                 is_guidance: matches!(
                     snapshot.host_notes.get(&index),
-                    Some(HostNote::Guidance(_) | HostNote::ExecutionMode(_))
+                    Some(HostNote::Guidance(_) | HostNote::ExecutionMode(_) | HostNote::LoopState)
                 ),
                 is_proposed_batch: proposed_position.is_some_and(|(proposed, _)| proposed == index),
                 message,

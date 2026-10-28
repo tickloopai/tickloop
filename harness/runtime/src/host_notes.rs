@@ -484,7 +484,12 @@ fn restored_skill_content(content: &str, remaining_tokens: &mut usize) -> Option
 
 /// Appends a host note inside `<system-reminder>` tags, which tell the model it comes from the
 /// host and not the user.
-fn append_note(snapshot: &mut ChatSnapshot, receipt: &Receipt, text: String, note: HostNote) {
+pub(super) fn append_note(
+    snapshot: &mut ChatSnapshot,
+    receipt: &Receipt,
+    text: String,
+    note: HostNote,
+) {
     let text = if text.starts_with(SYSTEM_REMINDER_OPENING) {
         text
     } else {

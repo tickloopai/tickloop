@@ -268,6 +268,7 @@ impl Agent {
                 bookkeeping,
                 start_new_tool_result_message: false,
                 mode_before_plan: None,
+                announced_loop_state: None,
                 // Occupy the child Chat until the backups finish copying outside the lock; it
                 // cannot start a Run or rewind.
                 active: Some(tokio_util::sync::CancellationToken::new()),

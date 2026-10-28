@@ -30,13 +30,12 @@ const MAX_CALIBRATION_GAP_PERCENT: u64 = 15;
 impl Agent {
     /// The current context of `chat_id` by category, as `/context` shows it.
     pub async fn context_breakdown(&self, chat_id: ChatId) -> Result<ContextBreakdown, AgentError> {
-        let family_roster = self.family_agents(chat_id).await?;
         let instruction_files = self.instruction_files(chat_id).await?;
         let current_date = self.current_date();
         let parts = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            self.context_parts(chat, &family_roster, &instruction_files, &current_date)?
+            self.context_parts(chat, &instruction_files, &current_date)?
         };
         // A long Chat takes a while to count; the executor keeps serving other Chats meanwhile.
         tokio::task::spawn_blocking(move || {
@@ -58,7 +57,7 @@ impl Agent {
         let current_date = self.current_date();
         let settings = self.load_user_settings(folder.clone()).await?;
         let chat = self.draft_chat(folder, draft, settings);
-        let parts = self.context_parts(&chat, &[], &instruction_files, &current_date)?;
+        let parts = self.context_parts(&chat, &instruction_files, &current_date)?;
         tokio::task::spawn_blocking(move || {
             parts.count(&*tickloop_harness_model::context_tokens::TOKEN_COUNTER)
         })
@@ -113,7 +112,6 @@ impl Agent {
     fn context_parts(
         &self,
         chat: &Chat,
-        family_roster: &[crate::family::FamilyAgent],
         instruction_files: &[InstructionFile],
         current_date: &str,
     ) -> Result<ContextParts, AgentError> {
@@ -213,11 +211,7 @@ impl Agent {
                 && entry.context_measurement.is_some()
         });
         Ok(ContextParts {
-            system_prompt: self.conversation_system_message(
-                chat,
-                family_roster,
-                workspace_host.as_ref(),
-            ),
+            system_prompt: self.conversation_system_message(chat, workspace_host.as_ref()),
             system_tools,
             skill_tool,
             skills,
@@ -265,6 +259,7 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::DateChange(_) => "Date change".into(),
             HostNote::PlanModeExit => "Plan mode exit".into(),
             HostNote::ExecutionMode(note) => format!("Execution mode · {}", note.mode.label()),
+            HostNote::LoopState => "Loop state".into(),
         });
     }
     matches!(
