@@ -157,3 +157,97 @@ async fn prepared_environment_approval_controls_routing_without_platform_assumpt
         }
     }
 }
+
+/// In Auto, an ordinary TickManage open still goes to the reviewer and runs once allowed; the
+/// placement and move forms earlier builds offered for Herdr Panes are refused before any review
+/// or dispatch, so nothing they named is admitted.
+#[tokio::test]
+async fn auto_reviews_ordinary_tick_opens_and_refuses_retired_view_forms_before_review() {
+    use tickloop_harness_protocol::{HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness_runtime::environment::{ExecutionTools, memory::counter_environment};
+
+    let open = json!({"action":"open","command":["/counter"],"cwd":"/","protocol":true});
+    let mut placed = open.clone();
+    placed["placement"] = json!({"type":"current_tab","direction":"right"});
+    let moved =
+        json!({"action":"move","tick_instance_id":"hosted:0190d0c4-6b7a-7c3e-9f00-0123456789ab"});
+    for (input, admitted) in [(open, true), (placed, false), (moved, false)] {
+        let folder = tempfile::tempdir().unwrap();
+        let environment = Arc::new(counter_environment());
+        let model = Arc::new(ScriptedModel::new(vec![
+            call("tick", "TickManage", input.clone()),
+            text("done"),
+        ]));
+        let reviewer = Arc::new(ScriptedModel::new(vec![text(
+            &auto_classification(false).to_string(),
+        )]));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(environment.clone()),
+                models: ChosenModels::new(model),
+            },
+            HarnessOptions::local(config()),
+        )
+        .unwrap();
+        agent
+            .install_host_tools(Arc::new(ExecutionTools::new(
+                environment.clone(),
+                HostToolAuthority::Native {
+                    endpoint: HostEndpointIdentity::TrustedAdapter {
+                        scope: tickloop_ids::generate(),
+                    },
+                },
+            )))
+            .unwrap();
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        let chat = agent.create_chat(folder.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        let receipt = agent
+            .submit(chat, "Open the counter beside you.".into())
+            .await
+            .unwrap();
+        let mut assessment = None;
+        let mut asked = false;
+        let mut result = None;
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::ApprovalAssessed { assessment: value } => assessment = Some(value),
+                EventKind::PermissionRequested { .. } => asked = true,
+                EventKind::ToolCompleted { result: value, .. } => result = Some(value),
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        agent.shutdown().await;
+        let result = result.expect("TickManage returns a result");
+        assert!(!asked, "{input}");
+        assert_eq!(result.is_error, !admitted, "{input}: {}", result.content);
+        if admitted {
+            assert_eq!(
+                assessment.map(|assessment| assessment.outcome),
+                Some(ApprovalOutcome::Allow),
+                "{input}"
+            );
+            assert!(result.content.contains("opened"), "{}", result.content);
+        } else {
+            assert!(assessment.is_none(), "{input}");
+            assert!(reviewer.requests.lock().unwrap().is_empty(), "{input}");
+            assert!(
+                result.content.contains("invalid TickManage input"),
+                "{input}: {}",
+                result.content
+            );
+        }
+    }
+}

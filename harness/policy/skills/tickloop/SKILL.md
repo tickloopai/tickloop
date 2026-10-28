@@ -9,7 +9,7 @@ A Tick is a program the Tickhost runs, a Bash background task or an artifact tha
 
 ## Check the host
 
-Read `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the environment. `tickhost` says whether Ticks can run here, and `name` and `integration` whether a Herdr Pane can show them. When something is missing, say so in plain words and stop; report only Tick operations that actually succeeded, and never drive a multiplexer through Bash instead.
+Read `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the environment. `tickhost` says whether Ticks can run here. When something is missing, say so in plain words and stop; report only Tick operations that actually succeeded, and never drive a multiplexer through Bash instead.
 
 ## Open a plugin's Tick
 
