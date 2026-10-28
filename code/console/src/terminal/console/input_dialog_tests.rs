@@ -2085,23 +2085,8 @@ fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() 
     );
 }
 
-#[test]
-fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
-    std::thread::Builder::new()
-        .stack_size(EMBEDDED_RUN_STACK_BYTES)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(keep_distinct_pending_plan_dialogs_for_copied_loops());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-async fn keep_distinct_pending_plan_dialogs_for_copied_loops() {
+#[tokio::test]
+async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus};
     use tickloop_harness::protocol::ExecutionMode;
     use tickloop_harness::protocol::{BranchRequest, EventKind};
