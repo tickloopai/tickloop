@@ -144,12 +144,21 @@ async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_js
     .await
     .unwrap();
     while let Ok(Some(message)) = read_frame::<_, ClientMessage>(&mut stream, FRAME_BYTES).await {
-        if let ClientMessage::Observe { request_id, .. } = message {
+        if let ClientMessage::Observe {
+            request_id, query, ..
+        } = message
+        {
+            let initial = match query {
+                tickloop_code_access::ObservationRequest::EndedAgents { .. } => {
+                    serde_json::json!({ "EndedAgents": [] })
+                }
+                _ => serde_json::json!({ "Overview": rows.clone() }),
+            };
             let opened = serde_json::json!({
                 "Opened": {
                     "request_id": request_id,
                     "observation_id": Uuid::new_v4(),
-                    "initial": { "Overview": rows.clone() },
+                    "initial": initial,
                     "cursor": { "daemon_epoch": epoch, "execution": null, "sequence": 0 },
                     "reset": null,
                     "feed": false,
@@ -241,4 +250,163 @@ async fn an_explicitly_unknown_work_fact_stays_unknown() {
         "the `New Agent` title alone never makes a worked Agent empty"
     );
     server.abort();
+}
+
+/// A daemon listing one running root and the ended roots it keeps, recording forgotten Chats.
+struct EndedAgentsDaemon {
+    epoch: Uuid,
+    running: AgentSummary,
+    ended: std::sync::Mutex<Vec<tickloop_code_access::EndedAgent>>,
+    forgotten: std::sync::Mutex<Vec<Uuid>>,
+}
+
+#[async_trait::async_trait]
+impl tickloop_code_access::AgentAccess for EndedAgentsDaemon {
+    async fn observe(
+        &self,
+        query: tickloop_code_access::ObservationRequest,
+    ) -> Result<tickloop_code_access::Observation, tickloop_code_access::AccessError> {
+        use tickloop_code_access::{ObservationRequest, ObservationValue};
+        let value = match query {
+            ObservationRequest::Overview { .. } => {
+                ObservationValue::Overview(vec![self.running.clone()])
+            }
+            ObservationRequest::EndedAgents { store_root } => {
+                assert_eq!(store_root.as_deref(), Some(std::path::Path::new("/config")));
+                ObservationValue::EndedAgents(self.ended.lock().unwrap().clone())
+            }
+            other => panic!("unexpected observation {other:?}"),
+        };
+        Ok(tickloop_code_access::Observation::single(
+            value,
+            tickloop_code_access::Cursor {
+                daemon_epoch: self.epoch,
+                execution: None,
+                sequence: 0,
+            },
+            None,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        envelope: tickloop_code_access::CommandEnvelope,
+    ) -> Result<tickloop_code_access::CommandReceipt, tickloop_code_access::AccessError> {
+        let tickloop_code_access::AgentCommand::ForgetEndedAgent { record } = envelope.command
+        else {
+            panic!("unexpected command");
+        };
+        let chat_id = record.chat_id;
+        self.forgotten.lock().unwrap().push(chat_id);
+        self.ended
+            .lock()
+            .unwrap()
+            .retain(|agent| agent.record.chat_id != chat_id);
+        Ok(tickloop_code_access::CommandReceipt {
+            command_id: envelope.command_id,
+            daemon_epoch: self.epoch,
+            state: tickloop_code_access::ReceiptState::Completed,
+            target: None,
+            result: Some(tickloop_code_access::CommandResult::Done),
+            error: None,
+            persistence: tickloop_code_access::PersistenceState::NotApplicable,
+        })
+    }
+
+    async fn show_view(
+        &self,
+        _: tickloop_code_access::DisplayUpdate,
+    ) -> Result<tickloop_code_access::DisplayReceipt, tickloop_code_access::AccessError> {
+        unreachable!()
+    }
+}
+
+fn ended_agent(chat: u128, folder: &str) -> tickloop_code_access::EndedAgent {
+    tickloop_code_access::EndedAgent {
+        record: tickloop_code_access::TranscriptRef {
+            store_root: "/config".into(),
+            chat_id: Uuid::from_u128(chat),
+        },
+        agent_id: Uuid::from_u128(chat + 1000),
+        folder: Some(folder.into()),
+        workspace: None,
+        title: format!("Ended {chat}"),
+        preview: None,
+        created_at: 1,
+        updated_at: 2,
+        ended_at: 3,
+        last_state: LoopState::Idle,
+        outcome: tickloop_code_access::EndedOutcome::Failed,
+        reason: tickloop_code_access::EndReason::DaemonStopped,
+        resumable: true,
+    }
+}
+
+#[tokio::test]
+async fn the_projection_lists_ended_roots_once_and_forgets_them_on_request() {
+    use super::Intent;
+    use tickloop_code_access::AgentFilter;
+
+    let epoch = Uuid::new_v4();
+    let running = AgentSummary {
+        subagent: None,
+        availability: ExecutionAvailability::Live,
+        execution: ExecutionRef {
+            daemon_epoch: epoch,
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        },
+        chat_id: Uuid::from_u128(1),
+        folder: Some("/work".into()),
+        state: LoopState::Idle,
+        run_id: None,
+        title: "Running".into(),
+        has_work: Some(true),
+        updated_at: None,
+        run_started_at: None,
+        preview: None,
+        waiting_permissions: 0,
+        waiting_questions: 0,
+        parent: None,
+        record: None,
+        workspace: None,
+        capabilities: Vec::new(),
+        views: Vec::new(),
+    };
+    let access = Arc::new(EndedAgentsDaemon {
+        epoch,
+        running,
+        // The running Chat's stale ended record and two ended roots in other folders.
+        ended: std::sync::Mutex::new(vec![
+            ended_agent(1, "/work"),
+            ended_agent(2, "/work"),
+            ended_agent(3, "/elsewhere"),
+        ]),
+        forgotten: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut console = AgentConsole::new(access.clone(), epoch, "/work".into(), None)
+        .with_store_root(Some("/config".into()));
+
+    let projection = console.refresh().await.unwrap();
+    let ended = |projection: &super::Projection| {
+        projection
+            .ended
+            .iter()
+            .map(|agent| agent.record.chat_id.as_u128())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ended(&projection), [2, 3]);
+
+    console
+        .interpret(Intent::Filter(AgentFilter {
+            folder: Some("/work".into()),
+            workspace: None,
+        }))
+        .unwrap();
+    assert_eq!(ended(&console.projection()), [2]);
+
+    console.forget_ended(Uuid::from_u128(2)).await.unwrap();
+    assert_eq!(*access.forgotten.lock().unwrap(), [Uuid::from_u128(2)]);
+    assert!(console.projection().ended.is_empty());
+    assert!(ended(&console.refresh().await.unwrap()).is_empty());
 }

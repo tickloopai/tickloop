@@ -14,19 +14,20 @@ use tickloop_code_access::{
     AccessCapability, AccessError, AccessErrorCode, AgentCommand, AgentDetailQuery, AgentFilter,
     AgentSummary, ChunkedResponseKind, ClientMessage, CommandEnvelope, CommandReceipt,
     CommandResult, ConfigurationChange, Cursor, DisplayReceipt, DisplayUpdate, DisplayedView,
-    EnvironmentValue, ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation,
-    HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction,
-    ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits, ReceiptState,
-    RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput, ViewRef,
+    EndReason, EndedAgent, EndedOutcome, EnvironmentValue, ExecutionAvailability, ExecutionRef,
+    HistoryAction, HostLocation, HostWorkContext, InteractionSource, LaunchSpec, LiveChatSnapshot,
+    LoopAction, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState, ProtocolLimits,
+    ReceiptState, RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput,
+    ViewRef,
 };
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
     Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content,
     ContextBreakdown, ContextCategory, ContextCategoryUsage, ContextItem, ContextToolServer,
     Decision, Event, EventKind, ExecutionMode, HostedMember, HostedMemberState, HostedProgramExit,
-    HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality, Message,
-    ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
+    HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality, LoopState,
+    Message, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
     MonitorMembership, ObservationKind, OperationRecord, OperationState, OtherTickhost,
     PermissionPolicy, PermissionRule, PermissionScope, ProductKind, Protocol, ProviderConnection,
     ProviderCredentialScope, ReasoningEffort, Role, TakenBackPrompt, ThinkingBudgets,
@@ -648,6 +649,12 @@ fn agent_commands_keep_their_recorded_wire() {
                 execution: execution(),
                 name: "plugin_notes_search".into(),
             },
+            AgentCommand::ForgetEndedAgent {
+                record: TranscriptRef {
+                    store_root: "/home/user/.tickloop".into(),
+                    chat_id: id(0x90),
+                },
+            },
         ],
     );
 }
@@ -744,6 +751,9 @@ fn observation_requests_keep_their_recorded_wire() {
             ObservationRequest::DraftMcpServer {
                 launch: Box::new(launch_spec()),
                 name: "plugin_notes_search".into(),
+            },
+            ObservationRequest::EndedAgents {
+                store_root: Some("/home/user/.tickloop".into()),
             },
         ],
     );
@@ -916,6 +926,44 @@ fn observation_values_keep_their_recorded_wire() {
                 error: None,
                 workers: Vec::new(),
             })),
+            ObservationValue::EndedAgents(vec![
+                EndedAgent {
+                    record: TranscriptRef {
+                        store_root: "/home/user/.tickloop".into(),
+                        chat_id: id(0x90),
+                    },
+                    agent_id: id(0x91),
+                    folder: Some("/work/project".into()),
+                    workspace: Some("w1".into()),
+                    title: "Fix the parser".into(),
+                    preview: Some("Parser fixed".into()),
+                    created_at: 1_000,
+                    updated_at: 2_000,
+                    ended_at: 3_000,
+                    last_state: LoopState::Idle,
+                    outcome: EndedOutcome::Failed,
+                    reason: EndReason::DaemonStopped,
+                    resumable: true,
+                },
+                EndedAgent {
+                    record: TranscriptRef {
+                        store_root: "/home/user/.tickloop".into(),
+                        chat_id: id(0x92),
+                    },
+                    agent_id: id(0x93),
+                    folder: None,
+                    workspace: None,
+                    title: "Old review".into(),
+                    preview: None,
+                    created_at: 10,
+                    updated_at: 20,
+                    ended_at: 20,
+                    last_state: LoopState::Running,
+                    outcome: EndedOutcome::Stopped,
+                    reason: EndReason::DaemonOff,
+                    resumable: false,
+                },
+            ]),
         ],
     );
 }

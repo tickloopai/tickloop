@@ -120,6 +120,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
             created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(tickloop_harness::protocol::AgentColor::ALL[(id % 8) as usize]),
         }),
+        ended: None,
     }
 }
 

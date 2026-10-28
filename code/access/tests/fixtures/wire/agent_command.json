@@ -435,5 +435,12 @@
       "generation": 3
     },
     "name": "plugin_notes_search"
+  },
+  {
+    "kind": "forget_ended_agent",
+    "record": {
+      "store_root": "/home/user/.tickloop",
+      "chat_id": "00000000-0000-0000-0000-000000000090"
+    }
   }
 ]

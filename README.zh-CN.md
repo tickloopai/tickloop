@@ -70,6 +70,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - 列表和菜单中用 `j`／`k` 或方向键移动，`enter` 选择，`esc` 返回。
 - Tick 以卡片显示在 Monitor 列中，在 Herdr 内外都一样。在 Monitor 列表中按 `space`（或点击该行）显示或隐藏 Tick 的卡片；按 `enter`（或点击已打开的卡片）进入 Tick，之后按键都交给它，`ctrl+c` 也一样。可以同时打开多张卡片。
 - 在卡片中按 `esc` 离开，卡片保持打开；连按 `esc esc` 把一个 `esc` 发给 Tick。点击卡片以外的地方也会离开。Shell 卡片只读。隐藏卡片或离开都不会结束程序。
+- 输入为空时按 `←` 打开 Agents 总览。已结束的 Agent（例如 daemon 停止时）会留在 Ended 组里，直到超过 `cleanupPeriodDays`（默认 30 天）；不会自动重启。在这样的行上按 `enter` 只加载保存的对话、不运行任何东西，发出下一条消息才继续；结束时已闲置超过 48 小时的行（Stopped）需要再按一次 `enter`。按两次 `x` 移除该行，对话仍保留。在总览中按 `r`（或输入 `/resume`）列出尚未在列表中的已保存对话，选中的会加入列表。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
 
 对话接近模型的上下文窗口上限时，Agent 会在下一次请求前先把对话压缩成摘要。触发点是窗口减去摘要所需的输出空间（模型的输出上限，最多 20,000 tokens）再减去 13,000 tokens 的缓冲，但不低于窗口的一半；触发点之后的空间就是 `/context` 中显示的 Autocompact buffer。距触发点不到 20,000 tokens 时，状态行的 `Context N% used` 改为警示色，对话中也会提示一次；随时可以用 `/compact` 手动压缩。想更早压缩，可在 `settings.json` 中把 `autoCompactWindow` 设为 token 数，例如 `"autoCompactWindow": 400000`；它小于模型窗口时，触发点改按它计算。此后新建或重新打开的对话生效。

@@ -537,6 +537,7 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
             created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
+        ended: None,
     }
 }
 
@@ -3826,6 +3827,7 @@ fn fleet_row(
             created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
+        ended: None,
     }
 }
 

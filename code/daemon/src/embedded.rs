@@ -1190,6 +1190,12 @@ impl EmbeddedAgentAccess {
             AgentCommand::ReplaceTickhost => Box::pin(std::future::ready(Err(
                 AccessError::invalid("only the Agent daemon replaces its Tickhost"),
             ))),
+            AgentCommand::ForgetEndedAgent { .. } => {
+                Box::pin(std::future::ready(Err(AccessError::new(
+                    AccessErrorCode::Unsupported,
+                    "only the Agent daemon keeps ended Agents",
+                ))))
+            }
         }
     }
 
@@ -2093,6 +2099,15 @@ impl AgentAccess for EmbeddedAgentAccess {
                 ObservationValue::McpServers(vec![
                     crate::draft_mcp::connect(&launch, &name).await?,
                 ]),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
+            ObservationRequest::EndedAgents { .. } => Ok(Observation::single(
+                ObservationValue::EndedAgents(Vec::new()),
                 Cursor {
                     daemon_epoch: self.inner.epoch,
                     execution: None,

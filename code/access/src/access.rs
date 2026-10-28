@@ -95,8 +95,10 @@ use tickloop_harness::protocol::{
 /// Loop how many Runs it started and how many times the Chat was compacted.
 /// 34.2 adds the reasoning tokens a response reported to its usage.
 /// 34.3 adds the total tokens of a Subagent run's last request to its family completion.
+/// 34.4 adds the ended root Agents the overview keeps after their execution ended, and forgetting
+/// one of them.
 pub const PROTOCOL_MAJOR: u16 = 34;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -439,6 +441,10 @@ pub enum AgentCommand {
     /// Stops the running Tickhost of another build than the daemon's, ending what it runs; the
     /// next open or Shell starts one of the daemon's build.
     ReplaceTickhost,
+    /// Removes the ended root Agent of `record` from the overview; its saved history stays.
+    ForgetEndedAgent {
+        record: TranscriptRef,
+    },
 }
 
 impl AgentCommand {
@@ -752,6 +758,13 @@ pub enum ObservationRequest {
         launch: Box<LaunchSpec>,
         name: String,
     },
+    /// The root Agents of the configuration root `store_root` whose execution ended, such as when
+    /// the daemon stopped, that the overview still lists until the user continues or forgets
+    /// them. Running Agents are never included. Without a root, the daemon uses its latest
+    /// Worker's.
+    EndedAgents {
+        store_root: Option<PathBuf>,
+    },
 }
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user
@@ -812,6 +825,49 @@ pub struct AgentSummary {
     pub workspace: Option<String>,
     pub capabilities: Vec<String>,
     pub views: Vec<DisplayedView>,
+}
+
+/// How an ended root Agent reads in the overview, following Claude Code's agent view: one that
+/// ended within the last 48 hours of its activity failed, an older one stopped.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedOutcome {
+    Failed,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    /// The daemon stopped while the Agent was running in it.
+    DaemonStopped,
+    /// The Agent had been inactive for over 48 hours when its daemon stopped.
+    DaemonOff,
+    /// Its worker was lost while the daemon kept running.
+    WorkerLost,
+}
+
+/// A root Agent whose execution ended, as the overview lists it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct EndedAgent {
+    pub record: TranscriptRef,
+    /// The Agent of its last execution.
+    pub agent_id: Uuid,
+    pub folder: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Unix milliseconds.
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub ended_at: u64,
+    pub last_state: LoopState,
+    pub outcome: EndedOutcome,
+    pub reason: EndReason,
+    /// Whether its saved history is still on disk to load.
+    pub resumable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1012,6 +1068,7 @@ pub enum ObservationValue {
     ProviderCredentials(Box<ProviderCredentialScope>),
     AccountModels(Result<AccountModelDirectory, String>),
     Overview(Vec<AgentSummary>),
+    EndedAgents(Vec<EndedAgent>),
     Agent(Box<LiveChatSnapshot>),
     Status(Box<LiveChatStatus>),
     TaskToolsSetting(bool),

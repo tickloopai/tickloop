@@ -34,8 +34,11 @@ fn catalog(epoch: Uuid, rows: Vec<AgentSummary>) -> Arc<Catalog> {
 #[async_trait]
 impl AgentAccess for Catalog {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+        let overview = matches!(query, ObservationRequest::Overview { .. });
         let mut observation = self.daemon.observe(query).await?;
-        observation.initial = ObservationValue::Overview(self.rows.lock().unwrap().clone());
+        if overview {
+            observation.initial = ObservationValue::Overview(self.rows.lock().unwrap().clone());
+        }
         Ok(observation)
     }
     async fn execute(&self, _: CommandEnvelope) -> Result<CommandReceipt, AccessError> {

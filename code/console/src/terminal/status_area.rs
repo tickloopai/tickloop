@@ -1172,6 +1172,7 @@ mod tests {
                 created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
                 color: None,
             }),
+            ended: None,
         };
         let mut area = StatusArea::default();
         area.update_agents(
@@ -1220,6 +1221,7 @@ mod tests {
                 created_at: 0,
                 color: None,
             }),
+            ended: None,
         };
         for width in 0..=60 {
             for selected in [false, true] {
@@ -1267,6 +1269,7 @@ mod tests {
                 created_at: 10_000,
                 color: Some(tickloop_harness::protocol::AgentColor::Cyan),
             }),
+            ended: None,
         };
         let mut area = StatusArea::default();
         let mut rows = vec![
@@ -1679,6 +1682,7 @@ mod tests {
                 created_at: 1_000,
                 color: Some(AgentColor::ALL[id as usize % 8]),
             }),
+            ended: None,
         };
         let mut area = StatusArea::default();
         area.update("Auto".into(), "model".into(), None, None);
@@ -1863,6 +1867,7 @@ mod shared_task_tests {
                     created_at: 0,
                     color: Some(tickloop_harness::protocol::AgentColor::Blue),
                 }),
+                ended: None,
             }],
             None,
         );

@@ -135,13 +135,25 @@ impl Workflow {
         current_chat: Option<Uuid>,
         as_new_chat: bool,
     ) -> Result<(ConversationPicker, Self), String> {
+        let hidden = current_chat.into_iter().collect::<Vec<_>>();
+        Self::chats_except(agent, workdir, &hidden, as_new_chat).await
+    }
+
+    /// The saved-conversation picker without the Chats in `hidden`, such as the Agents the
+    /// overview already lists.
+    pub(super) async fn chats_except(
+        agent: &Agent,
+        workdir: &std::path::Path,
+        hidden: &[Uuid],
+        as_new_chat: bool,
+    ) -> Result<(ConversationPicker, Self), String> {
         let saved = agent
             .saved_chats(workdir)
             .await
             .map_err(|error| error.to_string())?;
         let chats = saved
             .iter()
-            .filter(|chat| Some(chat.id) != current_chat.map(Into::into))
+            .filter(|chat| !hidden.contains(&chat.id.uuid()))
             .collect::<Vec<_>>();
         if chats.is_empty() {
             return Err("No conversations found to resume.".into());

@@ -144,6 +144,8 @@ const EXECUTION_UNAVAILABLE_FOR_INPUT: &str =
     "This execution is unavailable; inspect cached history or use /resume explicitly";
 const VIEW_UPDATE_AFTER_ENDED_AGENT: &str =
     "View update · waits until the shown Agent runs again; use /resume or open another Agent";
+const HISTORY_ADDED_TO_OVERVIEW: &str = "Added to the Agents list · enter opens it";
+const ALREADY_IN_OVERVIEW: &str = "This Agent is already in the list · press enter on its row";
 const HANDOFF_AGENT_ENDED: &str = "The Agent this View showed is no longer running; its unsent draft is kept and /resume opens saved conversations";
 use task_access::ShellTaskCenter;
 use thinking_preview::ThinkingPreview;
@@ -2056,7 +2058,8 @@ async fn interact_with_herdr(
         agent.daemon_epoch(),
         workdir.clone(),
         agent.host_location(),
-    );
+    )
+    .with_store_root(config_root.clone());
     let mut overview_active = false;
     let mut history_return_overview = false;
     let mut visible_family: Vec<ChatId> = Vec::new();
@@ -2265,9 +2268,13 @@ async fn interact_with_herdr(
             }
         }
         if let Some(outcome) = menu_outcome.take() {
+            // A conversation chosen from the overview's history joins the list as a row there,
+            // as Claude Code's agent view adds it.
+            let mut added_from_history = None;
             if history_return_overview {
                 if outcome.selection.is_some() {
                     history_return_overview = false;
+                    added_from_history = outcome.selection;
                 } else if menus.id().is_none() {
                     global
                         .interpret(crate::agent_console::Intent::Overview)
@@ -2365,6 +2372,29 @@ async fn interact_with_herdr(
                 status_dirty = false;
             } else {
                 status_dirty = true;
+            }
+            if let Some(chat) = added_from_history {
+                global.visible_ready(agent.reference(chat).await.ok());
+                if let Err(error) = global.refresh().await {
+                    daemon_unreachable = Some(format!(
+                        "{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",
+                        safe_text(&error.to_string())
+                    ));
+                    console.set_connection_notice(daemon_unreachable.clone())?;
+                }
+                global
+                    .interpret(crate::agent_console::Intent::Overview)
+                    .map_err(|error| error.to_string())?;
+                console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                if let Err(error) = agent.display_chat(None).await {
+                    console.set_connection_notice(Some(format!(
+                        "{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",
+                        safe_line(&error.to_string())
+                    )))?;
+                }
+                overview_active = true;
+                console.set_status(HISTORY_ADDED_TO_OVERVIEW)?;
+                status_dirty = false;
             }
         }
         if let Some(chat) = selected_chat {
@@ -3220,6 +3250,31 @@ async fn interact_with_herdr(
                         console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(visible.agent_id))?;
                     }
                 },
+                Some(InputEvent::ResumeEndedAgent(chat)) => {
+                    match agent.resume_chat(chat).await {
+                        Ok(snapshot)=>{
+                            console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
+                            overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot,true)?;
+                            selected_chat=Some(snapshot.id);message_groups=MessageGroups::default();
+                            displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
+                            tools.restore_snapshot(&snapshot);
+                            sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot resume the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::ForgetEndedAgent(chat)) => {
+                    let title=global.projection().ended.iter().find(|ended|ended.record.chat_id==chat).map(|ended|safe_line(&ended.title)).unwrap_or_else(||"the Agent".into());
+                    match global.forget_ended(chat).await {
+                        Ok(())=>{
+                            console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                            console.set_status(&format!("Removed {title} from the list · its saved history stays"))?;
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot remove the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
                 Some(InputEvent::OpenAgent(agent_id)) => {
                     if let Err(error)=global.refresh().await {
                         daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
@@ -3764,14 +3819,24 @@ async fn interact_with_herdr(
                             status_dirty=true;continue;
                         }
                         if line.trim()=="/resume" {
-                            let directory=global.projection().dispatch_directory;
-                            match Workflow::chats(agent,&directory,None,false).await {
+                            let projection=global.projection();
+                            let listed=projection.rows.iter().map(|row|row.chat_id).chain(projection.ended.iter().map(|ended|ended.record.chat_id)).collect::<Vec<_>>();
+                            match Workflow::chats_except(agent,&projection.dispatch_directory,&listed,false).await {
                                 Ok(workflow)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
                                     overview_active=false;history_return_overview=true;menus.conversations(console,workflow)?;
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
                             }
+                            continue;
+                        }
+                        if let Some(listed)=line.trim().strip_prefix("/resume ").and_then(ChatId::parse).and_then(|chat|{
+                            let projection=global.projection();
+                            projection.rows.iter().find(|row|row.chat_id==chat.uuid()&&row.subagent.is_none()&&row.parent.is_none()).map(|row|row.execution.agent_id)
+                                .or_else(||projection.ended.iter().find(|ended|ended.record.chat_id==chat.uuid()).map(|ended|ended.record.chat_id))
+                        }) {
+                            console.select_overview_agent(listed)?;
+                            console.set_status(ALREADY_IN_OVERVIEW)?;
                             continue;
                         }
                         if line.trim().starts_with("/resume ") {
@@ -8252,12 +8317,58 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
                 })
         })
         .cloned()
+        .chain(projection.ended.iter().map(ended_agent_row))
         .collect();
     console::AgentOverview {
         rows,
         dispatch_directory: projection.dispatch_directory.clone(),
         created: projection.created.map(|execution| execution.agent_id),
         visible: visible.map(|execution| execution.agent_id),
+    }
+}
+
+/// An ended root Agent's overview row, keyed by its Chat: there is no execution to name.
+fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRow {
+    use tickloop_code_access::{EndReason, EndedOutcome};
+    let outcome = match agent.outcome {
+        EndedOutcome::Failed => "Failed",
+        EndedOutcome::Stopped => "Stopped",
+    };
+    let detail = if !agent.resumable {
+        "history gone"
+    } else {
+        match agent.reason {
+            EndReason::DaemonStopped => "daemon stopped",
+            EndReason::DaemonOff => "ended while the daemon was off",
+            EndReason::WorkerLost => "worker lost",
+        }
+    };
+    console::AgentRow {
+        agent_id: agent.record.chat_id,
+        parent_id: None,
+        title: safe_line(&agent.title),
+        status: format!("{outcome} · {detail}"),
+        state: agent.last_state.clone(),
+        project: shown_folder(agent.folder.as_deref())
+            .to_string_lossy()
+            .into_owned(),
+        workspace: agent.workspace.clone(),
+        approvals: 0,
+        questions: 0,
+        group: crate::agent_console::AttentionGroup::Ended,
+        glyph: match agent.outcome {
+            EndedOutcome::Failed => Glyph::AgentFailed,
+            EndedOutcome::Stopped => Glyph::AgentStopped,
+        },
+        preview: agent.preview.as_deref().map(safe_line),
+        updated_at: Some(agent.ended_at),
+        run_started_at: None,
+        subagent: None,
+        ended: Some(console::EndedRow {
+            chat_id: agent.record.chat_id,
+            outcome: agent.outcome,
+            resumable: agent.resumable,
+        }),
     }
 }
 
@@ -8312,6 +8423,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 updated_at: row.updated_at,
                 run_started_at: row.run_started_at,
                 subagent: row.subagent.clone(),
+                ended: None,
             }
         })
         .collect::<Vec<_>>();
@@ -8785,6 +8897,7 @@ mod tests {
             closed: false,
             unconfirmed_dispatch: None,
             created: None,
+            ended: Vec::new(),
         };
         let overview = super::agent_overview(&projection);
         assert_eq!(overview.rows.len(), 1);

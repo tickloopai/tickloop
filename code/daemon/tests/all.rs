@@ -6,6 +6,8 @@ mod agent_access;
 mod agent_history_transport;
 #[path = "all/agent_message_daemon_diagnosis.rs"]
 mod agent_message_daemon_diagnosis;
+#[path = "all/agent_registry.rs"]
+mod agent_registry;
 #[path = "all/agent_titles.rs"]
 mod agent_titles;
 #[path = "all/builtin_catalog.rs"]

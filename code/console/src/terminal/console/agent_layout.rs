@@ -9,6 +9,7 @@ use super::{
 use crate::agent_console::AttentionGroup;
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
+use tickloop_code_access::EndedOutcome;
 use tickloop_harness::protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
@@ -22,6 +23,8 @@ pub(in crate::terminal) const MIN_REQUEST_AGENT_TITLE_COLUMNS: usize = 4;
 const MIN_METADATA_COLUMNS: usize = 12;
 const MIN_PREVIEW_COLUMNS: usize = 10;
 const PREVIEW_GAP: &str = "  ";
+/// Claude Code's agent view keeps at least this many Completed rows however short the terminal.
+const MIN_ENDED_ROWS: usize = 3;
 pub(super) const REQUEST_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -46,6 +49,17 @@ pub(crate) struct AgentRow {
     pub(crate) updated_at: Option<u64>,
     pub(crate) run_started_at: Option<u64>,
     pub(crate) subagent: Option<SubagentRegistration>,
+    /// Set on a root Agent whose execution ended; such a row is keyed by its Chat.
+    pub(crate) ended: Option<EndedRow>,
+}
+
+/// What the overview needs to continue or forget an ended root Agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndedRow {
+    pub(crate) chat_id: Uuid,
+    pub(crate) outcome: EndedOutcome,
+    /// Whether its saved history is still on disk to load.
+    pub(crate) resumable: bool,
 }
 
 /// What a row shows after its title when there is room: the newest message, path metadata and
@@ -83,6 +97,12 @@ impl AgentRow {
     /// The row's own status word retains its state even when a child's request sets the group:
     /// a failure is an error, while an interruption is only a warning.
     pub(in crate::terminal) fn status_role(&self) -> Role {
+        if let Some(ended) = &self.ended {
+            return match ended.outcome {
+                EndedOutcome::Failed => Role::Error,
+                EndedOutcome::Stopped => Role::MutedText,
+            };
+        }
         match self.state {
             LoopState::Failed => Role::Error,
             LoopState::Interrupted => Role::Warning,
@@ -388,7 +408,10 @@ fn group_role(group: AttentionGroup) -> Role {
         AttentionGroup::Errors => Role::Error,
         AttentionGroup::Working => Role::Accent,
         AttentionGroup::Done => Role::Success,
-        AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty => Role::MutedText,
+        AttentionGroup::Idle
+        | AttentionGroup::Unknown
+        | AttentionGroup::Empty
+        | AttentionGroup::Ended => Role::MutedText,
     }
 }
 
@@ -405,6 +428,7 @@ pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
         AttentionGroup::Done => Glyph::AgentStopped,
         AttentionGroup::Unknown => Glyph::AgentUnknown,
         AttentionGroup::Empty => Glyph::AgentEmpty,
+        AttentionGroup::Ended => Glyph::AgentStopped,
     }
 }
 
@@ -692,6 +716,26 @@ impl OverviewState {
         entries.iter().position(|entry| entry.target() == selected)
     }
 
+    /// The ended Agent row `id`, when that row is one.
+    pub(super) fn ended_row(&self, id: Uuid) -> Option<&EndedRow> {
+        self.projection.as_ref()?.row(id)?.ended.as_ref()
+    }
+
+    pub(super) fn row_title(&self, id: Uuid) -> Option<String> {
+        Some(display_single_line(
+            &self.projection.as_ref()?.row(id)?.title,
+        ))
+    }
+
+    /// Selects the listed row of `id` and scrolls to it; `false` when no such row is listed.
+    pub(super) fn select_agent(&mut self, id: Uuid) -> bool {
+        if !self.targets().contains(&OverviewTarget::Agent(id)) {
+            return false;
+        }
+        self.locate(id);
+        true
+    }
+
     pub(super) fn selected_agent(&self) -> Option<Uuid> {
         match self.selected {
             Some(OverviewTarget::Agent(id)) => Some(id),
@@ -870,13 +914,16 @@ impl OverviewState {
         };
         let shows_anchors =
             |group| self.is_group_folded(group) && !self.is_group_collapsed_by_user(group);
-        // Groups listed after Done keep their heading and kept rows on the first screen.
+        // Groups listed after Done keep their heading and kept rows on the first screen; Ended
+        // also keeps its minimum rows.
         let later_reserve = grouped
             .iter()
             .filter(|(group, members)| *group > AttentionGroup::Done && !members.is_empty())
             .map(|(group, members)| {
                 1 + if shows_anchors(*group) {
                     pinned_lines(members)
+                } else if *group == AttentionGroup::Ended && !self.is_group_folded(*group) {
+                    members.len().min(MIN_ENDED_ROWS)
                 } else {
                     0
                 }
@@ -901,7 +948,15 @@ impl OverviewState {
                 .iter()
                 .map(|member| member.lines.len())
                 .sum::<usize>();
-            let over_budget = group == AttentionGroup::Done && !folded && total > remaining;
+            // Done and Ended list what the screen holds and fold the rest behind a counter; Ended
+            // keeps at least its minimum rows, as Claude Code's Completed group does.
+            let budgeted = matches!(group, AttentionGroup::Done | AttentionGroup::Ended);
+            let over_budget = budgeted && !folded && total > remaining;
+            let floor = if group == AttentionGroup::Ended {
+                MIN_ENDED_ROWS
+            } else {
+                0
+            };
             // A default fold keeps the rows the View points at (current, created, selected or
             // visited during this visit) so none vanishes under the cursor; a fold the user chose
             // hides them all.
@@ -911,7 +966,10 @@ impl OverviewState {
                     .map(|member| member.pinned && shows_anchors(group))
                     .collect()
             } else if over_budget {
-                let mut available = remaining.saturating_sub(2 + pinned_lines(&members));
+                let mut available = remaining
+                    .saturating_sub(2)
+                    .max(floor)
+                    .saturating_sub(pinned_lines(&members));
                 let mut fits = true;
                 members
                     .iter()
@@ -1348,7 +1406,13 @@ impl OverviewState {
             } else {
                 "enter/→ collapse".to_owned()
             }],
-            Some(OverviewTarget::Agent(_)) => vec!["enter open".to_owned()],
+            Some(OverviewTarget::Agent(id)) => match self.ended_row(id) {
+                Some(ended) if ended.resumable => {
+                    vec!["enter resume".to_owned(), "x remove".to_owned()]
+                }
+                Some(_) => vec!["x remove".to_owned()],
+                None => vec!["enter open".to_owned()],
+            },
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
                 .iter()
@@ -1703,6 +1767,8 @@ pub(super) fn help_lines(
             "w filter Workspace".into(),
             "tab list / new Agent".into(),
             "enter / → open Agent (row)".into(),
+            "enter resume ended Agent (row)".into(),
+            "x twice removes ended Agent".into(),
             "enter / → / space fold group (heading)".into(),
             "enter dispatch (input)".into(),
             "r open history".into(),

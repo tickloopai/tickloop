@@ -221,6 +221,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                     created_at: 1,
                     color: None,
                 }),
+                ended: None,
             })
             .collect();
         state.status_area.update_agents(rows, Some(root));

@@ -47,6 +47,7 @@ use tickloop_code_settings::UserSettings;
 use tickloop_harness::protocol::OtherTickhost;
 use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
 
+pub mod agent_registry;
 mod chunked;
 pub mod daemon_control;
 mod daemon_management;
@@ -68,6 +69,7 @@ mod views;
 pub mod worker_control;
 mod worker_upgrade;
 
+pub use agent_registry::{AgentRegistries, AgentRegistry};
 pub use daemon_server::{DaemonServer, WorkerFactory};
 pub use embedded::EmbeddedAgentAccess;
 pub use ipc::{serve_connection, serve_daemon_listener, serve_listener, serve_worker_listener};
@@ -441,7 +443,11 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
         lifecycle: lifecycle.clone(),
         ingress: ingress.clone(),
     });
-    let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
+    let daemon = Arc::new(DaemonServer::with_agent_registries(
+        epoch,
+        factory.clone(),
+        AgentRegistries::from_settings(),
+    ));
     control.attach_daemon((*daemon).clone());
     if let Some(handoff) = handoff {
         let mut channel = upgrade::inherited_stream(handoff.handshake)?;
