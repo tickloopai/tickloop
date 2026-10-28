@@ -744,12 +744,6 @@ struct Lifetime {
     surface: TerminalSurface,
 }
 
-/// A hosted Tick of `chat` waiting to take the terminal.
-struct FullScreenAttach {
-    chat: Uuid,
-    grant: tickloop_harness::protocol::HostedViewGrant,
-}
-
 pub(super) struct State {
     workspace_trust: Option<WorkspaceTrust>,
     pub(super) interactive: bool,
@@ -927,18 +921,12 @@ pub(super) struct State {
     /// Where the last frame drew Monitor's `│` separator beside the conversation: its column and
     /// rows.
     monitor_separator: Option<(usize, std::ops::Range<usize>)>,
-    /// The socket of the Herdr session this View runs inside; Enter there opens a Monitor card.
-    herdr_socket: Option<PathBuf>,
     /// The Monitor cards open in the shown Chat and the one with the focus.
     cards: super::monitor_cards::MonitorCards,
     /// The Tick screen size the last frame gave each shown card.
     card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
-    /// A hosted Tick waiting to take this terminal; the input thread attaches it between keys.
-    full_screen_attach: Option<FullScreenAttach>,
-    /// An attached view owns the terminal; nothing is drawn until it is taken back.
-    terminal_lent: bool,
     /// One probe per access whose members' host state can be read: Herdr members inside a
     /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
@@ -1822,33 +1810,10 @@ impl Console {
             .map_err(|error| error.to_string())?
             .monitor_visible())
     }
-    pub(super) fn set_herdr_socket(&self, socket: PathBuf) -> Result<(), String> {
-        self.state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .herdr_socket = Some(socket);
-        Ok(())
-    }
-
     pub(super) fn remove_scheduled_task(&self, chat: Uuid, id: &Uuid) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_for_chat_mut(chat).remove_task(id);
         state.rendered_region = None;
-        Ok(())
-    }
-
-    /// Hands this terminal to the hosted Tick `grant` names as soon as the input thread is
-    /// between keys, provided `chat` is still shown in this interactive View.
-    pub(super) fn begin_full_screen_attach(
-        &self,
-        chat: Uuid,
-        grant: tickloop_harness::protocol::HostedViewGrant,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat != Some(chat) || !state.interactive {
-            return Err("This View can no longer show the Tick full screen".into());
-        }
-        state.full_screen_attach = Some(FullScreenAttach { chat, grant });
         Ok(())
     }
 
@@ -6265,12 +6230,9 @@ impl State {
             monitor_width: None,
             monitor_resizing: false,
             monitor_separator: None,
-            herdr_socket: None,
             cards: Default::default(),
             card_sizes: HashMap::new(),
             card_press: None,
-            full_screen_attach: None,
-            terminal_lent: false,
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
@@ -7157,7 +7119,7 @@ impl State {
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.schedule_file_index();
-        if !self.interactive || self.terminal_lent {
+        if !self.interactive {
             return Ok(());
         }
         if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
@@ -10264,7 +10226,6 @@ impl State {
         let input_visible = self.interactive
             && self.file_index_focused
             && self.prompt_enabled
-            && !self.terminal_lent
             && self.workspace_trust.is_none()
             && self.menu.is_none()
             && self.conversation_picker.is_none()
@@ -10671,7 +10632,6 @@ impl State {
             && self.scrollback.is_at_bottom()
             && !self.monitor.focused
             && !self.conversation_focused
-            && !self.terminal_lent
             && self.status_area.tasks_can_take_focus()
     }
 
@@ -11574,42 +11534,6 @@ impl State {
             return None;
         }
         Some(outcome)
-    }
-
-    /// Hands the terminal to an attached view: from now on nothing is drawn until it is
-    /// taken back, while Agent events keep updating the state.
-    fn lend_terminal(&mut self) -> io::Result<()> {
-        self.terminal_lent = true;
-        self.schedule_file_index();
-        let mut output = io::stdout().lock();
-        self.surface
-            .release(self.renderer, &mut output)
-            .and_then(|()| write!(output, "{RESET_SCROLL_REGION}"))
-            .and_then(|()| execute!(output, Show))
-            .and_then(|()| output.flush())
-    }
-
-    /// Takes the terminal back from an attached view; the Monitor list is shown as it was, with
-    /// `failure` when the view did not end with the user closing it.
-    fn reclaim_terminal(&mut self, failure: Option<&str>) {
-        let mut output = io::stdout().lock();
-        let restored = self.surface.take(self.renderer, &mut output);
-        drop(output);
-        self.terminal_lent = false;
-        self.screen_initialized = false;
-        self.rendered_region = None;
-        match restored {
-            Err(error) => {
-                self.monitor.action_error = Some(super::safe_line(&format!(
-                    "Cannot restore the terminal: {error}"
-                )));
-            }
-            Ok(()) => {
-                if let Some(failure) = failure {
-                    self.monitor.action_error = Some(super::safe_line(failure));
-                }
-            }
-        }
     }
 
     fn can_edit_in_external_editor(&self) -> bool {
@@ -12619,11 +12543,10 @@ impl State {
                     return self.toggle_card(instance);
                 }
                 (KeyCode::Enter, KeyModifiers::NONE)
-                    if self.herdr_socket.is_some()
-                        && self
-                            .monitor
-                            .selected()
-                            .is_some_and(|entry| self.has_card(&entry.instance)) =>
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| self.has_card(&entry.instance)) =>
                 {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.enter_card(instance);
@@ -12671,6 +12594,9 @@ impl State {
                         if let crate::monitor_rows::TickIntent::Notify(message) = intent {
                             self.monitor.action_error = Some(super::safe_line(message));
                             return None;
+                        }
+                        if let crate::monitor_rows::TickIntent::OpenView(instance) = intent {
+                            return self.enter_card(instance.clone());
                         }
                         let chat = self.chat?;
                         let executor = super::tick_actions::builtin::executor(intent)?;
@@ -13847,17 +13773,6 @@ fn read_keys(
             }
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
-            let attach = state
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .full_screen_attach
-                .take();
-            if let Some(attach) = attach {
-                if !lend_terminal_to_attached_view(state, attach, stop)? {
-                    break;
-                }
-                continue;
-            }
             if !idle_tick(state, stop, sender)? {
                 break;
             }
@@ -14018,63 +13933,6 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
     }
     state.draw(&mut io::stdout().lock())?;
     Ok(true)
-}
-
-/// Lends the terminal to an attached hosted Tick until the user detaches. The input thread runs
-/// the view, so no key reaches the Console, and the state stays unlocked, so Agent events keep
-/// arriving while nothing is drawn. Returns whether input continues.
-fn lend_terminal_to_attached_view(
-    state: &Arc<Mutex<State>>,
-    attach: FullScreenAttach,
-    stop: &AtomicBool,
-) -> io::Result<bool> {
-    use super::attach::{AttachEnd, AttachedView};
-    let lock = || {
-        state
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))
-    };
-    {
-        let mut state = lock()?;
-        if state.chat != Some(attach.chat) {
-            state.monitor_for_chat_mut(attach.chat).action_error =
-                Some("Not opened: another Chat is shown now".into());
-            state.draw(&mut io::stdout().lock())?;
-            return Ok(!stop.load(Ordering::Acquire));
-        }
-    }
-    let attached = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())
-        .and_then(|runtime| {
-            runtime
-                .block_on(AttachedView::attach(&attach.grant))
-                .map(|view| (runtime, view))
-                .map_err(|error| error.to_string())
-        });
-    let (runtime, view) = match attached {
-        Ok(attached) => attached,
-        Err(error) => {
-            let mut state = lock()?;
-            state.monitor_for_chat_mut(attach.chat).action_error =
-                Some(super::safe_line(&format!("Cannot open the Tick: {error}")));
-            state.draw(&mut io::stdout().lock())?;
-            return Ok(!stop.load(Ordering::Acquire));
-        }
-    };
-    let lent = lock()?.lend_terminal();
-    let failure = match lent.map(|()| runtime.block_on(view.run())) {
-        Ok(Ok(AttachEnd::Detached)) => None,
-        Ok(Ok(AttachEnd::Gone)) => Some("The Tick ended while open".to_owned()),
-        Ok(Ok(AttachEnd::Lost(reason))) => Some(format!("The view ended: {reason}")),
-        Ok(Err(error)) => Some(format!("The view ended: {error}")),
-        Err(error) => Some(format!("Cannot hand the terminal to the Tick: {error}")),
-    };
-    let mut state = lock()?;
-    state.reclaim_terminal(failure.as_deref());
-    state.draw(&mut io::stdout().lock())?;
-    Ok(!stop.load(Ordering::Acquire))
 }
 
 fn read_lines(stop: &AtomicBool, sender: &mpsc::Sender<InputEvent>) -> io::Result<()> {

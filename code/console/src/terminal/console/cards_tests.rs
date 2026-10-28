@@ -100,7 +100,6 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
 #[test]
 fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
     let mut state = cards_fixture();
-    state.herdr_socket = Some(PathBuf::from("/fixture/herdr.sock"));
     let chat = state.chat.unwrap();
     let first = selected(&state);
     attaches(state.key(key(KeyCode::Enter)), chat, &first);
@@ -138,7 +137,6 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
 #[test]
 fn keys_and_clicks_on_a_focused_card_never_reach_the_console() {
     let mut state = cards_fixture();
-    state.herdr_socket = Some(PathBuf::from("/fixture/herdr.sock"));
     let first = selected(&state);
     state.key(key(KeyCode::Enter));
     state.draw_frame(&mut Vec::new()).unwrap();
@@ -243,7 +241,6 @@ fn a_row_click_toggles_its_card_on_release_a_card_click_enters_and_a_drag_does_n
 #[test]
 fn a_dialog_over_the_input_takes_the_focus_from_a_card() {
     let mut state = cards_fixture();
-    state.herdr_socket = Some(PathBuf::from("/fixture/herdr.sock"));
     state.key(key(KeyCode::Enter));
     state.draw_frame(&mut Vec::new()).unwrap();
     assert!(state.card_focused());

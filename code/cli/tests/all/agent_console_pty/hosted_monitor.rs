@@ -58,118 +58,140 @@ async fn view_with_keys_ticks_progress(
     view
 }
 
-/// The screen line of the selected hosted row, with its glyph preserved by the selection mark.
-fn selected_row(frame: &str) -> Option<usize> {
-    frame.lines().position(|line| {
-        line.contains(&format!("{SELECTED_MARK} ◉")) || line.contains(&format!("{SELECTED_MARK}◉"))
-    })
-}
-
-/// Notices the Console used to show after a hosted Tick opened or closed; it now returns to the
-/// Monitor list quietly.
-const RETIRED_NOTICES: [&str; 4] = [
-    "Not inside Herdr",
-    "keeps running",
-    "Herdr popup",
-    "Herdr plugin",
-];
-
-/// The Monitor list is back without a notice on how the Tick was opened or closed.
-fn quietly_back_in_monitor(frame: &str) -> bool {
-    frame.contains("enter open") && !RETIRED_NOTICES.iter().any(|notice| frame.contains(notice))
-}
-
-/// Waits until the Console has taken the terminal back from a full-screen Tick, whose screen
-/// shows its size, and returns the Monitor list, which must carry no such notice.
-async fn back_in_monitor_quietly(view: &PtyView) -> String {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            let screen = terminal_screen(view);
-            if screen.contains("enter open") && !screen.contains("size 100x32") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the Console never took the terminal back:\n{}",
-            terminal_screen(view)
-        )
-    });
-    let frame = view.frame();
-    assert!(quietly_back_in_monitor(&frame), "{frame}");
-    frame
-}
-
-/// Closes a full-screen view with a lone Esc.
+/// Leaves an entered card, or the Monitor list, with a lone Esc.
 const CLOSE: &[u8] = b"\x1b";
-/// Ctrl+B Esc sends Esc to the Tick.
-const SEND_ESCAPE: &[u8] = b"\x02\x1b";
 
-/// Enter on a hosted Tick outside Herdr opens the same process full screen in this terminal at
-/// once: the Console stops reading and drawing, keys reach the Tick, Ctrl+B Esc sends Esc, and a
-/// lone Esc gives the terminal back to the Monitor list quietly with the same row selected and
-/// nothing typed left in the input. The Tick runs on: opening it again shows what was typed.
-/// Monitor itself shows no Tick content.
+/// How many Monitor cards show a keys Tick's screen; each card is 40 columns wide.
+fn keys_cards(frame: &str) -> usize {
+    frame
+        .lines()
+        .filter(|line| monitor_part(line).is_some_and(|part| part.contains("size 40x")))
+        .count()
+}
+
+/// The Monitor lines of the card that shows `keys`, the bytes its Tick received.
+fn card_shows(frame: &str, keys: &str) -> bool {
+    frame
+        .lines()
+        .any(|line| monitor_part(line).is_some_and(|part| part.trim_end().ends_with(keys)))
+}
+
+fn card_focused(frame: &str) -> bool {
+    frame.lines().any(|line| line.starts_with("esc leave"))
+}
+
+/// One SGR left click at 1-based `column` and `row`, as the terminal reports it.
+fn click(column: usize, row: usize) -> Vec<u8> {
+    format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").into_bytes()
+}
+
+/// The 1-based screen position of the Monitor text `needle`.
+fn monitor_position(frame: &str, needle: &str) -> (usize, usize) {
+    frame
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let (left, part) = line.split_once('│')?;
+            let column = part.find(needle)?;
+            Some((
+                left.chars().count() + 1 + part[..column].chars().count() + 1,
+                row + 1,
+            ))
+        })
+        .unwrap_or_else(|| panic!("no Monitor text {needle:?}: {frame}"))
+}
+
+/// Live Tick screens open as cards under their Monitor rows. Space shows and hides a card with
+/// the focus on the list, and several stay open; Enter enters one, so typed keys, Ctrl+C included,
+/// reach that Tick alone; a lone Esc leaves with the card still shown; Esc Esc sends one Esc. A
+/// click on a row toggles its card, a click in a card enters it and a click outside leaves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_closes_it() {
+async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
         view.send(b"\x1b[C");
-        let first = view
-            .wait_for("Monitor focused", |frame| frame.contains("enter open"))
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
             .await;
-        assert!(!first.contains("snapshot"), "{first}");
-        let first_row = hosted_rows(&first)
-            .into_iter()
-            .next()
-            .expect("a hosted row");
-        view.send(if selected_row(&first) == Some(first_row) {
-            b"j"
-        } else {
-            b"k"
-        });
-        let second = view
-            .wait_for("the other row selected", |frame| {
-                selected_row(frame).is_some_and(|row| Some(row) != selected_row(&first))
+        view.send(b" ");
+        view.wait_for("one card shows its Tick", |frame| keys_cards(frame) == 1)
+            .await;
+        view.send(b"j");
+        view.wait_for("the other row selected", |frame| {
+            frame.contains("space show")
+        })
+        .await;
+        view.send(b" ");
+        let both = view
+            .wait_for("both cards show", |frame| keys_cards(frame) == 2)
+            .await;
+        assert!(
+            !card_focused(&both),
+            "Space leaves the focus on the list: {both}"
+        );
+
+        view.send(b"\r");
+        view.wait_for("the card has the focus", card_focused).await;
+        view.send(b"z\x03\x02");
+        view.wait_for("the keys reach the entered Tick alone", |frame| {
+            card_shows(frame, "keys 7a 03 02") && keys_cards(frame) == 2
+        })
+        .await;
+        view.send(b"\x1b");
+        let left = view
+            .wait_for("a lone Esc leaves the card", |frame| {
+                !card_focused(frame) && frame.contains("space hide")
             })
             .await;
-
-        view.send(b"\r");
-        terminal_shows(&view, "size 100x32").await;
-        view.send(b"z");
-        terminal_shows(&view, "keys 7a").await;
-        view.send(SEND_ESCAPE);
-        terminal_shows(&view, "keys 7a 1b").await;
-        view.send(CLOSE);
-        let back = back_in_monitor_quietly(&view).await;
-        assert_eq!(
-            selected_row(&back),
-            selected_row(&second),
-            "the same row is selected: {back}"
-        );
-
+        assert_eq!(keys_cards(&left), 2, "the card stays shown: {left}");
         assert!(
-            !back.contains("keys 7a"),
-            "Monitor shows no Tick content: {back}"
-        );
-        view.send(b"\r");
-        terminal_shows(&view, "keys 7a 1b").await;
-        view.send(CLOSE);
-        back_in_monitor_quietly(&view).await;
-        view.send(b"\x1b");
-        view.wait_for("input focused again", input_focused).await;
-        assert!(
-            !view
-                .frame()
+            !left
                 .lines()
                 .any(|line| line.starts_with('❯') && line.contains('z')),
-            "nothing typed during the attach reached the Console: {}",
-            view.frame()
+            "nothing typed reached the Console: {left}"
         );
+
+        view.send(b"\r");
+        view.wait_for("entered again", card_focused).await;
+        view.send(b"\x1b\x1b");
+        view.wait_for("Esc Esc sends one Esc", |frame| {
+            card_shows(frame, "keys 7a 03 02 1b") && card_focused(frame)
+        })
+        .await;
+        let frame = view.frame();
+        view.send(&click(2, 2));
+        view.wait_for("a click outside leaves the card", |frame| {
+            !card_focused(frame)
+        })
+        .await;
+
+        let (column, row) = monitor_position(&frame, "keys 7a 03 02 1b");
+        view.send(&click(column, row));
+        view.wait_for("a click in a card enters it", card_focused)
+            .await;
+        view.send(b"y");
+        view.wait_for("the clicked card takes the keys", |frame| {
+            card_shows(frame, "keys 7a 03 02 1b 79")
+        })
+        .await;
+        view.send(b"\x1b");
+        view.wait_for("left again", |frame| !card_focused(frame))
+            .await;
+
+        view.send(b" ");
+        view.wait_for("Space hides the selected card", |frame| {
+            keys_cards(frame) == 1
+        })
+        .await;
+        let frame = view.frame();
+        let (column, row) = monitor_position(&frame, "Keys");
+        view.send(&click(column, row));
+        view.wait_for("a click on the row toggles its card", |frame| {
+            keys_cards(frame) != 1
+        })
+        .await;
+        view.send(b"\x1b");
+        view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
     .catch_unwind()
@@ -487,12 +509,12 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
     }
 }
 
-/// A long Agent stream remains live while Enter lends the terminal to the Tick. Closing the
-/// attached view restores its reply tail without an internal recovery notice.
+/// A long Agent stream keeps streaming into the conversation while a card has the focus; the
+/// keys typed meanwhile reach the Tick, never the Console, and no internal recovery shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_terminal() {
+async fn actual_cli_keeps_a_long_reply_streaming_while_a_card_has_the_focus() {
     const THINKING_DELTAS: usize = 8192;
-    const ATTACHED_REPLY: &str = "Reply tail received while the Tick owned the terminal.";
+    const ATTACHED_REPLY: &str = "Reply tail received while a card had the focus.";
     let fixture = PrivateFixture::new();
     let progress = model_http_support::ResponseProgress::default();
     let result = AssertUnwindSafe(async {
@@ -506,18 +528,18 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
-        terminal_shows(&view, "size 100x32").await;
+        view.wait_for("the card has the focus", card_focused).await;
         view.send(b"z");
-        terminal_shows(&view, "keys 7a").await;
-        view.send(SEND_ESCAPE);
-        terminal_shows(&view, "keys 7a 1b").await;
+        view.wait_for("the key reaches the Tick", |frame| {
+            card_shows(frame, "keys 7a")
+        })
+        .await;
         let client = fixture.client().await;
         let execution = catalog(&client).await[0].execution;
         wait_snapshot(&client, execution, "the opening turn finished", |snapshot| {
             snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         })
         .await;
-        let attached_output_start = view.output.lock().unwrap().len();
         client
             .execute(CommandEnvelope {
                 daemon_epoch: client.daemon_epoch(),
@@ -525,7 +547,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
                 command: AgentCommand::Submit {
                     execution,
                     input: UserInput::Text {
-                        text: "Think while the Tick owns the terminal.".into(),
+                        text: "Think while a card has the focus.".into(),
                         contexts: Vec::new(),
                         paths: Vec::new(),
                     },
@@ -542,31 +564,23 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
             }) && snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
         })
         .await;
-        let attached_output = view.output.lock().unwrap()[attached_output_start..].to_vec();
-        assert!(
-            !String::from_utf8_lossy(&attached_output).contains(COMPLETED_FRAME_START),
-            "Console frames must stay suppressed while the Tick owns the terminal"
-        );
-        assert!(
-            !String::from_utf8_lossy(&attached_output).contains(ATTACHED_REPLY),
-            "the Agent reply must not overwrite the attached Tick"
-        );
+        view.wait_for("the reply streams beside the focused card", |frame| {
+            frame.contains(ATTACHED_REPLY) && card_focused(frame) && card_shows(frame, "keys 7a")
+        })
+        .await;
         view.send(CLOSE);
-        back_in_monitor_quietly(&view).await;
+        view.wait_for("a lone Esc leaves the card", |frame| !card_focused(frame))
+            .await;
         view.send(b"\x1b");
         view.wait_for("input focused again", input_focused)
             .await;
-        view.wait_for("the attached stream tail survived reclaim", |frame| {
-            frame.contains(ATTACHED_REPLY)
-        })
-        .await;
         assert!(
             !String::from_utf8_lossy(&view.output.lock().unwrap()).contains("The view fell behind"),
-            "internal recovery must remain invisible across attach and reclaim"
+            "internal recovery must remain invisible while a card has the focus"
         );
         assert!(
             !view.frame().lines().any(|line| line.starts_with('❯') && line.contains('z')),
-            "nothing typed during the attach reached the Console: {}",
+            "nothing typed into the card reached the Console: {}",
             view.frame()
         );
         view.close().await;
@@ -731,43 +745,19 @@ async fn select_row(view: &mut PtyView, needle: &str) {
     select_line(view, target).await;
 }
 
-/// Waits until a view took the terminal: the Console's frame is gone from the screen.
-async fn terminal_taken(view: &PtyView) {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        while terminal_screen(view).contains("enter open") {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("no view took the terminal:\n{}", terminal_screen(view)));
+/// Whether a Monitor line shows `text`, such as a card's screen line.
+fn monitor_shows(frame: &str, text: &str) -> bool {
+    frame
+        .lines()
+        .any(|line| monitor_part(line).is_some_and(|part| part.contains(text)))
 }
 
-/// Waits until the Console took the terminal back from a view that showed `shown`.
-async fn back_from(view: &PtyView, shown: &str) {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            let screen = terminal_screen(view);
-            if screen.contains("enter open") && !screen.contains(shown) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the Console never took the terminal back:\n{}",
-            terminal_screen(view)
-        )
-    });
-}
-
-/// Outside Herdr, Enter opens a terminal Tick and a Shell full screen too, and Esc gives the
-/// terminal back to the Monitor list while each keeps running. The terminal Tick takes keys; the
-/// Shell's view shows its description, full command, directory and status over its live output,
-/// takes no input and shows how it ended. A running Shell needs two presses to stop.
+/// A terminal Tick and a Shell show in cards too: the terminal Tick takes the keys typed into
+/// its entered card; the Shell's card shows its status over its live output, takes no input and
+/// shows how it ended. A lone Esc leaves each card while it keeps running. A running Shell needs
+/// two presses to stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_stops_a_shell() {
+async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_local_ticks(&fixture, &[], true).await;
@@ -777,43 +767,36 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
 
         select_row(&mut view, "cat").await;
         view.send(b"\r");
-        terminal_taken(&view).await;
+        view.wait_for("the cat card has the focus", card_focused)
+            .await;
         view.send(b"hello cat\r");
-        terminal_shows(&view, "hello cat").await;
+        view.wait_for("cat echoes in its card", |frame| {
+            monitor_shows(frame, "hello cat")
+        })
+        .await;
         view.send(CLOSE);
-        back_from(&view, "hello cat").await;
-        assert!(quietly_back_in_monitor(&view.frame()), "{}", view.frame());
+        view.wait_for("a lone Esc leaves the cat card", |frame| {
+            !card_focused(frame) && monitor_shows(frame, "hello cat")
+        })
+        .await;
 
         select_row(&mut view, SHELL_VIEW_COMMAND).await;
         view.send(b"\r");
-        terminal_taken(&view).await;
-        terminal_shows(&view, "outone").await;
-        let shown = terminal_screen(&view);
-        for expected in [
-            SHELL_VIEW_DESCRIPTION.to_owned(),
-            format!("$ {SHELL_VIEW_COMMAND}"),
-            format!(
-                "in {}",
-                fixture.path("work").canonicalize().unwrap().display()
-            ),
-            "running".to_owned(),
-            "outone".to_owned(),
-        ] {
-            assert!(shown.contains(&expected), "{expected:?} in {shown}");
-        }
+        view.wait_for("the Shell card shows its output", |frame| {
+            card_focused(frame) && monitor_shows(frame, "outone") && monitor_shows(frame, "running")
+        })
+        .await;
         view.send(b"typed into the view");
         std::fs::write(fixture.path("work/gate"), "").unwrap();
-        terminal_shows(&view, "outtwo").await;
-        terminal_shows(&view, "exit 0").await;
-        let ended = terminal_screen(&view);
-        assert!(
-            !ended.contains("running") && !ended.contains("typed into the view"),
-            "{ended}"
-        );
+        let ended = view
+            .wait_for("the Shell card shows how it ended", |frame| {
+                monitor_shows(frame, "outtwo") && monitor_shows(frame, "exit 0")
+            })
+            .await;
+        assert!(!ended.contains("typed into the view"), "{ended}");
         view.send(CLOSE);
-        back_from(&view, "outtwo").await;
-        view.wait_for("the ended Shell keeps its row", |frame| {
-            frame.contains(SHELL_VIEW_COMMAND) && frame.contains("cat")
+        view.wait_for("the ended Shell keeps its row and card", |frame| {
+            !card_focused(frame) && frame.contains(SHELL_VIEW_COMMAND) && frame.contains("cat")
         })
         .await;
 
@@ -861,12 +844,12 @@ fn kitty_keyboard(view: &PtyView) -> KittyKeyboard {
     KittyKeyboard::after(&view.output.lock().unwrap())
 }
 
-/// In a terminal speaking the kitty keyboard protocol, every full-screen view, of a protocol
-/// Tick, a terminal Tick and a Shell alike, reads legacy keys and closes on Esc each time it
-/// opens, and Ctrl+B Esc still sends Esc. The Console gets its disambiguated keys back on its own
-/// screen, pushed once however often a view opened, with the main screen left untouched.
+/// In a terminal speaking the kitty keyboard protocol, every entered card, of a protocol Tick, a
+/// terminal Tick and a Shell alike, reads legacy keys and leaves on Esc each time it is entered,
+/// and Esc Esc sends Esc. The Console gets its disambiguated keys back on its own screen, pushed
+/// once however often a card was entered, with the main screen left untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_full_screen_views_close_on_esc_in_a_terminal_speaking_the_kitty_keyboard_protocol()
+async fn actual_cli_entered_cards_read_legacy_keys_in_a_terminal_speaking_the_kitty_keyboard_protocol()
  {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
@@ -875,26 +858,33 @@ async fn actual_cli_full_screen_views_close_on_esc_in_a_terminal_speaking_the_ki
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         for (row, typed, shown) in [
-            ("Keys", None, "size 100x32"),
+            ("Keys", None, "size 40x"),
             ("cat", Some(b"meow\r".as_slice()), "meow"),
             (SHELL_VIEW_COMMAND, None, "outone"),
         ] {
             for _ in 0..2 {
                 select_row(&mut view, row).await;
                 view.send(b"\r");
-                terminal_taken(&view).await;
+                view.wait_for("the card has the focus", card_focused).await;
                 if let Some(typed) = typed {
                     view.send(typed);
                 }
-                terminal_shows(&view, shown).await;
-                let in_view = kitty_keyboard(&view);
+                view.wait_for("the card shows its Tick", |frame| {
+                    monitor_shows(frame, shown)
+                })
+                .await;
+                let in_card = kitty_keyboard(&view);
+                assert_eq!(in_card.flags(), 0, "the {row} card reads legacy keys");
                 if row == "Keys" {
-                    view.send(&[in_view.control_b(), in_view.escape()].concat());
-                    terminal_shows(&view, "keys 1b").await;
+                    view.send(&[in_card.escape(), in_card.escape()].concat());
+                    view.wait_for("Esc Esc reaches the Tick as one Esc", |frame| {
+                        monitor_shows(frame, "keys 1b") && card_focused(frame)
+                    })
+                    .await;
                 }
-                view.send(in_view.escape());
-                back_from(&view, shown).await;
-                assert_eq!(in_view.flags(), 0, "the {row} view reads legacy keys");
+                view.send(in_card.escape());
+                view.wait_for("a lone Esc leaves the card", |frame| !card_focused(frame))
+                    .await;
                 let in_console = kitty_keyboard(&view);
                 assert_eq!(
                     in_console.alternate(),

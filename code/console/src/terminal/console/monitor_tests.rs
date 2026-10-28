@@ -381,6 +381,13 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     assert!(
         matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == tick.instance.to_string() && action.key == crate::monitor_rows::MONITOR_ENTER_KEY)
     );
+    assert!(state.card_focused(), "Enter enters the Shell's card");
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.card_focused() && state.monitor.focused);
     assert!(
         state
             .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -456,6 +463,8 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                     }
                 }
                 let clicked = tick_action_signature(state.pointer_input.take());
+                // Enter shows a hidden card as the click did.
+                state.cards.close_all();
                 state.monitor.detail = None;
                 state.monitor.focus(overlay, None);
                 let entered = tick_action_signature(
@@ -2873,6 +2882,9 @@ fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
             .is_some(),
         "a key the row binds keeps its row action"
     );
+    // The Shell's Enter key entered its card; a lone Esc leaves it.
+    assert!(state.card_focused());
+    state.leave_card();
     state.monitor.detail = None;
     state.monitor.focus(false, None);
     for (code, modifiers) in [

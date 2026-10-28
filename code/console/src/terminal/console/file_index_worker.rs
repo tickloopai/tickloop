@@ -160,15 +160,9 @@ mod tests {
                 .or_else(|| queue.pending.as_ref().map(|job| job.canceled.clone()))
                 .unwrap()
         };
-        state.terminal_lent = true;
-        state.schedule_file_index();
-        assert!(canceled.load(Ordering::Acquire));
-        assert!(worker.queue.0.lock().unwrap().wanted.is_none());
-        state.terminal_lent = false;
-        state.schedule_file_index();
-        assert!(worker.queue.0.lock().unwrap().wanted.is_some());
         state.file_index_focused = false;
         state.schedule_file_index();
+        assert!(canceled.load(Ordering::Acquire));
         assert!(worker.queue.0.lock().unwrap().wanted.is_none());
         drop(state);
     }

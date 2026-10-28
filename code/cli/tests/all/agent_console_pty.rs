@@ -1368,16 +1368,6 @@ async fn view_shows(view: &PtyView, texts: &[&str]) {
     });
 }
 
-async fn terminal_shows(view: &PtyView, text: &str) {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        while !terminal_screen(view).contains(text) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
-}
-
 fn chat_reply(tool: Option<(&str, &str, Value)>, text: &str) -> String {
     let delta = match &tool {
         Some((name, id, input)) => json!({

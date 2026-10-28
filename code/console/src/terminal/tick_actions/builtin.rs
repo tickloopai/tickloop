@@ -13,7 +13,8 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         TickIntent::Notify(_) => return None,
         TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
         TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
-        TickIntent::OpenView(instance) => Arc::new(OpenView { instance }),
+        // The Console shows and enters Monitor cards itself.
+        TickIntent::OpenView(_) => return None,
         TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
         TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted { instance }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
@@ -229,45 +230,6 @@ impl TickActionExecutor for DetailsOpen {
         ))
     }
 }
-/// Enter on a local Tick, a hosted Tick or a Shell outside Herdr opens its view full screen in
-/// this View's terminal; Esc closes it.
-struct OpenView {
-    instance: tick_protocol::InstanceRef,
-}
-impl TickActionExecutor for OpenView {
-    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        ui.monitor_entry(&self.instance)
-            .ok_or("This Tick is no longer in Monitor")?;
-        Ok(PreparedTickAction::new(
-            self.instance.to_string(),
-            crate::monitor_rows::MONITOR_ENTER_KEY,
-            Arc::new(OpenView {
-                instance: self.instance.clone(),
-            }),
-        ))
-    }
-}
-#[async_trait]
-impl TickActionBackend for OpenView {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        open_full_screen(&ctx, &self.instance).await
-    }
-}
-
-/// Attaches the local Tick full screen in this View's terminal with a one-time view grant.
-async fn open_full_screen(
-    ctx: &TickActionContext<'_>,
-    instance: &tick_protocol::InstanceRef,
-) -> Result<(), String> {
-    let grant = ctx
-        .agent
-        .attach_hosted_tick(ctx.chat, instance.clone())
-        .await
-        .map_err(|error| format!("Cannot open {instance}: {error}"))?;
-    ctx.console.begin_full_screen_attach(ctx.chat, grant)?;
-    Ok(())
-}
-
 /// Attaches the view of a Monitor card the user just opened: a one-time view grant from the
 /// Agent, used at once.
 pub(in crate::terminal) fn attach_card(instance: tick_protocol::InstanceRef) -> PreparedTickAction {

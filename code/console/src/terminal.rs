@@ -940,7 +940,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; inside Herdr enter enters the card, or a click in it does: keys, ctrl+c included, go to the Tick until a lone esc leaves the card, which stays shown, esc esc sends esc and a click outside leaves too; outside Herdr enter opens the view full screen, a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's screen only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c included, go to the Tick until a lone esc leaves the card, which stays shown while the Tick keeps running; esc esc sends esc and a click outside leaves too; a Shell's screen only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -1349,7 +1349,6 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     } else {
         (None, None)
     };
-    let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
         folder: workdir.clone(),
         additional_directories,
@@ -1454,9 +1453,6 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_width(monitor_width.map(usize::from))?;
-    if let Some(socket) = herdr_socket {
-        console.set_herdr_socket(socket)?;
-    }
     // The Agent's Ticks run in the Tickhost and are probed there.
     console.add_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
         agent.clone(),
@@ -10599,7 +10595,7 @@ mod status_agents_help_tests {
         }
 
         assert!(help.contains(
-            "a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick"
+            "a lone esc leaves the card, which stays shown while the Tick keeps running; esc esc sends esc"
         ));
     }
 }
