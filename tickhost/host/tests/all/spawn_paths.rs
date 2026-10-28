@@ -60,6 +60,6 @@ fn every_child_the_tickhost_crates_start_is_spawned_under_the_descriptor_guard()
         "children started outside hosted::spawn_child:\n{}",
         unguarded.join("\n")
     );
-    // A Shell task, a hosted Tick's launcher or terminal program, and a launcher's business Tick.
-    assert_eq!(guarded, 3, "the spawn paths changed; check each is guarded");
+    // A Shell task, a hosted Tick launcher or terminal, a launcher's business Tick, and the sandbox probe.
+    assert_eq!(guarded, 4, "the spawn paths changed; check each is guarded");
 }

@@ -20,6 +20,7 @@ mod execution_mode;
 pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
+pub mod sandbox;
 mod store;
 pub use execution_mode::parse_execution_mode;
 pub use tickloop_harness::policy::{AutoSettings, ProjectRuleChanges};
@@ -798,6 +799,10 @@ impl UserSettings {
         Self::new(root.join(SETTINGS_FILE_NAME))
     }
 
+    pub fn file_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn root_directory(&self) -> Option<&Path> {
         self.path.parent()
     }
@@ -839,6 +844,9 @@ impl UserSettings {
             read_error,
         };
         loaded.cleanup_period_days();
+        if let Err(error) = loaded.sandbox() {
+            loaded.warn(error);
+        }
         if has_retired_model_settings(&loaded.settings, parent_directory(&loaded.path)) {
             loaded.warn(BUILTIN_ONLY_NOTICE.into());
         }

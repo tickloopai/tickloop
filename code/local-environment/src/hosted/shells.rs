@@ -272,13 +272,14 @@ impl ShellTasks {
         chat: Uuid,
         launch: ShellLaunch,
         environment: Vec<(Vec<u8>, Vec<u8>)>,
+        sandbox: Option<tickhost::sandbox::SandboxPolicy>,
         dispatch: Option<&crate::environment::ExecutionDispatch>,
     ) -> Result<Box<dyn ShellProcess>, ShellStartError> {
         ChatShells {
             tasks: self.clone(),
             chat,
         }
-        .start_with_environment(launch, environment, dispatch)
+        .start_with_environment(launch, environment, sandbox, dispatch)
         .await
     }
 
@@ -427,7 +428,7 @@ impl ShellHost for ChatShells {
     }
 
     async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
-        self.start_with_environment(launch, launch_environment(), None)
+        self.start_with_environment(launch, launch_environment(), None, None)
             .await
     }
 }
@@ -437,6 +438,7 @@ impl ChatShells {
         &self,
         launch: ShellLaunch,
         environment: Vec<(Vec<u8>, Vec<u8>)>,
+        sandbox: Option<tickhost::sandbox::SandboxPolicy>,
         dispatch: Option<&crate::environment::ExecutionDispatch>,
     ) -> Result<Box<dyn ShellProcess>, ShellStartError> {
         let refused = |error: HostError| {
@@ -466,6 +468,7 @@ impl ChatShells {
                     command,
                     cwd,
                     environment: environment_digest(&environment),
+                    sandbox: sandbox.map(Box::new),
                 },
             )
             .await
