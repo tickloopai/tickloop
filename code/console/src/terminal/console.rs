@@ -1475,6 +1475,11 @@ impl Console {
     }
 
     #[cfg(test)]
+    pub(super) fn test_type(&self, text: &str) {
+        self.state.lock().unwrap().insert(text);
+    }
+
+    #[cfg(test)]
     pub(super) fn test_draft_images(&self) -> Vec<ImageContext> {
         let state = self.state.lock().unwrap();
         state.paste_blocks.images(state.editor.draft())
