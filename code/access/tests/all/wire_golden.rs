@@ -415,6 +415,7 @@ fn chat_snapshot() -> ChatSnapshot {
     snapshot.additional_directories = vec!["/work/shared".into()];
     snapshot.last_sequence = 9;
     snapshot.context_window_tokens = Some(200_000);
+    snapshot.auto_compact_window = Some(150_000);
     snapshot.last_model_run = Some(tickloop_ids::Id::from(id(0x20)));
     snapshot
         .pending_thinking

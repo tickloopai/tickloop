@@ -83,6 +83,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - 在 Monitor 中 `enter` 打开 Tick，`esc` 再隐藏；程序会继续运行。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
 
+对话接近模型的上下文窗口上限时，Agent 会在下一次请求前先把对话压缩成摘要。触发点是窗口减去摘要所需的输出空间（模型的输出上限，最多 20,000 tokens）再减去 13,000 tokens 的缓冲，但不低于窗口的一半；触发点之后的空间就是 `/context` 中显示的 Autocompact buffer。距触发点不到 20,000 tokens 时，状态行的 `Context N% used` 改为警示色，对话中也会提示一次；随时可以用 `/compact` 手动压缩。想更早压缩，可在 `settings.json` 中把 `autoCompactWindow` 设为 token 数，例如 `"autoCompactWindow": 400000`；它小于模型窗口时，触发点改按它计算。此后新建或重新打开的对话生效。
+
 Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop` 继续使用 `tickloop.monitor` 和 `~/.tickloop/herdr-popup-plugin`；其他根（包括 `make dev` 的 `~/.tickloop-dev`）使用 `tickloop.monitor.<root-key>`，目录仍为 `<配置根>/herdr-popup-plugin`，显示名包含根路径。稳定的 root key 与 daemon、Tickhost 共用，两套插件可在同一 Herdr 会话共存。每个根首次使用时接受 Monitor 的注册提示，或执行 `tickloop monitor popup install --herdr-socket SOCKET`；`remove` 只移除当前根的插件。默认根已有注册无需重做。
 
 ## Tick

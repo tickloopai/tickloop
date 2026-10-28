@@ -77,7 +77,7 @@ fn update(console: &Console, todos: Vec<tickloop_harness::protocol::SharedTask>)
         .update_status_area(
             "Auto".into(),
             "fixture".into(),
-            Some((42_000, 200_000)),
+            Some((42_000, 200_000).into()),
             Some({
                 let mut board = crate::terminal::status_area::test_task_board(&[]);
                 board.tasks = todos;
@@ -512,7 +512,7 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
             )
             .unwrap();
         for (context, text, context_role) in [
-            (Some((0, 200_000)), "Context 0% used", Role::Success),
+            (Some((0, 200_000).into()), "Context 0% used", Role::Success),
             (None, "Context unknown", Role::MutedText),
         ] {
             console

@@ -1125,6 +1125,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         events: Vec::new(),
         pending_thinking: BTreeMap::new(),
         context_window_tokens: None,
+        auto_compact_window: None,
         pending_model: None,
         plans: Vec::new(),
         progress: Vec::new(),
@@ -2370,6 +2371,7 @@ impl Agent {
             snapshot.thinking_enabled = parent.thinking_enabled;
             snapshot.search_config = parent.search_config;
             snapshot.task_tools_enabled = parent.task_tools_enabled;
+            snapshot.auto_compact_window = parent.auto_compact_window;
             snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
             let mut metadata = metadata;
             self.apply_host_rules(&mut metadata.ceiling.policy);

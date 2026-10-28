@@ -529,9 +529,12 @@ fn status_bar_omits_every_goal_state_in_wide_and_short_console_frames() {
     ] {
         for (width, height) in [(140, 10), (140, 30), (60, 10), (60, 30)] {
             let mut state = State::new(true, width, height);
-            state
-                .status_area
-                .update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
+            state.status_area.update(
+                "Auto".into(),
+                "fixture".into(),
+                Some((21000, 100000).into()),
+                None,
+            );
             let mut goal = goal();
             goal.status = goal_status.clone();
             let status = status(goal);
@@ -844,9 +847,12 @@ fn goal_only_monitor_counts_as_content_for_periodic_refresh() {
 fn paused_triggers_keep_model_in_the_same_status_line() {
     for (width, height) in [(140, 10), (140, 30), (60, 10), (60, 30)] {
         let mut state = State::new(true, width, height);
-        state
-            .status_area
-            .update("Auto".into(), "fixture".into(), Some((21000, 100000)), None);
+        state.status_area.update(
+            "Auto".into(),
+            "fixture".into(),
+            Some((21000, 100000).into()),
+            None,
+        );
         let mut status = status(goal());
         status.chat_loop.receiving = tickloop_harness::protocol::Receiving::Paused {
             reason: tickloop_harness::protocol::PauseReason::HistoryLoaded,

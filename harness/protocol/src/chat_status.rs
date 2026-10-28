@@ -65,6 +65,10 @@ pub struct ChatStatus {
     pub context_window_tokens: Option<usize>,
     /// Estimated tokens occupied by the active context, calibrated with service usage when known.
     pub context_tokens: Option<u64>,
+    /// The context tokens beyond which the next conversation request compacts the Chat first;
+    /// `None` while the context window is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_tokens: Option<u64>,
     /// The highest `[Image #N]` pasted into the conversation, sent or queued.
     pub highest_pasted_image_id: Option<u32>,
     /// The pending permission and question requests whose request event is still in the replay
@@ -95,6 +99,7 @@ pub struct ChatStatusInput<'a> {
     pub commands: &'a [CommandSnapshot],
     pub request_usage: &'a RequestUsageLedger,
     pub context_window_tokens: Option<usize>,
+    pub auto_compact_window: Option<usize>,
     pub events: &'a [Event],
     pub last_sequence: u64,
 }
@@ -118,6 +123,7 @@ impl ChatStatus {
                 commands: &snapshot.commands,
                 request_usage: &snapshot.request_usage,
                 context_window_tokens: snapshot.context_window_tokens,
+                auto_compact_window: snapshot.auto_compact_window,
                 events: &snapshot.events,
                 last_sequence: snapshot.last_sequence,
             },
@@ -198,6 +204,12 @@ impl ChatStatus {
                 process.request_usage,
                 process.model,
             ),
+            auto_compact_tokens: crate::auto_compact_tokens(
+                process.model,
+                process.context_window_tokens,
+                process.auto_compact_window,
+            )
+            .map(|tokens| tokens as u64),
             highest_pasted_image_id: highest_pasted_image_id(
                 &conversation.message_contexts,
                 process.pending_inputs,
@@ -207,6 +219,13 @@ impl ChatStatus {
             family_input_runs,
             last_sequence: process.last_sequence,
         }
+    }
+
+    /// Whether the context has come within the warning buffer of the automatic compaction line.
+    pub fn is_context_nearly_full(&self) -> bool {
+        self.context_tokens
+            .zip(self.auto_compact_tokens)
+            .is_some_and(|(used, line)| used >= crate::auto_compact_warning_tokens(line))
     }
 
     pub fn queued_inputs(&self) -> Vec<QueuedInput> {
