@@ -1624,6 +1624,17 @@ impl Agent {
                     policy,
                 )
             };
+            // Plan refuses these host tools before any rule is consulted.
+            let is_plan_mode_host_denial = decision == Decision::Deny
+                && execution_mode == ExecutionMode::Plan
+                && matches!(
+                    host_permission,
+                    Some(
+                        crate::host_tools::HostToolPermission::Automatic
+                            | crate::host_tools::HostToolPermission::Reviewable
+                            | crate::host_tools::HostToolPermission::Confirmation
+                    )
+                );
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
@@ -1768,6 +1779,8 @@ impl Agent {
                     auto_mode::prompts_unavailable_message(&name)
                 } else if is_rejected_by_user && name == ENTER_PLAN_MODE_TOOL_NAME {
                     plan::enter_plan_mode_declined(permission_comment.as_deref())
+                } else if !is_rejected_by_user && is_plan_mode_host_denial {
+                    self.plan_mode_refusal(receipt).await
                 } else {
                     permission_denial_message(permission_comment.as_deref())
                 };
@@ -2197,7 +2210,7 @@ impl Agent {
                     let mut assessment_details = None;
                     if decision == Decision::Deny {
                         deterministic_denial_reason = Some(if is_plan_mode_side_effect {
-                            "Plan execution mode denied this side effect".to_owned()
+                            self.plan_mode_refusal(receipt).await
                         } else if let Some(message) = policy.content_denial_message(
                             &prepared.name,
                             &prepared.input,

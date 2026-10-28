@@ -352,8 +352,7 @@ fn check_direct_call(
             folder: ceiling.folder.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         };
-        let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
-            && (prepared.is_read_only || chat.snapshot.policy.mode == ExecutionMode::Plan);
+        let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path));
         if !is_plan_file_access && !prepared.is_supported_in_delegated_scope() {
             return Err(
                 "Unsupported: the operation is outside the delegated resource scope".into(),

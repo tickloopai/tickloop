@@ -216,6 +216,15 @@ pub struct SafetyCheck {
 // names them without depending on the runtime.
 pub const ENTER_PLAN_MODE_TOOL_NAME: &str = "EnterPlanMode";
 pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "ExitPlanMode";
+/// The input of the `ExitPlanMode` permission request that asks the user to leave Plan mode
+/// without a plan, Claude Code's "Exit plan mode?" dialog; a plan approval names its
+/// `plan_version` instead.
+pub const EXIT_PLAN_MODE_WITHOUT_PLAN: &str = "exit_without_plan";
+
+/// Whether a permission request asks to leave Plan mode without a plan.
+pub fn exits_plan_mode_without_plan(name: &str, input: &serde_json::Value) -> bool {
+    name == EXIT_PLAN_MODE_TOOL_NAME && input[EXIT_PLAN_MODE_WITHOUT_PLAN] == true
+}
 pub const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
 pub const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
 /// The result of an `AskUserQuestion` call the user declined: Claude Code's `REJECT_MESSAGE`,

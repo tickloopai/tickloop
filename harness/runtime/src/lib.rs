@@ -475,9 +475,12 @@ struct Chat {
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
-    /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
-    /// plan, so the next request owes the model the exited-plan-mode notice.
+    /// Claude Code's `needsPlanModeExitAttachment`: the Chat left Plan mode, so the next request
+    /// owes the model the exited-plan-mode notice.
     needs_plan_mode_exit_notice: bool,
+    /// Claude Code's `hasExitedPlanMode`: the Chat left Plan mode since its last re-entry notice,
+    /// so returning to Plan with an existing plan file tells the model it is re-entering.
+    has_exited_plan_mode: bool,
     /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
     /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
     /// it unknown.
@@ -885,9 +888,24 @@ fn mode_before_plan_after(
 impl Chat {
     /// Changes the execution mode, remembering the mode Plan is entered from.
     fn change_execution_mode(&mut self, mode: ExecutionMode) {
+        self.record_plan_mode_transition(self.snapshot.policy.mode, mode);
         self.mode_before_plan =
             mode_before_plan_after(self.mode_before_plan, self.snapshot.policy.mode, mode);
         self.snapshot.policy.mode = mode;
+    }
+
+    /// Claude Code's `handlePlanModeTransition` and `setHasExitedPlanMode`: leaving Plan owes
+    /// the model the exit notice and makes a later return to Plan a re-entry; returning to Plan
+    /// before the notice is sent withdraws it.
+    fn record_plan_mode_transition(&mut self, from: ExecutionMode, to: ExecutionMode) {
+        match (from, to) {
+            (_, ExecutionMode::Plan) => self.needs_plan_mode_exit_notice = false,
+            (ExecutionMode::Plan, _) => {
+                self.needs_plan_mode_exit_notice = true;
+                self.has_exited_plan_mode = true;
+            }
+            _ => {}
+        }
     }
 
     /// Replaces the snapshot, forgetting the mode Plan was entered from if the mode changes.
@@ -3175,8 +3193,12 @@ impl Agent {
         let timing = timing::Phase::new("announce_host_tool_changes");
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         drop(timing);
-        let timing = timing::Phase::new("announce_plan_mode_exit");
+        let timing = timing::Phase::new("announce_plan_mode");
         Box::pin(self.announce_plan_mode_exit(receipt)).await?;
+        Box::pin(self.announce_plan_mode(receipt)).await?;
+        drop(timing);
+        let timing = timing::Phase::new("announce_task_reminder");
+        Box::pin(self.announce_task_reminder(receipt)).await?;
         drop(timing);
         // Only a Chat with a Folder probes the host it runs in.
         let workspace_host = self
@@ -3220,16 +3242,13 @@ impl Agent {
                 }
                 None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
                 self.conversation_system_message(
                     chat,
-                    receipt.loop_id,
                     &family_roster,
                     workspace_host.as_ref(),
-                    plan_mode.as_deref(),
                     &registry.searched_names(),
                 ),
             );
@@ -4797,15 +4816,8 @@ impl Agent {
         let _settings_gate = self.inner.settings_writes.lock().await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        // Claude Code's `handlePlanModeTransition`: leaving Plan owes the model an exit notice, and
-        // returning to Plan before it is sent withdraws it.
         let leaves_plan =
             chat.snapshot.policy.mode == ExecutionMode::Plan && mode != ExecutionMode::Plan;
-        match (chat.snapshot.policy.mode, mode) {
-            (_, ExecutionMode::Plan) => chat.needs_plan_mode_exit_notice = false,
-            (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
-            _ => {}
-        }
         chat.change_execution_mode(mode);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
@@ -5024,6 +5036,10 @@ impl Agent {
                 chat.snapshot.permissions.iter().any(|request| {
                     request.id == request_id
                         && request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME
+                        && !tickloop_harness_tools::exits_plan_mode_without_plan(
+                            &request.name,
+                            &request.input,
+                        )
                 })
             }) {
                 return Err(AgentError::Invalid(
@@ -5729,6 +5745,7 @@ impl NewChat {
             bookkeeping,
             start_new_tool_result_message: false,
             needs_plan_mode_exit_notice: false,
+            has_exited_plan_mode: false,
             mode_before_plan: None,
             active: None,
             active_run: None,

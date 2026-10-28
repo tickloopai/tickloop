@@ -245,26 +245,49 @@ pub fn submit_plan(id: &str, markdown: &str) -> Vec<Content> {
     .concat()
 }
 
-/// The plan file path named by the plan-mode reminder in a request's system prompt.
+/// The plan file path named by the latest Plan mode reminder in a request's conversation.
 pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
-    let system = request
+    request
         .messages
         .iter()
-        .filter(|message| message.role == Role::System)
-        .flat_map(|message| &message.content)
-        .find_map(|content| match content {
+        .rev()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| message.content.iter().rev())
+        .filter_map(|content| match content {
             Content::Text { text } => Some(text.as_str()),
             _ => None,
-        })?;
-    [
-        ("create your plan at ", " using the Write tool."),
-        ("A plan file already exists at ", ". You can read it"),
-    ]
-    .into_iter()
-    .find_map(|(before, after)| {
-        let (_, rest) = system.split_once(before)?;
-        Some(rest.split_once(after)?.0.to_owned())
-    })
+        })
+        .find_map(|text| {
+            [
+                ("create your plan at ", " using the Write tool."),
+                ("A plan file already exists at ", ". You can read it"),
+                ("Read-only except plan file (", ")."),
+                (
+                    "A plan file exists at ",
+                    " from your previous planning session.",
+                ),
+            ]
+            .into_iter()
+            .find_map(|(before, after)| {
+                let (_, rest) = text.split_once(before)?;
+                Some(rest.split_once(after)?.0.to_owned())
+            })
+        })
+}
+
+/// The text of every Plan mode reminder and other host note in a request's conversation, in
+/// order: user-role text wrapped in `<system-reminder>` tags.
+pub fn host_note_texts(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } if text.starts_with("<system-reminder>\n") => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// How long [`next_event`] waits for the next runtime event.

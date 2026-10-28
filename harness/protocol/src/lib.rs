@@ -68,10 +68,10 @@ pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
     AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, GuidanceNote, HostNote,
     InputId, LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
-    PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
-    ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
-    ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
-    chat_has_work, chat_preview, short_chat_title,
+    PermissionApprovalSource, PermissionExecution, PermissionRequest, PlanModeNote,
+    PlanModeReminder, PromptPolicy, ProposedToolCall, QueuedInput, QueuedInputKind, Receipt,
+    ResponseId, RunId, SavedChat, ToolCallRecovery, UserShellReceipt, UserShellRecord,
+    UserShellState, chat_display_title, chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_breakdown::{

@@ -298,6 +298,14 @@ pub struct ChainEntry {
     /// Code's `plan_mode_exit` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_mode_exit: bool,
+    /// Tickloop extension: marks a host note carrying Plan mode instructions, Claude Code's
+    /// `plan_mode` and `plan_mode_reentry` attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<tickloop_harness_protocol::PlanModeNote>,
+    /// Tickloop extension: marks the host note reminding the model of the task tools, Claude
+    /// Code's `task_reminder` attachment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task_reminder: bool,
     /// Tickloop extension: marks the host note telling the model the date it now is, Claude
     /// Code's `date_change` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2683,7 +2683,7 @@ async fn plan_rejects_writes_without_prompting_even_when_an_allow_rule_matches()
                 .any(|message| {
                     message.content.iter().any(|content| {
                         matches!(content, Content::ToolResult { content, is_error: true, .. }
-                    if content.text().contains("Plan execution mode denied"))
+                    if content.text().starts_with("Plan mode is active.") && content.text().contains("This operation was not executed."))
                     })
                 })
         );

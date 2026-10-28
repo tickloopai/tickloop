@@ -636,6 +636,8 @@ mod tests {
             is_meta: false,
             host_tools: None,
             plan_mode_exit: false,
+            plan_mode: None,
+            task_reminder: false,
             date_change: None,
             guidance: None,
             execution_mode: None,

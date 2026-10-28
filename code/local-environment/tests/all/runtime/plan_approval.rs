@@ -104,8 +104,8 @@ async fn every_approval_mode_returns_the_reviewed_plan_and_continues_the_same_ru
         assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult { tool_use_id, content, is_error: false } if tool_use_id == "plan" && content.text().contains("User has approved your plan.") && content.text().ends_with("Create the reviewed report."))));
         assert_eq!(
             exit_notices(&requests[1]),
-            0,
-            "the approval result already resumes the model"
+            1,
+            "like Claude Code 2.1.302, the approval leaves Plan and says so once"
         );
         agent.shutdown().await;
     }
@@ -427,14 +427,21 @@ async fn a_mode_change_during_a_run_applies_from_the_next_model_request() {
             .unwrap();
     }
     completed(&mut events, &receipt).await;
-    let planning = model
-        .requests
-        .lock()
-        .unwrap()
+    let requests = model.requests.lock().unwrap().clone();
+    let planning = requests
         .iter()
         .map(|request| reminded_plan_file(request).is_some())
         .collect::<Vec<_>>();
-    assert_eq!(planning, [false, true, false]);
+    assert_eq!(
+        planning,
+        [false, true, true],
+        "reminders stay in the history"
+    );
+    assert_eq!(
+        requests.iter().map(exit_notices).collect::<Vec<_>>(),
+        [0, 0, 1],
+        "the request after leaving Plan says so"
+    );
     agent.shutdown().await;
 }
 
@@ -479,8 +486,8 @@ async fn closing_a_plan_review_keeps_the_plan_pending_and_the_chosen_mode() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         exit_notices(&requests[1]),
-        0,
-        "approving after Shift+Tab left Plan resumes with the approved plan alone"
+        1,
+        "Shift+Tab left Plan, so the continuation says so once, as in Claude Code 2.1.302"
     );
     agent.shutdown().await;
 }
@@ -612,12 +619,13 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
     assert_eq!(child.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3);
-    assert!(system_prompt(&requests[0]).contains(
-        "Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
+    assert!(host_note_texts(&requests[0]).concat().contains(
+        "Subagent children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
     ));
-    let child_prompt = system_prompt(&requests[1]);
-    assert!(child_prompt.contains("Your parent Agent writes the plan"));
-    assert!(!child_prompt.contains("ExitPlanMode"), "{child_prompt}");
+    let child_notes = host_note_texts(&requests[1]).concat();
+    assert!(child_notes.contains("Answer the query you were given comprehensively in your final message, and do not write a plan or anything else to a file."));
+    assert!(!child_notes.contains("ExitPlanMode"), "{child_notes}");
+    assert!(!system_prompt(&requests[1]).contains("ExitPlanMode"));
     assert!(reminded_plan_file(&requests[1]).is_none());
     assert!(
         requests[1]
@@ -686,10 +694,10 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
         matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.ends_with(&format!("The plan file is located at {plan_file} if you need to reference it.\n</system-reminder>")))
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(
-        snapshot.host_notes.values().collect::<Vec<_>>(),
-        [&HostNote::PlanModeExit]
-    );
+    assert!(matches!(
+        snapshot.host_notes.values().collect::<Vec<_>>()[..],
+        [HostNote::PlanMode(_), HostNote::PlanModeExit]
+    ));
     let public = serde_json::to_string(&snapshot.public_conversation_items().unwrap()).unwrap();
     assert!(!public.contains(EXIT_NOTICE), "{public}");
     agent.shutdown().await;

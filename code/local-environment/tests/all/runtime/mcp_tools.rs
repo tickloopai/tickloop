@@ -6611,8 +6611,6 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
     for field in [
         "loop",
-        "plan",
-        "execution_mode",
         "service_connections",
         "artifact_ticks",
         "web_search",
@@ -6641,6 +6639,8 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         "family_temp_directory",
         "scratchpad",
         "workspace_host",
+        "plan",
+        "execution_mode",
     ] {
         assert!(state.get(absent).is_none(), "{absent}");
     }

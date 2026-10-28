@@ -23,15 +23,17 @@ use tickloop_harness_base::private_fs::{
 };
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatSnapshot, EventKind, FileReadRecord, LoopId, OperationRecord, PermissionApprovalSource,
-    Plan, Progress, PromptPolicy, Receipt, TodoItem, ToolDefinition, ToolResult,
+    ChatSnapshot, EventKind, FileReadRecord, HostNote, LoopId, OperationRecord,
+    PermissionApprovalSource, Plan, PlanModeNote, PlanModeReminder, Progress, PromptPolicy,
+    Receipt, Role, TodoItem, ToolDefinition, ToolResult,
 };
 use tickloop_harness_tools::{
-    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, FileReadRecordExt, TODO_WRITE_TOOL_NAME,
+    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_WITHOUT_PLAN,
+    FileReadRecordExt, TODO_WRITE_TOOL_NAME,
 };
 
 mod prompts;
-pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reminder};
+pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice};
 
 /// Components of the plan file's directory and file name `<slug>-loop-<loopId>.md`.
 const PLANS_DIRECTORY: &str = "plans";
@@ -50,6 +52,10 @@ const MAX_TODO_TEXT_BYTES: usize = 4096;
 /// Following Claude Code's `MAX_SLUG_RETRIES`: regenerate when the generated slug is already taken
 /// by a plan file.
 const MAX_SLUG_RETRIES: usize = 10;
+/// Claude Code 2.1.302's `TURNS_BETWEEN_ATTACHMENTS` and `FULL_REMINDER_EVERY_N_ATTACHMENTS`: a
+/// Plan mode reminder at most every five user turns, every fifth one in full.
+const TURNS_BETWEEN_PLAN_REMINDERS: usize = 5;
+const FULL_PLAN_REMINDER_EVERY: usize = 5;
 
 /// Following the "adjective-verb-noun" format of Claude Code's `generateWordSlug`, with words taken
 /// from the first part of its word lists.
@@ -649,6 +655,69 @@ pub(super) fn rebuild_plans_and_progress(
     Ok(warnings)
 }
 
+/// Which Plan mode reminder is due, following Claude Code 2.1.302's `getPlanModeAttachments`:
+/// none while fewer than five user turns followed the last reminder of this stretch in Plan,
+/// otherwise the next in the sequence since the Chat last left Plan, every fifth in full. A
+/// reminder that named another plan file, as after a fork or a recovered plan file prefix, is
+/// replaced at once by a full one. Only the conversation the model still sees counts.
+fn due_plan_mode_reminder(
+    snapshot: &ChatSnapshot,
+    plan_file: Option<&Path>,
+) -> Option<PlanModeReminder> {
+    let start = snapshot.active_start();
+    let mut user_turns = 0;
+    let mut last_reminder = None;
+    for index in (start..snapshot.messages.len()).rev() {
+        match snapshot.host_notes.get(&index) {
+            Some(HostNote::PlanMode(note)) => {
+                last_reminder = Some(note);
+                break;
+            }
+            Some(HostNote::PlanModeExit) => break,
+            Some(_) => continue,
+            None => {}
+        }
+        let message = &snapshot.messages[index];
+        if message.role == Role::User
+            && !message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolResult { .. }))
+        {
+            user_turns += 1;
+        }
+    }
+    let names_another_file =
+        last_reminder.is_some_and(|note| note.plan_file.as_deref() != plan_file);
+    if names_another_file {
+        return Some(PlanModeReminder::Full);
+    }
+    if last_reminder.is_some() && user_turns < TURNS_BETWEEN_PLAN_REMINDERS {
+        return None;
+    }
+    let earlier_reminders = snapshot
+        .host_notes
+        .range(start..)
+        .rev()
+        .map(|(_, note)| note)
+        .take_while(|note| **note != HostNote::PlanModeExit)
+        .filter(|note| {
+            matches!(
+                note,
+                HostNote::PlanMode(PlanModeNote {
+                    reminder: PlanModeReminder::Full | PlanModeReminder::Sparse,
+                    ..
+                })
+            )
+        })
+        .count();
+    Some(if earlier_reminders % FULL_PLAN_REMINDER_EVERY == 0 {
+        PlanModeReminder::Full
+    } else {
+        PlanModeReminder::Sparse
+    })
+}
+
 impl Agent {
     /// Declines the reviewed version. A waiting ExitPlanMode receives the feedback, or the
     /// cancellation that ends its Run. Without a waiting tool, feedback starts a planning
@@ -809,9 +878,10 @@ impl Agent {
         snapshot.policy.mode = mode;
         snapshot.policy.revision += 1;
         self.save(&snapshot);
+        // Like Claude Code's approval, leaving Plan here owes the exit notice as well.
+        chat.record_plan_mode_transition(chat.snapshot.policy.mode, mode);
+        let offers_task_tools = snapshot.task_tools_enabled;
         chat.replace_snapshot(snapshot);
-        // The approval result or continuation carries the approved plan; no exit notice follows.
-        chat.needs_plan_mode_exit_notice = false;
         if let Some(request) = request {
             let pending = approvals
                 .remove(&request.id)
@@ -829,7 +899,11 @@ impl Agent {
                 .retain(|permission| permission.id != request.id);
             return Ok(None);
         }
-        Ok(Some(prompts::approved_plan(&plan_file, &markdown)))
+        Ok(Some(prompts::approved_plan(
+            &plan_file,
+            &markdown,
+            offers_task_tools,
+        )))
     }
 
     /// The directory of plan files: `<root>/plans` when Chats are saved locally, otherwise `plans` under
@@ -846,41 +920,89 @@ impl Agent {
         }
     }
 
-    /// The plan mode section of a conversation request while the Chat is in Plan mode. It names
-    /// the Loop's plan file, choosing the Chat's plan file prefix on first use. A delegated child
-    /// has no plan file: it researches read-only and reports in its final reply.
-    pub(super) fn plan_mode_section(&self, chat: &mut Chat, loop_id: LoopId) -> Option<String> {
+    /// The Plan mode reminders the next request of a Chat in Plan owes, as host notes: like
+    /// Claude Code's `plan_mode` attachment, the first request in Plan gets the full reminder,
+    /// later ones another reminder every five user turns, every fifth in full and the rest
+    /// sparse; returning to Plan with an earlier plan file adds the `plan_mode_reentry` notice
+    /// first. Names the Loop's plan file, choosing the Chat's plan file prefix on first use. A
+    /// delegated child has no plan file: it researches read-only and reports in its final reply.
+    pub(super) fn plan_mode_notes(
+        &self,
+        chat: &mut Chat,
+        loop_id: LoopId,
+    ) -> Vec<(String, HostNote)> {
         if chat.snapshot.policy.mode != ExecutionMode::Plan {
-            return None;
+            return Vec::new();
         }
+        let note = |reminder, plan_file: Option<&Path>| {
+            HostNote::PlanMode(PlanModeNote {
+                reminder,
+                plan_file: plan_file.map(Path::to_path_buf),
+            })
+        };
         if chat.snapshot.delegation.is_some() {
-            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
+            return due_plan_mode_reminder(&chat.snapshot, None)
+                .map(|reminder| {
+                    (
+                        prompts::delegated_plan_mode_reminder(),
+                        note(reminder, None),
+                    )
+                })
+                .into_iter()
+                .collect();
         }
         // A Chat without a Folder has no plan file; Plan mode there only reads.
-        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
+        let Some(folder) = chat.snapshot.folder.as_deref() else {
+            return Vec::new();
+        };
+        let directory = self.plans_directory(folder);
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
         if ensure_plan_slug(&mut chat.bookkeeping, directory.path()) {
             self.save(&chat.snapshot);
         }
-        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)?;
-        Some(plan_mode_reminder(&plan_file, plan_file.exists()))
+        let Some(plan_file) = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
+        else {
+            return Vec::new();
+        };
+        let Some(reminder) = due_plan_mode_reminder(&chat.snapshot, Some(&plan_file)) else {
+            return Vec::new();
+        };
+        let plan_exists = plan_file.exists();
+        let mut notes = Vec::new();
+        if std::mem::take(&mut chat.has_exited_plan_mode) && plan_exists {
+            notes.push((
+                prompts::plan_mode_reentry_reminder(&plan_file),
+                note(PlanModeReminder::Reentry, Some(&plan_file)),
+            ));
+        }
+        let text = match reminder {
+            PlanModeReminder::Sparse => prompts::sparse_plan_mode_reminder(&plan_file),
+            _ => prompts::plan_mode_reminder(
+                &plan_file,
+                plan_exists,
+                self.inner.tool_policy.delegation,
+            ),
+        };
+        notes.push((text, note(reminder, Some(&plan_file))));
+        notes
     }
 
-    /// The Plan mode section as the next request would send it, without preparing the plan file
-    /// it names: a Chat without a plan file prefix yet reads with a stand-in name.
-    pub(super) fn plan_mode_preview(&self, chat: &Chat, loop_id: LoopId) -> Option<String> {
-        if chat.snapshot.policy.mode != ExecutionMode::Plan {
-            return None;
-        }
-        if chat.snapshot.delegation.is_some() {
-            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
-        }
-        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
-        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
-            .unwrap_or_else(|| directory.path().join(format!("plan{PLAN_FILE_EXTENSION}")));
-        Some(plan_mode_reminder(&plan_file, plan_file.exists()))
+    /// The result of a side effect Plan mode refused, naming the Loop's plan file.
+    pub(super) async fn plan_mode_refusal(&self, receipt: &Receipt) -> String {
+        let chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get(&receipt.chat_id) else {
+            return prompts::plan_mode_refusal(None, false);
+        };
+        let plan_file = chat.snapshot.folder.as_deref().and_then(|folder| {
+            current_plan_file(
+                &chat.bookkeeping,
+                self.plans_directory(folder).path(),
+                receipt.loop_id,
+            )
+        });
+        prompts::plan_mode_refusal(plan_file.as_deref(), chat.snapshot.delegation.is_some())
     }
 
     pub(super) async fn control_tool(
@@ -915,14 +1037,10 @@ impl Agent {
                 return Err("permission denied".into());
             }
             let mut snapshot = chat.snapshot.clone();
-            let (kind, content) = match name {
+            let (kind, step) = match name {
                 ENTER_PLAN_MODE_TOOL_NAME => {
                     if snapshot.policy.mode == ExecutionMode::Plan {
-                        return Ok(Some(ToolResult {
-                            content: prompts::already_in_plan_mode(),
-                            is_error: false,
-                            output_ref: None,
-                        }));
+                        return Ok(ControlStep::Done(prompts::already_in_plan_mode()));
                     }
                     chat.mode_before_plan = super::mode_before_plan_after(
                         chat.mode_before_plan,
@@ -931,7 +1049,11 @@ impl Agent {
                     );
                     snapshot.policy.mode = ExecutionMode::Plan;
                     snapshot.policy.revision += 1;
-                    (None, Some(prompts::entered_plan_mode()))
+                    chat.record_plan_mode_transition(
+                        chat.snapshot.policy.mode,
+                        ExecutionMode::Plan,
+                    );
+                    (None, ControlStep::Done(prompts::entered_plan_mode()))
                 }
                 EXIT_PLAN_MODE_TOOL_NAME => {
                     let mut bookkeeping = chat.bookkeeping.clone();
@@ -942,7 +1064,13 @@ impl Agent {
                         receipt.loop_id,
                     )?;
                     chat.bookkeeping = bookkeeping;
-                    (Some(EventKind::PlanUpdated { plan }), None)
+                    match plan {
+                        Some(plan) => (
+                            Some(EventKind::PlanUpdated { plan }),
+                            ControlStep::AwaitPlanApproval,
+                        ),
+                        None => (None, ControlStep::AwaitPlanModeExit),
+                    }
                 }
                 _ => unreachable!("plan tools were checked above"),
             };
@@ -951,20 +1079,95 @@ impl Agent {
             if let Some(kind) = kind {
                 self.emit(chat, receipt, kind);
             }
-            Ok(content.map(|content| ToolResult {
-                content,
-                is_error: false,
-                output_ref: None,
-            }))
+            Ok(step)
         }
         .await;
         Some(match result {
-            Ok(Some(result)) => Ok(result),
-            Ok(None) => {
+            Ok(ControlStep::Done(content)) => Ok(ToolResult {
+                content,
+                is_error: false,
+                output_ref: None,
+            }),
+            Ok(ControlStep::AwaitPlanApproval) => {
                 self.wait_for_plan_approval(receipt, operation, cancel)
                     .await
             }
+            Ok(ControlStep::AwaitPlanModeExit) => {
+                self.wait_for_plan_mode_exit(receipt, operation, cancel)
+                    .await
+            }
             Err(error) => Err(error),
+        })
+    }
+
+    /// Claude Code 2.1.302's ExitPlanMode without a plan: asks the user whether to leave Plan
+    /// mode. Yes restores the mode Plan was entered from, Ask when that is unknown; no keeps
+    /// Plan, and without feedback ends the Run like a cancelled plan approval.
+    async fn wait_for_plan_mode_exit(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, String> {
+        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+            return Err(
+                "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
+            );
+        }
+        let workspace = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+            super::session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
+                chat,
+            ))
+            .map_err(|error| error.to_string())?
+        };
+        let mut request_operation = operation.clone();
+        request_operation.input = json!({ EXIT_PLAN_MODE_WITHOUT_PLAN: true });
+        let session_operation = SessionPermissionOperation::from_normalized(
+            operation.name.clone(),
+            operation.input.clone(),
+            workspace,
+        )
+        .map_err(|error| error.to_string())?;
+        let answer = self
+            .request_permission(
+                receipt,
+                &request_operation,
+                session_operation,
+                super::PermissionPrompt {
+                    source: PermissionApprovalSource::ExplicitAsk,
+                    reason: Some("Exit plan mode without a plan".into()),
+                    mcp_server: None,
+                },
+                cancel.clone(),
+            )
+            .await?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&receipt.chat_id)
+            .ok_or("chat is unavailable")?;
+        if !answer.allow {
+            if answer.comment.is_none() {
+                chat.user_cancelled_runs.insert(receipt.run_id);
+                cancel.cancel();
+            }
+            return Ok(ToolResult {
+                content: prompts::declined_plan_mode_exit(answer.comment.as_deref()),
+                is_error: true,
+                output_ref: None,
+            });
+        }
+        if chat.snapshot.policy.mode == ExecutionMode::Plan {
+            let mode = chat.mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits);
+            chat.change_execution_mode(mode);
+            chat.snapshot.policy.revision += 1;
+            self.save(&chat.snapshot);
+        }
+        Ok(ToolResult {
+            content: prompts::APPROVED_PLAN_MODE_EXIT.into(),
+            is_error: false,
+            output_ref: None,
         })
     }
 
@@ -979,7 +1182,7 @@ impl Agent {
                 "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
             );
         }
-        let (plan, path, workspace, snapshot, bookkeeping) = {
+        let (plan, path, workspace, snapshot, bookkeeping, offers_task_tools) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
             let plan = chat
@@ -1010,6 +1213,7 @@ impl Agent {
                 .map_err(|error| error.to_string())?,
                 chat.snapshot.clone(),
                 chat.bookkeeping.clone(),
+                chat.snapshot.task_tools_enabled,
             )
         };
         self.checkpoint_transcript(&snapshot, &bookkeeping).await?;
@@ -1052,7 +1256,7 @@ impl Agent {
         }
         Ok(ToolResult {
             content: if answer.allow {
-                prompts::approved_plan(&path, &plan.markdown)
+                prompts::approved_plan(&path, &plan.markdown, offers_task_tools)
             } else {
                 prompts::declined_plan(answer.comment.as_deref())
             },
@@ -1063,14 +1267,15 @@ impl Agent {
 
     /// `ExitPlanMode`: reads the Loop's plan file and records its content as the next plan
     /// version for approval. The file is rewritten with that version's line, and a Chat that has
-    /// read the file keeps editing it without reading it again.
+    /// read the file keeps editing it without reading it again. A missing or blank plan file is
+    /// no plan: `None`, and the user is asked to leave Plan without one.
     fn submit_plan_file(
         &self,
         chat: &Chat,
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
         loop_id: LoopId,
-    ) -> Result<Plan, String> {
+    ) -> Result<Option<Plan>, String> {
         if snapshot.policy.mode != ExecutionMode::Plan {
             return Err(prompts::NOT_IN_PLAN_MODE.into());
         }
@@ -1089,9 +1294,7 @@ impl Agent {
         let path = plan_file_path(directory, &slug, loop_id).map_err(|error| error.to_string())?;
         let markdown = match read_plan_file(directory, &slug, loop_id) {
             Ok(file) => file.markdown,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(prompts::missing_plan_file(&path));
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(format!(
                     "cannot read the plan file {}: {error}",
@@ -1100,7 +1303,7 @@ impl Agent {
             }
         };
         if markdown.trim().is_empty() {
-            return Err(prompts::empty_plan_file(&path));
+            return Ok(None);
         }
         let version = highest_plan_version(snapshot, bookkeeping).unwrap_or(0) + 1;
         let contents = write_plan_file(directory, &slug, loop_id, version, &markdown)
@@ -1124,6 +1327,13 @@ impl Agent {
         };
         snapshot.plans.retain(|plan| plan.loop_id != loop_id);
         snapshot.plans.push(plan.clone());
-        Ok(plan)
+        Ok(Some(plan))
     }
+}
+
+/// What a plan control tool does after its synchronous part.
+enum ControlStep {
+    Done(String),
+    AwaitPlanApproval,
+    AwaitPlanModeExit,
 }

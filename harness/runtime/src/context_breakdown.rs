@@ -214,13 +214,11 @@ impl Agent {
             ),
             None => crate::tool_results::cut_tool_results_over_budget(&mut messages),
         }
-        let loop_id = chat.snapshot.chat_loop.id;
         let workspace_host = chat
             .snapshot
             .folder
             .is_some()
             .then(|| crate::host_tools::current_workspace_host(provider.as_deref()));
-        let plan_mode = self.plan_mode_preview(chat, loop_id);
         let user_context = chat
             .user_context
             .get()
@@ -229,10 +227,8 @@ impl Agent {
         Ok(ContextParts {
             system_prompt: self.conversation_system_message(
                 chat,
-                loop_id,
                 family_roster,
                 workspace_host.as_ref(),
-                plan_mode.as_deref(),
                 &registry.searched_names(),
             ),
             system_tools,
@@ -281,6 +277,8 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),
             HostNote::PlanModeExit => "Plan mode exit".into(),
+            HostNote::PlanMode(_) => "Plan mode reminder".into(),
+            HostNote::TaskReminder => "Task reminder".into(),
         });
     }
     matches!(

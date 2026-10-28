@@ -100,3 +100,5 @@ mod launch_rules;
 
 #[path = "all/deferred_plan_tool.rs"]
 mod deferred_plan_tool;
+#[path = "all/plan_reminders.rs"]
+mod plan_reminders;

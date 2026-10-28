@@ -104,9 +104,10 @@ pub trait PermissionPolicyExt {
 
     fn decide(&self, operation: &PreparedTool, workspace: &Workspace, loop_id: Uuid) -> Decision;
 
-    /// [`Self::decide_with_session`] with Claude Code's allowance for the current Loop's plan
-    /// file, which comes before its other file checks: the file is always readable and, in Plan
-    /// mode, the one writable file. Explicit Deny and Ask rules still apply to it.
+    /// [`Self::decide_with_session`] with Claude Code 2.1.302's allowance for the current Loop's
+    /// plan file, which comes before its other file checks: in every mode the file is readable
+    /// and writable without asking, and in Plan it is the one writable file. Explicit Deny and
+    /// Ask rules still apply to it.
     fn decide_with_plan_file(
         &self,
         operation: &PreparedTool,
@@ -270,8 +271,7 @@ impl PermissionPolicyExt for PermissionPolicy {
         session: Option<SessionPermissionDecision>,
         plan_file: Option<&Path>,
     ) -> Decision {
-        let is_plan_file_access = plan_file.is_some_and(|path| operation.accesses_file(path))
-            && (operation.is_read_only || self.mode == ExecutionMode::Plan);
+        let is_plan_file_access = plan_file.is_some_and(|path| operation.accesses_file(path));
         if !is_plan_file_access {
             return self.decide_with_session(operation, workspace, loop_id, session);
         }
@@ -1824,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn the_current_plan_file_is_readable_and_writable_only_in_plan_mode() {
+    fn the_current_plan_file_is_readable_and_writable_in_every_mode() {
         let directory = tempfile::tempdir().unwrap();
         let plans = tempfile::tempdir().unwrap();
         let plans_path = plans.path().canonicalize().unwrap();
@@ -1859,12 +1859,26 @@ mod tests {
         };
         assert_eq!(decide(&denied, &plan_write), Decision::Deny);
 
-        let ask = PermissionPolicy {
-            mode: ExecutionMode::AcceptEdits,
-            ..PermissionPolicy::default()
-        };
-        assert_eq!(decide(&ask, &plan_read), Decision::Allow);
-        assert_eq!(decide(&ask, &plan_write), Decision::Ask);
+        for mode in [
+            ExecutionMode::AcceptEdits,
+            ExecutionMode::Auto,
+            ExecutionMode::FullAccess,
+        ] {
+            let policy = PermissionPolicy {
+                mode,
+                ..PermissionPolicy::default()
+            };
+            assert_eq!(decide(&policy, &plan_read), Decision::Allow, "{mode:?}");
+            assert_eq!(decide(&policy, &plan_write), Decision::Allow, "{mode:?}");
+            for decision in [Decision::Deny, Decision::Ask] {
+                let ruled = PermissionPolicy {
+                    mode,
+                    rules: vec![tool_rule(decision, "Write", None)],
+                    ..PermissionPolicy::default()
+                };
+                assert_eq!(decide(&ruled, &plan_write), decision, "{mode:?}");
+            }
+        }
     }
 
     #[test]

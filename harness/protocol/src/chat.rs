@@ -417,6 +417,11 @@ pub enum HostNote {
     /// Claude Code's `plan_mode_exit` attachment: the user left Plan mode without approving a
     /// plan.
     PlanModeExit,
+    /// Claude Code's `plan_mode` and `plan_mode_reentry` attachments: the Plan mode instructions,
+    /// written into the conversation while the Chat is in Plan.
+    PlanMode(PlanModeNote),
+    /// Claude Code's `task_reminder` attachment: the task tools have not been used for a while.
+    TaskReminder,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
@@ -429,9 +434,34 @@ impl HostNote {
     pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::HostTools(announced) => Some(announced),
-            Self::PlanModeExit | Self::Guidance(_) | Self::DateChange(_) => None,
+            Self::PlanModeExit
+            | Self::PlanMode(_)
+            | Self::TaskReminder
+            | Self::Guidance(_)
+            | Self::DateChange(_) => None,
         }
     }
+}
+
+/// A Plan mode reminder note: which reminder, and the plan file it named.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlanModeNote {
+    pub reminder: PlanModeReminder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file: Option<PathBuf>,
+}
+
+/// Which Plan mode reminder a note carries, following Claude Code's `reminderType` and its
+/// separate `plan_mode_reentry` attachment.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanModeReminder {
+    /// The whole planning workflow.
+    Full,
+    /// The short reminder sent between full ones.
+    Sparse,
+    /// Returning to Plan with an earlier plan file to evaluate.
+    Reentry,
 }
 
 /// What a guidance note announces, like Claude Code's Skill messages and
