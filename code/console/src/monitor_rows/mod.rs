@@ -683,7 +683,8 @@ impl MonitorRowsRegistry {
             if !rows.is_empty() {
                 mark_subscribed(entry, rows);
             }
-            if rows.is_empty()
+            // Beside periodic subscriptions, Send Update hands over what they hold at once.
+            if rows.iter().all(|row| row.frequency.period().is_some())
                 && entry.instance.access() == "hosted"
                 && entry.running
                 && entry.owner == TickOwner::ThisChat

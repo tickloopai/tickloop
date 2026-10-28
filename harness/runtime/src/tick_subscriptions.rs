@@ -693,6 +693,26 @@ impl TickDeliveries {
         }
     }
 
+    /// Makes every periodic subscription of `chat_id` on `instance` that holds something due now,
+    /// so its own delivery hands it to the Loop at once and its next check follows a period later;
+    /// a Terminal Tick's changed screen is sampled first, as at a check. Whether any held
+    /// something.
+    fn make_held_due(&mut self, chat_id: ChatId, instance: &InstanceRef, now: Instant) -> bool {
+        let mut held = false;
+        for subscription in self.subscriptions.values_mut().filter(|subscription| {
+            subscription.chat_id == chat_id
+                && &subscription.instance == instance
+                && subscription.ready
+                && subscription.blocked.is_none()
+                && subscription.frequency.period().is_some()
+                && (subscription.latest.is_some() || subscription.has_pending_change)
+        }) {
+            subscription.due_at = Some(now);
+            held = true;
+        }
+        held
+    }
+
     fn next_due(&self) -> Option<Instant> {
         let retries = self.pending.values().filter_map(|pending| pending.retry_at);
         self.subscriptions
@@ -1405,23 +1425,39 @@ impl Agent {
         Ok(authority)
     }
 
+    /// The user's Send Update: hands the Loop the Tick's news now. What the Chat's periodic
+    /// Tick Subscriptions on it hold goes through their own delivery, which then waits a whole
+    /// period for the next check; `None` says so. Otherwise the Tick's current state is read and
+    /// delivered as a manual update, whose receipt is returned.
     pub async fn tick_send_update_for_user(
         &self,
         chat_id: ChatId,
         instance: InstanceRef,
-    ) -> Result<Receipt, AgentError> {
+    ) -> Result<Option<Receipt>, AgentError> {
         let (loop_id, title) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             let chat_loop = &chat.snapshot.chat_loop;
-            if chat_loop
+            let subscriptions = chat_loop
                 .subscriptions
                 .iter()
-                .any(|subscription| subscription.instance == instance)
+                .filter(|subscription| subscription.instance == instance);
+            if subscriptions
+                .clone()
+                .any(|subscription| subscription.frequency.period().is_none())
             {
                 return Err(AgentError::Invalid(
-                    "Send Update is available for unsubscribed Ticks".into(),
+                    "Send Update is not available for immediate Tick Subscriptions".into(),
                 ));
+            }
+            if subscriptions.count() > 0
+                && self
+                    .tick_deliveries()
+                    .make_held_due(chat_id, &instance, Instant::now())
+            {
+                drop(chats);
+                self.inner.tick_wake.notify_one();
+                return Ok(None);
             }
             // Asked before the Tick is read; the entry asks again with what was read.
             let unread = TriggerSource::TickManual {
@@ -1547,6 +1583,7 @@ impl Agent {
             },
         )
         .await
+        .map(Some)
     }
 
     pub(super) async fn revalidate_manual_tick_source(

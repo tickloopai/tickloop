@@ -1537,12 +1537,17 @@ impl EmbeddedAgentAccess {
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
             }
-            LoopAction::TickUpdate { instance } => Ok(CommandResult::Submitted(
-                agent
+            // Held updates go through their subscription's own delivery, with no receipt.
+            LoopAction::TickUpdate { instance } => Ok(
+                match agent
                     .tick_send_update_for_user(chat.into(), instance)
                     .await
-                    .map_err(agent_access_error)?,
-            )),
+                    .map_err(agent_access_error)?
+                {
+                    Some(receipt) => CommandResult::Submitted(receipt),
+                    None => CommandResult::Done,
+                },
+            ),
             LoopAction::TickManage { instance } => {
                 agent
                     .tick_subscribe_for_user(chat.into(), instance)
