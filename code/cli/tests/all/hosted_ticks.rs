@@ -2243,6 +2243,75 @@ for line in sys.stdin:
         assert_eq!(item["recover_with"], "history");
     }
 
+    /// A program reached through a link runs by the link's path, as in a terminal: one that
+    /// dispatches on its invocation name (MacVim's `vim` link to `mvim`) or finds its files beside
+    /// the link (a virtual environment's `bin/python`) sees the link, not the program it names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_tick_opened_through_a_link_sees_the_links_name_and_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let daemon = Daemon::start(1).await;
+        let chat = daemon.chats[0];
+        let tools = daemon.tools();
+        let programs = daemon.root.join("invocation");
+        let target = programs.join("real/report-invocation");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            "#!/bin/sh\nprintf 'invoked as %s\\n' \"$0\"\nprintf 'beside it: %s\\n' \"$(cat \"$(dirname \"$0\")/../pyvenv.cfg\")\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let venv_bin = programs.join("venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::fs::write(programs.join("venv/pyvenv.cfg"), "home = fake-venv").unwrap();
+        std::os::unix::fs::symlink(&target, venv_bin.join("python")).unwrap();
+
+        let opened = run_tool(
+            &tools,
+            chat,
+            "TickManage",
+            json!({"action":"open","command":["invocation/venv/bin/python"],"cwd":daemon.root}),
+        )
+        .await;
+        let invoked = daemon
+            .root
+            .canonicalize()
+            .unwrap()
+            .join("invocation/venv/bin/python");
+        let expected = [
+            format!("invoked as {}", invoked.display()),
+            "beside it: home = fake-venv".to_owned(),
+        ];
+        let mut text = String::new();
+        for _ in 0..400 {
+            let read = run_tool(
+                &tools,
+                chat,
+                "TickRead",
+                json!({"tick_instance_id":opened["tick_instance_id"]}),
+            )
+            .await;
+            text = read["data"]["text"].as_str().unwrap_or_default().to_owned();
+            if read["data"]["exit"] != Value::Null {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for line in &expected {
+            assert!(
+                text.contains(line.as_str()),
+                "{line:?} missing from {text:?}"
+            );
+        }
+        run_tool(
+            &tools,
+            chat,
+            "TickManage",
+            json!({"action":"close","tick_instance_id":opened["tick_instance_id"]}),
+        )
+        .await;
+    }
+
     /// The TickManage input that opens `/bin/cat` as a terminal Tick in the daemon's Tickhost.
     fn cat_command(daemon: &Daemon) -> Value {
         json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root})
@@ -2298,10 +2367,7 @@ for line in sys.stdin:
             json!({"tick_instance_id":instance}),
         )
         .await;
-        assert_eq!(
-            described["descriptor"]["command"],
-            json!([std::fs::canonicalize("/bin/cat").unwrap()])
-        );
+        assert_eq!(described["descriptor"]["command"], json!(["/bin/cat"]));
         assert!(read.get("command").is_none());
         assert_eq!(read["data"]["exit"], Value::Null);
         let refused = tools

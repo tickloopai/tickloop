@@ -630,6 +630,25 @@ impl DaemonServer {
         }
         Ok(())
     }
+    /// The Worker already running the family of a saved Subagent, which loads the member into
+    /// that family; a second Worker would run the same family twice.
+    async fn family_worker(
+        &self,
+        record: &TranscriptRef,
+    ) -> Result<Option<Arc<dyn AgentAccess>>, AccessError> {
+        let Some(root_chat) = crate::records::family_root(record).await? else {
+            return Ok(None);
+        };
+        let root = TranscriptRef {
+            store_root: record.store_root.clone(),
+            chat_id: root_chat,
+        };
+        self.directory().await?;
+        let Some(execution) = self.inner.records.lock().await.get(&root).copied() else {
+            return Ok(None);
+        };
+        Ok(self.worker(execution).await.ok())
+    }
     async fn execute_worker(
         &self,
         worker: Arc<dyn AgentAccess>,
@@ -747,6 +766,9 @@ impl DaemonServer {
                         }
                         Err(error) => return Err(error),
                     }
+                }
+                if !as_new && let Some(worker) = self.family_worker(record).await? {
+                    return self.execute_worker(worker, envelope).await;
                 }
                 let launch = launch.as_ref().ok_or_else(|| {
                     AccessError::invalid("loading an inactive record requires its LaunchSpec")

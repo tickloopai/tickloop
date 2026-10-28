@@ -4,6 +4,7 @@ use tickloop_code_access::{
     AccessError, ObservationValue, Page, RecordedMessage, RecordedTranscript, TranscriptRef,
 };
 use tickloop_harness::runtime::{AgentError, transcript::records};
+use uuid::Uuid;
 
 use crate::access_error::agent_access_error;
 
@@ -15,6 +16,13 @@ pub(crate) async fn saved_records(
     records::saved_records(root, folder, page.offset, page.bounded_limit())
         .await
         .map(ObservationValue::Records)
+        .map_err(agent_access_error)
+}
+
+/// The root Chat of the family the saved `record` belongs to, when it is a Subagent's.
+pub(crate) async fn family_root(record: &TranscriptRef) -> Result<Option<Uuid>, AccessError> {
+    records::saved_family_root(record.store_root.clone(), record.chat_id)
+        .await
         .map_err(agent_access_error)
 }
 

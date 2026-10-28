@@ -170,7 +170,10 @@ impl LocalShells {
                 .await
                 .map_err(|error| ExecutionError::new(error.code, error.message))?;
         }
-        let shell = Path::new(&spec.shell).canonicalize().map_err(io_error)?;
+        // The shell runs by the path it was chosen by, links kept, so it sees the name it was
+        // invoked as; the approval binds the file that path names.
+        let shell = std::path::absolute(&spec.shell).map_err(io_error)?;
+        shell.metadata().map_err(io_error)?;
         let cwd = Path::new(&spec.cwd).canonicalize().map_err(io_error)?;
         let output_path = if Path::new(&spec.output).is_absolute() {
             std::path::PathBuf::from(&spec.output)

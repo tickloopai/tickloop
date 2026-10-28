@@ -1785,3 +1785,56 @@ async fn artifact_tick_metadata_before_a_compaction_boundary_survives_restart() 
     );
     reopened.shutdown().await;
 }
+
+#[tokio::test]
+async fn saved_chats_leave_subagents_to_their_family_and_a_subagent_record_names_its_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let model = Arc::new(tickloop_harness::test_support::routed::RoutedModel::new(
+        |request| {
+            if !tickloop_harness::test_support::routed::state(request)["delegation"].is_null() {
+                return text("child report");
+            }
+            if !tickloop_harness::test_support::routed::has_tool_result(request, "delegate") {
+                return call(
+                    "delegate",
+                    "Subagent",
+                    json!({"task":"Inspect the module","name":"inspector"}),
+                );
+            }
+            text("root done")
+        },
+    ));
+    let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, "Delegate the inspection").await;
+    let child = agent.subagents(chat).await.unwrap()[0].child_chat_id;
+    agent.shutdown().await;
+
+    let reopened = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(Vec::<Vec<_>>::new())),
+    )
+    .unwrap();
+    let saved = reopened.saved_chats(directory.path()).await.unwrap();
+    assert_eq!(saved.iter().map(|chat| chat.id).collect::<Vec<_>>(), [chat]);
+    reopened.shutdown().await;
+    let records = tickloop_harness::runtime::transcript::records::saved_records(
+        root.clone(),
+        directory.path().into(),
+        0,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        records.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+        [chat]
+    );
+    let family_root = |chat: ChatId| {
+        tickloop_harness::runtime::transcript::records::saved_family_root(root.clone(), chat.uuid())
+    };
+    assert_eq!(family_root(child).await.unwrap(), Some(chat.uuid()));
+    assert_eq!(family_root(chat).await.unwrap(), None);
+}
