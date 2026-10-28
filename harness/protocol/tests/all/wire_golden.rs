@@ -147,9 +147,10 @@ fn permission_policy() -> PermissionPolicy {
         rules: vec![permission_rule(0x71, Decision::Allow, true)],
         project_constraints: vec![permission_rule(0x72, Decision::Ask, false)],
         managed_constraints: vec![permission_rule(0x73, Decision::Deny, true)],
-        // Never on the wire: the golden shows neither.
+        // Never on the wire: the golden shows none of these.
         host_rules: vec![permission_rule(0x74, Decision::Allow, false)],
         plan_without_auto: true,
+        mode_before_plan: Some(ExecutionMode::Auto),
         launch_rules: Vec::new(),
         revision: 4,
     }

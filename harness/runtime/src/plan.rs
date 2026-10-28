@@ -1034,8 +1034,8 @@ impl Agent {
                     if snapshot.policy.mode == ExecutionMode::Plan {
                         return Ok(ControlStep::Done(prompts::already_in_plan_mode()));
                     }
-                    chat.mode_before_plan = super::mode_before_plan_after(
-                        chat.mode_before_plan,
+                    snapshot.policy.mode_before_plan = super::mode_before_plan_after(
+                        snapshot.policy.mode_before_plan,
                         snapshot.policy.mode,
                         ExecutionMode::Plan,
                     );
@@ -1147,7 +1147,7 @@ impl Agent {
             });
         }
         if chat.snapshot.policy.mode == ExecutionMode::Plan {
-            let mode = ExecutionMode::Plan.leaving_plan(chat.mode_before_plan);
+            let mode = ExecutionMode::Plan.leaving_plan(chat.snapshot.policy.mode_before_plan);
             chat.change_execution_mode(mode);
             chat.snapshot.policy.revision += 1;
             self.save(&chat.snapshot);
