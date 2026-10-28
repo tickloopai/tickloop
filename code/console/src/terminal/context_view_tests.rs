@@ -223,6 +223,34 @@ fn a_narrow_terminal_puts_the_categories_under_a_smaller_grid() {
     );
 }
 
+/// The grid rows and how many cells the first of them holds.
+fn grid_shape(window: u64, width: usize) -> (usize, usize) {
+    let mut sized = breakdown();
+    sized.context_window_tokens = Some(window);
+    let lines = texts(&render(&sized, width, false));
+    let rows = grid_rows(&lines);
+    let columns = rows[0]
+        .chars()
+        .step_by(2)
+        .take_while(|character| "⛁⛀⛶⛝".contains(*character))
+        .count();
+    (rows.len(), columns)
+}
+
+#[test]
+fn a_window_from_500k_up_gets_the_twenty_column_grid() {
+    assert_eq!(grid_shape(872_000, 120), (10, 20), "Codex reports 872k");
+    assert_eq!(grid_shape(500_000, 120), (10, 20));
+    assert_eq!(grid_shape(499_999, 120), (10, 10));
+}
+
+#[test]
+fn a_narrow_terminal_keeps_five_columns_whatever_the_window() {
+    assert_eq!(grid_shape(872_000, 40), (10, 5));
+    assert_eq!(grid_shape(500_000, 40), (10, 5));
+    assert_eq!(grid_shape(499_999, 40), (5, 5));
+}
+
 #[test]
 fn without_a_known_window_no_grid_or_shares_are_shown() {
     let mut unknown = breakdown();
