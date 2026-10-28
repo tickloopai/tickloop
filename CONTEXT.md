@@ -10,7 +10,7 @@ Tickloop's product glossary. This file gives only term definitions and naming co
 A running object that the Agent can describe, read, and call, and from which it receives Tick Updates when it changes. There are only four Tick types (see "Tick Types"); a program a person starts themselves in a Herdr Pane or another terminal is not a Tick.
 
 **Tick Instance**:
-One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the Pane or other view that shows it; closing and reopening produces a new instance.
+One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the card that shows it; closing and reopening produces a new instance.
 _Avoid_: using a Pane ID to refer to a Tick
 
 **Tick Standard**:
@@ -28,7 +28,7 @@ One change in data or state produced by a Tick Instance, carrying its source and
 _Avoid_: event (in the general sense), notification
 
 **Tick Model Tools**:
-The model tools the Agent uses to operate Ticks: TickDescribe queries capabilities and the tool catalog, TickRead reads the current state, TickCall calls a Tick Tool declared by an Extension Tick, and TickManage manages instances, views, terminal input, and subscriptions. Shell and Artifact keep their own native tools (Bash/Read/TaskStop; ArtifactRead/ArtifactEdit/ArtifactComment/ArtifactUpload). TickUpdate and TickSubscription are names of events and relationships in the content stream, not model tools.
+The model tools the Agent uses to operate Ticks: TickDescribe queries capabilities and the tool catalog, TickRead reads the current state, TickCall calls a Tick Tool declared by an Extension Tick, and TickManage manages instances, terminal input, and subscriptions. Shell and Artifact keep their own native tools (Bash/Read/TaskStop; ArtifactRead/ArtifactEdit/ArtifactComment/ArtifactUpload). TickUpdate and TickSubscription are names of events and relationships in the content stream, not model tools.
 
 **Tick Tool**:
 A capability an Extension Tick declares in its own description for the Agent to call through TickCall, either a query (returns data) or an action (changes that instance's content or presentation). A Tick Tool does not change the Layout and brings no additional authorization.
@@ -39,11 +39,12 @@ An explicitly established association between a Chat's Loop and a Tick Instance;
 _Avoid_: listen, Watch, poll
 
 **Tickhost**:
-The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Herdr Panes, Monitor pop-ups, and ordinary terminals are only views attached to it. The program, process, and command are always written `tickhost`.
+The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Tick Cards in the Monitor are the only views attached to it. The program, process, and command are always written `tickhost`.
 _Avoid_: Tick host, tick-host, tick_host
 
-**Tick View**:
-A display and input surface attached to a Tick Instance; one Tick can have several views at once, and closing a view does not end the Tick. Esc (hide view) and Ctrl+B (attach prefix) belong to the view.
+**Tick Card**:
+The only view of a local Tick: a card in the Agent View's Monitor column, attached through Tickhost, with a Tickloop title above the Tick's own screen. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick.
+_Avoid_: popup, view Pane
 
 **Tick Ownership**:
 A persistent Chat's responsibility for the lifetime of the Ticks it opens, determined jointly by the config root and the Chat identity; a Subagent's Chat independently owns its own Ticks.
@@ -195,7 +196,7 @@ _Avoid_: owner, owner daemon, Agent execution service
 The process the Daemon starts for each root Agent; it calls the Harness as a library and runs model calls, tools, approvals, Triggers, and the Transcript for that Agent and its Subagents and Branches. Processes that run the Harness in other hosts are not called Workers.
 
 **Monitor**:
-The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom. Membership is managed separately from subscription and ownership.
+The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom; local Ticks are shown in it as Tick Cards. Membership is managed separately from subscription and ownership.
 _Avoid_: Ticks panel, task list
 
 **Unread Update**:
@@ -450,13 +451,13 @@ _Avoid_: Space (former Tickloop container name)
 The organization and arrangement of Workspace → Tab → Pane in Herdr, including splits, sizes, positions, and focus; managed separately from a Tick's business content.
 
 **Layout Host**:
-The external environment that hosts the Workspace layout and Tick Views, currently Herdr; it only presents views, and Ticks do not run in it.
+The external environment that hosts the Workspace layout and Agent Views, currently Herdr; Ticks neither run nor are shown in it.
 
 **Tab**:
 A page in a Herdr Workspace that organizes a set of Panes; display name and identity are handled separately.
 
 **Pane**:
-A layout container in Herdr that hosts a terminal session; it can be split, resized, and moved, and can present a Tick View. Pane identity and Tick Instance identity are handled separately.
+A layout container in Herdr that hosts a terminal session; it can be split, resized, and moved, and can present an Agent View, never a Tick. Pane identity and Tick Instance identity are handled separately.
 _Avoid_: Panel (former Tickloop container name)
 
 ### Appearance

@@ -41,7 +41,7 @@ Want to see a Tick in action? Ask the agent:
 
 > Open `python3 tick/examples/counter.py` with `protocol: true` and subscribe to it.
 
-Then press Enter on the Counter in the Monitor, type `+` and press Enter: the agent receives the new count and responds.
+Then select the Counter in the Monitor and press Enter to step into its card, type `+` and press Enter: the agent receives the new count and responds. Press `esc` to step out again.
 
 ## Everyday use
 
@@ -68,12 +68,11 @@ Keys:
 - `shift+tab` switches between Auto and Plan mode.
 - `ctrl+j` inserts a new line; `ctrl+g` edits your message in an external editor.
 - In lists and menus, use `j`/`k` or the arrow keys, `enter` to choose and `esc` to go back.
-- In the Monitor, `enter` opens a Tick and `esc` hides it again; the program keeps running.
+- Ticks appear as cards in the Monitor column, inside Herdr or any other terminal. In the Monitor list, `space` (or a click on the row) shows or hides a Tick's card; `enter` (or a click on an open card) steps into the Tick, so your keys go to it, `ctrl+c` included. Several cards can be open at once.
+- Inside a card, `esc` steps out and the card stays open; `esc esc` sends one `esc` to the Tick. Clicking outside the card also steps out. Shell cards are read only. The program keeps running when you hide its card or step out.
 - To close/remove a Tick, stop a Shell, unlink an Artifact or delete a scheduled task in Monitor, press plain `x` twice on the same row within three seconds. The first press shows a red `Press x again to …` hint, with no dialog. Expiry, selection movement, another key or leaving cancels it. `Ctrl+X` does not perform these actions; in text inputs and filters, `x` stays text.
 
 When a conversation nears the end of the model's context window, the agent summarizes it before its next request. That happens once the context passes the window less room for the summary (the model's output limit, at most 20,000 tokens) and a 13,000-token buffer, but never below half the window; `/context` shows the space past that point as the Autocompact buffer. From 20,000 tokens before that point the status line's `Context N% used` turns to the warning color and the conversation says once how near it is; `/compact` compacts at any time. To compact earlier, set `autoCompactWindow` in `settings.json` to a number of tokens, for example `"autoCompactWindow": 400000`; when it is smaller than the model's window, the point is measured in it instead. Conversations started or reopened afterwards use it.
-
-Inside Herdr, Monitor registers a popup plugin for each configuration root. The default `~/.tickloop` keeps `tickloop.monitor` at `~/.tickloop/herdr-popup-plugin`; other roots, including `make dev`’s `~/.tickloop-dev`, use `tickloop.monitor.<root-key>` at `<configuration root>/herdr-popup-plugin`, with the root path in the display name. The stable root key is shared with the daemon and Tickhost. Both plugins can be registered in one Herdr session. On first use in each root, accept Monitor’s registration offer, or run `tickloop monitor popup install --herdr-socket SOCKET`; `remove` unregisters only that root’s plugin. Existing default-root registrations keep working.
 
 ## Permissions and sandbox
 
@@ -192,7 +191,7 @@ To uninstall in the panel, press `x` twice on the same Installed row within thre
 
 Once a Tick is installed (and logged in, if it needs a login), ask the agent to open it by name, for example "open the NAME Tick and watch it". Installation runs nothing: a Tick's program runs as you only when opened under your permission settings. A disabled Tick cannot be opened by name. Installing, updating, removing and logging in are your actions; the agent only asks you to do them.
 
-Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py).
+Any program can become an Extension Tick by speaking the [Tick protocol](tick/protocol/SPECIFICATION.md); start from the [counter example](tick/examples/counter.py). A Tick is shown in a Monitor card at least 30 columns wide: it must stay usable at that width, redraw its whole screen when resized, and can ask for 6 to 14 rows with `screen.min_rows` in its description (6 by default). Go back a level with Backspace; a single `esc` never reaches the Tick.
 
 ## Plugins
 
