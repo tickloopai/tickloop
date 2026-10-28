@@ -572,6 +572,78 @@ async fn wait_for_running_shell(
 }
 
 #[tokio::test]
+async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        bash("long-shell", "sleep 30"),
+        text("answered now"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    allow_bash(&agent, chat.uuid()).await;
+    let mut events = agent.subscribe();
+    let active = agent
+        .submit(chat, "start the long work".into())
+        .await
+        .unwrap();
+    wait_for_running_shell(&agent, chat.uuid(), "long-shell", &mut events).await;
+    let queued = agent.submit(chat, "how is it going".into()).await.unwrap();
+    assert_eq!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [queued.run_id],
+        "a message alone waits for the tool boundary"
+    );
+
+    let sent_at = std::time::Instant::now();
+    agent.send_now(chat, queued.run_id).await.unwrap();
+    let mut interrupted = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::Interrupted if event.run_id == active.run_id => interrupted = true,
+            EventKind::InputMerged { into_run_id } if into_run_id == active.run_id => {
+                panic!("a message sent now never joins the interrupted run")
+            }
+            EventKind::Completed { .. } if event.run_id == queued.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(interrupted, "the run ahead of the message is interrupted");
+    assert!(
+        sent_at.elapsed() < std::time::Duration::from_secs(10),
+        "the message does not wait for the running tool"
+    );
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let newest = requests[1].messages.last().unwrap();
+    assert!(
+        newest
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::Text { text } if text == "how is it going")),
+        "the next model call ends with the message sent now: {newest:?}"
+    );
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn send_now_leaves_the_run_that_already_answers_the_message() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ToolThenWaitingModel {

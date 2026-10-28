@@ -63,7 +63,7 @@ Then press Enter on the Counter in the Monitor, type `+` and press Enter: the ag
 
 Keys:
 
-- `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` sends right away: running foreground Bash commands move to the background and keep running, and anything else is interrupted. Subagents always run in the background.
+- `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.
 - `esc` interrupts the agent. Press it twice on an empty input to undo to an earlier message.
 - `shift+tab` switches between Auto and Plan mode.
 - `ctrl+j` inserts a new line; `ctrl+g` edits your message in an external editor.
