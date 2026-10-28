@@ -588,11 +588,19 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     finish_turn(&resumed, chat.uuid(), "Return to A").await;
     let a_requests = a_requests.await.unwrap();
     let b_requests = b_requests.await.unwrap();
-    let stable_prefix = &a_requests[1].1["messages"].as_array().unwrap()[..3];
-    assert_eq!(
-        stable_prefix,
-        &a_requests[2].1["messages"].as_array().unwrap()[..3]
-    );
+    // The prompt cache breakpoints move from request to request; the bytes they mark do not.
+    let messages = |body: &Value| {
+        let mut messages = body["messages"].as_array().unwrap()[..3].to_vec();
+        for block in messages
+            .iter_mut()
+            .flat_map(|message| message["content"].as_array_mut().unwrap())
+        {
+            block.as_object_mut().unwrap().remove("cache_control");
+        }
+        messages
+    };
+    let stable_prefix = &messages(&a_requests[1].1);
+    assert_eq!(stable_prefix, &messages(&a_requests[2].1));
     assert_eq!(
         stable_prefix[2]["content"][0]["signature"],
         "original-signed-block"
