@@ -79,7 +79,7 @@ fn missing_tiers_are_selectable_without_rebinding_existing_defaults_or_plan_mode
     for provider in ["kimi-cn-api", "kimi-global-api"] {
         let config = catalog.get(provider, "kimi-k2.7-code").unwrap();
         assert!(access.series_for(&config).is_some());
-        assert_eq!(access.recommended_model(provider), Some("kimi-k3"));
+        assert_eq!(access.recommended_model(provider), Some("kimi-k3.1-pro"));
         assert_eq!(
             config.card.as_ref().unwrap().context_window_tokens,
             Some(262144)

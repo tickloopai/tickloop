@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::{fs, path::Path};
 use tickloop_code_settings::UserSettings;
-use tickloop_harness::model::cards::ModelCatalog;
+use tickloop_harness::model::{ModelConfigExt, cards::ModelCatalog};
 
 fn builtin_selection_with_ignored_overrides(root: &Path) {
     fs::create_dir_all(root.join("providers")).unwrap();
@@ -117,6 +117,44 @@ fn builtin_selections_need_no_definition_file_or_notice() {
             .unwrap()
     );
     assert!(loaded.into_warnings().is_empty());
+}
+
+#[test]
+fn saved_terra_selections_keep_old_and_new_identities_on_their_original_connections() {
+    let root = tempfile::tempdir().unwrap();
+    let catalog = ModelCatalog::defaults();
+    for (provider, context_window) in [("openai-api", 1_050_000), ("openai-codex", 872_000)] {
+        for model in ["gpt-5.6-terra", "gpt-6.1-terra"] {
+            let current = catalog.get(provider, model).unwrap();
+            let mut stale = current.clone();
+            stale.max_output_tokens = 1;
+            stale.card.as_mut().unwrap().max_output_tokens = 1;
+            stale.card.as_mut().unwrap().context_window_tokens = Some(272_000);
+            for (state, expected_warnings) in [
+                (
+                    json!({"defaultModel": {"provider": provider, "model": model}}),
+                    0,
+                ),
+                (json!({"model": stale}), 1),
+            ] {
+                let saved = serde_json::to_vec(&state).unwrap();
+                fs::write(root.path().join("settings.json"), &saved).unwrap();
+                let mut loaded = UserSettings::in_root(root.path()).load();
+                let selected = loaded.configured_model().unwrap().unwrap();
+                assert_eq!(selected, current, "{provider}/{model}");
+                assert_eq!(selected.model, model);
+                assert_eq!(selected.model_id, model);
+                assert_eq!(selected.provider_id, provider);
+                assert_eq!(
+                    selected.maximum_context_window_tokens(),
+                    Some(context_window)
+                );
+                assert_eq!(selected.max_output_tokens, 128_000);
+                assert_eq!(loaded.into_warnings().len(), expected_warnings);
+                assert_eq!(fs::read(root.path().join("settings.json")).unwrap(), saved);
+            }
+        }
+    }
 }
 
 #[test]

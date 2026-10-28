@@ -3,7 +3,7 @@ use tickloop_harness_test_support::model_http_support;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 use tickloop_harness_model::{
-    LocalModelClients, ModelClients, ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelRequest, StructuredOutput,
     access::AccessCatalog,
     availability::AccountModelDiscovery,
     cards::{ModelCatalog, built_in_model_profiles},
@@ -12,7 +12,8 @@ use tickloop_harness_model::{
 };
 use tickloop_harness_protocol::{
     Adapter, Content, ImageMediaType, ImageSource, Message, ModelAvailability, ModelConfig,
-    ProviderPatch, ReasoningEffort, Role, ThinkingControl, ToolDefinition,
+    NativeToolSearch, ProviderPatch, ReasoningEffort, Role, ThinkingControl, ToolDefinition,
+    auto_compact_tokens,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -44,11 +45,22 @@ fn api_cards_are_independent_and_recommendations_keep_exact_versions() {
         api.endpoints,
         BTreeMap::from([(Adapter::Responses, "https://api.openai.com/v1".into())])
     );
-    for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-luna"] {
+    for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"] {
         let profile = catalog.get("openai-api", model).unwrap();
         let card = profile.card.as_ref().unwrap();
-        assert_eq!(card.context_window_tokens, Some(1_050_000));
-        assert_eq!(card.max_output_tokens, 128_000);
+        assert_eq!(card.context_window_tokens, Some(1_050_000), "{model}");
+        assert_eq!(card.max_output_tokens, 128_000, "{model}");
+        assert_eq!(profile.max_output_tokens, 128_000, "{model}");
+        assert_eq!(
+            auto_compact_tokens(&profile, None, None),
+            Some(1_017_000),
+            "{model}"
+        );
+        assert_eq!(card.adapter, Adapter::Responses);
+        assert_eq!(
+            card.native_tool_search.flatten(),
+            Some(NativeToolSearch::OpenAi)
+        );
         assert!(profile.accepts_images());
         assert!(access.series_for(&profile).is_some());
         assert_eq!(card.display_name, profile.name);
@@ -87,6 +99,70 @@ fn api_cards_are_independent_and_recommendations_keep_exact_versions() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn terra_api_upgrade_rebinds_the_series_and_keeps_the_previous_card_loadable() {
+    let catalog = ModelCatalog::defaults();
+    let access = AccessCatalog::defaults();
+    let current = catalog.get("openai-api", "gpt-6.1-terra").unwrap();
+    let retained = catalog.get("openai-api", "gpt-5.6-terra").unwrap();
+    let visible = built_in_model_profiles();
+    assert!(visible.contains(&current));
+    assert!(!visible.contains(&retained));
+    assert_eq!(access.ordinary_candidate(&current, &catalog), Some(true));
+    assert_eq!(access.ordinary_candidate(&retained, &catalog), Some(false));
+    assert!(access.series_for(&retained).is_none());
+    let series = access.series_for(&current).unwrap();
+    assert_eq!(series.id, "terra");
+    assert_eq!(series.name, "GPT Terra");
+    assert_eq!(series.model, "gpt-6.1-terra");
+    assert_eq!(series.capability_order, Some(2));
+    assert_eq!(access.recommended_model("openai-api"), Some("gpt-6-astra"));
+    assert_eq!(
+        access
+            .provider("openai-api")
+            .unwrap()
+            .auxiliary_model
+            .as_deref(),
+        Some("gpt-6-luna")
+    );
+    for profile in [&current, &retained] {
+        let card = profile.card.as_ref().unwrap();
+        assert_eq!(card.thinking, ThinkingControl::Toggle);
+        assert!(!card.adaptive_by_default);
+        assert_eq!(
+            card.effort_levels,
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+            ]
+        );
+        for effort in card
+            .effort_levels
+            .iter()
+            .copied()
+            .chain([ReasoningEffort::Off])
+        {
+            assert!(validate_reasoning_effort(profile, Some(effort)).is_ok());
+        }
+        assert_eq!(profile.maximum_context_window_tokens(), Some(1_050_000));
+        assert_eq!(profile.max_output_tokens, 128_000);
+        assert_eq!(card.max_output_tokens, 128_000);
+        assert_eq!(auto_compact_tokens(profile, None, None), Some(1_017_000));
+        assert_eq!(card.adapter, Adapter::Responses);
+        assert!(profile.accepts_images());
+        assert_eq!(
+            card.native_tool_search.flatten(),
+            Some(NativeToolSearch::OpenAi)
+        );
+    }
+    assert_eq!(current.name, "GPT-6.1 Terra");
+    assert_eq!(retained.name, "GPT-5.6 Terra");
+    assert_ne!(current.identity(), retained.identity());
 }
 
 fn stream(output: Vec<Value>) -> String {
@@ -185,7 +261,7 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
     let configuration = config(
         &root,
         endpoint.trim_end_matches("/anthropic").to_owned() + "/v1",
-        "gpt-6.1-sol",
+        "gpt-6.1-terra",
     );
     let client = LocalModelClients::new(Some(root.to_path_buf()))
         .client(&configuration)
@@ -209,7 +285,8 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
             .contains("authorization: bearer test-openai-key")
     );
     assert!(!headers.to_ascii_lowercase().contains("chatgpt-account-id"));
-    assert_eq!(wire["model"], "gpt-6.1-sol");
+    assert_eq!(wire["model"], "gpt-6.1-terra");
+    assert_eq!(wire["max_output_tokens"], 128_000);
     assert_eq!(wire["store"], false);
     assert_eq!(wire["reasoning"]["effort"], "low");
     assert_eq!(

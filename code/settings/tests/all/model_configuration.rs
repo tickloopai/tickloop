@@ -270,7 +270,7 @@ fn custom_legacy_codex_keeps_fixed_adapter_and_known_capabilities() {
     assert_ne!(migrated.provider_id, "openai-codex");
     let card = migrated.card.as_ref().unwrap();
     assert_eq!(card.adapter, Adapter::CodexResponses);
-    assert_eq!(card.context_window_tokens, Some(272_000));
+    assert_eq!(card.context_window_tokens, Some(872_000));
     assert!(!card.effort_levels.is_empty());
     assert_eq!(migrate_legacy_model(migrated.clone()), migrated);
 }

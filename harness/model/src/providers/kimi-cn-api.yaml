@@ -19,13 +19,35 @@ selection:
   series:
   - id: kimi
     name: Kimi
-    model: kimi-k3
+    model: kimi-k3.1-pro
     capability_order: 0
+  - id: kimi-highspeed
+    name: Kimi Highspeed
+    model: kimi-k3.1-pro-highspeed
+    capability_order: 1
   - id: kimi-code
     name: Kimi Code
     model: kimi-k2.7-code
-    capability_order: 1
+    capability_order: 2
 models:
+- id: kimi-k3.1-pro
+  display_name: Kimi K3.1 Pro
+  adapter: kimi_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels: [low, high, max]
+  input_modalities: [text, image]
+  temperature_control: unsupported
+- id: kimi-k3.1-pro-highspeed
+  display_name: Kimi K3.1 Pro Highspeed
+  adapter: kimi_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels: [low, high, max]
+  input_modalities: [text, image]
+  temperature_control: unsupported
 - id: kimi-k3
   display_name: Kimi K3
   adapter: kimi_chat_completions
