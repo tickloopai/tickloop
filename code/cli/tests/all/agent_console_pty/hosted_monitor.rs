@@ -242,21 +242,6 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
     }
 }
 
-/// Whether the focused card, the one under the row marked `input`, shows `text`.
-fn focused_card_shows(frame: &str, text: &str) -> bool {
-    let parts: Vec<&str> = frame.lines().filter_map(monitor_part).collect();
-    let Some(focused) = parts
-        .iter()
-        .position(|part| part.trim_end().ends_with("input"))
-    else {
-        return false;
-    };
-    parts[focused + 1..]
-        .iter()
-        .take_while(|part| !part.trim_start_matches(['▌', ' ']).starts_with('◉'))
-        .any(|part| part.contains(text))
-}
-
 /// The rows each keys Tick's card shows it, from the size its screen reports.
 fn keys_card_rows(frame: &str) -> Vec<u16> {
     frame
@@ -270,10 +255,11 @@ fn keys_card_rows(frame: &str) -> Vec<u16> {
 }
 
 /// Ticks that declare key bubbling move the focus with the keys they do not use: a bubbled Down
-/// enters the next card, a bubbled Esc goes back to the list at once, after the Tick got the
-/// Esc. Cards of Ticks that declare `screen.max_rows` grow into the spare height up to it.
+/// or Tab goes back to the list with another Tick's row selected, entering no card, and a
+/// bubbled Esc goes back to the list at once, after the Tick got the Esc. Cards of Ticks that
+/// declare `screen.max_rows` grow into the spare height up to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_bubbled_keys_move_between_cards_and_back_to_the_list() {
+async fn actual_cli_bubbled_keys_go_back_to_the_list_with_another_tick_selected() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_keys_ticks_progress(
@@ -310,19 +296,45 @@ async fn actual_cli_bubbled_keys_move_between_cards_and_back_to_the_list() {
         .await;
 
         view.send(b"\x1b[B");
-        view.wait_for("the first Tick got Down and bubbled it", |frame| {
-            card_shows(frame, "keys 1b 5b 42") && focused_card_shows(frame, "count 0")
+        view.wait_for("the bubbled Down went back to the list", |frame| {
+            card_shows(frame, "keys 1b 5b 42")
+                && !card_focused(frame)
+                && frame.contains("space hide")
+                && keys_cards(frame) == 2
         })
         .await;
+        view.send(b"\r");
+        view.wait_for("a card entered", card_focused).await;
         view.send(b"q");
-        view.wait_for("the bubbled Down entered the second card", |frame| {
-            card_shows(frame, "keys 71") && card_shows(frame, "keys 1b 5b 42")
+        view.wait_for(
+            "Enter entered the second card, which Down selected",
+            |frame| {
+                card_focused(frame)
+                    && card_shows(frame, "keys 71")
+                    && card_shows(frame, "keys 1b 5b 42")
+            },
+        )
+        .await;
+
+        view.send(b"\t");
+        view.wait_for("the bubbled Tab went back to the list", |frame| {
+            card_shows(frame, "keys 71 09") && !card_focused(frame) && keys_cards(frame) == 2
         })
+        .await;
+        view.send(b"\r");
+        view.wait_for("a card entered", card_focused).await;
+        view.send(b"z");
+        view.wait_for(
+            "Enter entered the first card, which Tab selected",
+            |frame| card_focused(frame) && card_shows(frame, "keys 1b 5b 42 7a"),
+        )
         .await;
 
         view.send(b"\x1b");
         view.wait_for("the bubbled Esc went back to the list", |frame| {
-            card_shows(frame, "keys 71 1b") && !card_focused(frame) && frame.contains("space hide")
+            card_shows(frame, "keys 1b 5b 42 7a 1b")
+                && !card_focused(frame)
+                && frame.contains("space hide")
         })
         .await;
         // An Esc right after it would end the Esc pair on the list; a later one leaves the list.

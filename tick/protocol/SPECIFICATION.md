@@ -454,7 +454,7 @@ The host uses `mutates` to decide whether approval is needed before a call and w
 A client may show a Tick's terminal in a card beside its conversation, as the Monitor does. Such a card is exactly `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. A Tick that declares `screen.max_rows` may get more rows, up to `screen.max_rows`, when the client has height to spare; a client never takes rows from another card's `min_rows` to grow one. For Ticks shown this way:
 
 - A Tick **MAY** use Esc, but **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick. The first Esc is delivered at once.
-- A Tick **SHOULD** declare key bubbling and bubble the keys listed in [Section 5.8](#s5-8) that it does not use, so the person can move between cards with them.
+- A Tick **SHOULD** declare key bubbling and bubble the keys listed in [Section 5.8](#s5-8) that it does not use, so the person can move to other Ticks with them.
 - A Tick **MUST** stay usable at 30 columns.
 - A Tick **MUST** redraw its whole screen after `SIGWINCH`, and **SHOULD NOT** repaint when nothing changed.
 
@@ -462,7 +462,7 @@ A client may show a Tick's terminal in a card beside its conversation, as the Mo
 
 ### 5.8 Key bubbling
 
-A Tick shown in a card can hand keys it does not use back to the client, which then acts on them, for example by moving to the next card. Key bubbling travels as private OSC sequences in the Tick's terminal output, not as protocol messages, so it works for any program running in a Tick's terminal, extension or not.
+A Tick shown in a card can hand keys it does not use back to the client, which then acts on them, for example by selecting the next Tick. Key bubbling travels as private OSC sequences in the Tick's terminal output, not as protocol messages, so it works for any program running in a Tick's terminal, extension or not.
 
 Each sequence is `ESC ] 7777 ; tickloop ; <field>` followed by BEL (`0x07`) or ST (`ESC \`), with no spaces:
 
@@ -479,7 +479,7 @@ Rules:
 - A Tick declares `bubble=on` once it is ready for input, typically at startup. The declaration holds for the rest of the instance, across views and resizes, until the Tick writes `bubble=off`. A Tick starts with bubbling off.
 - A Tick **SHOULD** write `key=<name>` right after reading one of the listed keys that it does not use in its current state, and **MUST NOT** write it for a key it acted on.
 - The host ignores `key=` while bubbling is off, and unknown fields and key names. It removes every such sequence from the screen it keeps, so views never show them.
-- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice: the Monitor moves between cards, back to its list or to its input, and leaves the card on `esc`.
+- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice: the Monitor leaves the card on `esc` for its list, on `up`, `down`, `tab` and `backtab` for its list with another Tick selected (entering no other card), and on `left` for its input.
 - Other keys, including letters such as `h`, `j`, `k` and `l`, are never bubbled.
 - A Tick that never declares bubbling works unchanged; the person leaves its card with a double Esc.
 

@@ -140,11 +140,10 @@ impl State {
         self.rendered_region = None;
     }
 
-    /// Tab and Shift+Tab on the list, or bubbled by a focused card's Tick: selects the next or
-    /// previous row, wrapping. A row that can have a card shows it as a preview, which `enter`
-    /// enters; the preview Tab showed before closes unless the user kept it. Moving onto a row
-    /// without a card from a card leaves the card for the list.
-    pub(super) fn cycle_rows(&mut self, delta: isize, enter: bool) -> Option<InputEvent> {
+    /// Tab and Shift+Tab on the list: selects the next or previous row, wrapping. A row that can
+    /// have a card shows it as a preview; the preview Tab showed before closes unless the user
+    /// kept it.
+    pub(super) fn cycle_rows(&mut self, delta: isize) -> Option<InputEvent> {
         self.rendered_region = None;
         self.monitor.cycle_selection(delta);
         let row = self
@@ -153,15 +152,13 @@ impl State {
             .map(|entry| entry.instance.clone())
             .filter(|instance| self.has_card(instance));
         self.cards.close_preview(row.as_ref());
-        let Some(instance) = row else {
-            self.leave_card();
-            return None;
-        };
-        let attach = self.open_card(instance.clone(), CardOrigin::Preview);
-        if enter {
-            self.focus_card(instance);
-        }
-        attach
+        self.open_card(row?, CardOrigin::Preview)
+    }
+
+    /// Leaves the focused card, which stays shown, for the Monitor list with its row selected.
+    fn leave_card_for_list(&mut self) {
+        self.leave_card();
+        self.monitor.focus(self.monitor.overlay, None);
     }
 
     /// Acts on the first key the focused card's Tick bubbled that moves the focus; the keys
@@ -180,27 +177,32 @@ impl State {
                         .keys_mut()
                         .escape_sent_at()
                         .map(|at| at + DOUBLE_ESCAPE_WINDOW);
-                    self.leave_card();
-                    self.monitor.focus(self.monitor.overlay, None);
+                    self.leave_card_for_list();
                 }
-                BubbledKey::Up => self.focus_adjacent_card(-1),
-                BubbledKey::Down => self.focus_adjacent_card(1),
+                BubbledKey::Up => self.select_adjacent_card(-1),
+                BubbledKey::Down => self.select_adjacent_card(1),
                 BubbledKey::Left => {
                     self.leave_card();
                     self.monitor.focused = false;
                     self.monitor.overlay = false;
                 }
-                BubbledKey::Tab => return (true, self.cycle_rows(1, true)),
-                BubbledKey::Backtab => return (true, self.cycle_rows(-1, true)),
+                BubbledKey::Tab => {
+                    self.leave_card_for_list();
+                    return (true, self.cycle_rows(1));
+                }
+                BubbledKey::Backtab => {
+                    self.leave_card_for_list();
+                    return (true, self.cycle_rows(-1));
+                }
             }
             return (true, None);
         }
         (false, None)
     }
 
-    /// Moves the focus to the shown card before or after the focused one in the list, or back
-    /// to the list past either end, with the focused card's row selected.
-    fn focus_adjacent_card(&mut self, delta: isize) {
+    /// Leaves the focused card for the list with the row of the shown card before or after it
+    /// selected, or its own row past either end; no card is entered.
+    fn select_adjacent_card(&mut self, delta: isize) {
         let Some(focused) = self.cards.focused().cloned() else {
             return;
         };
@@ -218,18 +220,13 @@ impl State {
         }
         shown.sort_by_key(|instance| position(instance));
         let index = shown.iter().position(|instance| instance == &focused);
-        let next = index
+        let target = index
             .and_then(|index| index.checked_add_signed(delta))
             .and_then(|index| shown.get(index))
-            .cloned();
-        match next {
-            Some(instance) => self.focus_card(instance),
-            None => {
-                self.leave_card();
-                self.monitor.focus(self.monitor.overlay, None);
-                self.monitor.select(&focused);
-            }
-        }
+            .unwrap_or(&focused)
+            .clone();
+        self.leave_card_for_list();
+        self.monitor.select(&target);
     }
 
     /// Shows the cards of the rows the Agent just used or took an update in from, as long as the

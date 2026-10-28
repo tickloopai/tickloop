@@ -61,7 +61,7 @@ pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Esc Esc goes back to the Monitor list, whose own hints then offer Space to show other cards.
 pub(super) const FOCUSED_CARD_HINT: &str = "esc esc back to list";
 /// A Tick that bubbles the keys it does not use also leaves on one Esc it does not use, and its
-/// arrows and Tab move between cards.
+/// arrows and Tab leave for the list with another Tick selected.
 pub(super) const FOCUSED_BUBBLING_CARD_HINT: &str = "esc or esc esc back · ↑↓ tab move";
 /// A Shell's card is read-only, so leaving is all its keys do.
 pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc back to list";

@@ -12587,8 +12587,8 @@ impl State {
                     self.monitor.overlay = false;
                     self.rendered_region = None;
                 }
-                (KeyCode::Tab, KeyModifiers::NONE) => return self.cycle_rows(1, false),
-                (KeyCode::BackTab, _) => return self.cycle_rows(-1, false),
+                (KeyCode::Tab, KeyModifiers::NONE) => return self.cycle_rows(1),
+                (KeyCode::BackTab, _) => return self.cycle_rows(-1),
                 (KeyCode::Char(super::monitor::NEXT_UNSEEN_KEY), KeyModifiers::NONE) => {
                     self.monitor.select_next_unseen();
                     self.rendered_region = None;

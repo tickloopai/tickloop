@@ -940,11 +940,12 @@ fn bubble(
 }
 
 #[test]
-fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
+fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
     use tick_protocol::BubbledKey;
     let (mut state, rows) = tab_fixture();
-    let [one, two, three] = [&rows[1], &rows[2], &rows[3]];
-    attach_cards(&mut state, &[one.clone(), two.clone(), three.clone()]);
+    let chat = state.chat.unwrap();
+    let [notes, one, two, three] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    attach_cards(&mut state, &[one.clone(), two.clone()]);
     state.enter_card(one.clone());
     state.draw_frame(&mut Vec::new()).unwrap();
     assert_eq!(
@@ -955,21 +956,30 @@ fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
     bubble(&mut state, one, BubbledKey::Down);
     let (changed, inputs) = state.settle_card_signals();
     assert!(changed && inputs.is_empty());
-    assert_eq!(
-        state.cards.focused(),
-        Some(two),
-        "down enters the next card"
+    assert!(
+        !state.card_focused() && state.monitor.focused,
+        "down leaves the card for the list"
     );
+    assert_eq!(selected(&state), *two, "the next shown card's row");
+    assert!(
+        state.cards.is_open(one) && state.cards.is_open(two),
+        "both cards stay shown"
+    );
+
+    state.enter_card(two.clone());
     state.draw_frame(&mut Vec::new()).unwrap();
     bubble(&mut state, two, BubbledKey::Right);
     bubble(&mut state, two, BubbledKey::Up);
     bubble(&mut state, two, BubbledKey::Down);
     state.settle_card_signals();
+    assert!(!state.card_focused() && state.monitor.focused);
     assert_eq!(
-        state.cards.focused(),
-        Some(one),
+        selected(&state),
+        *one,
         "right is ignored, up acts, the rest go"
     );
+
+    state.enter_card(one.clone());
     bubble(&mut state, one, BubbledKey::Up);
     state.settle_card_signals();
     assert!(
@@ -978,14 +988,14 @@ fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
     );
     assert_eq!(selected(&state), *one);
 
-    state.enter_card(three.clone());
-    state.draw_frame(&mut Vec::new()).unwrap();
-    bubble(&mut state, three, BubbledKey::Down);
+    state.enter_card(two.clone());
+    bubble(&mut state, two, BubbledKey::Down);
     state.settle_card_signals();
     assert!(
         !state.card_focused() && state.monitor.focused,
-        "down past the last: the list"
+        "down past the last shown card: the list"
     );
+    assert_eq!(selected(&state), *two);
 
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Esc);
@@ -997,28 +1007,37 @@ fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
 
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Tab);
-    state.settle_card_signals();
-    assert_eq!(
-        state.cards.focused(),
-        Some(three),
-        "tab enters the next row's card"
+    let (changed, inputs) = state.settle_card_signals();
+    assert!(changed);
+    attaches(inputs.into_iter().next(), chat, three);
+    assert!(
+        !state.card_focused() && state.monitor.focused,
+        "tab acts as Tab on the list"
     );
-    bubble(&mut state, three, BubbledKey::Tab);
-    state.settle_card_signals();
-    assert!(!state.card_focused(), "the next row has no card: the list");
-    assert_eq!(selected(&state), rows[0]);
-    assert!(state.monitor.focused);
+    assert_eq!(selected(&state), *three);
+    assert_eq!(
+        origin(&state, three),
+        Some(CardOrigin::Preview),
+        "the next row's card is only previewed"
+    );
+    assert_eq!(
+        origin(&state, two),
+        Some(CardOrigin::User),
+        "the card left stays"
+    );
 
     state.enter_card(one.clone());
     bubble(&mut state, one, BubbledKey::Backtab);
     let (_, inputs) = state.settle_card_signals();
     assert!(inputs.is_empty());
-    assert!(!state.card_focused());
+    assert!(!state.card_focused() && state.monitor.focused);
     assert_eq!(
         selected(&state),
-        rows[0],
+        *notes,
         "backtab from the first Tick wraps upward"
     );
+    assert!(!state.cards.is_open(three), "the preview Tab showed closes");
+    assert!(state.cards.is_open(one));
 
     state.monitor.overlay = true;
     state.enter_card(two.clone());
@@ -1231,7 +1250,7 @@ fn a_card_tells_its_tick_it_has_the_keyboard_only_when_the_tick_wants_focus_repo
 }
 
 #[test]
-fn moving_between_cards_and_switching_chats_tell_each_tick_its_focus() {
+fn leaving_a_card_for_the_list_and_switching_chats_tell_each_tick_its_focus() {
     use tick_protocol::BubbledKey;
     let (mut state, rows) = tab_fixture();
     let [one, two] = [&rows[1], &rows[2]];
@@ -1249,11 +1268,19 @@ fn moving_between_cards_and_switching_chats_tell_each_tick_its_focus() {
     }
     state.settle_card_signals();
     state.draw_frame(&mut Vec::new()).unwrap();
-    state.enter_card(one.clone());
-    bubble(&mut state, one, BubbledKey::Down);
-    state.settle_card_signals();
-    assert_eq!(state.cards.focused(), Some(two));
-    assert_eq!(focus_requests(&mut queues[0]), [true, false]);
+    for key in [BubbledKey::Down, BubbledKey::Tab] {
+        state.enter_card(one.clone());
+        bubble(&mut state, one, key);
+        state.settle_card_signals();
+        assert!(!state.card_focused());
+        assert_eq!(selected(&state), *two);
+        assert_eq!(focus_requests(&mut queues[0]), [true, false], "{key:?}");
+        assert!(
+            focus_requests(&mut queues[1]).is_empty(),
+            "{key:?} gives no card the keyboard"
+        );
+    }
+    state.enter_card(two.clone());
     assert_eq!(focus_requests(&mut queues[1]), [true]);
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.draw_frame(&mut Vec::new()).unwrap();

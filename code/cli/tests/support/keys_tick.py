@@ -1,13 +1,13 @@
 # An extension Tick whose terminal is raw and shows its size, the last bytes it received and how
 # many it received; every byte is also appended to `received` in its working directory. With
-# `--bubble` it declares key bubbling and bubbles Down and a lone Esc; `--max-rows N` declares it
+# `--bubble` it declares key bubbling and bubbles Down, Tab and a lone Esc; `--max-rows N` declares it
 # can use N rows; `--focus-reports` asks for focus reports (DEC mode 1004), which it receives
 # among its keys.
 import fcntl, json, os, signal, struct, sys, termios, threading, tty
 BUBBLE = "--bubble" in sys.argv
 FOCUS_REPORTS = "--focus-reports" in sys.argv
 MAX_ROWS = int(sys.argv[sys.argv.index("--max-rows") + 1]) if "--max-rows" in sys.argv else None
-BUBBLED = {b"\x1b[B": "down", b"\x1bOB": "down", b"\x1b": "esc"}
+BUBBLED = {b"\x1b[B": "down", b"\x1bOB": "down", b"\t": "tab", b"\x1b": "esc"}
 received = []
 lock = threading.Lock()
 def draw(*_):

@@ -47,7 +47,7 @@ The only view of a local Tick: a card under the Tick's row in the Agent View's M
 _Avoid_: popup, view Pane
 
 **Key Bubbling**:
-A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus between cards, its list and the input.
+A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus from the card to its list or the input.
 
 **Tick Ownership**:
 A persistent Chat's responsibility for the lifetime of the Ticks it opens, determined jointly by the config root and the Chat identity; a Subagent's Chat independently owns its own Ticks.
