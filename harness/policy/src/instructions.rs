@@ -10,13 +10,14 @@ pub const USER_CONTEXT_OPENING: &str =
 const INSTRUCTIONS_CONTEXT_KEY: &str = "claudeMd";
 const CURRENT_DATE_CONTEXT_KEY: &str = "currentDate";
 const GIT_STATUS_CONTEXT_KEY: &str = "gitStatus";
-const CONTEXT_RELEVANCE_NOTE: &str = "IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.";
+/// Claude Code's closing of its user context, naming Tickloop.
+const CONTEXT_RELEVANCE_NOTE: &str = "Tickloop attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.";
 
 /// Claude Code's `date_change` reminder, appended to the conversation when the user's date moved
 /// on, so the user context that told an earlier date stays the conversation's unchanged prefix.
 pub fn date_change_message(current_date: &str) -> String {
     format!(
-        "<system-reminder>\nThe date has changed. Today's date is now {current_date}. DO NOT mention this to the user explicitly because they are already aware.\n</system-reminder>"
+        "<system-reminder>\nThe date has changed. Today's date is now {current_date}. No need to announce the new date \u{2014} the user's own clock shows it.\n</system-reminder>"
     )
 }
 
@@ -121,13 +122,13 @@ mod tests {
         );
         assert_eq!(
             message,
-            "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of /home/u/.tickloop/AGENTS.md (user's private global instructions for all projects):\n\nReply in English.\n\nContents of /repo/AGENTS.md (project instructions, checked into the codebase):\n\nRun make.\n\nContents of /repo/CLAUDE.local.md (user's private project instructions, not checked in):\n\nMine.\n# currentDate\nToday's date is 2026-10-26.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n"
+            "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of /home/u/.tickloop/AGENTS.md (user's private global instructions for all projects):\n\nReply in English.\n\nContents of /repo/AGENTS.md (project instructions, checked into the codebase):\n\nRun make.\n\nContents of /repo/CLAUDE.local.md (user's private project instructions, not checked in):\n\nMine.\n# currentDate\nToday's date is 2026-10-26.\n\n      Tickloop attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>\n"
         );
     }
 
     #[test]
     fn without_instructions_the_message_carries_only_the_date() {
-        let expected = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-10-26.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n";
+        let expected = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-10-26.\n\n      Tickloop attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>\n";
         assert_eq!(user_context_message(&[], "2026-10-26", None), expected);
         assert_eq!(
             user_context_message(
@@ -149,7 +150,7 @@ mod tests {
             ),
         );
         assert!(message.contains(
-            "# currentDate\nToday's date is 2026-10-26.\n# gitStatus\nThis is the git status at the start of the conversation.\n\nCurrent branch: main\n\n      IMPORTANT"
+            "# currentDate\nToday's date is 2026-10-26.\n# gitStatus\nThis is the git status at the start of the conversation.\n\nCurrent branch: main\n\n      Tickloop attached this context automatically"
         ));
     }
 }

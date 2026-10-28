@@ -8,7 +8,7 @@ use tickloop_harness::test_support::{ScriptedModel, config, text};
 
 const PREAMBLE: &str = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n";
 const DATE: &str = "# currentDate\nToday's date is 2026-10-27.";
-const RELEVANCE_NOTE: &str = "\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n";
+const RELEVANCE_NOTE: &str = "\n\n      Tickloop attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>\n";
 
 /// Late on the 26th in UTC is already the 27th in Shanghai, the user's zone.
 fn set_clock(agent: &Agent) {
@@ -203,7 +203,7 @@ async fn a_subagent_receives_the_instructions_its_parent_loaded() {
 #[tokio::test]
 async fn a_new_day_is_announced_once_at_the_end_and_the_user_context_stays() {
     use chrono::TimeZone;
-    const DATE_CHANGE: &str = "<system-reminder>\nThe date has changed. Today's date is now 2026-10-28. DO NOT mention this to the user explicitly because they are already aware.\n</system-reminder>";
+    const DATE_CHANGE: &str = "<system-reminder>\nThe date has changed. Today's date is now 2026-10-28. No need to announce the new date \u{2014} the user's own clock shows it.\n</system-reminder>";
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
     fs::create_dir_all(&project).unwrap();
