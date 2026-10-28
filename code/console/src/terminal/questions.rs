@@ -251,6 +251,7 @@ impl QuestionFlow {
                 id: tickloop_ids::generate(),
                 title: REVIEW_TITLE.into(),
                 context,
+                markdown: None,
                 options: vec![SUBMIT_ANSWERS.into(), CANCEL.into()],
                 selected: self.focus.min(1),
                 confirmation: false,
@@ -313,6 +314,7 @@ impl QuestionFlow {
             title: safe_text(&question.question),
             context,
             selected: self.focus.min(options.len() - 1),
+            markdown: None,
             options,
             confirmation: false,
         };

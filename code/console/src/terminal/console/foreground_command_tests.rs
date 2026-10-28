@@ -235,6 +235,7 @@ fn ctrl_b_leaves_the_command_alone_where_its_hint_does_not_have_the_keys() {
         id: Uuid::new_v4(),
         title: "Run this command?".into(),
         context: Vec::new(),
+        markdown: None,
         options: vec!["Allow once".into(), "Deny".into()],
         selected: 0,
         confirmation: true,

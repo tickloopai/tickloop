@@ -9,6 +9,7 @@ fn picker_menu(options: usize) -> Menu {
         id: Uuid::new_v4(),
         title: "Settings".into(),
         context: vec!["Changes apply immediately".into()],
+        markdown: None,
         options: (0..options)
             .map(|index| format!("Option {index}"))
             .collect(),

@@ -2432,7 +2432,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
                         .0;
                     tool_stream(
                         "Write",
-                        json!({"file_path":plan_file,"content":"Create reviewed.txt with the approved result."}),
+                        json!({"file_path":plan_file,"content":"## Steps\n\n* Create **reviewed.txt** with the approved result."}),
                     )
                     .replace("tool-fixture", "plan-file-tool")
                 }
@@ -2483,7 +2483,13 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     })
     .await
     .unwrap();
-    assert!(transcript.contains("Create reviewed.txt with the approved result."));
+    // Plain output keeps the plan's Markdown source.
+    for source in [
+        "## Steps",
+        "* Create **reviewed.txt** with the approved result.",
+    ] {
+        assert!(transcript.contains(source), "{source}\n{transcript}");
+    }
     assert!(!directory.path().join("reviewed.txt").exists());
     input.write_all(b"2\n").await.unwrap();
     drop(input);
