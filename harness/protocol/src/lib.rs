@@ -202,3 +202,6 @@ pub use usage::{
 
 mod tasks;
 pub use tasks::*;
+
+mod isolation;
+pub use isolation::{ExecutionIsolation, NetworkIsolation, WriteIsolation};

@@ -216,6 +216,7 @@ impl Fixture {
                 command: "true".into(),
                 cwd: self.directory.path().into(),
                 environment: environment_digest(&[]),
+                sandbox: None,
             },
         }
     }

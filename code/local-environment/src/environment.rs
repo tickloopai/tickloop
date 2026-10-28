@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 mod dispatch;
 pub(crate) mod local_shells;
 mod observe;
+mod sandbox;
 pub(crate) use dispatch::ExecutionDispatch;
 
 /// This computer: the file tools and project Skills work on the Chat's local Folder, and the
@@ -20,6 +21,13 @@ pub struct LocalEnvironment {
 }
 
 impl LocalEnvironment {
+    pub fn with_sandbox(self, settings: tickloop_code_settings::UserSettings) -> Self {
+        if let Some(shells) = &self.shells {
+            shells.set_sandbox(settings);
+        }
+        self
+    }
+
     pub fn install(&self, agent: &tickloop_harness::runtime::Agent) {
         if let Some(shells) = &self.shells {
             let tasks = shells.tasks();
