@@ -705,11 +705,7 @@ impl ExecutionPort for MemoryPort {
         };
         let open = match &intent {
             ExecutionIntent::Open(open) => Some(open.clone()),
-            ExecutionIntent::Reopen { instance } => {
-                let mut open = state.lost[instance].open.clone();
-                open.view = None;
-                Some(open)
-            }
+            ExecutionIntent::Reopen { instance } => Some(state.lost[instance].open.clone()),
             _ => None,
         };
         let shell_program = match &intent {
@@ -931,10 +927,8 @@ impl ExecutionPort for MemoryPort {
                             .0,
                         },
                     );
-                    let mut result = json!({"status":"opened", "host":"tickhost", "visibility":"hidden", "tick_instance_id":instance});
-                    if open.view.is_some() {
-                        result["view"] = json!({"status":"unavailable"});
-                    }
+                    let mut result =
+                        json!({"status":"opened", "host":"tickhost", "tick_instance_id":instance});
                     if let ExecutionIntent::Reopen { instance } = &prepared.facts().intent {
                         state.lost.remove(instance);
                         result["replaces"] = json!(instance);

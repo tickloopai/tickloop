@@ -590,14 +590,9 @@ pub async fn run_worker_with_models(
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
     request_logging::install(bootstrap.launch.config_root.as_deref())?;
     let models = models(bootstrap.launch.config_root.clone())?;
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let (agent, environment) = build_runtime_with_models(
-        &bootstrap.launch,
-        models,
-        Some(bootstrap.control.clone()),
-        &executable,
-    )
-    .await?;
+    let (agent, environment) =
+        build_runtime_with_models(&bootstrap.launch, models, Some(bootstrap.control.clone()))
+            .await?;
     let access = Arc::new(EmbeddedAgentAccess::for_worker_with_environment(
         agent.clone(),
         bootstrap.epoch,
@@ -666,21 +661,18 @@ pub async fn build_runtime(
 ) -> Result<Agent, String> {
     // One set of model clients per Worker: their private-history provenance lives as long as it.
     let models = Arc::new(LocalModelClients::new(launch.config_root.clone()));
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    build_runtime_with_models(launch, models, control, &executable)
+    build_runtime_with_models(launch, models, control)
         .await
         .map(|(agent, _)| agent)
 }
 
-/// Build the same version-owned runtime with caller-supplied model clients. `executable` is the
-/// `tickloop` whose attach client a Herdr Pane showing a Tick runs.
+/// Build the same version-owned runtime with caller-supplied model clients.
 /// Integration fixtures use this seam without adding definition-file loading to the CLI.
 #[doc(hidden)]
 pub async fn build_runtime_with_models(
     launch: &LaunchSpec,
     models: Arc<dyn ModelClients>,
     control: Option<tickloop_code_local_environment::hosted::worker_control::WorkerControlGrant>,
-    executable: &Path,
 ) -> Result<(Agent, LocalEnvironment), String> {
     let model = launch_model(launch.model.as_ref());
     let settings = launch
@@ -702,16 +694,7 @@ pub async fn build_runtime_with_models(
         None
     };
     // Every worker the daemon granted a Tickhost runs its shell commands and Ticks there, under
-    // spawns and views the daemon grants and with its host's own authority; a worker in a Herdr
-    // View can also show them in Herdr Panes.
-    let views = launch.host_work_context.as_ref().map(|work| {
-        tickloop_code_local_environment::hosted::views::HerdrViews::new(
-            tickhost_connect::layout::HerdrLayout::new(
-                tickhost_connect::herdr::HerdrContext::without_view(work.socket.clone()),
-            ),
-            executable,
-        )
-    });
+    // spawns and views the daemon grants and with its host's own authority.
     let hosted = control.as_ref().map(|grant| {
         let tools = tickloop_code_local_environment::hosted::tools::HostedTickTools::new(
             tickloop_code_local_environment::hosted::worker_control::DaemonControl::new(
@@ -733,10 +716,7 @@ pub async fn build_runtime_with_models(
             Some(root) => tools.with_plugins(tick_plugins::PluginStore::in_config_root(root)),
             None => tools,
         };
-        Arc::new(match views {
-            Some(views) => tools.with_herdr_views(views),
-            None => tools,
-        })
+        Arc::new(tools)
     });
     let environment = match (&control, &hosted) {
         (Some(grant), Some(hosted)) => LocalEnvironment::with(

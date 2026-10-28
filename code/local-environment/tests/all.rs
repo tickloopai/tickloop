@@ -15,6 +15,8 @@ mod tickhost_versions;
 #[path = "all/workspace_host_context.rs"]
 mod workspace_host_context;
 
+#[path = "all/retired_herdr_views.rs"]
+mod retired_herdr_views;
 #[path = "all/runtime/mod.rs"]
 mod runtime;
 #[path = "all/sandbox.rs"]

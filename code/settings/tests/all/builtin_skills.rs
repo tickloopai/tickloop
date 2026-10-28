@@ -88,6 +88,11 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "tickloop plugin enable",
         "tickloop plugin configure",
         "nest delegation",
+        // Ticks are no longer shown in Herdr Panes.
+        "`integration`",
+        "placement",
+        "Herdr Pane",
+        "ReadWorkspace",
         "directly delegated children",
         "names your own root",
         "newest Loop",

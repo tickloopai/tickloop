@@ -75,6 +75,21 @@ CreateGoal or UpdateGoal; no separate subagent mapping is needed, and delegation
 For a stateless host's durable Chat, host rules directly admit tools such as CronCreate, CronUpdate, CronDelete and ScheduleWakeup
 without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harness.rs`.
 
+## Tick tools without Herdr Pane views
+
+Ticks are no longer shown in Herdr Panes. `ReadWorkspace` (previously ReadOnly) is no longer offered, and
+TickManage takes only `open`, `send_input`, `close` and `reopen` as host forms (with the Loop's own
+`subscribe` and `unsubscribe`); `open` takes `command`, `cwd` and `protocol`, no longer `placement` or
+`workspace_id`, and `move` is gone. TickDescribe and TickRead stay ReadOnly; the remaining TickManage
+forms stay Reviewable, so Auto still reviews an ordinary open under the existing rules, and closing an
+instance this Loop created still relies on Session-Created Job Cleanup. A call carrying a removed form
+or field, such as one repeated from an older conversation, fails input validation before permission,
+review or dispatch; nothing is widened. Saved `ModifyTick` rules still map to the remaining forms.
+No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**,
+eight inapplicable native entries, and policy and built-in group version **10** are unchanged.
+`harness/runtime/tests/all/environment_approval.rs` covers the routing with the reference Execution
+Environment and a reviewer double.
+
 ## Sandbox Network Callback
 
 This native entry is remapped to Tickhost's deterministic HTTP/HTTPS CONNECT proxy.

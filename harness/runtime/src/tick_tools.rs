@@ -1,35 +1,26 @@
 //! The native Tick tools a worker installs, and the checks each call passes before any host is
-//! asked. Every Tick runs in the Tickhost as a `hosted:` instance; a worker in a Herdr View can
-//! also show its Ticks in Herdr Panes and list a Workspace's Panes. Artifact and Shell references
+//! asked. Every Tick runs in the Tickhost as a `hosted:` instance. Artifact and Shell references
 //! go to their native tools instead.
 
-use crate::environment::{TERMINAL_INPUT_BYTES, WORKSPACE_PAGE_SIZE};
+use crate::environment::TERMINAL_INPUT_BYTES;
 use serde_json::{Value, json};
 use tick_protocol::{HOSTED_ACCESS, InstanceRef, SHELL_ACCESS, ShellTaskKind};
 use tickloop_ids::{IdContext, ModelRef};
 
 use tickloop_harness_protocol::ToolDefinition;
 
-pub const READ_WORKSPACE: &str = "ReadWorkspace";
 pub const TICK_DESCRIBE: &str = "TickDescribe";
 pub const TICK_READ: &str = "TickRead";
 pub const TICK_CALL: &str = "TickCall";
 pub const TICK_MANAGE: &str = "TickManage";
-/// The open placement that shows a Tick nowhere. An open without a placement means the same.
-pub const HIDDEN_PLACEMENT: &str = "hidden";
-const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 const HOSTED_REFERENCE: &str = "hosted:<instance id> from an open";
-const HERDR_UNAVAILABLE: &str = "UnsupportedCapability: this Agent does not run in Herdr, so Workspaces and Tick views in Herdr Panes are unavailable; omit placement or pass {\"type\":\"hidden\"} to open the Tick in the Tickhost alone";
 
 /// Keys of a Tick tool result that hold what the Tick itself reported; their contents are the
 /// Tick's, never rewritten.
 const TICK_CONTENT_KEYS: [&str; 5] = ["data", "descriptor", "result", "args", "state"];
 
 pub(crate) fn is_tick_tool(name: &str) -> bool {
-    matches!(
-        name,
-        READ_WORKSPACE | TICK_DESCRIBE | TICK_READ | TICK_CALL | TICK_MANAGE
-    )
+    matches!(name, TICK_DESCRIBE | TICK_READ | TICK_CALL | TICK_MANAGE)
 }
 
 /// A Tick tool's input with the `tick_instance_id` the model wrote resolved to the stored form.
@@ -133,43 +124,18 @@ pub enum TickToolTargetError {
     Invalid { operation: String },
 }
 
-/// Whether the call places, moves or lists Herdr Panes, which only a worker in a Herdr View can
-/// do and which stays inside the Workspace a delegated Agent inherited.
-pub fn uses_herdr_layout(name: &str, input: &Value) -> bool {
-    match name {
-        READ_WORKSPACE => true,
-        TICK_MANAGE => match input["action"].as_str() {
-            Some("move") => true,
-            Some("open") => input["placement"]["type"]
-                .as_str()
-                .is_some_and(|placement| placement != HIDDEN_PLACEMENT),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 /// Refuses a call these tools cannot serve, decided from its input alone: an unknown tool or
-/// action, a target that is not a hosted Tick, or a Herdr Pane without Herdr `views`.
-pub fn check_call(name: &str, input: &Value, views: bool) -> Result<(), String> {
+/// action, or a target that is not a hosted Tick.
+pub fn check_call(name: &str, input: &Value) -> Result<(), String> {
     match name {
-        READ_WORKSPACE => {}
-        TICK_DESCRIBE | TICK_READ | TICK_CALL => check_target(name, input)?,
+        TICK_DESCRIBE | TICK_READ | TICK_CALL => check_target(name, input),
         TICK_MANAGE => match input["action"].as_str() {
-            Some("open") => {}
-            Some("move" | "send_input" | "close" | "reopen") => check_target(name, input)?,
-            _ => {
-                return Err(
-                    "TickManage action must be open, move, send_input, close or reopen".into(),
-                );
-            }
+            Some("open") => Ok(()),
+            Some("send_input" | "close" | "reopen") => check_target(name, input),
+            _ => Err("TickManage action must be open, send_input, close or reopen".into()),
         },
-        _ => return Err(format!("unknown Tick tool: {name}")),
+        _ => Err(format!("unknown Tick tool: {name}")),
     }
-    if uses_herdr_layout(name, input) && !views {
-        return Err(HERDR_UNAVAILABLE.into());
-    }
-    Ok(())
 }
 
 fn check_target(name: &str, input: &Value) -> Result<(), String> {
@@ -184,16 +150,9 @@ fn check_target(name: &str, input: &Value) -> Result<(), String> {
     Err(error.to_string())
 }
 
-/// The model-visible Tick tools; Herdr `views` add ReadWorkspace, placements and move.
-pub fn definitions(views: bool) -> Vec<ToolDefinition> {
+/// The model-visible Tick tools.
+pub fn definitions() -> Vec<ToolDefinition> {
     let mut definitions = Vec::new();
-    if views {
-        definitions.push(ToolDefinition {
-            name: READ_WORKSPACE.into(),
-            description: format!("List the Panes of the current Herdr Workspace, or of an explicitly named Workspace, marking each Pane that shows a view of one of this Chat's Ticks, and this Chat's Ticks as the Tickhost runs them. Uses the Agent's Work Context by default; without one, lists every Workspace. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Panes come in pages of at most {WORKSPACE_PAGE_SIZE} with the complete total; pass next_cursor back as cursor until it is null. CursorExpired means the Workspace changed: list again from the first page. Listing never subscribes."),
-            input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1},"cursor":{"type":"object","properties":{"generation":{"type":"string"},"after":{"type":"string"}},"required":["generation","after"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":WORKSPACE_PAGE_SIZE}},"additionalProperties":false}),
-        });
-    }
     let target = json!({"tick_instance_id":{"type":"string","minLength":1}});
     definitions.push(ToolDefinition {
         name: TICK_DESCRIBE.into(),
@@ -215,41 +174,24 @@ pub fn definitions(views: bool) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: TICK_MANAGE.into(),
-        description: tick_manage_description(views),
-        input_schema: tick_manage_schema(views),
+        description: tick_manage_description(),
+        input_schema: tick_manage_schema(),
     });
     definitions
 }
 
-fn tick_manage_description(views: bool) -> String {
-    let mut parts = vec![
-        "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol always does. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
-    ];
-    if views {
-        parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus; pass one only when the user asks for a place. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions. A view status other than shown may have left a Pane behind: inspect it with ReadWorkspace before retrying, and never create a duplicate view.".into());
-    }
-    parts.push(format!(
-        "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
-        crate::terminal_input::KEY_NAMES
-    ));
-    parts.push(
-        if views {
-            "close ends the Tick's process and closes the Herdr Panes that show it."
-        } else {
-            "close ends the Tick's process."
-        }
-        .into(),
-    );
-    parts.push("reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".into());
-    parts.push(format!(
-        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance{}. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load the tickloop Skill and that plugin's <package>:usage Skill.",
-        if views {
-            ", whether a Herdr Pane shows it and where"
-        } else {
-            ""
-        }
-    ));
-    parts.join(" ")
+fn tick_manage_description() -> String {
+    [
+        "open runs the program in the Tickhost: it keeps running without any View, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol always does. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
+        format!(
+            "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
+            crate::terminal_input::KEY_NAMES
+        ),
+        "close ends the Tick's process.".to_owned(),
+        "reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".to_owned(),
+        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load the tickloop Skill and that plugin's <package>:usage Skill.".to_owned(),
+    ]
+    .join(" ")
 }
 
 /// One accepted shape of an object, selected by the value of its discriminating field. The
@@ -312,17 +254,7 @@ impl Form {
 const OPEN: Form = Form {
     name: "open",
     required: &["command"],
-    optional: &["cwd", "protocol", "placement"],
-};
-const OPEN_IN_HERDR: Form = Form {
-    name: "open",
-    required: &["command"],
-    optional: &["cwd", "protocol", "placement", "workspace_id"],
-};
-const MOVE: Form = Form {
-    name: "move",
-    required: &["tick_instance_id"],
-    optional: &["workspace_id", "placement"],
+    optional: &["cwd", "protocol"],
 };
 const SEND_INPUT: Form = Form {
     name: "send_input",
@@ -340,42 +272,7 @@ const REOPEN: Form = Form {
     optional: &[],
 };
 
-const HIDDEN: Form = Form {
-    name: HIDDEN_PLACEMENT,
-    required: &[],
-    optional: &[],
-};
-const CURRENT_TAB: Form = Form {
-    name: "current_tab",
-    required: &[],
-    optional: &["direction"],
-};
-const PANE: Form = Form {
-    name: "pane",
-    required: &["pane_id"],
-    optional: &["direction"],
-};
-const NEW_TAB: Form = Form {
-    name: "new_tab",
-    required: &[],
-    optional: &[],
-};
-
-fn tick_manage_forms(views: bool) -> Vec<Form> {
-    if views {
-        vec![OPEN_IN_HERDR, MOVE, SEND_INPUT, CLOSE, REOPEN]
-    } else {
-        vec![OPEN, SEND_INPUT, CLOSE, REOPEN]
-    }
-}
-
-fn placement_forms(action: &str, views: bool) -> Vec<Form> {
-    match (action, views) {
-        ("move", _) => vec![CURRENT_TAB, PANE],
-        (_, true) => vec![HIDDEN, CURRENT_TAB, PANE, NEW_TAB],
-        (_, false) => vec![HIDDEN],
-    }
-}
+const TICK_MANAGE_FORMS: [Form; 4] = [OPEN, SEND_INPUT, CLOSE, REOPEN];
 
 /// Which forms require or accept `field`, leading its description so the model knows when to
 /// pass it without a schema variant per form.
@@ -421,85 +318,34 @@ fn select_form<'a>(
 }
 
 /// Checks a Tick tool input before any host is asked. TickManage must match the form its
-/// action selects, and its placement the form its type selects, so a refusal names the field to
-/// add or drop; the flat model schema then checks every value.
-pub fn validate_input(
-    name: &str,
-    schema: &Value,
-    input: &Value,
-    views: bool,
-) -> Result<(), String> {
+/// action selects, so a refusal names the field to add or drop; the flat model schema then
+/// checks every value.
+pub fn validate_input(name: &str, schema: &Value, input: &Value) -> Result<(), String> {
     if name == TICK_MANAGE
         && let Some(fields) = input.as_object()
     {
-        check_tick_manage_form(fields, views)
+        let action = select_form(fields, "action", "action", &TICK_MANAGE_FORMS)
+            .map_err(|reason| format!("invalid {name} input: {reason}"))?;
+        action
+            .check(fields, "action", action.name)
             .map_err(|reason| format!("invalid {name} input: {reason}"))?;
     }
     crate::validate_host_schema_input(name, schema, input)
 }
 
-fn check_tick_manage_form(
-    fields: &serde_json::Map<String, Value>,
-    views: bool,
-) -> Result<(), String> {
-    let forms = tick_manage_forms(views);
-    let action = select_form(fields, "action", "action", &forms)?;
-    action.check(fields, "action", action.name)?;
-    let Some(placement) = fields.get("placement").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    if !views
-        && placement
-            .get("type")
-            .is_some_and(|kind| kind != HIDDEN_PLACEMENT)
-    {
-        return Err(HERDR_UNAVAILABLE.into());
-    }
-    let forms = placement_forms(action.name, views);
-    let kind = select_form(
-        placement,
-        "type",
-        &format!("placement.type for {}", action.name),
-        &forms,
-    )?;
-    kind.check(placement, "type", &format!("placement type {}", kind.name))
-}
-
-fn tick_manage_schema(views: bool) -> Value {
-    let forms = tick_manage_forms(views);
+fn tick_manage_schema() -> Value {
+    let forms = &TICK_MANAGE_FORMS;
     let actions = forms.iter().map(|form| form.name).collect::<Vec<_>>();
-    let mut properties = json!({
+    let properties = json!({
         "action": {"type":"string","enum":actions,"description":format!("One of {}; each takes the fields whose description names it.", actions.join(", "))},
-        "command": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} The program's argv, executable first.", usage("command", &forms))},
-        "cwd": {"type":"string","minLength":1,"description":format!("{} The program's working directory; defaults to the Agent file work directory.", usage("cwd", &forms))},
-        "protocol": {"type":"boolean","description":format!("{} true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol needs no flag. Any other program runs as a terminal Tick.", usage("protocol", &forms))},
-        "placement": placement_schema(&forms, views),
-        "tick_instance_id": {"type":"string","minLength":1,"description":format!("{} The complete hosted: identity an open returned.", usage("tick_instance_id", &forms))},
-        "text": {"type":"string","description":format!("{} Text typed first; pass text, keys or both.", usage("text", &forms))},
-        "keys": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} Logical keys typed after text, such as Enter, Up or Ctrl-C.", usage("keys", &forms))},
+        "command": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} The program's argv, executable first.", usage("command", forms))},
+        "cwd": {"type":"string","minLength":1,"description":format!("{} The program's working directory; defaults to the Agent file work directory.", usage("cwd", forms))},
+        "protocol": {"type":"boolean","description":format!("{} true for a program that speaks the Tick protocol; an installed Tick package's program that declares the protocol needs no flag. Any other program runs as a terminal Tick.", usage("protocol", forms))},
+        "tick_instance_id": {"type":"string","minLength":1,"description":format!("{} The complete hosted: identity an open returned.", usage("tick_instance_id", forms))},
+        "text": {"type":"string","description":format!("{} Text typed first; pass text, keys or both.", usage("text", forms))},
+        "keys": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} Logical keys typed after text, such as Enter, Up or Ctrl-C.", usage("keys", forms))},
     });
-    if views {
-        properties["workspace_id"] = json!({"type":"string","minLength":1,"description":format!("{} The Herdr Workspace for the view; defaults to the Agent's Work Context.", usage("workspace_id", &forms))});
-    }
     json!({"type":"object","properties":properties,"required":["action"],"additionalProperties":false})
-}
-
-fn placement_schema(actions: &[Form], views: bool) -> Value {
-    let forms = placement_forms(OPEN.name, views);
-    let types = forms.iter().map(|form| form.name).collect::<Vec<_>>();
-    let mut properties = json!({"type":{"type":"string","enum":types}});
-    let description = if views {
-        properties["type"]["description"] = json!(
-            "hidden shows the Tick nowhere; current_tab places it beside the View carrying this input, which \"this Tab\", \"your Tab\" and \"next to you\" mean; pane places it beside pane_id; new_tab opens a new Tab. move takes only current_tab or pane."
-        );
-        properties["direction"] = json!({"type":"string","enum":PLACEMENT_DIRECTIONS,"description":format!("{} Defaults to right.", usage("direction", &forms))});
-        properties["pane_id"] = json!({"type":"string","minLength":1,"description":format!("{} A Pane in the selected Workspace, from ReadWorkspace.", usage("pane_id", &forms))});
-        "A Herdr Pane that shows a view of the Tick; omitted, open shows it nowhere and move uses current_tab."
-    } else {
-        properties["type"]["description"] = json!("hidden is the only placement outside Herdr.");
-        "Outside Herdr it shows the Tick nowhere, the same as omitting placement."
-    };
-    json!({"type":"object","properties":properties,"required":["type"],"additionalProperties":false,"description":format!("{} {description}", usage("placement", actions))})
 }
 
 #[cfg(test)]
@@ -577,190 +423,176 @@ mod tests {
         );
     }
 
-    fn validate(input: &Value, views: bool) -> Result<(), String> {
-        validate_input(TICK_MANAGE, &tick_manage_schema(views), input, views)
+    fn validate(input: &Value) -> Result<(), String> {
+        validate_input(TICK_MANAGE, &tick_manage_schema(), input)
     }
 
-    fn refusal(input: &Value, views: bool) -> String {
-        validate(input, views).expect_err(&input.to_string())
+    fn refusal(input: &Value) -> String {
+        validate(input).expect_err(&input.to_string())
     }
 
     #[test]
     fn the_tick_manage_description_names_where_bare_programs_are_found() {
-        for views in [false, true] {
-            let description = tick_manage_description(views);
-            assert!(
-                description.contains("command[0]='tick-<package>'"),
-                "{description}"
-            );
-            for text in [description, tick_manage_schema(views).to_string()] {
-                let names_tick = text
-                    .split(|character: char| {
-                        !(character.is_alphanumeric() || character == '-' || character == '_')
-                    })
-                    .any(|word| word == "tick");
-                assert!(!names_tick, "{text}");
-            }
+        let description = tick_manage_description();
+        assert!(
+            description.contains("command[0]='tick-<package>'"),
+            "{description}"
+        );
+        for text in [description, tick_manage_schema().to_string()] {
+            let names_tick = text
+                .split(|character: char| {
+                    !(character.is_alphanumeric() || character == '-' || character == '_')
+                })
+                .any(|word| word == "tick");
+            assert!(!names_tick, "{text}");
         }
     }
 
     #[test]
     fn tick_manage_schema_is_one_flat_object_that_describes_each_field() {
-        for views in [false, true] {
-            let schema = tick_manage_schema(views);
-            assert_eq!(schema["type"], "object");
-            assert_eq!(schema["required"], json!(["action"]));
-            assert_eq!(schema["additionalProperties"], false);
-            assert!(!schema.to_string().contains("Of\""), "{schema}");
-            let actions = if views {
-                json!(["open", "move", "send_input", "close", "reopen"])
-            } else {
-                json!(["open", "send_input", "close", "reopen"])
-            };
-            assert_eq!(schema["properties"]["action"]["enum"], actions);
-            for (field, property) in schema["properties"].as_object().unwrap() {
-                assert!(property["description"].is_string(), "{field}");
-            }
-            let described = |property: &Value, usage: &str| {
-                assert!(
-                    property["description"].as_str().unwrap().starts_with(usage),
-                    "{property}"
-                );
-            };
-            described(&schema["properties"]["command"], "Required by open.");
-            described(&schema["properties"]["text"], "Optional for send_input.");
-            assert_eq!(schema["properties"]["workspace_id"].is_object(), views);
-            let placement = &schema["properties"]["placement"];
-            assert_eq!(placement["required"], json!(["type"]));
-            assert_eq!(placement["additionalProperties"], false);
-            let placement_types = if views {
-                json!(["hidden", "current_tab", "pane", "new_tab"])
-            } else {
-                json!(["hidden"])
-            };
-            assert_eq!(placement["properties"]["type"]["enum"], placement_types);
-            if views {
-                assert_eq!(
-                    placement["properties"]["direction"]["enum"],
-                    json!(["left", "right", "up", "down"])
-                );
-                described(&placement["properties"]["pane_id"], "Required by pane.");
+        let schema = tick_manage_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(!schema.to_string().contains("Of\""), "{schema}");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["open", "send_input", "close", "reopen"])
+        );
+        for (field, property) in schema["properties"].as_object().unwrap() {
+            assert!(property["description"].is_string(), "{field}");
+        }
+        let described = |property: &Value, usage: &str| {
+            assert!(
+                property["description"].as_str().unwrap().starts_with(usage),
+                "{property}"
+            );
+        };
+        described(&schema["properties"]["command"], "Required by open.");
+        described(&schema["properties"]["text"], "Optional for send_input.");
+        for retired in ["placement", "workspace_id"] {
+            assert!(schema["properties"].get(retired).is_none(), "{retired}");
+        }
+    }
+
+    /// No definition offers a way to show a Tick in a Herdr Pane: Ticks are seen in the Monitor.
+    #[test]
+    fn no_tick_tool_places_lists_or_moves_panes() {
+        let definitions = definitions();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            [TICK_DESCRIBE, TICK_READ, TICK_CALL, TICK_MANAGE]
+        );
+        for definition in &definitions {
+            let text = format!("{} {}", definition.description, definition.input_schema);
+            for retired in ["Herdr", "Pane", "placement", "ReadWorkspace", "move"] {
+                assert!(!text.contains(retired), "{}: {retired}", definition.name);
             }
         }
     }
 
     #[test]
     fn tick_manage_input_refusals_name_what_to_change() {
-        let empty = refusal(&json!({}), true);
+        let empty = refusal(&json!({}));
         assert!(
             empty.starts_with("invalid TickManage input: action is required: one of "),
             "{empty}"
         );
         for requirement in [
             "open (requires command)",
-            "move (requires tick_instance_id)",
+            "send_input (requires tick_instance_id)",
             "close (requires tick_instance_id)",
         ] {
             assert!(empty.contains(requirement), "{empty}");
         }
-        for (input, views, reason) in [
-            (json!({"action":"open"}), true, "open requires command"),
-            (
-                json!({"action":"close"}),
-                false,
-                "close requires tick_instance_id",
-            ),
+        for (input, reason) in [
+            (json!({"action":"open"}), "open requires command"),
+            (json!({"action":"close"}), "close requires tick_instance_id"),
             (
                 json!({"action":"open","command":["tick"],"text":"x"}),
-                true,
-                "text is not allowed for open; open takes command, and optionally cwd, protocol, placement, workspace_id",
+                "text is not allowed for open; open takes command, and optionally cwd, protocol",
             ),
             (
                 json!({"action":"close","tick_instance_id":"hosted:1","keys":["Enter"]}),
-                true,
                 "keys is not allowed for close; close takes only tick_instance_id",
             ),
             (
                 json!({"action":"launch"}),
-                true,
-                "action must be one of open, move, send_input, close, reopen",
-            ),
-            (
-                json!({"action":"move","tick_instance_id":"hosted:1"}),
-                false,
                 "action must be one of open, send_input, close, reopen",
             ),
             (
-                json!({"action":"open","command":["tick"],"placement":{"type":"pane"}}),
-                true,
-                "placement type pane requires pane_id",
-            ),
-            (
-                json!({"action":"open","command":["tick"],"placement":{"type":"new_tab","direction":"left"}}),
-                true,
-                "direction is not allowed for placement type new_tab; placement type new_tab takes no other fields",
-            ),
-            (
-                json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"new_tab"}}),
-                true,
-                "placement.type for move must be one of current_tab, pane",
-            ),
-            (
-                json!({"action":"open","command":["tick"],"placement":{}}),
-                true,
-                "placement.type for open is required: one of hidden, current_tab, pane (requires pane_id), new_tab",
-            ),
-            (
                 json!({"action":"open","command":[]}),
-                true,
                 "input.command has too few items",
             ),
         ] {
             assert_eq!(
-                refusal(&input, views),
+                refusal(&input),
                 format!("invalid TickManage input: {reason}")
             );
         }
-        let shown_outside_herdr = refusal(
-            &json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}}),
-            false,
+    }
+
+    /// A call an earlier build offered, repeated from an old conversation, is refused like any
+    /// other field or action the tool does not take, before any host is asked, and the refusal
+    /// says what to send instead. Nothing of it is silently dropped or run.
+    #[test]
+    fn retired_placement_fields_and_move_are_refused_with_what_to_send_instead() {
+        for (input, reason) in [
+            (
+                json!({"action":"open","command":["tick"],"placement":{"type":"hidden"}}),
+                "placement is not allowed for open; open takes command, and optionally cwd, protocol",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"placement":{"type":"current_tab","direction":"left"}}),
+                "placement is not allowed for open; open takes command, and optionally cwd, protocol",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"workspace_id":"w1"}),
+                "workspace_id is not allowed for open; open takes command, and optionally cwd, protocol",
+            ),
+            (
+                json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"new_tab"}}),
+                "action must be one of open, send_input, close, reopen",
+            ),
+        ] {
+            assert_eq!(
+                refusal(&input),
+                format!("invalid TickManage input: {reason}")
+            );
+        }
+        let moved = check_call(
+            TICK_MANAGE,
+            &json!({"action":"move","tick_instance_id":"hosted:1"}),
+        )
+        .unwrap_err();
+        assert!(
+            moved.contains("must be open, send_input, close or reopen"),
+            "{moved}"
         );
         assert!(
-            shown_outside_herdr.contains("UnsupportedCapability"),
-            "{shown_outside_herdr}"
+            check_call("ReadWorkspace", &json!({}))
+                .unwrap_err()
+                .contains("unknown Tick tool")
         );
     }
 
     #[test]
     fn every_modify_form_is_accepted() {
-        for (input, views) in [
-            (
-                json!({"action":"open","command":["tick"],"cwd":"/tmp","protocol":true,"placement":{"type":"hidden"}}),
-                false,
-            ),
-            (
-                json!({"action":"open","command":["tick"],"workspace_id":"w1","placement":{"type":"pane","pane_id":"p1","direction":"up"}}),
-                true,
-            ),
-            (
-                json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"current_tab"}}),
-                true,
-            ),
-            (
-                json!({"action":"send_input","tick_instance_id":"hosted:1","text":"q","keys":["Enter"]}),
-                false,
-            ),
-            (
-                json!({"action":"reopen","tick_instance_id":"hosted:1"}),
-                false,
-            ),
+        for input in [
+            json!({"action":"open","command":["tick"],"cwd":"/tmp","protocol":true}),
+            json!({"action":"send_input","tick_instance_id":"hosted:1","text":"q","keys":["Enter"]}),
+            json!({"action":"close","tick_instance_id":"hosted:1"}),
+            json!({"action":"reopen","tick_instance_id":"hosted:1"}),
         ] {
-            assert_eq!(validate(&input, views), Ok(()), "{input}");
+            assert_eq!(validate(&input), Ok(()), "{input}");
         }
     }
 
     #[test]
-    fn only_hosted_targets_are_served_and_herdr_panes_need_views() {
+    fn only_hosted_targets_are_served() {
         for (name, input) in [
             (TICK_READ, json!({"tick_instance_id":"herdr:w1/p1"})),
             (TICK_CALL, json!({"tick_instance_id":"calendar:1"})),
@@ -769,32 +601,14 @@ mod tests {
                 json!({"action":"close","tick_instance_id":"terminal:1"}),
             ),
         ] {
-            let refused = check_call(name, &input, true).unwrap_err();
+            let refused = check_call(name, &input).unwrap_err();
             assert!(refused.starts_with("InvalidTickTarget"), "{refused}");
         }
         assert!(
-            check_call(TICK_READ, &json!({"tick_instance_id":"shell:1"}), true)
+            check_call(TICK_READ, &json!({"tick_instance_id":"shell:1"}))
                 .unwrap_err()
                 .starts_with("NativeToolRequired")
         );
-        let hidden = json!({"action":"open","command":["tick"],"placement":{"type":"hidden"}});
-        let shown = json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}});
-        let moved = json!({"action":"move","tick_instance_id":"hosted:1"});
-        for (name, input) in [
-            (READ_WORKSPACE, json!({})),
-            (TICK_MANAGE, shown.clone()),
-            (TICK_MANAGE, moved.clone()),
-        ] {
-            assert!(uses_herdr_layout(name, &input), "{input}");
-            assert!(check_call(name, &input, true).is_ok(), "{input}");
-            assert!(
-                check_call(name, &input, false)
-                    .unwrap_err()
-                    .starts_with("UnsupportedCapability"),
-                "{input}"
-            );
-        }
-        assert!(!uses_herdr_layout(TICK_MANAGE, &hidden));
-        assert!(check_call(TICK_MANAGE, &hidden, false).is_ok());
+        assert!(check_call(TICK_MANAGE, &json!({"action":"open","command":["tick"]})).is_ok());
     }
 }

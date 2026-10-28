@@ -279,8 +279,6 @@ pub enum WorkspaceIntegration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkspaceHostContext {
     pub name: WorkspaceHostName,
-    /// Whether this Agent can show its Ticks in the container's Panes.
-    pub integration: WorkspaceIntegration,
     /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
     /// The installed plugins, including disabled plugins.
@@ -312,7 +310,8 @@ pub enum WorkspacePluginLogin {
 }
 
 impl WorkspaceHostContext {
-    /// The container this process runs in, as its environment says, with no integration.
+    /// The container this process runs in, as its environment says, where this Agent cannot run
+    /// Ticks yet.
     pub fn from_environment() -> Self {
         Self::detected(
             std::env::var_os("HERDR_ENV").is_some_and(|value| value == "1"),
@@ -324,13 +323,6 @@ impl WorkspaceHostContext {
     /// The same container, where this Agent can also run Ticks in the Tickhost.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
-        self
-    }
-
-    /// Herdr, where this Agent can also show its Ticks in Panes.
-    pub fn with_herdr_views(mut self) -> Self {
-        self.name = WorkspaceHostName::Herdr;
-        self.integration = WorkspaceIntegration::Available;
         self
     }
 
@@ -346,7 +338,6 @@ impl WorkspaceHostContext {
         };
         Self {
             name,
-            integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
             plugins: Vec::new(),
         }

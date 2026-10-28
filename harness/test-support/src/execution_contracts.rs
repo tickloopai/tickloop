@@ -554,39 +554,6 @@ pub async fn restart_contract<F, Fut>(
     ));
 }
 
-pub async fn view_failure_contract(
-    environment: &dyn ExecutionEnvironment,
-    scope: ExecutionScope,
-    spec: OpenSpec,
-) {
-    let (port, authority, opened) = open(environment, scope, spec).await;
-    let instance = opened.opened.unwrap().instance;
-    let value: serde_json::Value = serde_json::from_str(&opened.result.content).unwrap();
-    assert_eq!(value["status"], "opened");
-    assert!(
-        matches!(
-            value["view"]["status"].as_str(),
-            Some("failed" | "unavailable" | "unknown" | "created_not_placed")
-        ),
-        "{value}"
-    );
-    assert!(
-        port.inspect(ExecutionQuery::Read(instance.clone()))
-            .await
-            .is_ok()
-    );
-    let ExecutionInspection::Instances(instances) =
-        port.inspect(ExecutionQuery::Instances).await.unwrap()
-    else {
-        panic!("missing instance listing");
-    };
-    assert_eq!(instances, vec![instance.clone()]);
-    assert!(matches!(
-        execute(&port, &authority, ExecutionIntent::Close { instance }).await,
-        ExecutionOutcome::Completed(_)
-    ));
-}
-
 pub async fn terminal_baseline_contract(
     environment: Arc<dyn ExecutionEnvironment>,
     scope: ExecutionScope,

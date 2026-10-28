@@ -18,7 +18,7 @@ use tickloop_harness::runtime::{
     Agent, SubagentLaunch,
     host_tools::{
         HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
-        PreparedHostCall, WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
+        PreparedHostCall, WorkspaceHostContext, WorkspaceIntegration,
     },
     mcp_tools::McpHostToolProvider,
 };
@@ -2437,7 +2437,7 @@ impl HostToolProvider for NativeFixture {
     }
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
-        Some(WorkspaceHostContext::from_environment().with_herdr_views())
+        Some(WorkspaceHostContext::from_environment().with_tickhost())
     }
 
     fn permission(
@@ -2482,8 +2482,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         ["native_fixture", "ArtifactLogin"]
     );
     let context = provider.workspace_host_context().unwrap();
-    assert_eq!(context.name, WorkspaceHostName::Herdr);
-    assert_eq!(context.integration, WorkspaceIntegration::Available);
+    assert_eq!(context.tickhost, WorkspaceIntegration::Available);
     assert_eq!(
         provider.host_endpoint().unwrap(),
         NativeFixture.host_endpoint().unwrap()
