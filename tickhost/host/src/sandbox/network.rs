@@ -25,12 +25,18 @@ const MAX_CONNECTIONS: usize = 64;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DENIED_DOMAINS: usize = 32;
+const MAX_DOMAIN_NAME_BYTES: usize = 253;
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 pub(crate) struct NetworkProxy {
     port: u16,
+    state: Arc<ProxyState>,
+}
+
+struct ProxyState {
+    allowed_domains: Vec<String>,
     stop: CancellationToken,
-    denied_domains: Arc<Mutex<BTreeSet<String>>>,
+    denied_domains: Mutex<BTreeSet<String>>,
 }
 
 impl NetworkProxy {
@@ -48,38 +54,31 @@ impl NetworkProxy {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *proxy_port))?;
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
-        let domains = Arc::new(allowed_domains.clone());
-        let stop = CancellationToken::new();
-        let cancelled = stop.clone();
-        let denied_domains = Arc::new(Mutex::new(BTreeSet::new()));
-        let denied = denied_domains.clone();
+        let state = Arc::new(ProxyState {
+            allowed_domains: allowed_domains.clone(),
+            stop: CancellationToken::new(),
+            denied_domains: Mutex::new(BTreeSet::new()),
+        });
+        let listener_state = state.clone();
         tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             loop {
                 let accepted = tokio::select! {
-                    _ = cancelled.cancelled() => break,
+                    _ = listener_state.stop.cancelled() => break,
                     accepted = listener.accept() => accepted,
                 };
                 let Ok((stream, _)) = accepted else { break };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     continue;
                 };
-                let domains = domains.clone();
-                let denied = denied.clone();
-                let cancelled = cancelled.clone();
+                let state = listener_state.clone();
                 tokio::spawn(async move {
                     let permit = Arc::new(permit);
-                    let connection_cancelled = cancelled.clone();
+                    let cancelled = state.stop.clone();
                     let service = service_fn(move |request| {
-                        let domains = domains.clone();
-                        let denied = denied.clone();
-                        let cancelled = connection_cancelled.clone();
+                        let state = state.clone();
                         let permit = permit.clone();
-                        async move {
-                            Ok::<_, Infallible>(
-                                forward(request, domains, denied, cancelled, permit).await,
-                            )
-                        }
+                        async move { Ok::<_, Infallible>(forward(request, state, permit).await) }
                     });
                     tokio::select! {
                         _ = cancelled.cancelled() => {},
@@ -95,8 +94,7 @@ impl NetworkProxy {
         });
         Ok(Some(Self {
             port: *proxy_port,
-            stop,
-            denied_domains,
+            state,
         }))
     }
 
@@ -118,12 +116,12 @@ impl NetworkProxy {
     }
 
     pub(crate) fn stop(&self) {
-        self.stop.cancel();
+        self.state.stop.cancel();
     }
 
     pub(crate) fn annotate_denials(&self, output: &std::fs::File) {
         use std::io::Write;
-        for domain in self.denied_domains.lock().unwrap().iter() {
+        for domain in self.state.denied_domains.lock().unwrap().iter() {
             let _ = writeln!(&mut &*output, "\n被沙箱拒绝的域名: {domain}");
         }
     }
@@ -137,9 +135,7 @@ impl Drop for NetworkProxy {
 
 async fn forward(
     mut request: Request<Incoming>,
-    domains: Arc<Vec<String>>,
-    denied: Arc<Mutex<BTreeSet<String>>>,
-    cancelled: CancellationToken,
+    state: Arc<ProxyState>,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Response<ProxyBody> {
     let is_connect = request.method() == Method::CONNECT;
@@ -153,7 +149,7 @@ async fn forward(
     else {
         return response(StatusCode::BAD_REQUEST, "missing destination host");
     };
-    if !domains.iter().any(|domain| {
+    if !state.allowed_domains.iter().any(|domain| {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         match domain.strip_prefix("*.") {
             Some(suffix) => host
@@ -162,8 +158,8 @@ async fn forward(
             None => host == domain,
         }
     }) {
-        let mut denied = denied.lock().unwrap();
-        if denied.len() < MAX_DENIED_DOMAINS && host.len() <= 253 {
+        let mut denied = state.denied_domains.lock().unwrap();
+        if denied.len() < MAX_DENIED_DOMAINS && host.len() <= MAX_DOMAIN_NAME_BYTES {
             denied.insert(host.clone());
         }
         return response(StatusCode::FORBIDDEN, "sandbox network access denied");
@@ -185,7 +181,7 @@ async fn forward(
         tokio::spawn(async move {
             let _permit = permit;
             tokio::select! {
-                _ = cancelled.cancelled() => {},
+                _ = state.stop.cancelled() => {},
                 _ = async {
                     if let Ok(upgraded) = hyper::upgrade::on(&mut request).await {
                         let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(upgraded), &mut stream).await;
@@ -217,7 +213,7 @@ async fn forward(
     };
     tokio::spawn(async move {
         tokio::select! {
-            _ = cancelled.cancelled() => {},
+            _ = state.stop.cancelled() => {},
             _ = connection => {},
         }
     });
