@@ -24,6 +24,10 @@ pub struct ContextBreakdown {
     pub system_tools: Vec<ContextItem>,
     /// MCP tools sent directly with each request, by server.
     pub mcp_tools: Vec<ContextToolServer>,
+    /// The part of each tool search pool tool a vendor's native search counts in context before
+    /// any search loads it, by server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_search_index: Vec<ContextToolServer>,
     /// Instruction files by path.
     pub instruction_files: Vec<ContextItem>,
     pub skills: Vec<ContextItem>,
@@ -48,12 +52,13 @@ pub enum ContextCategory {
     SystemPrompt,
     SystemTools,
     McpTools,
+    /// What a vendor's native search counts in context for the deferred tools it can load.
+    ToolSearchIndex,
     InstructionFiles,
     Skills,
     ToolSearchResults,
     Messages,
-    /// What the service reported beyond the count by more than the count can explain, such as
-    /// definitions a vendor's tool search loads.
+    /// What the service reported beyond the count by more than the count can explain.
     Unattributed,
 }
 
@@ -82,7 +87,8 @@ impl ContextToolServer {
 }
 
 /// The MCP tools reachable only through tool search: their definitions, counted as a load would
-/// send them, take no context until the model loads them.
+/// send them, take no context until the model loads them; what native search counts before that
+/// is the Tool search index category.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolSearchPool {
     pub mode: ToolSearchMode,

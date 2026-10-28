@@ -85,8 +85,10 @@ use tickloop_harness::protocol::{
 /// directories on Create.
 /// 32.1 adds the automatic compaction line to the Chat status and the `autoCompactWindow` cap
 /// to the live Chat snapshot.
-pub const PROTOCOL_MAJOR: u16 = 32;
-pub const PROTOCOL_MINOR: u16 = 1;
+/// 33.0 adds the context breakdown's Tool search index category, which older readers reject as
+/// unknown, and its per-server items.
+pub const PROTOCOL_MAJOR: u16 = 33;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
