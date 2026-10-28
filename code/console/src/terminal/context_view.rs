@@ -20,7 +20,10 @@ pub(super) const EXPAND_ARGUMENT: &str = "all";
 const MAX_SECTION_ITEMS: usize = 50;
 /// Below this width the grid shrinks to five columns, as Claude Code's does.
 const NARROW_WIDTH: usize = 80;
-const LARGE_WINDOW_TOKENS: u64 = 1_000_000;
+/// From this window up the grid doubles to twenty columns. Claude Code does so from 1M; the
+/// threshold is lowered to 500k because providers such as Codex report the input limit (872k)
+/// rather than the whole window, and those models should still get the large grid.
+const LARGE_WINDOW_TOKENS: u64 = 500_000;
 /// Each cell is a glyph and a space.
 const CELL_COLUMNS: usize = 2;
 const COLUMN_GAP: usize = 2;
