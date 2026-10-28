@@ -286,8 +286,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "/plan",
-        arguments: "",
-        description: "Enter Plan mode, or review this Chat's saved plan.",
+        arguments: "[open|DESCRIPTION]",
+        description: "Enter Plan mode, optionally planning DESCRIPTION; in Plan, show the plan or open it in your editor.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {

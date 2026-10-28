@@ -312,6 +312,7 @@ mod tests {
                         chat,
                         version: 1,
                         request: None,
+                        markdown: String::new(),
                     },
                 ),
             )

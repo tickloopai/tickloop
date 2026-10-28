@@ -113,7 +113,7 @@ mod workflows;
 mod workspace_trust;
 
 use agent_messaging::{AgentInput, AgentMessage};
-use console::{Console, InputEvent, RendererSwitch};
+use console::{Console, InputEvent, RendererSwitch, RequestedPlanEdit};
 use diff_catalog::ChangeCatalog;
 use directed_summary::{DirectedSummaryTasks, SummaryTaskCompletion};
 use display::{DisplayProfile, Glyph};
@@ -943,7 +943,7 @@ In transcript: / searches, enter accepts, n/N moves between matches; esc cancels
 j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
-/plan enters Plan mode, or opens this Chat's saved plan.
+/plan [open|DESCRIPTION] enters Plan mode, starting on DESCRIPTION when given; in Plan it shows the plan, and open edits it in your editor. A plan awaiting approval reopens its review: ctrl+g edits the plan, shift+tab on the feedback field approves with that feedback.
 Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; p pauses/resumes a periodic subscription or scheduled task; x twice confirms removal.
 The first new Goal, scheduled task or Tick in each Chat during this console session opens Monitor once without moving input focus, even when hidden. Closing it prevents further automatic opens. Existing content on opening a Chat does not trigger this; narrow terminals flash the Monitor entry instead of covering the conversation.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
@@ -1678,47 +1678,25 @@ fn banner_title_line(agent_runtime: Option<&str>) -> (usize, Vec<(String, Option
     (BANNER_TEXT_FIRST_ROW, line)
 }
 
-async fn open_current_plan(
+const PLAN_OPEN_ARGUMENT: &str = "open";
+const PLAN_MODE_ENABLED: &str = "Plan mode is active. Enter a task to make a plan.";
+const NO_PLAN_WRITTEN: &str = "Already in plan mode. No plan written yet.";
+
+/// `/plan [open|DESCRIPTION]`, after Claude Code: outside Plan it enters Plan and sends a
+/// description as the next prompt; in Plan it shows the current plan, and `open` edits it in the
+/// external editor. A plan awaiting approval reopens its review, where `open` edits that plan.
+/// Returns the description to send.
+async fn run_plan_command(
     agent: &Agent,
     console: &Console,
     menus: &mut Menus,
     chat: Option<ChatId>,
-) -> Result<(), String> {
-    if let Some(chat) = chat {
-        let snapshot = agent
-            .snapshot(chat.into())
-            .await
-            .map_err(|error| error.to_string())?;
-        // Plain input reaches here without the editor's scope check.
-        if snapshot.delegation.is_some() {
-            return Err(completion::command_refusal(
-                completion::CommandScope::Child,
-                "/plan",
-                completion::CHILD_PLAN_REPORTED,
-            ));
-        }
-        if let Some(plan) = snapshot
-            .plans
-            .iter()
-            .find(|plan| plan.loop_id == snapshot.chat_loop.id)
-        {
-            if console.is_interactive() || plan.approval_pending {
-                return menus.workflow(console, Workflow::plan(agent, chat.into()).await?);
-            }
-            outln!(
-                console,
-                "Plan version {} · approved mode {:?}\n{}",
-                plan.version,
-                plan.approved_execution_mode,
-                safe_text(&plan.markdown)
-            );
-            return Ok(());
-        }
-        agent
-            .set_execution_mode(chat.into(), ExecutionMode::Plan)
-            .await
-            .map_err(|error| error.to_string())?;
-    } else {
+    argument: &str,
+) -> Result<Option<String>, String> {
+    let argument = argument.trim();
+    let opens_plan = argument == PLAN_OPEN_ARGUMENT;
+    let description = (!argument.is_empty() && !opens_plan).then(|| argument.to_owned());
+    let Some(chat) = chat else {
         agent
             .change_configuration(
                 ConfigTarget::NewDraft,
@@ -1728,9 +1706,89 @@ async fn open_current_plan(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if description.is_none() {
+            outln!(console, "{PLAN_MODE_ENABLED}");
+        }
+        return Ok(description);
+    };
+    let snapshot = agent
+        .snapshot(chat.into())
+        .await
+        .map_err(|error| error.to_string())?;
+    // Plain input reaches here without the editor's scope check.
+    if snapshot.delegation.is_some() {
+        return Err(completion::command_refusal(
+            completion::CommandScope::Child,
+            "/plan",
+            completion::CHILD_PLAN_REPORTED,
+        ));
     }
-    outln!(console, "Plan mode is active. Enter a task to make a plan.");
-    Ok(())
+    let plan = snapshot
+        .plans
+        .iter()
+        .find(|plan| plan.loop_id == snapshot.chat_loop.id);
+    if description.is_none() && plan.is_some_and(|plan| plan.approval_pending) {
+        menus.workflow(console, Workflow::plan(agent, chat.into()).await?)?;
+        if opens_plan && console.is_interactive() {
+            console.request_plan_edit(RequestedPlanEdit::Review)?;
+        }
+        return Ok(None);
+    }
+    let was_in_plan = snapshot.policy.mode == ExecutionMode::Plan;
+    if !was_in_plan {
+        agent
+            .set_execution_mode(chat.into(), ExecutionMode::Plan)
+            .await
+            .map_err(|error| error.to_string())?;
+        if description.is_some() {
+            return Ok(description);
+        }
+        if !opens_plan {
+            outln!(console, "{PLAN_MODE_ENABLED}");
+            return Ok(None);
+        }
+    } else if !opens_plan {
+        match plan {
+            Some(_) if console.is_interactive() => {
+                menus.workflow(console, Workflow::plan(agent, chat.into()).await?)?;
+            }
+            Some(plan) => outln!(
+                console,
+                "Plan version {} · approved mode {:?}\n{}",
+                plan.version,
+                plan.approved_execution_mode,
+                safe_text(&plan.markdown)
+            ),
+            None => outln!(console, "{NO_PLAN_WRITTEN}"),
+        }
+        return Ok(None);
+    }
+    let Some(path) = agent
+        .plan_file(chat.into())
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        outln!(
+            console,
+            "{}",
+            if was_in_plan {
+                NO_PLAN_WRITTEN
+            } else {
+                PLAN_MODE_ENABLED
+            }
+        );
+        return Ok(None);
+    };
+    if console.is_interactive() {
+        console.request_plan_edit(RequestedPlanEdit::File(path))?;
+    } else {
+        outln!(
+            console,
+            "Plan file: {}",
+            safe_text(&path.display().to_string())
+        );
+    }
+    Ok(None)
 }
 
 fn close_login_session(
@@ -1780,6 +1838,8 @@ fn model_setup_blocks_input(line: &str) -> bool {
     if !command.starts_with('/')
         || command == "/compact"
         || (command == "/goal" && line.trim() != "/goal")
+        || (command == "/plan"
+            && !matches!(line.trim()["/plan".len()..].trim(), "" | PLAN_OPEN_ARGUMENT))
     {
         return true;
     }
@@ -3094,7 +3154,7 @@ async fn interact_with_herdr(
                     status_dirty = true;
                 },
                 Some(InputEvent::Suspend | InputEvent::OpenRewind | InputEvent::TakeBackQueued { .. }
-                    | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. }
+                    | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. } | InputEvent::PlanEdited { .. }
                     | InputEvent::BackgroundForegroundShell | InputEvent::Permissions(_)
                     | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login_active => {},
                 Some(InputEvent::Escape) => {
@@ -3289,6 +3349,13 @@ async fn interact_with_herdr(
                     match menus.choose(agent,console,menu_id,Some(index),comment).await {
                         Ok(outcome)=>menu_outcome=Some(outcome),
                         Err(error)=>outln!(console,"Cannot apply selection: {}",safe_text(&error)),
+                    }
+                },
+                Some(InputEvent::PlanEdited {menu_id,markdown}) => {
+                    status_dirty=true;
+                    match menus.edit_plan(agent,console,menu_id,markdown).await {
+                        Ok(())=>console.set_status("Plan edited · approve or keep planning on the new version")?,
+                        Err(error)=>console.set_status(&format!("Cannot save the edited plan: {}",safe_line(&error)))?,
                     }
                 },
                 Some(InputEvent::ExpandChoice {menu_id,index}) => {
@@ -3911,10 +3978,13 @@ async fn interact_with_herdr(
                             if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat.into()).await?; }
                         },
-                        "/plan" => {
-                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat).await {
-                                outln!(console,"Cannot open plan: {}",safe_text(&error));
+                        _ if line == "/plan" || line.starts_with("/plan ") => {
+                            match run_plan_command(agent,console,&mut menus,selected_chat,&line["/plan".len()..]).await {
+                                Ok(Some(description)) => paused_inputs.push_front(InputEvent::Line(description)),
+                                Ok(None) => {},
+                                Err(error) => outln!(console,"Cannot open plan: {}",safe_text(&error)),
                             }
+                            status_dirty = true;
                         },
                         "/details" if interactive => {
                             let id = console.start_transcript()?;
@@ -8442,6 +8512,8 @@ mod tests {
             "/goal finish the task",
             "/compact",
             "/compact summarize this",
+            "/plan add a cache",
+            "/plan open a pull request",
         ] {
             assert!(super::model_setup_blocks_input(input), "{input}");
         }
@@ -8456,6 +8528,8 @@ mod tests {
             "/help advanced",
             "/resume saved-chat",
             "/clear",
+            "/plan",
+            "/plan  open ",
         ] {
             assert!(!super::model_setup_blocks_input(input), "{input}");
         }
