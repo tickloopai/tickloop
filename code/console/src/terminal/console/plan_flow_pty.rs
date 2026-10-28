@@ -29,7 +29,11 @@ const STARTED_FILE: &str = "started";
 const GO_FILE: &str = "go";
 const STATE_FILE: &str = "state.json";
 const PHASE_FILE: &str = "phases.jsonl";
-const PLAN_REMINDER: &str = "Plan mode is active.";
+/// Opens each Plan mode reminder note, full or sparse.
+const PLAN_REMINDERS: [&str; 2] = [
+    "Plan mode is active.",
+    "Plan mode still active (see full instructions earlier in conversation).",
+];
 const EXIT_NOTICE: &str = "You have exited plan mode.";
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
 const LIVE_PLAN: &str = "## Live plan\n\n* Implement **after** approval\n* Report the result";
@@ -300,8 +304,9 @@ async fn wait_for_plan_approval(
     }
 }
 
-/// Whether each model request was made in Plan mode, how many of its messages carry the
-/// exited-plan-mode notice, and the texts and tool results of its latest message.
+/// Whether each model request was made in Plan mode (its conversation's last Plan mode note is a
+/// reminder rather than the exited-plan-mode notice), how many of its messages carry that notice,
+/// and the texts and tool results of the messages after the last reply.
 fn request_summaries(model: &ScriptedModel) -> Vec<Value> {
     model
         .requests
@@ -309,20 +314,29 @@ fn request_summaries(model: &ScriptedModel) -> Vec<Value> {
         .unwrap()
         .iter()
         .map(|request| {
-            let system = request
+            let plan_mode = request
                 .messages
                 .iter()
-                .filter(|message| message.role == MessageRole::System)
                 .flat_map(|message| &message.content)
                 .filter_map(|content| match content {
-                    Content::Text { text } => Some(text.as_str()),
+                    Content::Text { text } if text.contains(EXIT_NOTICE) => Some(false),
+                    Content::Text { text }
+                        if PLAN_REMINDERS.iter().any(|reminder| text.contains(reminder)) =>
+                    {
+                        Some(true)
+                    }
                     _ => None,
                 })
-                .collect::<String>();
-            let latest = request
+                .next_back()
+                .unwrap_or(false);
+            let first_latest = request
                 .messages
-                .last()
-                .into_iter()
+                .iter()
+                .rposition(|message| message.role == MessageRole::Assistant)
+                .map_or(0, |index| index + 1);
+            let latest = request.messages[first_latest..]
+                .iter()
+                .filter(|message| message.role != MessageRole::System)
                 .flat_map(|message| &message.content)
                 .filter_map(|content| match content {
                     Content::Text { text } => Some(text.clone()),
@@ -340,7 +354,7 @@ fn request_summaries(model: &ScriptedModel) -> Vec<Value> {
                 })
                 .count();
             json!({
-                "plan_mode": system.contains(PLAN_REMINDER),
+                "plan_mode": plan_mode,
                 "exit_notices": exit_notices,
                 "offers_exit_plan_mode": request.tools.iter().any(|tool| tool.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME),
                 "latest": latest,
@@ -555,7 +569,10 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
         "{state}"
     );
     assert!(latest_contains(&requests[3], "Revised plan"), "{state}");
-    assert_eq!(requests[3]["exit_notices"], 0, "{state}");
+    assert_eq!(
+        requests[3]["exit_notices"], 1,
+        "like Claude Code 2.1.302, approval leaves Plan and says so once: {state}"
+    );
     assert_eq!(state["mode"], "acceptEdits");
     assert_eq!(
         state["plans"],
@@ -577,7 +594,8 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     });
     assert_eq!(state["requests"].as_array().unwrap().len(), 5);
 
-    // Leaving Plan by Shift+Tab tells the next request once that plan mode ended.
+    // Passing through Plan by Shift+Tab leaves it again, so the next request says so once more,
+    // as Claude Code 2.1.302's `plan_mode_exit` does after any exit.
     flow.fixture.send(b"Wrap up\r");
     let (_, state) = flow.wait("the reply outside Plan", |frame, state| {
         frame.contains("Wrapped up outside Plan.")
@@ -586,7 +604,7 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     });
     let request = &state["requests"][5];
     assert_eq!(request["plan_mode"], false, "{state}");
-    assert_eq!(request["exit_notices"], 1, "{state}");
+    assert_eq!(request["exit_notices"], 2, "{state}");
     assert!(latest_contains(request, EXIT_NOTICE), "{state}");
     flow.exit();
 }
@@ -664,8 +682,8 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
     );
     assert!(latest_contains(&requests[1], "Pending plan"), "{state}");
     assert_eq!(
-        requests[1]["exit_notices"], 0,
-        "approval after Shift+Tab left Plan resumes with the approved plan alone: {state}"
+        requests[1]["exit_notices"], 1,
+        "Shift+Tab left Plan, so the continuation says so once: {state}"
     );
     assert_eq!(
         state["plans"],

@@ -426,7 +426,7 @@ async fn a_plan_the_user_edits_in_review_is_approved_as_a_new_user_edited_versio
     assert_eq!(
         result.content,
         format!(
-            "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep commits small."
+            "User has approved your plan. You can now start coding.\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep commits small."
         )
     );
     agent.shutdown().await;
