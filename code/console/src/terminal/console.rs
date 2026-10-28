@@ -141,6 +141,7 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
+    sandbox_surface::SandboxSurface,
     scrollback::{
         CollapsedCall, ForegroundCommandHint, InputEcho, ScrollAction, Scrollback, ToolCallState,
     },
@@ -936,6 +937,7 @@ pub(super) struct State {
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
     member_probe_running: bool,
     permissions_surface: Option<PermissionsSurface>,
+    sandbox_surface: Option<SandboxSurface>,
     footer: FooterState,
     status_area: StatusArea,
     overview: OverviewState,
@@ -2376,6 +2378,7 @@ impl Console {
                 || state.artifacts_picker.is_some()
                 || state.user_panel.is_some()
                 || state.conversation_picker.is_some()
+                || state.sandbox_surface.is_some()
                 || state.permissions_surface.is_some()
                 || state
                     .last_input_edit
@@ -3002,6 +3005,7 @@ impl Console {
             return Err("the transcript view requires a terminal".into());
         }
         state.permissions_surface = None;
+        state.sandbox_surface = None;
         let id = state.start_transcript();
         state
             .draw(&mut io::stdout().lock())
@@ -3088,6 +3092,7 @@ impl Console {
         }
         state.open_diff_screen(chat_id, catalog);
         state.permissions_surface = None;
+        state.sandbox_surface = None;
         state.clear_footer_selection();
         state.shell_background_chord_started_at = None;
         state.rendered_region = None;
@@ -4299,6 +4304,27 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn show_sandbox(&self, surface: SandboxSurface) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.request_layout.is_some() {
+            let mut dialog = input_dialog::DialogState::default();
+            dialog.sandbox_surface = Some(surface);
+            let chat = state.chat;
+            state.install_user_dialog(chat, dialog);
+            return Ok(());
+        }
+        state.sandbox_surface = Some(surface);
+        state.transcript = None;
+        state.hide_diff_screen();
+        state.clear_footer_selection();
+        state.menu_focused = false;
+        state.review_focused = false;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
     pub fn show_menu(&self, menu: Menu) -> Result<(), String> {
         self.show_menu_with_comments(
             menu,
@@ -4666,6 +4692,7 @@ impl Console {
             || {
                 !matches!(focus, MenuFocus::Picker(..))
                     || state.request_layout.is_some()
+                    || state.sandbox_surface.is_some()
                     || state.permissions_surface.is_some()
                     || (match &focus {
                         MenuFocus::WhenInputEmpty | MenuFocus::Question(_) => {
@@ -6121,6 +6148,7 @@ impl State {
         }
         self.hide_diff_screen();
         self.permissions_surface = None;
+        self.sandbox_surface = None;
         self.clear_footer_selection();
 
         self.shell_background_chord_started_at = None;
@@ -6285,6 +6313,7 @@ impl State {
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
+            sandbox_surface: None,
             footer: FooterState::default(),
             status_area: StatusArea::default(),
             overview: OverviewState::default(),
@@ -7184,6 +7213,7 @@ impl State {
                     && self.conversation_picker.is_none()
                     && self.artifacts_picker.is_none()
                     && self.user_panel.is_none()
+                    && self.sandbox_surface.is_none()
                     && self.permissions_surface.is_none())
             && self.transcript.is_none()
             && self.diff_screen.is_none()
@@ -7679,6 +7709,7 @@ impl State {
         !(((self.menu_focused || self.review_focused) && !self.menu_comment_is_editing())
             || self.footer.selected().is_some()
             || self.help_open
+            || self.sandbox_surface.is_some()
             || self.permissions_surface.is_some()
             || self.user_panel.is_some()
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
@@ -10215,6 +10246,7 @@ impl State {
             && self.conversation_picker.is_none()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
+            && self.sandbox_surface.is_none()
             && self.permissions_surface.is_none()
             && self.history_search.is_none()
             && !self.help_open
@@ -11069,6 +11101,7 @@ impl State {
                 && self.menu.is_none()
                 && self.artifacts_picker.is_none()
                 && self.conversation_picker.is_none()
+                && self.sandbox_surface.is_none()
                 && self.permissions_surface.is_none()
         {
             return None;
@@ -11119,6 +11152,9 @@ impl State {
             return None;
         }
         if self.menu.is_none() && self.foreground_shell {
+            return None;
+        }
+        if self.menu.is_none() && self.sandbox_surface.is_some() {
             return None;
         }
         if self.menu.is_none()
@@ -12232,6 +12268,7 @@ impl State {
             && self.conversation_picker.is_none()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
+            && self.sandbox_surface.is_none()
             && self.permissions_surface.is_none()
             && self.history_search.is_none()
             && !self.help_open
@@ -12655,6 +12692,7 @@ impl State {
         if self.menu.is_none()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
+            && self.sandbox_surface.is_none()
             && self.permissions_surface.is_none()
             && self.history_search.is_none()
         {
@@ -12738,6 +12776,7 @@ impl State {
             && (!self.can_background_foreground_work()
                 || self.menu.is_some()
                 || self.diff_screen.is_some()
+                || self.sandbox_surface.is_some()
                 || self.permissions_surface.is_some()
                 || self.transcript.is_some()
                 || self.history_search.is_some())
@@ -12762,6 +12801,15 @@ impl State {
         #[cfg(unix)]
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
             return Some(InputEvent::Suspend);
+        }
+        if self.menu.is_none()
+            && let Some(surface) = &mut self.sandbox_surface
+        {
+            self.escape_confirmation = None;
+            if surface.key(key) {
+                self.sandbox_surface = None;
+            }
+            return None;
         }
         if self.menu.is_none() && self.permissions_surface.is_some() {
             self.escape_confirmation = None;

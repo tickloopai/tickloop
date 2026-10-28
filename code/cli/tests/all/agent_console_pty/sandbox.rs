@@ -70,3 +70,132 @@ async fn permissions_shows_sandbox_setting_and_bang_shell_obeys_it() {
         }
     }
 }
+
+#[tokio::test]
+async fn sandbox_mode_changes_apply_to_the_next_shell_without_restarting() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        std::fs::write(
+            fixture.path("config/settings.json"),
+            json!({
+                "sandbox": {"failIfUnavailable":true, "filesystem":{"denyWrite":["blocked"]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut view = PtyView::start(&fixture);
+        view.wait_for("new input ready", new_input_is_visible).await;
+        view.send(b"/sandbox\r");
+        view.wait_for("sandbox Mode", |frame| frame.contains("[Mode]"))
+            .await;
+        view.send(b"kk\r");
+        view.wait_for("saved sandbox mode", |frame| {
+            frame.contains("Saved for this Folder")
+        })
+        .await;
+        view.send(b"\x1b");
+        view.wait_for_editor("sandbox closes", Some("")).await;
+        view.send(b"!printf blocked > blocked\r");
+        view.wait_for("next Shell is sandboxed", |frame| {
+            frame.contains("被沙箱拦截")
+        })
+        .await;
+        assert!(!fixture.path("work/blocked").exists());
+        view.wait_for_editor("Shell finished", Some("")).await;
+        view.send(b"/sandbox\r");
+        view.wait_for("sandbox Mode again", |frame| frame.contains("[Mode]"))
+            .await;
+        view.send(b"jj\r");
+        view.wait_for("sandbox disabled", |frame| {
+            frame.contains("Saved for this Folder")
+        })
+        .await;
+        view.send(b"\x1b");
+        view.wait_for_editor("sandbox closes again", Some("")).await;
+        view.send(b"!printf allowed > blocked\r");
+        view.wait_for("Shell without sandbox", |frame| {
+            frame.contains("(No output)") && fixture.path("work/blocked").exists()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.path("work/blocked")).unwrap(),
+            "allowed"
+        );
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn sandbox_mode_changes_apply_to_model_bash_in_the_same_chat() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let (url, _requests) = model_http_support::serve_responses(vec![
+            (200, chat_reply(Some(("Bash", "sandboxed-write", json!({"command":"printf first > blocked","description":"Try the protected write"}))), "")),
+            (200, chat_reply(None, "FIRST-BASH-FINISHED")),
+            (200, chat_reply(Some(("Bash", "ordinary-write", json!({"command":"printf second > blocked","description":"Write after the mode change"}))), "")),
+            (200, chat_reply(None, "SECOND-BASH-FINISHED")),
+        ]).await;
+        fixture.set_chat_model(&url);
+        std::fs::write(fixture.path("config/settings.json"), json!({"sandbox":{"failIfUnavailable":true,"filesystem":{"denyWrite":["blocked"]}}}).to_string()).unwrap();
+        let mut view = PtyView::start_with_flags(&fixture, &["--dangerously-skip-permissions"]);
+        view.wait_for("new input ready", new_input_is_visible).await;
+        view.send(b"/sandbox\r");
+        view.wait_for("Mode", |frame| frame.contains("[Mode]")).await;
+        view.send(b"kk\r");
+        view.wait_for("sandbox enabled", |frame| frame.contains("Saved for this Folder")).await;
+        view.send(b"\x1b");
+        view.wait_for_editor("sandbox closes", Some("")).await;
+        view.send(b"Try the protected write.\r");
+        view.wait_for("first model Bash finished", |frame| frame.contains("FIRST-BASH-FINISHED")).await;
+        assert!(!fixture.path("work/blocked").exists());
+        view.wait_for_editor("first turn finished", Some("")).await;
+        view.send(b"/sandbox\r");
+        view.wait_for("Mode again", |frame| frame.contains("[Mode]")).await;
+        view.send(b"jj\r");
+        view.wait_for("sandbox disabled", |frame| frame.contains("Saved for this Folder")).await;
+        view.send(b"\x1b");
+        view.wait_for_editor("sandbox closes again", Some("")).await;
+        view.send(b"Write again.\r");
+        view.wait_for("second model Bash finished", |frame| frame.contains("SECOND-BASH-FINISHED")).await;
+        assert_eq!(std::fs::read_to_string(fixture.path("work/blocked")).unwrap(), "second");
+        view.close().await;
+    }).catch_unwind().await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn folder_sandbox_unsupported_fields_are_reported_at_startup() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let folder = fixture.path("work").canonicalize().unwrap();
+        std::fs::write(
+            fixture.path("config/settings.json"),
+            json!({"projects":{
+                folder.to_str().unwrap():{"sandbox":{"filesystem":{"allowRead":["private"]}}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut view = PtyView::start(&fixture);
+        view.wait_for("directory sandbox unsupported-field warning", |frame| {
+            frame.contains("sandbox.filesystem.allowRead") && frame.contains("暂不支持")
+        })
+        .await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

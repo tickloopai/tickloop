@@ -40,3 +40,6 @@ mod mcp_credentials;
 
 #[path = "all/additional_directories.rs"]
 mod additional_directories;
+
+#[path = "all/sandbox_settings.rs"]
+mod sandbox_settings;
