@@ -152,6 +152,41 @@ fn mouse_and_focus_reports_after_an_escape_neither_send_it_nor_stop_it_leaving()
 }
 
 #[test]
+fn a_paste_whose_end_never_arrives_ends_once_it_goes_quiet() {
+    let start = Instant::now();
+    let mut keys = CardKeys::default();
+    assert_eq!(
+        keys.feed(b"\x1b[200~text\x1b[20", start, true),
+        bytes(b"\x1b[200~text")
+    );
+    assert_eq!(keys.deadline(), Some(start + PASTE_IDLE));
+    assert!(
+        keys.expire(start + PASTE_IDLE - Duration::from_millis(1))
+            .is_empty()
+    );
+    assert_eq!(
+        keys.expire(start + PASTE_IDLE),
+        bytes(b"\x1b[20\x1b[201~"),
+        "the held tail and the end marker the Tick waits for"
+    );
+    assert_eq!(keys.deadline(), None);
+    assert_eq!(keys.feed(b"x\x1b", start + PASTE_IDLE, false), bytes(b"x"));
+    assert!(keys.deadline().is_some(), "keys are keys again");
+
+    let mut keys = CardKeys::default();
+    assert_eq!(keys.feed(b"\x1b[200~a", start, false), bytes(b"a"));
+    assert_eq!(keys.feed(b"b", after(start, 1200), false), bytes(b"b"));
+    assert_eq!(
+        keys.deadline(),
+        Some(after(start, 1200) + PASTE_IDLE),
+        "each pasted read restarts the wait"
+    );
+    assert!(keys.expire(after(start, 1200) + PASTE_IDLE).is_empty());
+    assert_eq!(keys.feed(b"c", after(start, 5000), false), bytes(b"c"));
+    assert_eq!(keys.deadline(), None, "the paste ended");
+}
+
+#[test]
 fn mouse_reports_are_parsed_and_never_forwarded_as_they_came() {
     let start = Instant::now();
     let mut keys = CardKeys::default();

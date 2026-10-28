@@ -40,6 +40,9 @@ pub(super) const ESCAPE_WINDOW: Duration = Duration::from_millis(400);
 /// The bytes of one key's escape sequence arrive together; an Esc with nothing after it for this
 /// long was pressed alone.
 const SEQUENCE_DELAY: Duration = Duration::from_millis(50);
+/// A bracketed paste whose end marker has not come after this long of nothing more pasted is
+/// over, so a lost marker never traps the focus in the card.
+pub(super) const PASTE_IDLE: Duration = Duration::from_millis(1500);
 /// The most input a card holds while its view attaches; more, and all input after it, is
 /// dropped.
 const EARLY_INPUT_BYTES: usize = 64 * 1024;
@@ -826,6 +829,9 @@ pub(super) struct CardKeys {
     /// When a lone Esc was pressed that has not yet left the card or gone to the Tick.
     escape_at: Option<Instant>,
     in_paste: bool,
+    /// When the paste last brought bytes, and whether the Tick got its start marker.
+    paste_at: Option<Instant>,
+    paste_markers: bool,
     /// Pasted bytes held back while they could still begin the paste's end marker.
     paste_tail: Vec<u8>,
 }
@@ -840,9 +846,12 @@ impl CardKeys {
         paste_markers: bool,
     ) -> Vec<CardInput> {
         let mut items = Vec::new();
+        if self.in_paste && !input.is_empty() {
+            self.paste_at = Some(now);
+        }
         for &byte in input {
             if self.in_paste {
-                self.paste_byte(byte, paste_markers, &mut items);
+                self.paste_byte(byte, &mut items);
                 continue;
             }
             if !self.sequence.is_empty() {
@@ -893,16 +902,25 @@ impl CardKeys {
     pub(super) fn deadline(&self) -> Option<Instant> {
         let sequence = self.sequence_at.map(|at| at + SEQUENCE_DELAY);
         let escape = self.escape_at.map(|at| at + ESCAPE_WINDOW);
-        match (sequence, escape) {
-            (Some(sequence), Some(escape)) => Some(sequence.min(escape)),
-            (sequence, escape) => sequence.or(escape),
-        }
+        let paste = self.paste_at.map(|at| at + PASTE_IDLE);
+        [sequence, escape, paste].into_iter().flatten().min()
     }
 
     /// Settles what waited for time to tell: a held Esc with nothing after it is a lone Esc, an
-    /// unfinished sequence reaches the Tick as it is, and a lone Esc nothing followed leaves.
+    /// unfinished sequence reaches the Tick as it is, a lone Esc nothing followed leaves, and a
+    /// paste that went quiet without its end marker ends.
     pub(super) fn expire(&mut self, now: Instant) -> Vec<CardInput> {
         let mut items = Vec::new();
+        if let Some(at) = self.paste_at
+            && now >= at + PASTE_IDLE
+        {
+            let tail = std::mem::take(&mut self.paste_tail);
+            push_bytes(&mut items, &tail);
+            if self.paste_markers {
+                push_bytes(&mut items, PASTE_END);
+            }
+            self.end_paste();
+        }
         if let Some(at) = self.sequence_at
             && now >= at + SEQUENCE_DELAY
         {
@@ -957,6 +975,8 @@ impl CardKeys {
         }
         if token == PASTE_START {
             self.in_paste = true;
+            self.paste_at = Some(now);
+            self.paste_markers = paste_markers;
             if paste_markers {
                 push_bytes(items, PASTE_START);
             }
@@ -972,17 +992,24 @@ impl CardKeys {
         push_bytes(items, &bytes);
     }
 
-    fn paste_byte(&mut self, byte: u8, paste_markers: bool, items: &mut Vec<CardInput>) {
+    /// One pasted byte; the end marker reaches the Tick only when the start marker did.
+    fn paste_byte(&mut self, byte: u8, items: &mut Vec<CardInput>) {
         self.paste_tail.push(byte);
         if self.paste_tail.ends_with(PASTE_END) {
             let mut text = std::mem::take(&mut self.paste_tail);
             text.truncate(text.len() - PASTE_END.len());
             push_bytes(items, &text);
-            if paste_markers {
+            if self.paste_markers {
                 push_bytes(items, PASTE_END);
             }
-            self.in_paste = false;
+            self.end_paste();
         }
+    }
+
+    fn end_paste(&mut self) {
+        self.in_paste = false;
+        self.paste_at = None;
+        self.paste_markers = false;
     }
 
     /// Sends the pasted bytes read so far, except an end that may begin the end marker.
