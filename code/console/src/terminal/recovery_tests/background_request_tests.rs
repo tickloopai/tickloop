@@ -225,7 +225,7 @@ async fn run_background_request_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(monitor.snapshot(visible).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(monitor.snapshot(visible).await.unwrap())),
         user_settings: None,
     };
     let interaction_agent = monitor.clone();
@@ -466,7 +466,7 @@ fn start_background_request_pty(
         _master: pair.master,
         timeout: RECOVERY_TIMEOUT,
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     (fixture, directory)
 }
 

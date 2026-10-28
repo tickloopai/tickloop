@@ -431,7 +431,7 @@ async fn actual_cli_reopened_chat_keeps_its_banner_before_and_after_the_next_mes
         let mut reopened = PtyView::launch(&fixture, &["--resume", &chat], &[], true);
         let opened = reopened
             .wait_for("the same conversation reopened", |frame| {
-                frame.contains("History opened.") && frame.contains(FIRST_REPLY)
+                frame.contains(FIRST_REPLY)
             })
             .await;
         let banner_model = format!("{} · {:?}", model.model, model.protocol);

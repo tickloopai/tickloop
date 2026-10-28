@@ -1425,16 +1425,14 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             .into_iter()
             .next()
             .ok_or("No conversation found to continue")?;
-        StartupChat::Resumed(
-            Box::new(open_saved_chat(&agent, recent.id, fork_session).await?),
-            true,
-        )
+        StartupChat::Resumed(Box::new(
+            open_saved_chat(&agent, recent.id, fork_session).await?,
+        ))
     } else if let Some(requested) = resume {
         match requested {
-            Some(chat) => StartupChat::Resumed(
-                Box::new(open_saved_chat(&agent, chat, fork_session).await?),
-                true,
-            ),
+            Some(chat) => {
+                StartupChat::Resumed(Box::new(open_saved_chat(&agent, chat, fork_session).await?))
+            }
             None => StartupChat::Picker {
                 as_new_chat: fork_session,
             },
@@ -1515,7 +1513,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
 /// before startup; `-r` opens the picker.
 enum StartupChat {
     New,
-    Resumed(Box<tickloop_harness::protocol::ChatSnapshot>, bool),
+    Resumed(Box<tickloop_harness::protocol::ChatSnapshot>),
     Picker {
         as_new_chat: bool,
     },
@@ -1540,7 +1538,7 @@ async fn open_exact_chat(
         agent.resume_chat(chat.into()).await
     };
     match opened {
-        Ok(snapshot) => Ok(StartupChat::Resumed(Box::new(snapshot), true)),
+        Ok(snapshot) => Ok(StartupChat::Resumed(Box::new(snapshot))),
         Err(error) if error.code == AccessErrorCode::NotFound => {
             if let Some(console) = handoff {
                 console.leave_chat();
@@ -1554,7 +1552,7 @@ async fn open_exact_chat(
                 .snapshot(chat.into())
                 .await
                 .map_err(|error| format!("Failed to open Chat {}: {error}", chat.public()))?;
-            Ok(StartupChat::Resumed(Box::new(snapshot), false))
+            Ok(StartupChat::Resumed(Box::new(snapshot)))
         }
         Err(error) => Err(format!("Failed to resume Chat {}: {error}", chat.public())),
     }
@@ -2123,9 +2121,9 @@ async fn interact_with_herdr(
                 console.set_status(&safe_text(&error))?;
             }
         }
-        StartupChat::Resumed(snapshot, has_history) => {
+        StartupChat::Resumed(snapshot) => {
             learn_agent_colors(console, agent, &snapshot).await?;
-            show_opened_chat(console, agent, &snapshot, has_history)?;
+            show_opened_chat(console, agent, &snapshot)?;
             selected_chat = Some(snapshot.id);
             displayed_sequences.insert(snapshot.id.into(), snapshot.last_sequence);
             tools.restore_snapshot(&snapshot);
@@ -3778,7 +3776,7 @@ async fn interact_with_herdr(
                             match open_chat(agent,line.trim(),None).await {
                                 Ok(snapshot)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
+                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot)?;selected_chat=Some(snapshot.id);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
@@ -4406,7 +4404,7 @@ async fn interact_with_herdr(
                             match open_chat(agent, &line, selected_chat).await {
                                 Ok(snapshot) => {
                                     learn_agent_colors(console,agent,&snapshot).await?;
-                                    show_opened_chat(console,agent,&snapshot,true)?;
+                                    show_opened_chat(console,agent,&snapshot)?;
                                     selected_chat=Some(snapshot.id);
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
@@ -7646,12 +7644,13 @@ fn write_warning(console: &Console, warning: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes the history of the Chat just brought to the foreground into the view.
+/// Writes the history of the Chat just brought to the foreground into the view. Like Claude Code,
+/// no line follows the history: the input itself invites the next message, and sending it still
+/// resumes receiving Triggers when they were paused.
 fn show_opened_chat(
     console: &Console,
     agent: &Agent,
     snapshot: &tickloop_harness::protocol::ChatSnapshot,
-    has_history: bool,
 ) -> Result<(), String> {
     ensure_snapshot_banner(console, snapshot)?;
     console.reset_chat(snapshot.id.into())?;
@@ -7662,21 +7661,7 @@ fn show_opened_chat(
         write_warning(console, &warning)?;
     }
     show_settings_warnings(console, agent.user_settings_warnings(snapshot.id.into()))?;
-    workflows::write_public_history(console, snapshot)?;
-    if has_history {
-        let receiving_hint = if snapshot.chat_loop.receiving.is_receiving() {
-            "."
-        } else {
-            "; sending it resumes receiving Triggers."
-        };
-        outln!(
-            console,
-            "\nHistory opened. Enter a message to continue this Chat{receiving_hint}"
-        );
-    } else {
-        outln!(console, "Enter a message to continue this Chat.");
-    }
-    Ok(())
+    workflows::write_public_history(console, snapshot)
 }
 
 /// What a background notice calls an Agent before this View has received its snapshot.

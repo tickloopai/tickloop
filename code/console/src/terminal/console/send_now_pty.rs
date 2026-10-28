@@ -130,7 +130,7 @@ fn send_now_pty_fixture() {
                         crate::terminal::StartupState {
                             model_selected: true,
                             launch_arguments: Vec::new(),
-                            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
+                            chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot)),
                             user_settings: Some(tickloop_code_settings::UserSettings::in_root(
                                 &directory,
                             )),
@@ -185,7 +185,7 @@ fn send_now_pty_ctrl_enter_reaches_the_model_without_waiting_for_the_running_too
         30,
         "terminal::console::send_now_pty::send_now_pty_fixture",
     );
-    fixture.wait(|frame| frame.contains("continue this Chat") && frame.contains("fixture"));
+    fixture.wait(|frame| frame.contains("Tickloop v") && frame.contains("fixture"));
     assert!(
         fixture.raw_output().contains("\x1b[>1u"),
         "the View asks the terminal to tell ctrl+enter from enter"

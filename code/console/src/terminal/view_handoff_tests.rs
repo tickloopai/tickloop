@@ -98,7 +98,7 @@ async fn a_handoff_reconnects_the_chat_the_daemon_runs() {
     .await
     .unwrap();
 
-    let StartupChat::Resumed(snapshot, true) = opened else {
+    let StartupChat::Resumed(snapshot) = opened else {
         panic!("the live Chat opens with its history");
     };
     assert_eq!(Uuid::from(snapshot.id), chat);
@@ -117,10 +117,11 @@ async fn without_a_handoff_an_unknown_chat_still_starts_empty_under_its_id() {
         .await
         .unwrap();
 
-    let StartupChat::Resumed(snapshot, false) = opened else {
+    let StartupChat::Resumed(snapshot) = opened else {
         panic!("an unknown Chat starts empty");
     };
     assert_eq!(Uuid::from(snapshot.id), chat);
+    assert!(snapshot.messages.is_empty());
     assert!(daemon.agent.runs_chat(chat).await.unwrap());
     daemon.core.shutdown().await;
 }
