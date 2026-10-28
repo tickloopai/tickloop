@@ -3112,7 +3112,9 @@ fn compact_result_runs(
         }
     }
     if let Some(value) = &value {
-        if let Some(source) = value["source"].as_str() {
+        if name != "TickRead"
+            && let Some(source) = value["source"].as_str()
+        {
             rows.row([(clipped(source, PREVIEW_LINE_CHARACTERS).0, None)]);
         }
         let preview = value["output"]
@@ -5449,6 +5451,19 @@ mod tests {
         assert!(rendered.contains("actual command output"));
         assert!(rendered.contains("ctrl+o"));
         assert!(rendered.len() < 500);
+    }
+
+    #[test]
+    fn completed_tick_reads_show_no_source_line() {
+        for source in ["protocol", "terminal"] {
+            let result = ToolResult {
+                content: json!({"tick_instance_id":"hosted:counter","source":source,"seq":3,"at":null,"data":{"count":3}}).to_string(),
+                is_error: false,
+                output_ref: None,
+            };
+            let rendered = compact_result("TickRead", None, &result);
+            assert_eq!(rendered, "  ↳  Completed\n", "{source}");
+        }
     }
 
     #[test]

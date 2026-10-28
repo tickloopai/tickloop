@@ -474,7 +474,7 @@ async fn run_completed_reply_recovery_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
         user_settings: None,
     };
     let interaction_agent = agent.clone();
@@ -795,7 +795,7 @@ fn run_recovery_pty(route: &str) {
             RECOVERY_TIMEOUT
         },
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture
         .writer
         .write_all(b"Continue the same bounded cadence task.\r")
@@ -1596,7 +1596,7 @@ async fn run_retained_completion_lifecycle_fixture() {
             StartupState {
                 model_selected: true,
                 launch_arguments: Vec::new(),
-                chat: StartupChat::Resumed(Box::new(startup_snapshot), true),
+                chat: StartupChat::Resumed(Box::new(startup_snapshot)),
                 user_settings: None,
             },
             None,
@@ -2121,7 +2121,7 @@ async fn run_merge_boundary_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
         user_settings: None,
     };
     let interaction_agent = agent.clone();
@@ -2282,7 +2282,7 @@ fn run_merge_boundary_pty(route: &str) {
         _master: pair.master,
         timeout: RECOVERY_TIMEOUT,
     };
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(b"start the busy work\r");
     fixture.wait_for_phase(&phase_path, "busy");
     for input in MERGE_INPUTS {

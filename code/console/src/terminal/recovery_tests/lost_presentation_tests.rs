@@ -234,7 +234,7 @@ fn lost_presentation_pty_fixture() {
                     StartupState {
                         model_selected: true,
                         launch_arguments: Vec::new(),
-                        chat: StartupChat::Resumed(Box::new(snapshot), true),
+                        chat: StartupChat::Resumed(Box::new(snapshot)),
                                         user_settings: None,
                     },
                     None,

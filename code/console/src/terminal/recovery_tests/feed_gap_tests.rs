@@ -290,7 +290,7 @@ async fn run_feed_gap_fixture() {
     let startup = StartupState {
         model_selected: true,
         launch_arguments: Vec::new(),
-        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
+        chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap())),
         user_settings: None,
     };
     let (console, input) = Console::start(true).unwrap();
@@ -355,7 +355,7 @@ fn start_gap_fixture(route: &str) -> (RecoveryPty, tempfile::TempDir) {
 /// run still works on its last request; afterwards the run finishes with each row shown once.
 fn tool_rows_while_working(route: &str) -> String {
     let (mut fixture, directory) = start_gap_fixture(route);
-    fixture.wait_for("Enter a message to");
+    fixture.wait_for("Tickloop v");
     fixture.send(format!("{USER_INPUT}\r").as_bytes());
     fixture.wait_for_phase(&directory.path().join(GAP_PHASE_FILE), "summarizing");
     fixture.wait_until_shown("every tool row finished while the run works", |frame| {
