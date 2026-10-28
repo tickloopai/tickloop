@@ -3,7 +3,11 @@
 use std::sync::Arc;
 use tickloop_code_local_environment::{environment::LocalEnvironment, hosted::shells::OwnTickhost};
 use tickloop_code_settings::UserSettings;
-use tickloop_harness::runtime::environment::*;
+use tickloop_harness::{
+    protocol::{ChatId, EventKind, ExecutionMode, ToolResult},
+    runtime::{Agent, HarnessOptions, HarnessSeams, environment::*},
+    test_support::{ScriptedModel, call, config, harness::ChosenModels, next_event, text},
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -156,6 +160,72 @@ impl SandboxFixture {
         }
     }
 
+    async fn agent(&self, input: serde_json::Value, mode: ExecutionMode) -> (Agent, ChatId) {
+        let model = Arc::new(ScriptedModel::new(vec![
+            call("tested", "Bash", input),
+            text("done"),
+        ]));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(self.environment.clone())),
+                models: ChosenModels::new(model),
+            },
+            HarnessOptions {
+                settings: Some(Arc::new(self.settings.clone())),
+                ..HarnessOptions::local(config())
+            },
+        )
+        .unwrap();
+        let chat = agent
+            .create_chat(self.workspace.folder.clone().unwrap())
+            .await
+            .unwrap();
+        agent.set_execution_mode(chat, mode).await.unwrap();
+        (agent, chat)
+    }
+
+    async fn run_with_human_approval(
+        &self,
+        agent: &Agent,
+        chat: ChatId,
+        allow: bool,
+    ) -> (bool, ToolResult) {
+        let mut events = agent.subscribe();
+        let receipt = agent
+            .submit(
+                chat,
+                "Run the requested local command after confirmation.".into(),
+            )
+            .await
+            .unwrap();
+        let mut asked = false;
+        let mut result = None;
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert!(!self.root.path().join("outside").exists());
+                    asked = true;
+                    agent
+                        .answer_permission(chat, request.id, allow)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted { result: value, .. } => result = Some(value),
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        agent.shutdown().await;
+        (asked, result.expect("Bash returns a result"))
+    }
+
     async fn prepare(&self, command: &str) -> (tickloop_harness::tools::PreparedTool, uuid::Uuid) {
         let operation = tickloop_ids::generate();
         let prepared = self
@@ -208,80 +278,22 @@ impl tickloop_harness::tools::SecondaryModel for NoSecondaryModel {
 
 #[tokio::test]
 async fn unsandboxed_bash_writes_outside_only_after_human_approval() {
-    use tickloop_harness::{
-        protocol::{EventKind, ExecutionMode},
-        runtime::{Agent, HarnessOptions, HarnessSeams},
-        test_support::{ScriptedModel, call, config, harness::ChosenModels, next_event, text},
-    };
     for allow in [false, true] {
         let fixture =
             SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
-        let model = Arc::new(ScriptedModel::new(vec![
-            call(
-                "outside",
-                "Bash",
+        let (agent, chat) = fixture
+            .agent(
                 serde_json::json!({
-                    "command":"printf approved > ../outside",
-                    "dangerouslyDisableSandbox":true
+                    "command":"printf approved > ../outside", "dangerouslyDisableSandbox":true
                 }),
-            ),
-            text("done"),
-        ]));
-        let agent = Agent::with_seams(
-            HarnessSeams {
-                search: None,
-                transcripts: None,
-                environment: Some(Arc::new(fixture.environment.clone())),
-                models: ChosenModels::new(model),
-            },
-            HarnessOptions {
-                settings: Some(Arc::new(fixture.settings.clone())),
-                ..HarnessOptions::local(config())
-            },
-        )
-        .unwrap();
-        let chat = agent
-            .create_chat(fixture.workspace.folder.clone().unwrap())
-            .await
-            .unwrap();
-        agent
-            .set_execution_mode(chat, ExecutionMode::AcceptEdits)
-            .await
-            .unwrap();
-        let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(
-                chat,
-                "Write approved to ../outside after confirmation.".into(),
+                ExecutionMode::AcceptEdits,
             )
-            .await
-            .unwrap();
-        let mut asked = false;
-        let mut result = None;
-        loop {
-            let event = next_event(&mut events).await;
-            if event.run_id != receipt.run_id {
-                continue;
-            }
-            match event.kind {
-                EventKind::PermissionRequested { request } => {
-                    assert!(!fixture.root.path().join("outside").exists());
-                    asked = true;
-                    agent
-                        .answer_permission(chat, request.id, allow)
-                        .await
-                        .unwrap();
-                }
-                EventKind::ToolCompleted { result: value, .. } => result = Some(value),
-                EventKind::Completed { .. } | EventKind::Interrupted => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
-            }
-        }
+            .await;
+        let (asked, result) = fixture.run_with_human_approval(&agent, chat, allow).await;
         assert!(asked, "{result:?}");
         assert_eq!(fixture.root.path().join("outside").exists(), allow);
         if allow {
-            assert!(!result.unwrap().is_error);
+            assert!(!result.is_error);
             assert_eq!(
                 std::fs::read_to_string(fixture.root.path().join("outside")).unwrap(),
                 "approved"
@@ -292,11 +304,6 @@ async fn unsandboxed_bash_writes_outside_only_after_human_approval() {
 
 #[tokio::test]
 async fn unsandboxed_settings_control_explicit_and_excluded_commands() {
-    use tickloop_harness::{
-        protocol::{EventKind, ExecutionMode},
-        runtime::{Agent, HarnessOptions, HarnessSeams},
-        test_support::{ScriptedModel, call, config, harness::ChosenModels, next_event, text},
-    };
     for (settings, requested, outside) in [
         (
             serde_json::json!({"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}),
@@ -325,68 +332,15 @@ async fn unsandboxed_settings_control_explicit_and_excluded_commands() {
         ),
     ] {
         let fixture = SandboxFixture::new(settings.clone());
-        let model = Arc::new(ScriptedModel::new(vec![
-            call(
-                "outside",
-                "Bash",
+        let (agent, chat) = fixture
+            .agent(
                 serde_json::json!({
-                    "command":"printf approved > ../outside",
-                    "dangerouslyDisableSandbox":requested
+                    "command":"printf approved > ../outside", "dangerouslyDisableSandbox":requested
                 }),
-            ),
-            text("done"),
-        ]));
-        let agent = Agent::with_seams(
-            HarnessSeams {
-                search: None,
-                transcripts: None,
-                environment: Some(Arc::new(fixture.environment.clone())),
-                models: ChosenModels::new(model),
-            },
-            HarnessOptions {
-                settings: Some(Arc::new(fixture.settings.clone())),
-                ..HarnessOptions::local(config())
-            },
-        )
-        .unwrap();
-        let chat = agent
-            .create_chat(fixture.workspace.folder.clone().unwrap())
-            .await
-            .unwrap();
-        agent
-            .set_execution_mode(chat, ExecutionMode::AcceptEdits)
-            .await
-            .unwrap();
-        let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(
-                chat,
-                "Write approved to ../outside after confirmation.".into(),
+                ExecutionMode::AcceptEdits,
             )
-            .await
-            .unwrap();
-        let mut asked = false;
-        let mut result = None;
-        loop {
-            let event = next_event(&mut events).await;
-            if event.run_id != receipt.run_id {
-                continue;
-            }
-            match event.kind {
-                EventKind::PermissionRequested { request } => {
-                    assert!(!fixture.root.path().join("outside").exists());
-                    asked = true;
-                    agent
-                        .answer_permission(chat, request.id, true)
-                        .await
-                        .unwrap();
-                }
-                EventKind::ToolCompleted { result: value, .. } => result = Some(value),
-                EventKind::Completed { .. } | EventKind::Interrupted => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
-            }
-        }
+            .await;
+        let (asked, result) = fixture.run_with_human_approval(&agent, chat, true).await;
         assert!(asked, "{result:?}");
         assert_eq!(
             fixture.root.path().join("outside").exists(),
@@ -394,7 +348,7 @@ async fn unsandboxed_settings_control_explicit_and_excluded_commands() {
             "settings={settings}, result={result:?}"
         );
         if outside {
-            assert!(!result.unwrap().is_error);
+            assert!(!result.is_error);
             assert_eq!(
                 std::fs::read_to_string(fixture.root.path().join("outside")).unwrap(),
                 "approved"
@@ -792,14 +746,7 @@ async fn sandbox_denied_paths_cannot_gain_a_new_symlink_ancestor_after_preparati
 
 #[tokio::test]
 async fn unsandboxed_auto_calls_are_reviewed_even_for_normally_safe_commands() {
-    use tickloop_harness::{
-        protocol::{ApprovalOutcome, EventKind, ExecutionMode},
-        runtime::{Agent, HarnessOptions, HarnessSeams},
-        test_support::{
-            ScriptedModel, auto_classification, call, config, harness::ChosenModels, next_event,
-            text,
-        },
-    };
+    use tickloop_harness::{protocol::ApprovalOutcome, test_support::auto_classification};
     for excluded in [false, true] {
         for command in ["pwd", "mkdir reviewed"] {
             for block in [false, true] {
@@ -807,42 +754,19 @@ async fn unsandboxed_auto_calls_are_reviewed_even_for_normally_safe_commands() {
                     "enabled":true, "failIfUnavailable":true,
                     "excludedCommands": if excluded {vec![command]} else {vec![]}
                 }));
-                let model = Arc::new(ScriptedModel::new(vec![
-                    call(
-                        "reviewed",
-                        "Bash",
+                let (agent, chat) = fixture
+                    .agent(
                         serde_json::json!({
                             "command":command, "dangerouslyDisableSandbox":!excluded
                         }),
-                    ),
-                    text("done"),
-                ]));
+                        ExecutionMode::Auto,
+                    )
+                    .await;
                 let reviewer = Arc::new(ScriptedModel::new(vec![
                     text(&auto_classification(block).to_string()),
                     text(&auto_classification(block).to_string()),
                 ]));
-                let agent = Agent::with_seams(
-                    HarnessSeams {
-                        search: None,
-                        transcripts: None,
-                        environment: Some(Arc::new(fixture.environment.clone())),
-                        models: ChosenModels::new(model),
-                    },
-                    HarnessOptions {
-                        settings: Some(Arc::new(fixture.settings.clone())),
-                        ..HarnessOptions::local(config())
-                    },
-                )
-                .unwrap();
                 agent.set_auto_reviewer(reviewer.clone()).await;
-                let chat = agent
-                    .create_chat(fixture.workspace.folder.clone().unwrap())
-                    .await
-                    .unwrap();
-                agent
-                    .set_execution_mode(chat, ExecutionMode::Auto)
-                    .await
-                    .unwrap();
                 let mut events = agent.subscribe();
                 let receipt = agent
                     .submit(
@@ -972,5 +896,78 @@ async fn sandbox_denial_suggests_escape_only_when_the_prepared_settings_allow_it
             allowed,
             "{result:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn unsandboxed_preparation_keeps_its_route_after_settings_change() {
+    for allowed in [true, false] {
+        let fixture = SandboxFixture::new(serde_json::json!({
+            "enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":allowed
+        }));
+        let operation = tickloop_ids::generate();
+        let prepared = fixture.tools.prepare_for_operation(
+            &tickloop_ids::IdContext::new(), &fixture.workspace, "Bash",
+            &serde_json::json!({"command":"printf frozen > ../outside","dangerouslyDisableSandbox":true}),
+            operation,
+        ).await.unwrap();
+        std::fs::write(
+            fixture.settings.file_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "sandbox":{"enabled":true,"allowUnsandboxedCommands":!allowed}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let result = fixture.run((prepared, operation)).await;
+        assert_eq!(result.is_error, !allowed, "{result:?}");
+        assert_eq!(fixture.root.path().join("outside").exists(), allowed);
+    }
+}
+
+#[tokio::test]
+async fn unsandboxed_calls_keep_explicit_ask_and_deny_ahead_of_auto_review() {
+    use tickloop_harness::protocol::{Decision, PermissionRule};
+    for decision in [Decision::Ask, Decision::Deny] {
+        for excluded in [false, true] {
+            let command = "printf approved > ../outside";
+            let fixture = SandboxFixture::new(serde_json::json!({
+                "enabled":true,"failIfUnavailable":true,
+                "excludedCommands": if excluded {vec![command]} else {vec![]}
+            }));
+            let (agent, chat) = fixture
+                .agent(
+                    serde_json::json!({
+                        "command":command,"dangerouslyDisableSandbox":!excluded
+                    }),
+                    ExecutionMode::Auto,
+                )
+                .await;
+            agent
+                .set_permission_rules(
+                    chat,
+                    vec![PermissionRule {
+                        id: tickloop_ids::generate(),
+                        decision,
+                        tool: "Bash".into(),
+                        specifier: None,
+                        input: None,
+                        loop_id: None,
+                        persistent: false,
+                    }],
+                )
+                .await
+                .unwrap();
+            let reviewer = Arc::new(ScriptedModel::new(vec![]));
+            agent.set_auto_reviewer(reviewer.clone()).await;
+            let (asked, result) = fixture.run_with_human_approval(&agent, chat, true).await;
+            assert_eq!(asked, decision == Decision::Ask);
+            assert_eq!(result.is_error, decision == Decision::Deny, "{result:?}");
+            assert_eq!(
+                fixture.root.path().join("outside").exists(),
+                decision == Decision::Ask
+            );
+            assert!(reviewer.requests.lock().unwrap().is_empty());
+        }
     }
 }
