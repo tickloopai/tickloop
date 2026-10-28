@@ -76,10 +76,6 @@ fn card_shows(frame: &str, keys: &str) -> bool {
         .any(|line| monitor_part(line).is_some_and(|part| part.trim_end().ends_with(keys)))
 }
 
-fn card_focused(frame: &str) -> bool {
-    frame.lines().any(|line| line.starts_with("esc leave"))
-}
-
 /// One SGR left click at 1-based `column` and `row`, as the terminal reports it.
 fn click(column: usize, row: usize) -> Vec<u8> {
     format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").into_bytes()

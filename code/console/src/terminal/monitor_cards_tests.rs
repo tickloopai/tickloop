@@ -357,3 +357,19 @@ fn cards_close_with_their_chat_and_their_rows_and_lose_the_focus_with_them() {
     cards.retain(Some(Uuid::from_u128(2)), |_| true);
     assert!(cards.cards().is_empty(), "another Chat shows no cards");
 }
+
+#[test]
+fn input_typed_before_the_view_attaches_is_held_for_it() {
+    let chat = Uuid::from_u128(1);
+    let card: InstanceRef = "hosted:early".parse().unwrap();
+    let mut cards = MonitorCards::default();
+    cards.open(chat, card.clone());
+    cards.focus(card.clone());
+    cards.input(b"ab".to_vec());
+    cards.input(vec![b'c'; EARLY_INPUT_BYTES]);
+    assert_eq!(
+        cards.card(&card).unwrap().early_input,
+        b"ab",
+        "input beyond the limit is dropped"
+    );
+}

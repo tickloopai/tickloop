@@ -8,22 +8,30 @@ const TASK_TITLE: &str = "Inspect the shared task panel";
 const TASK_REPLY: &str = "SHARED-TASK-READY";
 const TASK_DRAFT: &str = "literal-jk-shared-draft";
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How much of a Shell's command the first line of its card shows whole.
+const SHELL_COMMAND_START: usize = 24;
 
-/// Waits until the terminal no longer shows the Shell view headed by `command`.
+/// Waits until the Shell's card headed by `command` no longer has the focus.
 async fn shell_view_closed(pty: &PtyView, command: &str) {
     tokio::time::timeout(UI_TIMEOUT, async {
-        while terminal_screen(pty).contains(&format!("$ {command}")) {
+        while card_focused(&terminal_screen(pty)) {
             tokio::time::sleep(SHELL_POLL_INTERVAL).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("the Shell view never closed:\n{}", terminal_screen(pty)));
+    .unwrap_or_else(|_| {
+        panic!(
+            "the {command:?} card kept the focus:\n{}",
+            terminal_screen(pty)
+        )
+    });
 }
 
-/// Waits until a Shell's own view holds the terminal: its full command over its output, with its
-/// status.
+/// Waits until a Shell's card has the focus and shows the start of its command, its output and
+/// its status; a 40-column card wraps the rest of a long command.
 async fn shell_view_shows(pty: &PtyView, command: &str, output: &str, status: &str) {
-    view_shows(pty, &[&format!("$ {command}"), output, status]).await;
+    let start: String = command.chars().take(SHELL_COMMAND_START).collect();
+    view_shows(pty, &[&format!("$ {start}"), output, status]).await;
 }
 
 async fn run_shared_task_list(fixture: &PrivateFixture) {

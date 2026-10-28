@@ -164,11 +164,7 @@ impl State {
     fn apply_card_inputs(&mut self, items: Vec<CardInput>) {
         for item in items {
             match item {
-                CardInput::Bytes(bytes) => {
-                    if let Some(view) = self.cards.focused_view() {
-                        view.input(bytes);
-                    }
-                }
+                CardInput::Bytes(bytes) => self.cards.input(bytes),
                 CardInput::Mouse(mouse) => {
                     if !self.card_mouse(mouse) {
                         self.leave_card();
@@ -216,8 +212,8 @@ impl State {
                         screen.mouse_protocol_encoding(),
                     )
                 });
-                if let (Some(Some(report)), Some(view)) = (report, self.cards.focused_view()) {
-                    view.input(report);
+                if let Some(Some(report)) = report {
+                    self.cards.input(report);
                 }
                 true
             }
@@ -254,9 +250,7 @@ impl State {
             (KeyCode::Left, _) => b"\x1b[D".to_vec(),
             _ => return None,
         };
-        if let Some(view) = self.cards.focused_view() {
-            view.input(bytes);
-        }
+        self.cards.input(bytes);
         None
     }
 
@@ -273,9 +267,7 @@ impl State {
         if markers {
             bytes.extend(b"\x1b[201~");
         }
-        if let Some(view) = self.cards.focused_view() {
-            view.input(bytes);
-        }
+        self.cards.input(bytes);
     }
 
     /// The open cards of the shown Chat whose rows are still listed, for the next frame. A Chat

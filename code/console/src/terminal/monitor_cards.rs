@@ -40,6 +40,8 @@ pub(super) const ESCAPE_WINDOW: Duration = Duration::from_millis(400);
 /// The bytes of one key's escape sequence arrive together; an Esc with nothing after it for this
 /// long was pressed alone.
 const SEQUENCE_DELAY: Duration = Duration::from_millis(50);
+/// The most input a card holds while its view attaches; more is dropped.
+const EARLY_INPUT_BYTES: usize = 64 * 1024;
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
@@ -266,6 +268,8 @@ pub(super) struct OpenCard {
     /// When the card opened, among this Chat's cards; the most recent ones stay shown.
     sequence: u64,
     pub(super) state: CardState,
+    /// Input typed into the focused card before its view attached; it reaches the Tick then.
+    early_input: Vec<u8>,
 }
 
 /// The cards open in the current Chat, the one with the focus, and the terminal modes a focused
@@ -323,6 +327,7 @@ impl MonitorCards {
             instance,
             sequence: self.next_sequence,
             state: CardState::Opening,
+            early_input: Vec::new(),
         });
         true
     }
@@ -363,6 +368,7 @@ impl MonitorCards {
     pub(super) fn attached(&mut self, chat: Uuid, instance: &InstanceRef, view: CardView) -> bool {
         match self.card_mut(instance) {
             Some(card) if matches!(card.state, CardState::Opening) => {
+                view.input(std::mem::take(&mut card.early_input));
                 card.state = CardState::Attached(view);
                 self.chat == Some(chat)
             }
@@ -378,6 +384,25 @@ impl MonitorCards {
         }
         if self.focused.as_ref() == Some(instance) {
             self.leave_focus();
+        }
+    }
+
+    /// Sends `bytes` to the focused card's Tick, or holds them until its view attaches.
+    pub(super) fn input(&mut self, bytes: Vec<u8>) {
+        let Some(focused) = self.focused.clone() else {
+            return;
+        };
+        let Some(card) = self.card_mut(&focused) else {
+            return;
+        };
+        match &card.state {
+            CardState::Attached(view) => view.input(bytes),
+            CardState::Opening => {
+                if card.early_input.len() + bytes.len() <= EARLY_INPUT_BYTES {
+                    card.early_input.extend(bytes);
+                }
+            }
+            CardState::Failed(_) => {}
         }
     }
 
