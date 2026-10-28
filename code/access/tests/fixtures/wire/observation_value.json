@@ -1230,5 +1230,43 @@
       "upgrading": true,
       "error": null
     }
+  },
+  {
+    "EndedAgents": [
+      {
+        "record": {
+          "store_root": "/home/user/.tickloop",
+          "chat_id": "00000000-0000-0000-0000-000000000090"
+        },
+        "agent_id": "00000000-0000-0000-0000-000000000091",
+        "folder": "/work/project",
+        "workspace": "w1",
+        "title": "Fix the parser",
+        "preview": "Parser fixed",
+        "created_at": 1000,
+        "updated_at": 2000,
+        "ended_at": 3000,
+        "last_state": "Idle",
+        "outcome": "failed",
+        "reason": "daemon_stopped",
+        "resumable": true
+      },
+      {
+        "record": {
+          "store_root": "/home/user/.tickloop",
+          "chat_id": "00000000-0000-0000-0000-000000000092"
+        },
+        "agent_id": "00000000-0000-0000-0000-000000000093",
+        "folder": null,
+        "title": "Old review",
+        "created_at": 10,
+        "updated_at": 20,
+        "ended_at": 20,
+        "last_state": "Running",
+        "outcome": "stopped",
+        "reason": "daemon_off",
+        "resumable": false
+      }
+    ]
   }
 ]

@@ -144,6 +144,8 @@ const EXECUTION_UNAVAILABLE_FOR_INPUT: &str =
     "This execution is unavailable; inspect cached history or use /resume explicitly";
 const VIEW_UPDATE_AFTER_ENDED_AGENT: &str =
     "View update · waits until the shown Agent runs again; use /resume or open another Agent";
+const HISTORY_ADDED_TO_OVERVIEW: &str = "Added to the Agents list · enter opens it";
+const ALREADY_IN_OVERVIEW: &str = "This Agent is already in the list · press enter on its row";
 const HANDOFF_AGENT_ENDED: &str = "The Agent this View showed is no longer running; its unsent draft is kept and /resume opens saved conversations";
 use task_access::ShellTaskCenter;
 use thinking_preview::ThinkingPreview;
@@ -2054,7 +2056,8 @@ async fn interact_with_herdr(
         agent.daemon_epoch(),
         workdir.clone(),
         agent.host_location(),
-    );
+    )
+    .with_store_root(config_root.clone());
     let mut overview_active = false;
     let mut history_return_overview = false;
     let mut visible_family: Vec<ChatId> = Vec::new();
@@ -2263,9 +2266,13 @@ async fn interact_with_herdr(
             }
         }
         if let Some(outcome) = menu_outcome.take() {
+            // A conversation chosen from the overview's history joins the list as a row there,
+            // as Claude Code's agent view adds it.
+            let mut added_from_history = None;
             if history_return_overview {
                 if outcome.selection.is_some() {
                     history_return_overview = false;
+                    added_from_history = outcome.selection;
                 } else if menus.id().is_none() {
                     global
                         .interpret(crate::agent_console::Intent::Overview)
@@ -2363,6 +2370,29 @@ async fn interact_with_herdr(
                 status_dirty = false;
             } else {
                 status_dirty = true;
+            }
+            if let Some(chat) = added_from_history {
+                global.visible_ready(agent.reference(chat).await.ok());
+                if let Err(error) = global.refresh().await {
+                    daemon_unreachable = Some(format!(
+                        "{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",
+                        safe_text(&error.to_string())
+                    ));
+                    console.set_connection_notice(daemon_unreachable.clone())?;
+                }
+                global
+                    .interpret(crate::agent_console::Intent::Overview)
+                    .map_err(|error| error.to_string())?;
+                console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                if let Err(error) = agent.display_chat(None).await {
+                    console.set_connection_notice(Some(format!(
+                        "{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",
+                        safe_line(&error.to_string())
+                    )))?;
+                }
+                overview_active = true;
+                console.set_status(HISTORY_ADDED_TO_OVERVIEW)?;
+                status_dirty = false;
             }
         }
         if let Some(chat) = selected_chat {
@@ -3218,6 +3248,95 @@ async fn interact_with_herdr(
                         console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(visible.agent_id))?;
                     }
                 },
+                Some(InputEvent::ResumeEndedAgent(chat)) => {
+                    match agent.resume_chat(chat).await {
+                        Ok(snapshot)=>{
+                            console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
+                            overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;show_opened_chat(console,agent,&snapshot)?;
+                            selected_chat=Some(snapshot.id);message_groups=MessageGroups::default();
+                            displayed_sequences.insert(snapshot.id.into(),snapshot.last_sequence);
+                            tools.restore_snapshot(&snapshot);
+                            sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot resume the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::StopAgent(agent_id)) => {
+                    let projection=global.projection();
+                    let Some(row)=projection.rows.iter().find(|row|row.execution.agent_id==agent_id).cloned() else {
+                        console.set_status("This Agent is no longer running")?;status_dirty=true;continue;
+                    };
+                    match global.stop_agent(row.execution).await {
+                        Ok(())=>{
+                            // The stopped Agent is no longer one this View can return to.
+                            if selected_chat.map(ChatId::uuid)==Some(row.chat_id) {
+                                selected_chat=None;global.visible_ready(None);console.clear_visible_agent()?;
+                            }
+                            if let Err(error)=global.refresh().await {
+                                daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                                console.set_connection_notice(daemon_unreachable.clone())?;
+                            }
+                            console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                            console.set_status(&format!("Stopped {} · enter resumes it",safe_line(&row.title)))?;
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot stop the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::PeekOpened(agent_id)) => {
+                    let row=global.projection().rows.into_iter().find(|row|row.execution.agent_id==agent_id);
+                    let request=match row {
+                        Some(row) if crate::agent_console::AgentState::of(&row)==crate::agent_console::AgentState::NeedsInput => {
+                            agent.snapshot(row.chat_id).await.ok().and_then(|snapshot|peek_request(&snapshot))
+                        },
+                        _ => None,
+                    };
+                    console.set_peek_request(agent_id,request)?;
+                },
+                Some(InputEvent::PeekReply { agent_id, text }) => {
+                    let sent=send_peek_reply(agent,&global.projection(),agent_id,text).await;
+                    if let Ok((_,Some(loaded)))=&sent {
+                        console.follow_peek(agent_id,*loaded)?;
+                    }
+                    if let Err(error)=global.refresh().await {
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
+                    }
+                    console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                    if let Some(peeked)=console.peeked_agent()? {
+                        console.select_overview_agent(peeked)?;
+                    }
+                    match sent {
+                        Ok((status,_))=>console.set_status(&status)?,
+                        Err(error)=>console.set_status(&format!("Cannot send the reply · {}",safe_line(&error)))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::PeekAnswer { agent_id, request_id, option }) => {
+                    match answer_peek(agent,&global.projection(),agent_id,request_id,option).await {
+                        Ok(())=>console.set_status("Answered")?,
+                        Err(error)=>console.set_status(&format!("Cannot answer · {}",safe_line(&error.to_string())))?,
+                    }
+                    if let Err(error)=global.refresh().await {
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
+                    }
+                    console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                    paused_inputs.push_back(InputEvent::PeekOpened(agent_id));
+                    status_dirty = true;
+                },
+                Some(InputEvent::ForgetEndedAgent(chat)) => {
+                    let title=global.projection().ended.iter().find(|ended|ended.record.chat_id==chat).map(|ended|safe_line(&ended.title)).unwrap_or_else(||"the Agent".into());
+                    match global.forget_ended(chat).await {
+                        Ok(())=>{
+                            console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                            console.set_status(&format!("Removed {title} from the list · its saved history stays"))?;
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot remove the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
                 Some(InputEvent::OpenAgent(agent_id)) => {
                     if let Err(error)=global.refresh().await {
                         daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
@@ -3762,14 +3881,24 @@ async fn interact_with_herdr(
                             status_dirty=true;continue;
                         }
                         if line.trim()=="/resume" {
-                            let directory=global.projection().dispatch_directory;
-                            match Workflow::chats(agent,&directory,None,false).await {
+                            let projection=global.projection();
+                            let listed=projection.rows.iter().map(|row|row.chat_id).chain(projection.ended.iter().map(|ended|ended.record.chat_id)).collect::<Vec<_>>();
+                            match Workflow::chats_except(agent,&projection.dispatch_directory,&listed,false).await {
                                 Ok(workflow)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
                                     overview_active=false;history_return_overview=true;menus.conversations(console,workflow)?;
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
                             }
+                            continue;
+                        }
+                        if let Some(listed)=line.trim().strip_prefix("/resume ").and_then(ChatId::parse).and_then(|chat|{
+                            let projection=global.projection();
+                            projection.rows.iter().find(|row|row.chat_id==chat.uuid()&&row.subagent.is_none()&&row.parent.is_none()).map(|row|row.execution.agent_id)
+                                .or_else(||projection.ended.iter().find(|ended|ended.record.chat_id==chat.uuid()).map(|ended|ended.record.chat_id))
+                        }) {
+                            console.select_overview_agent(listed)?;
+                            console.set_status(ALREADY_IN_OVERVIEW)?;
                             continue;
                         }
                         if line.trim().starts_with("/resume ") {
@@ -8228,16 +8357,22 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
             _ => break,
         }
     }
-    let rows = tree
+    let mut rows = tree
         .iter()
         .filter(|row| {
             row.parent_id.is_none()
                 && projection.rows.iter().any(|summary| {
-                    summary.execution.agent_id == row.agent_id && summary.subagent.is_none()
+                    summary.execution.agent_id == row.agent_id
+                        && summary.subagent.is_none()
+                        && crate::agent_console::is_listed(summary)
                 })
         })
         .cloned()
-        .collect();
+        .chain(projection.ended.iter().map(ended_agent_row))
+        .collect::<Vec<_>>();
+    // Each group lists its newest change first; for a finished row that is when it ended, as
+    // Claude Code orders its Completed group.
+    rows.sort_by_key(|row| (row.group, std::cmp::Reverse(row.updated_at)));
     console::AgentOverview {
         rows,
         dispatch_directory: projection.dispatch_directory.clone(),
@@ -8246,15 +8381,161 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
     }
 }
 
-/// Human status text for an Agent row; the Loop state names are internal.
+/// An ended root Agent's overview row, keyed by its Chat: there is no execution to name. Its
+/// status says why it ended, so it reads apart from a run that failed while its Agent still runs.
+fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRow {
+    use crate::agent_console::AgentState;
+    use tickloop_code_access::EndReason;
+    let agent_state = AgentState::of_ended(agent);
+    let reason = match agent.reason {
+        EndReason::DaemonStopped => Some("ended when the daemon stopped"),
+        EndReason::DaemonOff => Some("ended while the daemon was off"),
+        EndReason::WorkerLost => Some("worker lost"),
+        EndReason::UserStopped => None,
+    };
+    let status = [Some(agent_state.label()), reason]
+        .into_iter()
+        .flatten()
+        .chain((!agent.resumable).then_some("history gone"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    console::AgentRow {
+        agent_id: agent.record.chat_id,
+        parent_id: None,
+        title: safe_line(&agent.title),
+        status,
+        state: agent.last_state.clone(),
+        project: shown_folder(agent.folder.as_deref())
+            .to_string_lossy()
+            .into_owned(),
+        workspace: agent.workspace.clone(),
+        approvals: 0,
+        questions: 0,
+        agent_state,
+        group: agent_state.group(),
+        glyph: console::status_glyph(agent_state, false),
+        preview: agent.preview.as_deref().map(safe_line),
+        updated_at: Some(agent.ended_at),
+        run_started_at: None,
+        subagent: None,
+        ended: Some(console::EndedRow {
+            chat_id: agent.record.chat_id,
+            reason: agent.reason,
+            resumable: agent.resumable,
+        }),
+    }
+}
+
+/// Sends a peek panel reply to the Agent of the overview row `agent_id`. Replying to an ended row
+/// is the user continuing it: its saved history loads first, and the row it now runs under comes
+/// back with the status to show.
+async fn send_peek_reply(
+    agent: &Agent,
+    projection: &crate::agent_console::Projection,
+    agent_id: uuid::Uuid,
+    text: String,
+) -> Result<(String, Option<uuid::Uuid>), String> {
+    if let Some(row) = projection
+        .rows
+        .iter()
+        .find(|row| row.execution.agent_id == agent_id)
+    {
+        agent
+            .submit(row.chat_id, text)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok((format!("Sent to {}", safe_line(&row.title)), None));
+    }
+    let ended = projection
+        .ended
+        .iter()
+        .find(|ended| ended.record.chat_id == agent_id)
+        .ok_or("this Agent is no longer listed")?;
+    let chat = ended.record.chat_id;
+    agent
+        .resume_chat(chat)
+        .await
+        .map_err(|error| error.to_string())?;
+    agent
+        .submit(chat, text)
+        .await
+        .map_err(|error| error.to_string())?;
+    let loaded = agent
+        .reference(chat)
+        .await
+        .ok()
+        .map(|execution| execution.agent_id);
+    Ok((
+        format!("Resumed {} and sent your reply", safe_line(&ended.title)),
+        loaded,
+    ))
+}
+
+/// Answers the question the Agent of the overview row `agent_id` waits on with the option a number
+/// in the peek panel picked.
+async fn answer_peek(
+    agent: &Agent,
+    projection: &crate::agent_console::Projection,
+    agent_id: uuid::Uuid,
+    request_id: uuid::Uuid,
+    option: String,
+) -> Result<(), AccessError> {
+    let chat = projection
+        .rows
+        .iter()
+        .find(|row| row.execution.agent_id == agent_id)
+        .map(|row| row.chat_id)
+        .ok_or_else(|| AccessError::unavailable("this Agent is no longer running"))?;
+    agent
+        .answer_question(
+            chat,
+            request_id,
+            vec![tickloop_harness::protocol::QuestionAnswer::option(option)],
+        )
+        .await
+}
+
+/// The request a peeked Agent waits on. Only the options of a single question take a number: a
+/// permission request, plan approval or file change shows its context and choices only in the
+/// Agent's own view, so the panel names it and points there.
+fn peek_request(snapshot: &ChatSnapshot) -> Option<console::PeekRequest> {
+    if let Some(request) = snapshot.questions.first() {
+        let options = match request.questions.as_slice() {
+            [question] if !question.multi_select => question
+                .options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        return Some(console::PeekRequest {
+            request_id: request.id,
+            prompt: request
+                .questions
+                .first()
+                .map(|question| question.question.clone())
+                .unwrap_or_default(),
+            options,
+        });
+    }
+    let request = snapshot.permissions.first()?;
+    Some(console::PeekRequest {
+        request_id: request.id,
+        prompt: format!(
+            "Permission required · {}",
+            presentation::tool_name(&request.name)
+        ),
+        options: Vec::new(),
+    })
+}
+
+/// Human status text for an Agent row: its state, and why when that is not plain. The Loop state
+/// names are internal.
 fn agent_status_label(row: &AgentSummary) -> &'static str {
     use tickloop_code_access::ExecutionAvailability;
     use tickloop_harness::protocol::LoopState;
     if row.availability == ExecutionAvailability::Lost {
-        return "Lost · outcome unknown";
-    }
-    if row.has_work == Some(false) && row.waiting_permissions + row.waiting_questions == 0 {
-        return "Empty";
+        return "Failed · lost, outcome unknown";
     }
     match row.state {
         LoopState::Running => "Running",
@@ -8262,11 +8543,9 @@ fn agent_status_label(row: &AgentSummary) -> &'static str {
         LoopState::WaitingPermission => "Needs approval",
         LoopState::WaitingQuestion => "Needs answer",
         LoopState::WaitingPlan => "Plan review",
-        LoopState::Idle if row.has_work.is_none() => "Idle · work unknown",
-        LoopState::Idle if row.run_id.is_some() => "Completed",
-        LoopState::Idle => "Idle",
-        LoopState::Failed => "Failed",
-        LoopState::Interrupted => "Interrupted",
+        LoopState::Failed => "Failed · run failed",
+        LoopState::Interrupted => "Completed · interrupted",
+        LoopState::Idle => crate::agent_console::AgentState::of(row).label(),
     }
 }
 
@@ -8274,7 +8553,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
     let mut result = rows
         .iter()
         .map(|row| {
-            let group = crate::agent_console::AttentionGroup::of(row);
+            let agent_state = crate::agent_console::AgentState::of(row);
             let parent_id = row.parent.map(|parent| parent.agent_id);
             console::AgentRow {
                 agent_id: row.execution.agent_id,
@@ -8288,15 +8567,17 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 workspace: row.workspace.clone(),
                 approvals: row.waiting_permissions,
                 questions: row.waiting_questions,
-                group,
+                agent_state,
+                group: agent_state.group(),
                 glyph: console::status_glyph(
-                    group,
-                    row.state == tickloop_harness::protocol::LoopState::Idle,
+                    agent_state,
+                    row.state == tickloop_harness::protocol::LoopState::Interrupted,
                 ),
                 preview: row.preview.as_deref().map(safe_line),
                 updated_at: row.updated_at,
                 run_started_at: row.run_started_at,
                 subagent: row.subagent.clone(),
+                ended: None,
             }
         })
         .collect::<Vec<_>>();
@@ -8321,10 +8602,11 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 .map(|row| crate::agent_console::AttentionGroup::of(row))
                 .min()
                 .unwrap_or(root.group);
-            root.glyph = console::status_glyph(
-                root.group,
-                root.state == tickloop_harness::protocol::LoopState::Idle,
-            );
+            root.glyph = match root.group {
+                crate::agent_console::AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
+                crate::agent_console::AttentionGroup::Working => Glyph::AgentRunning,
+                crate::agent_console::AttentionGroup::Completed => root.glyph,
+            };
         }
     } else {
         result.sort_by_key(|row| {
@@ -8770,6 +9052,7 @@ mod tests {
             closed: false,
             unconfirmed_dispatch: None,
             created: None,
+            ended: Vec::new(),
         };
         let overview = super::agent_overview(&projection);
         assert_eq!(overview.rows.len(), 1);
@@ -8777,6 +9060,423 @@ mod tests {
         assert_eq!(overview.visible, Some(root.agent_id));
         assert_eq!(overview.rows[0].questions, 1);
         assert_eq!(overview.rows[0].status_role(), super::style::Role::Warning);
+    }
+
+    /// Refreshes `global` until the row of `chat` satisfies `ready`.
+    async fn wait_for_row(
+        global: &mut crate::agent_console::AgentConsole,
+        chat: uuid::Uuid,
+        ready: impl Fn(&tickloop_code_access::AgentSummary) -> bool,
+    ) -> tickloop_code_access::AgentSummary {
+        for _ in 0..500 {
+            let projection = global.refresh().await.unwrap();
+            if let Some(row) = projection
+                .rows
+                .iter()
+                .find(|row| row.chat_id == chat && ready(row))
+            {
+                return row.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the row of {chat} never became ready: {:?}",
+            global.projection().rows
+        );
+    }
+
+    fn last_request_text(model: &tickloop_harness::test_support::ScriptedModel) -> String {
+        serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_peek_reply_to_an_idle_agent_starts_its_next_turn_in_the_overview() {
+        use tickloop_harness::protocol::LoopState;
+        use tickloop_harness::test_support::{ScriptedModel, config, text};
+        let directory = tempfile::tempdir().unwrap();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            text("First pass done"),
+            text("Second pass done"),
+        ]));
+        let agent = super::Agent::new_embedded(config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.submit(chat, "First pass".into()).await.unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            directory.path().into(),
+            None,
+        );
+        let finished = wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::Idle && row.run_id.is_some()
+        })
+        .await;
+        let asked = model.requests.lock().unwrap().len();
+
+        let (status, loaded) = super::send_peek_reply(
+            &agent,
+            &global.projection(),
+            finished.execution.agent_id,
+            "Run the second pass".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, format!("Sent to {}", finished.title));
+        assert_eq!(loaded, None);
+        wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::Idle && row.run_id.is_some() && row.run_id != finished.run_id
+        })
+        .await;
+        assert!(model.requests.lock().unwrap().len() > asked);
+        assert!(last_request_text(&model).contains("Run the second pass"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_peek_reply_to_an_ended_agent_loads_its_history_and_starts_a_turn() {
+        use tickloop_code_settings::local_agent::LocalAgent;
+        use tickloop_harness::protocol::{EventKind, LoopState};
+        use tickloop_harness::test_support::{ScriptedModel, config, next_event, text};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let folder = directory.path().join("work");
+        std::fs::create_dir_all(&folder).unwrap();
+        let saved = tickloop_harness::runtime::Agent::open_embedded(
+            root.clone(),
+            config(),
+            std::sync::Arc::new(ScriptedModel::new(vec![text("Reviewed half")])),
+        )
+        .unwrap();
+        let chat = saved.create_chat(folder.clone()).await.unwrap();
+        let mut events = saved.subscribe();
+        let receipt = saved
+            .submit(chat, "Review the module".into())
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+        saved.shutdown().await;
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![text("Reviewed the rest")]));
+        let agent = super::Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            folder.clone(),
+            None,
+        );
+        let mut projection = global.refresh().await.unwrap();
+        assert!(projection.rows.is_empty(), "nothing runs before the reply");
+        projection.ended = vec![tickloop_code_access::EndedAgent {
+            record: tickloop_code_access::TranscriptRef {
+                store_root: root.clone(),
+                chat_id: chat.uuid(),
+            },
+            agent_id: uuid::Uuid::from_u128(1),
+            folder: Some(folder.clone()),
+            workspace: None,
+            title: "Review the module".into(),
+            preview: None,
+            created_at: 1,
+            updated_at: 2,
+            ended_at: 3,
+            last_state: LoopState::Idle,
+            outcome: tickloop_code_access::EndedOutcome::Failed,
+            reason: tickloop_code_access::EndReason::DaemonStopped,
+            resumable: true,
+        }];
+
+        let (status, loaded) =
+            super::send_peek_reply(&agent, &projection, chat.uuid(), "Finish the review".into())
+                .await
+                .unwrap();
+
+        assert_eq!(status, "Resumed Review the module and sent your reply");
+        let row = wait_for_row(&mut global, chat.uuid(), |row| {
+            row.state == LoopState::Idle && row.run_id.is_some()
+        })
+        .await;
+        assert_eq!(loaded, Some(row.execution.agent_id));
+        let request = last_request_text(&model);
+        assert!(request.contains("Review the module"), "{request}");
+        assert!(request.contains("Finish the review"), "{request}");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_number_in_the_peek_panel_answers_the_agents_question() {
+        use tickloop_harness::protocol::LoopState;
+        use tickloop_harness::test_support::{ScriptedModel, call, config, single_question, text};
+        let directory = tempfile::tempdir().unwrap();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            call("ask", "AskUserQuestion", single_question("Which report?")),
+            text("Writing the monthly report"),
+        ]));
+        let agent = super::Agent::new_embedded(config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.submit(chat, "Write the report".into()).await.unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            directory.path().into(),
+            None,
+        );
+        let waiting = wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::WaitingQuestion
+        })
+        .await;
+        let request = super::peek_request(&agent.snapshot(chat).await.unwrap()).unwrap();
+        assert_eq!(request.prompt, "Which report?");
+        assert_eq!(request.options, ["Weekly", "Monthly"]);
+
+        super::answer_peek(
+            &agent,
+            &global.projection(),
+            waiting.execution.agent_id,
+            request.request_id,
+            request.options[1].clone(),
+        )
+        .await
+        .unwrap();
+
+        wait_for_row(&mut global, chat, |row| row.state == LoopState::Idle).await;
+        assert!(last_request_text(&model).contains("Monthly"));
+        agent.shutdown().await;
+    }
+
+    /// A permission request, a plan approval or a file change is answered only in the Agent's own
+    /// view, where its context and every choice show: the peek panel gets no option for it, so no
+    /// number approves it and no session scope is reachable from there.
+    #[tokio::test]
+    async fn peek_requests_for_permissions_plans_and_file_changes_offer_no_option() {
+        use tickloop_harness::protocol::{
+            FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileVersion,
+            PermissionApprovalSource, PermissionExecution, PermissionRequest, PreparedFileChange,
+        };
+        use tickloop_harness::test_support::{ScriptedModel, config};
+        let directory = tempfile::tempdir().unwrap();
+        let agent = super::Agent::new_embedded(
+            config(),
+            std::sync::Arc::new(ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let base = agent.snapshot(chat).await.unwrap();
+        let version = |sha256: &str| FileVersion {
+            exists: true,
+            identity: None,
+            byte_len: 3,
+            line_count: 1,
+            ends_with_newline: false,
+            sha256: sha256.into(),
+        };
+        let file_change = PreparedFileChange {
+            summary: FileChangeReviewSummary {
+                action: FileChangeAction::Overwrite,
+                path: directory.path().join("notes.txt"),
+                before: version("before"),
+                after: version("after"),
+                added_lines: 1,
+                removed_lines: 1,
+                hunk_count: 1,
+            },
+            artifact: FileChangeArtifactRef {
+                path: directory.path().join("review.json"),
+                byte_len: 42,
+                sha256: "artifact".into(),
+            },
+        };
+        let requests = [
+            ("Bash", PermissionApprovalSource::PermissionPolicy, None),
+            ("Bash", PermissionApprovalSource::ExplicitAsk, None),
+            ("ExitPlanMode", PermissionApprovalSource::default(), None),
+            (
+                "Write",
+                PermissionApprovalSource::default(),
+                Some(Box::new(file_change)),
+            ),
+        ];
+        for (name, approval_source, file_change) in requests {
+            let mut snapshot = base.clone();
+            snapshot.permissions = vec![PermissionRequest {
+                parent_call: None,
+                mcp_server: None,
+                id: uuid::Uuid::new_v4(),
+                loop_id: uuid::Uuid::new_v4().into(),
+                execution: PermissionExecution::ToolCall {
+                    run_id: uuid::Uuid::new_v4().into(),
+                    call_id: "call".into(),
+                },
+                name: name.into(),
+                input: serde_json::json!({}),
+                file_change,
+                approval_reason: None,
+                approval_source,
+            }];
+
+            let request = super::peek_request(&snapshot).unwrap();
+
+            assert!(request.options.is_empty(), "{name}: {request:?}");
+            assert!(
+                request.prompt.starts_with("Permission required"),
+                "{name}: {request:?}"
+            );
+        }
+        agent.shutdown().await;
+    }
+
+    /// Claude Code's agent view states and groups, one mapping row each: what the daemon reports,
+    /// the state the row shows, its status text and its group.
+    #[test]
+    fn overview_rows_follow_the_agent_view_state_and_group_table() {
+        use crate::agent_console::{AgentState, AttentionGroup};
+        use tickloop_code_access::{EndReason, EndedAgent, EndedOutcome, TranscriptRef};
+        use tickloop_harness::protocol::LoopState;
+        let epoch = uuid::Uuid::new_v4();
+        let live = |id: u128,
+                    state: &str,
+                    run: bool,
+                    has_work: Option<bool>,
+                    lost: bool,
+                    updated_at: u64| {
+            let mut summary = serde_json::from_value::<tickloop_code_access::AgentSummary>(serde_json::json!({"execution":{"daemon_epoch":epoch,"agent_id":uuid::Uuid::from_u128(id),"generation":1},"chat_id":uuid::Uuid::from_u128(id),"folder":"/test","state":state,"title":format!("live {id}"),"waiting_permissions":0,"waiting_questions":0,"parent":null,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":updated_at})).unwrap();
+            summary.has_work = has_work;
+            summary.run_id = run.then(|| uuid::Uuid::from_u128(id + 1000).into());
+            if lost {
+                summary.availability = tickloop_code_access::ExecutionAvailability::Lost;
+            }
+            summary
+        };
+        let ended =
+            |id: u128, outcome: EndedOutcome, reason: EndReason, last_state, ended_at: u64| {
+                EndedAgent {
+                    record: TranscriptRef {
+                        store_root: "/config".into(),
+                        chat_id: uuid::Uuid::from_u128(id),
+                    },
+                    agent_id: uuid::Uuid::from_u128(id + 1000),
+                    folder: Some("/test".into()),
+                    workspace: None,
+                    title: format!("ended {id}"),
+                    preview: None,
+                    created_at: 1,
+                    updated_at: ended_at,
+                    ended_at,
+                    last_state,
+                    outcome,
+                    reason,
+                    resumable: true,
+                }
+            };
+        let projection = crate::agent_console::Projection {
+            overview: true,
+            visible: None,
+            dispatch_directory: "/test".into(),
+            rows: vec![
+                live(1, "WaitingQuestion", true, Some(true), false, 10),
+                live(2, "Running", true, Some(true), false, 20),
+                live(3, "Idle", true, Some(true), false, 30),
+                live(4, "Interrupted", true, Some(true), false, 40),
+                live(5, "Failed", true, Some(true), false, 50),
+                live(6, "Idle", true, Some(true), true, 60),
+                live(7, "Idle", false, Some(true), false, 70),
+                live(8, "Idle", true, None, false, 80),
+                live(9, "Idle", false, Some(false), false, 90),
+            ],
+            ended: vec![
+                ended(
+                    11,
+                    EndedOutcome::Failed,
+                    EndReason::DaemonStopped,
+                    LoopState::Running,
+                    100,
+                ),
+                ended(
+                    12,
+                    EndedOutcome::Stopped,
+                    EndReason::DaemonOff,
+                    LoopState::Idle,
+                    5,
+                ),
+                ended(
+                    13,
+                    EndedOutcome::Stopped,
+                    EndReason::UserStopped,
+                    LoopState::Running,
+                    110,
+                ),
+                ended(
+                    14,
+                    EndedOutcome::Failed,
+                    EndReason::DaemonStopped,
+                    LoopState::WaitingPermission,
+                    120,
+                ),
+            ],
+            waiting_permissions: 0,
+            waiting_questions: 0,
+            generation: 0,
+            closed: false,
+            unconfirmed_dispatch: None,
+            created: None,
+        };
+        let overview = super::agent_overview(&projection);
+        let rows = overview
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.title.as_str(),
+                    row.agent_state,
+                    row.status.as_str(),
+                    row.group,
+                )
+            })
+            .collect::<Vec<_>>();
+        use AgentState::*;
+        use AttentionGroup as G;
+        assert_eq!(
+            rows,
+            [
+                (
+                    "ended 14",
+                    NeedsInput,
+                    "Needs input · ended when the daemon stopped",
+                    G::NeedsInput
+                ),
+                ("live 1", NeedsInput, "Needs answer", G::NeedsInput),
+                ("live 2", Working, "Running", G::Working),
+                // Completed lists the newest end first, ended and running rows alike.
+                ("ended 13", Stopped, "Stopped", G::Completed),
+                (
+                    "ended 11",
+                    Failed,
+                    "Failed · ended when the daemon stopped",
+                    G::Completed
+                ),
+                ("live 8", Idle, "Idle", G::Completed),
+                ("live 7", Idle, "Idle", G::Completed),
+                (
+                    "live 6",
+                    Failed,
+                    "Failed · lost, outcome unknown",
+                    G::Completed
+                ),
+                ("live 5", Failed, "Failed · run failed", G::Completed),
+                ("live 4", Completed, "Completed · interrupted", G::Completed),
+                ("live 3", Completed, "Completed", G::Completed),
+                (
+                    "ended 12",
+                    Stopped,
+                    "Stopped · ended while the daemon was off",
+                    G::Completed
+                ),
+            ],
+            "an Agent that holds nothing (live 9) is not listed"
+        );
     }
 
     #[test]

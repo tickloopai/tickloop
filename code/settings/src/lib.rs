@@ -86,9 +86,9 @@ const TASK_TOOLS_ENABLED_KEY: &str = "taskToolsEnabled";
 const GOAL_TOKEN_BUDGET_KEY: &str = "goalTokenBudget";
 /// The model that checks a goal's reported completion; unset, the Chat's own model checks it.
 const GOAL_CHECK_MODEL_KEY: &str = "goalCheckModel";
-/// Follows the name and values of Claude Code's `cleanupPeriodDays`, but only 0 has a meaning: do
-/// not write the Transcript. Tickloop never deletes files automatically by age; positive values
-/// save the Chat just like an unset value.
+/// Follows the name and values of Claude Code's `cleanupPeriodDays`. 0 does not write the
+/// Transcript. Tickloop never deletes saved conversations by age; the period only ages ended Agents
+/// out of the Agents overview, as Claude Code ages out its agent view rows.
 const CLEANUP_PERIOD_DAYS_KEY: &str = "cleanupPeriodDays";
 /// Settings partitioned by project directory, modeled on `projects[<directory>]` in Claude Code's
 /// global config.
@@ -839,6 +839,11 @@ impl UserSettings {
     /// `shouldSkipPersistence`).
     pub fn skips_transcripts(&self) -> bool {
         self.load().cleanup_period_days() == Some(0)
+    }
+
+    /// The valid `cleanupPeriodDays`, when one is set.
+    pub fn cleanup_period_days(&self) -> Option<u64> {
+        self.load().cleanup_period_days()
     }
 
     pub fn model(&self) -> Option<ModelConfig> {

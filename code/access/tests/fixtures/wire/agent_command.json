@@ -435,5 +435,20 @@
       "generation": 3
     },
     "name": "plugin_notes_search"
+  },
+  {
+    "kind": "stop_agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    }
+  },
+  {
+    "kind": "forget_ended_agent",
+    "record": {
+      "store_root": "/home/user/.tickloop",
+      "chat_id": "00000000-0000-0000-0000-000000000090"
+    }
   }
 ]

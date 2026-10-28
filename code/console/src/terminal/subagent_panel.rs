@@ -5,7 +5,7 @@ use super::{
     loop_view_text::ellipsize,
     style::{Role, RoleLine},
 };
-use crate::agent_console::AttentionGroup;
+use crate::agent_console::{AgentState, AttentionGroup};
 use unicode_width::UnicodeWidthStr;
 
 const NAME_DESCRIPTION_GAP: &str = "  ";
@@ -66,7 +66,7 @@ pub(super) fn family_line(
     } else {
         (
             state_detail(row, now),
-            if row.group == AttentionGroup::Done
+            if row.agent_state == AgentState::Completed
                 && row.state == tickloop_harness::protocol::LoopState::Idle
             {
                 Role::MutedText
@@ -125,8 +125,8 @@ fn state_detail(row: &AgentRow, now: u64) -> String {
             |started_at| list_row::format_elapsed(now.saturating_sub(started_at)),
         );
     }
-    if row.group == AttentionGroup::Idle
-        || (row.group == AttentionGroup::Done
+    if row.agent_state == AgentState::Idle
+        || (row.agent_state == AgentState::Completed
             && row.state == tickloop_harness::protocol::LoopState::Idle)
     {
         return "idle".into();

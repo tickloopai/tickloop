@@ -47,6 +47,7 @@ use tickloop_code_settings::UserSettings;
 use tickloop_harness::protocol::OtherTickhost;
 use tickloop_harness::runtime::{Agent, HarnessOptions, HarnessSeams};
 
+pub mod agent_registry;
 mod chunked;
 pub mod daemon_control;
 mod daemon_management;
@@ -68,6 +69,7 @@ mod views;
 pub mod worker_control;
 mod worker_upgrade;
 
+pub use agent_registry::{AgentRegistries, AgentRegistry};
 pub use daemon_server::{DaemonServer, WorkerFactory};
 pub use embedded::EmbeddedAgentAccess;
 pub use ipc::{serve_connection, serve_daemon_listener, serve_listener, serve_worker_listener};
@@ -311,6 +313,31 @@ impl WorkerFactory for ProcessWorkerFactory {
             tokio::time::sleep(CONNECT_INTERVAL).await;
         }
     }
+    async fn stop_worker(&self, worker: &Arc<dyn AgentAccess>) -> Result<(), AccessError> {
+        let managed = {
+            let mut workers = self.workers.lock().await;
+            let index = workers
+                .iter()
+                .position(|managed| Arc::ptr_eq(&managed.access, worker))
+                .ok_or_else(|| AccessError::not_found("the Agent's Worker is not running"))?;
+            workers.remove(index)
+        };
+        drop(managed.lifeline);
+        {
+            let mut process = managed.process.lock().await;
+            if let Some(process) = process.as_mut()
+                && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        }
+        self.control.revoke(worker).await;
+        Ok(())
+    }
+
     async fn exited(&self, worker: &Arc<dyn AgentAccess>) -> bool {
         let process = self
             .workers
@@ -441,7 +468,11 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
         lifecycle: lifecycle.clone(),
         ingress: ingress.clone(),
     });
-    let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
+    let daemon = Arc::new(DaemonServer::with_agent_registries(
+        epoch,
+        factory.clone(),
+        AgentRegistries::from_settings(),
+    ));
     control.attach_daemon((*daemon).clone());
     if let Some(handoff) = handoff {
         let mut channel = upgrade::inherited_stream(handoff.handshake)?;

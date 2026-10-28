@@ -47,10 +47,9 @@ pub(super) enum Glyph {
     AgentIdle,
     AgentCompleted,
     AgentFailed,
-    /// An interrupted turn or a cancelled task: ended without completing, not by failure.
+    /// An interrupted turn, a cancelled task or a stopped Agent: ended without completing, not by
+    /// failure.
     AgentStopped,
-    AgentUnknown,
-    AgentEmpty,
     /// The Subagents panel's member dot, filled for the member this View shows; its colour is the
     /// member's state.
     AgentViewed,
@@ -130,8 +129,6 @@ impl DisplayProfile {
             Glyph::AgentWaiting => "◷",
             Glyph::AgentIdle | Glyph::AgentUnviewed => "○",
             Glyph::AgentFailed | Glyph::AgentStopped => "✖",
-            Glyph::AgentUnknown => "?",
-            Glyph::AgentEmpty => "◦",
             Glyph::AgentViewed => "●",
             Glyph::Collapsed => "▸",
             Glyph::Expanded => "▾",
@@ -332,8 +329,6 @@ mod tests {
             Glyph::AgentCompleted,
             Glyph::AgentFailed,
             Glyph::AgentStopped,
-            Glyph::AgentUnknown,
-            Glyph::AgentEmpty,
             Glyph::AgentViewed,
             Glyph::AgentUnviewed,
             Glyph::Collapsed,

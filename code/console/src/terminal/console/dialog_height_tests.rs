@@ -209,8 +209,9 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                 workspace: None,
                 approvals: 0,
                 questions: 0,
+                agent_state: crate::agent_console::AgentState::Working,
                 group: AttentionGroup::Working,
-                glyph: status_glyph(AttentionGroup::Working, false),
+                glyph: status_glyph(crate::agent_console::AgentState::Working, false),
                 preview: None,
                 updated_at: None,
                 run_started_at: None,
@@ -221,6 +222,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                     created_at: 1,
                     color: None,
                 }),
+                ended: None,
             })
             .collect();
         state.status_area.update_agents(rows, Some(root));

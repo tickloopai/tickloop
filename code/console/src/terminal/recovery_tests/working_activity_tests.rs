@@ -101,7 +101,7 @@ impl AgentAccess for ActivityAccess {
             } if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok(LOST_END_ROUTE) => Some(*execution),
             _ => None,
         };
-        let mut observation = self.daemon.observe(query).await?;
+        let mut observation = super::listed_as_worked(self.daemon.observe(query).await?);
         if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only")
             && let ObservationValue::Overview(rows) = &mut observation.initial
         {

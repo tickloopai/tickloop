@@ -6,9 +6,10 @@ use uuid::Uuid;
 use super::{
     Role, RoleLine, display_single_line, display_width, truncate_path_width, truncate_width,
 };
-use crate::agent_console::AttentionGroup;
+use crate::agent_console::{AgentState, AttentionGroup};
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
+use tickloop_code_access::EndReason;
 use tickloop_harness::protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
@@ -22,6 +23,9 @@ pub(in crate::terminal) const MIN_REQUEST_AGENT_TITLE_COLUMNS: usize = 4;
 const MIN_METADATA_COLUMNS: usize = 12;
 const MIN_PREVIEW_COLUMNS: usize = 10;
 const PREVIEW_GAP: &str = "  ";
+/// Claude Code's agent view keeps at least this many Completed rows however short the terminal.
+const MIN_COMPLETED_ROWS: usize = 3;
+const AGE_NOW: &str = "now";
 pub(super) const REQUEST_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -35,7 +39,9 @@ pub(crate) struct AgentRow {
     pub(crate) workspace: Option<String>,
     pub(crate) approvals: usize,
     pub(crate) questions: usize,
-    /// This row's own attention group; overview families group by their most urgent member.
+    /// This row's own state, as its status word names it.
+    pub(crate) agent_state: AgentState,
+    /// The row's attention group; an overview family groups by its most urgent member.
     pub(crate) group: AttentionGroup,
     /// The state shape drawn before the title; it pairs with the status word and never
     /// replaces it. The active DisplayProfile resolves it.
@@ -46,7 +52,44 @@ pub(crate) struct AgentRow {
     pub(crate) updated_at: Option<u64>,
     pub(crate) run_started_at: Option<u64>,
     pub(crate) subagent: Option<SubagentRegistration>,
+    /// Set on a root Agent whose execution ended; such a row is keyed by its Chat.
+    pub(crate) ended: Option<EndedRow>,
 }
+
+/// What the overview needs to continue or forget an ended root Agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndedRow {
+    pub(crate) chat_id: Uuid,
+    pub(crate) reason: EndReason,
+    /// Whether its saved history is still on disk to load.
+    pub(crate) resumable: bool,
+}
+
+/// The request a peeked Agent waits on, with the question options a typed number picks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeekRequest {
+    pub(crate) request_id: Uuid,
+    /// The full question, or which tool asks for permission.
+    pub(crate) prompt: String,
+    /// Option labels, numbered from 1. Empty when only the Agent's own view can answer: every
+    /// permission request, whose context and choices only that view shows, and several questions
+    /// at once.
+    pub(crate) options: Vec<String>,
+}
+
+/// Claude Code's peek panel: the selected Agent's state below the overview list, with the input
+/// replying to that Agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Peek {
+    pub(super) agent_id: Uuid,
+    pub(super) request: Option<PeekRequest>,
+    /// Whether the last drawn panel showed the request's prompt and every option whole; a number
+    /// answers only what the user could read.
+    pub(super) options_visible: bool,
+}
+
+/// The most rows the peek panel takes from the list.
+const MAX_PEEK_ROWS: usize = 10;
 
 /// What a row shows after its title when there is room: the newest message, path metadata and
 /// the age of its latest state change. Narrow rows drop path first, then the message, then age.
@@ -83,11 +126,27 @@ impl AgentRow {
     /// The row's own status word retains its state even when a child's request sets the group:
     /// a failure is an error, while an interruption is only a warning.
     pub(in crate::terminal) fn status_role(&self) -> Role {
-        match self.state {
-            LoopState::Failed => Role::Error,
-            LoopState::Interrupted => Role::Warning,
-            _ => group_role(self.group),
+        match self.agent_state {
+            AgentState::Failed => Role::Error,
+            AgentState::Completed if self.state == LoopState::Interrupted => Role::Warning,
+            _ if self.group != AttentionGroup::Completed => group_role(self.group),
+            AgentState::Completed => Role::Success,
+            _ => Role::MutedText,
         }
+    }
+
+    /// How long a running Agent has waited for the user, as Claude Code's peek panel says it; an
+    /// ended row no longer waits.
+    fn waiting_label(&self, now: u64) -> Option<String> {
+        if self.agent_state != AgentState::NeedsInput || self.ended.is_some() {
+            return None;
+        }
+        let age = age_label(self.updated_at?, now);
+        Some(if age == AGE_NOW {
+            "waiting <1m".into()
+        } else {
+            format!("waiting {age}")
+        })
     }
 
     pub(in crate::terminal) fn state_glyph(
@@ -381,30 +440,26 @@ fn ellipsize(text: &str, width: usize) -> String {
     format!("{}…", truncate_width(text, width - 1))
 }
 
-/// Status words keep their text; colour only separates attention from finished or empty work.
+/// Status words keep their text; colour only separates attention from finished work.
 fn group_role(group: AttentionGroup) -> Role {
     match group {
         AttentionGroup::NeedsInput => Role::Warning,
-        AttentionGroup::Errors => Role::Error,
         AttentionGroup::Working => Role::Accent,
-        AttentionGroup::Done => Role::Success,
-        AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty => Role::MutedText,
+        AttentionGroup::Completed => Role::Success,
     }
 }
 
 /// The semantic shape drawn before a row's title. Shapes differ per state so the list reads
-/// without colour; a finished row whose last turn did not complete (interrupted) is not drawn as
-/// a success.
-pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
-    match group {
-        AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
-        AttentionGroup::Errors => Glyph::AgentFailed,
-        AttentionGroup::Working => Glyph::AgentRunning,
-        AttentionGroup::Idle => Glyph::AgentIdle,
-        AttentionGroup::Done if completed => Glyph::AgentCompleted,
-        AttentionGroup::Done => Glyph::AgentStopped,
-        AttentionGroup::Unknown => Glyph::AgentUnknown,
-        AttentionGroup::Empty => Glyph::AgentEmpty,
+/// without colour; a Completed row whose last turn was interrupted is not drawn as a success.
+pub(crate) fn status_glyph(state: AgentState, interrupted: bool) -> Glyph {
+    match state {
+        AgentState::NeedsInput => Glyph::AgentNeedsInput,
+        AgentState::Working => Glyph::AgentRunning,
+        AgentState::Idle => Glyph::AgentIdle,
+        AgentState::Completed if interrupted => Glyph::AgentStopped,
+        AgentState::Completed => Glyph::AgentCompleted,
+        AgentState::Failed => Glyph::AgentFailed,
+        AgentState::Stopped => Glyph::AgentStopped,
     }
 }
 
@@ -414,7 +469,7 @@ pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
 fn age_label(updated_at: u64, now: u64) -> String {
     let seconds = now.saturating_sub(updated_at) / 1000;
     match seconds {
-        0..60 => "now".into(),
+        0..60 => AGE_NOW.into(),
         60..3600 => format!("{}m", seconds / 60),
         3600..172_800 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86_400),
@@ -541,7 +596,7 @@ impl AgentOverview {
             })
     }
 
-    fn row(&self, id: Uuid) -> Option<&AgentRow> {
+    pub(super) fn row(&self, id: Uuid) -> Option<&AgentRow> {
         self.rows.iter().find(|row| row.agent_id == id)
     }
 
@@ -592,21 +647,14 @@ impl OverviewEntry<'_> {
     }
 }
 
-/// Groups that start folded behind their heading: nothing in them needs the user now.
-fn folds_by_default(group: AttentionGroup) -> bool {
-    matches!(
-        group,
-        AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty
-    )
-}
-
 #[derive(Default)]
 pub(super) struct OverviewState {
     pub(super) projection: Option<AgentOverview>,
     pub(super) selected: Option<OverviewTarget>,
+    pub(super) peek: Option<Peek>,
     pub(super) current_draft: bool,
-    /// Explicit group heading choices (`true` folded); see `folds_by_default` for the rest. They
-    /// only change what this View lists.
+    /// Group heading choices (`true` folded); groups start unfolded. They only change what this
+    /// View lists.
     pub(super) folded_groups: HashMap<AttentionGroup, bool>,
     /// Groups whose budget-folded remainder the user opened.
     pub(super) opened_groups: HashSet<AttentionGroup>,
@@ -692,6 +740,103 @@ impl OverviewState {
         entries.iter().position(|entry| entry.target() == selected)
     }
 
+    /// The ended Agent row `id`, when that row is one.
+    pub(super) fn ended_row(&self, id: Uuid) -> Option<&EndedRow> {
+        self.projection.as_ref()?.row(id)?.ended.as_ref()
+    }
+
+    /// Selects the listed row of `id` and scrolls to it; `false` when no such row is listed.
+    pub(super) fn select_agent(&mut self, id: Uuid) -> bool {
+        if !self.targets().contains(&OverviewTarget::Agent(id)) {
+            return false;
+        }
+        self.locate(id);
+        true
+    }
+
+    /// Moves the selection to the next (`step` 1) or previous (-1) Agent row, past headings and
+    /// counters; the peek panel follows it.
+    pub(super) fn select_adjacent_agent(&mut self, step: isize) -> Option<Uuid> {
+        let agents = self
+            .targets()
+            .into_iter()
+            .filter_map(|target| match target {
+                OverviewTarget::Agent(id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let current = agents
+            .iter()
+            .position(|id| Some(*id) == self.selected_agent())?;
+        let next = *agents.get(current.checked_add_signed(step)?)?;
+        self.select_agent(next);
+        Some(next)
+    }
+
+    /// The peek panel's rows: the Agent's state and how long it has waited, its latest sentence,
+    /// and the request it waits on with the numbers that answer it. Also says whether the prompt
+    /// and every option fit whole within the panel.
+    fn peek_lines(&self, width: usize, now: u64) -> (Vec<RoleLine>, bool) {
+        let Some((peek, row)) = self.peek.as_ref().and_then(|peek| {
+            let row = self.projection.as_ref()?.row(peek.agent_id)?;
+            Some((peek, row))
+        }) else {
+            return (Vec::new(), false);
+        };
+        let text_columns = width.saturating_sub(4).max(1);
+        let fits = |text: &str, limit: usize| {
+            super::wrap_text(&display_single_line(text), text_columns).len() <= limit
+        };
+        let wrapped = |text: &str, role: Role, limit: usize| {
+            super::wrap_text(&display_single_line(text), text_columns)
+                .into_iter()
+                .take(limit)
+                .map(move |line| RoleLine::role(format!("{ROW_INDENT}  {line}"), role))
+                .collect::<Vec<_>>()
+        };
+        let status = match row.waiting_label(now) {
+            Some(waiting) => format!("{} · {waiting}", display_single_line(&row.status)),
+            None => display_single_line(&row.status),
+        };
+        let mut lines = vec![RoleLine::role("─".repeat(width), Role::MutedText)];
+        let mut heading = RoleLine::role(
+            format!("{ROW_INDENT}{}", display_single_line(&row.title)),
+            Role::Title,
+        );
+        heading.push(" · ", Some(Role::MutedText));
+        heading.push(status, Some(row.status_role()));
+        heading.truncate(width);
+        lines.push(heading);
+        match row.preview.as_deref() {
+            Some(preview) => lines.extend(wrapped(preview, Role::Text, 3)),
+            None => lines.extend(wrapped("Nothing said yet", Role::MutedText, 1)),
+        }
+        let mut options_visible = false;
+        if let Some(request) = &peek.request {
+            options_visible = !request.options.is_empty() && fits(&request.prompt, 3);
+            lines.extend(wrapped(&request.prompt, Role::Warning, 3));
+            for (number, label) in request.options.iter().enumerate() {
+                let option = format!("{}. {label}", number + 1);
+                options_visible &= fits(&option, 1);
+                lines.extend(wrapped(&option, Role::Text, 1));
+            }
+            options_visible &= lines.len() <= MAX_PEEK_ROWS;
+            if request.options.is_empty() {
+                lines.extend(wrapped("→ opens the Agent to answer", Role::MutedText, 1));
+            }
+        }
+        if let Some(ended) = &row.ended {
+            let note = if ended.resumable {
+                "A reply loads its saved history, then sends"
+            } else {
+                "Its saved history is gone; nothing can continue it"
+            };
+            lines.extend(wrapped(note, Role::MutedText, 1));
+        }
+        lines.truncate(MAX_PEEK_ROWS);
+        (lines, options_visible)
+    }
+
     pub(super) fn selected_agent(&self) -> Option<Uuid> {
         match self.selected {
             Some(OverviewTarget::Agent(id)) => Some(id),
@@ -775,15 +920,8 @@ impl OverviewState {
                 .is_none_or(|workspace| row.workspace.as_ref() == Some(workspace))
     }
 
+    /// Whether the user folded `group`; a folded group hides every row.
     fn is_group_folded(&self, group: AttentionGroup) -> bool {
-        self.folded_groups
-            .get(&group)
-            .copied()
-            .unwrap_or_else(|| folds_by_default(group))
-    }
-
-    /// Whether the user folded `group` themselves; such a fold hides every row of the group.
-    fn is_group_collapsed_by_user(&self, group: AttentionGroup) -> bool {
         self.folded_groups.get(&group) == Some(&true)
     }
 
@@ -868,20 +1006,6 @@ impl OverviewState {
                 .map(|member| member.lines.len())
                 .sum::<usize>()
         };
-        let shows_anchors =
-            |group| self.is_group_folded(group) && !self.is_group_collapsed_by_user(group);
-        // Groups listed after Done keep their heading and kept rows on the first screen.
-        let later_reserve = grouped
-            .iter()
-            .filter(|(group, members)| *group > AttentionGroup::Done && !members.is_empty())
-            .map(|(group, members)| {
-                1 + if shows_anchors(*group) {
-                    pinned_lines(members)
-                } else {
-                    0
-                }
-            })
-            .sum::<usize>();
         let mut entries = Vec::new();
         for (group, members) in grouped {
             if members.is_empty() {
@@ -889,29 +1013,23 @@ impl OverviewState {
             }
             let folded = self.is_group_folded(group);
             let open = self.opened_groups.contains(&group);
-            let remaining = (self.capacity + self.transient_rows).saturating_sub(
-                entries.len()
-                    + if group == AttentionGroup::Done {
-                        later_reserve
-                    } else {
-                        0
-                    },
-            );
+            let remaining = (self.capacity + self.transient_rows).saturating_sub(entries.len());
             let total = 1 + members
                 .iter()
                 .map(|member| member.lines.len())
                 .sum::<usize>();
-            let over_budget = group == AttentionGroup::Done && !folded && total > remaining;
-            // A default fold keeps the rows the View points at (current, created, selected or
-            // visited during this visit) so none vanishes under the cursor; a fold the user chose
-            // hides them all.
+            // As Claude Code's Completed group: it lists what the screen holds, at least its
+            // minimum, and folds the rest behind a counter. The rows the View points at (current,
+            // created, selected or visited during this visit) stay, so none vanishes under the
+            // cursor.
+            let over_budget = group == AttentionGroup::Completed && !folded && total > remaining;
             let shown = if folded {
-                members
-                    .iter()
-                    .map(|member| member.pinned && shows_anchors(group))
-                    .collect()
+                vec![false; members.len()]
             } else if over_budget {
-                let mut available = remaining.saturating_sub(2 + pinned_lines(&members));
+                let mut available = remaining
+                    .saturating_sub(2)
+                    .max(MIN_COMPLETED_ROWS)
+                    .saturating_sub(pinned_lines(&members));
                 let mut fits = true;
                 members
                     .iter()
@@ -986,11 +1104,18 @@ impl OverviewState {
 
     /// Status candidates for a row, richest first; the row frame keeps the richest that fits. The
     /// Agent this View returns to says so in every candidate.
-    fn row_status(&self, row: &AgentRow, terminal_columns: usize) -> Vec<Vec<(String, Role)>> {
-        let mut variants = row.own_status_variants(
-            vec![(display_single_line(&row.status), row.status_role())],
-            terminal_columns,
-        );
+    fn row_status(
+        &self,
+        row: &AgentRow,
+        terminal_columns: usize,
+        now: u64,
+    ) -> Vec<Vec<(String, Role)>> {
+        let status = match row.waiting_label(now) {
+            Some(waiting) => format!("{} · {waiting}", display_single_line(&row.status)),
+            None => display_single_line(&row.status),
+        };
+        let mut variants =
+            row.own_status_variants(vec![(status, row.status_role())], terminal_columns);
         let current = self
             .projection
             .as_ref()
@@ -1053,7 +1178,7 @@ impl OverviewState {
             .projection
             .as_ref()
             .and_then(|projection| projection.group_of(row.agent_id))
-            .filter(|group| self.is_group_collapsed_by_user(*group));
+            .filter(|group| self.is_group_folded(*group));
         if let Some((filters, keys)) = self.hiding_filters(row) {
             let mut details = Vec::new();
             if !self.input_focused {
@@ -1348,7 +1473,19 @@ impl OverviewState {
             } else {
                 "enter/→ collapse".to_owned()
             }],
-            Some(OverviewTarget::Agent(_)) => vec!["enter open".to_owned()],
+            Some(OverviewTarget::Agent(id)) => match self.ended_row(id) {
+                Some(ended) if ended.resumable => vec![
+                    "enter resume".to_owned(),
+                    "space peek".to_owned(),
+                    "x remove".to_owned(),
+                ],
+                Some(_) => vec!["x remove".to_owned()],
+                None => vec![
+                    "enter open".to_owned(),
+                    "space peek".to_owned(),
+                    "x stop".to_owned(),
+                ],
+            },
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
                 .iter()
@@ -1358,9 +1495,9 @@ impl OverviewState {
                         hidden,
                         open,
                     } if *candidate == group => Some(if *open {
-                        "enter/space show fewer".to_owned()
+                        "enter/→ show fewer".to_owned()
                     } else {
-                        format!("enter/space show {hidden}")
+                        format!("enter/→ show {hidden}")
                     }),
                     _ => None,
                 })
@@ -1371,8 +1508,8 @@ impl OverviewState {
     }
 
     /// A group heading. A folded heading keeps its request counts, then says that it holds the
-    /// Agent Esc returns to, then explains Unknown and Empty while they fit; request counts and
-    /// `current` shrink to `A1 Q1` and `cur` before they are dropped.
+    /// Agent Esc returns to; request counts and `current` shrink to `A1 Q1` and `cur` before they
+    /// are dropped.
     fn heading_line(
         &self,
         width: usize,
@@ -1402,11 +1539,6 @@ impl OverviewState {
                 })
                 .collect::<Vec<_>>()
         };
-        let explanation = match group {
-            AttentionGroup::Unknown if folded => Some("work not reported"),
-            AttentionGroup::Empty if folded => Some("never used"),
-            _ => None,
-        };
         let current_forms: &[&str] = if current {
             &[CURRENT_LABEL, "cur"]
         } else {
@@ -1432,13 +1564,6 @@ impl OverviewState {
                     .sum::<usize>()
             };
             if heading_width + width_of(&candidate) <= width {
-                if let Some(explanation) = explanation {
-                    let mut explained = candidate.clone();
-                    explained.push((explanation.to_owned(), Role::MutedText));
-                    if heading_width + width_of(&explained) <= width {
-                        candidate = explained;
-                    }
-                }
                 details = candidate;
                 break;
             }
@@ -1469,7 +1594,17 @@ impl OverviewState {
         } else {
             1
         };
-        self.capacity = height.saturating_sub(header_rows);
+        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
+        let (peek, options_visible) = self.peek_lines(width, now);
+        let peek = if height.saturating_sub(header_rows) > peek.len() + MIN_COMPLETED_ROWS {
+            peek
+        } else {
+            Vec::new()
+        };
+        if let Some(state) = self.peek.as_mut() {
+            state.options_visible = options_visible && !peek.is_empty();
+        }
+        self.capacity = height.saturating_sub(header_rows + peek.len());
         let entries = self.entries();
         let offset = self.scroll_offset(&entries);
         // Folded groups and counters scrolled out of the list stay discoverable in the heading.
@@ -1535,6 +1670,8 @@ impl OverviewState {
                 let workspace = truncate_width(&workspace, value_columns - project_columns);
                 let hints = if help_open {
                     Vec::new()
+                } else if self.peek.is_some() {
+                    vec!["↑/↓ Agent".to_owned(), "→ open".into(), "esc close".into()]
                 } else if self.input_focused {
                     vec!["tab list".to_owned(), "esc back".into()]
                 } else {
@@ -1561,7 +1698,6 @@ impl OverviewState {
                 Role::MutedText,
             ));
         }
-        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
         let rooms = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -1570,7 +1706,7 @@ impl OverviewState {
                     row.title_room(
                         width,
                         &Self::row_extras(row, terminal_columns, now, display),
-                        &self.row_status(row, terminal_columns),
+                        &self.row_status(row, terminal_columns, now),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                 )),
@@ -1583,7 +1719,10 @@ impl OverviewState {
             .filter(|(row, _)| ambiguous.contains(&row.agent_id) || self.needs_cue_number(row))
             .filter_map(|(row, _)| Some((row.agent_id, self.numbers.get(row.agent_id)?)))
             .collect::<HashMap<_, _>>();
-        let selected_target = self.selected.filter(|_| !self.input_focused);
+        // The peeked row stays marked while the reply box holds the input.
+        let selected_target = self
+            .selected
+            .filter(|_| !self.input_focused || self.peek.is_some());
         let tree_lines = entries
             .iter()
             .map(|entry| {
@@ -1606,7 +1745,7 @@ impl OverviewState {
                         width,
                         &Self::row_extras(row, terminal_columns, now, display),
                         ordinals.get(&row.agent_id).copied(),
-                        &self.row_status(row, terminal_columns),
+                        &self.row_status(row, terminal_columns, now),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                     OverviewEntry::CurrentDraft => current_draft_line(width, display),
@@ -1637,7 +1776,8 @@ impl OverviewState {
         self.ordinals = ordinals;
         let capacity = self.capacity;
         lines.extend(tree_lines.into_iter().skip(offset).take(capacity));
-        lines.resize(height, RoleLine::default());
+        lines.resize(height.saturating_sub(peek.len()), RoleLine::default());
+        lines.extend(peek);
         lines
     }
 }
@@ -1703,7 +1843,12 @@ pub(super) fn help_lines(
             "w filter Workspace".into(),
             "tab list / new Agent".into(),
             "enter / → open Agent (row)".into(),
-            "enter / → / space fold group (heading)".into(),
+            "enter resume ended Agent (row)".into(),
+            "space peek and reply (row)".into(),
+            "↑/↓ next Agent, → open (peek)".into(),
+            "1-9 enter answers a question (peek)".into(),
+            "x twice stops Agent / removes ended row".into(),
+            "enter / → fold group (heading)".into(),
             "enter dispatch (input)".into(),
             "r open history".into(),
             "/cwd PATH set dispatch directory".into(),

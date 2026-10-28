@@ -62,6 +62,15 @@ pub async fn saved_family_root(root: PathBuf, chat_id: Uuid) -> Result<Option<Uu
     .map_err(|error| AgentError::Storage(error.to_string()))
 }
 
+/// Whether the Transcript of `chat_id` is still on disk under the configuration root.
+pub async fn saved_record_exists(root: PathBuf, chat_id: Uuid) -> Result<bool, AgentError> {
+    tokio::task::spawn_blocking(move || super::path::locate(&root, chat_id))
+        .await
+        .map_err(|error| AgentError::Storage(error.to_string()))?
+        .map(|path| path.is_some())
+        .map_err(|error| AgentError::Storage(error.to_string()))
+}
+
 /// One page of the messages of a saved Chat under the configuration root.
 pub async fn transcript(
     root: PathBuf,

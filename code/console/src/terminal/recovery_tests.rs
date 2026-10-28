@@ -336,11 +336,22 @@ struct DelayedTerminalEvents {
     release: CancellationToken,
 }
 
+/// These fixtures' second Agent stands for one the user already worked in, and the overview lists
+/// no Agent that holds nothing, so their overview reports every Agent as worked.
+pub(super) fn listed_as_worked(mut observation: Observation) -> Observation {
+    if let ObservationValue::Overview(rows) = &mut observation.initial {
+        for row in rows {
+            row.has_work = Some(true);
+        }
+    }
+    observation
+}
+
 #[async_trait]
 impl AgentAccess for DelayedTerminalEvents {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         let (initial, cursor, reset, changes, failure) =
-            self.daemon.observe(query).await?.into_parts();
+            listed_as_worked(self.daemon.observe(query).await?).into_parts();
         let changes = changes.map(|mut changes| {
             let (forward, receiver) = mpsc::channel(FEED_CAPACITY);
             let release = self.release.clone();
@@ -937,7 +948,6 @@ impl RecoveryPty {
                     return;
                 }
                 let selected = selected.to_owned();
-                // Never-used sessions are folded behind their group heading until Enter opens it.
                 let lines = frame.lines().collect::<Vec<_>>();
                 let target_is_above = lines
                     .iter()
@@ -948,13 +958,7 @@ impl RecoveryPty {
                             .position(|line| line.starts_with(screen::SELECTED_MARK)),
                     )
                     .is_some_and(|(target, cursor)| target < cursor);
-                self.send(if target_is_above {
-                    b"k"
-                } else if selected.contains("▸ Empty") {
-                    b"\r"
-                } else {
-                    b"j"
-                });
+                self.send(if target_is_above { b"k" } else { b"j" });
                 self.wait_until(|frame| {
                     frame
                         .lines()

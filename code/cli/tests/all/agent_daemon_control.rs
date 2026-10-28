@@ -21,8 +21,8 @@ use std::{
 use serde_json::{Value, json};
 use tickloop_code_access::{
     AccessError, AgentAccess, AgentCommand, AgentFilter, CommandEnvelope, CommandReceipt,
-    CommandResult, DisplayReceipt, DisplayUpdate, EnvironmentValue, LaunchSpec, Observation,
-    ObservationRequest, ObservationValue, Page, TranscriptRef, UserInput,
+    CommandResult, DisplayReceipt, DisplayUpdate, EndReason, EndedOutcome, EnvironmentValue,
+    LaunchSpec, Observation, ObservationRequest, ObservationValue, Page, TranscriptRef, UserInput,
 };
 use tickloop_code_client::LocalAgentClient;
 use tickloop_code_daemon::{serve_daemon_listener, serve_worker_listener};
@@ -584,7 +584,7 @@ async fn verify_stopped_and_restart(
     assert_ne!(replacement.daemon_epoch(), old_epoch);
     let history = replacement
         .observe(ObservationRequest::Transcript {
-            record,
+            record: record.clone(),
             page: Page {
                 offset: 0,
                 limit: 256,
@@ -617,6 +617,20 @@ async fn verify_stopped_and_restart(
         matches!(overview.initial, ObservationValue::Overview(rows) if rows.is_empty()),
         "reading history must not resume the stopped worker"
     );
+    let ended = replacement
+        .observe(ObservationRequest::EndedAgents {
+            store_root: Some(record.store_root.clone()),
+        })
+        .await
+        .unwrap();
+    let ObservationValue::EndedAgents(ended) = ended.initial else {
+        panic!("ended Agents")
+    };
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].record, record);
+    assert_eq!(ended[0].outcome, EndedOutcome::Failed);
+    assert_eq!(ended[0].reason, EndReason::DaemonStopped);
+    assert!(ended[0].resumable);
     assert!(std::fs::read_dir(&fixture.runtime).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -694,6 +708,17 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
         store_root: fixture.config.clone(),
         chat_id: snapshot.conversation.id.into(),
     };
+    let registered = fixture
+        .config
+        .join("jobs")
+        .join(format!("{}.json", record.chat_id.hyphenated()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registered.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the daemon records its running root Agent for the overview");
     verify_stopped_and_restart(
         &mut fixture,
         epoch,
@@ -707,8 +732,102 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
         "stopping and restarting must not resend model work"
     );
     eprintln!(
-        "actual current daemon + active worker stopped; saved history readable; new daemon epoch and zero resumed workers"
+        "actual current daemon + active worker stopped; saved history readable; new daemon epoch, zero resumed workers and the root listed as ended"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_root_agent_ends_its_worker_process_and_keeps_it_listed_as_stopped() {
+    let mut fixture = DaemonFixture::new();
+    let daemon = tickloop_code_client::connect_or_start_at(
+        fixture.runtime.clone(),
+        support::fixture_cli::executable(),
+    )
+    .await
+    .unwrap();
+    let epoch = daemon.daemon_epoch();
+    fixture.daemon_epoch = Some(epoch);
+    let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
+    let created = daemon
+        .execute(create_command(epoch, launch))
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    } = created
+    else {
+        panic!("active worker created")
+    };
+    tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let worker_socket = std::fs::read_dir(&fixture.runtime)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+        .unwrap()
+        .path();
+    let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
+    let worker_process = worker.protocol().process_id;
+    let record = TranscriptRef {
+        store_root: fixture.config.clone(),
+        chat_id: snapshot.conversation.id.into(),
+    };
+
+    daemon
+        .execute(CommandEnvelope {
+            daemon_epoch: epoch,
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::StopAgent { execution },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+
+    assert_processes_exited(&[worker_process]).await;
+    let overview = daemon
+        .observe(ObservationRequest::Overview {
+            filter: AgentFilter::default(),
+            page: Page {
+                offset: 0,
+                limit: 256,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(overview.initial, ObservationValue::Overview(rows) if rows.is_empty()));
+    let ended = daemon
+        .observe(ObservationRequest::EndedAgents {
+            store_root: Some(fixture.config.clone()),
+        })
+        .await
+        .unwrap();
+    let ObservationValue::EndedAgents(ended) = ended.initial else {
+        panic!("ended Agents")
+    };
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].record, record);
+    assert_eq!(ended[0].outcome, EndedOutcome::Stopped);
+    assert_eq!(ended[0].reason, EndReason::UserStopped);
+    assert!(ended[0].resumable);
+    assert!(
+        requests.try_recv().is_err(),
+        "stopping must not resend model work"
+    );
+    let output = fixture.run(&["daemon", "stop"]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture.daemon_epoch = None;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

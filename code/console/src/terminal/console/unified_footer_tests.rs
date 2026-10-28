@@ -104,8 +104,9 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
         workspace: None,
         approvals: 0,
         questions: 0,
+        agent_state: crate::agent_console::AgentState::Working,
         group: AttentionGroup::Working,
-        glyph: status_glyph(AttentionGroup::Working, false),
+        glyph: status_glyph(crate::agent_console::AgentState::Working, false),
         preview: None,
         updated_at: None,
         run_started_at: None,
@@ -120,6 +121,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
             created_at: tickloop_harness::base::private_fs::unix_time_milliseconds(),
             color: Some(tickloop_harness::protocol::AgentColor::ALL[(id % 8) as usize]),
         }),
+        ended: None,
     }
 }
 

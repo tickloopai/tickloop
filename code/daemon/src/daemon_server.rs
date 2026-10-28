@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use uuid::Uuid;
 
 use super::{
+    agent_registry::AgentRegistries,
     receipts::ReceiptStore,
     views::{ViewRegistry, command_origin, verify_host},
 };
@@ -68,6 +69,14 @@ pub trait WorkerFactory: Send + Sync {
     async fn replace_tickhost(&self) -> Result<(), AccessError> {
         Ok(())
     }
+    /// Ends `worker` on the user's word: it saves what it holds and exits, and its process is
+    /// killed when it does not exit in time.
+    async fn stop_worker(&self, _worker: &Arc<dyn AgentAccess>) -> Result<(), AccessError> {
+        Err(AccessError::new(
+            AccessErrorCode::Unsupported,
+            "this daemon cannot stop an Agent",
+        ))
+    }
     /// The context breakdown of a New Agent `launch` would start, counted without starting it.
     async fn draft_context_breakdown(
         &self,
@@ -114,6 +123,7 @@ struct DaemonInner {
     changes: broadcast::Sender<ObservationUpdate>,
     admission: Arc<RwLock<()>>,
     retired: AtomicBool,
+    registries: Option<AgentRegistries>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +145,24 @@ struct WorkerCheckpoint {
 
 impl DaemonServer {
     pub fn new(epoch: Uuid, factory: Arc<dyn WorkerFactory>) -> Self {
+        Self::build(epoch, factory, None)
+    }
+
+    /// A daemon that keeps its root Agents in `registries`, so the overview still lists them after
+    /// it stops.
+    pub fn with_agent_registries(
+        epoch: Uuid,
+        factory: Arc<dyn WorkerFactory>,
+        registries: AgentRegistries,
+    ) -> Self {
+        Self::build(epoch, factory, Some(registries))
+    }
+
+    fn build(
+        epoch: Uuid,
+        factory: Arc<dyn WorkerFactory>,
+        registries: Option<AgentRegistries>,
+    ) -> Self {
         let daemon = Self {
             inner: Arc::new(DaemonInner {
                 epoch,
@@ -150,6 +178,7 @@ impl DaemonServer {
                 changes: broadcast::channel(REPLAY_CAPACITY).0,
                 admission: Arc::new(RwLock::new(())),
                 retired: AtomicBool::new(false),
+                registries,
             }),
         };
         tokio::spawn(monitor_directory(Arc::downgrade(&daemon.inner)));
@@ -363,6 +392,65 @@ impl DaemonServer {
         known.last_directory = agents;
         Ok(execution)
     }
+    /// Stops the root Agent of `execution` and every member of its family, which share its
+    /// Worker. The Worker leaves the directory before it is stopped, so the overview never reads
+    /// it as lost, and the root's record says the user stopped it.
+    async fn stop_agent(&self, execution: ExecutionRef) -> Result<(), AccessError> {
+        let worker = self.worker(execution).await?;
+        let directory = self.directory().await?;
+        let root = directory
+            .iter()
+            .find(|entry| entry.execution == execution)
+            .filter(|entry| entry.parent.is_none() && entry.subagent.is_none())
+            .cloned()
+            .ok_or_else(|| AccessError::invalid("only a root Agent can be stopped"))?;
+        let _ = worker
+            .execute(CommandEnvelope {
+                daemon_epoch: self.inner.epoch,
+                command_id: tickloop_ids::generate(),
+                command: AgentCommand::FlushTranscripts,
+            })
+            .await;
+        self.inner
+            .workers
+            .lock()
+            .await
+            .retain(|known| !Arc::ptr_eq(&known.access, &worker));
+        let stopped = {
+            let mut routes = self.inner.routes.lock().await;
+            let stopped = routes
+                .iter()
+                .filter(|(_, routed)| Arc::ptr_eq(routed, &worker))
+                .map(|(execution, _)| *execution)
+                .collect::<HashSet<_>>();
+            routes.retain(|execution, _| !stopped.contains(execution));
+            stopped
+        };
+        self.inner
+            .records
+            .lock()
+            .await
+            .retain(|_, execution| !stopped.contains(execution));
+        if let (Some(registries), Some(record)) = (&self.inner.registries, &root.record) {
+            let remaining = self.directory().await?;
+            registries
+                .registry(&record.store_root, &remaining)
+                .mark_stopped(&root);
+        }
+        self.inner.factory.stop_worker(&worker).await
+    }
+
+    /// The configuration root of the latest Worker that saves to one.
+    async fn latest_config_root(&self) -> Option<std::path::PathBuf> {
+        self.inner
+            .workers
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find_map(|worker| worker.launch.config_root.clone())
+    }
+
     fn cursor(&self) -> Cursor {
         Cursor {
             daemon_epoch: self.inner.epoch,
@@ -780,6 +868,23 @@ impl DaemonServer {
                 self.inner.factory.replace_tickhost().await?;
                 Ok((CommandResult::Done, PersistenceState::NotApplicable))
             }
+            AgentCommand::StopAgent { execution } => {
+                self.stop_agent(*execution).await?;
+                Ok((CommandResult::Done, PersistenceState::NotApplicable))
+            }
+            AgentCommand::ForgetEndedAgent { record } => {
+                let registries = self.inner.registries.as_ref().ok_or_else(|| {
+                    AccessError::new(
+                        AccessErrorCode::Unsupported,
+                        "this daemon keeps no ended Agents",
+                    )
+                })?;
+                let directory = self.directory().await?;
+                registries
+                    .registry(&record.store_root, &directory)
+                    .forget(record.chat_id, &directory)?;
+                Ok((CommandResult::Done, PersistenceState::NotApplicable))
+            }
             AgentCommand::FlushTranscripts => {
                 let mut persistence = PersistenceState::FlushObserved;
                 for worker in self.workers().await {
@@ -864,6 +969,25 @@ impl AgentAccess for DaemonServer {
                 self.cursor(),
                 None,
             )),
+            ObservationRequest::EndedAgents { store_root } => {
+                let store_root = match store_root {
+                    Some(root) => Some(root),
+                    None => self.latest_config_root().await,
+                };
+                let ended = match (&self.inner.registries, store_root) {
+                    (Some(registries), Some(root)) => {
+                        let directory = self.directory().await?;
+                        let registry = registries.registry(&root, &directory);
+                        registry.ended(&directory).await
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Observation::single(
+                    ObservationValue::EndedAgents(ended),
+                    self.cursor(),
+                    None,
+                ))
+            }
             ObservationRequest::DraftContextBreakdown { launch, draft } => Ok(Observation::single(
                 ObservationValue::ContextBreakdown(Box::new(
                     self.inner
@@ -956,17 +1080,9 @@ impl AgentAccess for DaemonServer {
             } => {
                 let root = match store_root {
                     Some(root) => root,
-                    None => self
-                        .inner
-                        .workers
-                        .lock()
-                        .await
-                        .iter()
-                        .rev()
-                        .find_map(|worker| worker.launch.config_root.clone())
-                        .ok_or_else(|| {
-                            AccessError::invalid("record query requires its configuration root")
-                        })?,
+                    None => self.latest_config_root().await.ok_or_else(|| {
+                        AccessError::invalid("record query requires its configuration root")
+                    })?,
                 };
                 for worker in self.workers().await {
                     let _ = worker
@@ -1046,6 +1162,9 @@ async fn monitor_directory(daemon: Weak<DaemonInner>) {
             && let Ok(current) = serde_json::to_vec(&directory)
             && previous != current
         {
+            if let Some(registries) = &daemon.inner.registries {
+                registries.observe(&directory);
+            }
             previous = current;
             daemon.changed();
         }
