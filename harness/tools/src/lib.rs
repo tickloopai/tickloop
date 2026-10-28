@@ -512,38 +512,43 @@ pub struct SensitiveWritePathPatterns {
     pub relative_components: Vec<String>,
 }
 
+/// Escapes a literal path for regex engines without case-insensitive flags, including Seatbelt.
+pub fn case_insensitive_path_pattern(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphabetic() {
+                format!(
+                    "[{}{}]",
+                    character.to_ascii_lowercase(),
+                    character.to_ascii_uppercase()
+                )
+            } else {
+                regex::escape(&character.to_string())
+            }
+        })
+        .collect()
+}
+
 pub fn credential_write_path_patterns() -> SensitiveWritePathPatterns {
-    let literal = |value: &str| -> String {
-        value
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphabetic() {
-                    format!(
-                        "[{}{}]",
-                        character.to_ascii_lowercase(),
-                        character.to_ascii_uppercase()
-                    )
-                } else {
-                    regex::escape(&character.to_string())
-                }
-            })
-            .collect()
-    };
-    let absolute_components = SENSITIVE_PATH_NAMES.iter().copied().map(literal).collect();
+    let absolute_components = SENSITIVE_PATH_NAMES
+        .iter()
+        .copied()
+        .map(case_insensitive_path_pattern)
+        .collect();
     let mut components = SENSITIVE_PATH_NAMES
         .iter()
-        .map(|name| literal(name))
+        .map(|name| case_insensitive_path_pattern(name))
         .collect::<Vec<_>>();
-    components.push(format!("{}[^/]*", literal(".env.")));
+    components.push(format!("{}[^/]*", case_insensitive_path_pattern(".env.")));
     components.extend(
         SENSITIVE_PATH_SIGNALS
             .iter()
-            .map(|name| format!("[^/]*{}[^/]*", literal(name))),
+            .map(|name| format!("[^/]*{}[^/]*", case_insensitive_path_pattern(name))),
     );
     components.extend(
         SENSITIVE_PATH_EXTENSIONS
             .iter()
-            .map(|name| format!("[^/]*\\.{}", literal(name))),
+            .map(|name| format!("[^/]*\\.{}", case_insensitive_path_pattern(name))),
     );
     SensitiveWritePathPatterns {
         absolute_components,

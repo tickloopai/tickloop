@@ -126,13 +126,14 @@ fn prepare_policy(
     for path in config.filesystem.default_deny_write_paths() {
         patterns
             .absolute_components
-            .push(case_insensitive_path(path));
+            .push(tickloop_harness::tools::case_insensitive_path_pattern(path));
         // Protect the container itself against replacement or symlink traversal, while its
         // ordinary children (notably Git objects, index and refs) remain writable.
         for (separator, _) in path.match_indices('/') {
-            patterns
-                .absolute_components
-                .push(format!("{}$", case_insensitive_path(&path[..separator])));
+            patterns.absolute_components.push(format!(
+                "{}$",
+                tickloop_harness::tools::case_insensitive_path_pattern(&path[..separator])
+            ));
         }
     }
     patterns.absolute_components.sort();
@@ -207,22 +208,6 @@ fn prepare_policy(
         },
         requires_approval,
     ))
-}
-
-fn case_insensitive_path(path: &str) -> String {
-    path.chars()
-        .map(|character| {
-            if character.is_ascii_alphabetic() {
-                format!(
-                    "[{}{}]",
-                    character.to_ascii_lowercase(),
-                    character.to_ascii_uppercase()
-                )
-            } else {
-                regex::escape(&character.to_string())
-            }
-        })
-        .collect()
 }
 
 fn resolve_configured_path(
