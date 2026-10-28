@@ -6,6 +6,7 @@ use std::{
 };
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+const DENIAL_SCAN_BYTES: u64 = 64 * 1024;
 const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -14,8 +15,15 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     pub deny_write: Vec<PathBuf>,
     pub protected_paths: Vec<PathBuf>,
-    pub denied_path_patterns: Vec<String>,
+    pub denied_path_patterns: Vec<ProtectedPathPattern>,
     pub network: SandboxNetwork,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedPathPattern {
+    pub pattern: String,
+    pub excluded_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -64,9 +72,11 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
         return Err(io::Error::other("sandbox unavailable on this platform"));
     }
     let mut profile = include_str!("sandbox_base.sbpl").to_owned();
-    profile.push_str(
-        "\n(allow file-read*)\n(deny network*)\n(deny system-fcntl (fcntl-command 80 110))\n",
-    );
+    // F_MAKECOMPRESSED (80) and F_TRANSFEREXTENTS (110) can mutate through read-only descriptors.
+    profile.push_str("\n(allow file-read*)\n(deny system-fcntl (fcntl-command 80 110))\n");
+    match policy.network {
+        SandboxNetwork::Disconnected => profile.push_str("(deny network*)\n"),
+    }
     for root in &policy.writable_roots {
         let path = quote_path(root)?;
         profile.push_str(&format!("(allow file-write* (subpath {path}))\n"));
@@ -91,12 +101,20 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
             ));
         }
     }
-    for pattern in &policy.denied_path_patterns {
-        if pattern.contains('"') || pattern.chars().any(char::is_control) {
+    for denied in &policy.denied_path_patterns {
+        let pattern = &denied.pattern;
+        if pattern.chars().any(char::is_control) {
             return Err(io::Error::other("unsupported protected-path pattern"));
         }
-        // SBPL regex literals preserve backslashes; Scheme string escaping changes the pattern.
-        profile.push_str(&format!("(deny file-write* (regex #\"{pattern}\"))\n"));
+        // SBPL regex literals preserve backslashes; only quotes need escaping.
+        let mut filters = format!("(regex #\"{}\")", pattern.replace('"', "\\\""));
+        for excluded in &denied.excluded_roots {
+            let path = quote_path(excluded)?;
+            filters.push_str(&format!(
+                " (require-not (literal {path})) (require-not (subpath {path}))"
+            ));
+        }
+        profile.push_str(&format!("(deny file-write* (require-all {filters}))\n"));
     }
     let mut command = tokio::process::Command::new(SANDBOX_EXEC);
     command.args(["-p", &profile]).arg(shell);
@@ -122,7 +140,7 @@ pub(crate) fn annotate_denial(output: &std::fs::File) {
     let Ok(length) = output.metadata().map(|metadata| metadata.len()) else {
         return;
     };
-    let mut bytes = vec![0; length.min(64 * 1024) as usize];
+    let mut bytes = vec![0; length.min(DENIAL_SCAN_BYTES) as usize];
     let offset = length.saturating_sub(bytes.len() as u64);
     let Ok(read) = output.read_at(&mut bytes, offset) else {
         return;

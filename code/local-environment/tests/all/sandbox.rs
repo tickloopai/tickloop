@@ -8,20 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
-    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
-    std::fs::create_dir_all(&scratch).unwrap();
-    let root = tempfile::tempdir_in(scratch.canonicalize().unwrap()).unwrap();
-    let folder = root.path().join("folder");
-    std::fs::create_dir(&folder).unwrap();
-    let config = root.path().join("config");
-    std::fs::create_dir(&config).unwrap();
-    std::fs::write(
-        config.join("settings.json"),
-        r#"{"sandbox":{"enabled":true,"failIfUnavailable":true}}"#,
-    )
-    .unwrap();
-    let environment = LocalEnvironment::with_shells(Arc::new(OwnTickhost::new()))
-        .with_sandbox(UserSettings::in_root(&config));
+    let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let root = &fixture.root;
+    let folder = fixture.workspace.folder.as_ref().unwrap();
+    let environment = &fixture.environment;
     let authority = ExecutionAuthority::new(tickloop_ids::generate().into());
     let port = environment.bind(
         ExecutionScope {
@@ -128,6 +118,7 @@ impl SandboxFixture {
         let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         let root = tempfile::tempdir_in(scratch.canonicalize().unwrap()).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
         let folder = root.path().join("folder");
         let config = root.path().join("config");
         std::fs::create_dir(&folder).unwrap();
@@ -515,4 +506,34 @@ async fn sandbox_protects_denied_paths_and_user_settings_through_symlinks() {
         .await;
     assert!(result.is_error, "{}", result.content);
     assert_eq!(std::fs::read(&target).unwrap(), before);
+}
+
+#[tokio::test]
+async fn sandbox_protects_the_targets_of_sensitive_symlink_names() {
+    let fixture = SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let folder = fixture.workspace.folder.as_ref().unwrap();
+    std::fs::create_dir(folder.join("ordinary")).unwrap();
+    std::os::unix::fs::symlink("ordinary", folder.join(".git")).unwrap();
+    let result = fixture
+        .run(fixture.prepare("printf bypass > .git/config").await)
+        .await;
+    assert!(result.is_error, "{}", result.content);
+    assert!(!folder.join("ordinary/config").exists());
+}
+
+#[tokio::test]
+async fn sandbox_does_not_treat_the_folder_name_as_a_sensitive_child_path() {
+    let mut fixture =
+        SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    let folder = fixture.root.path().join("tokenizer");
+    std::fs::create_dir(&folder).unwrap();
+    fixture.workspace.folder = Some(folder.clone());
+    let result = fixture
+        .run(fixture.prepare("printf allowed > ordinary.txt").await)
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read_to_string(folder.join("ordinary.txt")).unwrap(),
+        "allowed"
+    );
 }

@@ -487,7 +487,12 @@ fn is_sensitive_path(path: &Path) -> bool {
 
 /// Case-insensitive component patterns for the same credential and write-sensitive paths
 /// enforced by file tools. Execution adapters may enforce these at their filesystem boundary.
-pub fn sensitive_write_path_patterns() -> Vec<String> {
+pub struct SensitiveWritePathPatterns {
+    pub absolute_components: Vec<String>,
+    pub relative_components: Vec<String>,
+}
+
+pub fn sensitive_write_path_patterns() -> SensitiveWritePathPatterns {
     let literal = |value: &str| -> String {
         value
             .chars()
@@ -504,9 +509,13 @@ pub fn sensitive_write_path_patterns() -> Vec<String> {
             })
             .collect()
     };
-    let mut components = shell::sensitive_write_names()
+    let absolute_components = shell::sensitive_write_names()
         .chain(SENSITIVE_PATH_NAMES.iter().copied())
         .map(literal)
+        .collect();
+    let mut components = SENSITIVE_PATH_NAMES
+        .iter()
+        .map(|name| literal(name))
         .collect::<Vec<_>>();
     components.push(format!("{}[^/]*", literal(".env.")));
     components.extend(
@@ -519,10 +528,10 @@ pub fn sensitive_write_path_patterns() -> Vec<String> {
             .iter()
             .map(|name| format!("[^/]*\\.{}", literal(name))),
     );
-    components
-        .into_iter()
-        .map(|component| format!("(^|/){component}(/|$)"))
-        .collect()
+    SensitiveWritePathPatterns {
+        absolute_components,
+        relative_components: components,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
