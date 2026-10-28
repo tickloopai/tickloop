@@ -490,6 +490,7 @@ fn monitor_row_clicks_ignore_non_targets_and_other_input_surfaces() {
                     id: Uuid::new_v4(),
                     title: "Modal".into(),
                     context: Vec::new(),
+                    markdown: None,
                     options: vec!["Close".into()],
                     selected: 0,
                     confirmation: false,
