@@ -132,6 +132,10 @@ impl ChatInputSnapshot {
         }
     }
 
+    fn has_content(&self) -> bool {
+        !self.editor.draft().is_empty() || self.input_stash.is_some()
+    }
+
     fn validate(&self) -> Result<(), String> {
         if !self.editor.valid_upgrade_state()
             || !self
@@ -184,6 +188,28 @@ impl ConsoleUpgrade {
             input.validate()?;
         }
         Ok(())
+    }
+
+    /// Opens the restored View on the new-Agent input instead of the Chat it showed, for a Chat
+    /// the daemon no longer runs. The Chat's draft stays in front unless the new-Agent input has
+    /// its own, which then keeps its place while the Chat's draft waits under that Chat.
+    pub(in crate::terminal) fn leave_chat(&mut self) {
+        let Some(chat) = self.current_chat.take() else {
+            return;
+        };
+        let new_agent_input = self
+            .cached
+            .iter()
+            .position(|(cached_chat, _)| cached_chat.is_none())
+            .map(|index| self.cached.remove(index).1);
+        if let Some(input) = new_agent_input
+            && input.has_content()
+        {
+            let chat_input = std::mem::replace(&mut self.current, input);
+            self.cached.push((Some(chat), chat_input));
+        }
+        self.scroll
+            .retain(|(scrolled_chat, _)| *scrolled_chat != Some(chat));
     }
 }
 
@@ -552,6 +578,59 @@ mod tests {
         assert_eq!(state.editor.draft(), "保留草稿");
         assert_eq!(state.editor.cursor(), 6);
         assert!(state.pending_upgrade_scroll.contains_key(&Some(first)));
+    }
+
+    fn restore_without_chat(saved: ConsoleUpgrade) -> Console {
+        let restored = Console::test_for_chat(Uuid::new_v4());
+        restored.state.lock().unwrap().chat = None;
+        restored.restore_upgrade(saved).unwrap();
+        restored
+    }
+
+    #[test]
+    fn leaving_an_ended_chat_brings_its_draft_to_the_new_agent_input() {
+        let chat = Uuid::new_v4();
+        let console = Console::test_for_chat(chat);
+        console
+            .state
+            .lock()
+            .unwrap()
+            .insert("draft for the ended Agent");
+        let mut saved = console.test_upgrade_snapshot();
+        saved.leave_chat();
+
+        let restored = restore_without_chat(saved);
+        let state = restored.state.lock().unwrap();
+        assert_eq!(state.chat, None);
+        assert_eq!(state.editor.draft(), "draft for the ended Agent");
+        assert!(!state.editor_cache.contains_key(&Some(chat)));
+    }
+
+    #[test]
+    fn leaving_an_ended_chat_keeps_a_new_agent_draft_in_front_and_the_chat_draft_cached() {
+        let chat = Uuid::new_v4();
+        let console = Console::test_for_chat(chat);
+        console
+            .state
+            .lock()
+            .unwrap()
+            .insert("draft for the ended Agent");
+        console.select_chat(None).unwrap();
+        console.state.lock().unwrap().insert("new Agent draft");
+        console.select_chat(Some(chat)).unwrap();
+        let mut saved = console.test_upgrade_snapshot();
+        saved.leave_chat();
+
+        let restored = restore_without_chat(saved);
+        assert_eq!(
+            restored.state.lock().unwrap().editor.draft(),
+            "new Agent draft"
+        );
+        restored.select_chat(Some(chat)).unwrap();
+        assert_eq!(
+            restored.state.lock().unwrap().editor.draft(),
+            "draft for the ended Agent"
+        );
     }
 
     #[test]

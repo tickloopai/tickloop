@@ -837,6 +837,15 @@ impl ConsoleExecution {
         }
     }
 
+    /// Whether the daemon runs `chat` now, read from its catalog rather than this View's cache.
+    pub(super) async fn runs_chat(&self, chat: Uuid) -> Result<bool, AccessError> {
+        Ok(self
+            .catalog()
+            .await?
+            .iter()
+            .any(|row| row.chat_id == chat && row.availability == ExecutionAvailability::Live))
+    }
+
     /// The Agent and title `chat` had in the latest status this View received; `None` before any.
     pub(super) fn cached_title(&self, chat: Uuid) -> Option<(Uuid, String)> {
         let statuses = self.inner.statuses.read().unwrap();
