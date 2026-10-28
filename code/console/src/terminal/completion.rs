@@ -762,8 +762,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 29);
-        assert_eq!(builtin_commands().len(), 45);
+        assert_eq!(completion.candidates().len(), 30);
+        assert_eq!(builtin_commands().len(), 46);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -785,6 +785,7 @@ mod tests {
             "/ticks",
             "/mcp",
             "/context",
+            "/sandbox",
         ] {
             assert!(command_names(&completion).contains(&command));
         }
@@ -843,7 +844,7 @@ mod tests {
         completion.update("/s");
         assert_eq!(
             command_names(&completion),
-            vec!["/settings", "/stop", "/slides"]
+            vec!["/settings", "/sandbox", "/stop", "/slides"]
         );
         completion.update("/operations");
         assert!(!completion.is_open());
