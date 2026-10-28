@@ -383,7 +383,7 @@ pub struct PreparedExecution {
     chat: ChatId,
     facts: ExecutionFacts,
     isolation: ExecutionIsolation,
-    isolated_auto_approval: bool,
+    skips_approval_when_isolated: bool,
     lifetime: Arc<()>,
     cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
@@ -416,7 +416,7 @@ impl PreparedExecution {
             chat: authority.chat,
             facts,
             isolation: ExecutionIsolation::default(),
-            isolated_auto_approval: false,
+            skips_approval_when_isolated: false,
             lifetime: Arc::new(()),
             cleanup: None,
         }
@@ -443,13 +443,13 @@ impl PreparedExecution {
 
     /// Whether the environment's owner lets a sufficiently isolated execution skip ordinary
     /// approval; the Harness decides whether the reported isolation qualifies.
-    pub fn with_isolated_auto_approval(mut self, allowed: bool) -> Self {
-        self.isolated_auto_approval = allowed;
+    pub fn with_approval_skipped_when_isolated(mut self, allowed: bool) -> Self {
+        self.skips_approval_when_isolated = allowed;
         self
     }
 
-    pub fn allows_isolated_auto_approval(&self) -> bool {
-        self.isolated_auto_approval
+    pub fn skips_approval_when_isolated(&self) -> bool {
+        self.skips_approval_when_isolated
     }
 
     pub fn preparation(&self) -> PreparationId {

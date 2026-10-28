@@ -177,8 +177,9 @@ it; the sandbox, not the classifier, bounds what it can write and reach. Its app
 
 The fast path reads only the frozen preparation, after the deterministic checks: Plan's side-effect
 refusal, explicit Deny and Ask rules (whole-tool and content rules, unlike Claude Code, which lets a
-sandboxed command pass a whole-tool Ask), safety checks, explicit Allow and the environment's
-required approval. A call outside the sandbox (`dangerouslyDisableSandbox`, `excludedCommands`, or a
+sandboxed command pass a whole-tool Ask) and safety checks. As in Claude Code it comes before
+explicit Allow rules, so such a call is recorded as sandboxed even when an Allow rule also covers
+it. A Shell whose environment requires approval never qualifies. A call outside the sandbox (`dangerouslyDisableSandbox`, `excludedCommands`, or a
 fallback without isolation) reports unrestricted isolation and keeps ordinary approval. Plan and
 Full Access are unchanged. A whole-environment isolation report, as a future virtual machine would
 give, does not qualify. Sensitive paths stay unwritable inside the sandbox itself.

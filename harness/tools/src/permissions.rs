@@ -129,8 +129,9 @@ pub trait PermissionPolicyExt {
     ) -> Decision;
 
     /// Claude Code `autoAllowBashIfSandboxed`: Accept Edits and Auto run a Shell whose environment
-    /// reports sufficient isolation without asking or reviewing. Explicit rules, safety checks and
-    /// required approval are decided before it.
+    /// reports sufficient isolation without asking or reviewing, ahead of explicit Allow rules as
+    /// in Claude Code. Explicit Deny and Ask rules and safety checks are decided before it; a
+    /// Shell that requires approval never qualifies.
     fn admits_by_isolation(&self, operation: &PreparedTool) -> bool;
 
     /// Claude Code's refusal when a Deny naming this call's rule content applies, such as
@@ -316,13 +317,13 @@ impl PermissionPolicyExt for PermissionPolicy {
         let is_accept_edits = self.mode == ExecutionMode::AcceptEdits;
         let decision = if safety_check.is_some() {
             Decision::Ask
-        } else if explicit == Some(ExplicitPermissionDecision::Allow) {
+        } else if self.admits_by_isolation(operation)
+            || explicit == Some(ExplicitPermissionDecision::Allow)
+        {
             Decision::Allow
         } else if operation.requires_environment_approval() && self.mode != ExecutionMode::Plan {
             Decision::Ask
-        } else if self.admits_by_isolation(operation)
-            || is_accept_edits && operation.is_allowed_in_accept_edits(workspace)
-        {
+        } else if is_accept_edits && operation.is_allowed_in_accept_edits(workspace) {
             Decision::Allow
         } else if is_accept_edits && operation.accept_edits_supersedes_read_only() {
             Decision::Ask
@@ -356,7 +357,7 @@ impl PermissionPolicyExt for PermissionPolicy {
 
     fn admits_by_isolation(&self, operation: &PreparedTool) -> bool {
         matches!(self.mode, ExecutionMode::AcceptEdits | ExecutionMode::Auto)
-            && operation.is_auto_approved_by_isolation()
+            && operation.skips_approval_by_isolation()
     }
 
     fn content_denial_message(

@@ -24,7 +24,8 @@ const FOLDER_ONLY_OFFLINE: ExecutionIsolation = ExecutionIsolation {
 
 struct Scenario {
     isolation: ExecutionIsolation,
-    isolated_auto_approval: bool,
+    skips_approval_when_isolated: bool,
+    requires_approval: bool,
     mode: ExecutionMode,
     rule: Option<(Decision, Option<&'static str>)>,
     prompt_policy: PromptPolicy,
@@ -35,7 +36,8 @@ impl Scenario {
     fn sandboxed(mode: ExecutionMode) -> Self {
         Self {
             isolation: FOLDER_ONLY_OFFLINE,
-            isolated_auto_approval: true,
+            skips_approval_when_isolated: true,
+            requires_approval: false,
             mode,
             rule: None,
             prompt_policy: AgentHostOptions::embedded_defaults().prompt_policy,
@@ -55,7 +57,8 @@ async fn run(scenario: Scenario) -> Observed {
     let folder = tempfile::tempdir().unwrap();
     let environment = MemoryEnvironment::new();
     environment.set_isolation(scenario.isolation);
-    environment.set_isolated_shell_auto_approval(scenario.isolated_auto_approval);
+    environment.set_shell_approval_skipped_when_isolated(scenario.skips_approval_when_isolated);
+    environment.set_shell_approval_required(scenario.requires_approval);
     environment.define_shell(BUILD, Duration::ZERO, b"build-finished".to_vec(), 0);
     environment.define_shell(LOCAL_EDIT, Duration::ZERO, Vec::new(), 0);
     let model = Arc::new(ScriptedModel::new(vec![
@@ -171,6 +174,42 @@ async fn only_the_sandbox_fast_path_records_the_sandbox_reason() {
 
     let full_access = run(Scenario::sandboxed(ExecutionMode::FullAccess)).await;
     assert_eq!(full_access.approval.unwrap().direct_reason, None);
+
+    for (isolation, expected) in [
+        (FOLDER_ONLY_OFFLINE, Some(DirectApprovalReason::Sandbox)),
+        (ExecutionIsolation::default(), None),
+    ] {
+        let allowed_by_rule = run(Scenario {
+            isolation,
+            rule: Some((Decision::Allow, Some("cargo:*"))),
+            ..Scenario::sandboxed(ExecutionMode::AcceptEdits)
+        })
+        .await;
+        assert!(!allowed_by_rule.result.is_error, "{isolation:?}");
+        assert_eq!(
+            allowed_by_rule.approval.unwrap().direct_reason,
+            expected,
+            "{isolation:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shells_that_require_approval_never_skip_it_despite_reported_isolation() {
+    for mode in [ExecutionMode::Auto, ExecutionMode::AcceptEdits] {
+        let observed = run(Scenario {
+            requires_approval: true,
+            ..Scenario::sandboxed(mode)
+        })
+        .await;
+        assert_eq!(observed.reviewed, mode == ExecutionMode::Auto, "{mode:?}");
+        assert_eq!(
+            observed.asked,
+            mode == ExecutionMode::AcceptEdits,
+            "{mode:?}"
+        );
+        assert!(observed.result.is_error, "{mode:?}");
+    }
 }
 
 #[tokio::test]
@@ -185,7 +224,7 @@ async fn only_folder_isolation_without_open_network_skips_approval_in_accept_edi
         (FolderAndDirectories, Disconnected),
         (Environment, Disconnected),
     ] {
-        for isolated_auto_approval in [true, false] {
+        for skips_approval_when_isolated in [true, false] {
             for mode in [
                 ExecutionMode::Auto,
                 ExecutionMode::AcceptEdits,
@@ -193,14 +232,14 @@ async fn only_folder_isolation_without_open_network_skips_approval_in_accept_edi
             ] {
                 let observed = run(Scenario {
                     isolation: ExecutionIsolation { writes, network },
-                    isolated_auto_approval,
+                    skips_approval_when_isolated,
                     ..Scenario::sandboxed(mode)
                 })
                 .await;
                 let case = format!(
-                    "writes={writes:?} network={network:?} auto={isolated_auto_approval} mode={mode:?}"
+                    "writes={writes:?} network={network:?} auto={skips_approval_when_isolated} mode={mode:?}"
                 );
-                let skips_approval = isolated_auto_approval
+                let skips_approval = skips_approval_when_isolated
                     && writes == FolderAndDirectories
                     && network != OpenNetwork
                     && mode != ExecutionMode::Plan;

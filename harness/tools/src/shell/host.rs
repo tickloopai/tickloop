@@ -86,7 +86,7 @@ pub struct ShellPreparation {
     creates_output: bool,
     isolation: tickloop_harness_protocol::ExecutionIsolation,
     requires_approval: bool,
-    isolated_auto_approval: bool,
+    skips_approval_when_isolated: bool,
     action: Arc<Mutex<Option<Box<dyn PreparedShellStart>>>>,
 }
 
@@ -106,7 +106,7 @@ impl ShellPreparation {
             creates_output,
             isolation: Default::default(),
             requires_approval: false,
-            isolated_auto_approval: false,
+            skips_approval_when_isolated: false,
             action: Arc::new(Mutex::new(Some(action))),
         }
     }
@@ -127,16 +127,16 @@ impl ShellPreparation {
     pub fn isolation(&self) -> tickloop_harness_protocol::ExecutionIsolation {
         self.isolation
     }
-    pub fn with_isolated_auto_approval(mut self, allowed: bool) -> Self {
-        self.isolated_auto_approval = allowed;
+    pub fn with_approval_skipped_when_isolated(mut self, allowed: bool) -> Self {
+        self.skips_approval_when_isolated = allowed;
         self
     }
     /// Whether this Shell may skip approval because its environment confines writes to the
     /// Folder and its directories and does not open the network, and the environment's owner
     /// allows that. A Shell that must be approved never qualifies.
-    pub fn is_auto_approved_by_isolation(&self) -> bool {
+    pub fn skips_approval_by_isolation(&self) -> bool {
         use tickloop_harness_protocol::{NetworkIsolation, WriteIsolation};
-        self.isolated_auto_approval
+        self.skips_approval_when_isolated
             && !self.requires_approval
             && self.isolation.writes == WriteIsolation::FolderAndDirectories
             && self.isolation.network != NetworkIsolation::Unrestricted

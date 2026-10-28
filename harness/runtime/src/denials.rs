@@ -9,9 +9,9 @@ use tickloop_harness_protocol::{
     ApprovalAssessmentDetails, ApprovalHistoryView, ApprovalOutcome, ApprovalPath, ApprovalRecord,
     ApprovalResult, AutoBlockKind, ChatId, DenialAutoFinding, DenialAutoRuleSummary,
     DenialCategory, DenialPersistence, DenialRecord, DenialReference, DenialReviewFacts,
-    DenialRuleSource, DenialRuleSummary, DenialsView, DisplaySummary, MAX_RECENT_DENIALS,
-    OperationRecord, PermissionApprovalSource, PermissionPolicy, PermissionRule, Receipt,
-    SoftDenyClearance,
+    DenialRuleSource, DenialRuleSummary, DenialsView, DirectApprovalReason, DisplaySummary,
+    MAX_RECENT_DENIALS, OperationRecord, PermissionApprovalSource, PermissionPolicy,
+    PermissionRule, Receipt, SoftDenyClearance,
 };
 use tickloop_harness_tools::permissions::permission_rule_content;
 use tickloop_harness_tools::{BASH_TOOL_NAME, WEB_FETCH_TOOL_NAME};
@@ -91,7 +91,7 @@ pub(super) fn allowed_approval_record(
     if decision.path == ApprovalPath::Direct
         && matches!(decision.direct_basis, DirectApprovalBasis::Sandbox)
     {
-        record.direct_reason = Some(tickloop_harness_protocol::DirectApprovalReason::Sandbox);
+        record.direct_reason = Some(DirectApprovalReason::Sandbox);
     }
     record
 }

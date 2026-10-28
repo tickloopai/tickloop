@@ -1101,6 +1101,13 @@ async fn unsandboxed_exclusions_recognize_assignments_and_safe_wrappers() {
     }
 }
 
+const BUILD_MAKEFILE: &str = "build/out.txt:\n\tmkdir -p build\n\tprintf built > build/out.txt\n";
+
+fn blocking_reviewer() -> Arc<ScriptedModel> {
+    let block = tickloop_harness::test_support::auto_classification(true).to_string();
+    Arc::new(ScriptedModel::new(vec![text(&block), text(&block)]))
+}
+
 struct AutoApprovalRun {
     reviewed: bool,
     asked: bool,
@@ -1114,14 +1121,10 @@ impl SandboxFixture {
         command: &str,
         mode: ExecutionMode,
     ) -> AutoApprovalRun {
-        use tickloop_harness::test_support::auto_classification;
         let (agent, chat) = self
             .agent(serde_json::json!({"command":command}), mode)
             .await;
-        let blocking_reviewer = Arc::new(ScriptedModel::new(vec![
-            text(&auto_classification(true).to_string()),
-            text(&auto_classification(true).to_string()),
-        ]));
+        let blocking_reviewer = blocking_reviewer();
         agent.set_auto_reviewer(blocking_reviewer.clone()).await;
         let mut events = agent.subscribe();
         let receipt = agent
@@ -1173,11 +1176,7 @@ async fn sandboxed_build_runs_without_review_unless_auto_allow_is_turned_off() {
             }
             let fixture = SandboxFixture::new(sandbox);
             let folder = fixture.workspace.folder.clone().unwrap();
-            std::fs::write(
-                folder.join("Makefile"),
-                "build/out.txt:\n\tmkdir -p build\n\tprintf built > build/out.txt\n",
-            )
-            .unwrap();
+            std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
             let run = fixture.run_without_approval_answers("make", mode).await;
             let case = format!("autoAllowBashIfSandboxed={auto_allow:?} mode={mode:?}");
             let skips_approval = auto_allow != Some(false);
@@ -1258,12 +1257,9 @@ async fn unsandboxed_routes_keep_ordinary_approval_when_auto_allow_is_on() {
     ] {
         let fixture = SandboxFixture::new(sandbox.clone());
         let folder = fixture.workspace.folder.clone().unwrap();
-        std::fs::write(folder.join("Makefile"), "all:\n\tprintf built > out.txt\n").unwrap();
+        std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
         let (agent, chat) = fixture.agent(input, ExecutionMode::Auto).await;
-        let blocking_reviewer = Arc::new(ScriptedModel::new(vec![
-            text(&tickloop_harness::test_support::auto_classification(true).to_string()),
-            text(&tickloop_harness::test_support::auto_classification(true).to_string()),
-        ]));
+        let blocking_reviewer = blocking_reviewer();
         agent.set_auto_reviewer(blocking_reviewer.clone()).await;
         let (asked, result) = fixture.run_with_human_approval(&agent, chat, false).await;
         assert!(!asked, "{sandbox}");
@@ -1272,7 +1268,7 @@ async fn unsandboxed_routes_keep_ordinary_approval_when_auto_allow_is_on() {
             "{sandbox}"
         );
         assert!(result.is_error, "{sandbox}: {result:?}");
-        assert!(!folder.join("out.txt").exists(), "{sandbox}");
+        assert!(!folder.join("build/out.txt").exists(), "{sandbox}");
     }
 }
 
@@ -1308,11 +1304,7 @@ async fn live_model_runs_an_ordinary_build_in_the_sandbox_without_review() {
     let fixture =
         SandboxFixture::new(serde_json::json!({"enabled":true, "failIfUnavailable":true}));
     let folder = fixture.workspace.folder.clone().unwrap();
-    std::fs::write(
-        folder.join("Makefile"),
-        "build/out.txt:\n\tmkdir -p build\n\tprintf built > build/out.txt\n",
-    )
-    .unwrap();
+    std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
     let (agent, chat) = fixture
         .agent_with_model(model, model_config, ExecutionMode::Auto)
         .await;

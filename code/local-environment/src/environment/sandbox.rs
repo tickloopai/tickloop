@@ -16,7 +16,7 @@ pub(super) struct PreparedSandbox {
     pub isolation: ExecutionIsolation,
     pub warning: Option<String>,
     pub requires_approval: bool,
-    pub auto_approval: bool,
+    pub skips_approval_when_isolated: bool,
     pub escape_guidance: bool,
 }
 
@@ -55,7 +55,7 @@ pub(super) async fn prepare(
         });
     }
     let escape_guidance = config.allow_unsandboxed_commands;
-    let auto_approval = config.auto_allow_bash_if_sandboxed;
+    let skips_approval_when_isolated = config.auto_allow_bash_if_sandboxed;
     let settings = settings.clone();
     let spec = spec.clone();
     let policy = tokio::task::spawn_blocking(move || prepare_policy(&settings, &spec, &config))
@@ -69,7 +69,7 @@ pub(super) async fn prepare(
         },
         warning: None,
         requires_approval: false,
-        auto_approval,
+        skips_approval_when_isolated,
         escape_guidance,
     })
 }
