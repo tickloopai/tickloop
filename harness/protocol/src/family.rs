@@ -190,6 +190,11 @@ pub struct FamilyCompletion {
     pub triggering_message_ids: Vec<Uuid>,
     pub notification: SubagentNotificationDelivery,
     pub usage: Usage,
+    /// The total tokens of the run's last request, its whole input, cached or not, and its
+    /// output, as the Subagent result reports them; completions recorded before it was kept
+    /// have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
     /// How the run ended; completions recorded before it was kept have none, and their `state`
     /// stands for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

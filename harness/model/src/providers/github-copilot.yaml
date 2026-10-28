@@ -15,6 +15,9 @@ api_key_env: ""
 endpoints:
   messages: "https://api.individual.githubcopilot.com"
   responses: "https://api.individual.githubcopilot.com"
+# Claude on /v1/messages gets the same cache_control breakpoints as the Anthropic API
+# (harness/model/src/prompt_cache.rs); the Responses models never receive them.
+prompt_cache: "anthropic"
 # Claude models spend more tokens than o200k_base counts: Opus 5.5 conversation 1.56 and a first
 # request's system prompt and tools 1.72, Sonnet 5.5 conversation 1.50. /context starts from this
 # ratio and refines it from each Chat's own requests.

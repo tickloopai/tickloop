@@ -214,7 +214,7 @@ pub(super) fn child_run_result(
             "handle":registration.handle,"description":registration.description,"created_at":registration.created_at,
             "child_loop_id":ids.model_text(completion.child_loop_id),"child_run_id":ids.model_text(completion.child_run_id),"parent_chat_id":ids.model_text(parent_chat),
             "status":status.label(),"child_state":format!("{:?}", completion.state).to_lowercase(),"result":completion.result,"error":completion.error,
-            "usage":completion.usage}).to_string(),
+            "usage":completion.usage,"total_tokens":completion.total_tokens}).to_string(),
         is_error: status != ChildRunStatus::Completed,
         output_ref: None,
     })
@@ -277,7 +277,8 @@ pub(super) fn child_run_result_from_events(
             "handle":registration?.handle,"description":registration?.description,"created_at":registration?.created_at,
             "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),"parent_chat_id":ids.model_text(parent.chat_id),
             "status":status.label(),"child_state":format!("{:?}", chat_loop.state).to_lowercase(),"result":text,"error":error,
-            "usage":snapshot.request_usage.run_conversation_usage(child.run_id).unwrap_or_default()}).to_string(),
+            "usage":snapshot.request_usage.run_conversation_usage(child.run_id).unwrap_or_default(),
+            "total_tokens":snapshot.request_usage.run_final_total_tokens(child.run_id)}).to_string(),
         is_error:status != ChildRunStatus::Completed, output_ref:None,
     })
 }

@@ -1056,10 +1056,15 @@ fn subagent_result_lines(
         lines.extend(indented(&report.report));
     }
     if status == Some("completed") {
-        let tokens = ["input_tokens", "output_tokens"]
-            .iter()
-            .filter_map(|key| value["usage"][*key].as_u64())
-            .sum::<u64>();
+        // Claude Code shows the last request's whole input, cached or not, and its output;
+        // results recorded before `total_tokens` was kept fall back to the run's input and
+        // output.
+        let tokens = value["total_tokens"].as_u64().unwrap_or_else(|| {
+            ["input_tokens", "output_tokens"]
+                .iter()
+                .filter_map(|key| value["usage"][*key].as_u64())
+                .sum()
+        });
         let details = [
             (tokens > 0).then(|| format!("{} tokens", compact_count(tokens))),
             elapsed_ms.map(compact_duration),
@@ -4152,6 +4157,35 @@ mod tests {
             "a genuine protocol-shaped user prompt remains a prompt"
         );
         assert!(archive.contains(&forged));
+    }
+
+    #[test]
+    fn a_completed_subagent_counts_its_cached_input_in_its_tokens() {
+        let done_line = |value: Value| {
+            subagent_result_lines(None, &value, Some(4_000), None)
+                .last()
+                .unwrap()
+                .spans
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>()
+        };
+        let messages_usage = json!({"input_tokens":40,"output_tokens":2_000,"cache_read_input_tokens":90_000,"cache_write_input_tokens":8_000});
+        assert_eq!(
+            done_line(json!({"status":"completed","usage":messages_usage,"total_tokens":100_040})),
+            "Done (100k tokens · 4s)"
+        );
+        let responses_usage =
+            json!({"input_tokens":98_000,"output_tokens":2_000,"cache_read_input_tokens":90_000});
+        assert_eq!(
+            done_line(json!({"status":"completed","usage":responses_usage,"total_tokens":100_000})),
+            "Done (100k tokens · 4s)"
+        );
+        assert_eq!(
+            done_line(json!({"status":"completed","usage":responses_usage})),
+            "Done (100k tokens · 4s)",
+            "a result recorded without its total"
+        );
     }
 
     #[test]
