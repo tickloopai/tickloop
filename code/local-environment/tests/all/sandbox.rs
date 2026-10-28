@@ -13,6 +13,8 @@ use tickloop_harness::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "sandbox/defaults.rs"]
+mod defaults;
 #[path = "sandbox/network.rs"]
 mod network;
 #[path = "sandbox/review_fixes.rs"]
@@ -337,7 +339,7 @@ async fn unsandboxed_settings_control_explicit_and_excluded_commands() {
         (
             serde_json::json!({"enabled":true,"failIfUnavailable":true,"excludedCommands":["printf approved > ../outside"],"allowUnsandboxedCommands":false}),
             false,
-            false,
+            true,
         ),
         (
             serde_json::json!({"enabled":true,"failIfUnavailable":true,"excludedCommands":["unrelated:* "]}),
@@ -773,6 +775,7 @@ async fn unsandboxed_auto_calls_are_reviewed_even_for_normally_safe_commands() {
             for block in [false, true] {
                 let fixture = SandboxFixture::new(serde_json::json!({
                     "enabled":true, "failIfUnavailable":true,
+                    "allowUnsandboxedCommands": !excluded,
                     "excludedCommands": if excluded {vec![command]} else {vec![]}
                 }));
                 let (agent, chat) = fixture
