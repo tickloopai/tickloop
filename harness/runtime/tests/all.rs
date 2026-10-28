@@ -64,6 +64,8 @@ mod model_image_capability;
 mod model_live;
 #[path = "all/model_stream_replay.rs"]
 mod model_stream_replay;
+#[path = "all/prompt_cache_wire.rs"]
+mod prompt_cache_wire;
 
 #[path = "all/output_limit_recovery.rs"]
 mod output_limit_recovery;

@@ -327,13 +327,13 @@ impl Agent {
                             .entries()
                             .iter()
                             .find(|record| record.sequence == sequence)
-                            .map_or(0, |record| crate::goal::charged_tokens(&record.usage));
+                            .map_or(0, crate::goal::charged_tokens);
                         let effect = ledger.observe(sequence, usage)?;
                         let current = ledger
                             .entries()
                             .iter()
                             .find(|record| record.sequence == sequence)
-                            .map_or(0, |record| crate::goal::charged_tokens(&record.usage));
+                            .map_or(0, crate::goal::charged_tokens);
                         Ok((effect, current.saturating_sub(previous)))
                     })
                     .await?;

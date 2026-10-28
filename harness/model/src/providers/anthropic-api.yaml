@@ -10,6 +10,8 @@ auth: "api_key_env"
 api_key_env: "ANTHROPIC_API_KEY"
 endpoints:
   messages: "https://api.anthropic.com"
+# Explicit cache_control breakpoints (harness/model/src/prompt_cache.rs).
+prompt_cache: "anthropic"
 selection:
   auxiliary_model: claude-haiku-5-5
   series:

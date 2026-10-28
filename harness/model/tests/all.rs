@@ -24,6 +24,8 @@ mod model_usage_observations;
 mod native_tool_search;
 #[path = "all/openai_models.rs"]
 mod openai_models;
+#[path = "all/prompt_cache.rs"]
+mod prompt_cache;
 #[path = "all/provider_expansion.rs"]
 mod provider_expansion;
 
