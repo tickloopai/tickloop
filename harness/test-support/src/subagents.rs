@@ -90,6 +90,7 @@ impl ModelClient for SubagentTimingModel {
                 output_tokens: Some(7),
                 cache_read_input_tokens: Some(3),
                 cache_write_input_tokens: None,
+                reasoning_output_tokens: None,
             };
         }
         Ok(output)

@@ -363,6 +363,7 @@ async fn cache_reads_and_writes_reach_the_usage_from_start_and_delta() {
             output_tokens: Some(25),
             cache_read_input_tokens: Some(1_200),
             cache_write_input_tokens: Some(60),
+            reasoning_output_tokens: None,
         }
     );
     assert_eq!(
@@ -372,6 +373,26 @@ async fn cache_reads_and_writes_reach_the_usage_from_start_and_delta() {
             output_tokens: Some(9),
             cache_read_input_tokens: Some(1_260),
             cache_write_input_tokens: Some(30),
+            reasoning_output_tokens: None,
         }
     );
+}
+
+#[test]
+fn claude_models_start_from_their_measured_token_ratio() {
+    let catalog = ModelCatalog::defaults();
+    for profile in catalog.profiles() {
+        let is_claude = profile.adapter() == tickloop_harness_protocol::Adapter::Messages
+            && matches!(
+                profile.provider_id.as_str(),
+                "anthropic-api" | "github-copilot"
+            );
+        assert_eq!(
+            cards::context_token_ratio(&profile),
+            is_claude.then_some(1.6),
+            "{}/{}",
+            profile.provider_id,
+            profile.model_id
+        );
+    }
 }

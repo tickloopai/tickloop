@@ -175,6 +175,7 @@ fn usage(tokens: u64) -> Usage {
         output_tokens: Some(0),
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
+        reasoning_output_tokens: None,
     }
 }
 

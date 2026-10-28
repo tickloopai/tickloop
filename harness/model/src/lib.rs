@@ -2301,6 +2301,18 @@ fn observe_usage(
             failure.get_or_insert_with(|| invalid_response("usage details are not an object"));
         }
     }
+    let (output_details_name, reasoning_name) = match protocol {
+        Protocol::Messages => ("output_tokens_details", "thinking_tokens"),
+        Protocol::ChatCompletions => ("completion_tokens_details", "reasoning_tokens"),
+        Protocol::Responses | Protocol::Google | Protocol::SystemOne => {
+            ("output_tokens_details", "reasoning_tokens")
+        }
+    };
+    // Only `/context` reads it, so a detail the service shapes otherwise never fails a response.
+    observation.reasoning_output_tokens = value
+        .get(output_details_name)
+        .and_then(|details| details.get(reasoning_name))
+        .and_then(Value::as_u64);
     let mut has_observation = false;
     for (target, observed) in [
         (&mut usage.input_tokens, observation.input_tokens),
@@ -2322,6 +2334,10 @@ fn observe_usage(
             *target = Some(observed);
             has_observation = true;
         }
+    }
+    if let Some(reasoning) = observation.reasoning_output_tokens {
+        usage.reasoning_output_tokens = Some(reasoning);
+        has_observation = true;
     }
     if has_observation && let Some(events) = events {
         // Report validated fields before a protocol failure so the host can retain them.
@@ -2466,6 +2482,7 @@ pub fn fixture_title(request: ModelRequest) -> ModelOutput {
             output_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: None,
         },
         stop_reason: "end_turn".into(),
     }

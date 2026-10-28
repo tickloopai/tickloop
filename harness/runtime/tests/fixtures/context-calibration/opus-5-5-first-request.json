@@ -1,0 +1,4 @@
+{"source":"Claude Opus 5.5 over Messages, one request (2026-10-28, the /context report of 17.6k not itemized); the system prompt and tools are those GPT-6.1 Sol requests carried the same day from the same folder.","protocol":"messages","system_prompt_tokens":24160,"reported_total":42009,"messages":[
+{"r":"u","b":[["text",1]]},
+{"r":"u","b":[["text",203]]},
+{"r":"a","b":[["thinking",0],["text",55]],"u":[41867,142,0,0]}]}

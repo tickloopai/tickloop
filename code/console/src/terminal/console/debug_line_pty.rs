@@ -26,6 +26,7 @@ fn debug_line_pty_fixture() {
                                 output_tokens: Some(40),
                                 cache_read_input_tokens: Some(1_000),
                                 cache_write_input_tokens: Some(200),
+                                reasoning_output_tokens: None,
                             }],
                         ));
                     let core =

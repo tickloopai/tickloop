@@ -356,6 +356,26 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_input_tokens: Option<u64>,
+    /// The part of `output_tokens` the model spent reasoning, when the service reports it.
+    /// Absent from usage recorded before it was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// The whole input of the request, in the service's tokens. Messages reports the input it
+    /// read from and wrote to the prompt cache apart from `input_tokens`; the other protocols
+    /// count cached input within it.
+    pub fn context_input_tokens(&self, protocol: Protocol) -> Option<u64> {
+        let input = self.input_tokens?;
+        Some(if protocol == Protocol::Messages {
+            input
+                .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+                .saturating_add(self.cache_write_input_tokens.unwrap_or(0))
+        } else {
+            input
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -93,8 +93,9 @@ use tickloop_harness::protocol::{
 /// during a Chat.
 /// 34.1 adds the prompt cache break a request caused to its request usage record, and to the
 /// Loop how many Runs it started and how many times the Chat was compacted.
+/// 34.2 adds the reasoning tokens a response reported to its usage.
 pub const PROTOCOL_MAJOR: u16 = 34;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

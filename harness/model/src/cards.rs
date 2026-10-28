@@ -34,6 +34,11 @@ pub struct ProviderDefinition {
     /// Only the bundled catalog sets it, so a Provider added in settings never receives them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache: Option<crate::prompt_cache::PromptCache>,
+    /// Service tokens per `o200k_base` token for the Provider's models on each adapter whose
+    /// tokenizer differs from it: where `/context` starts before a Chat's own requests measure
+    /// the ratio. Only the bundled catalog sets it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_token_ratios: BTreeMap<Adapter, f64>,
     pub models: Vec<ModelCard>,
 }
 
@@ -185,6 +190,13 @@ impl ModelCatalog {
                 return Err(format!(
                     "{location}.prompt_cache: requires a model on the Messages adapter"
                 ));
+            }
+            for (adapter, ratio) in &provider.context_token_ratios {
+                if !ratio.is_finite() || *ratio <= 0.0 {
+                    return Err(format!(
+                        "{location}.context_token_ratios.{adapter:?}: must be a positive number"
+                    ));
+                }
             }
             let mut env_chars = provider.api_key_env.chars();
             let credentialless_loopback = provider.api_key_env.is_empty()
@@ -440,6 +452,7 @@ impl ModelCatalog {
                         format!("{location}.endpoints: required for new provider")
                     })?,
                     prompt_cache: None,
+                    context_token_ratios: BTreeMap::new(),
                     models,
                 });
             }
@@ -514,6 +527,14 @@ pub fn prompt_cache(config: &ModelConfig) -> Option<crate::prompt_cache::PromptC
         return None;
     }
     bundled_provider(&config.provider_id)?.prompt_cache
+}
+
+/// Service tokens per `o200k_base` token that `config`'s bundled Provider gives for its adapter.
+pub fn context_token_ratio(config: &ModelConfig) -> Option<f64> {
+    bundled_provider(&config.provider_id)?
+        .context_token_ratios
+        .get(&config.adapter())
+        .copied()
 }
 
 pub fn provider_group(provider_id: &str) -> Option<&'static str> {

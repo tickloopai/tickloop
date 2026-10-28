@@ -23,6 +23,7 @@ fn custom_provider(id: &str) -> ProviderDefinition {
         api_key_env: "GATEWAY_API_KEY".into(),
         endpoints: BTreeMap::from([(Adapter::Responses, "http://127.0.0.1:3001".into())]),
         prompt_cache: None,
+        context_token_ratios: Default::default(),
         models: vec![ModelCard {
             id: "assistant".into(),
             display_name: "Gateway Assistant".into(),

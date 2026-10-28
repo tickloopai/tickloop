@@ -9569,6 +9569,7 @@ mod tests {
                     output_tokens: None,
                     cache_read_input_tokens: Some(2_000),
                     cache_write_input_tokens: Some(500),
+                    reasoning_output_tokens: None,
                 },
             )
             .unwrap();

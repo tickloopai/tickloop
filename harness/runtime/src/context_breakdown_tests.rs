@@ -20,6 +20,10 @@ impl ContextTokenCounter for WordCounter {
     fn text_tokens(&self, text: &str) -> usize {
         text.split_whitespace().count()
     }
+
+    fn protocol_data_tokens(&self, protocol: Protocol, value: &Value) -> usize {
+        context_tokens::protocol_record_tokens(self, protocol, value)
+    }
 }
 
 fn message(role: Role, content: Vec<Content>) -> Message {
@@ -41,6 +45,9 @@ fn definition(name: &str, description: &str) -> ToolDefinition {
 fn parts(messages: Vec<Message>, search: Option<SearchParts>) -> ContextParts {
     ContextParts {
         message_labels: vec![None; messages.len()],
+        message_usage: vec![None; messages.len()],
+        protocol: Protocol::Responses,
+        prior_token_ratio: None,
         system_prompt: message(Role::System, vec![text("one two three four")]),
         system_tools: vec![definition("Read", "reads files")],
         skill_tool: Some(definition("Skill", "- alpha [project]: helps")),
@@ -900,4 +907,448 @@ async fn the_autocompact_buffer_ends_where_compaction_starts_under_the_window_ca
         );
         agent.shutdown().await;
     }
+}
+
+fn words(count: usize) -> String {
+    vec!["w"; count].join(" ")
+}
+
+fn response_usage(output: u64, reasoning: Option<u64>) -> Option<Usage> {
+    Some(Usage {
+        output_tokens: Some(output),
+        reasoning_output_tokens: reasoning,
+        ..Usage::default()
+    })
+}
+
+fn with_usage(mut parts: ContextParts, usage: Vec<(usize, Option<Usage>)>) -> ContextParts {
+    for (index, usage) in usage {
+        parts.message_usage[index] = usage;
+    }
+    parts
+}
+
+#[test]
+fn sealed_reasoning_counts_as_the_reasoning_its_response_reported_never_as_its_payload() {
+    let reasoning = Content::ProtocolData {
+        protocol: Protocol::Responses,
+        value: json!({"type": "reasoning", "encrypted_content": words(500), "summary": []}),
+    };
+    let messages = vec![
+        message(Role::User, vec![text("go")]),
+        message(Role::Assistant, vec![reasoning, text("done here")]),
+    ];
+    let assistant = |usage: Option<Usage>| {
+        let breakdown =
+            with_usage(parts(messages.clone(), None), vec![(1, usage)]).count(&WordCounter);
+        item_tokens(&breakdown.messages, ASSISTANT_MESSAGES)
+    };
+    assert_eq!(assistant(response_usage(42, Some(40))), 3 + 2 + 40);
+    assert_eq!(
+        assistant(response_usage(42, None)),
+        3 + 2 + 40,
+        "usage recorded before reasoning was reported: the output beside the visible part"
+    );
+    assert_eq!(
+        assistant(None),
+        3 + 2,
+        "another model's response: only readable reasoning counts"
+    );
+}
+
+#[test]
+fn tickloops_own_record_fields_never_count() {
+    let origin = words(30);
+    let messages = vec![message(
+        Role::Assistant,
+        vec![
+            Content::ProtocolData {
+                protocol: Protocol::Responses,
+                value: json!({
+                    "type": "_tickloop_assistant_phase",
+                    "phase": "commentary",
+                    "_tickloop_codex_origin": origin,
+                }),
+            },
+            text("checking now"),
+            Content::ProtocolData {
+                protocol: Protocol::Responses,
+                value: json!({"type": "record", "detail": "kept", "_tickloop_codex_origin": origin}),
+            },
+        ],
+    )];
+    let breakdown = parts(messages, None).count(&WordCounter);
+    assert_eq!(
+        item_tokens(&breakdown.messages, ASSISTANT_MESSAGES),
+        3 + 1 + 2 + 1,
+        "the phase as sent, the text and the record without the origin"
+    );
+}
+
+#[test]
+fn omitted_thinking_counts_as_the_thinking_its_response_reported() {
+    let messages = vec![
+        message(Role::User, vec![text("read it")]),
+        message(
+            Role::Assistant,
+            vec![
+                Content::Thinking {
+                    thinking: String::new(),
+                    signature: Some("sealed".into()),
+                },
+                Content::ToolUse {
+                    id: "call".into(),
+                    name: "Read".into(),
+                    input: json!("a b"),
+                },
+            ],
+        ),
+    ];
+    let assistant = |usage: Option<Usage>| {
+        let mut claude = with_usage(parts(messages.clone(), None), vec![(1, usage)]);
+        claude.protocol = Protocol::Messages;
+        claude.prior_token_ratio = Some(1.5);
+        item_tokens(&claude.count(&WordCounter).messages, ASSISTANT_MESSAGES)
+    };
+    assert_eq!(
+        assistant(response_usage(333, Some(300))),
+        3 + 3 + 200,
+        "the service's 300 thinking tokens at its 1.5 tokens per counted token"
+    );
+    assert_eq!(assistant(response_usage(333, None)), 3 + 3 + (222 - 3));
+}
+
+/// A conversation of `rounds` exchanges whose service counts `ratio` tokens for each counted
+/// one: every request's input is the scaled count of what it sends, every response's output the
+/// scaled count of the message it wrote.
+fn measured_conversation(rounds: usize, user_words: usize, ratio: f64) -> ContextParts {
+    let scaled = |tokens: u64| (tokens as f64 * ratio).round() as u64;
+    let mut messages = Vec::new();
+    let mut usage = Vec::new();
+    for round in 0..rounds {
+        messages.push(message(Role::User, vec![text(&words(user_words))]));
+        let input = scaled(
+            parts(messages.clone(), None)
+                .count(&WordCounter)
+                .used_tokens,
+        );
+        let answer = message(Role::Assistant, vec![text(&words(20 + round))]);
+        let output = scaled(WordCounter.message_tokens(&answer) as u64);
+        messages.push(answer);
+        usage.push((
+            messages.len() - 1,
+            Some(Usage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                ..Usage::default()
+            }),
+        ));
+    }
+    let (last_input, last_output) = usage
+        .last()
+        .and_then(|(_, usage)| usage.as_ref())
+        .map(|usage| (usage.input_tokens.unwrap(), usage.output_tokens.unwrap()))
+        .unwrap();
+    let mut parts = with_usage(parts(messages, None), usage);
+    parts.window = Some(100_000);
+    parts.compaction_trigger = None;
+    parts.reported_total = Some(last_input + last_output);
+    parts
+}
+
+#[test]
+fn a_service_tokenizer_measured_from_consecutive_responses_scales_every_category() {
+    let conversation = measured_conversation(5, 1_500, 1.56);
+    let counted = {
+        let mut uncalibrated = measured_conversation(5, 1_500, 1.56);
+        uncalibrated.reported_total = None;
+        uncalibrated.count(&WordCounter)
+    };
+    let reported = conversation.reported_total.unwrap();
+    assert!(
+        reported > counted.used_tokens * 150 / 100,
+        "beyond the 15% the count alone explains"
+    );
+    let breakdown = conversation.count(&WordCounter);
+    assert_eq!(breakdown.used_tokens, reported);
+    assert_eq!(category_sum(&breakdown), reported);
+    assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    for category_name in [ContextCategory::SystemPrompt, ContextCategory::Messages] {
+        let scaled = category(&counted, category_name) as f64 * 1.56;
+        let calibrated = category(&breakdown, category_name) as f64;
+        assert!(
+            (calibrated - scaled).abs() <= scaled * 0.01 + 1.0,
+            "{category_name:?}: {calibrated} against {scaled}"
+        );
+    }
+}
+
+#[test]
+fn a_tokenizer_matching_the_count_keeps_the_calibration_it_had() {
+    let conversation = measured_conversation(5, 1_500, 1.0);
+    let reported = conversation.reported_total.unwrap();
+    let breakdown = conversation.count(&WordCounter);
+    let mut uncalibrated = measured_conversation(5, 1_500, 1.0);
+    uncalibrated.reported_total = None;
+    let counted = uncalibrated.count(&WordCounter);
+    assert_eq!(breakdown.used_tokens, reported);
+    assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    assert_eq!(breakdown.categories, counted.categories, "{reported}");
+}
+
+#[test]
+fn what_the_measured_ratio_cannot_explain_still_stands_apart() {
+    let mut conversation = measured_conversation(5, 1_500, 1.0);
+    let reported = conversation.reported_total.unwrap() + 3_000;
+    conversation.reported_total = Some(reported);
+    conversation.prior_token_ratio = Some(1.6);
+    let breakdown = conversation.count(&WordCounter);
+    assert_eq!(breakdown.used_tokens, reported);
+    assert_eq!(
+        category(&breakdown, ContextCategory::Unattributed),
+        3_000,
+        "the Chat measured ratio one, outweighing the catalog's starting ratio"
+    );
+}
+
+#[test]
+fn before_a_chat_measures_its_ratio_the_catalogs_explains_its_first_request() {
+    let mut first = parts(vec![message(Role::User, vec![text(&words(200))])], None);
+    let counted = first.count_uncalibrated();
+    first.prior_token_ratio = Some(1.6);
+    first.reported_total = Some(counted * 17 / 10);
+    let breakdown = first.count(&WordCounter);
+    assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    assert_eq!(category_sum(&breakdown), counted * 17 / 10);
+}
+
+impl ContextParts {
+    fn count_uncalibrated(&self) -> u64 {
+        ContextParts {
+            system_prompt: self.system_prompt.clone(),
+            system_tools: self.system_tools.clone(),
+            skill_tool: self.skill_tool.clone(),
+            skills: self.skills.clone(),
+            mcp_tools: self.mcp_tools.clone(),
+            user_context: self.user_context.clone(),
+            instruction_files: self.instruction_files.clone(),
+            messages: self.messages.clone(),
+            message_labels: self.message_labels.clone(),
+            message_usage: self.message_usage.clone(),
+            protocol: self.protocol,
+            prior_token_ratio: self.prior_token_ratio,
+            search: None,
+            window: self.window,
+            compaction_trigger: self.compaction_trigger,
+            reported_total: None,
+        }
+        .count(&WordCounter)
+        .used_tokens
+    }
+}
+
+/// Token counts of a real Chat, with every block's text replaced by as many words as
+/// `o200k_base` counted for it and the usage each response reported, made with
+/// `/context` regression in mind.
+#[derive(serde::Deserialize)]
+struct CalibrationFixture {
+    source: String,
+    protocol: Protocol,
+    system_prompt_tokens: usize,
+    reported_total: u64,
+    messages: Vec<FixtureMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct FixtureMessage {
+    #[serde(rename = "r")]
+    role: String,
+    #[serde(rename = "b")]
+    blocks: Vec<(String, usize)>,
+    /// Input, output, cache read and cache write tokens of the response of the Chat's model.
+    #[serde(rename = "u", default)]
+    usage: Option<[Option<u64>; 4]>,
+}
+
+fn fixture_parts(fixture: &str) -> (ContextParts, String) {
+    let fixture: CalibrationFixture = serde_json::from_str(fixture).unwrap();
+    let block = |kind: &str, tokens: usize| match kind {
+        "text" => text(&words(tokens)),
+        "tool_use" => Content::ToolUse {
+            id: "call".into(),
+            name: "Tool".into(),
+            input: json!(words(tokens.saturating_sub(1))),
+        },
+        "tool_result" => Content::ToolResult {
+            tool_use_id: "call".into(),
+            content: tickloop_harness_protocol::ToolResultContent::Text(words(tokens)),
+            is_error: false,
+        },
+        "thinking" => Content::Thinking {
+            thinking: words(tokens),
+            signature: Some("sealed".into()),
+        },
+        "reasoning" => Content::ProtocolData {
+            protocol: Protocol::Responses,
+            value: json!({"type": "reasoning", "encrypted_content": words(tokens)}),
+        },
+        _ => Content::ProtocolData {
+            protocol: fixture.protocol,
+            value: json!({"type": "record", "text": words(tokens)}),
+        },
+    };
+    let messages = fixture
+        .messages
+        .iter()
+        .map(|entry| {
+            message(
+                if entry.role == "a" {
+                    Role::Assistant
+                } else {
+                    Role::User
+                },
+                entry
+                    .blocks
+                    .iter()
+                    .map(|(kind, tokens)| block(kind, *tokens))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let parts = ContextParts {
+        system_prompt: message(
+            Role::System,
+            vec![text(&words(fixture.system_prompt_tokens - 3))],
+        ),
+        system_tools: Vec::new(),
+        skill_tool: None,
+        skills: Vec::new(),
+        mcp_tools: Vec::new(),
+        user_context: message(Role::User, Vec::new()),
+        instruction_files: Vec::new(),
+        message_labels: vec![None; messages.len()],
+        message_usage: fixture
+            .messages
+            .iter()
+            .map(|entry| {
+                entry
+                    .usage
+                    .map(|[input, output, cache_read, cache_write]| Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_read_input_tokens: cache_read,
+                        cache_write_input_tokens: cache_write,
+                        reasoning_output_tokens: None,
+                    })
+            })
+            .collect(),
+        messages,
+        protocol: fixture.protocol,
+        prior_token_ratio: (fixture.protocol == Protocol::Messages).then_some(1.6),
+        search: None,
+        window: Some(1_000_000),
+        compaction_trigger: None,
+        reported_total: Some(fixture.reported_total),
+    };
+    (parts, fixture.source)
+}
+
+#[test]
+fn real_claude_chats_leave_no_large_share_unitemized() {
+    for fixture in [
+        include_str!("../tests/fixtures/context-calibration/opus-5-5-long.json"),
+        include_str!("../tests/fixtures/context-calibration/opus-5-5-first-request.json"),
+    ] {
+        let (parts, source) = fixture_parts(fixture);
+        let reported = parts.reported_total.unwrap();
+        let counted = parts.count_uncalibrated();
+        assert!(
+            reported > counted * 115 / 100,
+            "{source}: the count alone leaves {} unexplained",
+            reported - counted
+        );
+        let breakdown = parts.count(&WordCounter);
+        assert_eq!(breakdown.used_tokens, reported, "{source}");
+        assert_eq!(
+            category(&breakdown, ContextCategory::Unattributed),
+            0,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_real_sol_chat_keeps_its_total_and_counts_reasoning_by_its_tokens() {
+    let (parts, source) = fixture_parts(include_str!(
+        "../tests/fixtures/context-calibration/gpt-6-1-sol.json"
+    ));
+    let reported = parts.reported_total.unwrap();
+    let ratio = parts.token_ratio(&WordCounter);
+    assert!((0.98..=1.05).contains(&ratio), "{source}: ratio {ratio}");
+    let breakdown = parts.count(&WordCounter);
+    assert_eq!(breakdown.used_tokens, reported, "{source}");
+    assert_eq!(category_sum(&breakdown), reported, "{source}");
+    assert_eq!(
+        category(&breakdown, ContextCategory::Unattributed),
+        0,
+        "{source}"
+    );
+}
+
+/// Omitted thinking counts by the usage its response recorded, and only for responses of the
+/// model the Chat uses now: another model's reasoning is not what this one reads.
+#[tokio::test]
+async fn a_chats_responses_count_their_reasoning_by_their_recorded_usage() {
+    use tickloop_harness_model::ModelConfigExt;
+    let (agent, chat_id, _directory) = agent_with_catalog().await;
+    let mut chats = agent.inner.chats.lock().await;
+    let chat = chats.get_mut(&chat_id).unwrap();
+    let current = chat.snapshot.model.identity();
+    let mut previous = current.clone();
+    previous.requested_model = "earlier-model".into();
+    for (model, answer) in [(previous, "first answer"), (current, "second answer")] {
+        push(chat, Role::User, "question", None);
+        let index = chat.snapshot.messages.len();
+        chat.snapshot.messages.push(message(
+            Role::Assistant,
+            vec![
+                Content::Thinking {
+                    thinking: String::new(),
+                    signature: Some("sealed".into()),
+                },
+                text(answer),
+            ],
+        ));
+        chat.snapshot
+            .message_ids
+            .insert(index, tickloop_ids::generate());
+        chat.snapshot.message_models.insert(index, model);
+        if let Some(source) = chat.snapshot.model.private_history_source() {
+            chat.snapshot.message_sources.insert(index, source);
+        }
+        chat.snapshot
+            .message_usage
+            .insert(index, response_usage(52, Some(50)).unwrap());
+    }
+    let chat = chats.get(&chat_id).unwrap();
+    let breakdown = agent
+        .context_parts(chat, &[], "2026-10-28")
+        .unwrap()
+        .count(&WordCounter);
+    drop(chats);
+    assert_eq!(
+        item_tokens(&breakdown.messages, ASSISTANT_MESSAGES),
+        (3 + 2) + (3 + 2 + 50)
+    );
+    agent.shutdown().await;
+}
+
+#[test]
+fn an_uncalibrated_count_stands_whole_whatever_ratio_the_chat_measured() {
+    let mut conversation = measured_conversation(5, 1_500, 0.6);
+    conversation.reported_total = None;
+    let breakdown = conversation.count(&WordCounter);
+    assert!(!breakdown.calibrated);
+    assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    assert_eq!(category_sum(&breakdown), breakdown.used_tokens);
 }

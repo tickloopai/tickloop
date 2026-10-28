@@ -116,7 +116,8 @@ async fn native_wire_encodes_images_thinking_schema_and_inclusive_usage() {
             input_tokens: Some(100),
             output_tokens: Some(8),
             cache_read_input_tokens: Some(60),
-            cache_write_input_tokens: None
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: Some(3),
         }
     );
     let (headers, body) = captured.await.unwrap();

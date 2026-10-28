@@ -144,14 +144,7 @@ pub struct CacheBreakNote {
 
 impl RequestUsageRecord {
     pub fn context_input_tokens(&self) -> Option<u64> {
-        let input = self.usage.input_tokens?;
-        Some(if self.model.protocol == Protocol::Messages {
-            input
-                .saturating_add(self.usage.cache_read_input_tokens.unwrap_or(0))
-                .saturating_add(self.usage.cache_write_input_tokens.unwrap_or(0))
-        } else {
-            input
-        })
+        self.usage.context_input_tokens(self.model.protocol)
     }
 
     /// The input the service processed afresh rather than read from its prompt cache. Messages
@@ -420,6 +413,14 @@ impl RequestUsageLedger {
                 }
             }
         }
+        // A detail of the output rather than a billed counter, kept so the record matches the
+        // usage its assistant message carries.
+        if usage.reasoning_output_tokens.is_some()
+            && usage.reasoning_output_tokens != record.usage.reasoning_output_tokens
+        {
+            record.usage.reasoning_output_tokens = usage.reasoning_output_tokens;
+            effect.changed = true;
+        }
         Ok(effect)
     }
 
@@ -563,6 +564,7 @@ impl RequestUsageLedger {
             output_tokens: counters[1].run_total(UsageCounter::Output)?,
             cache_read_input_tokens: counters[2].run_total(UsageCounter::CacheRead)?,
             cache_write_input_tokens: counters[3].run_total(UsageCounter::CacheWrite)?,
+            reasoning_output_tokens: None,
         })
     }
 
@@ -609,6 +611,32 @@ mod tests {
         assert!(wire.get("auxiliary_entries").is_none());
         let restored: RequestUsageLedger = serde_json::from_value(wire).unwrap();
         assert_eq!(restored, ledger);
+    }
+
+    #[test]
+    fn reported_reasoning_rides_on_the_record_and_stays_absent_from_older_usage() {
+        let mut ledger = RequestUsageLedger::new();
+        let sequence = ledger
+            .start(owner(), ModelRequestKind::Conversation, identity())
+            .unwrap();
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(81),
+            reasoning_output_tokens: Some(64),
+            ..Usage::default()
+        };
+        assert!(ledger.observe(sequence, usage.clone()).unwrap().changed);
+        assert_eq!(ledger.entries()[0].usage, usage);
+        let older: Usage =
+            serde_json::from_value(serde_json::json!({"input_tokens": 10, "output_tokens": 81}))
+                .unwrap();
+        assert_eq!(older.reasoning_output_tokens, None);
+        assert!(
+            serde_json::to_value(&older)
+                .unwrap()
+                .get("reasoning_output_tokens")
+                .is_none()
+        );
     }
 
     #[test]
@@ -758,6 +786,7 @@ mod tests {
             output_tokens: Some(0),
             cache_read_input_tokens: Some(20),
             cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
         };
         assert_eq!(
             ledger.observe(sequence, input.clone()).unwrap(),
@@ -790,6 +819,7 @@ mod tests {
                 output_tokens: Some(30),
                 cache_read_input_tokens: Some(20),
                 cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }
         );
     }
@@ -813,6 +843,7 @@ mod tests {
             output_tokens: Some(30),
             cache_read_input_tokens: Some(10),
             cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: None,
         };
         assert_eq!(
             ledger.observe(sequence, regressed.clone()).unwrap(),
@@ -843,6 +874,7 @@ mod tests {
                 output_tokens: Some(30),
                 cache_read_input_tokens: Some(20),
                 cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }
         );
     }
@@ -1111,6 +1143,7 @@ mod tests {
                     output_tokens: Some(5),
                     cache_read_input_tokens: (input_tokens != 20).then_some(3),
                     cache_write_input_tokens: Some(0),
+                    reasoning_output_tokens: None,
                 },
                 RequestOutcome::Accepted,
             );
@@ -1162,6 +1195,7 @@ mod tests {
                 output_tokens: Some(15),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }
         );
     }

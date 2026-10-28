@@ -157,7 +157,8 @@ async fn messages_observations_are_absolute_and_preserve_missing_fields_and_expl
                 input_tokens: Some(10),
                 output_tokens: Some(output_tokens),
                 cache_read_input_tokens: Some(7),
-                cache_write_input_tokens: Some(0)
+                cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }
         );
     }
@@ -298,7 +299,8 @@ async fn malformed_later_message_usage_keeps_previous_values_and_new_valid_field
             input_tokens: Some(10),
             output_tokens: Some(4),
             cache_read_input_tokens: Some(5),
-            cache_write_input_tokens: Some(0)
+            cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: None,
         }
     );
 }
@@ -378,7 +380,8 @@ async fn responses_failure_and_incomplete_envelopes_report_usage_before_typed_fa
                 input_tokens: Some(10),
                 output_tokens: Some(4),
                 cache_read_input_tokens: Some(3),
-                cache_write_input_tokens: Some(0)
+                cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }]
         );
         assert!(!format!("{result:?}").contains("secret-body"));
@@ -452,7 +455,8 @@ async fn chat_finish_rejections_preserve_usage_and_cache_aliases_are_not_added()
                 input_tokens: Some(10),
                 output_tokens: Some(4),
                 cache_read_input_tokens: Some(3),
-                cache_write_input_tokens: Some(0)
+                cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }]
         );
     }
@@ -623,5 +627,47 @@ async fn completed_responses_and_chat_refusals_keep_terminal_usage() {
                 ..Usage::default()
             }]
         );
+    }
+}
+
+#[tokio::test]
+async fn each_protocol_reports_the_reasoning_within_its_output() {
+    let responses = [
+        response_start(),
+        response_terminal(
+            "completed",
+            json!({"input_tokens":10,"output_tokens":81,"output_tokens_details":{"reasoning_tokens":64}}),
+            json!({}),
+        ),
+    ]
+    .concat();
+    let messages = [
+        messages_start(json!({"input_tokens":10,"output_tokens":1})),
+        messages_delta(
+            json!({"output_tokens":81,"output_tokens_details":{"thinking_tokens":64}}),
+            Some("end_turn"),
+        ),
+        event(json!({}), "message_stop"),
+    ]
+    .concat();
+    let chat = format!(
+        "{}data: [DONE]\n\n",
+        chat_chunk(
+            json!({"prompt_tokens":10,"completion_tokens":81,"completion_tokens_details":{"reasoning_tokens":64}}),
+            Some("stop"),
+        )
+    );
+    for (protocol, body) in [
+        (Protocol::Responses, responses),
+        (Protocol::Messages, messages),
+        (Protocol::ChatCompletions, chat),
+    ] {
+        let (result, observations) = complete(protocol, body).await;
+        let usage = observations.last().cloned().unwrap();
+        assert_eq!(usage.output_tokens, Some(81), "{protocol:?}");
+        assert_eq!(usage.reasoning_output_tokens, Some(64), "{protocol:?}");
+        if let Ok(output) = result {
+            assert_eq!(output.usage, usage, "{protocol:?}");
+        }
     }
 }

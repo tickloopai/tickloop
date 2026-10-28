@@ -108,6 +108,7 @@ fn reported_usage() -> Usage {
         output_tokens: Some(4),
         cache_read_input_tokens: Some(0),
         cache_write_input_tokens: None,
+        reasoning_output_tokens: None,
     }
 }
 

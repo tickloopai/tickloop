@@ -135,6 +135,7 @@ async fn immediate_complete_response_wins_over_a_zero_length_deadline() {
         output_tokens: Some(3),
         cache_read_input_tokens: Some(0),
         cache_write_input_tokens: None,
+        reasoning_output_tokens: None,
     };
     let model = Arc::new(RaceModel {
         observations: vec![usage.clone()],
@@ -189,6 +190,7 @@ async fn cancellation_and_timeout_destroy_the_future_before_closing_and_draining
             output_tokens: None,
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
         };
         let model = Arc::new(RaceModel {
             on_drop: Some(usage.clone()),
@@ -292,6 +294,7 @@ async fn queued_usage_regression_takes_precedence_over_local_cancel_or_timeout()
                 output_tokens: Some(20),
                 cache_read_input_tokens: Some(9),
                 cache_write_input_tokens: Some(0),
+                reasoning_output_tokens: None,
             }
         );
         agent.shutdown().await;
