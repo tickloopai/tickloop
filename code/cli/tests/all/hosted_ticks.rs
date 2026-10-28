@@ -3007,9 +3007,35 @@ for line in sys.stdin:
             .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
             .unwrap();
         let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
-        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(
-            Vec::new(),
-        ));
+        use tickloop_harness::test_support::routed::{RoutedModel, has_tool_result, state};
+        use tickloop_harness::test_support::{call, text};
+        // The child's calls, known once the parent's Tick is open.
+        let child_calls = Arc::new(std::sync::OnceLock::<(Value, Value)>::new());
+        // The child runs in the background, so each member's reply follows its own state.
+        let model = Arc::new(RoutedModel::new({
+            let child_calls = child_calls.clone();
+            move |request| {
+                if state(request)["delegation"].is_null() {
+                    return if has_tool_result(request, "delegate") {
+                        text("Delegated.")
+                    } else {
+                        call(
+                            "delegate",
+                            "Subagent",
+                            json!({"task":"Inspect the counter."}),
+                        )
+                    };
+                }
+                let (read, open) = child_calls.get().unwrap();
+                if !has_tool_result(request, "child-read") {
+                    call("child-read", "TickRead", read.clone())
+                } else if !has_tool_result(request, "child-open") {
+                    call("child-open", "TickManage", open.clone())
+                } else {
+                    text("The child is done.")
+                }
+            }
+        }));
         let daemon = Daemon::start_in_herdr(model.clone(), herdr.socket.clone(), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         daemon
@@ -3026,31 +3052,27 @@ for line in sys.stdin:
         let instance = opened["tick_instance_id"].clone();
         let mut child_open = counter_command(&daemon);
         child_open.as_object_mut().unwrap().remove("placement");
-        for reply in [
-            tickloop_harness::test_support::call(
-                "delegate",
-                "Subagent",
-                json!({"task":"Inspect the counter."}),
-            ),
-            tickloop_harness::test_support::call(
-                "child-read",
-                "TickRead",
-                json!({"tick_instance_id":instance}),
-            ),
-            tickloop_harness::test_support::call("child-open", "TickManage", child_open),
-            tickloop_harness::test_support::text("The child is done."),
-            tickloop_harness::test_support::text("Delegated."),
-        ] {
-            model.enqueue(reply);
-        }
+        child_calls
+            .set((json!({"tick_instance_id":instance}), child_open))
+            .unwrap();
         let mut events = runtime.subscribe();
-        let results = run_turn(&runtime, chat, "Delegate the inspection").await;
-        let child = loop {
-            let event = events.try_recv().unwrap();
+        let mut results = run_turn(&runtime, chat, "Delegate the inspection").await;
+        let mut child = None;
+        while !(results.contains_key("child-read") && results.contains_key("child-open")) {
+            let event =
+                tickloop_harness::test_support::next_event_within(&mut events, HOSTED_EVENT_WAIT)
+                    .await;
             if event.chat_id != chat {
-                break event.chat_id;
+                child = Some(event.chat_id);
             }
-        };
+            if let EventKind::ToolCompleted {
+                call_id, result, ..
+            } = event.kind
+            {
+                results.insert(call_id, result);
+            }
+        }
+        let child = child.expect("the child's events arrive");
         assert!(
             !results["delegate"].is_error,
             "{}",

@@ -1378,6 +1378,38 @@ async fn terminal_shows(view: &PtyView, text: &str) {
     .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
 }
 
+/// The host state a model request carries in its system prompt: `delegation` is null for a
+/// root and names the delegating call for a member.
+fn request_state(request: &Value) -> Value {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| {
+            (message["role"] == "system")
+                .then(|| message["content"].as_str())
+                .flatten()
+                .and_then(|text| text.rsplit_once("Current host state: "))
+                .and_then(|(_, state)| serde_json::from_str(state).ok())
+        })
+        .expect("real model host state")
+}
+
+fn has_result(request: &Value, id: &str) -> bool {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["tool_call_id"] == id)
+}
+
+/// The delegating call of the member a request is from; `None` for a root.
+fn delegated_by(request: &Value) -> Option<String> {
+    request_state(request)["delegation"]["parent_call_id"]
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn chat_reply(tool: Option<(&str, &str, Value)>, text: &str) -> String {
     let delta = match &tool {
         Some((name, id, input)) => json!({
@@ -1528,72 +1560,104 @@ async fn run_child_views(fixture: &PrivateFixture) {
     const RAW_CHILD_CONTENT: &str =
         "123e4567-e89b-12d3-a456-426614174000 deadbeef /tmp/a --id deadbeef";
     const FOLLOW_UP: &str = "Continue the same bounded cadence task.";
-    const FIRST_CHILD_RESPONSE_INDEX: usize = 2;
-    const PARENT_RESULT_RESPONSE_INDEX: usize = 6;
-    let replies = vec![
-        chat_reply(
-            Some((
+    const PARENT_DELEGATED: &str = "Parent delegated the cadence task";
+    let (show_child_question, child_question_gate) = tokio::sync::oneshot::channel();
+    let (finish_parent, parent_gate) = tokio::sync::oneshot::channel();
+    let mut child_question_gate = Some(child_question_gate);
+    let mut parent_gate = Some(parent_gate);
+    // The child runs in the background, so replies follow who asks and what has arrived. The
+    // child's first question waits for both Views, and the parent's reply after the launch waits
+    // until the test lets the parent go on, so it stays busy while its child works.
+    let (base_url, mut requests) = model_http_support::serve_router_with_gates(move |request| {
+        let is_review = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .is_some_and(|value| value["operation"].is_object())
+            });
+        if is_review {
+            let verdict = tickloop_harness::test_support::auto_classification(false).to_string();
+            return (chat_reply(None, &verdict), None);
+        }
+        let history = request["messages"].to_string();
+        if delegated_by(request).is_some() {
+            if history.contains(FOLLOW_UP) {
+                return (
+                    chat_reply(
+                        Some((
+                            "SubagentHandback",
+                            "follow-up-report",
+                            json!({"message":"child follow-up acknowledged"}),
+                        )),
+                        "child follow-up acknowledged",
+                    ),
+                    None,
+                );
+            }
+            if !has_result(request, "question-first") {
+                return (
+                    chat_reply(
+                        Some((
+                            "AskUserQuestion",
+                            "question-first",
+                            tickloop_harness::test_support::single_question(
+                                "Which bounded cadence?",
+                            ),
+                        )),
+                        RAW_CHILD_CONTENT,
+                    ),
+                    child_question_gate.take(),
+                );
+            }
+            if !has_result(request, "question-second") {
+                return (
+                    chat_reply(
+                        Some((
+                            "AskUserQuestion",
+                            "question-second",
+                            tickloop_harness::test_support::single_question("Which second window?"),
+                        )),
+                        "",
+                    ),
+                    None,
+                );
+            }
+            return (
+                chat_reply(
+                    Some((
+                        "SubagentHandback",
+                        "child-report",
+                        json!({"message":"child weekly result"}),
+                    )),
+                    "child weekly result",
+                ),
+                None,
+            );
+        }
+        if !has_result(request, "delegate-cli") {
+            let delegate = (
                 "Subagent",
                 "delegate-cli",
                 json!({"task":CHILD_TASK,"name":"cadence","description":CHILD_TASK}),
-            )),
-            "",
-        ),
-        chat_reply(
-            None,
-            &tickloop_harness::test_support::auto_classification(false).to_string(),
-        ),
-        chat_reply(
-            Some((
-                "AskUserQuestion",
-                "question-first",
-                tickloop_harness::test_support::single_question("Which bounded cadence?"),
-            )),
-            RAW_CHILD_CONTENT,
-        ),
-        chat_reply(
-            Some((
-                "AskUserQuestion",
-                "question-second",
-                tickloop_harness::test_support::single_question("Which second window?"),
-            )),
-            "",
-        ),
-        chat_reply(
-            Some((
-                "SubagentHandback",
-                "child-report",
-                json!({"message":"child weekly result"}),
-            )),
-            "child weekly result",
-        ),
-        chat_reply(
-            None,
-            &tickloop_harness::test_support::auto_classification(false).to_string(),
-        ),
-        chat_reply(None, "parent delegated result received"),
-        chat_reply(
-            Some((
-                "SubagentHandback",
-                "follow-up-report",
-                json!({"message":"child follow-up acknowledged"}),
-            )),
-            "child follow-up acknowledged",
-        ),
-        chat_reply(
-            None,
-            &tickloop_harness::test_support::auto_classification(false).to_string(),
-        ),
-        chat_reply(None, "parent processed the follow-up report"),
-    ];
-    let (base_url, mut requests, mut releases) =
-        model_http_support::serve_responses_with_gated_responses(
-            replies.into_iter().map(|reply| (200, reply)).collect(),
-            &[FIRST_CHILD_RESPONSE_INDEX, PARENT_RESULT_RESPONSE_INDEX],
-        )
-        .await;
-    let finish_parent = releases.pop().unwrap();
-    let show_child_question = releases.pop().unwrap();
+            );
+            return (chat_reply(Some(delegate), ""), None);
+        }
+        if history.contains("child follow-up acknowledged") {
+            (
+                chat_reply(None, "parent processed the follow-up report"),
+                None,
+            )
+        } else if history.contains("child weekly result") {
+            (chat_reply(None, "parent delegated result received"), None)
+        } else {
+            (chat_reply(None, PARENT_DELEGATED), parent_gate.take())
+        }
+    })
+    .await;
     let mut model = tickloop_harness::test_support::config();
     model.protocol = tickloop_harness::protocol::Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
@@ -1859,23 +1923,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
         |snapshot| snapshot.questions.is_empty(),
     )
     .await;
-    let mut seen = Vec::new();
-    for _ in 0..=PARENT_RESULT_RESPONSE_INDEX {
-        seen.push(
-            tokio::time::timeout(UI_TIMEOUT, requests.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-        );
-    }
     let parent_running = wait_snapshot(
         &client,
         parent,
-        "parent waits on its model response after receiving the child result",
+        "the child's report waits while the parent waits on its model response",
         |snapshot| {
             snapshot.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Running
-                && snapshot.events.iter().any(|event| matches!(&event.kind,
-                    tickloop_harness::protocol::EventKind::ToolCompleted { call_id, .. } if call_id == "delegate-cli"))
+                && snapshot.conversation.family_completions.len() == 1
         },
     )
     .await;
@@ -2038,7 +2092,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     .await;
     assert_eq!(parent_done.conversation.chat_loop.id, parent_loop);
     assert_ne!(parent_done.conversation.chat_loop.run_id, parent_run);
-    assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains("parent delegated result received"))));
+    assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_harness::protocol::EventKind::Text(text) if text.contains(PARENT_DELEGATED))));
     let shared_fact = second
         .wait_for("shared child fact keeps the second View draft", |frame| {
             frame.contains("child follow-up acknowledged") && frame.contains("CHILD-DRAFT-TWO")
@@ -2114,45 +2168,45 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await
         .unwrap();
     assert!(forbidden.error.unwrap().message.contains("Unsupported"));
-    for _ in 0..3 {
-        seen.push(
-            tokio::time::timeout(UI_TIMEOUT, requests.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-        );
+    let mut seen = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        seen.push(request);
     }
-    assert!(requests.try_recv().is_err());
     assert!(
         seen.iter()
             .all(|(headers, _)| headers.starts_with("POST /chat/completions HTTP/1.1"))
     );
-    assert!(
-        seen[0].1["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["function"]["name"] == "Subagent")
-    );
-    assert!(
-        seen[2].1["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["function"]["name"] == "Subagent")
-    );
-    let follow_up_input = seen[7].1["messages"]
-        .as_array()
-        .unwrap()
+    let offers_subagent = |request: &Value| {
+        request["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "Subagent")
+        })
+    };
+    let conversation = seen
         .iter()
-        .rev()
-        .find(|message| is_user_prompt(message))
-        .unwrap();
-    assert_eq!(
-        follow_up_input["content"].as_str(),
-        Some(FOLLOW_UP),
-        "the real child model request must receive the cleared editor's exact follow-up"
-    );
+        .map(|(_, request)| request)
+        .filter(|request| request["tools"].is_array())
+        .collect::<Vec<_>>();
+    assert!(offers_subagent(conversation[0]), "the parent may delegate");
+    let child_requests = conversation
+        .iter()
+        .filter(|request| delegated_by(request).is_some())
+        .collect::<Vec<_>>();
+    assert!(offers_subagent(child_requests[0]), "the child may delegate");
+    let follow_up_input = child_requests
+        .iter()
+        .find_map(|request| {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|message| is_user_prompt(message))
+                .filter(|message| message["content"].as_str() == Some(FOLLOW_UP))
+        })
+        .expect("the real child model request must receive the cleared editor's exact follow-up");
+    assert_eq!(follow_up_input["content"].as_str(), Some(FOLLOW_UP));
     first.close().await;
     second.close().await;
 }

@@ -107,23 +107,24 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
         call(
             "first",
             "Subagent",
-            json!({"task":"Audit the first file","name":"Audit"}),
+            json!({"task":"Audit the first file","name":"Audit","run_in_background":false}),
         ),
         text("first done"),
         call(
             "second",
             "Subagent",
-            json!({"task":"Audit the second file","name":"audit"}),
+            json!({"task":"Audit the second file","name":"audit","run_in_background":false}),
         ),
         text("second done"),
         text("parent done"),
     ];
-    let core = Agent::open_embedded(
+    // The scripted replies need each child to finish before the parent goes on, which only a
+    // non-interactive host offers.
+    let core = non_interactive::opened_agent(
         store.clone(),
         config(),
         Arc::new(ScriptedModel::new(replies)),
-    )
-    .unwrap();
+    );
     let parent = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
@@ -141,20 +142,19 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
     assert_eq!(registry[1]["handle"], "audit-2");
     assert!(registry[0]["created_at"].as_u64().is_some());
     core.shutdown().await;
-    let restored = Agent::open_embedded(
+    let restored = non_interactive::opened_agent(
         store,
         config(),
         Arc::new(ScriptedModel::new(vec![
             call(
                 "third",
                 "Subagent",
-                json!({"task":"Audit a third file","name":"audit"}),
+                json!({"task":"Audit a third file","name":"audit","run_in_background":false}),
             ),
             text("third done"),
             text("parent follow-up done"),
         ])),
-    )
-    .unwrap();
+    );
     restored.resume_chat(parent).await.unwrap();
     let mut events = restored.subscribe();
     let receipt = restored

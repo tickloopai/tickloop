@@ -11,18 +11,26 @@ async fn exercise_nested_family(fixture: &PrivateFixture) {
             "",
         )
     };
-    let (base_url, mut requests) = model_http_support::serve_responses(vec![
-        (200, spawn("alpha", "Nested Alpha", "Delegate to beta")),
-        (200, spawn("beta", "Nested Beta", "Delegate to gamma")),
-        (
-            200,
-            spawn("gamma", "Nested Gamma", "Return the leaf report"),
-        ),
-        (200, chat_reply(None, "GAMMA-DONE")),
-        (200, chat_reply(None, "BETA-DONE")),
-        (200, chat_reply(None, "ALPHA-DONE")),
-        (200, chat_reply(None, "NESTED-FAMILY-DONE")),
-    ])
+    // Every member runs in the background, so replies follow who asks, not the order of asking.
+    let (base_url, mut requests) = model_http_support::serve_router(move |request| {
+        let history = request["messages"].to_string();
+        match delegated_by(request).as_deref() {
+            None if !has_result(request, "alpha") => {
+                spawn("alpha", "Nested Alpha", "Delegate to beta")
+            }
+            None if history.contains("ALPHA-DONE") => chat_reply(None, "NESTED-FAMILY-DONE"),
+            None => chat_reply(None, "Root delegated"),
+            Some("alpha") if !has_result(request, "beta") => {
+                spawn("beta", "Nested Beta", "Delegate to gamma")
+            }
+            Some("alpha") => chat_reply(None, "ALPHA-DONE"),
+            Some("beta") if !has_result(request, "gamma") => {
+                spawn("gamma", "Nested Gamma", "Return the leaf report")
+            }
+            Some("beta") => chat_reply(None, "BETA-DONE"),
+            _ => chat_reply(None, "GAMMA-DONE"),
+        }
+    })
     .await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
@@ -92,22 +100,35 @@ async fn exercise_nested_family(fixture: &PrivateFixture) {
         snapshot.conversation.delegation.as_ref().unwrap().depth(),
         3
     );
-    for index in 0..7 {
-        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
-            .await
+    let mut offered = Vec::new();
+    while let Ok((_, request)) = requests.try_recv() {
+        let subagent = request["tools"]
+            .as_array()
             .unwrap()
-            .unwrap()
-            .1;
-        if index == 3 {
-            assert!(
-                !request["tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|tool| tool["function"]["name"] == "Subagent")
-            );
+            .iter()
+            .find(|tool| tool["function"]["name"] == "Subagent")
+            .cloned();
+        offered.push((delegated_by(&request), subagent));
+    }
+    for (member, subagent) in &offered {
+        match (member.as_deref(), subagent) {
+            (Some("gamma"), subagent) => {
+                assert!(subagent.is_none(), "the third level cannot delegate")
+            }
+            (member, Some(subagent)) => assert!(
+                subagent["function"]["parameters"]["properties"]
+                    .get("run_in_background")
+                    .is_none(),
+                "{member:?} follows the terminal root and is not offered run_in_background"
+            ),
+            (member, None) => panic!("{member:?} is offered Subagent"),
         }
     }
+    assert!(
+        offered
+            .iter()
+            .any(|(member, _)| member.as_deref() == Some("gamma"))
+    );
     pty.close().await;
 }
 
