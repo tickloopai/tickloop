@@ -274,7 +274,7 @@ impl crate::Agent {
         let mut state = serde_json::json!({
             "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
             "artifact_ticks": chat.snapshot.artifact_ticks,
-            "delegation": chat.snapshot.delegation,
+            "delegation": chat.snapshot.delegation.as_ref().map(fixed_delegation),
             "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
         if let Some(folder) = &chat.snapshot.folder {
@@ -295,9 +295,69 @@ impl crate::Agent {
     }
 }
 
+/// What a Subagent's system prompt says of its delegation: only what was fixed when it was
+/// created, so the prompt cache prefix stays the same for its whole life. The session denials and
+/// host tool authorities its ceiling gains later are enforced at each call, whose result tells
+/// the model, and the trusted inputs and host context serve the Auto review, not the model.
+fn fixed_delegation(
+    delegation: &tickloop_harness_protocol::DelegationMetadata,
+) -> serde_json::Value {
+    let ceiling = &delegation.ceiling;
+    serde_json::json!({
+        "parent_chat_id": delegation.parent_chat_id,
+        "parent_call_id": delegation.parent_call_id,
+        "lineage": delegation.lineage().iter().map(|parent| parent.chat_id).collect::<Vec<_>>(),
+        "depth": delegation.depth(),
+        "task": delegation.task,
+        "ceiling": {
+            "folder": ceiling.folder,
+            "additional_directories": ceiling.additional_directories,
+            "execution_mode": ceiling.policy.mode,
+            "tick_instances": ceiling.tick_instances,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling a child gains later, such as session denials frozen in from its parent or an
+    /// Artifact account recorded after delegation, never reaches its system prompt.
+    #[test]
+    fn a_delegations_later_ceiling_changes_leave_its_prompt_alone() {
+        let mut delegation: tickloop_harness_protocol::DelegationMetadata =
+            serde_json::from_value(serde_json::json!({
+                "delegation_id": uuid::Uuid::from_u128(1),
+                "parent_chat_id": uuid::Uuid::from_u128(2),
+                "parent_loop_id": uuid::Uuid::from_u128(3),
+                "parent_run_id": uuid::Uuid::from_u128(4),
+                "parent_call_id": "delegate",
+                "task": "Inspect the report",
+                "ceiling": {
+                    "folder": "/w",
+                    "additional_directories": [],
+                    "policy": {"mode": "auto", "rules": [], "revision": 0},
+                    "session_denials": [],
+                    "host_context": null,
+                    "host_tools": {},
+                },
+            }))
+            .unwrap();
+        let before = fixed_delegation(&delegation);
+        delegation.ceiling.host_tools.insert(
+            "ArtifactEdit".into(),
+            std::collections::BTreeSet::from([tickloop_harness_protocol::HostToolAuthority::Mcp {
+                server_id: "artifacts".into(),
+                account_id: "owner".into(),
+            }]),
+        );
+        delegation.ceiling.session_denials = None;
+        delegation.trusted_user_inputs = Some(serde_json::json!([{"text": "later"}]));
+        assert_eq!(fixed_delegation(&delegation), before);
+        assert_eq!(before["task"], "Inspect the report");
+        assert_eq!(before["ceiling"]["execution_mode"], "auto");
+    }
 
     #[test]
     fn local_default_prompt_matches_the_base_commit_bytes() {
