@@ -324,7 +324,8 @@ impl State {
             .collect()
     }
 
-    /// Whether the focused card's Tick ended, as its row or its view tells.
+    /// Whether the focused card takes no more input: its Tick ended, as its row tells, or its
+    /// view ended.
     pub(super) fn focused_card_ended(&self) -> bool {
         let Some(view) = self.cards.focused_view() else {
             return false;
