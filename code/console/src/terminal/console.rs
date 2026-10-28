@@ -74,6 +74,9 @@ mod model_dialog_pty;
 #[path = "console/monitor_tests.rs"]
 mod monitor_tests;
 #[cfg(test)]
+#[path = "console/peek_tests.rs"]
+mod peek_tests;
+#[cfg(test)]
 mod plan_flow_pty;
 #[cfg(test)]
 mod plan_markdown_tests;
@@ -103,8 +106,8 @@ mod workspace_trust_tests;
 use agent_layout::OverviewState;
 use agent_layout::OverviewTarget;
 pub(super) use agent_layout::{
-    AgentOverview, AgentRow, EndedRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, WIDE_TERMINAL_COLUMNS,
-    status_glyph,
+    AgentOverview, AgentRow, EndedRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, PeekChoice, PeekRequest,
+    WIDE_TERMINAL_COLUMNS, status_glyph,
 };
 
 use super::{
@@ -312,6 +315,7 @@ const MIN_MENU_TERMINAL_ROWS: usize = FOOTER_ROWS + MIN_SCROLL_ROWS + MIN_MENU_B
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const MONITOR_CONFIRMATION_WINDOW: Duration = Duration::from_secs(3);
 const ENDED_HISTORY_MISSING: &str = "This Agent's saved history is no longer on disk, so there is nothing to resume · x twice removes the row";
+const PEEK_COMMAND_REFUSAL: &str = "Commands run in the Agent's own view · → opens it";
 const STOPPED_RESUME_OFFER: &str = "Press enter again to resume this Agent (it ended while the daemon was off), or x twice to remove it";
 
 const MONITOR_NOTICE_WINDOW: Duration = Duration::from_secs(2);
@@ -363,6 +367,20 @@ pub(super) enum InputEvent {
     ResumeEndedAgent(Uuid),
     /// Stops the running root Agent of this overview row and its family.
     StopAgent(Uuid),
+    /// The peek panel shows this overview row; its pending request is read for it.
+    PeekOpened(Uuid),
+    /// A reply typed in the peek panel for the Agent of this overview row; an ended row's Agent is
+    /// loaded first.
+    PeekReply {
+        agent_id: Uuid,
+        text: String,
+    },
+    /// A number typed in the peek panel that answers the Agent's pending request.
+    PeekAnswer {
+        agent_id: Uuid,
+        request_id: Uuid,
+        choice: agent_layout::PeekChoice,
+    },
     /// Removes the ended root Agent of this Chat from the overview; its history stays.
     ForgetEndedAgent(Uuid),
     /// Removes a finished subagent from the Subagents panel before its grace period ends.
@@ -490,6 +508,22 @@ impl fmt::Debug for InputEvent {
                 .field(value)
                 .finish(),
             Self::StopAgent(value) => formatter.debug_tuple("StopAgent").field(value).finish(),
+            Self::PeekOpened(value) => formatter.debug_tuple("PeekOpened").field(value).finish(),
+            Self::PeekReply { agent_id, .. } => formatter
+                .debug_struct("PeekReply")
+                .field("agent_id", agent_id)
+                .field("text", &"[redacted]")
+                .finish(),
+            Self::PeekAnswer {
+                agent_id,
+                request_id,
+                choice,
+            } => formatter
+                .debug_struct("PeekAnswer")
+                .field("agent_id", agent_id)
+                .field("request_id", request_id)
+                .field("choice", choice)
+                .finish(),
             Self::ForgetEndedAgent(value) => formatter
                 .debug_tuple("ForgetEndedAgent")
                 .field(value)
@@ -978,6 +1012,8 @@ pub(super) struct State {
     overview_input: ChatInput,
     overview_source_input: Option<ChatInput>,
     overview_source_view: Option<ViewPresentation>,
+    /// The dispatch draft kept while the peek panel's reply box holds the input.
+    peek_dispatch_input: Option<ChatInput>,
     help_open: bool,
     help_offset: usize,
     last_input_edit: Option<Instant>,
@@ -2168,6 +2204,48 @@ impl Console {
             .map_err(|error| error.to_string())
     }
 
+    /// What the peek panel on `agent_id` shows the Agent waits on, when it still shows that row.
+    pub(super) fn set_peek_request(
+        &self,
+        agent_id: Uuid,
+        request: Option<agent_layout::PeekRequest>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(peek) = state
+            .overview
+            .peek
+            .as_mut()
+            .filter(|peek| peek.agent_id == agent_id)
+        {
+            peek.request = request;
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The overview row the peek panel shows, when it shows one.
+    pub(super) fn peeked_agent(&self) -> Result<Option<Uuid>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.overview.peek.as_ref().map(|peek| peek.agent_id))
+    }
+
+    /// Keeps the peek panel on an ended row's Agent once a reply loaded it under a new row.
+    pub(super) fn follow_peek(&self, from: Uuid, to: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(peek) = state
+            .overview
+            .peek
+            .as_mut()
+            .filter(|peek| peek.agent_id == from)
+        {
+            peek.agent_id = to;
+            peek.request = None;
+            state.overview.select_agent(to);
+        }
+        Ok(())
+    }
+
     /// Selects the overview row of `agent_id` when it is listed.
     pub(super) fn select_overview_agent(&self, agent_id: Uuid) -> Result<bool, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -2184,6 +2262,17 @@ impl Console {
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let was_open = state.overview.projection.is_some();
+        let peeked_row_left = state.overview.peek.as_ref().is_some_and(|peek| {
+            projection.as_ref().is_none_or(|projection| {
+                !projection
+                    .rows
+                    .iter()
+                    .any(|row| row.agent_id == peek.agent_id)
+            })
+        });
+        if peeked_row_left {
+            state.close_peek();
+        }
         if !was_open && projection.is_some() {
             state.clear_prompt_suggestion();
             state.overview.current_draft = state.chat.is_none();
@@ -6346,6 +6435,7 @@ impl State {
             overview_input: ChatInput::default(),
             overview_source_input: None,
             overview_source_view: None,
+            peek_dispatch_input: None,
             help_open: false,
             help_offset: 0,
             last_input_edit: None,
@@ -9058,7 +9148,15 @@ impl State {
             && self.prompt_enabled
             && let Some(line) = input.styled_lines.first_mut()
         {
-            let placeholder = if !overview && !self.queued_inputs.is_empty() {
+            let peek_title = self
+                .overview
+                .peek
+                .as_ref()
+                .and_then(|peek| self.overview.projection.as_ref()?.row(peek.agent_id))
+                .map(|row| display_single_line(&row.title));
+            let placeholder = if let Some(title) = peek_title.filter(|_| overview) {
+                Some(format!("Reply to {title}…"))
+            } else if !overview && !self.queued_inputs.is_empty() {
                 Some(QUEUED_INPUT_PLACEHOLDER.to_owned())
             } else {
                 child_badge
@@ -9385,6 +9483,12 @@ impl State {
                         "ctrl+n/p select · enter complete · tab complete · esc close"
                     } else {
                         "ctrl+n/p select · tab complete · enter send · esc close"
+                    }
+                } else if overview && self.overview.peek.is_some() {
+                    if self.editor.draft().is_empty() {
+                        "enter send · ↑/↓ Agent · → open · space/esc close"
+                    } else {
+                        "enter send · ctrl+g editor · esc close"
                     }
                 } else if overview {
                     if !self.overview.input_focused {
@@ -12384,6 +12488,9 @@ impl State {
         if !matches!(key.code, KeyCode::Enter | KeyCode::Right) {
             self.overview_resume_offer = None;
         }
+        if self.overview.peek.is_some() {
+            return self.peek_key(key);
+        }
         if key.code == KeyCode::Esc {
             return Some(Some(InputEvent::CloseOverview));
         }
@@ -12414,7 +12521,11 @@ impl State {
                 }
                 None => {}
             },
-            (KeyCode::Char(' '), KeyModifiers::NONE) => self.overview.toggle_selected(),
+            (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                if let Some(id) = self.overview.selected_agent() {
+                    return Some(Some(self.open_peek(id)));
+                }
+            }
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.overview.cycle_filter(true),
             (KeyCode::Char('w'), KeyModifiers::NONE) => self.overview.cycle_filter(false),
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
@@ -12430,6 +12541,114 @@ impl State {
             _ => {}
         }
         Some(None)
+    }
+
+    /// Opens the peek panel on the overview row `id`: the input becomes its reply box, and the
+    /// dispatch draft waits until the panel closes.
+    fn open_peek(&mut self, id: Uuid) -> InputEvent {
+        if self.peek_dispatch_input.is_none() {
+            self.peek_dispatch_input = Some(self.replace_input(ChatInput::default()));
+        }
+        self.overview.peek = Some(agent_layout::Peek {
+            agent_id: id,
+            request: None,
+        });
+        self.overview.input_focused = true;
+        InputEvent::PeekOpened(id)
+    }
+
+    /// Closes the peek panel, discarding its reply draft and giving the dispatch draft back.
+    pub(super) fn close_peek(&mut self) {
+        if self.overview.peek.take().is_none() {
+            return;
+        }
+        if let Some(dispatch) = self.peek_dispatch_input.take() {
+            self.replace_input(dispatch);
+        }
+        self.overview.input_focused = false;
+    }
+
+    /// Keys while the peek panel is open, as in Claude Code's: Esc closes it, ↑/↓ move it to the
+    /// neighbouring Agent, → opens that Agent, Space on an empty reply closes it and Enter sends
+    /// the reply. Every other key edits the reply.
+    fn peek_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
+        let draft = self.editor.draft();
+        let empty = draft.is_empty();
+        let single_line = !draft.contains('\n');
+        let id = self.overview.peek.as_ref()?.agent_id;
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.close_peek();
+                Some(None)
+            }
+            (KeyCode::Up | KeyCode::Down, KeyModifiers::NONE) if single_line => {
+                let step = if key.code == KeyCode::Up { -1 } else { 1 };
+                Some(
+                    self.overview
+                        .select_adjacent_agent(step)
+                        .map(|next| self.open_peek(next)),
+                )
+            }
+            (KeyCode::Right, KeyModifiers::NONE) if empty => {
+                self.close_peek();
+                if self.overview.ended_row(id).is_some() {
+                    Some(self.continue_ended_agent(id))
+                } else {
+                    Some(Some(InputEvent::OpenAgent(id)))
+                }
+            }
+            (KeyCode::Char(' '), KeyModifiers::NONE) if empty => {
+                self.close_peek();
+                Some(None)
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => Some(self.send_peek_reply(id)),
+            _ => None,
+        }
+    }
+
+    /// The reply in the peek panel: a number that picks one of the pending request's choices
+    /// answers it, other text is a message to the Agent. Commands run only in the Agent's view.
+    fn send_peek_reply(&mut self, id: Uuid) -> Option<InputEvent> {
+        let text = self
+            .paste_blocks
+            .source_text(self.editor.draft())
+            .to_owned();
+        if text.trim().is_empty() {
+            return None;
+        }
+        if self.completion.is_command_input(&text) {
+            self.hold_status(PEEK_COMMAND_REFUSAL);
+            return None;
+        }
+        if self
+            .overview
+            .ended_row(id)
+            .is_some_and(|ended| !ended.resumable)
+        {
+            self.hold_status(ENDED_HISTORY_MISSING);
+            return None;
+        }
+        let choice = self
+            .overview
+            .peek
+            .as_ref()
+            .and_then(|peek| peek.request.as_ref())
+            .and_then(|request| {
+                let number = text.trim().parse::<usize>().ok()?;
+                let (_, choice) = request.choices.get(number.checked_sub(1)?)?;
+                Some((request.request_id, choice.clone()))
+            });
+        self.editor.apply(EditorCommand::Clear);
+        self.paste_blocks.take();
+        self.completion.dismiss();
+        Some(match choice {
+            Some((request_id, choice)) => InputEvent::PeekAnswer {
+                agent_id: id,
+                request_id,
+                choice,
+            },
+            None => InputEvent::PeekReply { agent_id: id, text },
+        })
     }
 
     /// Enter on an ended row loads its history, as Claude Code's agent view does: a row that ended

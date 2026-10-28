@@ -3286,6 +3286,48 @@ async fn interact_with_herdr(
                     }
                     status_dirty = true;
                 },
+                Some(InputEvent::PeekOpened(agent_id)) => {
+                    let row=global.projection().rows.into_iter().find(|row|row.execution.agent_id==agent_id);
+                    let request=match row {
+                        Some(row) if crate::agent_console::AgentState::of(&row)==crate::agent_console::AgentState::NeedsInput => {
+                            agent.snapshot(row.chat_id).await.ok().and_then(|snapshot|peek_request(&snapshot))
+                        },
+                        _ => None,
+                    };
+                    console.set_peek_request(agent_id,request)?;
+                },
+                Some(InputEvent::PeekReply { agent_id, text }) => {
+                    let sent=send_peek_reply(agent,&global.projection(),agent_id,text).await;
+                    if let Ok((_,Some(loaded)))=&sent {
+                        console.follow_peek(agent_id,*loaded)?;
+                    }
+                    if let Err(error)=global.refresh().await {
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
+                    }
+                    console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                    if let Some(peeked)=console.peeked_agent()? {
+                        console.select_overview_agent(peeked)?;
+                    }
+                    match sent {
+                        Ok((status,_))=>console.set_status(&status)?,
+                        Err(error)=>console.set_status(&format!("Cannot send the reply · {}",safe_line(&error)))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::PeekAnswer { agent_id, request_id, choice }) => {
+                    match answer_peek(agent,&global.projection(),agent_id,request_id,choice).await {
+                        Ok(())=>console.set_status("Answered")?,
+                        Err(error)=>console.set_status(&format!("Cannot answer · {}",safe_line(&error.to_string())))?,
+                    }
+                    if let Err(error)=global.refresh().await {
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
+                    }
+                    console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                    paused_inputs.push_back(InputEvent::PeekOpened(agent_id));
+                    status_dirty = true;
+                },
                 Some(InputEvent::ForgetEndedAgent(chat)) => {
                     let title=global.projection().ended.iter().find(|ended|ended.record.chat_id==chat).map(|ended|safe_line(&ended.title)).unwrap_or_else(||"the Agent".into());
                     match global.forget_ended(chat).await {
@@ -8399,6 +8441,139 @@ fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRo
     }
 }
 
+/// Sends a peek panel reply to the Agent of the overview row `agent_id`. Replying to an ended row
+/// is the user continuing it: its saved history loads first, and the row it now runs under comes
+/// back with the status to show.
+async fn send_peek_reply(
+    agent: &Agent,
+    projection: &crate::agent_console::Projection,
+    agent_id: uuid::Uuid,
+    text: String,
+) -> Result<(String, Option<uuid::Uuid>), String> {
+    if let Some(row) = projection
+        .rows
+        .iter()
+        .find(|row| row.execution.agent_id == agent_id)
+    {
+        agent
+            .submit(row.chat_id, text)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok((format!("Sent to {}", safe_line(&row.title)), None));
+    }
+    let ended = projection
+        .ended
+        .iter()
+        .find(|ended| ended.record.chat_id == agent_id)
+        .ok_or("this Agent is no longer listed")?;
+    let chat = ended.record.chat_id;
+    agent
+        .resume_chat(chat)
+        .await
+        .map_err(|error| error.to_string())?;
+    agent
+        .submit(chat, text)
+        .await
+        .map_err(|error| error.to_string())?;
+    let loaded = agent
+        .reference(chat)
+        .await
+        .ok()
+        .map(|execution| execution.agent_id);
+    Ok((
+        format!("Resumed {} and sent your reply", safe_line(&ended.title)),
+        loaded,
+    ))
+}
+
+/// Answers the request the Agent of the overview row `agent_id` waits on with a peek panel choice.
+async fn answer_peek(
+    agent: &Agent,
+    projection: &crate::agent_console::Projection,
+    agent_id: uuid::Uuid,
+    request_id: uuid::Uuid,
+    choice: console::PeekChoice,
+) -> Result<(), AccessError> {
+    let chat = projection
+        .rows
+        .iter()
+        .find(|row| row.execution.agent_id == agent_id)
+        .map(|row| row.chat_id)
+        .ok_or_else(|| AccessError::unavailable("this Agent is no longer running"))?;
+    match choice {
+        console::PeekChoice::Answer(label) => {
+            agent
+                .answer_question(
+                    chat,
+                    request_id,
+                    vec![tickloop_harness::protocol::QuestionAnswer::option(label)],
+                )
+                .await
+        }
+        console::PeekChoice::Permission { allow, scope } => {
+            agent
+                .answer_permission_with_scope(chat, request_id, allow, scope)
+                .await
+        }
+    }
+}
+
+/// The request a peeked Agent waits on, with what a typed number answers: an option of its one
+/// question, or one of the permission choices its own view offers apart from rules and comments.
+fn peek_request(snapshot: &ChatSnapshot) -> Option<console::PeekRequest> {
+    use console::PeekChoice;
+    use tickloop_harness::protocol::{PermissionApprovalSource, PermissionScope};
+    if let Some(request) = snapshot.questions.first() {
+        let choices = match request.questions.as_slice() {
+            [question] if !question.multi_select => question
+                .options
+                .iter()
+                .map(|option| {
+                    (
+                        option.label.clone(),
+                        PeekChoice::Answer(option.label.clone()),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        return Some(console::PeekRequest {
+            request_id: request.id,
+            prompt: request
+                .questions
+                .first()
+                .map(|question| question.question.clone())
+                .unwrap_or_default(),
+            choices,
+        });
+    }
+    let request = snapshot.permissions.first()?;
+    let permission = |allow, scope| PeekChoice::Permission { allow, scope };
+    let choices = if request.approval_source == PermissionApprovalSource::ExplicitAsk {
+        vec![
+            ("Yes, once".into(), permission(true, PermissionScope::Once)),
+            ("No".into(), permission(false, PermissionScope::Once)),
+        ]
+    } else {
+        vec![
+            ("Yes".into(), permission(true, PermissionScope::Once)),
+            (
+                "Yes, for this session".into(),
+                permission(true, PermissionScope::Session),
+            ),
+            ("No".into(), permission(false, PermissionScope::Once)),
+        ]
+    };
+    Some(console::PeekRequest {
+        request_id: request.id,
+        prompt: format!(
+            "Permission required · {}",
+            presentation::tool_name(&request.name)
+        ),
+        choices,
+    })
+}
+
 /// Human status text for an Agent row: its state, and why when that is not plain. The Loop state
 /// names are internal.
 fn agent_status_label(row: &AgentSummary) -> &'static str {
@@ -8930,6 +9105,199 @@ mod tests {
         assert_eq!(overview.visible, Some(root.agent_id));
         assert_eq!(overview.rows[0].questions, 1);
         assert_eq!(overview.rows[0].status_role(), super::style::Role::Warning);
+    }
+
+    /// Refreshes `global` until the row of `chat` satisfies `ready`.
+    async fn wait_for_row(
+        global: &mut crate::agent_console::AgentConsole,
+        chat: uuid::Uuid,
+        ready: impl Fn(&tickloop_code_access::AgentSummary) -> bool,
+    ) -> tickloop_code_access::AgentSummary {
+        for _ in 0..500 {
+            let projection = global.refresh().await.unwrap();
+            if let Some(row) = projection
+                .rows
+                .iter()
+                .find(|row| row.chat_id == chat && ready(row))
+            {
+                return row.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the row of {chat} never became ready: {:?}",
+            global.projection().rows
+        );
+    }
+
+    fn last_request_text(model: &tickloop_harness::test_support::ScriptedModel) -> String {
+        serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_peek_reply_to_an_idle_agent_starts_its_next_turn_in_the_overview() {
+        use tickloop_harness::protocol::LoopState;
+        use tickloop_harness::test_support::{ScriptedModel, config, text};
+        let directory = tempfile::tempdir().unwrap();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            text("First pass done"),
+            text("Second pass done"),
+        ]));
+        let agent = super::Agent::new_embedded(config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.submit(chat, "First pass".into()).await.unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            directory.path().into(),
+            None,
+        );
+        let finished = wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::Idle && row.run_id.is_some()
+        })
+        .await;
+        let asked = model.requests.lock().unwrap().len();
+
+        let (status, loaded) = super::send_peek_reply(
+            &agent,
+            &global.projection(),
+            finished.execution.agent_id,
+            "Run the second pass".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, format!("Sent to {}", finished.title));
+        assert_eq!(loaded, None);
+        wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::Idle && row.run_id.is_some() && row.run_id != finished.run_id
+        })
+        .await;
+        assert!(model.requests.lock().unwrap().len() > asked);
+        assert!(last_request_text(&model).contains("Run the second pass"));
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_peek_reply_to_an_ended_agent_loads_its_history_and_starts_a_turn() {
+        use tickloop_code_settings::local_agent::LocalAgent;
+        use tickloop_harness::protocol::{EventKind, LoopState};
+        use tickloop_harness::test_support::{ScriptedModel, config, next_event, text};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let folder = directory.path().join("work");
+        std::fs::create_dir_all(&folder).unwrap();
+        let saved = tickloop_harness::runtime::Agent::open_embedded(
+            root.clone(),
+            config(),
+            std::sync::Arc::new(ScriptedModel::new(vec![text("Reviewed half")])),
+        )
+        .unwrap();
+        let chat = saved.create_chat(folder.clone()).await.unwrap();
+        let mut events = saved.subscribe();
+        let receipt = saved
+            .submit(chat, "Review the module".into())
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+        saved.shutdown().await;
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![text("Reviewed the rest")]));
+        let agent = super::Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            folder.clone(),
+            None,
+        );
+        let mut projection = global.refresh().await.unwrap();
+        assert!(projection.rows.is_empty(), "nothing runs before the reply");
+        projection.ended = vec![tickloop_code_access::EndedAgent {
+            record: tickloop_code_access::TranscriptRef {
+                store_root: root.clone(),
+                chat_id: chat.uuid(),
+            },
+            agent_id: uuid::Uuid::from_u128(1),
+            folder: Some(folder.clone()),
+            workspace: None,
+            title: "Review the module".into(),
+            preview: None,
+            created_at: 1,
+            updated_at: 2,
+            ended_at: 3,
+            last_state: LoopState::Idle,
+            outcome: tickloop_code_access::EndedOutcome::Failed,
+            reason: tickloop_code_access::EndReason::DaemonStopped,
+            resumable: true,
+        }];
+
+        let (status, loaded) =
+            super::send_peek_reply(&agent, &projection, chat.uuid(), "Finish the review".into())
+                .await
+                .unwrap();
+
+        assert_eq!(status, "Resumed Review the module and sent your reply");
+        let row = wait_for_row(&mut global, chat.uuid(), |row| {
+            row.state == LoopState::Idle && row.run_id.is_some()
+        })
+        .await;
+        assert_eq!(loaded, Some(row.execution.agent_id));
+        let request = last_request_text(&model);
+        assert!(request.contains("Review the module"), "{request}");
+        assert!(request.contains("Finish the review"), "{request}");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_number_in_the_peek_panel_answers_the_agents_question() {
+        use tickloop_harness::protocol::LoopState;
+        use tickloop_harness::test_support::{ScriptedModel, call, config, single_question, text};
+        let directory = tempfile::tempdir().unwrap();
+        let model = std::sync::Arc::new(ScriptedModel::new(vec![
+            call("ask", "AskUserQuestion", single_question("Which report?")),
+            text("Writing the monthly report"),
+        ]));
+        let agent = super::Agent::new_embedded(config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.submit(chat, "Write the report".into()).await.unwrap();
+        let mut global = crate::agent_console::AgentConsole::new(
+            agent.access(),
+            agent.daemon_epoch(),
+            directory.path().into(),
+            None,
+        );
+        let waiting = wait_for_row(&mut global, chat, |row| {
+            row.state == LoopState::WaitingQuestion
+        })
+        .await;
+        let request = super::peek_request(&agent.snapshot(chat).await.unwrap()).unwrap();
+        assert_eq!(request.prompt, "Which report?");
+        assert_eq!(
+            request
+                .choices
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            ["Weekly", "Monthly"]
+        );
+
+        super::answer_peek(
+            &agent,
+            &global.projection(),
+            waiting.execution.agent_id,
+            request.request_id,
+            request.choices[1].1.clone(),
+        )
+        .await
+        .unwrap();
+
+        wait_for_row(&mut global, chat, |row| row.state == LoopState::Idle).await;
+        assert!(last_request_text(&model).contains("Monthly"));
+        agent.shutdown().await;
     }
 
     /// Claude Code's agent view states and groups, one mapping row each: what the daemon reports,

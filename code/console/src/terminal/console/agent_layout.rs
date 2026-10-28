@@ -10,7 +10,7 @@ use crate::agent_console::{AgentState, AttentionGroup};
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
 use tickloop_code_access::EndReason;
-use tickloop_harness::protocol::{LoopState, SubagentRegistration};
+use tickloop_harness::protocol::{LoopState, PermissionScope, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
 pub(super) const NORMAL_LAYOUT_MIN_ROWS: usize = 16;
@@ -64,6 +64,38 @@ pub(crate) struct EndedRow {
     /// Whether its saved history is still on disk to load.
     pub(crate) resumable: bool,
 }
+
+/// What a number typed into the peek panel's reply box answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PeekChoice {
+    /// A question option, by its label.
+    Answer(String),
+    Permission {
+        allow: bool,
+        scope: PermissionScope,
+    },
+}
+
+/// The request a peeked Agent waits on, with the choices a typed number picks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeekRequest {
+    pub(crate) request_id: Uuid,
+    /// The full question, or which tool asks for permission.
+    pub(crate) prompt: String,
+    /// Empty when only the Agent's own view can answer, such as several questions at once.
+    pub(crate) choices: Vec<(String, PeekChoice)>,
+}
+
+/// Claude Code's peek panel: the selected Agent's state below the overview list, with the input
+/// replying to that Agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Peek {
+    pub(super) agent_id: Uuid,
+    pub(super) request: Option<PeekRequest>,
+}
+
+/// The most rows the peek panel takes from the list.
+const MAX_PEEK_ROWS: usize = 10;
 
 /// What a row shows after its title when there is room: the newest message, path metadata and
 /// the age of its latest state change. Narrow rows drop path first, then the message, then age.
@@ -570,7 +602,7 @@ impl AgentOverview {
             })
     }
 
-    fn row(&self, id: Uuid) -> Option<&AgentRow> {
+    pub(super) fn row(&self, id: Uuid) -> Option<&AgentRow> {
         self.rows.iter().find(|row| row.agent_id == id)
     }
 
@@ -625,6 +657,7 @@ impl OverviewEntry<'_> {
 pub(super) struct OverviewState {
     pub(super) projection: Option<AgentOverview>,
     pub(super) selected: Option<OverviewTarget>,
+    pub(super) peek: Option<Peek>,
     pub(super) current_draft: bool,
     /// Group heading choices (`true` folded); groups start unfolded. They only change what this
     /// View lists.
@@ -725,6 +758,79 @@ impl OverviewState {
         }
         self.locate(id);
         true
+    }
+
+    /// Moves the selection to the next (`step` 1) or previous (-1) Agent row, past headings and
+    /// counters; the peek panel follows it.
+    pub(super) fn select_adjacent_agent(&mut self, step: isize) -> Option<Uuid> {
+        let agents = self
+            .targets()
+            .into_iter()
+            .filter_map(|target| match target {
+                OverviewTarget::Agent(id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let current = agents
+            .iter()
+            .position(|id| Some(*id) == self.selected_agent())?;
+        let next = *agents.get(current.checked_add_signed(step)?)?;
+        self.select_agent(next);
+        Some(next)
+    }
+
+    /// The peek panel's rows: the Agent's state and how long it has waited, its latest sentence,
+    /// and the request it waits on with the numbers that answer it.
+    fn peek_lines(&self, width: usize, now: u64) -> Vec<RoleLine> {
+        let Some((peek, row)) = self.peek.as_ref().and_then(|peek| {
+            let row = self.projection.as_ref()?.row(peek.agent_id)?;
+            Some((peek, row))
+        }) else {
+            return Vec::new();
+        };
+        let wrapped = |text: &str, role: Role, limit: usize| {
+            super::wrap_text(&display_single_line(text), width.saturating_sub(4).max(1))
+                .into_iter()
+                .take(limit)
+                .map(move |line| RoleLine::role(format!("{ROW_INDENT}  {line}"), role))
+                .collect::<Vec<_>>()
+        };
+        let status = match row.waiting_label(now) {
+            Some(waiting) => format!("{} · {waiting}", display_single_line(&row.status)),
+            None => display_single_line(&row.status),
+        };
+        let mut lines = vec![RoleLine::role("─".repeat(width), Role::MutedText)];
+        let mut heading = RoleLine::role(
+            format!("{ROW_INDENT}{}", display_single_line(&row.title)),
+            Role::Title,
+        );
+        heading.push(" · ", Some(Role::MutedText));
+        heading.push(status, Some(row.status_role()));
+        heading.truncate(width);
+        lines.push(heading);
+        match row.preview.as_deref() {
+            Some(preview) => lines.extend(wrapped(preview, Role::Text, 3)),
+            None => lines.extend(wrapped("Nothing said yet", Role::MutedText, 1)),
+        }
+        if let Some(request) = &peek.request {
+            lines.extend(wrapped(&request.prompt, Role::Warning, 3));
+            for (number, (label, _)) in request.choices.iter().enumerate() {
+                lines.extend(wrapped(&format!("{}. {label}", number + 1), Role::Text, 1));
+            }
+            if request.choices.is_empty() {
+                lines.extend(wrapped("→ opens the Agent to answer", Role::MutedText, 1));
+            }
+        }
+        if let Some(ended) = &row.ended {
+            let note = if ended.resumable {
+                "A reply loads its saved history, then sends"
+            } else {
+                "Its saved history is gone; nothing can continue it"
+            };
+            lines.extend(wrapped(note, Role::MutedText, 1));
+        }
+        lines.truncate(MAX_PEEK_ROWS);
+        lines
     }
 
     pub(super) fn selected_agent(&self) -> Option<Uuid> {
@@ -1364,11 +1470,17 @@ impl OverviewState {
                 "enter/→ collapse".to_owned()
             }],
             Some(OverviewTarget::Agent(id)) => match self.ended_row(id) {
-                Some(ended) if ended.resumable => {
-                    vec!["enter resume".to_owned(), "x remove".to_owned()]
-                }
+                Some(ended) if ended.resumable => vec![
+                    "enter resume".to_owned(),
+                    "space peek".to_owned(),
+                    "x remove".to_owned(),
+                ],
                 Some(_) => vec!["x remove".to_owned()],
-                None => vec!["enter open".to_owned(), "x stop".to_owned()],
+                None => vec![
+                    "enter open".to_owned(),
+                    "space peek".to_owned(),
+                    "x stop".to_owned(),
+                ],
             },
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
@@ -1379,9 +1491,9 @@ impl OverviewState {
                         hidden,
                         open,
                     } if *candidate == group => Some(if *open {
-                        "enter/space show fewer".to_owned()
+                        "enter/→ show fewer".to_owned()
                     } else {
-                        format!("enter/space show {hidden}")
+                        format!("enter/→ show {hidden}")
                     }),
                     _ => None,
                 })
@@ -1478,7 +1590,14 @@ impl OverviewState {
         } else {
             1
         };
-        self.capacity = height.saturating_sub(header_rows);
+        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
+        let peek = self.peek_lines(width, now);
+        let peek = if height.saturating_sub(header_rows) > peek.len() + MIN_COMPLETED_ROWS {
+            peek
+        } else {
+            Vec::new()
+        };
+        self.capacity = height.saturating_sub(header_rows + peek.len());
         let entries = self.entries();
         let offset = self.scroll_offset(&entries);
         // Folded groups and counters scrolled out of the list stay discoverable in the heading.
@@ -1544,6 +1663,8 @@ impl OverviewState {
                 let workspace = truncate_width(&workspace, value_columns - project_columns);
                 let hints = if help_open {
                     Vec::new()
+                } else if self.peek.is_some() {
+                    vec!["↑/↓ Agent".to_owned(), "→ open".into(), "esc close".into()]
                 } else if self.input_focused {
                     vec!["tab list".to_owned(), "esc back".into()]
                 } else {
@@ -1570,7 +1691,6 @@ impl OverviewState {
                 Role::MutedText,
             ));
         }
-        let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
         let rooms = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -1592,7 +1712,10 @@ impl OverviewState {
             .filter(|(row, _)| ambiguous.contains(&row.agent_id) || self.needs_cue_number(row))
             .filter_map(|(row, _)| Some((row.agent_id, self.numbers.get(row.agent_id)?)))
             .collect::<HashMap<_, _>>();
-        let selected_target = self.selected.filter(|_| !self.input_focused);
+        // The peeked row stays marked while the reply box holds the input.
+        let selected_target = self
+            .selected
+            .filter(|_| !self.input_focused || self.peek.is_some());
         let tree_lines = entries
             .iter()
             .map(|entry| {
@@ -1646,7 +1769,8 @@ impl OverviewState {
         self.ordinals = ordinals;
         let capacity = self.capacity;
         lines.extend(tree_lines.into_iter().skip(offset).take(capacity));
-        lines.resize(height, RoleLine::default());
+        lines.resize(height.saturating_sub(peek.len()), RoleLine::default());
+        lines.extend(peek);
         lines
     }
 }
@@ -1713,8 +1837,11 @@ pub(super) fn help_lines(
             "tab list / new Agent".into(),
             "enter / → open Agent (row)".into(),
             "enter resume ended Agent (row)".into(),
+            "space peek and reply (row)".into(),
+            "↑/↓ next Agent, → open (peek)".into(),
+            "1-9 enter answers (peek)".into(),
             "x twice stops Agent / removes ended row".into(),
-            "enter / → / space fold group (heading)".into(),
+            "enter / → fold group (heading)".into(),
             "enter dispatch (input)".into(),
             "r open history".into(),
             "/cwd PATH set dispatch directory".into(),

@@ -1519,7 +1519,9 @@ fn agent_layout_draft_overview_refresh_filters_and_heading_folds_preserve_naviga
             state.overview.selected,
             Some(OverviewTarget::Heading(AttentionGroup::NeedsInput))
         );
-        state.key(key(KeyCode::Char(' ')));
+        // Enter folds and unfolds a heading; Space only peeks at Agent rows.
+        assert!(state.key(key(KeyCode::Char(' '))).is_none());
+        assert!(state.key(key(KeyCode::Enter)).is_none());
         assert!(state.key(key(KeyCode::Enter)).is_none());
         assert_eq!(
             state.overview.selected,
@@ -3595,10 +3597,9 @@ fn agent_layout_overview_help_hides_inactive_header_hints_and_restores_list_focu
     }
     let frame = frame_lines(&console);
     let header = line_with(&frame, "Project:").unwrap();
+    // The header drops its last hints first when the row's own hints take the width.
     assert!(
-        header.contains("p/w filter")
-            && header.contains("r history")
-            && header.contains("esc back"),
+        header.contains("p/w filter") && header.contains("r history"),
         "{frame:#?}"
     );
     assert!(matches!(
@@ -4491,18 +4492,17 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(fleet_overview())).unwrap();
     let mut state = console.state.lock().unwrap();
-    // `Workspace` in the filter also contains the lowercase key name.
-    let offers_space = |hint: &str| hint.contains("/space") || hint.contains("· space");
+    // Space peeks at an Agent row; it folds nothing.
     select_agent(&mut state, FAILED_FAMILY);
     let frame = drawn(&mut state);
     assert!(
-        frame[1].contains("enter open") && !offers_space(&frame[1]),
+        frame[1].contains("enter open · space peek · x stop"),
         "{frame:#?}"
     );
     select_agent(&mut state, Uuid::from_u128(0x5500));
     let frame = drawn(&mut state);
     assert!(
-        frame[1].contains("enter open") && !offers_space(&frame[1]),
+        frame[1].contains("enter open · space peek · x stop"),
         "{frame:#?}"
     );
     select_target(
@@ -4510,11 +4510,11 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
         OverviewTarget::Disclosure(AttentionGroup::Completed),
     );
     let frame = drawn(&mut state);
-    assert!(frame[1].contains("enter/space show"), "{frame:#?}");
+    assert!(frame[1].contains("enter/→ show"), "{frame:#?}");
     assert!(
         frame
             .last()
-            .is_some_and(|line| line.contains("enter/space show")),
+            .is_some_and(|line| line.contains("enter/→ show")),
         "{frame:#?}"
     );
     state.key(key(KeyCode::Tab));

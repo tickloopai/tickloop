@@ -233,7 +233,10 @@ fn enter_resumes_an_agent_that_failed_or_was_stopped_at_once() {
         );
         let mut state = console.state.lock().unwrap();
         select(&mut state, ended_chat(0));
-        assert_eq!(state.overview.row_hints(), ["enter resume", "x remove"]);
+        assert_eq!(
+            state.overview.row_hints(),
+            ["enter resume", "space peek", "x remove"]
+        );
 
         let event = state.key(key(KeyCode::Enter));
 
@@ -337,7 +340,10 @@ fn two_presses_of_x_stop_a_running_agent_and_the_first_warns_in_red() {
     );
     let mut state = console.state.lock().unwrap();
     select(&mut state, running.agent_id);
-    assert_eq!(state.overview.row_hints(), ["enter open", "x stop"]);
+    assert_eq!(
+        state.overview.row_hints(),
+        ["enter open", "space peek", "x stop"]
+    );
 
     assert!(state.key(key(KeyCode::Char('x'))).is_none());
     red_hint(&mut state, "Press x again to stop this Agent");
