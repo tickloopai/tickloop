@@ -4,8 +4,9 @@ use tickloop_harness::protocol::{
 };
 use uuid::Uuid;
 
-/// Matches the message text appended by `runtime/persistence.rs` when restoring a conversation,
-/// taken from Claude Code's `conversationRecovery.ts`.
+/// Matches the sentinel `runtime/persistence.rs` appends when restoring a conversation, and the
+/// continuation message earlier versions also wrote into Transcripts; taken from Claude Code's
+/// `conversationRecovery.ts`.
 const CONTINUE_FROM_INTERRUPTION: &str = "Continue from where you left off.";
 const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 

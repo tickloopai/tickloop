@@ -24,7 +24,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const CONTINUE_FROM_INTERRUPTION: &str = "Continue from where you left off.";
 const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 
 async fn require_workspace_write_approval(agent: &Agent, chat: Uuid) {
@@ -401,8 +400,8 @@ async fn killed_process_resumes_from_its_flushed_transcript() {
 
 #[tokio::test]
 async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history() {
-    // Ends with a tool result: first append the "continue from where it was interrupted" meta
-    // message, then the sentinel.
+    // Ends with a tool result: following Claude Code's resume the user starts, only the sentinel
+    // is appended, no "continue from where you left off" prompt, and no Run starts.
     {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
@@ -425,9 +424,31 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         });
 
         let model = Arc::new(ScriptedModel::new(vec![text("continued")]));
-        let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
-        restored.resume_chat(chat).await.unwrap();
+        let restored = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+        let resumed = restored.resume_chat(chat).await.unwrap();
+        // No Run starts on resume: the first model request is the one the next prompt makes.
+        assert_eq!(resumed.chat_loop.state, LoopState::Interrupted);
+        assert!(model.requests.lock().unwrap().is_empty());
+        let resumed_messages = resumed.conversation_messages().unwrap();
+        assert_eq!(
+            resumed_messages.last(),
+            Some(&assistant(NO_RESPONSE_REQUESTED))
+        );
+        assert!(
+            !format!("{resumed_messages:?}").contains("Continue from where you left off."),
+            "{resumed_messages:?}"
+        );
         complete_turn(&restored, chat, "next prompt").await;
+        let lines = std::fs::read_to_string(transcript_file(&root, chat.uuid()))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect::<Vec<tickloop_harness::transcript::Line>>();
+        let displayed =
+            serde_json::to_string(&tickloop_harness::transcript::display::project(&lines)).unwrap();
+        assert!(displayed.contains("next prompt"), "{displayed}");
+        assert!(!displayed.contains(NO_RESPONSE_REQUESTED));
+        assert!(!displayed.contains("Continue from where you left off."));
         let sent = conversation(&model.requests.lock().unwrap()[0]);
         assert!(matches!(
             &sent[1].content[..],
@@ -439,11 +460,7 @@ async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history
         ));
         assert_eq!(
             sent[3..],
-            [
-                user(CONTINUE_FROM_INTERRUPTION),
-                assistant(NO_RESPONSE_REQUESTED),
-                user("next prompt"),
-            ]
+            [assistant(NO_RESPONSE_REQUESTED), user("next prompt")]
         );
         restored.shutdown().await;
     }
