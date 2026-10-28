@@ -137,9 +137,7 @@ impl TickDescriptor {
         if let Some(rows) = result
             .pointer("/screen/min_rows")
             .filter(|rows| !rows.is_null())
-            && !rows
-                .as_u64()
-                .is_some_and(|rows| screen_rows_are_valid(rows))
+            && !rows.as_u64().is_some_and(screen_rows_are_valid)
         {
             return Err(invalid_min_rows());
         }

@@ -143,7 +143,9 @@ impl Agent {
                     .members
                     .iter()
                     .find(|member| &member.instance == lost)
-                    .map_or((false, None), |member| (member.is_terminal, member.min_rows));
+                    .map_or((false, None), |member| {
+                        (member.is_terminal, member.min_rows)
+                    });
                 let member = membership.record_opened(reopened.clone(), title);
                 member.is_terminal = is_terminal;
                 member.min_rows = min_rows;

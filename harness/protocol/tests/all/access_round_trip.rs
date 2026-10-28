@@ -174,7 +174,8 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     );
     assert!(saved.is_removed(&"hosted:hidden".parse().unwrap()));
     assert!(
-        serde_json::to_string(&saved.members[1]).unwrap() == r#"{"is_terminal":false,"instance":"hosted:added"}"#,
+        serde_json::to_string(&saved.members[1]).unwrap()
+            == r#"{"is_terminal":false,"instance":"hosted:added"}"#,
         "an undeclared minimum is left out"
     );
     assert!(
