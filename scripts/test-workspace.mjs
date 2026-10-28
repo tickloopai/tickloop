@@ -16,7 +16,7 @@ const environment = { ...process.env, HOME: home, TMPDIR: temporary,
   TICKLOOP_CONFIG_DIR: config, TICKLOOP_TMPDIR: temporary,
   NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost' };
 for (const key of Object.keys(environment))
-  if (key.startsWith('HERDR_') || key === 'TICKLOOP_TICK_RUNTIME_DIR') delete environment[key];
+  if (key.startsWith('HERDR_') || ['TICKLOOP_TICK_RUNTIME_DIR', 'TICKLOOP_DEBUG'].includes(key)) delete environment[key];
 
 // A private inherited root or an explicitly registered fixture root proves ownership;
 // executable names and build directories never grant permission to signal a process.

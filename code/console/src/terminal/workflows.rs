@@ -1121,7 +1121,8 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
         })
         && matches!(event.kind, EventKind::Completed { .. })
     {
-        super::write_completion_notice(console, None)?;
+        let debug = super::completion_debug(console, chat, event.run_id)?;
+        super::write_completion_notice(console, None, debug.as_ref())?;
     }
     console.replay_execution_losses(chat.id.into())?;
     Ok(())

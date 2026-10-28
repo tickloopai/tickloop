@@ -207,6 +207,8 @@ async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process
     assert!(texts(&in_process).contains(&"first prompt".to_owned()));
     let expected = in_process.conversation_messages().unwrap();
     assert!(!message_text(&expected).contains("first answer"));
+    assert_eq!(in_process.chat_loop.runs_started, Some(3));
+    assert_eq!(in_process.chat_loop.compactions, Some(1));
     agent.shutdown().await;
     drop(agent);
 
@@ -221,7 +223,14 @@ async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process
     assert_eq!(restored.conversation_messages().unwrap(), expected);
     assert_eq!(restored.effective_context_window_tokens(), Some(5_000_000));
     assert_eq!(restored.rewind_points().len(), 1);
+    // The Loop's counts outlive the messages compaction left behind.
+    assert_eq!(restored.chat_loop.runs_started, Some(3));
+    assert_eq!(restored.chat_loop.compactions, Some(1));
     complete_turn(&resumed, chat, "fourth prompt").await;
+    assert_eq!(
+        resumed.snapshot(chat).await.unwrap().chat_loop.runs_started,
+        Some(4)
+    );
     let mut sent = conversation(&resumed_model.last_request());
     assert_eq!(
         sent.pop().map(|message| message_text(&[message])),

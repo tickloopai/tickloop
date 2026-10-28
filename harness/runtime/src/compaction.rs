@@ -77,6 +77,9 @@ impl CompactionLayout {
     ) -> (ChatSnapshot, ChatBookkeeping) {
         let rewrites_existing = !self.keeps_existing_prefix(snapshot.messages.len());
         let mut compacted = snapshot.clone();
+        if let Some(compactions) = &mut compacted.chat_loop.compactions {
+            *compactions += 1;
+        }
         let mut compacted_bookkeeping = bookkeeping.clone();
         compacted_bookkeeping.lifecycle.remember_compacted_leaf(
             bookkeeping

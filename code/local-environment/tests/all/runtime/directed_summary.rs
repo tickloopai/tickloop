@@ -124,7 +124,9 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
     let before = agent.snapshot(chat).await.unwrap();
     let checkpoint = before.rewind_points()[1].clone();
     let raw_messages = before.messages.clone();
-    let loops = serde_json::to_value(&before.chat_loop).unwrap();
+    // The summary counts as one more compaction of the Chat; the Loop is otherwise unchanged.
+    let mut loops = serde_json::to_value(&before.chat_loop).unwrap();
+    loops["compactions"] = (before.chat_loop.compactions.unwrap() + 1).into();
     let prior_usage = before.request_usage.entries().to_vec();
 
     let outcome = agent

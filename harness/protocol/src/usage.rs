@@ -126,6 +126,20 @@ pub struct RequestUsageRecord {
     pub serialized_request_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_measurement: Option<crate::ContextMeasurement>,
+    /// How this request broke the prompt cache of the Chat's previous request, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_break: Option<CacheBreakNote>,
+}
+
+/// What a View shows of a prompt cache break: the part of the request prefix from which the
+/// cached prefix no longer matched, why the cache most likely broke, and how long after the
+/// Chat's previous request it came.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CacheBreakNote {
+    pub first_changed: Option<String>,
+    pub likely_cause: String,
+    #[serde(default)]
+    pub gap_seconds: u64,
 }
 
 impl RequestUsageRecord {
@@ -365,6 +379,7 @@ impl RequestUsageLedger {
             usage: Usage::default(),
             serialized_request_bytes: None,
             context_measurement: None,
+            cache_break: None,
         });
         self.last_sequence = sequence.0;
         Ok(sequence)
@@ -452,6 +467,15 @@ impl RequestUsageLedger {
         bytes: usize,
     ) -> Result<(), LedgerError> {
         self.in_flight(sequence)?.serialized_request_bytes = Some(bytes);
+        Ok(())
+    }
+
+    pub fn record_cache_break(
+        &mut self,
+        sequence: RequestSequence,
+        note: CacheBreakNote,
+    ) -> Result<(), LedgerError> {
+        self.in_flight(sequence)?.cache_break = Some(note);
         Ok(())
     }
 
@@ -573,6 +597,37 @@ mod tests {
         assert!(wire.get("auxiliary_entries").is_none());
         let restored: RequestUsageLedger = serde_json::from_value(wire).unwrap();
         assert_eq!(restored, ledger);
+    }
+
+    #[test]
+    fn a_cache_break_note_rides_on_its_in_flight_request_and_is_absent_otherwise() {
+        let mut ledger = RequestUsageLedger::new();
+        let unbroken = ledger
+            .start(owner(), ModelRequestKind::Conversation, identity())
+            .unwrap();
+        let broken = ledger
+            .start(owner(), ModelRequestKind::Conversation, identity())
+            .unwrap();
+        let note = CacheBreakNote {
+            first_changed: Some("system:host_state.mode".into()),
+            likely_cause: "prefix_changed".into(),
+            gap_seconds: 4,
+        };
+        ledger.record_cache_break(broken, note.clone()).unwrap();
+        ledger.finish(broken, RequestOutcome::Accepted).unwrap();
+        assert_eq!(
+            ledger.record_cache_break(broken, note.clone()),
+            Err(LedgerError::RequestAlreadyFinished(broken))
+        );
+        let wire = serde_json::to_value(&ledger).unwrap();
+        assert!(wire["entries"][0].get("cache_break").is_none());
+        assert_eq!(
+            wire["entries"][1]["cache_break"],
+            serde_json::json!({"first_changed":"system:host_state.mode","likely_cause":"prefix_changed","gap_seconds":4})
+        );
+        let restored: RequestUsageLedger = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.entries()[0].sequence, unbroken);
+        assert_eq!(restored.entries()[1].cache_break, Some(note));
     }
     use crate::Protocol;
     use uuid::Uuid;

@@ -34,6 +34,7 @@ mod conversation_layout_tests;
 mod conversation_picker;
 #[cfg(test)]
 mod daemon_loss_tests;
+mod debug_line;
 mod denials_surface;
 pub mod diff_catalog;
 pub mod diff_dialog;
@@ -334,6 +335,7 @@ fn write_next_reply_line(console: &Console, reply: &mut ReplyLines) -> Result<()
 fn write_completion_notice(
     console: &Console,
     details: Option<&CompletionDetails>,
+    debug: Option<&CompletionDebug>,
 ) -> Result<(), String> {
     let display = console.display_profile()?;
     let interactive = console.is_interactive();
@@ -353,11 +355,56 @@ fn write_completion_notice(
         None => ("Reply completed".into(), ""),
     };
     // Claude Code's turn summary, `Worked for 12s`, is muted throughout.
-    console.write_completion_notice(&[
+    let mut spans = vec![
         (heading, Some(Role::MutedText)),
         (details.into(), Some(Role::MutedText)),
-        ("\n".into(), None),
-    ])
+    ];
+    if let Some(debug) = debug {
+        let cache = &debug.summary;
+        spans.push((" · ".into(), Some(Role::MutedText)));
+        spans.push((
+            cache.cache.clone(),
+            Some(if cache.is_warning {
+                Role::Warning
+            } else {
+                Role::MutedText
+            }),
+        ));
+        if let Some(average) = &cache.average {
+            spans.push((format!(" · {average}"), Some(Role::MutedText)));
+        }
+        if interactive && console.debug_button_is_clickable()? {
+            spans.push(("  ".into(), Some(Role::MutedText)));
+            spans.push((debug_line::DEBUG_BUTTON.into(), Some(Role::Link)));
+        }
+        console.remember_debug_details(debug.details.clone())?;
+    }
+    spans.push(("\n".into(), None));
+    console.write_completion_notice(&spans)
+}
+
+/// What a finished turn's line adds when the Console shows debug details: its prompt cache
+/// summary, and the details its button copies.
+struct CompletionDebug {
+    summary: debug_line::CacheSummary,
+    details: String,
+}
+
+/// The debug details of `run`, when the Console shows them and the run made a model request the
+/// ledger, which lives only as long as the Agent's process, still holds.
+fn completion_debug(
+    console: &Console,
+    snapshot: &ChatSnapshot,
+    run: RunId,
+) -> Result<Option<CompletionDebug>, String> {
+    if !console.shows_debug_details()? {
+        return Ok(None);
+    }
+    let turn = debug_line::TurnDebug::of(snapshot, run);
+    Ok((!turn.has_no_requests()).then(|| CompletionDebug {
+        summary: turn.cache_summary(),
+        details: turn.details(),
+    }))
 }
 
 /// What a finished run reports: how long it worked, in one of Claude Code's verbs that the run
@@ -422,6 +469,7 @@ fn command_timing(command: &str) -> CommandTiming {
             "/exit"
                 | "/help"
                 | "/details"
+                | debug_line::DEBUG_COMMAND
                 | "/diff"
                 | "/status"
                 | "/context"
@@ -3995,6 +4043,7 @@ async fn interact_with_herdr(
                             } else {console.update_transcript(id,vec!["No conversation yet. Return to enter a task.".into()].into())?;}
                         },
                         "/details" => out!(console, "{}",tools.toggle()),
+                        debug_line::DEBUG_COMMAND if console.shows_debug_details()? => console.copy_debug_details()?,
                         "/diff" if interactive => {
                             if let Some(chat) = selected_chat {
                                 open_diff(agent,console,chat).await?;
@@ -4721,7 +4770,12 @@ async fn interact_with_herdr(
                                 let shells = task_center.snapshot(event.chat_id.into()).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
                                 Some(completion_details(event.run_id, observed_run_starts.get(&event.run_id.uuid()).map(std::time::Instant::elapsed), shells))
                             } else { None };
-                            write_completion_notice(console, details.as_ref())?;
+                            let debug = if console.shows_debug_details()?
+                                && let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await
+                            {
+                                completion_debug(console, &snapshot, event.run_id)?
+                            } else { None };
+                            write_completion_notice(console, details.as_ref(), debug.as_ref())?;
                             if suggestible_runs.remove(&event.run_id.uuid()) && interactive {
                                 if let Ok(status) = turn_snapshot.status(agent, event.chat_id).await {
                                     if let Some(reason) = prompt_suggestion::suppression(&status) {
@@ -6115,7 +6169,8 @@ fn render_restored_observation(
                     }
                 }
                 EventKind::Completed { .. } => {
-                    write_completion_notice(console, None)?;
+                    let debug = completion_debug(console, &observation.snapshot, event.run_id)?;
+                    write_completion_notice(console, None, debug.as_ref())?;
                 }
                 EventKind::Started if console.is_interactive() => {
                     console.hide_completion_notice()?;
@@ -8500,6 +8555,99 @@ async fn navigate_agent(
 mod tests {
     use super::InputEvent;
     use std::sync::Arc;
+
+    /// The finished line of a turn as `write_completion_notice` writes it, with the role of each
+    /// non-blank span.
+    fn finished_line(
+        mouse: bool,
+        shells: usize,
+        debug: Option<super::CompletionDebug>,
+    ) -> (String, Vec<(String, Option<super::Role>)>) {
+        let console = super::Console::test_interactive_for_chat(uuid::Uuid::from_u128(1));
+        if mouse {
+            console.test_capture_mouse();
+        }
+        let run = uuid::Uuid::from_u128(5).into();
+        let details =
+            super::completion_details(run, Some(std::time::Duration::from_secs(8)), shells);
+        super::write_completion_notice(&console, Some(&details), debug.as_ref()).unwrap();
+        let rows = console.test_conversation_rows();
+        let row = rows
+            .iter()
+            .find(|row| row.spans.iter().any(|span| span.text.contains(" for 8s")))
+            .unwrap();
+        (
+            row.spans.iter().map(|span| span.text.as_str()).collect(),
+            row.spans
+                .iter()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| (span.text.clone(), span.role))
+                .collect(),
+        )
+    }
+
+    fn debug(cache: &str, is_warning: bool, average: Option<&str>) -> super::CompletionDebug {
+        super::CompletionDebug {
+            summary: super::debug_line::CacheSummary {
+                cache: cache.into(),
+                is_warning,
+                average: average.map(Into::into),
+            },
+            details: "chat: fixture".into(),
+        }
+    }
+
+    #[test]
+    fn the_cache_summary_and_button_end_the_finished_line_after_what_it_already_says() {
+        let (plain, _) = finished_line(true, 1, None);
+        let verb = plain.split(" for 8s").next().unwrap().to_owned();
+        assert_eq!(plain, format!("{verb} for 8s · 1 shell still running"));
+        for (cache, warning, average, mouse, expected) in [
+            (
+                "cache 96%",
+                false,
+                Some("avg 91%"),
+                true,
+                " · cache 96% · avg 91%  [debug info]",
+            ),
+            (
+                "cache cold",
+                false,
+                None,
+                true,
+                " · cache cold  [debug info]",
+            ),
+            ("cache n/a", false, None, true, " · cache n/a  [debug info]"),
+            (
+                "cache 4% (break: tools)",
+                true,
+                Some("avg 88%"),
+                true,
+                " · cache 4% (break: tools) · avg 88%  [debug info]",
+            ),
+            // Without mouse capture a button could not be clicked, so /debug stands alone.
+            (
+                "cache 96%",
+                false,
+                Some("avg 91%"),
+                false,
+                " · cache 96% · avg 91%",
+            ),
+        ] {
+            let (line, roles) = finished_line(mouse, 1, Some(debug(cache, warning, average)));
+            assert_eq!(line, format!("{plain}{expected}"));
+            for (text, role) in roles {
+                let expected_role = if text == cache && warning {
+                    super::Role::Warning
+                } else if text == super::debug_line::DEBUG_BUTTON {
+                    super::Role::Link
+                } else {
+                    super::Role::MutedText
+                };
+                assert_eq!(role, Some(expected_role), "{text}");
+            }
+        }
+    }
 
     #[test]
     fn model_setup_blocks_messages_and_skills_but_keeps_local_commands() {

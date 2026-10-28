@@ -51,6 +51,8 @@ if [ ! -e "$dev_root" ]; then
     printf 'Seeded development configuration:%s\n' "${seeded:- nothing (no saved settings or model login)}" >&2
 fi
 export TICKLOOP_CONFIG_DIR="$dev_root"
+# A development build shows each finished turn's debug details unless the caller chose.
+export TICKLOOP_DEBUG="${TICKLOOP_DEBUG-1}"
 unset TICKLOOP_TICK_RUNTIME_DIR
 printf 'Development configuration: %s\n' "$TICKLOOP_CONFIG_DIR" >&2
 
