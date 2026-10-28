@@ -861,7 +861,7 @@ fn tab_selects_every_row_in_turn_and_previews_the_cards_it_passes() {
     attaches(state.key(key(KeyCode::Tab)), chat, one);
     assert_eq!(selected(&state), *one);
     assert_eq!(origin(&state, one), Some(CardOrigin::Preview));
-    assert!(state.monitor_list_hint().contains("space keep"));
+    assert!(state.monitor_list_hint().contains("space hide"));
     assert!(!state.card_focused(), "Tab leaves the keys on the list");
 
     attaches(state.key(key(KeyCode::Tab)), chat, two);
@@ -871,14 +871,16 @@ fn tab_selects_every_row_in_turn_and_previews_the_cards_it_passes() {
     );
     assert_eq!(origin(&state, two), Some(CardOrigin::Preview));
     assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(!state.cards.is_open(two), "Space hides a preview too");
+    attaches(state.key(key(KeyCode::Char(' '))), chat, two);
     assert_eq!(
         origin(&state, two),
         Some(CardOrigin::User),
-        "Space keeps it"
+        "Space shows it as the user's"
     );
 
     attaches(state.key(key(KeyCode::Tab)), chat, three);
-    assert!(state.cards.is_open(two), "a kept card stays");
+    assert!(state.cards.is_open(two), "a card the user showed stays");
     assert!(state.key(key(KeyCode::Tab)).is_none());
     assert_eq!(
         selected(&state),

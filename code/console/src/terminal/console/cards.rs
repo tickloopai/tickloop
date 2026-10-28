@@ -84,23 +84,16 @@ impl State {
         })
     }
 
-    /// Space, or a click on the row: shows the card, keeps a card Tab only previewed, or hides
-    /// a kept one, which detaches its view. The focus stays on the list.
+    /// Space, or a click on the row: shows the card, or hides it, previewed or not, which
+    /// detaches its view. The focus stays on the list.
     pub(super) fn toggle_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
         self.rendered_region = None;
-        if self.card_is_kept(&instance) {
+        if self.cards.is_open(&instance) {
             self.cards.hide(&instance);
             self.card_sizes.remove(&instance);
             return None;
         }
         self.open_card(instance, CardOrigin::User)
-    }
-
-    /// Whether `instance`'s card is open and not only previewed, so Space hides it.
-    fn card_is_kept(&self, instance: &InstanceRef) -> bool {
-        self.cards
-            .card(instance)
-            .is_some_and(|card| card.origin != CardOrigin::Preview)
     }
 
     /// Enter, or a click inside a card: shows the card if it is hidden, keeps it, and gives it
@@ -655,10 +648,8 @@ impl State {
         if !self.row_toggles_card(&entry.instance) {
             return hint;
         }
-        let space = if self.card_is_kept(&entry.instance) {
+        let space = if self.cards.is_open(&entry.instance) {
             "space hide"
-        } else if self.cards.is_open(&entry.instance) {
-            "space keep"
         } else {
             "space show"
         };
