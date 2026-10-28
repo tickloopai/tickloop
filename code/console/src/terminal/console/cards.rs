@@ -4,10 +4,10 @@
 use super::*;
 use crate::terminal::monitor::MonitorTarget;
 use crate::terminal::monitor_cards::{
-    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardScreen, CardSize,
-    CardState, CardView, DEFAULT_CARD_ROWS, SgrMouse, ViewEnd,
+    CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardOrigin, CardScreen,
+    CardSize, CardState, CardView, DEFAULT_CARD_ROWS, SgrMouse, ViewEnd,
 };
-use tick_protocol::InstanceRef;
+use tick_protocol::{BubbledKey, InstanceRef};
 
 /// What the frame needs of one open card; its screen is locked only while the frame is drawn.
 pub(super) struct CardSource {
@@ -44,24 +44,34 @@ impl State {
             })
     }
 
+    fn card_member(
+        &self,
+        instance: &InstanceRef,
+    ) -> Option<&tickloop_harness::protocol::MonitorMember> {
+        self.monitor.chat_status.as_ref().and_then(|status| {
+            status
+                .monitor
+                .members
+                .iter()
+                .find(|member| &member.instance == instance)
+        })
+    }
+
     /// The fewest rows the Tick declared when it opened, or the default.
     fn card_min_rows(&self, instance: &InstanceRef) -> u16 {
-        self.monitor
-            .chat_status
-            .as_ref()
-            .and_then(|status| {
-                status
-                    .monitor
-                    .members
-                    .iter()
-                    .find(|member| &member.instance == instance)
-            })
+        self.card_member(instance)
             .and_then(|member| member.min_rows)
             .unwrap_or(DEFAULT_CARD_ROWS)
             .clamp(
                 tick_protocol::MIN_SCREEN_ROWS,
                 tick_protocol::MAX_SCREEN_ROWS,
             )
+    }
+
+    /// The most rows the Tick declared it can use when it opened, if any.
+    fn card_max_rows(&self, instance: &InstanceRef) -> Option<u16> {
+        self.card_member(instance)
+            .and_then(|member| member.max_rows)
     }
 
     /// The size `instance`'s view attaches at: its last allotted size, or its minimum at the
@@ -74,35 +84,44 @@ impl State {
         })
     }
 
-    /// Space, or a click on the row: shows the card, or hides it, which detaches its view. The
-    /// focus stays on the list.
+    /// Space, or a click on the row: shows the card, keeps a card Tab only previewed, or hides
+    /// a kept one, which detaches its view. The focus stays on the list.
     pub(super) fn toggle_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
         self.rendered_region = None;
-        if self.cards.is_open(&instance) {
-            self.cards.close(&instance);
+        if self.card_is_kept(&instance) {
+            self.cards.hide(&instance);
             self.card_sizes.remove(&instance);
             return None;
         }
-        self.open_card(instance)
+        self.open_card(instance, CardOrigin::User)
     }
 
-    /// Enter, or a click inside a card: shows the card if it is hidden and gives it the focus,
-    /// so the user's input goes to its Tick.
+    /// Whether `instance`'s card is open and not only previewed, so Space hides it.
+    fn card_is_kept(&self, instance: &InstanceRef) -> bool {
+        self.cards
+            .card(instance)
+            .is_some_and(|card| card.origin != CardOrigin::Preview)
+    }
+
+    /// Enter, or a click inside a card: shows the card if it is hidden, keeps it, and gives it
+    /// the focus, so the user's input goes to its Tick.
     pub(super) fn enter_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
-        self.rendered_region = None;
-        self.monitor.select(&instance);
-        let attach = if self.cards.is_open(&instance) {
-            None
-        } else {
-            self.open_card(instance.clone())
-        };
-        self.cards.focus(instance);
+        let attach = self.open_card(instance.clone(), CardOrigin::User);
+        self.focus_card(instance);
         attach
     }
 
-    fn open_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
+    /// Gives an open card the focus, selecting its row so the list scrolls to it.
+    fn focus_card(&mut self, instance: InstanceRef) {
+        self.rendered_region = None;
+        self.monitor.select(&instance);
+        self.cards.focus(instance);
+    }
+
+    /// Opens `instance`'s card for `origin`; the event attaches its view when it was not open.
+    fn open_card(&mut self, instance: InstanceRef, origin: CardOrigin) -> Option<InputEvent> {
         let chat = self.chat?;
-        if !self.cards.open(chat, instance.clone()) {
+        if !self.cards.open_as(chat, instance.clone(), origin) {
             return None;
         }
         Some(InputEvent::TickAction {
@@ -133,6 +152,133 @@ impl State {
         self.rendered_region = None;
     }
 
+    /// Tab and Shift+Tab on the list, or bubbled by a focused card's Tick: selects the next or
+    /// previous row, wrapping. A row that can have a card shows it as a preview, which `enter`
+    /// enters; the preview Tab showed before closes unless the user kept it. Moving onto a row
+    /// without a card from a card leaves the card for the list.
+    pub(super) fn cycle_rows(&mut self, delta: isize, enter: bool) -> Option<InputEvent> {
+        self.rendered_region = None;
+        self.monitor.cycle_selection(delta);
+        let row = self
+            .monitor
+            .selected()
+            .map(|entry| entry.instance.clone())
+            .filter(|instance| self.has_card(instance));
+        self.cards.close_preview(row.as_ref());
+        let Some(instance) = row else {
+            self.leave_card();
+            return None;
+        };
+        let attach = self.open_card(instance.clone(), CardOrigin::Preview);
+        if enter {
+            self.focus_card(instance);
+        }
+        attach
+    }
+
+    /// Acts on the first key the focused card's Tick bubbled that moves the focus; the keys
+    /// after it came from where the focus no longer is and go nowhere. Returns whether anything
+    /// changed, and what a card that Tab showed asks of the Agent.
+    pub(super) fn settle_bubbled_keys(&mut self) -> (bool, Option<InputEvent>) {
+        for key in self.cards.take_bubbled() {
+            if !self.card_focused() {
+                break;
+            }
+            match key {
+                BubbledKey::Right => continue,
+                BubbledKey::Esc => {
+                    self.leave_card();
+                    self.monitor.focus(self.monitor.overlay, None);
+                }
+                BubbledKey::Up => self.focus_adjacent_card(-1),
+                BubbledKey::Down => self.focus_adjacent_card(1),
+                BubbledKey::Left => {
+                    self.leave_card();
+                    self.monitor.focused = false;
+                    self.monitor.overlay = false;
+                }
+                BubbledKey::Tab => return (true, self.cycle_rows(1, true)),
+                BubbledKey::Backtab => return (true, self.cycle_rows(-1, true)),
+            }
+            return (true, None);
+        }
+        (false, None)
+    }
+
+    /// Moves the focus to the shown card before or after the focused one in the list, or back
+    /// to the list past either end, with the focused card's row selected.
+    fn focus_adjacent_card(&mut self, delta: isize) {
+        let Some(focused) = self.cards.focused().cloned() else {
+            return;
+        };
+        let entries = self.monitor.entries();
+        let position =
+            |instance: &InstanceRef| entries.iter().position(|entry| &entry.instance == instance);
+        let mut shown: Vec<InstanceRef> = self
+            .shown_cards
+            .iter()
+            .filter(|instance| position(instance).is_some())
+            .cloned()
+            .collect();
+        if !shown.contains(&focused) {
+            shown.push(focused.clone());
+        }
+        shown.sort_by_key(|instance| position(instance));
+        let index = shown.iter().position(|instance| instance == &focused);
+        let next = index
+            .and_then(|index| index.checked_add_signed(delta))
+            .and_then(|index| shown.get(index))
+            .cloned();
+        match next {
+            Some(instance) => self.focus_card(instance),
+            None => {
+                self.leave_card();
+                self.monitor.focus(self.monitor.overlay, None);
+                self.monitor.select(&focused);
+            }
+        }
+    }
+
+    /// Shows the cards of the rows the Agent just used or took an update in from, as long as the
+    /// user has not hidden them; the focus and selection stay. While the user is outside the
+    /// Monitor, the list also scrolls the newest of them into view. Returns whether a card
+    /// opened; the attaches of their views wait for [`State::settle_card_signals`].
+    pub(super) fn show_agent_cards(&mut self) -> bool {
+        let touched = self.monitor.take_agent_touched();
+        let user_in_monitor = self.monitor.focused || self.card_focused();
+        let mut opened = None;
+        for instance in touched {
+            if !self.has_card(&instance)
+                || self.cards.is_open(&instance)
+                || !self.cards.agent_may_show(&instance)
+            {
+                continue;
+            }
+            if let Some(attach) = self.open_card(instance.clone(), CardOrigin::Agent) {
+                self.queued_card_inputs.push(attach);
+                opened = Some(instance);
+            }
+        }
+        let Some(instance) = opened else {
+            return false;
+        };
+        if !user_in_monitor {
+            self.monitor.reveal_row(instance);
+        }
+        self.rendered_region = None;
+        true
+    }
+
+    /// What cards settle apart from the user's own input: keys a focused card's Tick bubbled,
+    /// and cards the Agent's use shows. Returns whether the screen changed, and what to send.
+    pub(super) fn settle_card_signals(&mut self) -> (bool, Vec<InputEvent>) {
+        let (bubbled, event) = self.settle_bubbled_keys();
+        let shown = self.show_agent_cards();
+        let mut inputs = std::mem::take(&mut self.queued_card_inputs);
+        inputs.extend(event);
+        (bubbled || shown, inputs)
+    }
+
     /// Whether the last frame showed a card, so that a frame of its Tick changes the screen.
     pub(super) fn card_in_view(&self) -> bool {
         self.monitor_row_targets
@@ -151,11 +297,19 @@ impl State {
     /// outside the card and the mouse reports after it are the Console's, drawn to `output`.
     pub(super) fn card_input(&mut self, input: &[u8], now: Instant, output: &mut impl Write) {
         let paste_markers = self.focused_card_screen(|screen| screen.bracketed_paste());
-        let items = self
-            .cards
-            .keys_mut()
-            .feed(input, now, paste_markers.unwrap_or(false));
+        let read_only = self.focused_card_is_read_only();
+        let items =
+            self.cards
+                .keys_mut()
+                .feed(input, now, paste_markers.unwrap_or(false), read_only);
         self.apply_card_inputs(items, now, output);
+    }
+
+    /// A Shell's card shows its screen and takes no keys, so a lone Esc leaves it.
+    fn focused_card_is_read_only(&self) -> bool {
+        self.cards
+            .focused()
+            .is_some_and(|instance| instance.shell_task().is_some())
     }
 
     /// Settles a held Esc once its time passed; returns whether the screen changed.
@@ -163,7 +317,8 @@ impl State {
         if !self.card_focused() {
             return false;
         }
-        let items = self.cards.keys_mut().expire(now);
+        let read_only = self.focused_card_is_read_only();
+        let items = self.cards.keys_mut().expire(now, read_only);
         let leaves = items.contains(&CardInput::Leave);
         self.apply_card_inputs(items, now, &mut io::sink());
         leaves
@@ -249,13 +404,15 @@ impl State {
     }
 
     /// A key crossterm decoded before the input thread switched to the card's raw input: passed
-    /// on as the Tick's terminal would send it; Esc leaves.
+    /// on as the Tick's terminal would send it; Esc counts as a lone Esc.
     pub(super) fn card_key(&mut self, key: KeyEvent) -> Option<InputEvent> {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        if key.code == KeyCode::Esc {
-            self.leave_card();
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            let read_only = self.focused_card_is_read_only();
+            let items = self.cards.keys_mut().escape(Instant::now(), read_only);
+            self.apply_card_inputs(items, Instant::now(), &mut io::sink());
             return None;
         }
         let application_cursor = self
@@ -288,6 +445,7 @@ impl State {
     /// still listed. A card whose Tick ended, as its row or its view tells, keeps its last screen
     /// and says how on its rule.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
+        self.monitor.card_focused = self.card_focused();
         let monitor = &self.monitor;
         self.cards
             .retain(self.chat, |instance| monitor.lists(instance));
@@ -314,6 +472,7 @@ impl State {
                     instance: card.instance.clone(),
                     demand: CardDemand {
                         min_rows: self.card_min_rows(&card.instance),
+                        max_rows: self.card_max_rows(&card.instance),
                         priority: self.cards.priority(card),
                     },
                     focused: focused.as_ref() == Some(&card.instance),
@@ -374,6 +533,7 @@ impl State {
     /// frame did not show, such as when a menu covers Monitor.
     pub(super) fn settle_cards(&mut self, sizes: Vec<(InstanceRef, CardSize)>) {
         let resizes_due = std::mem::take(&mut self.card_resizes_due);
+        self.shown_cards = sizes.iter().map(|(instance, _)| instance.clone()).collect();
         for (instance, size) in &sizes {
             if let Some(card) = self.cards.card_mut(instance)
                 && let CardState::Attached(view) = &mut card.state
@@ -482,6 +642,8 @@ impl State {
         if let Some(focused) = self.cards.focused() {
             return if focused.shell_task().is_some() {
                 crate::terminal::monitor_cards::FOCUSED_SHELL_CARD_HINT
+            } else if self.cards.focused_bubbles() {
+                crate::terminal::monitor_cards::FOCUSED_BUBBLING_CARD_HINT
             } else {
                 crate::terminal::monitor_cards::FOCUSED_CARD_HINT
             }
@@ -494,8 +656,10 @@ impl State {
         if !self.row_toggles_card(&entry.instance) {
             return hint;
         }
-        let space = if self.cards.is_open(&entry.instance) {
+        let space = if self.card_is_kept(&entry.instance) {
             "space hide"
+        } else if self.cards.is_open(&entry.instance) {
+            "space keep"
         } else {
             "space show"
         };

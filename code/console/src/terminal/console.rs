@@ -944,6 +944,11 @@ pub(super) struct State {
     card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
     /// The next frame sends each card's size at once, as when a separator drag ends.
     card_resizes_due: bool,
+    /// The cards the last frame showed, collapsed ones left out.
+    shown_cards: Vec<tick_protocol::InstanceRef>,
+    /// What showing cards asked of the Agent outside a key, such as attaching a view the
+    /// Agent's use showed; the input loop sends it.
+    queued_card_inputs: Vec<InputEvent>,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
@@ -6280,6 +6285,8 @@ impl State {
             cards: Default::default(),
             card_sizes: HashMap::new(),
             card_resizes_due: false,
+            shown_cards: Vec::new(),
+            queued_card_inputs: Vec::new(),
             card_press: None,
             member_probes: Vec::new(),
             member_probe_running: false,
@@ -6679,8 +6686,11 @@ impl State {
                     self.conversation_focused = false;
                     self.monitor.focus(self.monitor.overlay, None);
                     self.monitor.select_target(&instance);
-                    self.pointer_input =
-                        self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    // An edge line only scrolls to the row it counts; it opens nothing.
+                    if !matches!(instance, super::monitor::MonitorTarget::Unseen { .. }) {
+                        self.pointer_input =
+                            self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
                     return true;
                 }
                 if self.monitor_toggle_target.as_ref().is_some_and(|target| {
@@ -12565,6 +12575,12 @@ impl State {
                     self.monitor.overlay = false;
                     self.rendered_region = None;
                 }
+                (KeyCode::Tab, KeyModifiers::NONE) => return self.cycle_rows(1, false),
+                (KeyCode::BackTab, _) => return self.cycle_rows(-1, false),
+                (KeyCode::Char(super::monitor::NEXT_UNSEEN_KEY), KeyModifiers::NONE) => {
+                    self.monitor.select_next_unseen();
+                    self.rendered_region = None;
+                }
                 (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
@@ -13947,11 +13963,13 @@ fn idle_tick(
     // scrolling from here.
     let selection_scrolled = state.scroll_selection(Instant::now());
     let requested_plan_edit = state.take_requested_plan_edit();
+    let (cards_changed, card_inputs) = state.settle_card_signals();
     if state.poll_clipboard_hint(Instant::now())
         || confirmation_expired
         || rows_changed
         || hint_changed
         || selection_scrolled
+        || cards_changed
         || requested_plan_edit.is_some()
     {
         state.draw(&mut io::stdout().lock())?;
@@ -13959,7 +13977,9 @@ fn idle_tick(
     drop(state);
     Ok(requested_plan_edit
         .flatten()
-        .is_none_or(|input| send_input(sender, stop, input)))
+        .into_iter()
+        .chain(card_inputs)
+        .all(|input| send_input(sender, stop, input)))
 }
 
 /// Reads the user's raw input for the focused Monitor card, waiting at most until `deadline`,

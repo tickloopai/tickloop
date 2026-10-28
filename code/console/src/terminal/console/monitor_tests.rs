@@ -300,7 +300,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::Tick(tick.instance.clone()),
             "exit 0",
-            "enter open · x remove · esc input",
+            "enter open · x remove · tab next · esc input",
         ),
         (
             MonitorTarget::ScheduledTask(TASK_ID),
@@ -330,6 +330,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
             }
             MonitorTarget::MoreScheduled => panic!("one scheduled task has no overflow row"),
             MonitorTarget::Card { .. } => panic!("no card is open"),
+            MonitorTarget::Unseen { .. } => panic!("no update is unseen"),
             MonitorTarget::Goal => {
                 assert!(state.monitor.is_goal_selected());
                 assert!(state.monitor.selected().is_none());

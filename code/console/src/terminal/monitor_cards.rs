@@ -4,12 +4,13 @@
 //! Tick, so it reads the keys its own terminal would send.
 
 use std::{
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
-use tick_protocol::InstanceRef;
+use tick_protocol::{BubbledKey, InstanceRef};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
@@ -34,9 +35,9 @@ pub(super) const DEFAULT_CARD_ROWS: u16 = tick_protocol::MIN_SCREEN_ROWS;
 const RULE_ROWS: usize = 1;
 /// Each shown card also needs its own row in the list above it.
 const CARD_ROW: usize = 1;
-/// A lone Esc leaves the card once nothing else follows it within this time; a second Esc within
-/// it sends one Esc to the Tick instead.
-pub(super) const ESCAPE_WINDOW: Duration = Duration::from_millis(400);
+/// A lone Esc reaches the Tick at once; a second lone Esc within this time of the first leaves
+/// the card instead and never reaches the Tick.
+pub(super) const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(300);
 /// The bytes of one key's escape sequence arrive together; an Esc with nothing after it for this
 /// long was pressed alone.
 const SEQUENCE_DELAY: Duration = Duration::from_millis(50);
@@ -57,8 +58,11 @@ const CARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const CARD_RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-/// Esc goes back to the Monitor list, whose own hints then offer Space to show other cards.
-pub(super) const FOCUSED_CARD_HINT: &str = "esc back to list · esc esc send esc";
+/// Esc Esc goes back to the Monitor list, whose own hints then offer Space to show other cards.
+pub(super) const FOCUSED_CARD_HINT: &str = "esc esc back to list";
+/// A Tick that bubbles the keys it does not use also leaves on one Esc it does not use, and its
+/// arrows and Tab move between cards.
+pub(super) const FOCUSED_BUBBLING_CARD_HINT: &str = "esc or esc esc back · ↑↓ tab move";
 /// A Shell's card is read-only, so leaving is all its keys do.
 pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc back to list";
 
@@ -92,11 +96,29 @@ impl CardSize {
     }
 }
 
+/// The most bubbled keys a card holds until the Console takes them; more are dropped.
+const BUBBLED_KEYS: usize = 16;
+
 /// What the Tickhost has shown a card so far.
 pub(super) struct CardScreen {
     pub(super) parser: vt100::Parser,
     /// Why the view ended, once it did.
     pub(super) ended: Option<ViewEnd>,
+    /// Whether the Tick declared it bubbles the keys it does not use.
+    pub(super) bubbling: bool,
+    /// The keys the Tick bubbled that the Console has not acted on yet, oldest first.
+    pub(super) bubbled: Vec<BubbledKey>,
+}
+
+impl CardScreen {
+    pub(super) fn new(parser: vt100::Parser) -> Self {
+        Self {
+            parser,
+            ended: None,
+            bubbling: false,
+            bubbled: Vec::new(),
+        }
+    }
 }
 
 /// Why a card's view ended.
@@ -241,10 +263,11 @@ impl CardView {
             .request("attach", json!({"size": size.requested()}), CONTROL_TIMEOUT)
             .await?;
         let (events, writer) = connection.into_parts();
-        let screen = Arc::new(Mutex::new(CardScreen {
-            parser: vt100::Parser::new(size.rows.max(1), size.columns.max(1), 0),
-            ended: None,
-        }));
+        let screen = Arc::new(Mutex::new(CardScreen::new(vt100::Parser::new(
+            size.rows.max(1),
+            size.columns.max(1),
+            0,
+        ))));
         let reader = tokio::spawn(read_frames(events, screen.clone(), redraw.clone()));
         let (requests, queued) = mpsc::channel(CARD_REQUESTS);
         tokio::spawn(write_requests(
@@ -267,10 +290,11 @@ impl CardView {
     #[cfg(test)]
     pub(super) fn detached(size: CardSize) -> (Self, mpsc::Receiver<CardRequest>) {
         let (requests, queued) = mpsc::channel(CARD_REQUESTS);
-        let screen = Arc::new(Mutex::new(CardScreen {
-            parser: vt100::Parser::new(size.rows.max(1), size.columns.max(1), 0),
-            ended: None,
-        }));
+        let screen = Arc::new(Mutex::new(CardScreen::new(vt100::Parser::new(
+            size.rows.max(1),
+            size.columns.max(1),
+            0,
+        ))));
         (
             Self {
                 size,
@@ -334,7 +358,25 @@ async fn read_frames(
                 screen.parser.process(data.as_bytes());
             }
             Some("gone") => break ViewEnd::TickEnded,
-            Some("bubbling" | "bubble") => continue,
+            Some("bubbling") => {
+                let Ok(mut screen) = screen.lock() else {
+                    return;
+                };
+                screen.bubbling = event["enabled"].as_bool().unwrap_or(false);
+                screen.bubbled.clear();
+            }
+            Some("bubble") => {
+                let key = event["key"].as_str().and_then(BubbledKey::from_name);
+                let Ok(mut screen) = screen.lock() else {
+                    return;
+                };
+                if let Some(key) = key
+                    && screen.bubbling
+                    && screen.bubbled.len() < BUBBLED_KEYS
+                {
+                    screen.bubbled.push(key);
+                }
+            }
             _ => {
                 break ViewEnd::Failed(super::safe_line(
                     event["error"]["message"].as_str().unwrap_or("view ended"),
@@ -454,10 +496,24 @@ pub(super) enum CardState {
     Failed(String),
 }
 
+/// Who showed a card, which decides which cards stay shown when not all fit and which close by
+/// themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CardOrigin {
+    /// The user showed or entered it: Space, Enter or a click.
+    User,
+    /// Tab selected its row; it closes when Tab moves on unless the user keeps it.
+    Preview,
+    /// The Agent used its Tick or took in its update; it stays until the user hides it.
+    Agent,
+}
+
 pub(super) struct OpenCard {
     pub(super) instance: InstanceRef,
-    /// When the card opened, among this Chat's cards; the most recent ones stay shown.
+    /// When the card opened, or the user last kept it, among this Chat's cards; the most recent
+    /// ones stay shown.
     sequence: u64,
+    pub(super) origin: CardOrigin,
     pub(super) state: CardState,
     /// Input typed into the focused card before its view attached; it reaches the Tick then.
     early_input: Vec<u8>,
@@ -472,6 +528,9 @@ pub(super) struct MonitorCards {
     chat: Option<Uuid>,
     open: Vec<OpenCard>,
     focused: Option<InstanceRef>,
+    /// The cards the user hid in this Chat; the Agent's use shows them again only after the user
+    /// does.
+    hidden: HashSet<InstanceRef>,
     next_sequence: u64,
     keys: CardKeys,
     redraw: Arc<Notify>,
@@ -504,25 +563,73 @@ impl MonitorCards {
         self.open.iter_mut().find(|card| &card.instance == instance)
     }
 
-    /// Opens `instance`'s card in `chat`; cards of another Chat close first. Returns false when
-    /// it was open already.
+    /// Opens `instance`'s card in `chat` as the user's; cards of another Chat close first. A card
+    /// already open becomes the user's. Returns false when it was open already.
+    #[cfg(test)]
     pub(super) fn open(&mut self, chat: Uuid, instance: InstanceRef) -> bool {
+        self.open_as(chat, instance, CardOrigin::User)
+    }
+
+    /// Opens `instance`'s card in `chat` for `origin`. A card the user opens is kept from then
+    /// on, and the Agent's use shows it again later. A card already open keeps its place and
+    /// becomes the user's when the user opens it. Returns false when it was open already.
+    pub(super) fn open_as(
+        &mut self,
+        chat: Uuid,
+        instance: InstanceRef,
+        origin: CardOrigin,
+    ) -> bool {
         if self.chat != Some(chat) {
             self.close_all();
+            self.hidden.clear();
             self.chat = Some(chat);
         }
-        if self.is_open(&instance) {
-            return false;
+        if origin == CardOrigin::User {
+            self.hidden.remove(&instance);
         }
         self.next_sequence += 1;
+        let sequence = self.next_sequence;
+        if let Some(card) = self.card_mut(&instance) {
+            if origin == CardOrigin::User && card.origin != CardOrigin::User {
+                card.origin = CardOrigin::User;
+                card.sequence = sequence;
+            }
+            return false;
+        }
         self.open.push(OpenCard {
             instance,
-            sequence: self.next_sequence,
+            sequence,
+            origin,
             state: CardState::Opening,
             early_input: Vec::new(),
             early_input_overflowed: false,
         });
         true
+    }
+
+    /// The user hides the card: it closes, and the Agent's use no longer shows it.
+    pub(super) fn hide(&mut self, instance: &InstanceRef) {
+        self.close(instance);
+        self.hidden.insert(instance.clone());
+    }
+
+    /// Whether the Agent's use may show `instance`'s card: the user has not hidden it since last
+    /// showing it.
+    pub(super) fn agent_may_show(&self, instance: &InstanceRef) -> bool {
+        !self.hidden.contains(instance)
+    }
+
+    /// Closes the preview card, unless it is `keep`, when Tab moves on.
+    pub(super) fn close_preview(&mut self, keep: Option<&InstanceRef>) {
+        let previews: Vec<InstanceRef> = self
+            .open
+            .iter()
+            .filter(|card| card.origin == CardOrigin::Preview && Some(&card.instance) != keep)
+            .map(|card| card.instance.clone())
+            .collect();
+        for instance in previews {
+            self.close(&instance);
+        }
     }
 
     /// Closes the card, which detaches its view; a focused card loses the focus.
@@ -601,11 +708,38 @@ impl MonitorCards {
         }
     }
 
+    /// Gives the card the focus; the keys its Tick bubbled before are dropped.
     pub(super) fn focus(&mut self, instance: InstanceRef) {
         if self.is_open(&instance) {
             self.focused = Some(instance);
             self.keys = CardKeys::default();
+            self.take_bubbled();
         }
+    }
+
+    /// The keys the focused card's Tick bubbled since they were last taken, oldest first. Keys
+    /// other cards' Ticks bubbled go nowhere.
+    pub(super) fn take_bubbled(&mut self) -> Vec<BubbledKey> {
+        let focused = self.focused.clone();
+        let mut taken = Vec::new();
+        for card in &self.open {
+            if let CardState::Attached(view) = &card.state
+                && let Ok(mut screen) = view.screen.lock()
+            {
+                let bubbled = std::mem::take(&mut screen.bubbled);
+                if focused.as_ref() == Some(&card.instance) {
+                    taken = bubbled;
+                }
+            }
+        }
+        taken
+    }
+
+    /// Whether the focused card's Tick bubbles the keys it does not use.
+    pub(super) fn focused_bubbles(&self) -> bool {
+        self.focused_view()
+            .and_then(|view| view.screen.lock().ok().map(|screen| screen.bubbling))
+            .unwrap_or(false)
     }
 
     pub(super) fn leave_focus(&mut self) {
@@ -626,11 +760,14 @@ impl MonitorCards {
         }
     }
 
-    /// Which card stays shown first when not all fit: the focused one, then the most recently
-    /// opened.
+    /// Which card stays shown first when not all fit: the focused one, then the ones the user
+    /// opened, most recent first, then the ones the Agent or Tab showed, most recent first.
     pub(super) fn priority(&self, card: &OpenCard) -> u64 {
+        const USER_OPENED: u64 = 1 << 62;
         if self.focused.as_ref() == Some(&card.instance) {
             u64::MAX
+        } else if card.origin == CardOrigin::User {
+            USER_OPENED + card.sequence
         } else {
             card.sequence
         }
@@ -706,7 +843,15 @@ pub(super) fn mode_changes(from: Option<CardModes>, to: Option<CardModes>) -> St
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CardDemand {
     pub(super) min_rows: u16,
+    /// The most rows the Tick can use; `None` keeps the card at its minimum.
+    pub(super) max_rows: Option<u16>,
     pub(super) priority: u64,
+}
+
+impl CardDemand {
+    fn max_rows(self) -> u16 {
+        self.max_rows.unwrap_or(self.min_rows).max(self.min_rows)
+    }
 }
 
 /// One open card as a Monitor frame shows it.
@@ -742,10 +887,11 @@ pub(super) struct CardAllocation {
 }
 
 /// Shares a list viewport `height` rows tall among open cards. `list_rows` is what the list
-/// needs without cards, the cards' own rows included. Every shown card gets at least its
-/// minimum below its row and a rule; when not all fit, the ones of highest priority stay and the
-/// others collapse behind one `+N collapsed` line. When even one does not fit, the first stays
-/// shown, cropped. Height the list leaves over goes to the shown cards evenly.
+/// needs without cards, the cards' own rows included. Every shown card gets exactly its minimum
+/// below its row and a rule; when not all fit, the ones of highest priority stay and the others
+/// collapse behind one `+N collapsed` line. When even one does not fit, the first stays shown,
+/// cropped. Height the list leaves over goes to the shown cards that can use more rows, shared
+/// evenly up to each one's maximum; what none of them can use stays empty below the list.
 pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) -> CardAllocation {
     let mut order: Vec<usize> = (0..demands.len()).collect();
     order.sort_by_key(|index| std::cmp::Reverse(demands[*index].priority));
@@ -784,12 +930,11 @@ pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) 
         .map(|index| RULE_ROWS + usize::from(demands[*index].min_rows))
         .sum();
     let spare = height.saturating_sub(list_rows + card_rows + collapsed_line(shown));
-    let (each, remainder) = (spare / shown, spare % shown);
-    for (position, index) in kept.into_iter().enumerate() {
-        let extra = each + usize::from(position < remainder);
-        let screen = demands[index]
-            .min_rows
-            .saturating_add(u16::try_from(extra).unwrap_or(u16::MAX));
+    let screens = grow_into(
+        spare,
+        &kept.iter().map(|index| demands[*index]).collect::<Vec<_>>(),
+    );
+    for (index, screen) in kept.into_iter().zip(screens) {
         cards[index] = Some(CardRows {
             screen,
             shown: screen,
@@ -798,6 +943,27 @@ pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) 
     CardAllocation {
         cards,
         collapsed: demands.len() - shown,
+    }
+}
+
+/// Each card's screen rows: its minimum, and a fair share of `spare` rows up to its maximum.
+/// Rows a share leaves over go one each to the first cards that can still grow.
+fn grow_into(mut spare: usize, demands: &[CardDemand]) -> Vec<u16> {
+    let mut screens: Vec<u16> = demands.iter().map(|demand| demand.min_rows).collect();
+    loop {
+        let growing: Vec<usize> = (0..demands.len())
+            .filter(|index| screens[*index] < demands[*index].max_rows())
+            .collect();
+        if growing.is_empty() || spare == 0 {
+            return screens;
+        }
+        let share = (spare / growing.len()).max(1);
+        for index in growing {
+            let room = usize::from(demands[index].max_rows() - screens[index]);
+            let added = share.min(room).min(spare);
+            screens[index] += u16::try_from(added).unwrap_or(u16::MAX);
+            spare -= added;
+        }
     }
 }
 
@@ -1046,18 +1212,19 @@ pub(super) enum CardInput {
 }
 
 /// Splits a focused card's raw input into what reaches the Tick and what leaves the card. A lone
-/// Esc leaves once nothing follows it within [`ESCAPE_WINDOW`]; a second Esc within it sends one
-/// Esc and keeps the focus; any other key after it sends both. Escape sequences such as arrows,
+/// Esc reaches the Tick as soon as it is known to be alone; a second lone Esc within
+/// [`DOUBLE_ESCAPE_WINDOW`] of it, with no other key between them, leaves the card and never
+/// reaches the Tick. A read-only card leaves on a lone Esc. Escape sequences such as arrows,
 /// Alt-keys and every other byte, Ctrl keys included, reach the Tick unchanged. Text inside a
 /// bracketed paste is never a key; its markers reach the Tick only when it asked for them.
-/// Mouse reports and the terminal's focus reports are never sent as they came, and an Esc held
-/// before them stays held.
+/// Mouse reports and the terminal's focus reports are never sent as they came, and neither
+/// breaks an Esc pair.
 #[derive(Debug, Default)]
 pub(super) struct CardKeys {
     /// An escape sequence not ended yet, perhaps a lone Esc, and when its Esc arrived.
     sequence: Vec<u8>,
     sequence_at: Option<Instant>,
-    /// When a lone Esc was pressed that has not yet left the card or gone to the Tick.
+    /// When the lone Esc the Tick last got was pressed, while a second one would still leave.
     escape_at: Option<Instant>,
     in_paste: bool,
     /// When the paste last brought bytes, and whether the Tick got its start marker.
@@ -1069,12 +1236,13 @@ pub(super) struct CardKeys {
 
 impl CardKeys {
     /// The items `input`, read at `now`, makes; `paste_markers` is whether the Tick asked for
-    /// bracketed paste.
+    /// bracketed paste, and `read_only` whether a lone Esc leaves at once.
     pub(super) fn feed(
         &mut self,
         input: &[u8],
         now: Instant,
         paste_markers: bool,
+        read_only: bool,
     ) -> Vec<CardInput> {
         let mut items = Vec::new();
         if self.in_paste && !input.is_empty() {
@@ -1088,7 +1256,7 @@ impl CardKeys {
             if !self.sequence.is_empty() {
                 if self.sequence == [ESCAPE] && byte == ESCAPE {
                     let at = self.sequence_at.unwrap_or(now);
-                    self.lone_escape(at, &mut items);
+                    self.lone_escape(at, read_only, &mut items);
                     self.sequence_at = Some(now);
                     continue;
                 }
@@ -1101,7 +1269,7 @@ impl CardKeys {
                         self.sequence.push(byte);
                         let sequence = std::mem::take(&mut self.sequence);
                         self.sequence_at = None;
-                        self.token(sequence, now, paste_markers, &mut items);
+                        self.token(sequence, now, paste_markers, read_only, &mut items);
                         continue;
                     }
                     SequenceStep::Breaks => {
@@ -1109,10 +1277,16 @@ impl CardKeys {
                         self.sequence_at = None;
                         if sequence == [ESCAPE] {
                             // An Esc and a key in one read: Alt and that key, both for the Tick.
-                            self.token(vec![ESCAPE, byte], now, paste_markers, &mut items);
+                            self.token(
+                                vec![ESCAPE, byte],
+                                now,
+                                paste_markers,
+                                read_only,
+                                &mut items,
+                            );
                             continue;
                         }
-                        self.token(sequence, now, paste_markers, &mut items);
+                        self.token(sequence, now, paste_markers, read_only, &mut items);
                     }
                 }
             }
@@ -1120,7 +1294,7 @@ impl CardKeys {
                 self.sequence.push(byte);
                 self.sequence_at = Some(now);
             } else {
-                self.token(vec![byte], now, paste_markers, &mut items);
+                self.token(vec![byte], now, paste_markers, read_only, &mut items);
             }
         }
         if self.in_paste {
@@ -1132,15 +1306,14 @@ impl CardKeys {
     /// When [`Self::expire`] next has something to decide.
     pub(super) fn deadline(&self) -> Option<Instant> {
         let sequence = self.sequence_at.map(|at| at + SEQUENCE_DELAY);
-        let escape = self.escape_at.map(|at| at + ESCAPE_WINDOW);
         let paste = self.paste_at.map(|at| at + PASTE_IDLE);
-        [sequence, escape, paste].into_iter().flatten().min()
+        [sequence, paste].into_iter().flatten().min()
     }
 
     /// Settles what waited for time to tell: a held Esc with nothing after it is a lone Esc, an
-    /// unfinished sequence reaches the Tick as it is, a lone Esc nothing followed leaves, and a
-    /// paste that went quiet without its end marker ends.
-    pub(super) fn expire(&mut self, now: Instant) -> Vec<CardInput> {
+    /// unfinished sequence reaches the Tick as it is, and a paste that went quiet without its
+    /// end marker ends. `read_only` is whether a lone Esc leaves at once.
+    pub(super) fn expire(&mut self, now: Instant, read_only: bool) -> Vec<CardInput> {
         let mut items = Vec::new();
         if let Some(at) = self.paste_at
             && now >= at + PASTE_IDLE
@@ -1158,39 +1331,47 @@ impl CardKeys {
             let sequence = std::mem::take(&mut self.sequence);
             self.sequence_at = None;
             if sequence == [ESCAPE] {
-                self.lone_escape(at, &mut items);
+                self.lone_escape(at, read_only, &mut items);
             } else {
                 self.forward(sequence, &mut items);
             }
         }
-        if let Some(at) = self.escape_at
-            && now >= at + ESCAPE_WINDOW
-        {
-            self.escape_at = None;
-            items.push(CardInput::Leave);
-        }
         items
     }
 
-    fn lone_escape(&mut self, at: Instant, items: &mut Vec<CardInput>) {
-        if self.escape_at.take().is_some() {
-            push_bytes(items, &[ESCAPE]);
+    /// An Esc crossterm decoded before the raw input took over, pressed at `at`.
+    pub(super) fn escape(&mut self, at: Instant, read_only: bool) -> Vec<CardInput> {
+        let mut items = Vec::new();
+        self.lone_escape(at, read_only, &mut items);
+        items
+    }
+
+    /// A lone Esc pressed at `at`: the second of a pair, or any on a read-only card, leaves;
+    /// otherwise it reaches the Tick.
+    fn lone_escape(&mut self, at: Instant, read_only: bool, items: &mut Vec<CardInput>) {
+        let second = self
+            .escape_at
+            .take()
+            .is_some_and(|first| at.saturating_duration_since(first) < DOUBLE_ESCAPE_WINDOW);
+        if read_only || second {
+            items.push(CardInput::Leave);
         } else {
+            push_bytes(items, &[ESCAPE]);
             self.escape_at = Some(at);
         }
     }
 
-    /// One whole key or report. A key is sent after any Esc held before it; a report is no key,
-    /// so the Esc stays held.
+    /// One whole key or report. A key ends an Esc pair; a report is no key, so it does not.
     fn token(
         &mut self,
         token: Vec<u8>,
         now: Instant,
         paste_markers: bool,
+        read_only: bool,
         items: &mut Vec<CardInput>,
     ) {
         if is_kitty_escape(&token) {
-            self.lone_escape(now, items);
+            self.lone_escape(now, read_only, items);
             return;
         }
         if token == FOCUS_GAINED || token == FOCUS_LOST {
@@ -1201,9 +1382,7 @@ impl CardKeys {
             items.push(CardInput::Mouse(mouse));
             return;
         }
-        if self.escape_at.take().is_some() {
-            push_bytes(items, &[ESCAPE]);
-        }
+        self.escape_at = None;
         if token == PASTE_START {
             self.in_paste = true;
             self.paste_at = Some(now);
@@ -1217,9 +1396,7 @@ impl CardKeys {
     }
 
     fn forward(&mut self, bytes: Vec<u8>, items: &mut Vec<CardInput>) {
-        if self.escape_at.take().is_some() {
-            push_bytes(items, &[ESCAPE]);
-        }
+        self.escape_at = None;
         push_bytes(items, &bytes);
     }
 

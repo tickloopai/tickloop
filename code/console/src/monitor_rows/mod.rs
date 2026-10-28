@@ -355,7 +355,13 @@ pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
 /// match what a key does.
 pub const MONITOR_PAUSE_KEY: char = 'p';
-pub const MONITOR_KEYS: [char; 2] = [MONITOR_REFRESH_KEY, MONITOR_PAUSE_KEY];
+/// Selects the next row with an unseen update.
+pub const MONITOR_NEXT_UNSEEN_KEY: char = 'n';
+pub const MONITOR_KEYS: [char; 3] = [
+    MONITOR_REFRESH_KEY,
+    MONITOR_PAUSE_KEY,
+    MONITOR_NEXT_UNSEEN_KEY,
+];
 
 /// The Monitor half of an access. Rows are computed from the View's own Chat snapshot,
 /// subscriptions, Shell tasks, artifact metadata and host probes; they never read Tick content,

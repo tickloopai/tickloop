@@ -1,6 +1,8 @@
 use super::*;
 use crate::terminal::monitor::{MonitorEntry, MonitorTarget, TickGroup};
-use crate::terminal::monitor_cards::{CardDemand, CardFrame, FOCUSED_CARD_HINT};
+use crate::terminal::monitor_cards::{
+    CardDemand, CardFrame, CardOrigin, CardState, FOCUSED_CARD_HINT,
+};
 
 fn shell_entry(title: &str) -> MonitorEntry {
     let instance = tick_protocol::InstanceRef::shell(Uuid::new_v4());
@@ -109,7 +111,7 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
 }
 
 #[test]
-fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
+fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_a_read_only_one_open() {
     let mut state = cards_fixture();
     let chat = state.chat.unwrap();
     let first = selected(&state);
@@ -131,9 +133,8 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
     let start = Instant::now();
     state.card_input(b"\x1b", start, &mut Vec::new());
     assert!(state.card_focused(), "an Esc waits for what follows");
-    assert!(!state.expire_card_keys(start + Duration::from_millis(60)));
-    assert!(state.expire_card_keys(start + Duration::from_millis(400)));
-    assert!(!state.card_focused());
+    assert!(state.expire_card_keys(start + Duration::from_millis(60)));
+    assert!(!state.card_focused(), "a lone Esc leaves a read-only card");
     assert!(state.cards.is_open(&first), "the card stays shown");
     assert_eq!(selected(&state), first, "the selection stays on the Tick");
     assert!(state.monitor.focused);
@@ -143,10 +144,11 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
         "entering an open card attaches nothing new"
     );
     assert!(state.card_focused());
-    state.card_input(b"\x1b\x1b", start, &mut Vec::new());
-    state.expire_card_keys(start + Duration::from_millis(60));
-    state.expire_card_keys(start + Duration::from_millis(1000));
-    assert!(state.card_focused(), "Esc Esc stays in the card");
+    state.card_key(key(KeyCode::Esc));
+    assert!(
+        !state.card_focused(),
+        "an Esc decoded before the raw input took over leaves too"
+    );
 }
 
 #[test]
@@ -297,6 +299,7 @@ fn a_focused_card_and_an_unfocused_card_render_their_rows_rules_and_screens() {
             instance: &instance,
             demand: CardDemand {
                 min_rows: 6,
+                max_rows: None,
                 priority: 1,
             },
             focused,
@@ -677,6 +680,7 @@ fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_collapsed() {
         instance,
         demand: CardDemand {
             min_rows: 6,
+            max_rows: None,
             priority: 1,
         },
         focused: false,
@@ -793,4 +797,276 @@ fn a_click_outside_a_focused_card_leaves_it_and_then_acts_where_it_landed() {
         state.pointer_input.is_none() && state.cards.is_open(&first),
         "a drag toggles nothing"
     );
+}
+
+fn hosted_entry(title: &str) -> MonitorEntry {
+    let mut hosted = shell_entry(title);
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    hosted.instance = instance.clone();
+    hosted.group = TickGroup::Ticks;
+    hosted.actions[0].intent = crate::monitor_rows::TickIntent::OpenView(instance);
+    hosted
+}
+
+/// A row that can have no card, as an Artifact's.
+fn plain_entry(title: &str) -> MonitorEntry {
+    let mut plain = shell_entry(title);
+    plain.instance = tick_protocol::InstanceRef::new("calendar", title).unwrap();
+    plain.group = TickGroup::Artifacts;
+    plain.actions[0].intent = crate::monitor_rows::TickIntent::ShowDetails(plain.instance.clone());
+    plain
+}
+
+/// A View whose focused Monitor lists a row without a card and three hosted Ticks; returns the
+/// rows in the list's order, the first selected.
+fn tab_fixture() -> (State, Vec<tick_protocol::InstanceRef>) {
+    let mut state = State::new(true, 140, 60);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state
+        .monitor
+        .replace(TickGroup::Artifacts, vec![plain_entry("notes")]);
+    state.monitor.replace(
+        TickGroup::Ticks,
+        vec![
+            hosted_entry("one"),
+            hosted_entry("two"),
+            hosted_entry("three"),
+        ],
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.monitor.focus(false, None);
+    let rows: Vec<_> = state
+        .monitor
+        .entries()
+        .iter()
+        .map(|entry| entry.instance.clone())
+        .collect();
+    state.monitor.select(&rows[0]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    (state, rows)
+}
+
+fn origin(state: &State, instance: &tick_protocol::InstanceRef) -> Option<CardOrigin> {
+    state.cards.card(instance).map(|card| card.origin)
+}
+
+#[test]
+fn tab_selects_every_row_in_turn_and_previews_the_cards_it_passes() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    let [notes, one, two, three] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    assert!(state.monitor_list_hint().contains("tab next"));
+
+    attaches(state.key(key(KeyCode::Tab)), chat, one);
+    assert_eq!(selected(&state), *one);
+    assert_eq!(origin(&state, one), Some(CardOrigin::Preview));
+    assert!(state.monitor_list_hint().contains("space keep"));
+    assert!(!state.card_focused(), "Tab leaves the keys on the list");
+
+    attaches(state.key(key(KeyCode::Tab)), chat, two);
+    assert!(
+        !state.cards.is_open(one),
+        "the preview closes as Tab moves on"
+    );
+    assert_eq!(origin(&state, two), Some(CardOrigin::Preview));
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert_eq!(
+        origin(&state, two),
+        Some(CardOrigin::User),
+        "Space keeps it"
+    );
+
+    attaches(state.key(key(KeyCode::Tab)), chat, three);
+    assert!(state.cards.is_open(two), "a kept card stays");
+    assert!(state.key(key(KeyCode::Tab)).is_none());
+    assert_eq!(
+        selected(&state),
+        *notes,
+        "Tab wraps to a row without a card"
+    );
+    assert!(!state.cards.is_open(three));
+    assert!(!state.monitor.detail.is_some(), "it only selects that row");
+
+    attaches(state.key(key(KeyCode::BackTab)), chat, three);
+    assert_eq!(selected(&state), *three, "Shift+Tab wraps back");
+    assert!(state.key(key(KeyCode::Enter)).is_none());
+    assert!(state.card_focused());
+    assert_eq!(
+        origin(&state, three),
+        Some(CardOrigin::User),
+        "entering keeps it"
+    );
+}
+
+#[test]
+fn tab_in_the_input_never_moves_the_monitor() {
+    let (mut state, rows) = tab_fixture();
+    state.monitor.focused = false;
+    state.key(key(KeyCode::Tab));
+    state.key(key(KeyCode::BackTab));
+    assert_eq!(selected(&state), rows[0]);
+    assert!(state.cards.cards().is_empty());
+}
+
+/// Opens and attaches the cards of `rows` with the user's Space.
+fn attach_cards(state: &mut State, rows: &[tick_protocol::InstanceRef]) {
+    let chat = state.chat.unwrap();
+    for row in rows {
+        state.monitor.select(row);
+        attaches(state.key(key(KeyCode::Char(' '))), chat, row);
+        let (view, _requests) =
+            crate::terminal::monitor_cards::CardView::detached(state.card_size(row));
+        view.screen.lock().unwrap().bubbling = true;
+        assert!(state.cards.attached(chat, row, view));
+    }
+    state.draw_frame(&mut Vec::new()).unwrap();
+}
+
+fn bubble(
+    state: &mut State,
+    instance: &tick_protocol::InstanceRef,
+    key: tick_protocol::BubbledKey,
+) {
+    let Some(card) = state.cards.card(instance) else {
+        panic!("no card for {instance}");
+    };
+    let CardState::Attached(view) = &card.state else {
+        panic!("{instance} is not attached");
+    };
+    view.screen.lock().unwrap().bubbled.push(key);
+}
+
+#[test]
+fn bubbled_keys_move_the_focus_between_cards_the_list_and_the_input() {
+    use tick_protocol::BubbledKey;
+    let (mut state, rows) = tab_fixture();
+    let [one, two, three] = [&rows[1], &rows[2], &rows[3]];
+    attach_cards(&mut state, &[one.clone(), two.clone(), three.clone()]);
+    state.enter_card(one.clone());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(
+        state.monitor_list_hint(),
+        crate::terminal::monitor_cards::FOCUSED_BUBBLING_CARD_HINT
+    );
+
+    bubble(&mut state, one, BubbledKey::Down);
+    let (changed, inputs) = state.settle_card_signals();
+    assert!(changed && inputs.is_empty());
+    assert_eq!(
+        state.cards.focused(),
+        Some(two),
+        "down enters the next card"
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    bubble(&mut state, two, BubbledKey::Right);
+    bubble(&mut state, two, BubbledKey::Up);
+    bubble(&mut state, two, BubbledKey::Down);
+    state.settle_card_signals();
+    assert_eq!(
+        state.cards.focused(),
+        Some(one),
+        "right is ignored, up acts, the rest go"
+    );
+    bubble(&mut state, one, BubbledKey::Up);
+    state.settle_card_signals();
+    assert!(
+        !state.card_focused() && state.monitor.focused,
+        "up past the first: the list"
+    );
+    assert_eq!(selected(&state), *one);
+
+    state.enter_card(three.clone());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    bubble(&mut state, three, BubbledKey::Down);
+    state.settle_card_signals();
+    assert!(
+        !state.card_focused() && state.monitor.focused,
+        "down past the last: the list"
+    );
+
+    state.enter_card(two.clone());
+    bubble(&mut state, two, BubbledKey::Esc);
+    state.settle_card_signals();
+    assert!(
+        !state.card_focused() && state.monitor.focused,
+        "esc: the list at once"
+    );
+
+    state.enter_card(two.clone());
+    bubble(&mut state, two, BubbledKey::Tab);
+    state.settle_card_signals();
+    assert_eq!(
+        state.cards.focused(),
+        Some(three),
+        "tab enters the next row's card"
+    );
+    bubble(&mut state, three, BubbledKey::Tab);
+    state.settle_card_signals();
+    assert!(!state.card_focused(), "the next row has no card: the list");
+    assert_eq!(selected(&state), rows[0]);
+    assert!(state.monitor.focused);
+
+    state.enter_card(one.clone());
+    bubble(&mut state, one, BubbledKey::Backtab);
+    let (_, inputs) = state.settle_card_signals();
+    assert!(inputs.is_empty());
+    assert!(!state.card_focused());
+    assert_eq!(
+        selected(&state),
+        rows[0],
+        "backtab from the first Tick wraps upward"
+    );
+
+    state.monitor.overlay = true;
+    state.enter_card(two.clone());
+    bubble(&mut state, two, BubbledKey::Left);
+    state.settle_card_signals();
+    assert!(
+        !state.card_focused() && !state.monitor.focused && !state.monitor.overlay,
+        "left: the input, closing an overlay Monitor"
+    );
+    bubble(&mut state, two, BubbledKey::Down);
+    let (changed, inputs) = state.settle_card_signals();
+    assert!(
+        !changed && inputs.is_empty(),
+        "with no card focused nothing bubbles"
+    );
+}
+
+#[test]
+fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    let one = &rows[1];
+    state.monitor.focused = false;
+    state.monitor.flash_use(rows[0].clone(), 1);
+    state.monitor.flash_use(one.clone(), 1);
+    let (changed, inputs) = state.settle_card_signals();
+    assert!(changed);
+    assert_eq!(inputs.len(), 1, "only the row with a card opens one");
+    attaches(inputs.into_iter().next(), chat, one);
+    assert_eq!(origin(&state, one), Some(CardOrigin::Agent));
+    assert!(
+        !state.card_focused() && !state.monitor.focused,
+        "the focus stays"
+    );
+    assert_eq!(selected(&state), rows[0], "the selection stays");
+
+    state.monitor.focus(false, None);
+    state.monitor.select(one);
+    assert!(state.monitor_list_hint().contains("space hide"));
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(!state.cards.is_open(one));
+    state.monitor.flash_use(one.clone(), 2);
+    let (changed, inputs) = state.settle_card_signals();
+    assert!(
+        !changed && inputs.is_empty(),
+        "a card the user hid stays hidden"
+    );
+    attaches(state.key(key(KeyCode::Char(' '))), chat, one);
+    state.cards.close(one);
+    state.monitor.flash_use(one.clone(), 3);
+    let (_, inputs) = state.settle_card_signals();
+    attaches(inputs.into_iter().next(), chat, one);
 }

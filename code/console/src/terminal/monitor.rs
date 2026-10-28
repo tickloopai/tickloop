@@ -39,6 +39,10 @@ const TOO_SHORT_NOTE: &str = "terminal too short";
 
 /// A row whose card other cards took the room from says so at its end.
 const COLLAPSED_CARD_NOTE: &str = "collapsed";
+/// The fewest list lines that make room for an edge line telling of unseen updates.
+const UNSEEN_EDGE_MIN_ROWS: usize = 3;
+/// Selects the next row with an unseen update while the list has the keyboard.
+pub(super) const NEXT_UNSEEN_KEY: char = crate::monitor_rows::MONITOR_NEXT_UNSEEN_KEY;
 
 /// How a row shows that its card is open; its glyph stays its own state mark either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +143,11 @@ pub(super) enum MonitorTarget {
     ScheduledTask(Uuid),
     MoreScheduled,
     Goal,
+    /// The edge line counting rows with unseen updates above (`below: false`) or below the
+    /// visible part of the list.
+    Unseen {
+        below: bool,
+    },
 }
 
 #[derive(Default)]
@@ -181,6 +190,18 @@ pub(super) struct Monitor {
     pub(super) shell_starts: HashMap<uuid::Uuid, u64>,
     pub(super) focused: bool,
     pub(super) overlay: bool,
+    /// Whether a card under a row has the keyboard; the list's status line then hides.
+    pub(super) card_focused: bool,
+    /// The instances the Agent used, or whose update an Agent turn took in, since they were
+    /// last taken; their cards show by themselves.
+    agent_touched: Vec<InstanceRef>,
+    /// A row the next frame scrolls into view without selecting it.
+    reveal: std::cell::RefCell<Option<InstanceRef>>,
+    /// The rows with unseen updates above and below the visible part of the list, as the last
+    /// frame counted them.
+    unseen_edges: Cell<(usize, usize)>,
+    /// The first and last row the last frame showed of the list, wholly or partly.
+    visible_rows: std::cell::RefCell<(Option<InstanceRef>, Option<InstanceRef>)>,
     /// Whether the column has shown rows in this Chat; it then stays when empty, so the
     /// conversation does not change width each time a background Shell starts or ends.
     shown: bool,
@@ -408,6 +429,7 @@ impl Monitor {
                     self.selected = Some(MonitorTarget::Goal);
                 }
             }
+            MonitorTarget::Unseen { below } => self.select_nearest_unseen(*below),
         }
     }
     fn preview_count(&self) -> usize {
@@ -751,6 +773,7 @@ impl Monitor {
         let membership = self.chat_status.as_deref().map(|chat| &chat.monitor);
         let mut listed_updates = HashMap::new();
         let mut signals = Vec::new();
+        let mut touched = Vec::new();
         for entry in listed {
             if let Some(used) = membership
                 .and_then(|membership| membership.used_at(&entry.instance))
@@ -759,6 +782,7 @@ impl Monitor {
                 let previous = self.used.get(&entry.instance).copied();
                 if previous.is_none_or(|previous| used > previous) {
                     self.used.insert(entry.instance.clone(), used);
+                    touched.push(entry.instance.clone());
                     signals.push((RowFlash::Use, used));
                 }
             }
@@ -774,6 +798,7 @@ impl Monitor {
                 let previous = self.seen_take_ins.insert(entry.instance.clone(), taken_in);
                 if previous != Some(taken_in) && taken_in >= flashes_since {
                     self.taken_in.insert(entry.instance.clone(), taken_in);
+                    touched.push(entry.instance.clone());
                     signals.push((RowFlash::TakeIn, taken_in));
                 }
             }
@@ -811,6 +836,9 @@ impl Monitor {
                     .is_some()
         });
         self.listed_updates = listed_updates;
+        for instance in &touched {
+            self.note_agent_touched(instance);
+        }
         for (flash, since) in signals {
             self.note_entry_flash(flash, since);
         }
@@ -829,6 +857,7 @@ impl Monitor {
         self.received.clear();
         self.entry_signal = None;
         self.entry_flash_at_ms = None;
+        self.agent_touched.clear();
     }
     /// When time alone next changes the list: the next finished Shell to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
@@ -933,6 +962,7 @@ impl Monitor {
     /// What `entry`'s whole row flashes for, and since when: the later of an Agent turn taking its
     /// update in and the Agent using its instance, so a flash that starts covers one under way.
     pub(super) fn flash_use(&mut self, instance: InstanceRef, since_ms: u64) {
+        self.note_agent_touched(&instance);
         self.used.insert(instance, since_ms);
         self.note_entry_flash(RowFlash::Use, since_ms);
     }
@@ -1192,6 +1222,21 @@ impl Monitor {
         if let Some(entry) = self.selected() {
             self.tick_anchor = Some(entry.instance.clone());
         }
+        let targets = self.selectable_targets();
+        let index = self
+            .selected
+            .as_ref()
+            .and_then(|selected| targets.iter().position(|target| target == selected))
+            .unwrap_or(0);
+        let target = (index as isize).saturating_add(delta);
+        self.selected = targets
+            .get(target.clamp(0, targets.len().saturating_sub(1) as isize) as usize)
+            .cloned();
+    }
+
+    /// Every row the keys can select, in the list's order: the loaded rows, the shown scheduled
+    /// tasks and their `+N more`, then the Goal.
+    fn selectable_targets(&self) -> Vec<MonitorTarget> {
         let mut targets = self
             .entries
             .iter()
@@ -1209,15 +1254,138 @@ impl Monitor {
         if self.goal().is_some() {
             targets.push(MonitorTarget::Goal);
         }
-        let index = self
+        targets
+    }
+
+    /// Tab and Shift+Tab: selects the next or previous row in the list's order, wrapping at both
+    /// ends; every row counts, whether or not it can have a card.
+    pub(super) fn cycle_selection(&mut self, delta: isize) {
+        self.wheel_offset.set(None);
+        if self.expanded_tasks {
+            let count = self.tasks().len();
+            if count == 0 {
+                self.close_task_list();
+                return;
+            }
+            let index = self
+                .selected_task()
+                .and_then(|selected| self.tasks().iter().position(|task| task.id == selected.id))
+                .unwrap_or(if delta > 0 { count - 1 } else { 0 });
+            let next = (index as isize + delta).rem_euclid(count as isize) as usize;
+            self.selected = Some(MonitorTarget::ScheduledTask(self.tasks()[next].id));
+            return;
+        }
+        while self.next_page.is_some() {
+            self.load_tick_page();
+        }
+        let targets = self.selectable_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let count = targets.len() as isize;
+        let next = match self
             .selected
             .as_ref()
             .and_then(|selected| targets.iter().position(|target| target == selected))
-            .unwrap_or(0);
-        let target = (index as isize).saturating_add(delta);
-        self.selected = targets
-            .get(target.clamp(0, targets.len().saturating_sub(1) as isize) as usize)
+        {
+            Some(index) => (index as isize + delta).rem_euclid(count),
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        let target = targets[next as usize].clone();
+        if let MonitorTarget::Tick(instance) = &target {
+            self.tick_anchor = Some(instance.clone());
+        }
+        self.selected = Some(target);
+    }
+
+    fn note_agent_touched(&mut self, instance: &InstanceRef) {
+        self.agent_touched.retain(|touched| touched != instance);
+        self.agent_touched.push(instance.clone());
+    }
+
+    /// The instances the Agent used or took an update in from since last asked, oldest first.
+    pub(super) fn take_agent_touched(&mut self) -> Vec<InstanceRef> {
+        std::mem::take(&mut self.agent_touched)
+    }
+
+    /// Scrolls `instance`'s row into view in the next frame, leaving the selection alone.
+    pub(super) fn reveal_row(&self, instance: InstanceRef) {
+        *self.reveal.borrow_mut() = Some(instance);
+    }
+
+    /// The rows holding an update the Chat has not handled, in the list's order, the ones on
+    /// pages not loaded yet included.
+    fn unseen_rows(&self) -> Vec<InstanceRef> {
+        self.listing
+            .iter()
+            .filter(|row| MonitorEntry::from((*row).clone()).is_unread())
+            .map(|row| row.instance.clone())
+            .collect()
+    }
+
+    /// `n`: selects the next row with an unseen update after the selected one, wrapping, so
+    /// pressing it again walks through them.
+    pub(super) fn select_next_unseen(&mut self) {
+        let unseen = self.unseen_rows();
+        let order: Vec<&InstanceRef> = self.listing.iter().map(|row| &row.instance).collect();
+        let current = self.selected().and_then(|entry| {
+            order
+                .iter()
+                .position(|instance| **instance == entry.instance)
+        });
+        let position = |instance: &InstanceRef| {
+            order
+                .iter()
+                .position(|listed| *listed == instance)
+                .unwrap_or(0)
+        };
+        let next = unseen
+            .iter()
+            .find(|instance| current.is_none_or(|current| position(instance) > current))
+            .or_else(|| unseen.first())
             .cloned();
+        if let Some(instance) = next {
+            self.select_listed(&instance);
+        }
+    }
+
+    /// A click on an edge line: selects the unseen row nearest to the visible part, above it or
+    /// below it.
+    fn select_nearest_unseen(&mut self, below: bool) {
+        let unseen = self.unseen_rows();
+        let (top, bottom) = self.visible_rows.borrow().clone();
+        let order: Vec<&InstanceRef> = self.listing.iter().map(|row| &row.instance).collect();
+        let position = |instance: &InstanceRef| order.iter().position(|listed| *listed == instance);
+        let nearest = if below {
+            unseen.iter().find(|instance| {
+                bottom
+                    .as_ref()
+                    .is_none_or(|bottom| position(instance) > position(bottom))
+            })
+        } else {
+            unseen.iter().rev().find(|instance| {
+                top.as_ref()
+                    .is_some_and(|top| position(instance) < position(top))
+            })
+        }
+        .cloned();
+        if let Some(instance) = nearest {
+            self.select_listed(&instance);
+        }
+    }
+
+    /// Selects a listed row, loading the pages up to it first.
+    fn select_listed(&mut self, instance: &InstanceRef) {
+        while !self.entries.iter().any(|entry| &entry.instance == instance)
+            && self.next_page.is_some()
+        {
+            self.load_tick_page();
+        }
+        if let Some(entry) = self.selected() {
+            self.tick_anchor = Some(entry.instance.clone());
+        }
+        self.select(instance);
     }
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
     pub(super) fn set_membership(&mut self, membership: MonitorMembership) {
@@ -1250,9 +1418,14 @@ impl Monitor {
         self.frame(width, height, display, now_ms).lines
     }
 
+    /// The status line under the list: an action's error, or the selected row's state while the
+    /// list itself has the keyboard.
     fn selected_status(&self) -> String {
         if let Some(error) = &self.action_error {
             return error.clone();
+        }
+        if !self.focused || self.card_focused {
+            return String::new();
         }
         let Some(entry) = self.selected() else {
             return String::new();
@@ -1336,6 +1509,10 @@ impl Monitor {
         if let Some(mark) = self.selected().and_then(|entry| entry.subscription) {
             hints.push(if mark.paused { "p resume" } else { "p pause" }.into());
         }
+        if self.unseen_edges.get() != (0, 0) {
+            hints.push(format!("{NEXT_UNSEEN_KEY} next update"));
+        }
+        hints.push("tab next".into());
         hints.push("esc input".into());
         hints.join(" · ")
     }
@@ -1796,13 +1973,44 @@ impl Monitor {
                 offset = selected_rows.end.saturating_sub(tick_capacity);
             }
         }
+        let revealed = self
+            .reveal
+            .borrow_mut()
+            .take()
+            .and_then(|instance| row_span(&row_ids, &instance));
+        if let Some(span) = revealed.filter(|_| tick_capacity > 0) {
+            if span.start < offset {
+                offset = span.start;
+            } else if span.end > offset + tick_capacity {
+                offset = span.end.saturating_sub(tick_capacity).min(span.start);
+            }
+            self.wheel_offset.set(Some(offset));
+        }
         offset = offset.min(total_rows.saturating_sub(tick_capacity));
         self.tick_offset.set(offset);
         if self.wheel_offset.get().is_some() {
             self.wheel_offset.set(Some(offset));
         }
+        let mut unseen = self.unseen_edges_of(&row_ids, offset, tick_capacity);
+        // An edge line never covers the selected row: the list scrolls one line further.
+        if self.wheel_offset.get().is_none() && !selected_rows.is_empty() {
+            let covered_below = !unseen.below.is_empty()
+                && selected_rows.end >= offset + tick_capacity
+                && offset < total_rows.saturating_sub(tick_capacity);
+            let covered_above =
+                !unseen.above.is_empty() && selected_rows.start <= offset && offset > 0;
+            let adjusted = offset + usize::from(covered_below) - usize::from(covered_above);
+            if adjusted != offset {
+                offset = adjusted;
+                self.tick_offset.set(offset);
+                unseen = self.unseen_edges_of(&row_ids, offset, tick_capacity);
+            }
+        }
+        self.unseen_edges
+            .set((unseen.above.len(), unseen.below.len()));
+        *self.visible_rows.borrow_mut() = visible_span(&row_ids, offset, tick_capacity);
         let tick_start = lines.len();
-        let card_lines: Vec<bool> = row_ids
+        let mut card_lines: Vec<bool> = row_ids
             .iter()
             .skip(offset)
             .take(tick_capacity)
@@ -1817,6 +2025,24 @@ impl Monitor {
             .collect::<Vec<_>>();
         lines.extend(rows.into_iter().skip(offset).take(tick_capacity));
         lines.resize(tick_start + tick_capacity, RoleLine::default());
+        for (below, rows, row) in [
+            (false, &unseen.above, 0),
+            (true, &unseen.below, tick_capacity.saturating_sub(1)),
+        ] {
+            if rows.is_empty() {
+                continue;
+            }
+            let flash_since = rows
+                .iter()
+                .filter_map(|instance| self.update_flashes.get(instance))
+                .max()
+                .copied();
+            lines[tick_start + row] =
+                unseen_edge_line(below, rows.len(), flash_since, display, ascii, now_ms);
+            card_lines[row] = false;
+            targets.retain(|(target_row, _)| *target_row != tick_start + row);
+            targets.push((tick_start + row, MonitorTarget::Unseen { below }));
+        }
         let tick_rows = tick_start..lines.len();
         if scrollbar {
             let thumb = scrollbar_thumb(tick_capacity, total_rows, offset);
@@ -1928,6 +2154,100 @@ impl Monitor {
             card_sizes: cards.sizes(),
         }
     }
+}
+
+/// The rows with unseen updates out of view of a list frame.
+struct UnseenEdges {
+    above: Vec<InstanceRef>,
+    below: Vec<InstanceRef>,
+}
+
+impl Monitor {
+    /// Counts the rows with unseen updates wholly above and below the `capacity` list lines
+    /// shown from `offset`; a row on a page not loaded yet lies below. An edge line takes the
+    /// first or last of those lines, so the rows under it count too.
+    fn unseen_edges_of(
+        &self,
+        row_ids: &[Option<MonitorTarget>],
+        offset: usize,
+        capacity: usize,
+    ) -> UnseenEdges {
+        let unseen = self.unseen_rows();
+        let mut edges = UnseenEdges {
+            above: Vec::new(),
+            below: Vec::new(),
+        };
+        if capacity < UNSEEN_EDGE_MIN_ROWS || unseen.is_empty() {
+            return edges;
+        }
+        let (mut top, mut bottom) = (offset, offset + capacity);
+        for _ in 0..3 {
+            edges = UnseenEdges {
+                above: Vec::new(),
+                below: Vec::new(),
+            };
+            for instance in &unseen {
+                match row_span(row_ids, instance) {
+                    Some(span) if span.end <= top => edges.above.push(instance.clone()),
+                    Some(span) if span.start < bottom => {}
+                    _ => edges.below.push(instance.clone()),
+                }
+            }
+            top = offset + usize::from(!edges.above.is_empty() && offset > 0);
+            bottom = offset + capacity - usize::from(!edges.below.is_empty());
+        }
+        edges
+    }
+}
+
+/// The list lines of `instance`'s row and its card.
+fn row_span(
+    row_ids: &[Option<MonitorTarget>],
+    instance: &InstanceRef,
+) -> Option<std::ops::Range<usize>> {
+    let belongs = |id: &Option<MonitorTarget>| matches!(id, Some(MonitorTarget::Tick(row)) | Some(MonitorTarget::Card { instance: row, .. }) if row == instance);
+    let start = row_ids.iter().position(belongs)?;
+    let end = row_ids.iter().rposition(belongs)? + 1;
+    Some(start..end)
+}
+
+/// The first and last row whose lines the `capacity` list lines from `offset` show.
+fn visible_span(
+    row_ids: &[Option<MonitorTarget>],
+    offset: usize,
+    capacity: usize,
+) -> (Option<InstanceRef>, Option<InstanceRef>) {
+    let row_of = |id: &Option<MonitorTarget>| match id {
+        Some(MonitorTarget::Tick(instance) | MonitorTarget::Card { instance, .. }) => {
+            Some(instance.clone())
+        }
+        _ => None,
+    };
+    let visible = row_ids.iter().skip(offset).take(capacity);
+    (
+        visible.clone().find_map(row_of),
+        visible.rev().find_map(row_of),
+    )
+}
+
+/// The edge line `↑ N updated` or `↓ N updated`, its arrow flashing in the update colour.
+fn unseen_edge_line(
+    below: bool,
+    count: usize,
+    flash_since: Option<u64>,
+    display: DisplayProfile,
+    ascii: bool,
+    now_ms: u64,
+) -> RoleLine {
+    let arrow = match (below, ascii) {
+        (false, false) => "↑",
+        (true, false) => "↓",
+        (false, true) => "^",
+        (true, true) => "v",
+    };
+    let mut line = RoleLine::role(arrow, list_row::update_mark(flash_since, display, now_ms));
+    line.push(format!(" {count} updated"), Some(Role::MutedText));
+    line
 }
 
 /// The public facts of one Monitor row. Opening it never reads, subscribes or calls the model.
@@ -2177,7 +2497,10 @@ mod registered_rows_tests {
         );
         assert!(!text.contains("Subscribed"));
         assert!(!text.contains("enter"), "keys are on the hint row: {text}");
-        assert_eq!(list.hint(), "enter inspect · z expand · esc input");
+        assert_eq!(
+            list.hint(),
+            "enter inspect · z expand · tab next · esc input"
+        );
     }
 }
 
@@ -3556,6 +3879,145 @@ mod scrolling_tests {
         monitor.set_chat_status(Arc::new(status));
         monitor.focus(false, None);
         monitor
+    }
+
+    fn calendar(index: usize) -> InstanceRef {
+        format!("calendar:{index:03}").parse().unwrap()
+    }
+
+    fn observe(monitor: &mut Monitor, rows: &[usize], at_ms: u64) {
+        let mut status = (**monitor.chat_status.as_ref().unwrap()).clone();
+        for row in rows {
+            status.monitor.mark_observed(calendar(*row), at_ms);
+        }
+        monitor.set_chat_status(Arc::new(status));
+    }
+
+    fn texts(frame: &MonitorFrame) -> Vec<String> {
+        frame.lines.iter().map(|line| line.text()).collect()
+    }
+
+    #[test]
+    fn rows_with_unseen_updates_out_of_view_are_counted_at_the_edges_and_n_walks_through_them() {
+        let display = DisplayProfile::default();
+        let mut monitor = monitor(30);
+        observe(&mut monitor, &[1, 2, 25, 28], 5_000);
+        monitor.select(&calendar(15));
+        let frame = monitor.frame(30, 12, display, 6_000);
+        let lines = texts(&frame);
+        assert!(
+            lines.iter().any(|line| line.starts_with("↑ 2 updated")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("↓ 2 updated")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Tick 015")),
+            "an edge line never covers the selected row: {lines:#?}"
+        );
+        for below in [false, true] {
+            assert!(
+                frame
+                    .targets
+                    .iter()
+                    .any(|(_, target)| *target == MonitorTarget::Unseen { below }),
+                "{:?}",
+                frame.targets
+            );
+        }
+        assert!(
+            monitor.hint().contains("n next update"),
+            "{}",
+            monitor.hint()
+        );
+
+        observe(&mut monitor, &[20], 7_000);
+        let updated = monitor.frame(30, 12, display, 7_500);
+        let rows_of = |frame: &MonitorFrame| {
+            texts(frame)
+                .into_iter()
+                .filter(|line| line.contains("Tick 0"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows_of(&updated),
+            rows_of(&frame),
+            "an update never scrolls"
+        );
+        assert!(
+            texts(&updated)
+                .iter()
+                .any(|line| line.starts_with("↓ 3 updated"))
+        );
+
+        monitor.select_target(&MonitorTarget::Unseen { below: false });
+        assert_eq!(
+            monitor.selected().unwrap().instance,
+            calendar(2),
+            "nearest above"
+        );
+        monitor.select(&calendar(15));
+        monitor.frame(30, 12, display, 7_500);
+        monitor.select_target(&MonitorTarget::Unseen { below: true });
+        assert_eq!(
+            monitor.selected().unwrap().instance,
+            calendar(20),
+            "nearest below"
+        );
+
+        let mut walked = Vec::new();
+        for _ in 0..6 {
+            monitor.select_next_unseen();
+            walked.push(monitor.selected().unwrap().instance.clone());
+        }
+        assert_eq!(
+            walked,
+            [25, 28, 1, 2, 20, 25].map(calendar),
+            "n walks through them in list order, wrapping"
+        );
+        let shown = monitor.frame(30, 12, display, 7_500);
+        assert!(texts(&shown).iter().any(|line| line.contains("Tick 025")));
+    }
+
+    #[test]
+    fn the_selected_rows_status_line_shows_only_while_the_list_has_the_keyboard() {
+        let display = DisplayProfile::default();
+        let mut monitor = monitor(2);
+        observe(&mut monitor, &[0], 5_000);
+        let status = |monitor: &Monitor| texts(&monitor.frame(30, 12, display, 6_000)).join("\n");
+        assert!(status(&monitor).contains("Unread"), "list focused");
+        monitor.card_focused = true;
+        assert!(!status(&monitor).contains("Unread"), "a card focused");
+        monitor.card_focused = false;
+        monitor.focused = false;
+        assert!(!status(&monitor).contains("Unread"), "the input focused");
+        assert_eq!(
+            monitor.side_content_height(30, 12, display, 6_000),
+            12 - 1,
+            "no line is held for it"
+        );
+        monitor.action_error = Some("Cannot open".into());
+        assert!(
+            status(&monitor).contains("Cannot open"),
+            "an action's error stays"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_every_row_wrapping_at_both_ends() {
+        let mut monitor = monitor(3);
+        monitor.select(&calendar(0));
+        let mut cycled = Vec::new();
+        for _ in 0..4 {
+            monitor.cycle_selection(1);
+            cycled.push(monitor.selected().unwrap().instance.clone());
+        }
+        assert_eq!(cycled, [1, 2, 0, 1].map(calendar));
+        monitor.select(&calendar(0));
+        monitor.cycle_selection(-1);
+        assert_eq!(monitor.selected().unwrap().instance, calendar(2));
     }
 
     #[test]
