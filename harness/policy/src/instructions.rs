@@ -130,6 +130,41 @@ mod tests {
         );
     }
 
+    /// Claude Code's label for each instruction source; an imported file takes the scope, and so
+    /// the label, of the file that imports it.
+    #[test]
+    fn each_instruction_source_is_labelled_like_claude_code() {
+        for (scope, label) in [
+            (
+                InstructionScope::User,
+                "(user's private global instructions for all projects)",
+            ),
+            (
+                InstructionScope::Project,
+                "(project instructions, checked into the codebase)",
+            ),
+            (
+                InstructionScope::Local,
+                "(user's private project instructions, not checked in)",
+            ),
+        ] {
+            let message = user_context_message(
+                &[
+                    file("/repo/AGENTS.md", scope, "Rules."),
+                    file("/repo/docs/imported.md", scope, "Imported rules."),
+                ],
+                "2026-10-26",
+                None,
+            );
+            for path in ["/repo/AGENTS.md", "/repo/docs/imported.md"] {
+                assert!(
+                    message.contains(&format!("Contents of {path} {label}:\n\n")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
     /// A project's files and git status come from its repository and cannot close the message.
     #[test]
     fn repository_text_cannot_close_the_context() {

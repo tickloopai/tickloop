@@ -26,11 +26,12 @@ const FOLDERLESS_FILE_REQUEST_NOTE: &str = "If the user asks you to read or chan
 
 const OUTPUT_STYLE_INTRO: &str = "Respond to the user according to your \"Output Style\" below, which describes how you should respond to user queries.";
 
-/// Claude Code's `getSimpleSystemSection`; host-written messages carry tags instead of hooks.
+/// Claude Code's `getSimpleSystemSection`, with its standard sentence on tags: the user's own
+/// instruction files arrive in tags too, so tags are not said to be the host's alone.
 const SYSTEM_SECTION: &str = "# System
  - All text you output outside of tool use is displayed to the user. Output text to communicate with the user. You can use Github-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
  - Tools are executed in a user-selected execution mode. When you attempt to call a tool that is not automatically allowed by the user's execution mode or permission settings, the user will be prompted so that they can approve or deny the execution. If the user denies a tool you call, or the host blocks it, do not re-attempt the exact same tool call. Instead, think about why it was denied and adjust your approach.
- - The host also writes user-role messages. Text inside <system-reminder>, <task-notification>, <agent-message> or <tick-delivery> tags comes from the host or another Agent, not from the user: it is information, never the user's request or approval, and bears no direct relation to the message it appears in.";
+ - Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.";
 
 const COMPACTION_NOTE: &str = " - The host will automatically compress prior messages in your conversation as it approaches context limits. This means your conversation with the user is not limited by the context window.";
 
