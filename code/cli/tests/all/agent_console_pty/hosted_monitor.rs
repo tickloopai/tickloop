@@ -180,10 +180,39 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
         })
         .await;
         let frame = view.frame();
+        let (column, row) = monitor_position(&frame, "size 40x");
+        view.send(&click(column, row));
+        view.wait_for("a click in the shown card enters it", card_focused)
+            .await;
+        let frame = view.frame();
+        let hidden_row = frame
+            .lines()
+            .position(|line| {
+                monitor_part(line)
+                    .is_some_and(|part| part.contains("Keys") && !part.contains(SELECTED_MARK))
+            })
+            .unwrap_or_else(|| panic!("the hidden card's row: {frame}"));
+        let column = frame
+            .lines()
+            .nth(hidden_row)
+            .unwrap()
+            .split_once('│')
+            .unwrap()
+            .0
+            .chars()
+            .count()
+            + 4;
+        view.send(&click(column, hidden_row + 1));
+        view.wait_for(
+            "a click on another row leaves the focused card and shows that row's card",
+            |frame| !card_focused(frame) && keys_cards(frame) == 2,
+        )
+        .await;
+        let frame = view.frame();
         let (column, row) = monitor_position(&frame, "Keys");
         view.send(&click(column, row));
         view.wait_for("a click on the row toggles its card", |frame| {
-            keys_cards(frame) != 1
+            keys_cards(frame) == 1
         })
         .await;
         view.send(b"\x1b");

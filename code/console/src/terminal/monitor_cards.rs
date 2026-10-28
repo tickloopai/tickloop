@@ -57,9 +57,10 @@ const CARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const CARD_RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
+/// Esc goes back to the Monitor list, whose own hints then offer Space to show other cards.
+pub(super) const FOCUSED_CARD_HINT: &str = "esc back to list · esc esc send esc";
 /// A Shell's card is read-only, so leaving is all its keys do.
-pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc leave";
+pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc back to list";
 
 const ESCAPE: u8 = 0x1b;
 /// A control sequence still unfinished at this length is no key's.
@@ -937,6 +938,51 @@ impl SgrMouse {
     /// A button pressed down, the kind of report that leaves or enters a card.
     pub(super) fn is_click(self) -> bool {
         self.pressed && !self.is_motion() && !self.is_wheel()
+    }
+
+    /// The report as the Console's own mouse event, as crossterm decodes it.
+    pub(super) fn console_event(self) -> crossterm::event::MouseEvent {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        const SHIFT: u16 = 4;
+        const ALT: u16 = 8;
+        const CONTROL: u16 = 16;
+        let button = match self.code & MOUSE_BUTTONS {
+            0 => Some(MouseButton::Left),
+            1 => Some(MouseButton::Middle),
+            2 => Some(MouseButton::Right),
+            _ => None,
+        };
+        let kind = if self.is_wheel() {
+            match self.code & MOUSE_BUTTONS {
+                0 => MouseEventKind::ScrollUp,
+                1 => MouseEventKind::ScrollDown,
+                2 => MouseEventKind::ScrollLeft,
+                _ => MouseEventKind::ScrollRight,
+            }
+        } else {
+            match (button, self.is_motion(), self.pressed) {
+                (Some(button), true, _) => MouseEventKind::Drag(button),
+                (None, true, _) => MouseEventKind::Moved,
+                (Some(button), false, true) => MouseEventKind::Down(button),
+                (button, false, _) => MouseEventKind::Up(button.unwrap_or(MouseButton::Left)),
+            }
+        };
+        let mut modifiers = KeyModifiers::NONE;
+        for (bit, modifier) in [
+            (SHIFT, KeyModifiers::SHIFT),
+            (ALT, KeyModifiers::ALT),
+            (CONTROL, KeyModifiers::CONTROL),
+        ] {
+            if self.code & bit != 0 {
+                modifiers |= modifier;
+            }
+        }
+        MouseEvent {
+            kind,
+            column: self.column.saturating_sub(1),
+            row: self.row.saturating_sub(1),
+            modifiers,
+        }
     }
 
     /// The report a Tick asked for with its mouse `mode` and `encoding`, at `column` and `row`

@@ -13808,7 +13808,7 @@ fn read_keys(
                 state.card_focused().then(|| state.card_deadline())
             };
             if let Some(deadline) = card {
-                let read = read_card_input(state, deadline)?;
+                let read = read_card_input(state, deadline, stop, sender)?;
                 // The card's keys are the Tick's, so the Console's own input counts as idle.
                 if (!read && !idle_tick(state, stop, sender)?)
                     || !settle_background_work(state, stop, sender, true, &mut deferred_frame)?
@@ -13963,10 +13963,15 @@ fn idle_tick(
 }
 
 /// Reads the user's raw input for the focused Monitor card, waiting at most until `deadline`,
-/// when a held Esc is due to be settled. Returns whether input arrived, read for the card or left
+/// when a held Esc is due to be settled; what a click that left the card asks goes to `sender`. Returns whether input arrived, read for the card or left
 /// to the Console once the card lost the focus; with nothing arrived the held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
 /// meanwhile.
-fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::Result<bool> {
+fn read_card_input(
+    state: &Arc<Mutex<State>>,
+    deadline: Option<Instant>,
+    stop: &AtomicBool,
+    sender: &mpsc::Sender<InputEvent>,
+) -> io::Result<bool> {
     let wait = deadline.map_or(INPUT_POLL_INTERVAL, |deadline| {
         deadline
             .saturating_duration_since(Instant::now())
@@ -14023,9 +14028,19 @@ fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::
         // The input ended; the Console's own reader reports it.
         state.leave_card();
     } else {
-        state.card_input(&buffer[..count as usize], Instant::now());
+        state.card_input(
+            &buffer[..count as usize],
+            Instant::now(),
+            &mut io::stdout().lock(),
+        );
     }
     state.draw(&mut io::stdout().lock())?;
+    // A click that left the card acts in the Console, such as showing another row's card.
+    let clicked = state.pointer_input.take();
+    drop(state);
+    if let Some(input) = clicked {
+        send_input(sender, stop, input);
+    }
     Ok(true)
 }
 

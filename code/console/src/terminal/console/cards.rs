@@ -147,14 +147,15 @@ impl State {
             .flatten()
     }
 
-    /// Hands the user's raw input bytes, read while a card has the focus, to its Tick.
-    pub(super) fn card_input(&mut self, input: &[u8], now: Instant) {
+    /// Hands the user's raw input bytes, read while a card has the focus, to its Tick; a click
+    /// outside the card and the mouse reports after it are the Console's, drawn to `output`.
+    pub(super) fn card_input(&mut self, input: &[u8], now: Instant, output: &mut impl Write) {
         let paste_markers = self.focused_card_screen(|screen| screen.bracketed_paste());
         let items = self
             .cards
             .keys_mut()
             .feed(input, now, paste_markers.unwrap_or(false));
-        self.apply_card_inputs(items, now);
+        self.apply_card_inputs(items, now, output);
     }
 
     /// Settles a held Esc once its time passed; returns whether the screen changed.
@@ -164,7 +165,7 @@ impl State {
         }
         let items = self.cards.keys_mut().expire(now);
         let leaves = items.contains(&CardInput::Leave);
-        self.apply_card_inputs(items, now);
+        self.apply_card_inputs(items, now, &mut io::sink());
         leaves
     }
 
@@ -174,15 +175,25 @@ impl State {
         Some(read(screen.parser.screen()))
     }
 
-    fn apply_card_inputs(&mut self, items: Vec<CardInput>, now: Instant) {
-        for item in items {
+    fn apply_card_inputs(&mut self, items: Vec<CardInput>, now: Instant, output: &mut impl Write) {
+        let mut items = items.into_iter();
+        while let Some(item) = items.next() {
             match item {
                 CardInput::Bytes(bytes) => self.cards.input(bytes),
                 CardInput::Focus(true) => self.focus_gained(now),
                 CardInput::Focus(false) => self.focus_lost(),
                 CardInput::Mouse(mouse) => {
                     if !self.card_mouse(mouse) {
+                        // The click leaves the card and then acts where it landed, as do the
+                        // reports after it, such as its release; keys after it are dropped.
                         self.leave_card();
+                        let console_reports = items.filter_map(|item| match item {
+                            CardInput::Mouse(mouse) => Some(mouse),
+                            _ => None,
+                        });
+                        for report in std::iter::once(mouse).chain(console_reports) {
+                            self.pointer(report.console_event(), output);
+                        }
                         return;
                     }
                 }
