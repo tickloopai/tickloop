@@ -92,6 +92,7 @@ impl MonitorRows for CalendarRows {
             .iter()
             .filter(|row| row.instance.access() == "cal")
             .map(|row| TickDescriptor {
+                joined_at_ms: None,
                 instance: row.instance.clone(),
                 group: TickGroup::Ticks,
                 glyph: TickGlyph::Protocol,

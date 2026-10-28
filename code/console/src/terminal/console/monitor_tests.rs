@@ -1381,6 +1381,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
             let instance = tick_protocol::InstanceRef::new("cal", "remote").unwrap();
             vec![TickDescriptor {
+                joined_at_ms: None,
                 instance: instance.clone(),
                 group: TickGroup {
                     order: 4,

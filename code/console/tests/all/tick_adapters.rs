@@ -35,6 +35,7 @@ impl MonitorRows for CalendarRows {
     }
     fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
         vec![TickDescriptor {
+            joined_at_ms: None,
             instance: calendar(),
             group: TickGroup {
                 order: 4,

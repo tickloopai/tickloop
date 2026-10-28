@@ -40,6 +40,7 @@ impl MonitorRows for HostedRows {
                     descriptor.kind = "Terminal".into();
                 }
                 TickDescriptor {
+                    joined_at_ms: None,
                     instance: row.instance.clone(),
                     group: TickGroup::Ticks,
                     glyph: descriptor.glyph,
@@ -245,6 +246,7 @@ impl MonitorRows for ArtifactRows {
                 rows.insert(
                     instance.clone(),
                     TickDescriptor {
+                        joined_at_ms: Some(tick.added_at_ms),
                         instance,
                         group: TickGroup::Artifacts,
                         glyph: TickGlyph::Artifact,
@@ -314,6 +316,7 @@ impl MonitorRows for ShellRows {
             .map(|task| {
                 let instance = InstanceRef::shell(task.id);
                 TickDescriptor {
+                    joined_at_ms: None,
                     actions: shell_actions(task, &instance),
                     instance,
                     group: TickGroup::Shells,

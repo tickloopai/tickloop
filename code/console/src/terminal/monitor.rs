@@ -1027,8 +1027,16 @@ impl Monitor {
         self.entries.extend(rows);
         self.entries.sort_by(|a, b| {
             crate::monitor_rows::display_order(
-                (a.group, a.updated_at_ms, &a.instance),
-                (b.group, b.updated_at_ms, &b.instance),
+                (
+                    a.group,
+                    crate::monitor_rows::identity_time_ms(&a.instance),
+                    &a.instance,
+                ),
+                (
+                    b.group,
+                    crate::monitor_rows::identity_time_ms(&b.instance),
+                    &b.instance,
+                ),
             )
         });
         self.entries.dedup_by(|a, b| a.instance == b.instance);
@@ -2114,6 +2122,7 @@ mod registered_rows_tests {
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
             vec![TickDescriptor {
+                joined_at_ms: None,
                 instance: tick_protocol::InstanceRef::new("calendar", "earnings").unwrap(),
                 group: TickGroup {
                     order: 4,
@@ -2199,6 +2208,7 @@ mod signal_tests {
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
             let at = *self.0.lock().unwrap();
             vec![TickDescriptor {
+                joined_at_ms: None,
                 instance: quotes(),
                 group: TickGroup::Ticks,
                 glyph: TickGlyph::Protocol,
