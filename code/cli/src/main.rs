@@ -80,7 +80,7 @@ fn main() {
     let is_console = !arguments.first().is_some_and(|arg| {
         matches!(
             arg.to_str(),
-            Some("update" | "daemon" | "worker" | "monitor" | "tick" | "plugin" | "mcp")
+            Some("update" | "daemon" | "worker" | "tick" | "plugin" | "mcp")
         )
     }) && !arguments
         .iter()

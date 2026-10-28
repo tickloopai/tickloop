@@ -2656,7 +2656,6 @@ fn fixture_host_pane() -> tickhost_connect::herdr::Pane {
         tab_id: "tab-a".into(),
         cwd: None,
         foreground_cwd: None,
-        tokens: Default::default(),
     }
 }
 

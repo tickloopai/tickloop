@@ -22,7 +22,7 @@ use tickloop_code_client::DAEMON_RUN_ARGUMENTS;
 use tickloop_code_daemon::WORKER_ARGUMENT;
 use tickloop_code_local_environment::hosted::controller::TICKHOST_EXECUTABLE;
 use tickloop_harness::model::{LocalModelClients, ModelClients};
-use tickloop_harness::protocol::{ATTACH_ARGUMENTS, ModelConfig};
+use tickloop_harness::protocol::ModelConfig;
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";
@@ -238,7 +238,6 @@ fn is_product_process(arguments: &[OsString]) -> bool {
     let daemon_run = DAEMON_RUN_ARGUMENTS.len();
     is_worker_entry(arguments)
         || (arguments.len() > daemon_run && arguments[..daemon_run] == DAEMON_RUN_ARGUMENTS)
-        || arguments == ATTACH_ARGUMENTS
 }
 
 fn is_worker_entry(arguments: &[OsString]) -> bool {

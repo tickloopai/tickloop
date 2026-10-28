@@ -119,10 +119,7 @@ pub use host::{
     HerdrInteraction, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority,
     HostedResources, OtherTickhost, TickhostOccupancy,
 };
-pub use hosted::{
-    ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedMember, HostedMemberState, HostedProgramExit,
-    HostedViewGrant, VIEW_PANE_ENVIRONMENT,
-};
+pub use hosted::{HostedMember, HostedMemberState, HostedProgramExit, HostedViewGrant};
 pub use ids::{
     AgentMessageId, AgentMessageKind, ChatId, ChatKind, DelegationId, DelegationKind, HostedRunId,
     HostedRunKind, InputKind, LoopKind, MessageChainId, MessageChainKind, OperationId,

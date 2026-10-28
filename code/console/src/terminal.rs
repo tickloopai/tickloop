@@ -18,7 +18,6 @@ mod agent_messaging;
 mod approval_status;
 mod artifact_ui;
 mod artifacts_picker;
-pub mod attach;
 mod auto_setup_surface;
 mod background_work;
 #[cfg(test)]
@@ -68,7 +67,6 @@ mod menus;
 mod mode_cycle_tests;
 mod monitor;
 mod monitor_cards;
-pub mod monitor_command;
 #[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
@@ -905,14 +903,12 @@ Usage: tickloop [--cwd DIRECTORY]
        [--no-session-persistence]
        tickloop update [--check | --status]
        tickloop daemon stop
-       tickloop monitor attach
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
        tickloop mcp list | add NAME URL [--header 'NAME: VALUE']... [--dir] | add NAME [--env NAME=VALUE]... [--dir] -- COMMAND [ARGUMENTS...] | remove NAME [--dir] | login NAME | logout NAME
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
-monitor attach is the attach client of a Herdr view Pane: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
 plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
 mcp lists the MCP servers an Agent here would have without starting any, adds or removes your own servers in the global settings or, with --dir, this directory's, and logs in to or out of a remote server.
@@ -10607,10 +10603,9 @@ mod status_agents_help_tests {
     }
 
     #[test]
-    fn help_names_the_monitor_commands_and_hosted_tick_keys() {
+    fn help_names_the_hosted_tick_keys_without_a_monitor_command() {
         let help = super::help_text();
-        assert!(!help.contains("monitor popup"));
-        assert!(help.contains("tickloop monitor attach"));
+        assert!(!help.contains("tickloop monitor"));
         for expected in [
             "Press x twice within 3 seconds",
             "restoring its subscriptions at their frequencies",

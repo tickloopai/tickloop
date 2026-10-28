@@ -14,7 +14,6 @@ use tickloop_code_client::{DAEMON_COMMAND, RUN_SUBCOMMAND};
 use tickloop_code_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_worker};
 use tickloop_tick_installer::PluginKind;
 
-const MONITOR_COMMAND: &str = "monitor";
 const TICK_COMMAND: &str = "tick";
 const PLUGIN_COMMAND: &str = "plugin";
 
@@ -32,9 +31,6 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         (DAEMON_COMMAND, Some(RUN_SUBCOMMAND)) => Some(run_daemon(&arguments[2..]).await),
         (DAEMON_COMMAND, _) => Some(daemon_control::run(&arguments[1..]).await),
         (WORKER_ARGUMENT, _) => Some(run_worker(&arguments[1..]).await),
-        (MONITOR_COMMAND, _) => {
-            Some(tickloop_code_console::terminal::monitor_command::run(&arguments[1..]).await)
-        }
         (TICK_COMMAND, _) => Some(plugin_command::run(PluginKind::Tick, &arguments[1..]).await),
         ("mcp", _) => Some(mcp_command::run(&arguments[1..]).await),
         (PLUGIN_COMMAND, _) => Some(plugin_command::run(PluginKind::Plugin, &arguments[1..]).await),
