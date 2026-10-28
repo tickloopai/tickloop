@@ -117,7 +117,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                     .unwrap(),
                 "plan" | "plan feedback" => {
                     let mut page = menu(id);
-                    page.options = ["Auto", "Ask", "Full Access", "No, keep planning"]
+                    page.options = ["Yes, approve · Auto", "No, keep planning"]
                         .into_iter()
                         .map(String::from)
                         .collect();
@@ -1803,10 +1803,9 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         ConsoleExecution::new_embedded(tickloop_harness::test_support::config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let other = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::Plan)
-        .await
-        .unwrap();
+    for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
     let mut events = agent.subscribe();
     agent.submit(chat, "Plan the task".into()).await.unwrap();
     let request = loop {
@@ -1848,8 +1847,11 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
             Some(Role::PlanMode)
         );
         assert!(state.menu_plan);
-        assert_eq!(state.menu.as_ref().unwrap().options[3], "No, keep planning");
-        assert_eq!(state.menu_comment.as_ref().unwrap().options, [3]);
+        assert_eq!(
+            state.menu.as_ref().unwrap().options,
+            ["Yes, approve · Auto", "No, keep planning"]
+        );
+        assert_eq!(state.menu_comment.as_ref().unwrap().options, [1]);
         assert_eq!(
             state.input_dialog_frame().0.len(),
             input_dialog::FIXED_INPUT_DIALOG_ROWS
@@ -1900,7 +1902,6 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         );
         assert!(state.menu_plan);
         assert_eq!(state.menu_comment.as_ref().unwrap().label, "Feedback");
-        state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         state
             .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap()
@@ -1913,7 +1914,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     else {
         panic!("expected plan choice");
     };
-    assert_eq!(index, 1);
+    assert_eq!(index, 0);
     menus
         .choose(&agent, &console, menu_id, Some(index), comment)
         .await
@@ -1936,7 +1937,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     }
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
-        ExecutionMode::AcceptEdits
+        ExecutionMode::Auto
     );
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     let saved = super::super::workflows::Workflow::plan(&agent, chat)
@@ -2020,13 +2021,16 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
         .unwrap()
         .expect("restored approval opens automatically");
     assert!(model.requests.lock().unwrap().is_empty());
+    let shown = console.state.lock().unwrap().menu.clone().unwrap();
+    assert_eq!(shown.title, "Plan approval");
     assert_eq!(
-        console.state.lock().unwrap().menu.as_ref().unwrap().title,
-        "Plan approval"
+        shown.options,
+        ["Yes, approve · Ask", "No, keep planning"],
+        "a reload forgets the mode Plan was entered from, so approval falls back to Ask"
     );
     let mut events = restored.subscribe();
     let effect = menus
-        .choose(&restored, &console, id, Some(1), None)
+        .choose(&restored, &console, id, Some(0), None)
         .await
         .unwrap();
     assert_eq!(effect.receipt.unwrap().loop_id, receipt.loop_id);
@@ -2052,13 +2056,8 @@ async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
 fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() {
     let console = tests::console_with_state(State::new(true, 80, 24));
     let mut plan = menu(Uuid::new_v4());
-    plan.options = vec![
-        "Auto".into(),
-        "Ask".into(),
-        "Full Access".into(),
-        "No, keep planning".into(),
-    ];
-    plan.selected = 3;
+    plan.options = vec!["Yes, approve · Auto".into(), "No, keep planning".into()];
+    plan.selected = 1;
     plan.confirmation = true;
     let id = plan.id;
     console.show_plan_menu(plan, true).unwrap();
@@ -2086,7 +2085,7 @@ fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() 
         Some("j feedback 中文")
     );
     assert!(
-        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, index: 3, comment: Some(feedback) }) if menu_id == id && feedback == "j feedback 中文")
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, index: 1, comment: Some(feedback) }) if menu_id == id && feedback == "j feedback 中文")
     );
 }
 
@@ -2167,7 +2166,7 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     let copy_menu = console.dialog_menu_id().unwrap().unwrap();
     assert_ne!(copy_menu, source_menu);
     menus
-        .choose(&agent, &console, copy_menu, Some(1), None)
+        .choose(&agent, &console, copy_menu, Some(0), None)
         .await
         .unwrap();
     loop {
@@ -2297,7 +2296,7 @@ async fn retire_a_restored_plan_dialog_after_another_view_decision() {
     let stale_id = second.dialog_menu_id().unwrap().unwrap();
     let mut events = agent.subscribe();
     first_menus
-        .choose(&agent, &first, first_id, Some(1), None)
+        .choose(&agent, &first, first_id, Some(0), None)
         .await
         .unwrap();
     loop {
@@ -2529,7 +2528,7 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     assert!(agent.decline_plan(chat, 1, None).await.is_err());
     assert!(agent.snapshot(chat).await.unwrap().plans[0].approval_pending);
     menus
-        .choose(&agent, &console, new_id, Some(1), None)
+        .choose(&agent, &console, new_id, Some(0), None)
         .await
         .unwrap();
     loop {

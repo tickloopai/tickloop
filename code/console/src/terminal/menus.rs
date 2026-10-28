@@ -843,6 +843,7 @@ impl Menus {
                 chat,
                 version,
                 request,
+                approval_mode,
                 ..
             }),
         )) = &self.active
@@ -857,6 +858,7 @@ impl Menus {
             version: *version,
             request: *request,
             markdown: String::new(),
+            approval_mode: *approval_mode,
         };
         let (mut menu, mut edited) = reviewed.edit_plan(agent, markdown).await?;
         if let Workflow::Plan {

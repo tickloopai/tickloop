@@ -95,7 +95,7 @@ Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop`
 
 启动参数的取值不可用时拒绝启动，并说明替代写法；同样的值写在 `defaultMode` 中只给出同样的警告，新 Chat 以 Auto 启动。
 
-Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写的计划文件例外；该文件在任何模式下都可直接读写、不需询问。Agent 在没有计划时请求离开 Plan，回答“是”回到进入 Plan 前的模式，回答“否”继续计划。原本要问你的操作，如 `WebFetch`、读取工作目录外的文件或调用 MCP 工具，按 Auto 处理：Auto 会直接允许的就直接允许，其余交给 Auto 审查，审查不放行时才问你。显式 Ask 与 Deny 规则仍然优先，宽泛的 Shell Allow 规则与 Auto 下一样不能跳过审查。若想改为询问，在 `settings.json` 中设置 `"useAutoModeDuringPlan": false`，此后新建或重新打开的对话生效。
+Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写的计划文件例外；该文件在任何模式下都可直接读写、不需询问。Agent 提交计划后，批准选项显示进入 Plan 前的模式，确认后以该模式开始；也可附反馈继续规划，在反馈输入框按 `shift+tab` 则连同反馈批准。Agent 在没有计划时请求离开 Plan，回答“是”回到进入 Plan 前的模式，回答“否”继续计划。无论哪种情况，若原模式未知（如重启后或从 Plan 模式启动的对话），都回到 Ask。原本要问你的操作，如 `WebFetch`、读取工作目录外的文件或调用 MCP 工具，按 Auto 处理：Auto 会直接允许的就直接允许，其余交给 Auto 审查，审查不放行时才问你。显式 Ask 与 Deny 规则仍然优先，宽泛的 Shell Allow 规则与 Auto 下一样不能跳过审查。若想改为询问，在 `settings.json` 中设置 `"useAutoModeDuringPlan": false`，此后新建或重新打开的对话生效。
 
 ### 单次启动的规则
 

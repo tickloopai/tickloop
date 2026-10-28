@@ -1147,7 +1147,7 @@ impl Agent {
             });
         }
         if chat.snapshot.policy.mode == ExecutionMode::Plan {
-            let mode = chat.mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits);
+            let mode = ExecutionMode::Plan.leaving_plan(chat.mode_before_plan);
             chat.change_execution_mode(mode);
             chat.snapshot.policy.revision += 1;
             self.save(&chat.snapshot);

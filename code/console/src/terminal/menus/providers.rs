@@ -315,6 +315,7 @@ mod tests {
                         version: 1,
                         request: None,
                         markdown: String::new(),
+                        approval_mode: tickloop_harness::protocol::ExecutionMode::Auto,
                     },
                 ),
             )
@@ -1131,7 +1132,7 @@ mod tests {
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-5.6 Terra", "GPT-6 Luna"]
+            ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-6.1 Terra", "GPT-6 Luna"]
         );
         assert!(!codex.models.contains(&old_sol));
         assert!(!codex.models.contains(&retired));

@@ -373,7 +373,9 @@ fn plan_approval_pty_fixture() {
         ]));
         let agent = ConsoleExecution::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.clone()).await.unwrap();
-        agent.set_execution_mode(chat, ExecutionMode::Plan).await.unwrap();
+        for mode in [ExecutionMode::AcceptEdits, ExecutionMode::Plan] {
+            agent.set_execution_mode(chat, mode).await.unwrap();
+        }
         let (console, mut input) = Console::start(true).unwrap();
         console.select_chat(Some(chat)).unwrap();
         console.set_prompt_enabled(true).unwrap();
@@ -401,7 +403,7 @@ fn plan_approval_pty_fixture() {
                 },
                 event = input.recv() => match event {
                     Some(InputEvent::Choice { menu_id, index, comment }) => {
-                        assert_eq!(index, 1);
+                        assert_eq!(index, 0);
                         let outcome = menus.choose(&agent, &console, menu_id, Some(index), comment).await.unwrap();
                         assert!(outcome.receipt.is_none(), "approval must continue the existing run");
                         pending.clear();
@@ -434,10 +436,10 @@ fn plan_approval_pty_opens_without_a_command_and_starts_execution_after_approval
             "terminal::console::input_dialog_pty::plan_approval_pty_fixture",
         );
         let frame = fixture
-            .wait(|frame| frame.contains("Plan approval") && frame.contains("Approve and start"));
+            .wait(|frame| frame.contains("Plan approval") && frame.contains("Yes, approve · Ask"));
         assert!(frame.contains("Controlled PTY plan"), "{frame}");
         assert!(!directory.path().join("executed.txt").exists());
-        fixture.send(b"j\r");
+        fixture.send(b"\r");
         fixture.wait(|_| {
             std::fs::read_to_string(directory.path().join("phase"))
                 .is_ok_and(|phase| phase == "executed")

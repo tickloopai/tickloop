@@ -43,6 +43,9 @@ pub struct ChatStatus {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_enabled: bool,
     pub policy: PermissionPolicy,
+    /// The mode the Chat entered Plan from, as [`ChatSnapshot::mode_before_plan`] has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_before_plan: Option<crate::ExecutionMode>,
     pub chat_loop: LoopSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::GoalSnapshot>,
@@ -183,6 +186,7 @@ impl ChatStatus {
             reasoning_effort: process.reasoning_effort,
             thinking_enabled: process.thinking_enabled,
             policy: process.policy.clone(),
+            mode_before_plan: conversation.mode_before_plan,
             chat_loop: conversation.chat_loop.clone(),
             goal: conversation.goal.clone(),
             first_prompt: first_prompt(conversation, process.pending_inputs),

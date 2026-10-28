@@ -773,7 +773,7 @@ fn host_tool_decision(
         let mode = match (execution_mode, mode_before_plan) {
             (ExecutionMode::Plan, Some(ExecutionMode::FullAccess)) => ExecutionMode::FullAccess,
             (ExecutionMode::Plan, _) if policy.uses_auto_admission() => ExecutionMode::Auto,
-            (ExecutionMode::Plan, _) => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
+            (ExecutionMode::Plan, _) => ExecutionMode::Plan.leaving_plan(mode_before_plan),
             (mode, _) => mode,
         };
         return match (configured, mode) {
@@ -1091,6 +1091,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         scheduled_tasks: Vec::new(),
         scheduled_task_revocations: Vec::new(),
         task_board: None,
+        mode_before_plan: None,
         goal: None,
         goal_history: Vec::new(),
         family_inputs: BTreeMap::new(),
@@ -5208,6 +5209,7 @@ impl Agent {
             .cloned()
             .collect();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
+        snapshot.mode_before_plan = chats[&chat_id].mode_before_plan;
         snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(snapshot)

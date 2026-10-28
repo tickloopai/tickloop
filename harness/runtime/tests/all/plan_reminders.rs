@@ -482,3 +482,30 @@ async fn a_bare_no_ends_the_run_and_a_later_yes_restores_the_earlier_mode() {
     );
     agent.shutdown().await;
 }
+
+/// Reads name the mode Plan was entered from, which the plan approval continues in, only while
+/// the Chat is in Plan.
+#[tokio::test]
+async fn reads_name_the_mode_plan_was_entered_from_while_in_plan() {
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+    }
+    assert_eq!(
+        agent.status(chat).await.unwrap().mode_before_plan,
+        Some(ExecutionMode::FullAccess)
+    );
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().mode_before_plan,
+        Some(ExecutionMode::FullAccess)
+    );
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    assert_eq!(agent.status(chat).await.unwrap().mode_before_plan, None);
+    assert_eq!(agent.snapshot(chat).await.unwrap().mode_before_plan, None);
+    agent.shutdown().await;
+}

@@ -103,6 +103,88 @@ fn regional_catalog_and_thinking_controls_match_actual_model_capabilities() {
     }
 }
 
+#[test]
+fn stable_flash_is_selectable_only_on_the_verified_global_api() {
+    let catalog = ModelCatalog::defaults();
+    catalog.validate().unwrap();
+    let access = tickloop_harness_model::access::AccessCatalog::defaults();
+    let flash = catalog
+        .get("minimax-global-api", "MiniMax-M3.1-Flash")
+        .unwrap();
+    let card = flash.card.as_ref().unwrap();
+    assert_eq!(card.context_window_tokens, Some(1_000_000));
+    assert_eq!(card.max_output_tokens, 131_072);
+    assert!(card.adaptive_by_default);
+    assert_eq!(
+        card.thinking,
+        tickloop_harness_protocol::ThinkingControl::AlwaysOn
+    );
+    assert!(flash.accepts_images());
+    assert!(access.series_for(&flash).is_some());
+    assert_eq!(
+        access.recommended_model("minimax-global-api"),
+        Some("MiniMax-M3")
+    );
+    assert_eq!(
+        access
+            .provider("minimax-global-api")
+            .unwrap()
+            .auxiliary_model
+            .as_deref(),
+        Some("MiniMax-M3")
+    );
+    for effort in [ReasoningEffort::Off, ReasoningEffort::On] {
+        assert!(validate_reasoning_effort(&flash, Some(effort)).is_err());
+    }
+    for provider in ["minimax-cn-api", "minimax-cn-oauth", "minimax-global-oauth"] {
+        assert!(catalog.get(provider, "MiniMax-M3.1-Flash").is_none());
+    }
+}
+
+#[tokio::test]
+async fn stable_flash_api_encodes_adaptive_thinking_without_temperature() {
+    for effort in [
+        None,
+        Some(ReasoningEffort::Low),
+        Some(ReasoningEffort::Medium),
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::Xhigh),
+        Some(ReasoningEffort::Max),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ModelCatalog::defaults()
+            .get("minimax-global-api", "MiniMax-M3.1-Flash")
+            .unwrap();
+        save_api_key(root.path(), &config.api_key_env, "test-minimax-api-key").unwrap();
+        let (url, captured) = model_http_support::serve_response(
+            200,
+            response(
+                vec![json!({"type":"text","text":"flash answer"})],
+                "end_turn",
+            ),
+        )
+        .await;
+        config.base_url = url;
+        let (events, _) = mpsc::unbounded_channel();
+        LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap()
+            .complete(request(effort), events, CancellationToken::new())
+            .await
+            .unwrap();
+        let (_, body) = captured.await.unwrap();
+        assert_eq!(body["model"], "MiniMax-M3.1-Flash");
+        assert_eq!(body["max_tokens"], 131_072);
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert!(body.get("temperature").is_none());
+        if let Some(effort) = effort {
+            assert_eq!(body["output_config"]["effort"], effort.label());
+        } else {
+            assert!(body.get("output_config").is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn regional_api_uses_bearer_messages_images_thinking_and_cache_usage() {
     for region in ["cn", "global"] {
