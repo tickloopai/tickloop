@@ -195,7 +195,7 @@ pub use trigger_display::{
     scheduled_skill_prompt, strip_final_scheduled_run_prompt, strip_loop_instructions_error_prompt,
 };
 pub use usage::{
-    CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,
+    CacheBreakNote, CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,
     ObservationEffect, ProtocolFailure, RequestFailure, RequestOutcome, RequestOwner,
     RequestSequence, RequestUsageLedger, RequestUsageRecord, ResponseRejection, UsageCounter,
     UsageCoverage, UsageSummary,

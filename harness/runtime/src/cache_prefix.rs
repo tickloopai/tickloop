@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tickloop_harness_protocol::{Message, ModelIdentity, RunId, ToolDefinition};
+use tickloop_harness_protocol::{CacheBreakNote, Message, ModelIdentity, RunId, ToolDefinition};
 
 #[derive(Clone, Default)]
 pub(crate) struct CachePrefixState {
@@ -490,7 +490,17 @@ impl CacheBreak {
         }
     }
 
-    /// Writes the break to the Agent log only: it never reaches the model or the Transcript.
+    /// What the request's usage record keeps of the break, for a View's debug line.
+    pub(crate) fn note(&self) -> CacheBreakNote {
+        CacheBreakNote {
+            first_changed: self.first_changed.clone(),
+            likely_cause: self.likely_cause().to_owned(),
+            gap_seconds: self.gap_seconds,
+        }
+    }
+
+    /// Writes the break to the Agent log; neither the log nor the note reaches the model or the
+    /// Transcript.
     pub(crate) fn log(&self, chat: tickloop_harness_protocol::ChatId, run: RunId) {
         let tokens =
             |tokens: Option<u64>| tokens.map_or("unknown".to_owned(), |count| count.to_string());

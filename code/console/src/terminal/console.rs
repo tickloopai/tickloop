@@ -40,6 +40,8 @@ mod connection_tests;
 #[path = "console/conversation_picker_tests.rs"]
 mod conversation_picker_tests;
 #[cfg(test)]
+mod debug_line_pty;
+#[cfg(test)]
 mod dialog_height_pty;
 #[cfg(test)]
 mod dialog_height_tests;
@@ -846,6 +848,10 @@ pub(super) struct State {
     delayed_send_now: bool,
     delayed_restored_contexts: Option<Vec<InputContext>>,
     terminal_shows_links: bool,
+    /// Whether a finished turn's line ends with its prompt cache summary and debug button.
+    shows_debug_details: bool,
+    /// The latest finished turn's debug details, which its button and `/debug` copy.
+    debug_details: Option<String>,
     clipboard_hint: ClipboardImageHint,
     shell_input: ShellInputState,
     queued_inputs: Vec<QueuedInput>,
@@ -2930,6 +2936,61 @@ impl Console {
             .map_or(self._lifetime.interactive, |state| state.interactive)
     }
 
+    pub(super) fn shows_debug_details(&self) -> Result<bool, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .shows_debug_details)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_show_debug_details(&self) {
+        self.state.lock().unwrap().shows_debug_details = true;
+    }
+
+    /// As the fullscreen renderer leaves it when it captures the mouse.
+    #[cfg(test)]
+    pub(super) fn test_capture_mouse(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.surface = TerminalSurface::new(true);
+        state
+            .surface
+            .alternate_screen
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_debug_details(&self) -> Option<String> {
+        self.state.lock().unwrap().debug_details.clone()
+    }
+
+    /// Whether a click can reach a debug button: only the fullscreen renderer captures the mouse,
+    /// and only when the user has not turned the capture off.
+    pub(super) fn debug_button_is_clickable(&self) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.surface.mouse && state.surface.renderer() == Renderer::Fullscreen)
+    }
+
+    pub(super) fn remember_debug_details(&self, details: String) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .debug_details = Some(details);
+        Ok(())
+    }
+
+    /// Copies the latest finished turn's debug details, as `/debug` asks.
+    pub(super) fn copy_debug_details(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let mut output = io::stdout().lock();
+        state.copy_debug_details(&mut output);
+        if state.interactive && state.transcript.is_none() {
+            state.draw(&mut output).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn start_transcript(&self) -> Result<Uuid, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
@@ -3351,6 +3412,11 @@ impl Console {
         };
         let mut initial = State::new_with_display(interactive, width, height, preferences);
         initial.workspace_trust = workspace_trust;
+        initial.shows_debug_details = super::debug_line::enabled_by(
+            std::env::var(super::debug_line::DEBUG_VARIABLE)
+                .ok()
+                .as_deref(),
+        );
         if let Some(menu) = startup_menu {
             initial.menu = Some(menu);
             initial.menu_focused = true;
@@ -6053,6 +6119,7 @@ impl State {
         self.clear_footer_selection();
 
         self.shell_background_chord_started_at = None;
+        self.debug_details = None;
         self.chat = Some(chat);
     }
 
@@ -6148,6 +6215,8 @@ impl State {
             delayed_send_now: false,
             delayed_restored_contexts: None,
             terminal_shows_links: false,
+            shows_debug_details: false,
+            debug_details: None,
             clipboard_hint: ClipboardImageHint::new(),
             shell_input: ShellInputState::default(),
             queued_inputs: Vec::new(),
@@ -6646,6 +6715,12 @@ impl State {
             if let Some(url) = self.link_at(at) {
                 return self.open_link_press(&url, output);
             }
+        } else if self.debug_button_at(at) {
+            // Like a link's press, it selects nothing, and neither do the drag and release after it.
+            self.last_click = None;
+            let had_selection = self.clear_selection();
+            self.link_press = true;
+            return self.copy_debug_details(output) || had_selection;
         }
         let clicks = self.count_click(at, Instant::now());
         self.start_selection(at, clicks)
@@ -6769,6 +6844,52 @@ impl State {
             column = end;
         }
         url_at(&rows, first_row, cell)
+    }
+
+    /// Whether the conversation draws a finished turn's debug button at the screen cell `at`.
+    fn debug_button_at(&mut self, at: Cell) -> bool {
+        let (surface, cell, _) = self.surface_cell(at);
+        if surface != Surface::Conversation {
+            return false;
+        }
+        let (first_row, rows) = self.rows_around(surface, cell.row);
+        let Some(row) = cell
+            .row
+            .checked_sub(first_row)
+            .and_then(|index| rows.get(index))
+        else {
+            return false;
+        };
+        let mut column = 0;
+        for span in &row.spans {
+            let end = column + line_width(&span.text);
+            if (column..end).contains(&cell.column) {
+                return span.text == super::debug_line::DEBUG_BUTTON
+                    && span.role == Some(Role::Link);
+            }
+            column = end;
+        }
+        false
+    }
+
+    /// Copies the latest finished turn's debug details with the notice a copied selection gets.
+    fn copy_debug_details(&mut self, output: &mut impl Write) -> bool {
+        let Some(details) = self.debug_details.clone() else {
+            self.status = "No finished turn has debug info yet".into();
+            return true;
+        };
+        match self.clipboard.write(&details, output) {
+            Ok(route) => {
+                let duration = if route == CopyRoute::Terminal {
+                    UNCONFIRMED_COPY_NOTICE_DURATION
+                } else {
+                    COPY_NOTICE_DURATION
+                };
+                self.show_copy_notice(copy_notice(details.chars().count(), route), duration);
+            }
+            Err(error) => self.status = format!("Cannot copy the debug info: {error}"),
+        }
+        true
     }
 
     /// A press that opens a link selects nothing, and neither does the drag and release after it.
@@ -14940,6 +15061,95 @@ mod tests {
         let (row, column) = drawn_at(&state, "句子");
         click(&mut state, (row, column), 2, KeyModifiers::NONE);
         assert_eq!(last_copy(&copies).as_deref(), Some("中文句子很长"));
+    }
+
+    #[test]
+    fn a_click_on_the_debug_button_copies_the_turns_details_and_says_so() {
+        let (mut state, copies, _) = state_showing(80, "the reply\n", false);
+        state.scrollback.append_completion_notice(&[
+            ("⏺ Baked for 8s".into(), Some(Role::MutedText)),
+            (" · ".into(), Some(Role::MutedText)),
+            ("cache 96%".into(), Some(Role::MutedText)),
+            (" · avg 91%".into(), Some(Role::MutedText)),
+            ("  ".into(), Some(Role::MutedText)),
+            (
+                super::super::debug_line::DEBUG_BUTTON.into(),
+                Some(Role::Link),
+            ),
+            ("\n".into(), None),
+        ]);
+        state.debug_details = Some("chat: a\nrun: b".into());
+        state.draw(&mut Vec::new()).unwrap();
+        let (row, column) = drawn_at(&state, "cache 96%");
+        click(&mut state, (row, column), 1, KeyModifiers::NONE);
+        assert_eq!(
+            last_copy(&copies),
+            None,
+            "the summary itself copies nothing"
+        );
+        let (row, column) = drawn_at(&state, "debug info]");
+        click(&mut state, (row, column), 1, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies).as_deref(), Some("chat: a\nrun: b"));
+        assert_eq!(state.live_copy_notice(), Some("Copied 14 characters"));
+        assert!(state.selection.is_none());
+
+        // A reply that only says the button's words is not the button.
+        let (mut state, copies, _) = state_showing(80, "press [debug info] now\n", false);
+        state.debug_details = Some("details".into());
+        let (row, column) = drawn_at(&state, "[debug info]");
+        click(&mut state, (row, column + 1), 1, KeyModifiers::NONE);
+        assert_eq!(last_copy(&copies), None);
+    }
+
+    #[test]
+    fn the_debug_command_copies_the_latest_details_or_says_there_are_none() {
+        let console = Console::test_interactive_for_chat(Uuid::from_u128(1));
+        console.copy_debug_details().unwrap();
+        assert_eq!(
+            console.test_status_text(),
+            "No finished turn has debug info yet"
+        );
+        console
+            .remember_debug_details("chat: first".into())
+            .unwrap();
+        console
+            .remember_debug_details("chat: latest".into())
+            .unwrap();
+        console.copy_debug_details().unwrap();
+        let state = console.state.lock().unwrap();
+        let Clipboard::Captured { copies, .. } = &state.clipboard else {
+            unreachable!("test consoles capture the clipboard");
+        };
+        assert_eq!(copies.lock().unwrap().as_slice(), ["chat: latest"]);
+        // Test consoles copy as a remote session does, where only OSC 52 carries the copy.
+        assert_eq!(
+            state.live_copy_notice(),
+            Some(copy_notice(12, CopyRoute::Terminal).as_str())
+        );
+    }
+
+    #[test]
+    fn the_debug_command_is_offered_only_while_debug_details_show() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.insert("/deb");
+        state.refresh_completion();
+        assert!(!state.completion.is_open());
+
+        state.shows_debug_details = true;
+        state.refresh_completion();
+        assert_eq!(
+            state
+                .completion
+                .candidates()
+                .map(|candidate| candidate.command.as_str())
+                .collect::<Vec<_>>(),
+            [super::super::debug_line::DEBUG_COMMAND]
+        );
+        assert_eq!(
+            super::super::command_timing(super::super::debug_line::DEBUG_COMMAND),
+            super::super::CommandTiming::Immediate
+        );
     }
 
     #[test]

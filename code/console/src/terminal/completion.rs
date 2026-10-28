@@ -491,6 +491,8 @@ pub(super) fn skill_candidates(registry: &SkillRegistry) -> Arc<[CompletionCandi
 pub(super) struct Completion {
     matches: Vec<CompletionCandidate>,
     skills: Arc<[CompletionCandidate]>,
+    /// Whether `/debug` is offered, as it is only while the Console shows debug details.
+    offers_debug: bool,
     selected: Option<usize>,
     draft: String,
     token_start: usize,
@@ -500,6 +502,10 @@ pub(super) struct Completion {
 impl Completion {
     pub(super) fn set_skills(&mut self, skills: Arc<[CompletionCandidate]>) {
         self.skills = skills;
+    }
+
+    pub(super) fn offer_debug(&mut self, offers_debug: bool) {
+        self.offers_debug = offers_debug;
     }
 
     #[cfg(test)]
@@ -545,6 +551,17 @@ impl Completion {
                     }
                 }),
         );
+        if self.offers_debug
+            && scope != CommandScope::Overview
+            && super::debug_line::DEBUG_COMMAND[1..].starts_with(query)
+        {
+            self.matches.push(CompletionCandidate {
+                command: super::debug_line::DEBUG_COMMAND.into(),
+                arguments: String::new(),
+                description: "Copies the latest finished turn's debug info.".into(),
+                menu_group: Some(CommandGroup::Advanced),
+            });
+        }
         self.matches.extend(
             self.skills
                 .iter()
@@ -587,6 +604,7 @@ impl Completion {
 
     fn knows_command(&self, name: &str) -> bool {
         COMMANDS.iter().any(|spec| &spec.command[1..] == name)
+            || (self.offers_debug && &super::debug_line::DEBUG_COMMAND[1..] == name)
             || self.skills.iter().any(|skill| {
                 let skill_name = &skill.command[1..];
                 skill_name == name

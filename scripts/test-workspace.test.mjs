@@ -19,14 +19,18 @@ test('workspace runner removes its temporary roots on success and failure', t =>
   writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
     const fs = require('node:fs');
     if (process.argv.includes('--version')) process.exit(0);
-    fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify([process.env.TICKLOOP_CONFIG_DIR, process.env.TICKLOOP_TMPDIR]));
+    fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify([process.env.TICKLOOP_CONFIG_DIR, process.env.TICKLOOP_TMPDIR, process.env.TICKLOOP_DEBUG ?? null]));
     process.exit(fs.existsSync(${JSON.stringify(join(directory, 'fail'))}) ? 1 : 0);
   `, { mode: 0o755 });
   for (const fails of [false, true]) {
     if (fails) writeFileSync(join(directory, 'fail'), '');
     const result = spawnSync('make', ['test-workspace'], { cwd: directory,
-      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, HOME: directory, MAKEFLAGS: '', MAKELEVEL: '' }, encoding: 'utf8' });
-    const roots = JSON.parse(readFileSync(report, 'utf8'));
+      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, HOME: directory, MAKEFLAGS: '', MAKELEVEL: '', TICKLOOP_DEBUG: '1' },
+      encoding: 'utf8' });
+    const [config, temporary, debug] = JSON.parse(readFileSync(report, 'utf8'));
+    // A developer's debug details must not reach the tests' terminal output.
+    assert.equal(debug, null);
+    const roots = [config, temporary];
     const leaked = roots.filter(root => existsSync(root));
     for (const root of leaked) rmSync(root, { recursive: true, force: true });
     assert.deepEqual(leaked, [], result.stderr);
