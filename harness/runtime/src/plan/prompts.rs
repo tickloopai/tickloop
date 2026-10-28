@@ -219,6 +219,12 @@ You can refer back to it if needed during implementation.
     )
 }
 
+/// A plan file path as a mode note shows it: the Folder it lies in is the user's, so the path
+/// keeps to its line.
+fn shown(path: &Path) -> String {
+    tickloop_harness_protocol::tags::single_line(&path.display().to_string())
+}
+
 /// Claude Code's `plan_mode_exit` attachment, sent once after the user leaves Plan mode without
 /// approving a plan.
 pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
@@ -226,7 +232,7 @@ pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
         .map(|path| {
             format!(
                 " The plan file is located at {} if you need to reference it.",
-                path.display()
+                shown(path)
             )
         })
         .unwrap_or_default();
@@ -254,7 +260,7 @@ You are returning to plan mode after having previously exited it. A plan file ex
 4. Continue on with the plan process and most importantly you should always edit the plan file one way or the other before calling {EXIT_PLAN_MODE_TOOL_NAME}
 
 Treat this as a fresh planning session. Do not assume the existing plan is relevant without evaluating it first.",
-        plan_file.display()
+        shown(plan_file)
     )
 }
 
@@ -268,7 +274,7 @@ Plan mode is active. The user indicated that they do not want you to execute yet
 fn sparse_plan_mode_reminder(plan_file: &Path) -> String {
     format!(
         "Plan mode still active (see full instructions earlier in conversation). Read-only except plan file ({}) and Artifact documents through {ARTIFACT_EDIT_TOOL}. Follow the iterative planning workflow, and end your turn only with {ASK_USER_QUESTION_TOOL_NAME} or {EXIT_PLAN_MODE_TOOL_NAME}.",
-        plan_file.display()
+        shown(plan_file)
     )
 }
 
@@ -291,7 +297,7 @@ pub(crate) fn plan_mode_rules(
 /// The full plan mode reminder a root Chat with a Folder hears on entering Plan mode and every
 /// few sparse reminders after.
 pub(crate) fn plan_mode_reminder(plan_file: &Path, plan_exists: bool) -> String {
-    let plan_file = plan_file.display();
+    let plan_file = shown(plan_file);
     let plan_file_info = if plan_exists {
         format!(
             "A plan file already exists at {plan_file}. You can read it and make incremental edits using the {EDIT_TOOL_NAME} tool."

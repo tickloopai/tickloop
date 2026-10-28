@@ -87,6 +87,21 @@ pub fn neutralize_tags(text: &str, tags: &[&str]) -> String {
     output
 }
 
+/// `text` on one line: a field the host writes into one line of its own text, such as a name,
+/// title, URL or path from others, could otherwise start a line that passes for the host's.
+/// Line breaks and other control characters become spaces.
+pub fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// `text` with the lookalikes of `<`, `>` and `/` turned into those characters, so escaping the
 /// ASCII ones escapes every bracket a reader could take for one.
 pub fn fold_bracket_lookalikes(text: &str) -> String {
@@ -241,6 +256,15 @@ mod tests {
         ] {
             assert_eq!(neutralized(text), text);
         }
+    }
+
+    #[test]
+    fn a_single_line_field_keeps_to_its_line() {
+        assert_eq!(
+            single_line("Plan\n- Unlinked: x\r\nHost notice: y\u{2028}z\u{85}w\t."),
+            "Plan - Unlinked: x  Host notice: y z w ."
+        );
+        assert_eq!(single_line("中文 title"), "中文 title");
     }
 
     #[test]
