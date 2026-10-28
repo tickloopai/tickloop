@@ -819,3 +819,183 @@ async fn planned_upgrade_keeps_the_mode_plan_was_entered_from() {
     original.shutdown_for_upgrade().await;
     successor.shutdown().await;
 }
+
+/// An Agent whose host denies `Grep` and whose user turned Auto in Plan off.
+fn agent_with_host_rules_and_settings(model: Arc<ScriptedModel>) -> Agent {
+    use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsSnapshot};
+    let settings = MemorySettingsStore::new(SettingsSnapshot {
+        use_auto_mode_during_plan: false,
+        ..SettingsSnapshot::default()
+    });
+    Agent::with_seams(
+        crate::HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
+            models: tickloop_harness_test_support::harness::ChosenModels::new(model),
+        },
+        crate::HarnessOptions {
+            settings: Some(Arc::new(settings)),
+            host_rules: vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Deny,
+                tool: "Grep".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+            ..crate::HarnessOptions::local(config())
+        },
+    )
+    .unwrap()
+}
+
+/// What a policy never records comes back after a planned upgrade as a load fills it in: the
+/// host's rules and the user's Auto in Plan setting, and the launch rules, which only the
+/// checkpoint carries, for the root, its child and the child's frozen ceiling. The host's Deny
+/// and the launch Deny still refuse, and Plan entered from Auto still asks instead of using Auto.
+#[tokio::test]
+async fn planned_upgrade_keeps_host_rules_launch_rules_and_auto_in_plan_off() {
+    let directory = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let notes = external.path().join("notes.txt");
+    std::fs::write(&notes, "OUTSIDE_NOTES").unwrap();
+    let original = agent_with_host_rules_and_settings(Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "Subagent",
+            serde_json::json!({"task":"Look around"}),
+        ),
+        text("child done"),
+        text("parent done"),
+    ])));
+    let chat = original
+        .create_chat_with_launch_rules(
+            directory.path().into(),
+            vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Deny,
+                tool: "Glob".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    complete(&original, chat, "Delegate a look around").await;
+    for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+        original.set_execution_mode(chat, mode).await.unwrap();
+    }
+    let policies = |chats: &HashMap<ChatId, Chat>| {
+        let mut policies = chats
+            .values()
+            .flat_map(|chat| {
+                std::iter::once((chat.snapshot.id, false, &chat.snapshot.policy)).chain(
+                    chat.snapshot
+                        .delegation
+                        .as_ref()
+                        .map(|delegation| (chat.snapshot.id, true, &delegation.ceiling.policy)),
+                )
+            })
+            .map(|(id, is_ceiling, policy)| {
+                let ids =
+                    |rules: &[PermissionRule]| rules.iter().map(|rule| rule.id).collect::<Vec<_>>();
+                (
+                    id.uuid(),
+                    is_ceiling,
+                    policy
+                        .host_rules
+                        .iter()
+                        .map(|rule| format!("{:?} {}", rule.decision, rule.tool))
+                        .collect::<Vec<_>>(),
+                    ids(&policy.launch_rules),
+                    policy.plan_without_auto,
+                )
+            })
+            .collect::<Vec<_>>();
+        policies.sort();
+        policies
+    };
+    let before = policies(&*original.inner.chats.lock().await);
+    assert_eq!(
+        before.len(),
+        3,
+        "the root, its child and the child's ceiling"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(_, _, host, launch, plan_without_auto)| host.len() == 1
+                && launch.len() == 1
+                && *plan_without_auto),
+        "{before:?}"
+    );
+    let checkpoint = prepare(&original).await;
+    let successor_model = Arc::new(ScriptedModel::new(vec![
+        call("grep", "Grep", serde_json::json!({"pattern":"anything"})),
+        call("glob", "Glob", serde_json::json!({"pattern":"*"})),
+        call("read", "Read", serde_json::json!({"file_path": notes})),
+        text("done"),
+    ]));
+    let successor = agent_with_host_rules_and_settings(successor_model);
+    successor
+        .restore_upgrade(serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(policies(&*successor.inner.chats.lock().await), before);
+    successor.activate_upgrade().await.unwrap();
+    original.shutdown_for_upgrade().await;
+    successor.release_upgrade().await.unwrap();
+
+    let mut events = successor.subscribe();
+    let receipt = successor.submit(chat, "Look again".into()).await.unwrap();
+    let mut prompts = Vec::new();
+    let mut results = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    prompts.push(request.name.clone());
+                    successor
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted {
+                    call_id, result, ..
+                } => {
+                    results.insert(call_id, result);
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        results["grep"].is_error,
+        "the host's Deny: {}",
+        results["grep"].content
+    );
+    assert!(
+        results["glob"].is_error,
+        "the launch Deny: {}",
+        results["glob"].content
+    );
+    assert_eq!(
+        prompts,
+        ["Read"],
+        "Plan entered from Auto asks with Auto in Plan off"
+    );
+    assert!(results["read"].content.contains("OUTSIDE_NOTES"));
+    successor.shutdown().await;
+}

@@ -1955,7 +1955,7 @@ impl Agent {
                                         == Some(crate::host_tools::HostToolPermission::ReadOnly)
                                     {
                                         super::denials::DirectApprovalBasis::ReadOnly
-                                    } else if execution_mode == ExecutionMode::FullAccess {
+                                    } else if policy.admission_mode() == ExecutionMode::FullAccess {
                                         super::denials::DirectApprovalBasis::FullAccess
                                     } else {
                                         super::denials::DirectApprovalBasis::HostTool
@@ -2605,7 +2605,9 @@ impl Agent {
                                 path: approval_path,
                                 direct_basis: if prepared.is_read_only {
                                     super::denials::DirectApprovalBasis::ReadOnly
-                                } else if chat.snapshot.policy.mode == ExecutionMode::FullAccess {
+                                } else if chat.snapshot.policy.admission_mode()
+                                    == ExecutionMode::FullAccess
+                                {
                                     super::denials::DirectApprovalBasis::FullAccess
                                 } else if bypassed_by_unrestricted_host {
                                     super::denials::DirectApprovalBasis::UnrestrictedHost

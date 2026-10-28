@@ -160,7 +160,9 @@ impl PermissionPolicy {
 
     /// The mode whose admission decides what is not refused outright: the mode leaving Plan
     /// continues in ([`ExecutionMode::leaving_plan`]), so Ask when unknown, except that Plan after
-    /// Auto decides as Ask when the user turned Auto in Plan off. Outside Plan, the mode itself.
+    /// Auto decides as Ask when the user turned Auto in Plan off. Plan after Full Access allows
+    /// what it does not refuse, as Claude Code's Plan with bypass available does; explicit Deny and
+    /// Ask rules still come first. Outside Plan, the mode itself.
     pub fn admission_mode(&self) -> ExecutionMode {
         match self.mode.leaving_plan(self.mode_before_plan) {
             ExecutionMode::Auto if !self.uses_auto_admission() => ExecutionMode::AcceptEdits,

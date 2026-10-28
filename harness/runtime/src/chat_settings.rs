@@ -28,6 +28,10 @@ use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, Decision, ModelConfig, PermissionRule, ReasoningEffort,
 };
 
+fn plan_without_auto(saved: Option<&SettingsSnapshot>) -> bool {
+    saved.is_some_and(|saved| !saved.use_auto_mode_during_plan)
+}
+
 /// Persistent rule changes partitioned by canonical project working directory.
 pub(super) type RuleChanges = BTreeMap<PathBuf, ProjectRuleChanges>;
 
@@ -79,6 +83,18 @@ impl Agent {
         policy.host_rules = self.inner.host_rules.clone();
     }
 
+    /// The user's `useAutoModeDuringPlan: false` as a Chat in `folder` reads it when it is created
+    /// or resumed: a policy never records it.
+    pub(super) fn plan_without_auto(&self, folder: Option<&Path>) -> bool {
+        plan_without_auto(
+            self.inner
+                .settings
+                .as_ref()
+                .map(|settings| settings.read(folder))
+                .as_ref(),
+        )
+    }
+
     pub(super) fn apply_new_chat_settings(
         &self,
         snapshot: &mut ChatSnapshot,
@@ -103,9 +119,7 @@ impl Agent {
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
         self.apply_host_rules(&mut snapshot.policy);
-        snapshot.policy.plan_without_auto = saved
-            .as_ref()
-            .is_some_and(|saved| !saved.use_auto_mode_during_plan);
+        snapshot.policy.plan_without_auto = plan_without_auto(saved.as_ref());
         snapshot.task_tools_enabled = saved.as_ref().map_or_else(
             || {
                 self.inner
