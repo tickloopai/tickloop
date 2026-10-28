@@ -3112,7 +3112,7 @@ fn compact_result_runs(
         }
     }
     if let Some(value) = &value {
-        if name != "TickRead"
+        if !matches!(name, "TickRead" | "TickDescribe")
             && let Some(source) = value["source"].as_str()
         {
             rows.row([(clipped(source, PREVIEW_LINE_CHARACTERS).0, None)]);
@@ -5462,6 +5462,19 @@ mod tests {
                 output_ref: None,
             };
             let rendered = compact_result("TickRead", None, &result);
+            assert_eq!(rendered, "  ↳  Completed\n", "{source}");
+        }
+    }
+
+    #[test]
+    fn completed_tick_describes_show_no_source_line() {
+        for source in ["protocol", "terminal"] {
+            let result = ToolResult {
+                content: json!({"tick_instance_id":"hosted:counter","source":source,"descriptor":{"name":"counter","revision":"1"}}).to_string(),
+                is_error: false,
+                output_ref: None,
+            };
+            let rendered = compact_result("TickDescribe", None, &result);
             assert_eq!(rendered, "  ↳  Completed\n", "{source}");
         }
     }
