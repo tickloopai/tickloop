@@ -196,7 +196,8 @@ pub(super) struct Monitor {
     /// The rows with unseen updates above and below the visible part of the list, as the last
     /// frame counted them.
     unseen_edges: Cell<(usize, usize)>,
-    /// The first and last row the last frame showed of the list, wholly or partly.
+    /// The first and last row the last frame showed of the list, wholly or partly, outside its
+    /// edge lines.
     visible_rows: std::cell::RefCell<(Option<InstanceRef>, Option<InstanceRef>)>,
     /// Whether the column has shown rows in this Chat; it then stays when empty, so the
     /// conversation does not change width each time a background Shell starts or ends.
@@ -2004,7 +2005,14 @@ impl Monitor {
         }
         self.unseen_edges
             .set((unseen.above.len(), unseen.below.len()));
-        *self.visible_rows.borrow_mut() = visible_span(&row_ids, offset, tick_capacity);
+        // The lines under the edge lines are not visible, so their rows count as out of view.
+        let covered_top = usize::from(!unseen.above.is_empty());
+        let covered_bottom = usize::from(!unseen.below.is_empty());
+        *self.visible_rows.borrow_mut() = visible_span(
+            &row_ids,
+            offset + covered_top,
+            tick_capacity.saturating_sub(covered_top + covered_bottom),
+        );
         let tick_start = lines.len();
         let mut card_lines: Vec<bool> = row_ids
             .iter()
@@ -3982,6 +3990,33 @@ mod scrolling_tests {
         );
         let shown = monitor.frame(30, 12, display, 7_500);
         assert!(texts(&shown).iter().any(|line| line.contains("Tick 025")));
+    }
+
+    #[test]
+    fn a_click_on_an_edge_line_selects_the_unseen_row_the_line_covers() {
+        let display = DisplayProfile::default();
+        let mut monitor = monitor(30);
+        monitor.select(&calendar(15));
+        let first_shown = texts(&monitor.frame(30, 12, display, 6_000))
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("◉ Tick ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|index| index.parse::<usize>().ok())
+            })
+            .unwrap();
+        observe(&mut monitor, &[first_shown - 2, first_shown], 5_000);
+        let lines = texts(&monitor.frame(30, 12, display, 6_000));
+        assert!(
+            lines.iter().any(|line| line.starts_with("↑ 2 updated")),
+            "the row under the edge line counts: {lines:#?}"
+        );
+        monitor.select_target(&MonitorTarget::Unseen { below: false });
+        assert_eq!(
+            monitor.selected().unwrap().instance,
+            calendar(first_shown),
+            "and a click on the line selects it"
+        );
     }
 
     #[test]
