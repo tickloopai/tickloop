@@ -554,6 +554,14 @@ pub enum LoopAction {
     ApprovePlan {
         version: u64,
         mode: ExecutionMode,
+        /// The user's feedback on the plan, sent along with the approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// Replaces the reviewed plan version with the user's edit; the edit awaits approval.
+    EditPlan {
+        version: u64,
+        markdown: String,
     },
     DeclinePlan {
         version: u64,
@@ -689,6 +697,8 @@ pub enum AgentDetailQuery {
     Warnings,
     /// The Agent's MCP servers, once it has taken up its current configuration.
     McpServers,
+    /// The current Loop's plan file, when one has been written.
+    PlanFile,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1018,6 +1028,7 @@ pub enum ObservationValue {
     Receipt(Option<Box<CommandReceipt>>),
     OtherTickhost(Option<OtherTickhost>),
     RuntimeVersion(Box<crate::RuntimeVersion>),
+    PlanFile(Option<PathBuf>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

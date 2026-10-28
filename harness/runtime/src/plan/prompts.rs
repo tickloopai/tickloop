@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::mcp_tools::ARTIFACT_EDIT_TOOL;
 
-use tickloop_harness_protocol::SUBAGENT_TOOL_NAME;
+use tickloop_harness_protocol::{Plan, SUBAGENT_TOOL_NAME};
 use tickloop_harness_tools::{
     ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
@@ -214,16 +214,26 @@ pub(super) fn declined_plan(feedback: Option<&str>) -> String {
 }
 
 /// The approved ExitPlanMode result, also used to continue a saved plan whose original Run ended.
-pub(super) fn approved_plan(path: &Path, markdown: &str) -> String {
+/// Claude Code marks a plan the user edited in review and appends feedback given on approval.
+pub(super) fn approved_plan(path: &Path, plan: &Plan, feedback: Option<&str>) -> String {
+    let heading = if plan.edited_by_user {
+        "Approved Plan (edited by user)"
+    } else {
+        "Approved Plan"
+    };
+    let feedback = feedback
+        .map(|feedback| format!("\n\nUser feedback on this plan: {feedback}"))
+        .unwrap_or_default();
     format!(
         "User has approved your plan. You can now start coding. Proceed with the approved work
 
 Your plan has been saved to: {}
 You can refer back to it if needed during implementation.
 
-## Approved Plan:
-{markdown}",
-        path.display()
+## {heading}:
+{}{feedback}",
+        path.display(),
+        plan.markdown
     )
 }
 

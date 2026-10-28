@@ -596,6 +596,7 @@ pub(super) fn rebuild_plans_and_progress(
                     markdown: file.markdown,
                     approved_execution_mode: None,
                     approval_pending: restored_version != version || pending.unwrap_or(true),
+                    edited_by_user: false,
                 });
             }
             (
@@ -624,6 +625,7 @@ pub(super) fn rebuild_plans_and_progress(
                     markdown,
                     approved_execution_mode: None,
                     approval_pending: true,
+                    edited_by_user: false,
                 });
             }
             (Some(version), file) => {
@@ -716,6 +718,83 @@ impl Agent {
             .map(Some)
     }
 
+    /// Replaces the reviewed version with the user's edit, recorded as the next version and
+    /// still awaiting approval: a waiting ExitPlanMode keeps waiting, now bound to the new version.
+    pub async fn edit_plan(
+        &self,
+        chat_id: ChatId,
+        version: u64,
+        markdown: String,
+    ) -> Result<(), AgentError> {
+        if markdown.trim().is_empty() {
+            return Err(AgentError::Invalid("the edited plan is empty".into()));
+        }
+        if markdown.len() > MAX_PLAN_BYTES {
+            return Err(AgentError::Invalid(format!(
+                "the edited plan exceeds {MAX_PLAN_BYTES} bytes"
+            )));
+        }
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let loop_id = chat.snapshot.chat_loop.id;
+        let request = chat.snapshot.permissions.iter().position(|request| {
+            request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id
+        });
+        if chat.active.is_some() && request.is_none() {
+            return Err(AgentError::Busy);
+        }
+        let plans_directory = self.plans_directory(super::require_folder(&chat.snapshot)?);
+        let next_version = highest_plan_version(&chat.snapshot, &chat.bookkeeping)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let plan = chat
+            .snapshot
+            .plans
+            .iter_mut()
+            .find(|plan| plan.loop_id == loop_id)
+            .ok_or_else(|| AgentError::Invalid("the Loop has no plan".into()))?;
+        if plan.version != version {
+            return Err(AgentError::Invalid(
+                "plan was revised; review the current version".into(),
+            ));
+        }
+        if !plan.approval_pending {
+            return Err(AgentError::Invalid(
+                "plan approval was already processed".into(),
+            ));
+        }
+        if plan.markdown == markdown {
+            return Ok(());
+        }
+        let slug = chat
+            .bookkeeping
+            .plan_slug
+            .as_deref()
+            .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
+        write_plan_file(
+            plans_directory.path(),
+            slug,
+            loop_id,
+            next_version,
+            &markdown,
+        )
+        .map_err(|error| AgentError::Invalid(format!("cannot save the edited plan: {error}")))?;
+        plan.version = next_version;
+        plan.markdown = markdown;
+        plan.edited_by_user = true;
+        if let Some(request) = request {
+            chat.snapshot.permissions[request].input = json!({"plan_version": next_version});
+        }
+        self.save(&chat.snapshot);
+        let (snapshot, bookkeeping) = (chat.snapshot.clone(), chat.bookkeeping.clone());
+        drop(chats);
+        // The file already carries the new version; recording it now keeps a crash from
+        // restoring it as another unapproved version. A failed checkpoint is retried by the
+        // regular save, and the edit itself stands.
+        let _ = self.checkpoint_transcript(&snapshot, &bookkeeping).await;
+        Ok(())
+    }
+
     /// Approves the reviewed version and resumes its waiting tool. If that Run already ended,
     /// returns the approved-plan input needed to start an explicit continuation.
     pub async fn approve_plan(
@@ -724,6 +803,21 @@ impl Agent {
         version: u64,
         mode: ExecutionMode,
     ) -> Result<Option<String>, AgentError> {
+        self.approve_plan_with_feedback(chat_id, version, mode, None)
+            .await
+    }
+
+    /// Like `approve_plan`, and the approval carries the user's feedback on the plan.
+    pub async fn approve_plan_with_feedback(
+        &self,
+        chat_id: ChatId,
+        version: u64,
+        mode: ExecutionMode,
+        feedback: Option<String>,
+    ) -> Result<Option<String>, AgentError> {
+        let feedback = feedback
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty());
         if mode == ExecutionMode::Plan {
             return Err(AgentError::Invalid(
                 "select an execution mode when approving a plan".into(),
@@ -803,7 +897,7 @@ impl Agent {
         }
         plan.approved_execution_mode = Some(mode);
         plan.approval_pending = false;
-        let markdown = plan.markdown.clone();
+        let approved = plan.clone();
         let plan_file = current_plan_file(&chat.bookkeeping, plans_directory.path(), loop_id)
             .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
         snapshot.policy.mode = mode;
@@ -821,7 +915,7 @@ impl Agent {
                 .send(PermissionAnswer {
                     allow: true,
                     revision: chat.snapshot.policy.revision,
-                    comment: None,
+                    comment: feedback,
                 })
                 .map_err(|_| AgentError::Invalid("plan approval expired".into()))?;
             chat.snapshot
@@ -829,7 +923,26 @@ impl Agent {
                 .retain(|permission| permission.id != request.id);
             return Ok(None);
         }
-        Ok(Some(prompts::approved_plan(&plan_file, &markdown)))
+        Ok(Some(prompts::approved_plan(
+            &plan_file,
+            &approved,
+            feedback.as_deref(),
+        )))
+    }
+
+    /// The current Loop's plan file, once it exists.
+    pub async fn plan_file(&self, chat_id: ChatId) -> Result<Option<PathBuf>, AgentError> {
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+        let Some(folder) = chat.snapshot.folder.as_deref() else {
+            return Ok(None);
+        };
+        Ok(current_plan_file(
+            &chat.bookkeeping,
+            self.plans_directory(folder).path(),
+            chat.snapshot.chat_loop.id,
+        )
+        .filter(|path| path.is_file()))
     }
 
     /// The directory of plan files: `<root>/plans` when Chats are saved locally, otherwise `plans` under
@@ -1034,14 +1147,34 @@ impl Agent {
                 cancel.clone(),
             )
             .await?;
+        // The user may have replaced the submitted text in review; the result carries the
+        // version that was approved.
+        let approved = if answer.allow {
+            let chats = self.inner.chats.lock().await;
+            chats
+                .get(&receipt.chat_id)
+                .and_then(|chat| {
+                    chat.snapshot
+                        .plans
+                        .iter()
+                        .find(|current| current.loop_id == receipt.loop_id)
+                        .cloned()
+                })
+                .unwrap_or_else(|| plan.clone())
+        } else {
+            plan.clone()
+        };
         if !answer.allow {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&receipt.chat_id)
                 .ok_or("chat is unavailable")?;
-            if let Some(current) = chat.snapshot.plans.iter_mut().find(|current| {
-                current.loop_id == receipt.loop_id && current.version == plan.version
-            }) {
+            if let Some(current) = chat
+                .snapshot
+                .plans
+                .iter_mut()
+                .find(|current| current.loop_id == receipt.loop_id)
+            {
                 current.approval_pending = answer.comment.is_none();
             }
             self.save(&chat.snapshot);
@@ -1052,7 +1185,7 @@ impl Agent {
         }
         Ok(ToolResult {
             content: if answer.allow {
-                prompts::approved_plan(&path, &plan.markdown)
+                prompts::approved_plan(&path, &approved, answer.comment.as_deref())
             } else {
                 prompts::declined_plan(answer.comment.as_deref())
             },
@@ -1121,6 +1254,7 @@ impl Agent {
             markdown,
             approved_execution_mode: None,
             approval_pending: true,
+            edited_by_user: false,
         };
         snapshot.plans.retain(|plan| plan.loop_id != loop_id);
         snapshot.plans.push(plan.clone());
