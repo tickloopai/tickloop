@@ -11,8 +11,22 @@ pub(crate) fn agent_with_plan_setting(
     model: Arc<ScriptedModel>,
     use_auto_mode_during_plan: bool,
 ) -> Agent {
+    agent_with_plan_setting_and_subagents(
+        model,
+        use_auto_mode_during_plan,
+        tickloop_harness_runtime::SubagentLaunch::AlwaysBackground,
+    )
+}
+
+pub(crate) fn agent_with_plan_setting_and_subagents(
+    model: Arc<ScriptedModel>,
+    use_auto_mode_during_plan: bool,
+    subagent_launch: tickloop_harness_runtime::SubagentLaunch,
+) -> Agent {
     use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsSnapshot};
-    use tickloop_harness_runtime::{HarnessOptions, HarnessSeams, environment::FolderEnvironment};
+    use tickloop_harness_runtime::{
+        HarnessOptions, HarnessSeams, ToolPolicy, environment::FolderEnvironment,
+    };
     use tickloop_harness_test_support::harness::ChosenModels;
     let settings = MemorySettingsStore::new(SettingsSnapshot {
         use_auto_mode_during_plan,
@@ -28,6 +42,10 @@ pub(crate) fn agent_with_plan_setting(
         HarnessOptions {
             settings: Some(Arc::new(settings)),
             host: tickloop_harness_protocol::AgentHostOptions::embedded_defaults(),
+            tools: ToolPolicy {
+                subagent_launch,
+                ..ToolPolicy::local()
+            },
             ..HarnessOptions::local(config())
         },
     )

@@ -2,6 +2,9 @@ use super::*;
 
 const TASK_TOOLS: [&str; 4] = ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate"];
 const TASK_TOOLS_MENU_INDEX: usize = 14;
+const ENABLED_PROMPT: &str = "Create a task and delegate its review.";
+const DISABLED_PROMPT: &str = "Delegate again with task tools disabled.";
+const REENABLED_PROMPT: &str = "Continue with task tools enabled.";
 
 fn assert_task_tools(request: &Value, enabled: bool) {
     let names = request["tools"]
@@ -14,6 +17,20 @@ fn assert_task_tools(request: &Value, enabled: bool) {
         assert_eq!(names.contains(&name), enabled, "{name}: {names:?}");
     }
     assert!(!names.contains(&"TodoWrite"));
+}
+
+/// Checks every request the model received so far, root and member alike, and takes at least
+/// the root's final one.
+fn assert_every_pending_request(
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+    enabled: bool,
+) {
+    let mut checked = 0;
+    while let Ok((_, request)) = requests.try_recv() {
+        assert_task_tools(&request, enabled);
+        checked += 1;
+    }
+    assert!(checked > 0, "the work reached the model");
 }
 
 async fn toggle_task_tools(pty: &mut PtyView, enabled: bool) {
@@ -57,10 +74,20 @@ fn subagent_reply(name: &str) -> String {
 }
 
 async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
-    let (base_url, mut requests) = model_http_support::serve_responses(vec![
-        (
-            200,
-            chat_reply(
+    // Members run in the background, so replies follow who asks and what has arrived.
+    let (base_url, mut requests) = model_http_support::serve_router(|request| {
+        let history = request["messages"].to_string();
+        match delegated_by(request).as_deref() {
+            Some("enabled-member") => return chat_reply(None, "ENABLED-MEMBER-DONE"),
+            Some(_) => return chat_reply(None, "DISABLED-MEMBER-DONE"),
+            None => {}
+        }
+        let phase = [ENABLED_PROMPT, DISABLED_PROMPT, REENABLED_PROMPT]
+            .into_iter()
+            .max_by_key(|prompt| history.rfind(prompt).map_or(-1, |at| at as i64))
+            .unwrap();
+        match phase {
+            ENABLED_PROMPT if !has_result(request, "create-shared-task") => chat_reply(
                 Some((
                     "TaskCreate",
                     "create-shared-task",
@@ -72,15 +99,22 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
                 )),
                 "",
             ),
-        ),
-        (200, subagent_reply("enabled-member")),
-        (200, chat_reply(None, "ENABLED-MEMBER-DONE")),
-        (200, chat_reply(None, "ENABLED-ROOT-DONE")),
-        (200, subagent_reply("disabled-member")),
-        (200, chat_reply(None, "DISABLED-MEMBER-DONE")),
-        (200, chat_reply(None, "DISABLED-ROOT-DONE")),
-        (200, chat_reply(None, "REENABLED-ROOT-DONE")),
-    ])
+            ENABLED_PROMPT if !has_result(request, "enabled-member") => {
+                subagent_reply("enabled-member")
+            }
+            ENABLED_PROMPT if history.contains("ENABLED-MEMBER-DONE") => {
+                chat_reply(None, "ENABLED-ROOT-DONE")
+            }
+            DISABLED_PROMPT if !has_result(request, "disabled-member") => {
+                subagent_reply("disabled-member")
+            }
+            DISABLED_PROMPT if history.contains("DISABLED-MEMBER-DONE") => {
+                chat_reply(None, "DISABLED-ROOT-DONE")
+            }
+            REENABLED_PROMPT => chat_reply(None, "REENABLED-ROOT-DONE"),
+            _ => chat_reply(None, "Review delegated"),
+        }
+    })
     .await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
@@ -100,7 +134,7 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
             .unwrap();
     assert_eq!(saved["taskToolsEnabled"], true);
 
-    pty.send(b"Create a task and delegate its review.\r");
+    pty.send(format!("{ENABLED_PROMPT}\r").as_bytes());
     pty.wait_for("shared task appears in the compact list", |frame| {
         frame.contains("ENABLED-ROOT-DONE")
             && frame
@@ -110,14 +144,9 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
                 })
     })
     .await;
-    for _ in 0..4 {
-        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .1;
-        assert_task_tools(&request, true);
-    }
+    pty.wait_for_editor("enabled work completed", Some(""))
+        .await;
+    assert_every_pending_request(&mut requests, true);
     let root = catalog(&client)
         .await
         .into_iter()
@@ -128,8 +157,6 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
     let board = before.conversation.task_boards.values().next().unwrap();
     assert_eq!(board.tasks.len(), 1);
     let task_id = board.tasks[0].id;
-    pty.wait_for_editor("enabled work completed", Some(""))
-        .await;
 
     let child_id = catalog(&client)
         .await
@@ -170,19 +197,14 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
                 .task_tools_enabled
         );
     }
-    pty.send(b"Delegate again with task tools disabled.\r");
+    pty.send(format!("{DISABLED_PROMPT}\r").as_bytes());
     pty.wait_for("disabled work completed", |frame| {
         frame.contains("DISABLED-ROOT-DONE")
     })
     .await;
-    for _ in 0..3 {
-        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .1;
-        assert_task_tools(&request, false);
-    }
+    pty.wait_for_editor("disabled work leaves editor ready", Some(""))
+        .await;
+    assert_every_pending_request(&mut requests, false);
     let after = snapshot(&client, root).await;
     assert_eq!(
         after
@@ -195,8 +217,6 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
             .id,
         task_id
     );
-    pty.wait_for_editor("disabled work leaves editor ready", Some(""))
-        .await;
     toggle_task_tools(&mut pty, true).await;
     assert!(requests.try_recv().is_err());
     pty.wait_for("reenabling tools restores the same task panel", |frame| {
@@ -211,7 +231,7 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
         })
         .await;
     child_view.close().await;
-    pty.send(b"Continue with task tools enabled.\r");
+    pty.send(format!("{REENABLED_PROMPT}\r").as_bytes());
     pty.wait_for("re-enabled work completed", |frame| {
         frame.contains("REENABLED-ROOT-DONE")
     })

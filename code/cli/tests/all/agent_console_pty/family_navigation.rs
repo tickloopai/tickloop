@@ -242,45 +242,59 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         .unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
-    let responses = vec![
-        chat_reply(
-            Some((
-                "Subagent",
-                "family-first-child",
-                json!({"task":FIRST_CHILD_TASK,"name":"family-one","description":FIRST_CHILD_TASK}),
-            )),
-            "",
-        ),
-        chat_reply(None, FIRST_CHILD_REPLY),
-        chat_reply(
-            Some((
-                "Subagent",
-                "family-second-child",
-                json!({"task":SECOND_CHILD_TASK,"name":"family-two","description":SECOND_CHILD_TASK}),
-            )),
-            "",
-        ),
-        chat_reply(None, SECOND_CHILD_REPLY),
-        chat_reply(None, MAIN_REPLY),
-        chat_reply(Some(("ListSubagents", "main-todo", json!({}))), ""),
-        waiting_reply("main-context-wait", "Main remains busy"),
-        chat_reply(Some(("ListSubagents", "first-todo", json!({}))), ""),
-        waiting_reply("first-context-wait", "First child remains busy"),
-        chat_reply(Some(("ListSubagents", "second-todo", json!({}))), ""),
-        waiting_reply("second-context-wait", "Second child remains busy"),
-        waiting_reply(
-            "second-follow-up-wait",
-            "Selected second child received context",
-        ),
-        waiting_reply("main-follow-up-wait", "Selected Main received context"),
-        waiting_reply(
-            "first-follow-up-wait",
-            "Selected first child received context",
-        ),
-    ];
-    let (base_url, mut requests) = model_http_support::serve_responses(
-        responses.into_iter().map(|reply| (200, reply)).collect(),
-    )
+    // Children run in the background, so each member's reply follows who asks and where that
+    // member is: its first run, then the continued run that holds a tool boundary.
+    let (base_url, mut requests) = model_http_support::serve_router(move |request| {
+        let history = request["messages"].to_string();
+        let (key, label, busy, received, first_reply) = match delegated_by(request).as_deref() {
+            None => ("main", "Main", "Main remains busy", "Selected Main received context", MAIN_REPLY),
+            Some("family-first-child") => (
+                "first",
+                "first child",
+                "First child remains busy",
+                "Selected first child received context",
+                FIRST_CHILD_REPLY,
+            ),
+            _ => (
+                "second",
+                "second child",
+                "Second child remains busy",
+                "Selected second child received context",
+                SECOND_CHILD_REPLY,
+            ),
+        };
+        if history.contains(&format!("Continue {label} and wait for bounded context.")) {
+            let (todo, context_wait) = (format!("{key}-todo"), format!("{key}-context-wait"));
+            return if !has_result(request, &todo) {
+                chat_reply(Some(("ListSubagents", &todo, json!({}))), "")
+            } else if !has_result(request, &context_wait) {
+                waiting_reply(&context_wait, busy)
+            } else {
+                waiting_reply(&format!("{key}-follow-up-wait"), received)
+            };
+        }
+        if key == "main" && !has_result(request, "family-first-child") {
+            return chat_reply(
+                Some((
+                    "Subagent",
+                    "family-first-child",
+                    json!({"task":FIRST_CHILD_TASK,"name":"family-one","description":FIRST_CHILD_TASK}),
+                )),
+                "",
+            );
+        }
+        if key == "main" && !has_result(request, "family-second-child") {
+            return chat_reply(
+                Some((
+                    "Subagent",
+                    "family-second-child",
+                    json!({"task":SECOND_CHILD_TASK,"name":"family-two","description":SECOND_CHILD_TASK}),
+                )),
+                "",
+            );
+        }
+        chat_reply(None, first_reply)
+    })
     .await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
@@ -309,6 +323,23 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         )
     });
     let main = rows.iter().find(|row| row.title == MAIN_TASK).unwrap();
+    wait_snapshot(
+        &client,
+        main.execution,
+        "both children's completions reach Main",
+        |current| {
+            current.conversation.chat_loop.state == tickloop_harness::protocol::LoopState::Idle
+                && current
+                    .conversation
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter(|content| matches!(content, tickloop_harness::protocol::Content::Text { text } if text.starts_with("<task-notification>")))
+                    .count()
+                    == 2
+        },
+    )
+    .await;
     let first = rows
         .iter()
         .find(|row| row.title == FIRST_CHILD_TASK)
@@ -464,31 +495,27 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         frame.contains(SECOND_CHILD_DRAFT)
     })
     .await;
-    let initial_requests = (0..5)
-        .map(|_| requests.try_recv().unwrap().1)
-        .collect::<Vec<_>>();
-    assert!(
-        initial_requests[0]["tools"]
-            .to_string()
-            .contains("Subagent")
-    );
-    assert!(
-        initial_requests[1]["messages"]
-            .to_string()
-            .contains(FIRST_CHILD_TASK)
-    );
-    assert!(
-        initial_requests[3]["messages"]
-            .to_string()
-            .contains(SECOND_CHILD_TASK)
-    );
+    let mut initial_requests = Vec::new();
+    while let Ok((_, request)) = requests.try_recv() {
+        initial_requests.push(request);
+    }
+    let asked_by = |member: Option<&str>, text: &str| {
+        initial_requests.iter().any(|request| {
+            delegated_by(request).as_deref() == member && request.to_string().contains(text)
+        })
+    };
+    assert!(asked_by(None, "Subagent"));
+    assert!(asked_by(Some("family-first-child"), FIRST_CHILD_TASK));
+    assert!(asked_by(Some("family-second-child"), SECOND_CHILD_TASK));
 
     let main_wait = continue_waiting(&client, main_execution, "Main").await;
     let first_wait = continue_waiting(&client, first_execution, "first child").await;
     let second_wait = continue_waiting(&client, second_execution, "second child").await;
-    for _ in 0..6 {
-        requests.try_recv().unwrap();
+    let mut continued = 0;
+    while requests.try_recv().is_ok() {
+        continued += 1;
     }
+    assert_eq!(continued, 6, "each member lists its family, then waits");
     let runs = [
         (main_execution, main_wait.conversation.chat_loop.run_id),
         (first_execution, first_wait.conversation.chat_loop.run_id),

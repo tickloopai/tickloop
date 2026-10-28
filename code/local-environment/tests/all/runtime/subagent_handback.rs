@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tickloop_code_settings::local_agent::LocalAgent;
 use tickloop_harness::protocol::{AgentColor, EventKind, ExecutionMode};
-use tickloop_harness::runtime::Agent;
+use tickloop_harness::runtime::{Agent, SubagentLaunch};
 use tickloop_harness::test_support::routed::{RoutedModel, has_tool_result, state};
 use tickloop_harness::test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,
@@ -83,13 +83,17 @@ async fn auto_plain_final_text_is_not_forwarded_without_handback() {
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Return a bounded report","name":"peer"}),
+                json!({"task":"Return a bounded report","name":"peer","run_in_background":false}),
             )
         } else {
             text("root done")
         }
     }));
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     agent
         .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![text(
             &auto_classification(false).to_string(),
@@ -169,7 +173,7 @@ async fn reports_are_delivered_with_audit_warnings_and_finish_after_the_current_
                     call(
                         "delegate",
                         "Subagent",
-                        json!({"task":"Return the report and complete the fixture batch","name":"peer"}),
+                        json!({"task":"Return the report and complete the fixture batch","name":"peer","run_in_background":false}),
                     )
                 } else {
                     text("root done")
@@ -181,7 +185,11 @@ async fn reports_are_delivered_with_audit_warnings_and_finish_after_the_current_
                 "block" => vec![text(&auto_classification(true).to_string()); 2],
                 _ => vec![text("invalid classifier response"); 2],
             });
-            let agent = Agent::new_embedded(config(), model.clone());
+            let agent = Agent::new_embedded_with_subagent_launch(
+                config(),
+                model.clone(),
+                SubagentLaunch::BackgroundByDefault,
+            );
             if use_jev {
                 agent
                     .set_judgment_client(Arc::new(ReportJudgment { review }))
@@ -327,13 +335,18 @@ async fn report_requirements_and_deliveries_survive_restore_without_replaying_pl
                 call(
                     "delegate",
                     "Subagent",
-                    json!({"task":"Return a bounded report","name":"peer"}),
+                    json!({"task":"Return a bounded report","name":"peer","run_in_background":false}),
                 )
             } else {
                 text("done")
             }
         }));
-        let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
+        let agent = super::support::open_waiting_agent(
+            root.clone(),
+            config(),
+            model,
+            tickloop_harness::protocol::AgentHostOptions::embedded_defaults(),
+        );
         agent
             .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
                 text(
@@ -432,13 +445,17 @@ async fn handback_availability_and_explicit_rules_preserve_mode_boundaries() {
                     call(
                         "delegate",
                         "Subagent",
-                        json!({"task":"Return a report","name":"peer"}),
+                        json!({"task":"Return a report","name":"peer","run_in_background":false}),
                     )
                 } else {
                     text("done")
                 }
             }));
-            let agent = Agent::new_embedded(config(), model.clone());
+            let agent = Agent::new_embedded_with_subagent_launch(
+                config(),
+                model.clone(),
+                SubagentLaunch::BackgroundByDefault,
+            );
             let reviewer = Arc::new(ScriptedModel::new(vec![
                 text(
                     &auto_classification(false).to_string()

@@ -1027,12 +1027,17 @@ async fn composed_host_sources_allow_delegation_without_available_artifacts() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Return the child report", "name":"peer"}),
+            json!({"task":"Return the child report", "name":"peer", "run_in_background":false}),
         ),
         text("child report"),
         text("done"),
     ]));
-    let agent = Agent::new_embedded(config(), model);
+    // The call returns the child's report only on a non-interactive host, where it may wait.
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model,
+        tickloop_harness_runtime::SubagentLaunch::BackgroundByDefault,
+    );
     agent
         .install_host_tools(vec![
             Arc::new(WorkspaceTools::default()) as Arc<dyn HostToolProvider>,

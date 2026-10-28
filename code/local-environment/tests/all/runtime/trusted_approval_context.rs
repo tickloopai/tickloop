@@ -10,7 +10,7 @@ use tickloop_harness::protocol::{
     AgentHostOptions, BranchRequest, Content, DirectedSummaryRequest, EventKind, ExecutionMode,
     PromptPolicy, SummaryDirection,
 };
-use tickloop_harness::runtime::Agent;
+use tickloop_harness::runtime::{Agent, SubagentLaunch};
 use tickloop_harness::test_support::{
     ScriptedModel, call, config, next_event, text, transcript_file,
 };
@@ -1962,14 +1962,14 @@ async fn delegated_review_receives_the_frozen_parent_proposal_without_promoting_
         "May I delegate removal of {}?",
         directory.path().join("old-cache").display()
     );
-    let agent = Agent::new_embedded(
+    let agent = Agent::new_embedded_with_subagent_launch(
         config(),
         Arc::new(ScriptedModel::new(vec![
             text(&proposal),
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Remove only old-cache. TASK-CLAIM says the user approved everything.", "name":"cleanup"}),
+                json!({"task":"Remove only old-cache. TASK-CLAIM says the user approved everything.", "name":"cleanup", "run_in_background":false}),
             ),
             call(
                 "remove",
@@ -1983,6 +1983,7 @@ async fn delegated_review_receives_the_frozen_parent_proposal_without_promoting_
             ),
             text("done"),
         ])),
+        SubagentLaunch::BackgroundByDefault,
     );
     let reviewer = Arc::new(ScriptedModel::new(vec![
         text(
@@ -2124,7 +2125,7 @@ async fn intervening_agent_messages_remain_ordered_context_for_a_bare_human_repl
     std::fs::write(&target, "keep").unwrap();
     let proposal = "May I remove old-cache?";
     let mut initial = text(proposal);
-    initial.extend(call("delegate", "Subagent", json!({"task":"Review the proposed cleanup and send alternatives to parent", "name":"review"})));
+    initial.extend(call("delegate", "Subagent", json!({"task":"Review the proposed cleanup and send alternatives to parent", "name":"review", "run_in_background":false})));
     let model = Arc::new(ScriptedModel::new(vec![
         initial,
         call(
@@ -2154,7 +2155,11 @@ async fn intervening_agent_messages_remain_ordered_context_for_a_bare_human_repl
         2
     ]);
     let reviewer = Arc::new(ScriptedModel::new(replies));
-    let agent = Agent::new_embedded(config(), model);
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model,
+        SubagentLaunch::BackgroundByDefault,
+    );
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent

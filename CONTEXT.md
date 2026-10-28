@@ -231,7 +231,7 @@ _Avoid_: memory, rules file
 ### Subagent and Family
 
 **Subagent**:
-An Agent that accepts delegation from a parent Agent and works within the delegation relationship and its authorization scope. A foreground delegation waits for that run's report; a background delegation returns immediately and notifies the parent Agent on completion.
+An Agent that accepts delegation from a parent Agent and works within the delegation relationship and its authorization scope. A delegation runs in the background: it returns immediately and notifies the parent Agent on completion. Only on a non-interactive host may a delegation instead wait for that run's report.
 
 **Agent Family**:
 A root Agent and all descendants it delegates to directly or indirectly (at most three levels); membership is determined by actual delegation, and a Subagent delegating further does not create a new family.

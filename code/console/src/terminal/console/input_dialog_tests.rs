@@ -2367,14 +2367,17 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
         tickloop_harness::test_support::call(
             "delegate",
             "Subagent",
-            serde_json::json!({"task":"Plan the delegated task."}),
+            serde_json::json!({"task":"Plan the delegated task.","run_in_background":false}),
         ),
         tickloop_harness::test_support::text("Child plan: write child-plan.txt."),
         tickloop_harness::test_support::text("The parent observed the child plan."),
     ]));
-    let core = tickloop_harness::runtime::Agent::new_embedded(
+    // The scripted replies need the parent to wait for its child, which only a non-interactive
+    // host offers.
+    let core = tickloop_harness::runtime::Agent::new_embedded_with_subagent_launch(
         tickloop_harness::test_support::config(),
         model.clone(),
+        tickloop_harness::runtime::SubagentLaunch::BackgroundByDefault,
     );
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_harness::test_support::config());

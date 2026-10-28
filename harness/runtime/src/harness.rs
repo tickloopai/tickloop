@@ -132,6 +132,18 @@ pub enum WaitHosting {
     Durable,
 }
 
+/// How a `Subagent` call runs, following Claude Code. The choice is the host's and fixed for
+/// its lifetime, so every request of a Chat lists the same tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentLaunch {
+    /// Claude Code in a terminal: every Subagent runs in the background, and the model is not
+    /// offered `run_in_background`; one it still passes is ignored.
+    AlwaysBackground,
+    /// Claude Code's non-interactive sessions: a Subagent runs in the background unless the
+    /// model passes `run_in_background: false`, and then the call waits for its report.
+    BackgroundByDefault,
+}
+
 /// Which of the Agent's own capabilities its Chats offer the model, and where WebFetch may reach
 /// without a Folder. The file tools, Bash and TaskStop also need a Folder; each capability still
 /// follows its own settings, such as Task tools or web search.
@@ -148,6 +160,8 @@ pub struct ToolPolicy {
     pub questions: bool,
     /// Subagent, and a child's report back.
     pub delegation: bool,
+    /// How Subagents run, for the whole family: each member's call follows its root's host.
+    pub subagent_launch: SubagentLaunch,
     /// ListSubagents, SendMessage and StopSubagent.
     pub family_messages: bool,
     pub tasks: bool,
@@ -176,7 +190,8 @@ pub struct ToolPolicy {
 }
 
 impl ToolPolicy {
-    /// Every capability: a local Agent's.
+    /// Every capability: a local Agent's, whose Subagents always run in the background as in
+    /// Claude Code's terminal.
     pub const fn local() -> Self {
         Self {
             web_fetch: true,
@@ -186,6 +201,7 @@ impl ToolPolicy {
             plan: true,
             questions: true,
             delegation: true,
+            subagent_launch: SubagentLaunch::AlwaysBackground,
             family_messages: true,
             tasks: true,
             goals: true,
@@ -201,7 +217,8 @@ impl ToolPolicy {
 
     /// A durable Chat's: WebFetch of URLs and Artifact writes to targets with provenance,
     /// questions, Subagents and their messages, Task tools and the host's tools, with waits the
-    /// Transcript keeps.
+    /// Transcript keeps. Subagents run in the background unless the model asks to wait, as in
+    /// Claude Code's non-interactive sessions.
     pub const fn durable_chat() -> Self {
         Self {
             web_fetch: true,
@@ -211,6 +228,7 @@ impl ToolPolicy {
             plan: false,
             questions: true,
             delegation: true,
+            subagent_launch: SubagentLaunch::BackgroundByDefault,
             family_messages: true,
             tasks: true,
             goals: false,
@@ -244,6 +262,7 @@ impl ToolPolicy {
             plan: false,
             questions: false,
             delegation: false,
+            subagent_launch: SubagentLaunch::BackgroundByDefault,
             family_messages: false,
             tasks: false,
             goals: false,

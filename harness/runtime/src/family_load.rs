@@ -4,7 +4,7 @@
 //! are settled by its records, a foreground call waits on its child again before that child goes
 //! on, and a child whose end the load decides reports it to its parent like any other end.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::json;
 use tickloop_harness_protocol::{
@@ -28,6 +28,9 @@ pub(crate) struct FamilyRecords {
     launched: HashMap<(ChatId, RunId, String), LaunchedChild>,
     /// Every input some member accepted, by its id, with where it was accepted.
     accepted: HashMap<Uuid, Receipt>,
+    /// The `Subagent` calls that waited for their child's report, by Chat, Run and call: a call
+    /// that recorded no such wait launched its child in the background.
+    waiting_calls: HashSet<(ChatId, RunId, String)>,
     task_boards: HashMap<(ChatId, LoopId), TaskBoard>,
 }
 
@@ -51,6 +54,14 @@ impl FamilyRecords {
                         .insert(((*id), (*loop_id).into()), board.clone());
                 }
             }
+            records
+                .waiting_calls
+                .extend(transcript.lifecycle.iter().filter_map(|line| match line {
+                    Line::Wait(entry) if matches!(entry.kind, WaitKind::Subagent { .. }) => {
+                        Some((*id, entry.run_id.into(), entry.resume.call_id()?.to_owned()))
+                    }
+                    _ => None,
+                }));
             let inputs = transcript.lifecycle.iter().filter_map(|line| match line {
                 Line::Input(entry) => Some(entry),
                 _ => None,
@@ -130,7 +141,10 @@ impl FamilyRecords {
                     .get(&(snapshot.id, run, call.call_id.clone()))?;
                 let registration = child.registration.as_ref()?;
                 let task = &child.task;
-                if input["run_in_background"].as_bool() == Some(true) {
+                if !self
+                    .waiting_calls
+                    .contains(&(snapshot.id, run, call.call_id.clone()))
+                {
                     return Some(crate::delegation::launched_result(ids, task, registration));
                 }
                 if let Some(completion) = snapshot.family_completions.iter().find(|completion| {
