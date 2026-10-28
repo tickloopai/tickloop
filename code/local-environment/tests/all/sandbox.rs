@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "sandbox/network.rs"]
 mod network;
+#[path = "sandbox/review_fixes.rs"]
+mod review_fixes;
 
 #[tokio::test]
 async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
@@ -44,6 +46,7 @@ async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            folder: Some(folder.display().to_string()),
             dangerously_disable_sandbox: false,
             additional_directories: Vec::new(),
             family_temp: None,
@@ -559,6 +562,7 @@ async fn sandbox_and_reference_hosts_share_the_frozen_isolation_contract() {
         ),
     };
     let spec = ShellSpec {
+        folder: scope.folder.clone(),
         dangerously_disable_sandbox: false,
         additional_directories: Vec::new(),
         family_temp: None,
