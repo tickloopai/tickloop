@@ -103,6 +103,9 @@ impl Agent {
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
         self.apply_host_rules(&mut snapshot.policy);
+        snapshot.policy.plan_without_auto = saved
+            .as_ref()
+            .is_some_and(|saved| !saved.use_auto_mode_during_plan);
         snapshot.task_tools_enabled = saved.as_ref().map_or_else(
             || {
                 self.inner

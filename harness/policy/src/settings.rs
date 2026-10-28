@@ -41,6 +41,9 @@ pub struct SettingsSnapshot {
     pub goal_token_budget: Option<u64>,
     pub goal_check_model: Option<ModelConfig>,
     pub skips_transcripts: bool,
+    /// Claude Code's `useAutoModeDuringPlan`: Plan admits and reviews as Auto does. On unless
+    /// settings turn it off.
+    pub use_auto_mode_during_plan: bool,
     pub auto: Result<(AutoSettings, AutoSettingsRevision), String>,
     pub jev: Result<JevConfig, String>,
     pub warnings: Vec<String>,
@@ -63,6 +66,7 @@ impl Default for SettingsSnapshot {
             goal_token_budget: None,
             goal_check_model: None,
             skips_transcripts: false,
+            use_auto_mode_during_plan: true,
             auto: Ok((AutoSettings::default(), empty_auto_settings_revision())),
             jev: Ok(JevConfig::default()),
             warnings: Vec::new(),
