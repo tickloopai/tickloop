@@ -56,12 +56,12 @@ pub fn deferred_tool_context_tokens(
     tool: &ToolDefinition,
 ) -> usize {
     match protocol {
-        // Messages keeps deferred tools out of the context window until a search loads them, and
-        // a loaded definition counts with the search result that names it (tool search docs).
+        // "The API excludes deferred tools from the system-prompt prefix"; a loaded definition
+        // counts with the search result that names it.
         Protocol::Messages => 0,
-        // Responses documents no rule. Service usage matches each deferred function costing its
-        // name and description, not its parameters; to be confirmed against the service.
-        Protocol::Responses => counter.text_tokens(&format!("{} {}", tool.name, tool.description)),
+        // "For an individual deferred function, the model still sees the function name and
+        // description"; its parameters load on search.
+        Protocol::Responses => counter.text_tokens(&format!("{}\n{}", tool.name, tool.description)),
         Protocol::ChatCompletions | Protocol::Google | Protocol::SystemOne => 0,
     }
 }
