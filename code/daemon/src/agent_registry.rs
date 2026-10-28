@@ -31,6 +31,9 @@ const RECORD_VERSION: u32 = 1;
 pub const STALE_AFTER_MILLISECONDS: u64 = 48 * 60 * 60 * 1000;
 /// Claude Code's default `cleanupPeriodDays`.
 pub const DEFAULT_CLEANUP_PERIOD_DAYS: u64 = 30;
+/// Claude Code's 5-second grace: a record that says running but whose execution this daemon does
+/// not list reads as failed only once it is older than this, so a just-created Agent is not.
+pub const UNLISTED_GRACE_MILLISECONDS: u64 = 5_000;
 const DAY_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,6 +70,13 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    fn ended(mut self, status: RecordStatus, reason: EndReason, ended_at: u64) -> Self {
+        self.status = status;
+        self.end_reason = Some(reason);
+        self.ended_at = Some(ended_at);
+        self
+    }
+
     fn is_ended(&self) -> bool {
         self.status != RecordStatus::Live
     }
@@ -79,11 +89,19 @@ impl AgentRecord {
         }
     }
 
+    fn awaited_the_user(&self) -> bool {
+        matches!(
+            self.last_state,
+            LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan
+        )
+    }
+
     /// Ends a record whose execution is gone, as Claude Code's restart reaper does: recent activity
-    /// failed now, activity older than [`STALE_AFTER_MILLISECONDS`] stopped back then.
+    /// failed now, activity older than [`STALE_AFTER_MILLISECONDS`] stopped back then. An Agent that
+    /// was waiting for the user still waits for them, however long ago that was.
     fn end_without_execution(&mut self, now: u64) {
         let stale = now.saturating_sub(self.updated_at) > STALE_AFTER_MILLISECONDS;
-        if stale {
+        if stale && !self.awaited_the_user() {
             self.status = RecordStatus::Stopped;
             self.end_reason = Some(EndReason::DaemonOff);
             self.ended_at = Some(self.updated_at);
@@ -92,6 +110,28 @@ impl AgentRecord {
             self.end_reason = Some(EndReason::DaemonStopped);
             self.ended_at = Some(now);
         }
+    }
+}
+
+/// The running record of the root Agent `summary` describes, keeping what `existing` knew first.
+fn record_of(summary: &AgentSummary, existing: Option<&AgentRecord>, now: u64) -> AgentRecord {
+    AgentRecord {
+        version: RECORD_VERSION,
+        agent_id: summary.execution.agent_id,
+        chat_id: summary.chat_id,
+        folder: summary.folder.clone(),
+        workspace: summary.workspace.clone(),
+        title: summary.title.clone(),
+        preview: summary.preview.clone(),
+        created_at: existing.map_or(now, |record| record.created_at),
+        updated_at: summary
+            .updated_at
+            .or(existing.map(|record| record.updated_at))
+            .unwrap_or(now),
+        last_state: summary.state.clone(),
+        status: RecordStatus::Live,
+        ended_at: None,
+        end_reason: None,
     }
 }
 
@@ -227,39 +267,40 @@ impl AgentRegistry {
         };
         for summary in directory.iter().filter(|summary| self.is_own_root(summary)) {
             let existing = records.get(&summary.chat_id);
-            let lost = summary.availability == ExecutionAvailability::Lost;
-            let (status, ended_at, end_reason) = if lost {
-                (
+            let record = if summary.availability == ExecutionAvailability::Lost {
+                let ended_at = existing.and_then(|record| record.ended_at).unwrap_or(now);
+                record_of(summary, existing, now).ended(
                     RecordStatus::Failed,
-                    Some(existing.and_then(|record| record.ended_at).unwrap_or(now)),
-                    Some(EndReason::WorkerLost),
+                    EndReason::WorkerLost,
+                    ended_at,
                 )
             } else {
-                (RecordStatus::Live, None, None)
-            };
-            let record = AgentRecord {
-                version: RECORD_VERSION,
-                agent_id: summary.execution.agent_id,
-                chat_id: summary.chat_id,
-                folder: summary.folder.clone(),
-                workspace: summary.workspace.clone(),
-                title: summary.title.clone(),
-                preview: summary.preview.clone(),
-                created_at: existing.map_or(now, |record| record.created_at),
-                updated_at: summary
-                    .updated_at
-                    .or(existing.map(|record| record.updated_at))
-                    .unwrap_or(now),
-                last_state: summary.state.clone(),
-                status,
-                ended_at,
-                end_reason,
+                record_of(summary, existing, now)
             };
             if existing != Some(&record) {
                 self.write_logged(&record);
                 records.insert(record.chat_id, record);
             }
         }
+    }
+
+    /// Records that the user stopped the root Agent `summary` describes.
+    pub(crate) fn mark_stopped(&self, summary: &AgentSummary) {
+        if !self.is_own_root(summary) {
+            return;
+        }
+        let now = (self.clock)();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(records) = state.records.as_mut() else {
+            return;
+        };
+        let record = record_of(summary, records.get(&summary.chat_id), now).ended(
+            RecordStatus::Stopped,
+            EndReason::UserStopped,
+            now,
+        );
+        self.write_logged(&record);
+        records.insert(record.chat_id, record);
     }
 
     /// The ended root Agents `directory` does not list, with whether their history can load.
@@ -275,14 +316,21 @@ impl AgentRegistry {
                 None => Vec::new(),
             }
         };
+        let now = (self.clock)();
         let mut ended = Vec::new();
-        for record in records {
-            let Some(outcome) = record.outcome() else {
-                continue;
-            };
+        for mut record in records {
             if listed.contains(&record.chat_id) {
                 continue;
             }
+            if !record.is_ended() {
+                if now.saturating_sub(record.created_at) < UNLISTED_GRACE_MILLISECONDS {
+                    continue;
+                }
+                record = record.ended(RecordStatus::Failed, EndReason::WorkerLost, now);
+            }
+            let Some(outcome) = record.outcome() else {
+                continue;
+            };
             let resumable = tickloop_harness::runtime::transcript::records::saved_record_exists(
                 self.store_root.clone(),
                 record.chat_id,
@@ -684,5 +732,64 @@ mod tests {
         restarted.forget(chat, &[]).unwrap();
         assert!(restarted.ended(&[]).await.is_empty());
         assert!(restarted.read_all().is_empty());
+    }
+
+    #[test]
+    fn an_agent_waiting_for_the_user_still_fails_after_48_hours() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let before = fixture.registry(None);
+        before.reconcile(&[]);
+        let mut waiting = fixture.root_summary(chat);
+        waiting.state = LoopState::WaitingQuestion;
+        waiting.updated_at = Some(fixture.now() - STALE_AFTER_MILLISECONDS - 1);
+        before.observe(&[waiting]);
+
+        let after = fixture.registry(None);
+        after.reconcile(&[]);
+
+        assert_eq!(
+            statuses(&after),
+            [(chat, RecordStatus::Failed, Some(EndReason::DaemonStopped))]
+        );
+        assert_eq!(after.read_all()[0].last_state, LoopState::WaitingQuestion);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_running_record_reads_as_failed_only_after_five_seconds() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let registry = fixture.registry(None);
+        registry.reconcile(&[fixture.root_summary(chat)]);
+
+        fixture.advance(UNLISTED_GRACE_MILLISECONDS - 1);
+        assert!(registry.ended(&[]).await.is_empty());
+
+        fixture.advance(1);
+        let ended = registry.ended(&[]).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].outcome, EndedOutcome::Failed);
+        assert_eq!(ended[0].reason, EndReason::WorkerLost);
+        // Reading never rewrites the record; only the daemon's own observations do.
+        assert_eq!(statuses(&registry), [(chat, RecordStatus::Live, None)]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_root_is_ended_by_the_user() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let registry = fixture.registry(None);
+        registry.reconcile(&[fixture.root_summary(chat)]);
+        fixture.advance(HOUR);
+
+        registry.mark_stopped(&fixture.root_summary(chat));
+
+        assert_eq!(
+            statuses(&registry),
+            [(chat, RecordStatus::Stopped, Some(EndReason::UserStopped))]
+        );
+        let ended = registry.ended(&[]).await;
+        assert_eq!(ended[0].outcome, EndedOutcome::Stopped);
+        assert_eq!(ended[0].ended_at, fixture.now());
     }
 }

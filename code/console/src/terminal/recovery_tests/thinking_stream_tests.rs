@@ -187,7 +187,10 @@ impl AgentAccess for MeasuredThinkingAccess {
             std::fs::rename(&pending, THINKING_QUERY_FILE).unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.daemon.observe(query).await
+        self.daemon
+            .observe(query)
+            .await
+            .map(super::listed_as_worked)
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {

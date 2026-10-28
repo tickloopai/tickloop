@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent_console::AttentionGroup;
+use crate::agent_console::{AgentState, AttentionGroup};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
@@ -514,6 +514,11 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
         workspace: Some("workspace-a".into()),
         approvals: usize::from(id == ROOT_AGENT),
         questions: 0,
+        agent_state: if id == ROOT_AGENT {
+            AgentState::NeedsInput
+        } else {
+            AgentState::Working
+        },
         group: if id == ROOT_AGENT {
             AttentionGroup::NeedsInput
         } else {
@@ -521,9 +526,9 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
         },
         glyph: status_glyph(
             if id == ROOT_AGENT {
-                AttentionGroup::NeedsInput
+                AgentState::NeedsInput
             } else {
-                AttentionGroup::Working
+                AgentState::Working
             },
             false,
         ),
@@ -3016,8 +3021,9 @@ fn finished_row(id: Uuid, title: &str, project: &str) -> AgentRow {
     row.status = "Interrupted".into();
     row.state = LoopState::Interrupted;
     row.approvals = 0;
-    row.group = AttentionGroup::Done;
-    row.glyph = status_glyph(AttentionGroup::Done, false);
+    row.agent_state = AgentState::Completed;
+    row.group = AttentionGroup::Completed;
+    row.glyph = status_glyph(AgentState::Completed, true);
     row.project = project.into();
     row
 }
@@ -3801,9 +3807,9 @@ fn fleet_row(
     parent: Option<Uuid>,
     title: &str,
     (state, status): (LoopState, &str),
-    group: AttentionGroup,
+    agent_state: AgentState,
 ) -> AgentRow {
-    let glyph = status_glyph(group, false);
+    let glyph = status_glyph(agent_state, state == LoopState::Interrupted);
     AgentRow {
         agent_id: id,
         parent_id: parent,
@@ -3815,7 +3821,8 @@ fn fleet_row(
         workspace: Some("w1".into()),
         approvals: 0,
         questions: 0,
-        group,
+        agent_state,
+        group: agent_state.group(),
         glyph,
         preview: None,
         updated_at: None,
@@ -3847,7 +3854,7 @@ fn fleet_overview() -> AgentOverview {
         None,
         "Research NVDA",
         (LoopState::WaitingQuestion, "Needs answer"),
-        AttentionGroup::NeedsInput,
+        AgentState::NeedsInput,
     );
     asking.questions = 1;
     let mut rows = vec![
@@ -3857,35 +3864,35 @@ fn fleet_overview() -> AgentOverview {
             None,
             "Plan the hedge",
             (LoopState::WaitingPlan, "Plan review"),
-            AttentionGroup::NeedsInput,
+            AgentState::NeedsInput,
         ),
         fleet_row(
             FAILED_FAMILY,
             None,
             "Rebalance",
             (LoopState::Failed, "Failed"),
-            AttentionGroup::Errors,
+            AgentState::Failed,
         ),
         fleet_row(
             INTERRUPTED_FAMILY,
             None,
             "Long scan",
             (LoopState::Running, "Running"),
-            AttentionGroup::Working,
+            AgentState::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5500),
             None,
             "Watch earnings",
             (LoopState::Queued, "Queued"),
-            AttentionGroup::Working,
+            AgentState::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5600),
             None,
             "!tail -f log",
             (LoopState::Idle, "Idle"),
-            AttentionGroup::Idle,
+            AgentState::Idle,
         ),
     ];
     rows.extend((0..16).map(|index| {
@@ -3894,7 +3901,7 @@ fn fleet_overview() -> AgentOverview {
             None,
             &format!("Done task {index:02}"),
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         )
     }));
     rows.extend((0..14).map(|index| {
@@ -3907,7 +3914,7 @@ fn fleet_overview() -> AgentOverview {
             None,
             "New Agent",
             (LoopState::Idle, "Empty"),
-            AttentionGroup::Empty,
+            AgentState::Idle,
         )
     }));
     AgentOverview {
@@ -3923,7 +3930,7 @@ fn drawn(state: &mut State) -> Vec<String> {
     super::tests::selection_marked_screen(state)
 }
 
-/// Group headings in screen order, without selection marker or fold glyph: `Done · 16`.
+/// Group headings in screen order, without selection marker or fold glyph: `Completed · 16`.
 fn heading_order(frame: &[String]) -> Vec<String> {
     frame
         .iter()
@@ -3945,7 +3952,7 @@ fn heading_order(frame: &[String]) -> Vec<String> {
 }
 
 #[test]
-fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
+fn agent_layout_dense_overview_folds_completed_without_hiding_attention() {
     let mut state = State::new(true, 100, 32);
     state.chat = Some(VISIBLE_EMPTY);
     state.prompt_enabled = true;
@@ -3953,30 +3960,28 @@ fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
     console.set_global_overview(Some(fleet_overview())).unwrap();
     let frame = frame_lines(&console);
     assert_eq!(frame.len(), 32);
+    // Claude Code's agent view groups: Failed, Idle and finished Agents all list under Completed.
     assert_eq!(
         heading_order(&frame),
-        [
-            "Needs input · 2",
-            "Errors · 1",
-            "Working · 2",
-            "Idle · 1",
-            "Done · 16",
-            "Empty · 14 · never used",
-        ],
-        "every group heading and the Done counter fit the first screen: {frame:#?}"
+        ["Needs input · 2", "Working · 2", "Completed · 32"],
+        "every group heading and the Completed counter fit the first screen: {frame:#?}"
     );
     assert!(line_with(&frame, "Rebalance").unwrap().contains("Failed"));
     assert!(line_with(&frame, "Long scan").unwrap().contains("Running"));
     let asking = line_with(&frame, "Research NVDA").unwrap();
     assert!(asking.contains("questions 1"), "{asking}");
-    let more = line_with(&frame, "more done").unwrap();
-    let shown_done = frame
+    let more = line_with(&frame, "more completed").unwrap();
+    let shown = list_lines(&frame)
         .iter()
-        .filter(|line| line.contains("Done task"))
+        .filter(|line| {
+            ["Rebalance", "!tail", "Done task", "New Agent"]
+                .iter()
+                .any(|title| line.contains(title))
+        })
         .count();
-    assert!(shown_done < 16);
+    assert!(shown < 32);
     assert!(
-        more.contains(&format!("{} more done", 16 - shown_done)),
+        more.contains(&format!("{} more completed", 32 - shown)),
         "{more}"
     );
 
@@ -3984,27 +3989,26 @@ fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
     assert_eq!(
         state.overview.selected,
         Some(OverviewTarget::Agent(VISIBLE_EMPTY)),
-        "entering from the empty session's conversation locates it"
+        "entering from a conversation locates its row"
     );
     let frame = drawn(&mut state);
-    let listed_empty = listed_rows(list_lines(&frame), "New Agent");
+    let listed = listed_rows(list_lines(&frame), "New Agent");
     assert_eq!(
-        listed_empty.len(),
+        listed.len(),
         1,
-        "only this View's own empty session stays listed: {frame:#?}"
+        "the counter folds the rest, but never this View's own row: {frame:#?}"
     );
-    assert!(listed_empty[0].contains("current"), "{frame:#?}");
-    select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Empty));
+    assert!(listed[0].contains("current"), "{frame:#?}");
+    select_target(
+        &mut state,
+        OverviewTarget::Heading(AttentionGroup::Completed),
+    );
     assert!(state.key(key(KeyCode::Enter)).is_none());
     let frame = drawn(&mut state);
-    assert!(line_with(&frame, "▾ Empty · 14").is_some(), "{frame:#?}");
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Heading(AttentionGroup::Empty))
+    assert!(
+        line_with(&frame, "▸ Completed · 32").is_some(),
+        "{frame:#?}"
     );
-    state.key(key(KeyCode::Char(' ')));
-    let frame = drawn(&mut state);
-    assert!(line_with(&frame, "▸ Empty · 14").is_some(), "{frame:#?}");
     assert!(
         listed_rows(list_lines(&frame), "New Agent").is_empty(),
         "an explicit fold hides the current row too: {frame:#?}"
@@ -4012,6 +4016,12 @@ fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
     assert!(
         line_with(&frame, "Current New Agent (").is_some_and(|cue| cue.contains("collapsed")),
         "the status line still says where the current Agent is: {frame:#?}"
+    );
+    state.key(key(KeyCode::Enter));
+    let frame = drawn(&mut state);
+    assert!(
+        line_with(&frame, "▾ Completed · 32").is_some(),
+        "{frame:#?}"
     );
 }
 
@@ -4050,7 +4060,10 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
     console.set_global_overview(Some(fleet_overview())).unwrap();
     let before = {
         let mut state = console.state.lock().unwrap();
-        state.overview.opened_groups.insert(AttentionGroup::Done);
+        state
+            .overview
+            .opened_groups
+            .insert(AttentionGroup::Completed);
         select_agent(&mut state, done_task(9));
         let frame = drawn(&mut state);
         assert!(
@@ -4065,7 +4078,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         None,
         "Approve the order preview",
         (LoopState::WaitingPermission, "Needs approval"),
-        AttentionGroup::NeedsInput,
+        AgentState::NeedsInput,
     );
     asking.approvals = 1;
     arrived.rows.insert(0, asking);
@@ -4120,8 +4133,9 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
         .map(|mut row| {
             row.status = "Interrupted".into();
             row.state = LoopState::Interrupted;
-            row.group = AttentionGroup::Done;
-            row.glyph = status_glyph(AttentionGroup::Done, false);
+            row.agent_state = AgentState::Completed;
+            row.group = AttentionGroup::Completed;
+            row.glyph = status_glyph(AgentState::Completed, true);
             row
         })
         .collect::<Vec<_>>();
@@ -4161,7 +4175,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
                 None,
                 &format!("Working task {index:02}"),
                 (LoopState::Running, "Running"),
-                AttentionGroup::Working,
+                AgentState::Working,
             )
         })
         .collect::<Vec<_>>();
@@ -4171,7 +4185,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
             None,
             &format!("Done task {index:02}"),
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         )
     }));
     rows.extend((0..3).map(|index| {
@@ -4180,7 +4194,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
             None,
             "New Agent",
             (LoopState::Idle, "Empty"),
-            AttentionGroup::Empty,
+            AgentState::Idle,
         )
     }));
     console
@@ -4193,20 +4207,23 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
         .unwrap();
     let frame = frame_lines(&console);
     assert!(
-        frame[0].contains("folded +5 done +3 empty"),
-        "folded counters below the list remain readable: {frame:#?}"
+        frame[0].contains("folded +5 completed"),
+        "the folded counter below the list remains readable: {frame:#?}"
     );
     let mut state = console.state.lock().unwrap();
     for _ in 0..40 {
         state.key(key(KeyCode::Char('j')));
     }
     let frame = drawn(&mut state);
-    assert!(line_with(&frame, "… 5 more done").is_some(), "{frame:#?}");
-    assert!(!frame[0].contains("+5 done"), "{frame:#?}");
+    assert!(
+        line_with(&frame, "… 5 more completed").is_some(),
+        "{frame:#?}"
+    );
+    assert!(!frame[0].contains("+5 completed"), "{frame:#?}");
 }
 
 #[test]
-fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
+fn agent_layout_the_current_row_stays_listed_when_completed_folds_the_rest() {
     let mut state = State::new(true, 100, 24);
     state.chat = Some(VISIBLE_EMPTY);
     let console = super::tests::console_with_state(state);
@@ -4215,7 +4232,7 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
         None,
         "Working task",
         (LoopState::Running, "Running"),
-        AttentionGroup::Working,
+        AgentState::Working,
     )];
     rows.extend((0..30).map(|index| {
         fleet_row(
@@ -4223,15 +4240,15 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
             None,
             &format!("Done task {index:02}"),
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         )
     }));
     rows.push(fleet_row(
         VISIBLE_EMPTY,
         None,
         "New Agent",
-        (LoopState::Idle, "Empty"),
-        AttentionGroup::Empty,
+        (LoopState::Idle, "Idle"),
+        AgentState::Idle,
     ));
     console
         .set_global_overview(Some(AgentOverview {
@@ -4243,16 +4260,17 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
         .unwrap();
     let mut state = console.state.lock().unwrap();
     let frame = drawn(&mut state);
-    let dispatch = frame
+    let current = listed_rows(list_lines(&frame), "New Agent");
+    assert_eq!(current.len(), 1, "{frame:#?}");
+    assert!(current[0].contains("current"), "{frame:#?}");
+    let shown = list_lines(&frame)
         .iter()
-        .position(|line| line.starts_with("New Agent · cwd"))
-        .expect("the dispatch line");
+        .filter(|line| line.contains("Done task"))
+        .count();
     assert!(
-        !frame[dispatch - 1].trim().is_empty(),
-        "an Empty group whose rows are all pinned draws no counter, so Done uses that row: {frame:#?}"
+        line_with(&frame, &format!("… {} more completed", 30 - shown)).is_some(),
+        "{frame:#?}"
     );
-    assert!(line_with(&frame, "… 19 more done").is_some(), "{frame:#?}");
-    assert!(line_with(&frame, "empty sessions").is_none(), "{frame:#?}");
 }
 
 #[test]
@@ -4487,7 +4505,10 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
         frame[1].contains("enter open") && !offers_space(&frame[1]),
         "{frame:#?}"
     );
-    select_target(&mut state, OverviewTarget::Disclosure(AttentionGroup::Done));
+    select_target(
+        &mut state,
+        OverviewTarget::Disclosure(AttentionGroup::Completed),
+    );
     let frame = drawn(&mut state);
     assert!(frame[1].contains("enter/space show"), "{frame:#?}");
     assert!(
@@ -4551,24 +4572,24 @@ fn agent_layout_overview_rows_carry_state_in_words_and_semantic_roles() {
 }
 
 #[test]
-fn agent_layout_typing_a_long_dispatch_scrolls_the_list_without_refolding_done() {
+fn agent_layout_typing_a_long_dispatch_scrolls_the_list_without_refolding_completed() {
     let mut state = State::new(true, 100, 24);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(fleet_overview())).unwrap();
     let mut state = console.state.lock().unwrap();
-    let folded_done = |frame: &[String]| {
+    let folded_completed = |frame: &[String]| {
         frame
             .iter()
             .find_map(|line| {
                 line.split("… ")
                     .nth(1)
-                    .filter(|rest| rest.contains("more done"))
+                    .filter(|rest| rest.contains("more completed"))
                     .map(str::to_owned)
             })
             .or_else(|| frame[0].split("folded ").nth(1).map(str::to_owned))
     };
-    let before = folded_done(&drawn(&mut state)).expect("Done is folded at 100×24");
+    let before = folded_completed(&drawn(&mut state)).expect("Completed is folded at 100×24");
     state.key(key(KeyCode::Tab));
     for line in 0..5 {
         state.insert(&format!("dispatch line {line}"));
@@ -4576,7 +4597,7 @@ fn agent_layout_typing_a_long_dispatch_scrolls_the_list_without_refolding_done()
     }
     let frame = drawn(&mut state);
     assert_eq!(frame.len(), 24);
-    let after = folded_done(&frame).expect("Done stays folded while typing");
+    let after = folded_completed(&frame).expect("Completed stays folded while typing");
     let count = |text: &str| {
         text.split_whitespace()
             .find_map(|word| word.trim_start_matches('+').parse::<usize>().ok())
@@ -4597,11 +4618,14 @@ fn agent_layout_a_vanished_counter_selects_the_last_row_of_its_group() {
     {
         let mut state = console.state.lock().unwrap();
         drawn(&mut state);
-        select_target(&mut state, OverviewTarget::Disclosure(AttentionGroup::Done));
+        select_target(
+            &mut state,
+            OverviewTarget::Disclosure(AttentionGroup::Completed),
+        );
     }
     let mut fewer = fleet_overview();
     fewer.rows.retain(|row| {
-        row.group != AttentionGroup::Done
+        row.group != AttentionGroup::Completed
             || row.agent_id == done_task(0)
             || row.parent_id == Some(done_task(0))
     });
@@ -4763,14 +4787,14 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             None,
             SCREENSHOT_TITLE,
             (LoopState::Running, "Running"),
-            AttentionGroup::Working,
+            AgentState::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5500),
             None,
             "Keep this task",
             (LoopState::Queued, "Queued"),
-            AttentionGroup::Working,
+            AgentState::Working,
         ),
     ];
     rows.extend((0..17).map(|index| {
@@ -4779,7 +4803,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             None,
             "New Agent",
             (LoopState::Idle, "Idle"),
-            AttentionGroup::Idle,
+            AgentState::Idle,
         )
     }));
     rows.extend((0..6).map(|index| {
@@ -4788,7 +4812,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             None,
             SCREENSHOT_TITLE,
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         )
     }));
     rows.push(fleet_row(
@@ -4796,7 +4820,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
         None,
         "Tick 的标准化设计",
         (LoopState::Interrupted, "Interrupted"),
-        AttentionGroup::Done,
+        AgentState::Completed,
     ));
     AgentOverview {
         rows,
@@ -4822,7 +4846,7 @@ fn has_hex_token(line: &str) -> bool {
 }
 
 #[test]
-fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
+fn agent_layout_groups_start_open_and_fold_only_on_the_users_word() {
     let mut state = State::new(true, 80, 24);
     state.chat = Some(SCREENSHOT_SOURCE);
     state.prompt_enabled = true;
@@ -4831,28 +4855,28 @@ fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
         .set_global_overview(Some(screenshot_overview(None)))
         .unwrap();
     let frame = frame_lines(&console);
-    let idle_heading = line_with(&frame, "Idle · 17").expect("the folded Idle count stays visible");
+    let completed = line_with(&frame, "Completed · 24").expect("the Completed count is visible");
+    assert!(completed.contains('▾'), "{completed}");
     assert!(
-        listed_rows(&frame, "New Agent").is_empty(),
-        "seventeen idle rows stay behind their heading by default: {frame:#?}"
+        !listed_rows(&frame, "New Agent").is_empty(),
+        "Claude Code's agent view folds no group by default: {frame:#?}"
     );
-    assert!(idle_heading.contains('▸'), "{idle_heading}");
     let mut state = console.state.lock().unwrap();
-    select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Idle));
-    assert_eq!(state.overview.row_hints(), ["enter/→ expand"]);
+    select_target(
+        &mut state,
+        OverviewTarget::Heading(AttentionGroup::Completed),
+    );
+    assert_eq!(state.overview.row_hints(), ["enter/→ collapse"]);
     assert!(
         state.key(key(KeyCode::Enter)).is_none(),
         "Enter on a heading toggles it and opens no Agent"
     );
     let frame = drawn(&mut state);
-    assert!(
-        !listed_rows(&frame, "New Agent").is_empty(),
-        "the expanded group lists its Agents: {frame:#?}"
-    );
-    assert!(line_with(&frame, "▾ Idle · 17").is_some(), "{frame:#?}");
-    assert!(state.key(key(KeyCode::Enter)).is_none());
-    let frame = drawn(&mut state);
     assert!(listed_rows(&frame, "New Agent").is_empty(), "{frame:#?}");
+    assert!(
+        line_with(&frame, "▸ Completed · 24").is_some(),
+        "{frame:#?}"
+    );
     drop(state);
     console
         .set_global_overview(Some(screenshot_overview(None)))
@@ -4862,6 +4886,10 @@ fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
         listed_rows(&frame, "New Agent").is_empty(),
         "the fold survives a refresh: {frame:#?}"
     );
+    let mut state = console.state.lock().unwrap();
+    assert!(state.key(key(KeyCode::Enter)).is_none());
+    let frame = drawn(&mut state);
+    assert!(!listed_rows(&frame, "New Agent").is_empty(), "{frame:#?}");
 }
 
 #[test]
@@ -4908,7 +4936,7 @@ fn agent_layout_repeated_long_titles_stay_distinguishable_without_hashes() {
             .set_global_overview(Some(screenshot_overview(None)))
             .unwrap();
         let mut state = console.state.lock().unwrap();
-        let done = OverviewTarget::Disclosure(AttentionGroup::Done);
+        let done = OverviewTarget::Disclosure(AttentionGroup::Completed);
         for _ in 0..80 {
             if state.overview.selected == Some(done) {
                 state.key(key(KeyCode::Enter));
@@ -4955,7 +4983,7 @@ fn repeated_done(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
         parent,
         title,
         (LoopState::Interrupted, "Interrupted"),
-        AttentionGroup::Done,
+        AgentState::Completed,
     )
 }
 
@@ -5107,14 +5135,14 @@ fn agent_layout_receipt_and_hidden_current_cues_survive_together() {
                     None,
                     "Scan quotes",
                     (LoopState::Running, "Running"),
-                    AttentionGroup::Working,
+                    AgentState::Working,
                 ),
                 fleet_row(
                     created,
                     None,
                     "Draft summary",
                     (LoopState::Running, "Running"),
-                    AttentionGroup::Working,
+                    AgentState::Working,
                 ),
                 source_root,
                 source,
@@ -5138,7 +5166,10 @@ fn agent_layout_receipt_and_hidden_current_cues_survive_together() {
                 state.key(key(KeyCode::Char('p')));
                 assert_eq!(state.overview.project.as_deref(), Some("/work/fleet"));
             } else {
-                select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Done));
+                select_target(
+                    &mut state,
+                    OverviewTarget::Heading(AttentionGroup::Completed),
+                );
                 assert!(state.key(key(KeyCode::Enter)).is_none());
             }
             select_agent(&mut state, scan);
@@ -5160,7 +5191,8 @@ fn agent_layout_receipt_and_hidden_current_cues_survive_together() {
             );
             if !hide_by_filter && width >= 40 {
                 assert!(
-                    line_with(&frame, "▸ Done").is_some_and(|heading| heading.contains("current")),
+                    line_with(&frame, "▸ Completed")
+                        .is_some_and(|heading| heading.contains("current")),
                     "{label}: the collapsed heading names the current Agent: {frame:#?}"
                 );
             }
@@ -5191,7 +5223,7 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
             None,
             "Scan quotes",
             (LoopState::Running, "Running"),
-            AttentionGroup::Working,
+            AgentState::Working,
         );
         scan.project = "project-b".into();
         dispatch_overview(
@@ -5211,7 +5243,7 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
         select_target(&mut console.state.lock().unwrap(), target);
         console
     };
-    let done = OverviewTarget::Heading(AttentionGroup::Done);
+    let done = OverviewTarget::Heading(AttentionGroup::Completed);
     let console = console_selecting(done);
     let mut state = console.state.lock().unwrap();
     state.key(key(KeyCode::Char('p')));
@@ -5219,11 +5251,11 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
     assert_eq!(
         state.overview.selected,
         Some(done),
-        "project-a still lists the Done heading"
+        "project-a still lists the Completed heading"
     );
     let frame = drawn(&mut state);
     assert!(
-        line_with(&frame, &format!("{SELECTED_MARK} ▾ Done · 1")).is_some(),
+        line_with(&frame, &format!("{SELECTED_MARK} ▾ Completed · 1")).is_some(),
         "{frame:#?}"
     );
     drop(state);
@@ -5251,7 +5283,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             None,
             "Alpha",
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         );
         done.updated_at = Some(six_minutes_ago);
         let mut approval = fleet_row(
@@ -5259,7 +5291,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             None,
             "Bravo",
             (LoopState::Running, "Running"),
-            AttentionGroup::NeedsInput,
+            AgentState::NeedsInput,
         );
         approval.approvals = 1;
         approval.questions = 1;
@@ -5269,7 +5301,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             None,
             "Charlie",
             (LoopState::Interrupted, "Interrupted"),
-            AttentionGroup::Done,
+            AgentState::Completed,
         );
         let mut state = State::new(true, width, height);
         state.prompt_enabled = true;

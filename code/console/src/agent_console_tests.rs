@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use uuid::Uuid;
 
-use super::{AgentConsole, AttentionGroup};
+use super::{AgentConsole, AgentState};
 use tickloop_code_access::{
     AgentSummary, ClientMessage, ExecutionAvailability, ExecutionRef, HANDSHAKE_FRAME_BYTES,
     PROTOCOL_MAJOR, PROTOCOL_MINOR, ServerHello, ServerMessage,
@@ -230,25 +230,24 @@ async fn an_explicitly_unknown_work_fact_stays_unknown() {
         "a explicitly unknown summary must not be re-sent with an invented work fact: {forwarded}"
     );
     assert_eq!(row(unknown.execution).has_work, None);
-    assert_eq!(
-        AttentionGroup::of(row(unknown.execution)),
-        AttentionGroup::Unknown,
-        "a summary without the fact is neither known worked Idle nor known Empty"
-    );
+    // Claude Code's agent view has no Unknown state: a summary without the fact reads as Idle.
+    assert_eq!(AgentState::of(row(unknown.execution)), AgentState::Idle);
+    assert!(super::is_listed(row(unknown.execution)));
     assert_eq!(row(empty.execution).has_work, Some(false));
-    assert_eq!(
-        AttentionGroup::of(row(empty.execution)),
-        AttentionGroup::Empty
+    assert!(
+        !super::is_listed(row(empty.execution)),
+        "an Agent that holds nothing is not listed in the overview"
     );
     assert_eq!(
         serde_json::to_value(row(worked.execution)).unwrap()["has_work"],
         true
     );
     assert_eq!(
-        AttentionGroup::of(row(worked.execution)),
-        AttentionGroup::Idle,
+        AgentState::of(row(worked.execution)),
+        AgentState::Idle,
         "the `New Agent` title alone never makes a worked Agent empty"
     );
+    assert!(super::is_listed(row(worked.execution)));
     server.abort();
 }
 

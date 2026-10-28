@@ -1670,6 +1670,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     other_launch.config_root = Some(fixture.path("config"));
     other_launch.model = Some(model);
     other_launch.session_persistence = false;
+    // A Shell gives the other root work, so the overview lists it; it asks no model.
     let CommandResult::Created {
         execution: other, ..
     } = client
@@ -1679,7 +1680,10 @@ async fn run_child_views(fixture: &PrivateFixture) {
             command: AgentCommand::Create {
                 launch_rules: Vec::new(),
                 launch: other_launch,
-                initial: None,
+                initial: Some(UserInput::Shell {
+                    command: "true".into(),
+                    background: false,
+                }),
                 origin: None,
             },
         })
@@ -1693,7 +1697,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first.send(b"\x1b[D");
     first
         .wait_for("delegation overview", |frame| {
-            frame.contains("Agents · local") && frame.contains("▸ Empty · 1")
+            frame.contains("Agents · local") && frame.contains("!true")
         })
         .await;
     first.send(b"p");
@@ -1768,8 +1772,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     assert!(!folded.contains(CHILD_TASK), "{folded}");
     assert!(
-        folded.contains("▸ Empty · 1"),
-        "the never-used root stays discoverable behind its heading: {folded}"
+        folded.contains("!true"),
+        "the other project's root stays listed: {folded}"
     );
     select_overview_row(&mut first, "Delegate bounded cadence.").await;
     let overview = first.frame();
@@ -3229,44 +3233,6 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
     panic!("overview never selected {title}: {}", view.frame());
 }
 
-/// Opens the folded `group` heading with real keys: up to the first line, then down to it.
-async fn open_group_heading(view: &mut PtyView, group: &str) {
-    view.send(b"\x1b[5~");
-    // New Agent is the second row; accepting it can acknowledge a frame from before PageUp.
-    view.wait_for("overview selection reaches its first group", |frame| {
-        selected_row_title(frame).is_some_and(|title| title.starts_with("Needs input"))
-    })
-    .await;
-    let folded = format!("{SELECTED_MARK} ▸ {group} · ");
-    for _ in 0..40 {
-        let frame = view.frame();
-        if frame.contains(&folded) {
-            view.send(b"\r");
-            view.wait_for("the group heading opens", |frame| {
-                frame.contains(&format!("{SELECTED_MARK} ▾ {group} · "))
-            })
-            .await;
-            return;
-        }
-        let next = frame
-            .lines()
-            .skip_while(|line| !line.starts_with(SELECTED_MARK))
-            .nth(1)
-            .map(row_title)
-            .and_then(|title| title.split(" · ").next())
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| panic!("no row below the overview selection: {frame}"))
-            .to_owned();
-        view.send(b"j");
-        view.wait_for("overview navigation selects the next listed row", |frame| {
-            selected_row_title(frame).and_then(|title| title.split(" · ").next())
-                == Some(next.as_str())
-        })
-        .await;
-    }
-    panic!("no folded {group} heading: {}", view.frame());
-}
-
 /// A listed row's text after its selection marker, indentation and state glyph.
 fn row_title(line: &str) -> &str {
     let rest = line.trim_start_matches([SELECTED_MARK, ' ']);
@@ -3425,12 +3391,10 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
             frame
                 .lines()
                 .any(|line| line.starts_with("Project: ") && line.contains("work"))
-                && frame.contains("▸ Idle · 2")
+                && frame.contains("▾ Completed · 2")
         },
     )
     .await;
-    // Both finished Shell Agents are Idle; Idle starts folded behind its heading.
-    open_group_heading(&mut view, "Idle").await;
     let mut frame = view
         .wait_for(
             "launch filter lists both identical tasks with reading numbers",
@@ -3638,9 +3602,7 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
     for (width, height) in [(40, 16), (80, 24), (120, 48)] {
         view.resize(width, height).await;
         let frame = view
-            .wait_for("dense overview", |frame| {
-                frame.contains("▸ Idle · 3") && frame.contains("▸ Empty · 5")
-            })
+            .wait_for("dense overview", |frame| frame.contains("▾ Completed · 3"))
             .await;
         assert!(
             frame
@@ -3648,65 +3610,40 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
                 .all(|line| unicode_width::UnicodeWidthStr::width(line) <= width),
             "{width}×{height}: {frame}"
         );
-        assert!(
-            frame.lines().position(|line| line.contains("Idle · 3"))
-                < frame.lines().position(|line| line.contains("Empty · 5")),
-            "{width}×{height}: worked Agents come before never-used sessions: {frame}"
+        assert_eq!(
+            frame
+                .lines()
+                .filter(|line| line.contains("printf dense-"))
+                .count(),
+            3,
+            "{width}×{height}: the worked Agents are listed: {frame}"
         );
         assert!(
-            !frame.lines().any(|line| line.contains("· Empty")),
-            "{width}×{height}: never-used sessions stay folded: {frame}"
+            !frame.contains("Empty"),
+            "{width}×{height}: Agents that hold nothing are not listed: {frame}"
         );
     }
-    for _ in 0..8 {
-        if view.frame().contains(&format!("{SELECTED_MARK} ▸ Empty")) {
-            break;
-        }
-        view.send(b"j");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    view.wait_for("the Empty heading is selected", |frame| {
-        frame.contains(&format!("{SELECTED_MARK} ▸ Empty · 5"))
+    let rows = catalog(&client).await;
+    assert_eq!(
+        rows.len(),
+        8,
+        "the daemon still runs the Agents the overview leaves out"
+    );
+    assert!(
+        empty
+            .iter()
+            .all(|execution| rows.iter().any(|row| row.execution == *execution))
+    );
+    view.send(b"\x1b");
+    view.wait_for("the overview closes", |frame| {
+        !frame.contains("Agents · local")
     })
     .await;
-    view.send(b"\r");
-    let opened = view
-        .wait_for("every never-used session becomes discoverable", |frame| {
-            frame.contains(&format!("{SELECTED_MARK} ▾ Empty · 5"))
-                && frame
-                    .lines()
-                    .filter(|line| line.contains("· Empty"))
-                    .count()
-                    == 5
-        })
-        .await;
-    assert!(opened.contains("▸ Idle · 3"), "{opened}");
-    view.send(b"j\r");
-    let opened_execution = tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            if let Some(row) = catalog(&client)
-                .await
-                .into_iter()
-                .find(|row| empty.contains(&row.execution) && !row.views.is_empty())
-            {
-                break row.execution;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("Enter on a revealed empty session connects to that execution");
-    assert!(empty.contains(&opened_execution));
-    assert_eq!(
-        catalog(&client).await.len(),
-        8,
-        "opening creates nothing new"
-    );
     view.close().await;
 }
 
 #[tokio::test]
-async fn actual_cli_dense_overview_folds_never_used_sessions_and_keeps_them_openable() {
+async fn actual_cli_dense_overview_lists_no_agent_that_holds_nothing() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(run_dense_overview(&fixture))
         .catch_unwind()
@@ -3902,22 +3839,20 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
                 frame.lines().any(|line| line.starts_with("Agents"))
             })
             .await;
-        let unknown = frame
+        // Claude Code's agent view has no Unknown state: a session without the work fact reads as
+        // Idle, under Completed with the worked ones.
+        let completed = frame
             .lines()
-            .find(|line| line.contains("Unknown · 17"))
+            .find(|line| line.contains("Completed · 20"))
             .unwrap_or_else(|| {
-                panic!("{width}×{height}: the unreported count stays visible: {frame}")
+                panic!("{width}×{height}: the Completed count stays visible: {frame}")
             });
-        assert!(unknown.contains('▸'), "{width}×{height}: {unknown}");
+        assert!(completed.contains('▾'), "{width}×{height}: {completed}");
         assert!(
-            frame.lines().any(|line| line.contains("Idle · 3")),
-            "{width}×{height}: worked Idle Agents keep their own group: {frame}"
+            unreported_rows(&frame) >= 1,
+            "{width}×{height}: unreported sessions are listed as Idle: {frame}"
         );
-        assert_eq!(
-            unreported_rows(&frame),
-            0,
-            "{width}×{height}: unreported sessions are not listed one by one: {frame}"
-        );
+        assert!(!frame.contains("Unknown"), "{width}×{height}: {frame}");
         assert!(
             frame
                 .lines()
@@ -3925,23 +3860,10 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
             "{width}×{height}: {frame}"
         );
     }
-    for _ in 0..8 {
-        if view.frame().contains(&format!("{SELECTED_MARK} ▸ Unknown")) {
-            break;
-        }
-        view.send(b"j");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    view.wait_for("the Unknown heading is selected", |frame| {
-        frame.contains(&format!("{SELECTED_MARK} ▸ Unknown"))
-    })
-    .await;
-    view.send(b"\r");
-    view.wait_for("the unreported sessions become discoverable", |frame| {
-        frame.contains("▾ Unknown · 17") && unreported_rows(frame) >= 3
-    })
-    .await;
-    view.send(b"j\r");
+    // Completed lists the Shell Agents, whose change time is known, before the unreported
+    // sessions; the first row after the three Shells is an unreported session.
+    select_overview_row(&mut view, "printf legacy-").await;
+    view.send(b"jjj\r");
     let opened = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             if let Some(row) = catalog(&client)
@@ -3955,7 +3877,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
         }
     })
     .await
-    .expect("Enter on a revealed session connects to that execution");
+    .expect("Enter on a listed session connects to that execution");
     assert!(unreported.contains(&opened));
     assert_eq!(
         catalog(&client).await.len(),
@@ -3968,7 +3890,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
 }
 
 #[tokio::test]
-async fn actual_cli_legacy_dense_overview_preserves_unknown_work_facts() {
+async fn actual_cli_legacy_dense_overview_lists_unreported_sessions_as_idle() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(run_legacy_dense_overview(&fixture))
         .catch_unwind()

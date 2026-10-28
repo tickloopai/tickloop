@@ -1160,6 +1160,7 @@ mod tests {
             workspace: None,
             approvals: 0,
             questions: 0,
+            agent_state: crate::agent_console::AgentState::Working,
             group: crate::agent_console::AttentionGroup::Working,
             glyph: Glyph::AgentRunning,
             preview: None,
@@ -1209,6 +1210,7 @@ mod tests {
             workspace: None,
             approvals: 0,
             questions: 0,
+            agent_state: crate::agent_console::AgentState::Working,
             group: crate::agent_console::AttentionGroup::Working,
             glyph: Glyph::AgentRunning,
             preview: None,
@@ -1257,6 +1259,7 @@ mod tests {
             workspace: None,
             approvals: 0,
             questions: 0,
+            agent_state: crate::agent_console::AgentState::Working,
             group: AttentionGroup::Working,
             glyph: Glyph::AgentRunning,
             preview: Some("Run sleep 30".into()),
@@ -1365,7 +1368,8 @@ mod tests {
             Some(162_000),
             "only the run time ticks"
         );
-        rows[1].group = AttentionGroup::Idle;
+        rows[1].agent_state = crate::agent_console::AgentState::Idle;
+        rows[1].group = AttentionGroup::Completed;
         rows[1].state = tickloop_harness::protocol::LoopState::Idle;
         rows[1].status = "Idle".into();
         rows[1].glyph = Glyph::AgentIdle;
@@ -1377,6 +1381,7 @@ mod tests {
         let idle = &area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 181_000)[1];
         assert!(idle.text().ends_with("idle"), "{idle:?}");
         assert_eq!(area.next_frame_ms(181_000), None);
+        rows[1].agent_state = crate::agent_console::AgentState::Working;
         rows[1].group = AttentionGroup::Working;
         rows[1].state = tickloop_harness::protocol::LoopState::Running;
         rows[1].status = "Running".into();
@@ -1657,10 +1662,10 @@ mod tests {
 
     #[test]
     fn subagent_panel_dots_wear_agent_colors_and_remember_the_selection() {
-        use crate::agent_console::AttentionGroup;
+        use crate::agent_console::AgentState;
         use tickloop_harness::protocol::{AgentColor, SubagentRegistration};
         let root = Uuid::from_u128(1);
-        let row = |id: u128, state: LoopState, group: AttentionGroup| AgentRow {
+        let row = |id: u128, state: LoopState, agent_state: AgentState| AgentRow {
             agent_id: Uuid::from_u128(id),
             parent_id: (id != 1).then_some(root),
             title: format!("member-{id}"),
@@ -1670,8 +1675,9 @@ mod tests {
             workspace: None,
             approvals: 0,
             questions: 0,
-            group,
-            glyph: super::super::console::status_glyph(group, false),
+            agent_state,
+            group: agent_state.group(),
+            glyph: super::super::console::status_glyph(agent_state, false),
             preview: None,
             updated_at: Some(64_000),
             run_started_at: None,
@@ -1688,10 +1694,10 @@ mod tests {
         area.update("Auto".into(), "model".into(), None, None);
         area.update_agents(
             vec![
-                row(1, LoopState::Idle, AttentionGroup::Idle),
-                row(2, LoopState::Idle, AttentionGroup::Idle),
-                row(3, LoopState::Failed, AttentionGroup::Errors),
-                row(4, LoopState::Interrupted, AttentionGroup::Done),
+                row(1, LoopState::Idle, AgentState::Idle),
+                row(2, LoopState::Idle, AgentState::Idle),
+                row(3, LoopState::Failed, AgentState::Failed),
+                row(4, LoopState::Interrupted, AgentState::Completed),
             ],
             Some(root),
         );
@@ -1855,7 +1861,8 @@ mod shared_task_tests {
                 workspace: None,
                 approvals: 0,
                 questions: 0,
-                group: crate::agent_console::AttentionGroup::Idle,
+                agent_state: crate::agent_console::AgentState::Idle,
+                group: crate::agent_console::AttentionGroup::Completed,
                 glyph: Glyph::AgentIdle,
                 preview: None,
                 updated_at: None,

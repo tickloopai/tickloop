@@ -94,7 +94,10 @@ struct HiddenRecoveryAccess {
 #[async_trait]
 impl AgentAccess for HiddenRecoveryAccess {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        self.daemon.observe(query).await
+        self.daemon
+            .observe(query)
+            .await
+            .map(super::listed_as_worked)
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {

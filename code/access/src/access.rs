@@ -95,8 +95,8 @@ use tickloop_harness::protocol::{
 /// Loop how many Runs it started and how many times the Chat was compacted.
 /// 34.2 adds the reasoning tokens a response reported to its usage.
 /// 34.3 adds the total tokens of a Subagent run's last request to its family completion.
-/// 34.4 adds the ended root Agents the overview keeps after their execution ended, and forgetting
-/// one of them.
+/// 34.4 adds the ended root Agents the overview keeps after their execution ended, stopping a
+/// root Agent, and forgetting an ended one.
 pub const PROTOCOL_MAJOR: u16 = 34;
 pub const PROTOCOL_MINOR: u16 = 4;
 
@@ -441,6 +441,11 @@ pub enum AgentCommand {
     /// Stops the running Tickhost of another build than the daemon's, ending what it runs; the
     /// next open or Shell starts one of the daemon's build.
     ReplaceTickhost,
+    /// Stops the root Agent of `execution` and its family: their Loops and Worker end, and the
+    /// overview keeps the root as Stopped until the user continues or removes it.
+    StopAgent {
+        execution: ExecutionRef,
+    },
     /// Removes the ended root Agent of `record` from the overview; its saved history stays.
     ForgetEndedAgent {
         record: TranscriptRef,
@@ -845,6 +850,8 @@ pub enum EndReason {
     DaemonOff,
     /// Its worker was lost while the daemon kept running.
     WorkerLost,
+    /// The user stopped it.
+    UserStopped,
 }
 
 /// A root Agent whose execution ended, as the overview lists it.

@@ -69,6 +69,14 @@ pub trait WorkerFactory: Send + Sync {
     async fn replace_tickhost(&self) -> Result<(), AccessError> {
         Ok(())
     }
+    /// Ends `worker` on the user's word: it saves what it holds and exits, and its process is
+    /// killed when it does not exit in time.
+    async fn stop_worker(&self, _worker: &Arc<dyn AgentAccess>) -> Result<(), AccessError> {
+        Err(AccessError::new(
+            AccessErrorCode::Unsupported,
+            "this daemon cannot stop an Agent",
+        ))
+    }
     /// The context breakdown of a New Agent `launch` would start, counted without starting it.
     async fn draft_context_breakdown(
         &self,
@@ -384,6 +392,54 @@ impl DaemonServer {
         known.last_directory = agents;
         Ok(execution)
     }
+    /// Stops the root Agent of `execution` and every member of its family, which share its
+    /// Worker. The Worker leaves the directory before it is stopped, so the overview never reads
+    /// it as lost, and the root's record says the user stopped it.
+    async fn stop_agent(&self, execution: ExecutionRef) -> Result<(), AccessError> {
+        let worker = self.worker(execution).await?;
+        let directory = self.directory().await?;
+        let root = directory
+            .iter()
+            .find(|entry| entry.execution == execution)
+            .filter(|entry| entry.parent.is_none() && entry.subagent.is_none())
+            .cloned()
+            .ok_or_else(|| AccessError::invalid("only a root Agent can be stopped"))?;
+        let _ = worker
+            .execute(CommandEnvelope {
+                daemon_epoch: self.inner.epoch,
+                command_id: tickloop_ids::generate(),
+                command: AgentCommand::FlushTranscripts,
+            })
+            .await;
+        self.inner
+            .workers
+            .lock()
+            .await
+            .retain(|known| !Arc::ptr_eq(&known.access, &worker));
+        let stopped = {
+            let mut routes = self.inner.routes.lock().await;
+            let stopped = routes
+                .iter()
+                .filter(|(_, routed)| Arc::ptr_eq(routed, &worker))
+                .map(|(execution, _)| *execution)
+                .collect::<HashSet<_>>();
+            routes.retain(|execution, _| !stopped.contains(execution));
+            stopped
+        };
+        self.inner
+            .records
+            .lock()
+            .await
+            .retain(|_, execution| !stopped.contains(execution));
+        if let (Some(registries), Some(record)) = (&self.inner.registries, &root.record) {
+            let remaining = self.directory().await?;
+            registries
+                .registry(&record.store_root, &remaining)
+                .mark_stopped(&root);
+        }
+        self.inner.factory.stop_worker(&worker).await
+    }
+
     /// The configuration root of the latest Worker that saves to one.
     async fn latest_config_root(&self) -> Option<std::path::PathBuf> {
         self.inner
@@ -810,6 +866,10 @@ impl DaemonServer {
             }
             AgentCommand::ReplaceTickhost => {
                 self.inner.factory.replace_tickhost().await?;
+                Ok((CommandResult::Done, PersistenceState::NotApplicable))
+            }
+            AgentCommand::StopAgent { execution } => {
+                self.stop_agent(*execution).await?;
                 Ok((CommandResult::Done, PersistenceState::NotApplicable))
             }
             AgentCommand::ForgetEndedAgent { record } => {

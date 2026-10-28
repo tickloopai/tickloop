@@ -1196,14 +1196,20 @@ async fn a_lost_execution_stays_an_error_even_before_it_ever_worked() {
     let lost = rows.iter().find(|row| row.execution == configured).unwrap();
     assert_eq!(lost.has_work, Some(false));
     assert_eq!(lost.availability, ExecutionAvailability::Lost);
+    // A lost execution reads as Failed and lists under Completed, as Claude Code's agent view
+    // groups a failed session.
+    assert_eq!(
+        tickloop_code_console::agent_console::AgentState::of(lost),
+        tickloop_code_console::agent_console::AgentState::Failed
+    );
     assert_eq!(
         tickloop_code_console::agent_console::AttentionGroup::of(lost),
-        tickloop_code_console::agent_console::AttentionGroup::Errors
+        tickloop_code_console::agent_console::AttentionGroup::Completed
     );
     assert_eq!(
         rows.iter().map(|row| row.execution).collect::<Vec<_>>(),
-        [configured, finished],
-        "a lost execution ranks with errors before finished work"
+        [finished, configured],
+        "a lost execution lists with finished work under Completed, newest change first"
     );
     runtime.shutdown().await;
 }
@@ -1300,7 +1306,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
     );
     assert_eq!(
         group(failed),
-        tickloop_code_console::agent_console::AttentionGroup::Errors
+        tickloop_code_console::agent_console::AttentionGroup::Completed
     );
     for name in ["release-foreground", "release-background"] {
         std::fs::write(directory.path().join(name), "done").unwrap();

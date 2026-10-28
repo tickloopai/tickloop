@@ -3264,6 +3264,28 @@ async fn interact_with_herdr(
                     }
                     status_dirty = true;
                 },
+                Some(InputEvent::StopAgent(agent_id)) => {
+                    let projection=global.projection();
+                    let Some(row)=projection.rows.iter().find(|row|row.execution.agent_id==agent_id).cloned() else {
+                        console.set_status("This Agent is no longer running")?;status_dirty=true;continue;
+                    };
+                    match global.stop_agent(row.execution).await {
+                        Ok(())=>{
+                            // The stopped Agent is no longer one this View can return to.
+                            if selected_chat.map(ChatId::uuid)==Some(row.chat_id) {
+                                selected_chat=None;global.visible_ready(None);console.clear_visible_agent()?;
+                            }
+                            if let Err(error)=global.refresh().await {
+                                daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                                console.set_connection_notice(daemon_unreachable.clone())?;
+                            }
+                            console.set_global_overview(Some(agent_overview(&global.projection())))?;
+                            console.set_status(&format!("Stopped {} · enter resumes it",safe_line(&row.title)))?;
+                        },
+                        Err(error)=>console.set_status(&format!("Cannot stop the Agent · {}",safe_line(&error.to_string())))?,
+                    }
+                    status_dirty = true;
+                },
                 Some(InputEvent::ForgetEndedAgent(chat)) => {
                     let title=global.projection().ended.iter().find(|ended|ended.record.chat_id==chat).map(|ended|safe_line(&ended.title)).unwrap_or_else(||"the Agent".into());
                     match global.forget_ended(chat).await {
@@ -8308,17 +8330,22 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
             _ => break,
         }
     }
-    let rows = tree
+    let mut rows = tree
         .iter()
         .filter(|row| {
             row.parent_id.is_none()
                 && projection.rows.iter().any(|summary| {
-                    summary.execution.agent_id == row.agent_id && summary.subagent.is_none()
+                    summary.execution.agent_id == row.agent_id
+                        && summary.subagent.is_none()
+                        && crate::agent_console::is_listed(summary)
                 })
         })
         .cloned()
         .chain(projection.ended.iter().map(ended_agent_row))
-        .collect();
+        .collect::<Vec<_>>();
+    // Each group lists its newest change first; for a finished row that is when it ended, as
+    // Claude Code orders its Completed group.
+    rows.sort_by_key(|row| (row.group, std::cmp::Reverse(row.updated_at)));
     console::AgentOverview {
         rows,
         dispatch_directory: projection.dispatch_directory.clone(),
@@ -8327,27 +8354,29 @@ fn agent_overview(projection: &crate::agent_console::Projection) -> console::Age
     }
 }
 
-/// An ended root Agent's overview row, keyed by its Chat: there is no execution to name.
+/// An ended root Agent's overview row, keyed by its Chat: there is no execution to name. Its
+/// status says why it ended, so it reads apart from a run that failed while its Agent still runs.
 fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRow {
-    use tickloop_code_access::{EndReason, EndedOutcome};
-    let outcome = match agent.outcome {
-        EndedOutcome::Failed => "Failed",
-        EndedOutcome::Stopped => "Stopped",
+    use crate::agent_console::AgentState;
+    use tickloop_code_access::EndReason;
+    let agent_state = AgentState::of_ended(agent);
+    let reason = match agent.reason {
+        EndReason::DaemonStopped => Some("ended when the daemon stopped"),
+        EndReason::DaemonOff => Some("ended while the daemon was off"),
+        EndReason::WorkerLost => Some("worker lost"),
+        EndReason::UserStopped => None,
     };
-    let detail = if !agent.resumable {
-        "history gone"
-    } else {
-        match agent.reason {
-            EndReason::DaemonStopped => "daemon stopped",
-            EndReason::DaemonOff => "ended while the daemon was off",
-            EndReason::WorkerLost => "worker lost",
-        }
-    };
+    let status = [Some(agent_state.label()), reason]
+        .into_iter()
+        .flatten()
+        .chain((!agent.resumable).then_some("history gone"))
+        .collect::<Vec<_>>()
+        .join(" · ");
     console::AgentRow {
         agent_id: agent.record.chat_id,
         parent_id: None,
         title: safe_line(&agent.title),
-        status: format!("{outcome} · {detail}"),
+        status,
         state: agent.last_state.clone(),
         project: shown_folder(agent.folder.as_deref())
             .to_string_lossy()
@@ -8355,32 +8384,28 @@ fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRo
         workspace: agent.workspace.clone(),
         approvals: 0,
         questions: 0,
-        group: crate::agent_console::AttentionGroup::Ended,
-        glyph: match agent.outcome {
-            EndedOutcome::Failed => Glyph::AgentFailed,
-            EndedOutcome::Stopped => Glyph::AgentStopped,
-        },
+        agent_state,
+        group: agent_state.group(),
+        glyph: console::status_glyph(agent_state, false),
         preview: agent.preview.as_deref().map(safe_line),
         updated_at: Some(agent.ended_at),
         run_started_at: None,
         subagent: None,
         ended: Some(console::EndedRow {
             chat_id: agent.record.chat_id,
-            outcome: agent.outcome,
+            reason: agent.reason,
             resumable: agent.resumable,
         }),
     }
 }
 
-/// Human status text for an Agent row; the Loop state names are internal.
+/// Human status text for an Agent row: its state, and why when that is not plain. The Loop state
+/// names are internal.
 fn agent_status_label(row: &AgentSummary) -> &'static str {
     use tickloop_code_access::ExecutionAvailability;
     use tickloop_harness::protocol::LoopState;
     if row.availability == ExecutionAvailability::Lost {
-        return "Lost · outcome unknown";
-    }
-    if row.has_work == Some(false) && row.waiting_permissions + row.waiting_questions == 0 {
-        return "Empty";
+        return "Failed · lost, outcome unknown";
     }
     match row.state {
         LoopState::Running => "Running",
@@ -8388,11 +8413,9 @@ fn agent_status_label(row: &AgentSummary) -> &'static str {
         LoopState::WaitingPermission => "Needs approval",
         LoopState::WaitingQuestion => "Needs answer",
         LoopState::WaitingPlan => "Plan review",
-        LoopState::Idle if row.has_work.is_none() => "Idle · work unknown",
-        LoopState::Idle if row.run_id.is_some() => "Completed",
-        LoopState::Idle => "Idle",
-        LoopState::Failed => "Failed",
-        LoopState::Interrupted => "Interrupted",
+        LoopState::Failed => "Failed · run failed",
+        LoopState::Interrupted => "Completed · interrupted",
+        LoopState::Idle => crate::agent_console::AgentState::of(row).label(),
     }
 }
 
@@ -8400,7 +8423,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
     let mut result = rows
         .iter()
         .map(|row| {
-            let group = crate::agent_console::AttentionGroup::of(row);
+            let agent_state = crate::agent_console::AgentState::of(row);
             let parent_id = row.parent.map(|parent| parent.agent_id);
             console::AgentRow {
                 agent_id: row.execution.agent_id,
@@ -8414,10 +8437,11 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 workspace: row.workspace.clone(),
                 approvals: row.waiting_permissions,
                 questions: row.waiting_questions,
-                group,
+                agent_state,
+                group: agent_state.group(),
                 glyph: console::status_glyph(
-                    group,
-                    row.state == tickloop_harness::protocol::LoopState::Idle,
+                    agent_state,
+                    row.state == tickloop_harness::protocol::LoopState::Interrupted,
                 ),
                 preview: row.preview.as_deref().map(safe_line),
                 updated_at: row.updated_at,
@@ -8448,10 +8472,11 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 .map(|row| crate::agent_console::AttentionGroup::of(row))
                 .min()
                 .unwrap_or(root.group);
-            root.glyph = console::status_glyph(
-                root.group,
-                root.state == tickloop_harness::protocol::LoopState::Idle,
-            );
+            root.glyph = match root.group {
+                crate::agent_console::AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
+                crate::agent_console::AttentionGroup::Working => Glyph::AgentRunning,
+                crate::agent_console::AttentionGroup::Completed => root.glyph,
+            };
         }
     } else {
         result.sort_by_key(|row| {
@@ -8905,6 +8930,157 @@ mod tests {
         assert_eq!(overview.visible, Some(root.agent_id));
         assert_eq!(overview.rows[0].questions, 1);
         assert_eq!(overview.rows[0].status_role(), super::style::Role::Warning);
+    }
+
+    /// Claude Code's agent view states and groups, one mapping row each: what the daemon reports,
+    /// the state the row shows, its status text and its group.
+    #[test]
+    fn overview_rows_follow_the_agent_view_state_and_group_table() {
+        use crate::agent_console::{AgentState, AttentionGroup};
+        use tickloop_code_access::{EndReason, EndedAgent, EndedOutcome, TranscriptRef};
+        use tickloop_harness::protocol::LoopState;
+        let epoch = uuid::Uuid::new_v4();
+        let live = |id: u128,
+                    state: &str,
+                    run: bool,
+                    has_work: Option<bool>,
+                    lost: bool,
+                    updated_at: u64| {
+            let mut summary = serde_json::from_value::<tickloop_code_access::AgentSummary>(serde_json::json!({"execution":{"daemon_epoch":epoch,"agent_id":uuid::Uuid::from_u128(id),"generation":1},"chat_id":uuid::Uuid::from_u128(id),"folder":"/test","state":state,"title":format!("live {id}"),"waiting_permissions":0,"waiting_questions":0,"parent":null,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":updated_at})).unwrap();
+            summary.has_work = has_work;
+            summary.run_id = run.then(|| uuid::Uuid::from_u128(id + 1000).into());
+            if lost {
+                summary.availability = tickloop_code_access::ExecutionAvailability::Lost;
+            }
+            summary
+        };
+        let ended =
+            |id: u128, outcome: EndedOutcome, reason: EndReason, last_state, ended_at: u64| {
+                EndedAgent {
+                    record: TranscriptRef {
+                        store_root: "/config".into(),
+                        chat_id: uuid::Uuid::from_u128(id),
+                    },
+                    agent_id: uuid::Uuid::from_u128(id + 1000),
+                    folder: Some("/test".into()),
+                    workspace: None,
+                    title: format!("ended {id}"),
+                    preview: None,
+                    created_at: 1,
+                    updated_at: ended_at,
+                    ended_at,
+                    last_state,
+                    outcome,
+                    reason,
+                    resumable: true,
+                }
+            };
+        let projection = crate::agent_console::Projection {
+            overview: true,
+            visible: None,
+            dispatch_directory: "/test".into(),
+            rows: vec![
+                live(1, "WaitingQuestion", true, Some(true), false, 10),
+                live(2, "Running", true, Some(true), false, 20),
+                live(3, "Idle", true, Some(true), false, 30),
+                live(4, "Interrupted", true, Some(true), false, 40),
+                live(5, "Failed", true, Some(true), false, 50),
+                live(6, "Idle", true, Some(true), true, 60),
+                live(7, "Idle", false, Some(true), false, 70),
+                live(8, "Idle", true, None, false, 80),
+                live(9, "Idle", false, Some(false), false, 90),
+            ],
+            ended: vec![
+                ended(
+                    11,
+                    EndedOutcome::Failed,
+                    EndReason::DaemonStopped,
+                    LoopState::Running,
+                    100,
+                ),
+                ended(
+                    12,
+                    EndedOutcome::Stopped,
+                    EndReason::DaemonOff,
+                    LoopState::Idle,
+                    5,
+                ),
+                ended(
+                    13,
+                    EndedOutcome::Stopped,
+                    EndReason::UserStopped,
+                    LoopState::Running,
+                    110,
+                ),
+                ended(
+                    14,
+                    EndedOutcome::Failed,
+                    EndReason::DaemonStopped,
+                    LoopState::WaitingPermission,
+                    120,
+                ),
+            ],
+            waiting_permissions: 0,
+            waiting_questions: 0,
+            generation: 0,
+            closed: false,
+            unconfirmed_dispatch: None,
+            created: None,
+        };
+        let overview = super::agent_overview(&projection);
+        let rows = overview
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.title.as_str(),
+                    row.agent_state,
+                    row.status.as_str(),
+                    row.group,
+                )
+            })
+            .collect::<Vec<_>>();
+        use AgentState::*;
+        use AttentionGroup as G;
+        assert_eq!(
+            rows,
+            [
+                (
+                    "ended 14",
+                    NeedsInput,
+                    "Needs input · ended when the daemon stopped",
+                    G::NeedsInput
+                ),
+                ("live 1", NeedsInput, "Needs answer", G::NeedsInput),
+                ("live 2", Working, "Running", G::Working),
+                // Completed lists the newest end first, ended and running rows alike.
+                ("ended 13", Stopped, "Stopped", G::Completed),
+                (
+                    "ended 11",
+                    Failed,
+                    "Failed · ended when the daemon stopped",
+                    G::Completed
+                ),
+                ("live 8", Idle, "Idle", G::Completed),
+                ("live 7", Idle, "Idle", G::Completed),
+                (
+                    "live 6",
+                    Failed,
+                    "Failed · lost, outcome unknown",
+                    G::Completed
+                ),
+                ("live 5", Failed, "Failed · run failed", G::Completed),
+                ("live 4", Completed, "Completed · interrupted", G::Completed),
+                ("live 3", Completed, "Completed", G::Completed),
+                (
+                    "ended 12",
+                    Stopped,
+                    "Stopped · ended while the daemon was off",
+                    G::Completed
+                ),
+            ],
+            "an Agent that holds nothing (live 9) is not listed"
+        );
     }
 
     #[test]

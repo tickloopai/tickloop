@@ -33,6 +33,7 @@ const REGISTRY_WAIT: Duration = Duration::from_secs(5);
 struct CountingWorkers {
     root: PathBuf,
     started: AtomicUsize,
+    stopped: AtomicUsize,
     model: Arc<ScriptedModel>,
 }
 
@@ -41,6 +42,7 @@ impl CountingWorkers {
         Arc::new(Self {
             root: root.into(),
             started: AtomicUsize::new(0),
+            stopped: AtomicUsize::new(0),
             model: Arc::new(ScriptedModel::new(vec![text("Continued the module")])),
         })
     }
@@ -61,6 +63,11 @@ impl WorkerFactory for CountingWorkers {
         let runtime =
             Agent::open_embedded(self.root.clone(), config(), self.model.clone()).unwrap();
         Ok(Arc::new(EmbeddedAgentAccess::for_worker(runtime, epoch)))
+    }
+
+    async fn stop_worker(&self, _: &Arc<dyn AgentAccess>) -> Result<(), AccessError> {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn exited(&self, _: &Arc<dyn AgentAccess>) -> bool {
@@ -475,4 +482,47 @@ async fn an_unreadable_record_is_skipped_and_left_in_place() {
 
     assert!(ended(&daemon, &root).await.is_empty());
     assert!(damaged.exists());
+}
+
+#[tokio::test]
+async fn stopping_a_root_ends_its_worker_and_keeps_it_listed_as_stopped() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let folder = directory.path();
+    let (root_chat, child_chat) = saved_family(&root, folder).await;
+    let workers = CountingWorkers::new(&root);
+    let daemon = started_daemon(workers.clone());
+    let execution = load(&daemon, &root, folder, root_chat).await;
+    let child = load(&daemon, &root, folder, child_chat).await;
+    wait_for_record(&root, root_chat, "live").await;
+
+    let refused = execute(&daemon, AgentCommand::StopAgent { execution: child })
+        .await
+        .into_result()
+        .unwrap_err();
+    assert_eq!(refused.code, AccessErrorCode::Invalid);
+    assert_eq!(workers.stopped.load(Ordering::SeqCst), 0);
+
+    execute(&daemon, AgentCommand::StopAgent { execution })
+        .await
+        .into_result()
+        .unwrap();
+
+    assert_eq!(workers.stopped.load(Ordering::SeqCst), 1);
+    assert!(overview(&daemon).await.is_empty());
+    let rows = ended(&daemon, &root).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].record.chat_id, root_chat.uuid());
+    assert_eq!(rows[0].outcome, EndedOutcome::Stopped);
+    assert_eq!(rows[0].reason, EndReason::UserStopped);
+    assert!(rows[0].resumable);
+    let record = wait_for_record(&root, root_chat, "stopped").await;
+    assert_eq!(record["endReason"], "user_stopped");
+    // The monitor does not bring the stopped root back.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(ended(&daemon, &root).await.len(), 1);
+    assert_eq!(
+        wait_for_record(&root, root_chat, "stopped").await["status"],
+        "stopped"
+    );
 }

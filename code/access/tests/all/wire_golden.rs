@@ -649,6 +649,9 @@ fn agent_commands_keep_their_recorded_wire() {
                 execution: execution(),
                 name: "plugin_notes_search".into(),
             },
+            AgentCommand::StopAgent {
+                execution: execution(),
+            },
             AgentCommand::ForgetEndedAgent {
                 record: TranscriptRef {
                     store_root: "/home/user/.tickloop".into(),

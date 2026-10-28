@@ -126,7 +126,7 @@ _Avoid_: multiple Loops, goal list, StartGoal
 Stops execution of the current turn, issued by Esc or by Ctrl+C on empty input while running; it also pauses the active Goal and ends a self-paced `/loop`, without changing Receiving.
 
 **Stop (`/stop`)**:
-Brings the Loop to a full stop: interrupts the current turn, pauses the active Goal, ends a self-paced `/loop`, pauses Receiving, and stops all of this Agent's descendants.
+Brings the Loop to a full stop: interrupts the current turn, pauses the active Goal, ends a self-paced `/loop`, pauses Receiving, and stops all of this Agent's descendants. The Agent keeps running; ending it is Stopping an Agent.
 _Avoid_: using "Stop" to mean leaving the view
 
 **Input Queue**:
@@ -217,6 +217,17 @@ Host environment information the Agent uses to understand the scope of its work,
 
 **Agents Overview**:
 An overview, machine-wide, of all Agents and their parent-child relationships, from which the user can enter a selected Agent's view.
+
+**Agent State**:
+How the Agents Overview names a root Agent, after Claude Code's agent view: Needs input, Working, Idle, Completed (its last turn finished), Failed (its run failed, its execution was lost, or it ended when the daemon stopped) or Stopped (the user stopped it, or it ended while the daemon was off). The Overview groups them under Needs input, Working and Completed, which holds the last four.
+_Avoid_: Done, Errors, Empty, Unknown
+
+**Ended Agent**:
+A root Agent whose execution ended but which the Agents Overview still lists from the registry in the configuration root, as Failed or Stopped, until the user continues it from its saved history or removes the row.
+
+**Stopping an Agent**:
+Ending a root Agent's execution from the Agents Overview: the Loops and Worker of its family end, and it stays listed as a Stopped Ended Agent.
+_Avoid_: confusing it with Stop (`/stop`), which keeps the Agent running
 
 **Current Agent**:
 The Agent an Agent View was showing before it opened the Overview, i.e. the one it returns to on leaving the Overview; expressed separately from the cursor selection in the Overview and from host focus.

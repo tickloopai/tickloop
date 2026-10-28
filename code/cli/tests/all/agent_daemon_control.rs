@@ -737,6 +737,100 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_root_agent_ends_its_worker_process_and_keeps_it_listed_as_stopped() {
+    let mut fixture = DaemonFixture::new();
+    let daemon = tickloop_code_client::connect_or_start_at(
+        fixture.runtime.clone(),
+        support::fixture_cli::executable(),
+    )
+    .await
+    .unwrap();
+    let epoch = daemon.daemon_epoch();
+    fixture.daemon_epoch = Some(epoch);
+    let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
+    let created = daemon
+        .execute(create_command(epoch, launch))
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    } = created
+    else {
+        panic!("active worker created")
+    };
+    tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let worker_socket = std::fs::read_dir(&fixture.runtime)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+        .unwrap()
+        .path();
+    let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
+    let worker_process = worker.protocol().process_id;
+    let record = TranscriptRef {
+        store_root: fixture.config.clone(),
+        chat_id: snapshot.conversation.id.into(),
+    };
+
+    daemon
+        .execute(CommandEnvelope {
+            daemon_epoch: epoch,
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::StopAgent { execution },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+
+    assert_processes_exited(&[worker_process]).await;
+    let overview = daemon
+        .observe(ObservationRequest::Overview {
+            filter: AgentFilter::default(),
+            page: Page {
+                offset: 0,
+                limit: 256,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(overview.initial, ObservationValue::Overview(rows) if rows.is_empty()));
+    let ended = daemon
+        .observe(ObservationRequest::EndedAgents {
+            store_root: Some(fixture.config.clone()),
+        })
+        .await
+        .unwrap();
+    let ObservationValue::EndedAgents(ended) = ended.initial else {
+        panic!("ended Agents")
+    };
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].record, record);
+    assert_eq!(ended[0].outcome, EndedOutcome::Stopped);
+    assert_eq!(ended[0].reason, EndReason::UserStopped);
+    assert!(ended[0].resumable);
+    assert!(
+        requests.try_recv().is_err(),
+        "stopping must not resend model work"
+    );
+    let output = fixture.run(&["daemon", "stop"]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture.daemon_epoch = None;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_management_wire_stops_a_daemon_of_any_business_major() {
     let mut fixture = DaemonFixture::new();
     let daemon = tickloop_code_client::connect_or_start_at(

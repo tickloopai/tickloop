@@ -313,6 +313,31 @@ impl WorkerFactory for ProcessWorkerFactory {
             tokio::time::sleep(CONNECT_INTERVAL).await;
         }
     }
+    async fn stop_worker(&self, worker: &Arc<dyn AgentAccess>) -> Result<(), AccessError> {
+        let managed = {
+            let mut workers = self.workers.lock().await;
+            let index = workers
+                .iter()
+                .position(|managed| Arc::ptr_eq(&managed.access, worker))
+                .ok_or_else(|| AccessError::not_found("the Agent's Worker is not running"))?;
+            workers.remove(index)
+        };
+        drop(managed.lifeline);
+        {
+            let mut process = managed.process.lock().await;
+            if let Some(process) = process.as_mut()
+                && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        }
+        self.control.revoke(worker).await;
+        Ok(())
+    }
+
     async fn exited(&self, worker: &Arc<dyn AgentAccess>) -> bool {
         let process = self
             .workers

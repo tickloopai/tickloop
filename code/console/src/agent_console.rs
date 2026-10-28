@@ -7,7 +7,7 @@ use std::{
 };
 use tickloop_code_access::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentFilter, AgentSummary,
-    CommandEnvelope, CommandReceipt, CommandResult, DisplayedView, EndedAgent,
+    CommandEnvelope, CommandReceipt, CommandResult, DisplayedView, EndedAgent, EndedOutcome,
     ExecutionAvailability, ExecutionRef, HostLocation, InteractionSource, LaunchSpec,
     MAX_PAGE_LIMIT, ObservationRequest, ObservationValue, Page, ReceiptState, TranscriptRef,
     UserInput, ViewRef,
@@ -214,6 +214,19 @@ impl AgentConsole {
             Err(error) if error.code == AccessErrorCode::Unavailable => Err(error),
             Err(_) => Ok(Vec::new()),
         }
+    }
+
+    /// Stops the root Agent `execution` and its family; the overview keeps it as Stopped.
+    pub async fn stop_agent(&mut self, execution: ExecutionRef) -> Result<(), AccessError> {
+        self.access
+            .execute(CommandEnvelope {
+                daemon_epoch: self.epoch,
+                command_id: tickloop_ids::generate(),
+                command: AgentCommand::StopAgent { execution },
+            })
+            .await?
+            .into_result()?;
+        Ok(())
     }
 
     /// Removes an ended Agent from the list; its saved history stays.
@@ -789,75 +802,112 @@ fn created_execution(receipt: &CommandReceipt) -> Option<ExecutionRef> {
     }
 }
 
-/// How much attention an Agent row asks for. Overview families group and sort by their most
-/// urgent member, so work or errors below a finished root stay prominent.
+/// An Agent's state as Claude Code's agent view names it.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-pub enum AttentionGroup {
+pub enum AgentState {
     NeedsInput,
-    Errors,
     Working,
+    /// It never finished a turn, or its producer did not report whether it did.
     Idle,
-    Done,
-    /// Idle Agents whose producer did not report whether they ever worked.
-    Unknown,
-    Empty,
-    /// Root Agents whose execution ended, such as when the daemon stopped; Claude Code's agent
-    /// view lists them under Completed. Only the user continues them.
-    Ended,
+    /// Its last turn finished, or was interrupted.
+    Completed,
+    /// Its run ended with an error, its execution was lost, or it ended when the daemon stopped.
+    Failed,
+    /// The user stopped it, or it ended while the daemon was off.
+    Stopped,
 }
 
-impl AttentionGroup {
-    pub const ALL: [Self; 8] = [
-        Self::NeedsInput,
-        Self::Errors,
-        Self::Working,
-        Self::Idle,
-        Self::Done,
-        Self::Unknown,
-        Self::Empty,
-        Self::Ended,
-    ];
-
-    /// Requests, loss and the reported state decide first; a missing work fact only matters for
-    /// an Agent that would otherwise read as Idle.
+impl AgentState {
+    /// Requests and loss decide first, then the reported Loop state.
     pub fn of(row: &AgentSummary) -> Self {
         if row.waiting_permissions + row.waiting_questions > 0 {
             return Self::NeedsInput;
         }
         if row.availability == ExecutionAvailability::Lost {
-            return Self::Errors;
-        }
-        if row.has_work == Some(false) {
-            return Self::Empty;
+            return Self::Failed;
         }
         match row.state {
             LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan => {
                 Self::NeedsInput
             }
-            LoopState::Failed => Self::Errors,
             LoopState::Running | LoopState::Queued => Self::Working,
-            LoopState::Idle if row.has_work.is_none() => Self::Unknown,
-            // An idle Loop that has run finished its last turn.
-            LoopState::Idle if row.run_id.is_some() => Self::Done,
+            LoopState::Failed => Self::Failed,
+            LoopState::Interrupted => Self::Completed,
+            // An idle Loop that reported work and has run finished its last turn.
+            LoopState::Idle if row.has_work == Some(true) && row.run_id.is_some() => {
+                Self::Completed
+            }
             LoopState::Idle => Self::Idle,
-            LoopState::Interrupted => Self::Done,
+        }
+    }
+
+    /// An ended root still waits for the user when it ended waiting for them.
+    pub fn of_ended(agent: &EndedAgent) -> Self {
+        match (agent.outcome, &agent.last_state) {
+            (
+                _,
+                LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan,
+            ) => Self::NeedsInput,
+            (EndedOutcome::Failed, _) => Self::Failed,
+            (EndedOutcome::Stopped, _) => Self::Stopped,
+        }
+    }
+
+    pub fn group(self) -> AttentionGroup {
+        match self {
+            Self::NeedsInput => AttentionGroup::NeedsInput,
+            Self::Working => AttentionGroup::Working,
+            Self::Idle | Self::Completed | Self::Failed | Self::Stopped => {
+                AttentionGroup::Completed
+            }
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::NeedsInput => "Needs input",
-            Self::Errors => "Errors",
             Self::Working => "Working",
             Self::Idle => "Idle",
-            Self::Done => "Done",
-            Self::Unknown => "Unknown",
-            Self::Empty => "Empty",
-            Self::Ended => "Ended",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Stopped => "Stopped",
         }
     }
+}
+
+/// The overview's groups, in Claude Code's order. Overview families group and sort by their most
+/// urgent member, so a request or work below a finished root stays prominent.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum AttentionGroup {
+    NeedsInput,
+    Working,
+    /// Idle, Completed, Failed and Stopped Agents, newest end first.
+    Completed,
+}
+
+impl AttentionGroup {
+    pub const ALL: [Self; 3] = [Self::NeedsInput, Self::Working, Self::Completed];
+
+    pub fn of(row: &AgentSummary) -> Self {
+        AgentState::of(row).group()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "Needs input",
+            Self::Working => "Working",
+            Self::Completed => "Completed",
+        }
+    }
+}
+
+/// Whether the overview lists `row`: an Agent that holds nothing at all is not listed.
+pub fn is_listed(row: &AgentSummary) -> bool {
+    row.has_work != Some(false)
 }
 
 /// Families list by their most urgent member, then by their latest reported state change (unknown

@@ -1190,7 +1190,7 @@ impl EmbeddedAgentAccess {
             AgentCommand::ReplaceTickhost => Box::pin(std::future::ready(Err(
                 AccessError::invalid("only the Agent daemon replaces its Tickhost"),
             ))),
-            AgentCommand::ForgetEndedAgent { .. } => {
+            AgentCommand::StopAgent { .. } | AgentCommand::ForgetEndedAgent { .. } => {
                 Box::pin(std::future::ready(Err(AccessError::new(
                     AccessErrorCode::Unsupported,
                     "only the Agent daemon keeps ended Agents",

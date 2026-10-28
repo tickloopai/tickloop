@@ -6,10 +6,10 @@ use uuid::Uuid;
 use super::{
     Role, RoleLine, display_single_line, display_width, truncate_path_width, truncate_width,
 };
-use crate::agent_console::AttentionGroup;
+use crate::agent_console::{AgentState, AttentionGroup};
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
-use tickloop_code_access::EndedOutcome;
+use tickloop_code_access::EndReason;
 use tickloop_harness::protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
@@ -24,7 +24,8 @@ const MIN_METADATA_COLUMNS: usize = 12;
 const MIN_PREVIEW_COLUMNS: usize = 10;
 const PREVIEW_GAP: &str = "  ";
 /// Claude Code's agent view keeps at least this many Completed rows however short the terminal.
-const MIN_ENDED_ROWS: usize = 3;
+const MIN_COMPLETED_ROWS: usize = 3;
+const AGE_NOW: &str = "now";
 pub(super) const REQUEST_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -38,7 +39,9 @@ pub(crate) struct AgentRow {
     pub(crate) workspace: Option<String>,
     pub(crate) approvals: usize,
     pub(crate) questions: usize,
-    /// This row's own attention group; overview families group by their most urgent member.
+    /// This row's own state, as its status word names it.
+    pub(crate) agent_state: AgentState,
+    /// The row's attention group; an overview family groups by its most urgent member.
     pub(crate) group: AttentionGroup,
     /// The state shape drawn before the title; it pairs with the status word and never
     /// replaces it. The active DisplayProfile resolves it.
@@ -57,7 +60,7 @@ pub(crate) struct AgentRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EndedRow {
     pub(crate) chat_id: Uuid,
-    pub(crate) outcome: EndedOutcome,
+    pub(crate) reason: EndReason,
     /// Whether its saved history is still on disk to load.
     pub(crate) resumable: bool,
 }
@@ -97,17 +100,27 @@ impl AgentRow {
     /// The row's own status word retains its state even when a child's request sets the group:
     /// a failure is an error, while an interruption is only a warning.
     pub(in crate::terminal) fn status_role(&self) -> Role {
-        if let Some(ended) = &self.ended {
-            return match ended.outcome {
-                EndedOutcome::Failed => Role::Error,
-                EndedOutcome::Stopped => Role::MutedText,
-            };
+        match self.agent_state {
+            AgentState::Failed => Role::Error,
+            AgentState::Completed if self.state == LoopState::Interrupted => Role::Warning,
+            _ if self.group != AttentionGroup::Completed => group_role(self.group),
+            AgentState::Completed => Role::Success,
+            _ => Role::MutedText,
         }
-        match self.state {
-            LoopState::Failed => Role::Error,
-            LoopState::Interrupted => Role::Warning,
-            _ => group_role(self.group),
+    }
+
+    /// How long a running Agent has waited for the user, as Claude Code's peek panel says it; an
+    /// ended row no longer waits.
+    fn waiting_label(&self, now: u64) -> Option<String> {
+        if self.agent_state != AgentState::NeedsInput || self.ended.is_some() {
+            return None;
         }
+        let age = age_label(self.updated_at?, now);
+        Some(if age == AGE_NOW {
+            "waiting <1m".into()
+        } else {
+            format!("waiting {age}")
+        })
     }
 
     pub(in crate::terminal) fn state_glyph(
@@ -401,34 +414,26 @@ fn ellipsize(text: &str, width: usize) -> String {
     format!("{}…", truncate_width(text, width - 1))
 }
 
-/// Status words keep their text; colour only separates attention from finished or empty work.
+/// Status words keep their text; colour only separates attention from finished work.
 fn group_role(group: AttentionGroup) -> Role {
     match group {
         AttentionGroup::NeedsInput => Role::Warning,
-        AttentionGroup::Errors => Role::Error,
         AttentionGroup::Working => Role::Accent,
-        AttentionGroup::Done => Role::Success,
-        AttentionGroup::Idle
-        | AttentionGroup::Unknown
-        | AttentionGroup::Empty
-        | AttentionGroup::Ended => Role::MutedText,
+        AttentionGroup::Completed => Role::Success,
     }
 }
 
 /// The semantic shape drawn before a row's title. Shapes differ per state so the list reads
-/// without colour; a finished row whose last turn did not complete (interrupted) is not drawn as
-/// a success.
-pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
-    match group {
-        AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
-        AttentionGroup::Errors => Glyph::AgentFailed,
-        AttentionGroup::Working => Glyph::AgentRunning,
-        AttentionGroup::Idle => Glyph::AgentIdle,
-        AttentionGroup::Done if completed => Glyph::AgentCompleted,
-        AttentionGroup::Done => Glyph::AgentStopped,
-        AttentionGroup::Unknown => Glyph::AgentUnknown,
-        AttentionGroup::Empty => Glyph::AgentEmpty,
-        AttentionGroup::Ended => Glyph::AgentStopped,
+/// without colour; a Completed row whose last turn was interrupted is not drawn as a success.
+pub(crate) fn status_glyph(state: AgentState, interrupted: bool) -> Glyph {
+    match state {
+        AgentState::NeedsInput => Glyph::AgentNeedsInput,
+        AgentState::Working => Glyph::AgentRunning,
+        AgentState::Idle => Glyph::AgentIdle,
+        AgentState::Completed if interrupted => Glyph::AgentStopped,
+        AgentState::Completed => Glyph::AgentCompleted,
+        AgentState::Failed => Glyph::AgentFailed,
+        AgentState::Stopped => Glyph::AgentStopped,
     }
 }
 
@@ -438,7 +443,7 @@ pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
 fn age_label(updated_at: u64, now: u64) -> String {
     let seconds = now.saturating_sub(updated_at) / 1000;
     match seconds {
-        0..60 => "now".into(),
+        0..60 => AGE_NOW.into(),
         60..3600 => format!("{}m", seconds / 60),
         3600..172_800 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86_400),
@@ -616,21 +621,13 @@ impl OverviewEntry<'_> {
     }
 }
 
-/// Groups that start folded behind their heading: nothing in them needs the user now.
-fn folds_by_default(group: AttentionGroup) -> bool {
-    matches!(
-        group,
-        AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty
-    )
-}
-
 #[derive(Default)]
 pub(super) struct OverviewState {
     pub(super) projection: Option<AgentOverview>,
     pub(super) selected: Option<OverviewTarget>,
     pub(super) current_draft: bool,
-    /// Explicit group heading choices (`true` folded); see `folds_by_default` for the rest. They
-    /// only change what this View lists.
+    /// Group heading choices (`true` folded); groups start unfolded. They only change what this
+    /// View lists.
     pub(super) folded_groups: HashMap<AttentionGroup, bool>,
     /// Groups whose budget-folded remainder the user opened.
     pub(super) opened_groups: HashSet<AttentionGroup>,
@@ -719,12 +716,6 @@ impl OverviewState {
     /// The ended Agent row `id`, when that row is one.
     pub(super) fn ended_row(&self, id: Uuid) -> Option<&EndedRow> {
         self.projection.as_ref()?.row(id)?.ended.as_ref()
-    }
-
-    pub(super) fn row_title(&self, id: Uuid) -> Option<String> {
-        Some(display_single_line(
-            &self.projection.as_ref()?.row(id)?.title,
-        ))
     }
 
     /// Selects the listed row of `id` and scrolls to it; `false` when no such row is listed.
@@ -819,15 +810,8 @@ impl OverviewState {
                 .is_none_or(|workspace| row.workspace.as_ref() == Some(workspace))
     }
 
+    /// Whether the user folded `group`; a folded group hides every row.
     fn is_group_folded(&self, group: AttentionGroup) -> bool {
-        self.folded_groups
-            .get(&group)
-            .copied()
-            .unwrap_or_else(|| folds_by_default(group))
-    }
-
-    /// Whether the user folded `group` themselves; such a fold hides every row of the group.
-    fn is_group_collapsed_by_user(&self, group: AttentionGroup) -> bool {
         self.folded_groups.get(&group) == Some(&true)
     }
 
@@ -912,23 +896,6 @@ impl OverviewState {
                 .map(|member| member.lines.len())
                 .sum::<usize>()
         };
-        let shows_anchors =
-            |group| self.is_group_folded(group) && !self.is_group_collapsed_by_user(group);
-        // Groups listed after Done keep their heading and kept rows on the first screen; Ended
-        // also keeps its minimum rows.
-        let later_reserve = grouped
-            .iter()
-            .filter(|(group, members)| *group > AttentionGroup::Done && !members.is_empty())
-            .map(|(group, members)| {
-                1 + if shows_anchors(*group) {
-                    pinned_lines(members)
-                } else if *group == AttentionGroup::Ended && !self.is_group_folded(*group) {
-                    members.len().min(MIN_ENDED_ROWS)
-                } else {
-                    0
-                }
-            })
-            .sum::<usize>();
         let mut entries = Vec::new();
         for (group, members) in grouped {
             if members.is_empty() {
@@ -936,39 +903,22 @@ impl OverviewState {
             }
             let folded = self.is_group_folded(group);
             let open = self.opened_groups.contains(&group);
-            let remaining = (self.capacity + self.transient_rows).saturating_sub(
-                entries.len()
-                    + if group == AttentionGroup::Done {
-                        later_reserve
-                    } else {
-                        0
-                    },
-            );
+            let remaining = (self.capacity + self.transient_rows).saturating_sub(entries.len());
             let total = 1 + members
                 .iter()
                 .map(|member| member.lines.len())
                 .sum::<usize>();
-            // Done and Ended list what the screen holds and fold the rest behind a counter; Ended
-            // keeps at least its minimum rows, as Claude Code's Completed group does.
-            let budgeted = matches!(group, AttentionGroup::Done | AttentionGroup::Ended);
-            let over_budget = budgeted && !folded && total > remaining;
-            let floor = if group == AttentionGroup::Ended {
-                MIN_ENDED_ROWS
-            } else {
-                0
-            };
-            // A default fold keeps the rows the View points at (current, created, selected or
-            // visited during this visit) so none vanishes under the cursor; a fold the user chose
-            // hides them all.
+            // As Claude Code's Completed group: it lists what the screen holds, at least its
+            // minimum, and folds the rest behind a counter. The rows the View points at (current,
+            // created, selected or visited during this visit) stay, so none vanishes under the
+            // cursor.
+            let over_budget = group == AttentionGroup::Completed && !folded && total > remaining;
             let shown = if folded {
-                members
-                    .iter()
-                    .map(|member| member.pinned && shows_anchors(group))
-                    .collect()
+                vec![false; members.len()]
             } else if over_budget {
                 let mut available = remaining
                     .saturating_sub(2)
-                    .max(floor)
+                    .max(MIN_COMPLETED_ROWS)
                     .saturating_sub(pinned_lines(&members));
                 let mut fits = true;
                 members
@@ -1044,11 +994,18 @@ impl OverviewState {
 
     /// Status candidates for a row, richest first; the row frame keeps the richest that fits. The
     /// Agent this View returns to says so in every candidate.
-    fn row_status(&self, row: &AgentRow, terminal_columns: usize) -> Vec<Vec<(String, Role)>> {
-        let mut variants = row.own_status_variants(
-            vec![(display_single_line(&row.status), row.status_role())],
-            terminal_columns,
-        );
+    fn row_status(
+        &self,
+        row: &AgentRow,
+        terminal_columns: usize,
+        now: u64,
+    ) -> Vec<Vec<(String, Role)>> {
+        let status = match row.waiting_label(now) {
+            Some(waiting) => format!("{} · {waiting}", display_single_line(&row.status)),
+            None => display_single_line(&row.status),
+        };
+        let mut variants =
+            row.own_status_variants(vec![(status, row.status_role())], terminal_columns);
         let current = self
             .projection
             .as_ref()
@@ -1111,7 +1068,7 @@ impl OverviewState {
             .projection
             .as_ref()
             .and_then(|projection| projection.group_of(row.agent_id))
-            .filter(|group| self.is_group_collapsed_by_user(*group));
+            .filter(|group| self.is_group_folded(*group));
         if let Some((filters, keys)) = self.hiding_filters(row) {
             let mut details = Vec::new();
             if !self.input_focused {
@@ -1411,7 +1368,7 @@ impl OverviewState {
                     vec!["enter resume".to_owned(), "x remove".to_owned()]
                 }
                 Some(_) => vec!["x remove".to_owned()],
-                None => vec!["enter open".to_owned()],
+                None => vec!["enter open".to_owned(), "x stop".to_owned()],
             },
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
@@ -1435,8 +1392,8 @@ impl OverviewState {
     }
 
     /// A group heading. A folded heading keeps its request counts, then says that it holds the
-    /// Agent Esc returns to, then explains Unknown and Empty while they fit; request counts and
-    /// `current` shrink to `A1 Q1` and `cur` before they are dropped.
+    /// Agent Esc returns to; request counts and `current` shrink to `A1 Q1` and `cur` before they
+    /// are dropped.
     fn heading_line(
         &self,
         width: usize,
@@ -1466,11 +1423,6 @@ impl OverviewState {
                 })
                 .collect::<Vec<_>>()
         };
-        let explanation = match group {
-            AttentionGroup::Unknown if folded => Some("work not reported"),
-            AttentionGroup::Empty if folded => Some("never used"),
-            _ => None,
-        };
         let current_forms: &[&str] = if current {
             &[CURRENT_LABEL, "cur"]
         } else {
@@ -1496,13 +1448,6 @@ impl OverviewState {
                     .sum::<usize>()
             };
             if heading_width + width_of(&candidate) <= width {
-                if let Some(explanation) = explanation {
-                    let mut explained = candidate.clone();
-                    explained.push((explanation.to_owned(), Role::MutedText));
-                    if heading_width + width_of(&explained) <= width {
-                        candidate = explained;
-                    }
-                }
                 details = candidate;
                 break;
             }
@@ -1634,7 +1579,7 @@ impl OverviewState {
                     row.title_room(
                         width,
                         &Self::row_extras(row, terminal_columns, now, display),
-                        &self.row_status(row, terminal_columns),
+                        &self.row_status(row, terminal_columns, now),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                 )),
@@ -1670,7 +1615,7 @@ impl OverviewState {
                         width,
                         &Self::row_extras(row, terminal_columns, now, display),
                         ordinals.get(&row.agent_id).copied(),
-                        &self.row_status(row, terminal_columns),
+                        &self.row_status(row, terminal_columns, now),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                     OverviewEntry::CurrentDraft => current_draft_line(width, display),
@@ -1768,7 +1713,7 @@ pub(super) fn help_lines(
             "tab list / new Agent".into(),
             "enter / → open Agent (row)".into(),
             "enter resume ended Agent (row)".into(),
-            "x twice removes ended Agent".into(),
+            "x twice stops Agent / removes ended row".into(),
             "enter / → / space fold group (heading)".into(),
             "enter dispatch (input)".into(),
             "r open history".into(),

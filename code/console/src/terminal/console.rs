@@ -272,7 +272,7 @@ impl TerminalSurface {
 
 #[cfg(test)]
 use super::monitor::MonitorEntry;
-use tickloop_code_access::{EndedOutcome, ExecutionRef};
+use tickloop_code_access::{EndReason, ExecutionRef};
 use tickloop_harness::protocol::{
     Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind, TaskBoard,
     TickSubscriptionStatus,
@@ -313,7 +313,7 @@ const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const MONITOR_CONFIRMATION_WINDOW: Duration = Duration::from_secs(3);
 const ENDED_HISTORY_MISSING: &str = "This Agent's saved history is no longer on disk, so there is nothing to resume · x twice removes the row";
 const STOPPED_RESUME_OFFER: &str = "Press enter again to resume this Agent (it ended while the daemon was off), or x twice to remove it";
-const ONLY_ENDED_AGENTS_REMOVABLE: &str = "Only an ended Agent can be removed from the list";
+
 const MONITOR_NOTICE_WINDOW: Duration = Duration::from_secs(2);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
@@ -361,6 +361,8 @@ pub(super) enum InputEvent {
     OpenAgent(Uuid),
     /// Loads the saved history of the ended root Agent of this Chat and opens it; nothing runs.
     ResumeEndedAgent(Uuid),
+    /// Stops the running root Agent of this overview row and its family.
+    StopAgent(Uuid),
     /// Removes the ended root Agent of this Chat from the overview; its history stays.
     ForgetEndedAgent(Uuid),
     /// Removes a finished subagent from the Subagents panel before its grace period ends.
@@ -487,6 +489,7 @@ impl fmt::Debug for InputEvent {
                 .debug_tuple("ResumeEndedAgent")
                 .field(value)
                 .finish(),
+            Self::StopAgent(value) => formatter.debug_tuple("StopAgent").field(value).finish(),
             Self::ForgetEndedAgent(value) => formatter
                 .debug_tuple("ForgetEndedAgent")
                 .field(value)
@@ -1006,8 +1009,8 @@ pub(super) struct State {
     escape_confirmation: Option<EscapeConfirmation>,
     monitor_confirmation: Option<PendingKeyAction<MonitorRemoval>>,
     monitor_notice: Option<TimedNotice>,
-    /// The ended overview row the first `x` asked to remove.
-    overview_removal: Option<PendingKeyAction<Uuid>>,
+    /// What the first `x` on an overview row asked for.
+    overview_row_action: Option<PendingKeyAction<OverviewRowAction>>,
     /// The stopped overview row whose first Enter explained why a second one resumes it.
     overview_resume_offer: Option<Uuid>,
 }
@@ -1074,6 +1077,28 @@ impl<T: PartialEq> PendingKeyAction<T> {
                 requested_at: Instant::now(),
             });
             false
+        }
+    }
+}
+
+/// Plain `x` twice on an overview row: a running Agent stops, an ended one leaves the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverviewRowAction {
+    Stop(Uuid),
+    Remove(Uuid),
+}
+
+impl OverviewRowAction {
+    fn row(self) -> Uuid {
+        match self {
+            Self::Stop(id) | Self::Remove(id) => id,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Stop(_) => "Press x again to stop this Agent",
+            Self::Remove(_) => "Press x again to remove this row",
         }
     }
 }
@@ -6344,7 +6369,7 @@ impl State {
             exit_confirmation: None,
             escape_confirmation: None,
             monitor_confirmation: None,
-            overview_removal: None,
+            overview_row_action: None,
             overview_resume_offer: None,
             monitor_notice: None,
         }
@@ -9472,8 +9497,8 @@ impl State {
                         Role::StatusBar
                     },
                 );
-            } else if let Some(hint) = self.pending_overview_removal() {
-                line = RoleLine::role(truncate_width(&hint, self.width), Role::Error);
+            } else if let Some(hint) = self.pending_overview_action() {
+                line = RoleLine::role(truncate_width(hint, self.width), Role::Error);
             }
             hint_row = Some(line);
         }
@@ -12065,8 +12090,8 @@ impl State {
         if let Some(hint) = self.monitor_key_notice() {
             return Some(hint.into());
         }
-        if let Some(hint) = self.pending_overview_removal() {
-            return Some(hint);
+        if let Some(hint) = self.pending_overview_action() {
+            return Some(hint.into());
         }
         if let Some(control) = self.pending_exit_control() {
             return Some(if control == 'C' {
@@ -12085,8 +12110,8 @@ impl State {
         if let Some(hint) = self.monitor_key_notice() {
             return truncate_width(hint, self.width);
         }
-        if let Some(hint) = self.pending_overview_removal() {
-            return truncate_width(&hint, self.width);
+        if let Some(hint) = self.pending_overview_action() {
+            return truncate_width(hint, self.width);
         }
         let with_failure = match &self.provider_failure {
             Some(failure) if status.is_empty() => failure.clone(),
@@ -12178,9 +12203,9 @@ impl State {
             self.monitor_notice = None;
         }
         let overview_removal_expired =
-            self.overview_removal.is_some() && self.pending_overview_removal().is_none();
+            self.overview_row_action.is_some() && self.pending_overview_action().is_none();
         if overview_removal_expired {
-            self.overview_removal = None;
+            self.overview_row_action = None;
         }
         let plugin_expired = self
             .user_panel
@@ -12354,7 +12379,7 @@ impl State {
             return None;
         }
         if key.code != KeyCode::Char('x') || key.modifiers != KeyModifiers::NONE {
-            self.overview_removal = None;
+            self.overview_row_action = None;
         }
         if !matches!(key.code, KeyCode::Enter | KeyCode::Right) {
             self.overview_resume_offer = None;
@@ -12396,7 +12421,7 @@ impl State {
                 return Some(Some(InputEvent::Line("/resume".into())));
             }
             (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                return Some(self.request_overview_removal());
+                return Some(self.request_overview_row_action());
             }
             (KeyCode::Tab, _) => self.overview.input_focused = true,
             (KeyCode::BackTab, _) => {
@@ -12407,15 +12432,16 @@ impl State {
         Some(None)
     }
 
-    /// Enter on an ended row loads its history, as Claude Code's agent view does: a stopped row
-    /// first says why, and a row whose history is gone can only be removed.
+    /// Enter on an ended row loads its history, as Claude Code's agent view does: a row that ended
+    /// while the daemon was off first says so, and a row whose history is gone can only be
+    /// removed.
     fn continue_ended_agent(&mut self, id: Uuid) -> Option<InputEvent> {
         let ended = self.overview.ended_row(id)?.clone();
         if !ended.resumable {
             self.hold_status(ENDED_HISTORY_MISSING);
             return None;
         }
-        if ended.outcome == EndedOutcome::Stopped && self.overview_resume_offer != Some(id) {
+        if ended.reason == EndReason::DaemonOff && self.overview_resume_offer != Some(id) {
             self.overview_resume_offer = Some(id);
             self.hold_status(STOPPED_RESUME_OFFER);
             return None;
@@ -12424,31 +12450,42 @@ impl State {
         Some(InputEvent::ResumeEndedAgent(ended.chat_id))
     }
 
-    fn pending_overview_removal(&self) -> Option<String> {
-        let id = *self
-            .overview_removal
+    fn pending_overview_action(&self) -> Option<&'static str> {
+        let action = *self
+            .overview_row_action
             .as_ref()?
             .pending(MONITOR_CONFIRMATION_WINDOW)?;
-        if self.overview.input_focused || self.overview.selected_agent() != Some(id) {
-            return None;
-        }
-        let title = self.overview.row_title(id)?;
-        Some(format!("Press x again to remove {title} from the list"))
+        (self.overview.projection.is_some()
+            && !self.overview.input_focused
+            && self.overview.selected_agent() == Some(action.row()))
+        .then(|| action.hint())
     }
 
-    /// The first `x` on an ended row asks; a second on the same row within the window removes it.
-    fn request_overview_removal(&mut self) -> Option<InputEvent> {
-        let Some((id, chat)) = self
-            .overview
-            .selected_agent()
-            .and_then(|id| self.overview.ended_row(id).map(|ended| (id, ended.chat_id)))
-        else {
-            self.overview_removal = None;
-            self.hold_status(ONLY_ENDED_AGENTS_REMOVABLE);
+    /// The first `x` on an Agent row asks; a second on the same row within the window stops a
+    /// running Agent or removes an ended one from the list.
+    fn request_overview_row_action(&mut self) -> Option<InputEvent> {
+        let Some(id) = self.overview.selected_agent() else {
+            self.overview_row_action = None;
             return None;
         };
-        PendingKeyAction::request(&mut self.overview_removal, id, MONITOR_CONFIRMATION_WINDOW)
-            .then_some(InputEvent::ForgetEndedAgent(chat))
+        let action = match self.overview.ended_row(id) {
+            Some(_) => OverviewRowAction::Remove(id),
+            None => OverviewRowAction::Stop(id),
+        };
+        if !PendingKeyAction::request(
+            &mut self.overview_row_action,
+            action,
+            MONITOR_CONFIRMATION_WINDOW,
+        ) {
+            return None;
+        }
+        match action {
+            OverviewRowAction::Stop(id) => Some(InputEvent::StopAgent(id)),
+            OverviewRowAction::Remove(id) => self
+                .overview
+                .ended_row(id)
+                .map(|ended| InputEvent::ForgetEndedAgent(ended.chat_id)),
+        }
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<InputEvent> {
@@ -17658,8 +17695,9 @@ mod tests {
             workspace: None,
             approvals: 0,
             questions: 0,
+            agent_state: crate::agent_console::AgentState::Working,
             group: AttentionGroup::Working,
-            glyph: status_glyph(AttentionGroup::Working, false),
+            glyph: status_glyph(crate::agent_console::AgentState::Working, false),
             preview: None,
             updated_at: None,
             run_started_at: None,
