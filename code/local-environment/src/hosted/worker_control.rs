@@ -320,6 +320,7 @@ mod handoff_tests {
                 command: "printf once".into(),
                 cwd: "/tmp".into(),
                 environment: "fixture".into(),
+                sandbox: None,
             },
         }
     }

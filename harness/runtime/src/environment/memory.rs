@@ -20,6 +20,7 @@ pub struct MemoryEnvironment {
 
 #[derive(Default)]
 struct MemoryState {
+    isolation: ExecutionIsolation,
     epoch: Uuid,
     clock: std::time::Duration,
     shell_programs: HashMap<String, MemoryShellProgram>,
@@ -134,6 +135,10 @@ impl Default for MemoryEnvironment {
 }
 
 impl MemoryEnvironment {
+    pub fn set_isolation(&self, isolation: ExecutionIsolation) {
+        self.state.lock().unwrap().isolation = isolation;
+    }
+
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(MemoryState {
@@ -716,6 +721,7 @@ impl ExecutionPort for MemoryPort {
                 },
             },
         );
+        let prepared = prepared.with_isolation(state.isolation);
         let mut plans = self.plans.lock().unwrap();
         plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
         plans.insert(

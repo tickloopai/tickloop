@@ -749,6 +749,10 @@ pub async fn build_runtime_with_models(
         ),
         _ => LocalEnvironment::bare(),
     };
+    let environment = match &settings {
+        Some(settings) => environment.with_sandbox(settings.clone()),
+        None => environment,
+    };
     let agent = Agent::with_seams(
         HarnessSeams {
             search: None,

@@ -360,6 +360,8 @@ fn unknown_exit(reason: &str) -> ShellExit {
 
 pub fn shell_spec(launch: &ShellLaunch) -> ShellSpec {
     ShellSpec {
+        additional_directories: Vec::new(),
+        family_temp: None,
         operation: launch.operation_id,
         shell: launch.shell.to_string_lossy().into_owned(),
         command: launch.command.clone(),
@@ -376,6 +378,14 @@ pub async fn prepare_shell(
     delivery: ShellOutputDelivery,
 ) -> Result<ShellPreparation, ToolError> {
     let spec = ShellSpec {
+        additional_directories: request
+            .additional_directories
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        family_temp: request
+            .family_temp
+            .map(|path| path.to_string_lossy().into_owned()),
         operation: request.operation,
         shell: request.shell.to_string_lossy().into_owned(),
         command: request.command,
@@ -387,6 +397,7 @@ pub async fn prepare_shell(
         .prepare(ExecutionIntent::SpawnShell(spec))
         .await
         .map_err(|error| ToolError::Rejected(error.to_string()))?;
+    let isolation = prepared.isolation();
     Ok(ShellPreparation::new(
         request.operation,
         delivery == ShellOutputDelivery::CallerFile,
@@ -396,7 +407,8 @@ pub async fn prepare_shell(
             prepared,
             delivery,
         }),
-    ))
+    )
+    .with_isolation(isolation))
 }
 
 struct PreparedEnvironmentShell {

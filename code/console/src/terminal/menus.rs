@@ -2102,13 +2102,27 @@ impl Menus {
         } else {
             "Choose a mode for this Chat, or view activity without changing it."
         };
+        let sandbox = self.user_settings.as_ref().map_or_else(
+            || Ok(tickloop_code_settings::sandbox::SandboxSettings::default()),
+            |settings| settings.load().sandbox(),
+        );
+        let sandbox_status = match sandbox {
+            Ok(settings) if settings.enabled && settings.fail_if_unavailable => {
+                "Sandbox: on · refuse if unavailable"
+            }
+            Ok(settings) if settings.enabled => {
+                "Sandbox: on · warn and run without isolation if unavailable"
+            }
+            Ok(_) => "Sandbox: off",
+            Err(_) => "Sandbox: invalid configuration · Shell execution refused",
+        };
         options.push("↗ View recent activity · keep current mode".into());
         self.show(
             console,
             Menu {
                 id: tickloop_ids::generate(),
                 title: "Permissions · Choose mode".into(),
-                context: vec![context.into()],
+                context: vec![context.into(), sandbox_status.into()],
                 markdown: None,
                 options,
                 selected,
