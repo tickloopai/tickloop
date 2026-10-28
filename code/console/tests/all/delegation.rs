@@ -1765,7 +1765,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         .unwrap()
         .ceiling;
     assert_eq!(ceiling.host_tools["TickRead"].len(), 1);
-    assert_eq!(ceiling.host_tools["TickManage"].len(), 2);
+    assert_eq!(ceiling.host_tools["TickManage"].len(), 1);
     assert!(!ceiling.host_tools.contains_key("Bash"));
     core.shutdown().await;
     let result = result.expect("the real delegated Bash call must return");
