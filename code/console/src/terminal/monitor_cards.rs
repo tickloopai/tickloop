@@ -52,11 +52,15 @@ const CARD_REQUESTS: usize = 64;
 /// A Tickhost that takes none of a view's requests for this long stopped reading it: the view
 /// ends and its connection closes, which detaches it.
 const CARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A Tick redraws on every resize its terminal gets, so a view sends its resizes at least this
+/// far apart: dragging Monitor's separator or resizing the terminal never floods the Tick.
+pub(super) const CARD_RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
+/// Esc goes back to the Monitor list, whose own hints then offer Space to show other cards.
+pub(super) const FOCUSED_CARD_HINT: &str = "esc back to list · esc esc send esc";
 /// A Shell's card is read-only, so leaving is all its keys do.
-pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc leave";
+pub(super) const FOCUSED_SHELL_CARD_HINT: &str = "esc back to list";
 
 const ESCAPE: u8 = 0x1b;
 /// A control sequence still unfinished at this length is no key's.
@@ -92,12 +96,115 @@ impl CardSize {
 pub(super) struct CardScreen {
     pub(super) parser: vt100::Parser,
     /// Why the view ended, once it did.
-    pub(super) ended: Option<String>,
+    pub(super) ended: Option<ViewEnd>,
 }
 
-enum CardRequest {
+/// Why a card's view ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ViewEnd {
+    /// The Tickhost said the Tick ended.
+    TickEnded,
+    /// The view itself ended, for this reason; its Tick may run on.
+    Failed(String),
+}
+
+/// What a card's rule says about its view, in the colour it says it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CardNote {
+    pub(super) text: String,
+    pub(super) role: Role,
+    /// The card's Tick ended: this outranks anything else the rule could say.
+    pub(super) ended: bool,
+}
+
+impl CardNote {
+    pub(super) fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: Role::MutedText,
+            ended: false,
+        }
+    }
+
+    /// How the card's Tick ended, in the colour of its row's state mark.
+    pub(super) fn ended(text: String, role: Role) -> Self {
+        Self {
+            text,
+            role,
+            ended: true,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CardRequest {
     Input(Vec<u8>),
     Resize(CardSize),
+    /// Sends a resize still waiting for [`CARD_RESIZE_INTERVAL`] at once, as when a drag ends.
+    FlushResize,
+}
+
+/// Spaces one view's resizes [`CARD_RESIZE_INTERVAL`] apart: the first change after a quiet
+/// spell goes at once, and of the changes that follow within the interval only the latest goes,
+/// when it is over or at a flush.
+#[derive(Debug)]
+struct ResizePacing {
+    /// The size the Tick's terminal was last given.
+    sent: CardSize,
+    sent_at: Option<tokio::time::Instant>,
+    waiting: Option<CardSize>,
+}
+
+impl ResizePacing {
+    fn new(attached: CardSize) -> Self {
+        Self {
+            sent: attached,
+            sent_at: None,
+            waiting: None,
+        }
+    }
+
+    /// Asks for `size` at `now`; returns it when it is to be sent at once.
+    fn request(&mut self, size: CardSize, now: tokio::time::Instant) -> Option<CardSize> {
+        self.waiting = None;
+        if size == self.sent {
+            return None;
+        }
+        if self
+            .sent_at
+            .is_some_and(|sent_at| now < sent_at + CARD_RESIZE_INTERVAL)
+        {
+            self.waiting = Some(size);
+            return None;
+        }
+        Some(self.mark_sent(size, now))
+    }
+
+    /// When the waiting size is due.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.waiting?;
+        self.sent_at.map(|sent_at| sent_at + CARD_RESIZE_INTERVAL)
+    }
+
+    /// The waiting size once its interval is over.
+    fn due(&mut self, now: tokio::time::Instant) -> Option<CardSize> {
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            self.flush(now)
+        } else {
+            None
+        }
+    }
+
+    fn flush(&mut self, now: tokio::time::Instant) -> Option<CardSize> {
+        let size = self.waiting.take()?;
+        Some(self.mark_sent(size, now))
+    }
+
+    fn mark_sent(&mut self, size: CardSize, now: tokio::time::Instant) -> CardSize {
+        self.sent = size;
+        self.sent_at = Some(now);
+        size
+    }
 }
 
 /// One card's view attached to its Tick. Dropping it detaches the view.
@@ -143,6 +250,7 @@ impl CardView {
         tokio::spawn(write_requests(
             writer,
             queued,
+            size,
             reader.abort_handle(),
             screen.clone(),
             redraw,
@@ -155,11 +263,35 @@ impl CardView {
         })
     }
 
-    /// Asks for `size`; a size the full queue cannot take is asked for again by the next frame.
+    /// A view connected to nothing, whose requests the caller reads.
+    #[cfg(test)]
+    pub(super) fn detached(size: CardSize) -> (Self, mpsc::Receiver<CardRequest>) {
+        let (requests, queued) = mpsc::channel(CARD_REQUESTS);
+        let screen = Arc::new(Mutex::new(CardScreen {
+            parser: vt100::Parser::new(size.rows.max(1), size.columns.max(1), 0),
+            ended: None,
+        }));
+        (
+            Self {
+                size,
+                screen,
+                requests,
+            },
+            queued,
+        )
+    }
+
+    /// Asks for `size`, which reaches the Tick paced by [`CARD_RESIZE_INTERVAL`]; a size the
+    /// full queue cannot take is asked for again by the next frame.
     pub(super) fn resize(&mut self, size: CardSize) {
         if size != self.size && self.requests.try_send(CardRequest::Resize(size)).is_ok() {
             self.size = size;
         }
+    }
+
+    /// Sends the size last asked for at once, without waiting out the pacing interval.
+    pub(super) fn flush_resize(&self) {
+        let _ = self.requests.try_send(CardRequest::FlushResize);
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>) {
@@ -179,8 +311,8 @@ async fn read_frames(
     let ended = loop {
         let event = match hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES).await {
             Ok(Some(event)) => event,
-            Ok(None) => break "the Tickhost closed this view".to_owned(),
-            Err(error) => break error.message,
+            Ok(None) => break ViewEnd::Failed("the Tickhost closed this view".to_owned()),
+            Err(error) => break ViewEnd::Failed(super::safe_line(&error.message)),
         };
         match event["event"].as_str() {
             Some("frame") => {
@@ -201,34 +333,60 @@ async fn read_frames(
                 }
                 screen.parser.process(data.as_bytes());
             }
-            Some("gone") => break "Tick ended".to_owned(),
+            Some("gone") => break ViewEnd::TickEnded,
             Some("bubbling" | "bubble") => continue,
             _ => {
-                break event["error"]["message"]
-                    .as_str()
-                    .unwrap_or("view ended")
-                    .to_owned();
+                break ViewEnd::Failed(super::safe_line(
+                    event["error"]["message"].as_str().unwrap_or("view ended"),
+                ));
             }
         }
         redraw.notify_one();
     };
     if let Ok(mut screen) = screen.lock() {
-        screen.ended = Some(super::safe_line(&ended));
+        screen.ended = Some(ended);
     }
     redraw.notify_one();
 }
 
-/// Sends the card's input and resizes in order; once the card goes, detaches the view. A write
-/// the Tickhost takes nothing of within `write_timeout` ends the view and closes its connection.
+/// Sends the card's input in order and its resizes paced by [`ResizePacing`], starting from the
+/// `attached` size; once the card goes, detaches the view. A write the Tickhost takes nothing of
+/// within `write_timeout` ends the view and closes its connection.
 async fn write_requests(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     mut queued: mpsc::Receiver<CardRequest>,
+    attached: CardSize,
     reader: tokio::task::AbortHandle,
     screen: Arc<Mutex<CardScreen>>,
     redraw: Arc<Notify>,
     write_timeout: Duration,
 ) {
-    while let Some(request) = queued.recv().await {
+    let mut pacing = ResizePacing::new(attached);
+    loop {
+        let deadline = pacing.deadline();
+        let waiting_due = async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        let queued_request = tokio::select! {
+            request = queued.recv() => match request {
+                Some(request) => Some(request),
+                None => break,
+            },
+            () = waiting_due => None,
+        };
+        let now = tokio::time::Instant::now();
+        let request = match queued_request {
+            Some(CardRequest::Resize(size)) => pacing.request(size, now).map(CardRequest::Resize),
+            Some(CardRequest::FlushResize) => pacing.flush(now).map(CardRequest::Resize),
+            Some(input) => Some(input),
+            None => pacing.due(now).map(CardRequest::Resize),
+        };
+        let Some(request) = request else {
+            continue;
+        };
         let sent = match request {
             CardRequest::Input(bytes) => {
                 let mut sent = Ok(());
@@ -253,10 +411,13 @@ async fn write_requests(
                 )
                 .await
             }
+            CardRequest::FlushResize => Ok(()),
         };
         if let Err(error) = sent {
             if let Ok(mut screen) = screen.lock() {
-                screen.ended.get_or_insert(super::safe_line(&error.message));
+                screen
+                    .ended
+                    .get_or_insert(ViewEnd::Failed(super::safe_line(&error.message)));
             }
             redraw.notify_one();
             reader.abort();
@@ -555,8 +716,8 @@ pub(super) struct CardFrame<'a> {
     pub(super) focused: bool,
     /// The Tick's screen once the view attached.
     pub(super) screen: Option<&'a vt100::Screen>,
-    /// What the rule says about the view, such as that it is opening or why it ended.
-    pub(super) note: Option<String>,
+    /// What the rule says about the view, such as that it is opening or how its Tick ended.
+    pub(super) note: Option<CardNote>,
 }
 
 /// The rows a shown card gets: the Tick's screen rows and how many of them fit on screen; fewer
@@ -646,11 +807,11 @@ pub(super) fn collapsed_line(collapsed: usize) -> RoleLine {
 }
 
 /// The rule between a card's row and the Tick's screen: light, or heavy in the accent colour
-/// for the focused card, with a short `note` such as why the view ended.
+/// for the focused card, with a short `note` such as how its Tick ended.
 pub(super) fn rule_line(
     width: usize,
     focused: bool,
-    note: Option<&str>,
+    note: Option<&CardNote>,
     display: DisplayProfile,
 ) -> RoleLine {
     let (glyph, role) = if focused {
@@ -662,8 +823,10 @@ pub(super) fn rule_line(
     let lead = glyph.repeat(2.min(width));
     line.push(lead, Some(role));
     if let Some(note) = note.filter(|_| width > 6) {
-        let note = super::conversation_picker::ellipsize(note, width.saturating_sub(5));
-        line.push(format!(" {note} "), Some(Role::MutedText));
+        let text = super::conversation_picker::ellipsize(&note.text, width.saturating_sub(5));
+        line.push(" ", Some(role));
+        line.push(text, Some(note.role));
+        line.push(" ", Some(role));
     }
     let rest = width.saturating_sub(line.text().width());
     line.push(glyph.repeat(rest), Some(role));
@@ -776,6 +939,51 @@ impl SgrMouse {
     /// A button pressed down, the kind of report that leaves or enters a card.
     pub(super) fn is_click(self) -> bool {
         self.pressed && !self.is_motion() && !self.is_wheel()
+    }
+
+    /// The report as the Console's own mouse event, as crossterm decodes it.
+    pub(super) fn console_event(self) -> crossterm::event::MouseEvent {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        const SHIFT: u16 = 4;
+        const ALT: u16 = 8;
+        const CONTROL: u16 = 16;
+        let button = match self.code & MOUSE_BUTTONS {
+            0 => Some(MouseButton::Left),
+            1 => Some(MouseButton::Middle),
+            2 => Some(MouseButton::Right),
+            _ => None,
+        };
+        let kind = if self.is_wheel() {
+            match self.code & MOUSE_BUTTONS {
+                0 => MouseEventKind::ScrollUp,
+                1 => MouseEventKind::ScrollDown,
+                2 => MouseEventKind::ScrollLeft,
+                _ => MouseEventKind::ScrollRight,
+            }
+        } else {
+            match (button, self.is_motion(), self.pressed) {
+                (Some(button), true, _) => MouseEventKind::Drag(button),
+                (None, true, _) => MouseEventKind::Moved,
+                (Some(button), false, true) => MouseEventKind::Down(button),
+                (button, false, _) => MouseEventKind::Up(button.unwrap_or(MouseButton::Left)),
+            }
+        };
+        let mut modifiers = KeyModifiers::NONE;
+        for (bit, modifier) in [
+            (SHIFT, KeyModifiers::SHIFT),
+            (ALT, KeyModifiers::ALT),
+            (CONTROL, KeyModifiers::CONTROL),
+        ] {
+            if self.code & bit != 0 {
+                modifiers |= modifier;
+            }
+        }
+        MouseEvent {
+            kind,
+            column: self.column.saturating_sub(1),
+            row: self.row.saturating_sub(1),
+            modifiers,
+        }
     }
 
     /// The report a Tick asked for with its mouse `mode` and `encoding`, at `column` and `row`

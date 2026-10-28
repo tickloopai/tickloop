@@ -17,6 +17,7 @@ fn shell_entry(title: &str) -> MonitorEntry {
         tone: crate::monitor_rows::StatusTone::Live,
         updated_at_ms: None,
         update: None,
+        ended: None,
         resources: None,
         actions: vec![crate::monitor_rows::MonitorAction {
             key: crate::monitor_rows::MONITOR_ENTER_KEY,
@@ -79,7 +80,11 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
     assert!(!state.card_focused() && state.monitor.focused);
     state.draw_frame(&mut Vec::new()).unwrap();
     let shown = screen(&state);
-    assert!(shown.contains(&format!("▾ {title}")), "{shown}");
+    assert!(
+        shown.contains(&format!("$ {title}")),
+        "the row keeps its own glyph: {shown}"
+    );
+    assert!(!shown.contains('▾') && !shown.contains('▸'), "{shown}");
     assert!(shown.contains("── opening ──"), "{shown}");
     assert!(state.monitor_list_hint().contains("space hide"));
 
@@ -94,7 +99,13 @@ fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
     assert!(state.key(key(KeyCode::Char(' '))).is_none());
     assert!(!state.cards.is_open(&second) && state.cards.is_open(&first));
     state.draw_frame(&mut Vec::new()).unwrap();
-    assert!(!screen(&state).contains(&format!("▾ {second_title}")));
+    let shown = screen(&state);
+    assert!(shown.contains(&format!("$ {second_title}")), "{shown}");
+    assert_eq!(
+        shown.matches("── opening ──").count(),
+        1,
+        "only the first card shows: {shown}"
+    );
 }
 
 #[test]
@@ -113,12 +124,12 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
     );
     assert_eq!(
         state.monitor_list_hint(),
-        "esc leave",
+        "esc back to list",
         "a Shell's card is read-only, so only leaving is hinted"
     );
 
     let start = Instant::now();
-    state.card_input(b"\x1b", start);
+    state.card_input(b"\x1b", start, &mut Vec::new());
     assert!(state.card_focused(), "an Esc waits for what follows");
     assert!(!state.expire_card_keys(start + Duration::from_millis(60)));
     assert!(state.expire_card_keys(start + Duration::from_millis(400)));
@@ -132,7 +143,7 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_it_open() {
         "entering an open card attaches nothing new"
     );
     assert!(state.card_focused());
-    state.card_input(b"\x1b\x1b", start);
+    state.card_input(b"\x1b\x1b", start, &mut Vec::new());
     state.expire_card_keys(start + Duration::from_millis(60));
     state.expire_card_keys(start + Duration::from_millis(1000));
     assert!(state.card_focused(), "Esc Esc stays in the card");
@@ -165,12 +176,13 @@ fn keys_and_clicks_on_a_focused_card_never_reach_the_console() {
     state.card_input(
         format!("\x1b[<0;{};{}M", rule.1 + 3, rule.0 + 1).as_bytes(),
         Instant::now(),
+        &mut Vec::new(),
     );
     assert!(
         state.card_focused(),
         "a click inside the card keeps the focus"
     );
-    state.card_input(b"\x1b[<0;2;2M", Instant::now());
+    state.card_input(b"\x1b[<0;2;2M", Instant::now(), &mut Vec::new());
     assert!(!state.card_focused(), "a click outside leaves it");
 }
 
@@ -179,12 +191,12 @@ fn focus_reports_read_by_a_focused_card_reach_the_console() {
     let mut state = cards_fixture();
     state.key(key(KeyCode::Enter));
     state.file_index_focused = true;
-    state.card_input(b"\x1b[O", Instant::now());
+    state.card_input(b"\x1b[O", Instant::now(), &mut Vec::new());
     assert!(
         !state.file_index_focused,
         "the Console lost the terminal's focus"
     );
-    state.card_input(b"\x1b[I", Instant::now());
+    state.card_input(b"\x1b[I", Instant::now(), &mut Vec::new());
     assert!(state.file_index_focused && state.card_focused());
 }
 
@@ -304,7 +316,7 @@ fn a_focused_card_and_an_unfocused_card_render_their_rows_rules_and_screens() {
 
     let quiet = frame(false);
     let row = line_of(&quiet, "tail log");
-    assert!(row.text().starts_with("▾ tail log"), "{:?}", row.text());
+    assert!(row.text().starts_with("$ tail log"), "{:?}", row.text());
     assert!(!row.text().contains("input"));
     assert!(row.spans.iter().all(|span| span.role != Some(Role::Accent)));
     let rule = line_of(&quiet, "───");
@@ -484,5 +496,301 @@ fn keys_decoded_before_the_raw_input_reach_the_tick_as_its_terminal_sends_them()
     assert_eq!(
         super::cards::card_key_bytes(key(KeyCode::CapsLock), false),
         None
+    );
+}
+
+/// A hosted Tick's row with a live screen, its card open on a view whose requests the test reads.
+fn attached_hosted_card(
+    state: &mut State,
+) -> (
+    tick_protocol::InstanceRef,
+    tokio::sync::mpsc::Receiver<crate::terminal::monitor_cards::CardRequest>,
+) {
+    let chat = state.chat.unwrap();
+    let mut hosted = shell_entry("hosted tick");
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    hosted.instance = instance.clone();
+    hosted.group = TickGroup::Ticks;
+    hosted.actions[0].intent = crate::monitor_rows::TickIntent::OpenView(instance.clone());
+    state.monitor.replace(TickGroup::Ticks, vec![hosted]);
+    state.monitor.select(&instance);
+    attaches(state.key(key(KeyCode::Char(' '))), chat, &instance);
+    let (view, requests) =
+        crate::terminal::monitor_cards::CardView::detached(state.card_size(&instance));
+    assert!(state.cards.attached(chat, &instance, view));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    (instance, requests)
+}
+
+fn queued_requests(
+    requests: &mut tokio::sync::mpsc::Receiver<crate::terminal::monitor_cards::CardRequest>,
+) -> Vec<crate::terminal::monitor_cards::CardRequest> {
+    std::iter::from_fn(|| requests.try_recv().ok()).collect()
+}
+
+#[test]
+fn releasing_the_monitor_separator_sends_the_cards_final_size_at_once() {
+    use crate::terminal::monitor_cards::CardRequest;
+    let mut state = cards_fixture();
+    let (_instance, mut requests) = attached_hosted_card(&mut state);
+    queued_requests(&mut requests);
+    let separator = state.monitor_separator.as_ref().unwrap().0;
+    let mouse = |kind, column: usize| MouseEvent {
+        kind,
+        row: 2,
+        column: column as u16,
+        modifiers: KeyModifiers::NONE,
+    };
+    state.pointer(
+        mouse(MouseEventKind::Down(MouseButton::Left), separator),
+        &mut Vec::new(),
+    );
+    for column in (separator - 6..separator).rev() {
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), column),
+            &mut Vec::new(),
+        );
+        state.draw_frame(&mut Vec::new()).unwrap();
+    }
+    let dragged = queued_requests(&mut requests);
+    assert!(
+        dragged
+            .iter()
+            .all(|request| matches!(request, CardRequest::Resize(_))),
+        "the drag paces its resizes in the view: {dragged:?}"
+    );
+    assert!(
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), separator - 6),
+            &mut Vec::new()
+        ),
+        "the release draws the final frame"
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(queued_requests(&mut requests), [CardRequest::FlushResize]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(queued_requests(&mut requests).is_empty(), "flushed once");
+}
+
+fn card_screen(
+    state: &State,
+    instance: &tick_protocol::InstanceRef,
+) -> Arc<Mutex<crate::terminal::monitor_cards::CardScreen>> {
+    match &state.cards.card(instance).unwrap().state {
+        crate::terminal::monitor_cards::CardState::Attached(view) => view.screen.clone(),
+        _ => panic!("the card's view is attached"),
+    }
+}
+
+/// The row of `instance` as the Monitor's next listing reports it, changed by `change`.
+fn change_row(
+    state: &mut State,
+    instance: &tick_protocol::InstanceRef,
+    change: impl FnOnce(&mut MonitorEntry),
+) {
+    let mut entry = state
+        .monitor
+        .entries()
+        .iter()
+        .find(|entry| &entry.instance == instance)
+        .unwrap()
+        .clone();
+    change(&mut entry);
+    state.monitor.replace(TickGroup::Ticks, vec![entry]);
+}
+
+#[test]
+fn a_card_whose_tick_exited_keeps_its_last_screen_says_how_on_its_rule_and_loses_the_focus() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    card_screen(&state, &instance)
+        .lock()
+        .unwrap()
+        .parser
+        .process(b"thread 'main' panicked");
+    state.key(key(KeyCode::Enter));
+    assert!(state.card_focused());
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "exited 101".into();
+        entry.tone = crate::monitor_rows::StatusTone::Neutral;
+        entry.ended = Some("exited 101".into());
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let shown = screen(&state);
+    assert!(shown.contains("── exited 101 ──"), "{shown}");
+    assert!(
+        shown.contains("thread 'main' panicked"),
+        "the last screen stays: {shown}"
+    );
+    assert!(!state.card_focused(), "an ended Tick takes no keys");
+    assert!(state.cards.is_open(&instance));
+    assert!(state.monitor_list_hint().contains("space hide"));
+}
+
+#[test]
+fn a_view_that_saw_its_tick_end_says_so_before_the_row_does() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    state.key(key(KeyCode::Enter));
+    card_screen(&state, &instance).lock().unwrap().ended =
+        Some(crate::terminal::monitor_cards::ViewEnd::TickEnded);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let shown = screen(&state);
+    assert!(shown.contains("── ended ──"), "{shown}");
+    assert!(!state.card_focused());
+
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "gone".into();
+        entry.tone = crate::monitor_rows::StatusTone::Gone;
+        entry.ended = Some("ended".into());
+        entry.actions = vec![crate::monitor_rows::MonitorAction {
+            key: crate::monitor_rows::MONITOR_ENTER_KEY,
+            label: "reopen",
+            intent: crate::monitor_rows::TickIntent::ReopenHosted(instance.clone()),
+        }];
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(screen(&state).contains("── ended ──"), "the row agrees");
+    assert!(
+        state.monitor_list_hint().contains("space hide"),
+        "{}",
+        state.monitor_list_hint()
+    );
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(
+        !state.cards.is_open(&instance),
+        "Space still hides the card of a Tick that no longer opens a view"
+    );
+    assert!(
+        state.key(key(KeyCode::Char(' '))).is_none() && !state.cards.is_open(&instance),
+        "and never shows it again"
+    );
+}
+
+#[test]
+fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_collapsed() {
+    let mut monitor = crate::terminal::monitor::Monitor::default();
+    let (first, second) = (shell_entry("first log"), shell_entry("second log"));
+    let instances = [first.instance.clone(), second.instance.clone()];
+    monitor.replace(TickGroup::Shells, vec![first, second]);
+    let cards = instances.each_ref().map(|instance| CardFrame {
+        instance,
+        demand: CardDemand {
+            min_rows: 6,
+            priority: 1,
+        },
+        focused: false,
+        screen: None,
+        note: None,
+    });
+    let frame = monitor.frame_with_cards(30, 12, DisplayProfile::default(), 0, &cards);
+    let texts = frame
+        .lines
+        .iter()
+        .map(|line| line.text())
+        .collect::<Vec<_>>();
+    assert!(
+        texts.iter().any(|line| line.contains("+1 collapsed")),
+        "{texts:?}"
+    );
+    let rows = texts
+        .iter()
+        .filter(|line| line.starts_with("$ "))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{texts:?}");
+    assert!(
+        rows.iter().any(|row| row.trim_end().ends_with("collapsed")),
+        "the collapsed card's row says so: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|line| !line.contains('▸') && !line.contains('▾'))
+    );
+}
+
+/// One SGR left press, or release, at the 0-based screen `cell`, as the terminal reports it.
+fn sgr_left(pressed: bool, (row, column): (usize, usize)) -> Vec<u8> {
+    let end = if pressed { 'M' } else { 'm' };
+    format!("\x1b[<0;{};{}{end}", column + 1, row + 1).into_bytes()
+}
+
+fn target_cell(state: &State, wanted: &MonitorTarget) -> (usize, usize) {
+    state
+        .monitor_row_targets
+        .iter()
+        .find(|target| &target.target == wanted)
+        .map(|target| (target.row, target.columns.start + 2))
+        .unwrap_or_else(|| panic!("{wanted:?} is not on screen"))
+}
+
+#[test]
+fn a_click_outside_a_focused_card_leaves_it_and_then_acts_where_it_landed() {
+    let mut state = cards_fixture();
+    let chat = state.chat.unwrap();
+    let first = selected(&state);
+    state.key(key(KeyCode::Char('j')));
+    let second = selected(&state);
+    state.key(key(KeyCode::Char('k')));
+    attaches(state.key(key(KeyCode::Enter)), chat, &first);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.card_focused());
+
+    let second_row = target_cell(&state, &MonitorTarget::Tick(second.clone()));
+    let click = [sgr_left(true, second_row), sgr_left(false, second_row)].concat();
+    state.card_input(&click, Instant::now(), &mut Vec::new());
+    assert!(!state.card_focused(), "the click leaves the card");
+    attaches(state.pointer_input.take(), chat, &second);
+    assert!(
+        state.cards.is_open(&first) && state.cards.is_open(&second),
+        "a click on another row shows its card too"
+    );
+    assert_eq!(selected(&state), second);
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    state.enter_card(first.clone());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let second_card = target_cell(
+        &state,
+        &MonitorTarget::Card {
+            instance: second.clone(),
+            row: Some(1),
+        },
+    );
+    state.card_input(
+        &sgr_left(true, second_card),
+        Instant::now(),
+        &mut Vec::new(),
+    );
+    assert!(!state.card_focused(), "acted on the release");
+    state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            row: second_card.0 as u16,
+            column: second_card.1 as u16,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        state.cards.focused(),
+        Some(&second),
+        "a click in another open card enters it"
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    let first_row = target_cell(&state, &MonitorTarget::Tick(first.clone()));
+    let elsewhere = (first_row.0 + 1, first_row.1);
+    let drag = [
+        sgr_left(true, first_row),
+        format!("\x1b[<32;{};{}M", elsewhere.1 + 1, elsewhere.0 + 1).into_bytes(),
+        sgr_left(false, elsewhere),
+    ]
+    .concat();
+    state.card_input(&drag, Instant::now(), &mut Vec::new());
+    assert!(!state.card_focused());
+    assert!(
+        state.pointer_input.is_none() && state.cards.is_open(&first),
+        "a drag toggles nothing"
     );
 }

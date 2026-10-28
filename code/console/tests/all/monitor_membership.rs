@@ -105,6 +105,7 @@ impl MonitorRows for CalendarRows {
                 updated_at_ms: row.last_delivery_ms,
                 update: None,
                 running: true,
+                ended: None,
                 resources: None,
                 actions: vec![MonitorAction {
                     key: 'o',

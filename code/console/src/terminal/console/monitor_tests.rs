@@ -41,6 +41,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         tone: crate::monitor_rows::StatusTone::Neutral,
         updated_at_ms: Some(1000),
         update: None,
+        ended: None,
         resources: None,
         actions: vec![
             crate::monitor_rows::MonitorAction {
@@ -211,6 +212,7 @@ fn monitor_selection_restores_per_agent_and_ignores_obsolete_mouse_targets() {
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
             update: None,
+            ended: None,
             resources: None,
             actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b", true),
         }],
@@ -1396,6 +1398,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
                 update: None,
                 resources: None,
                 running: true,
+                ended: None,
                 actions: vec![MonitorAction {
                     key: MONITOR_ENTER_KEY,
                     label: "details",

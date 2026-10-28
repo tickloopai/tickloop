@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{
     display::{DisplayProfile, Glyph},
     list_row::{self, ListRow, RowFlash},
-    monitor_cards::{CardAllocation, CardFrame, CardRows, CardSize},
+    monitor_cards::{CardAllocation, CardFrame, CardNote, CardRows, CardSize},
     style::{Role, RoleLine},
     subscription_detail::SubscriptionDetail,
 };
@@ -37,7 +37,10 @@ const FOCUSED_CARD_MARK: &str = "input";
 /// The rule of a card cropped because not even its minimum fits.
 const TOO_SHORT_NOTE: &str = "terminal too short";
 
-/// How a row shows that its card is open.
+/// A row whose card other cards took the room from says so at its end.
+const COLLAPSED_CARD_NOTE: &str = "collapsed";
+
+/// How a row shows that its card is open; its glyph stays its own state mark either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CardMark {
     Shown,
@@ -92,6 +95,8 @@ pub(super) struct MonitorEntry {
     pub(super) updated_at_ms: Option<u64>,
     /// The latest update that counts for unread, and whether this Chat still has to handle it.
     pub(super) update: Option<RowUpdate>,
+    /// How its hosted Tick ended, in the words its card's rule shows.
+    pub(super) ended: Option<String>,
     pub(super) resources: Option<TickResources>,
     pub(super) actions: Vec<MonitorAction>,
 }
@@ -1337,9 +1342,9 @@ impl Monitor {
         self.entry_lines_with_card(entry, width, display, now_ms, None)
     }
 
-    /// The row of `entry`, marked `▾` while its card shows, `▸` while it is open but collapsed,
-    /// and in the accent colour on the selection background, ending with `input`, while its card
-    /// has the focus.
+    /// The row of `entry` with its own glyph whether its card shows or not: ending with
+    /// `collapsed` while its card is open but other cards took the room, and in the accent colour
+    /// on the selection background, ending with `input`, while its card has the focus.
     fn entry_lines_with_card(
         &self,
         entry: &MonitorEntry,
@@ -1352,17 +1357,18 @@ impl Monitor {
         let paused = entry.subscription.is_some_and(|mark| mark.paused);
         let focused_card = card == Some(CardMark::Focused);
         let mut details = list_row::row_details(entry.tone, &entry.notes, now_ms);
-        if focused_card {
+        let card_note = match card {
+            Some(CardMark::Focused) => Some(FOCUSED_CARD_MARK),
+            Some(CardMark::Collapsed) => Some(COLLAPSED_CARD_NOTE),
+            Some(CardMark::Shown) | None => None,
+        };
+        if let Some(card_note) = card_note {
             if !details.is_empty() {
                 details.push_str(" · ");
             }
-            details.push_str(FOCUSED_CARD_MARK);
+            details.push_str(card_note);
         }
-        let glyph = match card {
-            None => display.glyph(entry.glyph),
-            Some(CardMark::Collapsed) => display.glyph(Glyph::Collapsed),
-            Some(CardMark::Shown | CardMark::Focused) => display.glyph(Glyph::Expanded),
-        };
+        let glyph = display.glyph(entry.glyph);
         let mut lines = ListRow {
             selected: self.focused
                 && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
@@ -1521,10 +1527,11 @@ impl Monitor {
                     row_ids.push(Some(MonitorTarget::Tick(entry.instance.clone())));
                 }
                 if let Some((card, Some(card_rows))) = card {
-                    let note = if card_rows.is_cropped() {
-                        Some(TOO_SHORT_NOTE)
-                    } else {
-                        card.note.as_deref()
+                    let too_short = CardNote::plain(TOO_SHORT_NOTE);
+                    let note = match &card.note {
+                        Some(note) if note.ended => Some(note),
+                        _ if card_rows.is_cropped() => Some(&too_short),
+                        note => note.as_ref(),
                     };
                     rows.push(super::monitor_cards::rule_line(
                         cards.columns,
@@ -2087,6 +2094,7 @@ impl From<TickDescriptor> for MonitorEntry {
             tone: row.tone,
             updated_at_ms: row.updated_at_ms,
             update: row.update,
+            ended: row.ended,
             resources: row.resources,
             actions: row.actions,
         }
@@ -2122,6 +2130,7 @@ mod registered_rows_tests {
                 updated_at_ms: None,
                 update: None,
                 running: true,
+                ended: None,
                 resources: None,
                 actions: [('o', "inspect"), ('z', "expand")]
                     .into_iter()
@@ -2203,6 +2212,7 @@ mod signal_tests {
                 updated_at_ms: at,
                 update: at.map(RowUpdate::new),
                 running: true,
+                ended: None,
                 resources: None,
                 actions: Vec::new(),
             }]
