@@ -478,10 +478,6 @@ struct Chat {
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
-    /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
-    /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
-    /// it unknown.
-    mode_before_plan: Option<ExecutionMode>,
     /// What the model was last told of the Loop in this process; a load starts untold.
     announced_loop_state: Option<loop_state_notes::AnnouncedLoopState>,
     active: Option<CancellationToken>,
@@ -762,21 +758,11 @@ fn host_tool_decision(
     configured: Option<tickloop_harness_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     policy: &tickloop_harness_protocol::PermissionPolicy,
-    mode_before_plan: Option<ExecutionMode>,
     has_human_input: bool,
 ) -> Decision {
     let execution_mode = policy.mode;
     if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
-        // As in Claude Code, Plan entered from Full Access keeps allowing third-party calls, and
-        // otherwise uses Auto's review unless the user turned that off; then Plan decides them as
-        // the mode it was entered from, an unknown one as Ask.
-        let mode = match (execution_mode, mode_before_plan) {
-            (ExecutionMode::Plan, Some(ExecutionMode::FullAccess)) => ExecutionMode::FullAccess,
-            (ExecutionMode::Plan, _) if policy.uses_auto_admission() => ExecutionMode::Auto,
-            (ExecutionMode::Plan, _) => ExecutionMode::Plan.leaving_plan(mode_before_plan),
-            (mode, _) => mode,
-        };
-        return match (configured, mode) {
+        return match (configured, policy.admission_mode()) {
             (Some(rule), _) => Decision::from(rule.decision),
             (None, ExecutionMode::FullAccess) => Decision::Allow,
             (None, ExecutionMode::Auto) => Decision::Check,
@@ -799,9 +785,7 @@ fn host_tool_decision(
             Some(Decision::Allow) if allow_rule_bypasses_review || is_allowed_by_host => {
                 Decision::Allow
             }
-            _ if matches!(execution_mode, ExecutionMode::Auto | ExecutionMode::Plan) => {
-                Decision::Check
-            }
+            _ if policy.admission_mode() == ExecutionMode::Auto => Decision::Check,
             _ => Decision::Allow,
         };
     }
@@ -887,16 +871,17 @@ fn mode_before_plan_after(
 impl Chat {
     /// Changes the execution mode, remembering the mode Plan is entered from.
     fn change_execution_mode(&mut self, mode: ExecutionMode) {
-        self.mode_before_plan =
-            mode_before_plan_after(self.mode_before_plan, self.snapshot.policy.mode, mode);
-        self.snapshot.policy.mode = mode;
+        let policy = &mut self.snapshot.policy;
+        policy.mode_before_plan =
+            mode_before_plan_after(policy.mode_before_plan, policy.mode, mode);
+        policy.mode = mode;
     }
 
-    /// Replaces the snapshot, forgetting the mode Plan was entered from if the mode changes.
-    fn replace_snapshot(&mut self, snapshot: ChatSnapshot) {
-        if snapshot.policy.mode != self.snapshot.policy.mode {
-            self.mode_before_plan = None;
-        }
+    /// Replaces the snapshot, keeping the mode Plan was entered from only if the mode stays.
+    fn replace_snapshot(&mut self, mut snapshot: ChatSnapshot) {
+        snapshot.policy.mode_before_plan = (snapshot.policy.mode == self.snapshot.policy.mode)
+            .then_some(self.snapshot.policy.mode_before_plan)
+            .flatten();
         self.snapshot = snapshot;
     }
 
@@ -5209,7 +5194,7 @@ impl Agent {
             .cloned()
             .collect();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
-        snapshot.mode_before_plan = chats[&chat_id].mode_before_plan;
+        snapshot.mode_before_plan = snapshot.policy.mode_before_plan;
         snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(snapshot)
@@ -5747,7 +5732,6 @@ impl NewChat {
             snapshot,
             bookkeeping,
             start_new_tool_result_message: false,
-            mode_before_plan: None,
             announced_loop_state: None,
             active: None,
             active_run: None,

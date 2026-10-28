@@ -1142,9 +1142,10 @@ mod tests {
     }
 
     /// Claude Code's `useAutoModeDuringPlan`: Plan still refuses side effects, and what it would
-    /// ask about goes through Auto's admission instead, unless the user turned that off.
+    /// ask about goes through Auto's admission instead, but only when Plan was entered from Auto
+    /// and the user did not turn that off. Entered from any other mode or an unknown one, it asks.
     #[test]
-    fn plan_admits_as_auto_unless_the_user_turned_it_off() {
+    fn plan_admits_as_auto_only_after_auto_unless_the_user_turned_it_off() {
         let directory = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         std::fs::write(external.path().join("notes.txt"), "notes").unwrap();
@@ -1164,29 +1165,44 @@ mod tests {
             BASH_TOOL_NAME,
             json!({"command":"rm -rf build"}),
         );
-        let decide = |plan_without_auto, rules: Vec<PermissionRule>, operation: &PreparedTool| {
+        let decide = |mode_before_plan,
+                      plan_without_auto,
+                      rules: Vec<PermissionRule>,
+                      operation: &PreparedTool| {
             PermissionPolicy {
                 mode: ExecutionMode::Plan,
                 rules,
                 plan_without_auto,
+                mode_before_plan,
                 ..PermissionPolicy::default()
             }
             .decide(operation, &workspace, Uuid::nil())
         };
         let broad_allow = || vec![tool_rule(Decision::Allow, "*", None)];
+        let after_auto = Some(ExecutionMode::Auto);
 
-        assert_eq!(decide(false, vec![], &web_fetch), Decision::Check);
-        assert_eq!(decide(false, vec![], &external_read), Decision::Allow);
         assert_eq!(
-            decide(false, broad_allow(), &web_fetch),
+            decide(after_auto, false, vec![], &web_fetch),
+            Decision::Check
+        );
+        assert_eq!(
+            decide(after_auto, false, vec![], &external_read),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(after_auto, false, broad_allow(), &web_fetch),
             Decision::Check,
             "a broad Allow does not bypass the review, as in Auto"
         );
         for operation in [&workspace_write, &mutating_shell] {
-            assert_eq!(decide(false, broad_allow(), operation), Decision::Deny);
+            assert_eq!(
+                decide(after_auto, false, broad_allow(), operation),
+                Decision::Deny
+            );
         }
         assert_eq!(
             decide(
+                after_auto,
                 false,
                 vec![tool_rule(Decision::Ask, "Read", None)],
                 &external_read
@@ -1195,6 +1211,7 @@ mod tests {
         );
         assert_eq!(
             decide(
+                after_auto,
                 false,
                 vec![web_fetch_rule(Decision::Deny, "domain:docs.example.com")],
                 &web_fetch
@@ -1202,11 +1219,20 @@ mod tests {
             Decision::Deny
         );
 
-        assert_eq!(decide(true, vec![], &web_fetch), Decision::Ask);
-        assert_eq!(decide(true, vec![], &external_read), Decision::Ask);
-        assert_eq!(decide(true, broad_allow(), &web_fetch), Decision::Allow);
-        for operation in [&workspace_write, &mutating_shell] {
-            assert_eq!(decide(true, vec![], operation), Decision::Deny);
+        for (mode_before_plan, plan_without_auto) in [
+            (after_auto, true),
+            (Some(ExecutionMode::AcceptEdits), false),
+            (Some(ExecutionMode::FullAccess), false),
+            (None, false),
+        ] {
+            let decide =
+                |rules, operation| decide(mode_before_plan, plan_without_auto, rules, operation);
+            assert_eq!(decide(vec![], &web_fetch), Decision::Ask);
+            assert_eq!(decide(vec![], &external_read), Decision::Ask);
+            assert_eq!(decide(broad_allow(), &web_fetch), Decision::Allow);
+            for operation in [&workspace_write, &mutating_shell] {
+                assert_eq!(decide(vec![], operation), Decision::Deny);
+            }
         }
     }
 

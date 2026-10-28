@@ -87,11 +87,13 @@ async fn finish(agent: &Agent, chat: uuid::Uuid, prompt: &str) -> usize {
 async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_before_effects() {
     for tool in ["Subagent", "SendMessage"] {
         for use_jev in [false, true] {
-            for mode in [
-                ExecutionMode::Auto,
-                ExecutionMode::Plan,
-                ExecutionMode::AcceptEdits,
-                ExecutionMode::FullAccess,
+            // Plan reviews them only when entered from Auto; from Ask it admits them as Ask does.
+            for (mode_before_plan, mode) in [
+                (None, ExecutionMode::Auto),
+                (Some(ExecutionMode::Auto), ExecutionMode::Plan),
+                (Some(ExecutionMode::AcceptEdits), ExecutionMode::Plan),
+                (None, ExecutionMode::AcceptEdits),
+                (None, ExecutionMode::FullAccess),
             ] {
                 for rule in [
                     None,
@@ -99,7 +101,8 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                     Some(Decision::Ask),
                     Some(Decision::Deny),
                 ] {
-                    let reviewed = matches!(mode, ExecutionMode::Auto | ExecutionMode::Plan)
+                    let reviewed = (mode == ExecutionMode::Auto
+                        || mode_before_plan == Some(ExecutionMode::Auto))
                         && match rule {
                             None => true,
                             Some(Decision::Allow) => tool == "Subagent",
@@ -141,7 +144,9 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                         } else {
                             None
                         };
-                        agent.set_execution_mode(chat, mode).await.unwrap();
+                        for mode in mode_before_plan.into_iter().chain([mode]) {
+                            agent.set_execution_mode(chat, mode).await.unwrap();
+                        }
                         if let Some(decision) = rule {
                             agent
                                 .set_permission_rules(
@@ -209,7 +214,9 @@ async fn delegation_and_messages_follow_classifier_modes_and_explicit_rules_befo
                                 .collect()
                         };
                         agent.shutdown().await;
-                        let label = format!("{tool} {mode:?} {rule:?} jev={use_jev} block={block}");
+                        let label = format!(
+                            "{tool} {mode:?} from {mode_before_plan:?} {rule:?} jev={use_jev} block={block}"
+                        );
                         assert_eq!(prompts, usize::from(rule == Some(Decision::Ask)), "{label}");
                         assert_eq!(
                             requests.len(),

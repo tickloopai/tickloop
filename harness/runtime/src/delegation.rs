@@ -429,6 +429,19 @@ pub(super) fn effective_policy(
     chats: &HashMap<ChatId, Chat>,
     receipt: &Receipt,
 ) -> Result<tickloop_harness_protocol::PermissionPolicy, String> {
+    fn stricter(left: ExecutionMode, right: ExecutionMode) -> ExecutionMode {
+        match (left, right) {
+            (ExecutionMode::Plan, _) | (_, ExecutionMode::Plan) => ExecutionMode::Plan,
+            (ExecutionMode::AcceptEdits, _) | (_, ExecutionMode::AcceptEdits) => {
+                ExecutionMode::AcceptEdits
+            }
+            (ExecutionMode::Auto, _) | (_, ExecutionMode::Auto) => ExecutionMode::Auto,
+            _ => ExecutionMode::FullAccess,
+        }
+    }
+    fn leaving_plan(policy: &tickloop_harness_protocol::PermissionPolicy) -> ExecutionMode {
+        policy.mode.leaving_plan(policy.mode_before_plan)
+    }
     let parents = super::family_tree::lineage(chats, receipt.chat_id)?;
     let mut policy = chats[&receipt.chat_id].snapshot.policy.clone();
     for id in std::iter::once(receipt.chat_id).chain(parents.iter().map(|parent| parent.chat_id)) {
@@ -439,14 +452,11 @@ pub(super) fn effective_policy(
             &delegation.ceiling.policy,
             &chats[&delegation.parent_chat_id].snapshot.policy,
         ] {
-            policy.mode = match (policy.mode, ancestor_policy.mode) {
-                (ExecutionMode::Plan, _) | (_, ExecutionMode::Plan) => ExecutionMode::Plan,
-                (ExecutionMode::AcceptEdits, _) | (_, ExecutionMode::AcceptEdits) => {
-                    ExecutionMode::AcceptEdits
-                }
-                (ExecutionMode::Auto, _) | (_, ExecutionMode::Auto) => ExecutionMode::Auto,
-                _ => ExecutionMode::FullAccess,
-            };
+            // A combined Plan decides as the stricter of the modes each side's Plan would leave to.
+            let mode = stricter(policy.mode, ancestor_policy.mode);
+            policy.mode_before_plan = (mode == ExecutionMode::Plan)
+                .then(|| stricter(leaving_plan(&policy), leaving_plan(ancestor_policy)));
+            policy.mode = mode;
             policy.plan_without_auto |= ancestor_policy.plan_without_auto;
             for rules in [
                 &ancestor_policy.rules,
@@ -505,11 +515,7 @@ pub(super) fn host_authority(
         mcp_server,
     } = host_call;
     let policy = effective_policy(chats, receipt)?;
-    let decide = |policy: &tickloop_harness_protocol::PermissionPolicy,
-                  mode_before_plan,
-                  loop_id,
-                  session,
-                  human| {
+    let decide = |policy: &tickloop_harness_protocol::PermissionPolicy, loop_id, session, human| {
         let explicit = match mcp_server {
             Some(server) => policy.explicit_mcp_rule_match(
                 &operation.name,
@@ -521,7 +527,7 @@ pub(super) fn host_authority(
             None => policy.explicit_rule_match(&operation.name, permission_input, loop_id, session),
         };
         (
-            host_tool_decision(explicit, permission, policy, mode_before_plan, human),
+            host_tool_decision(explicit, permission, policy, human),
             explicit.is_some_and(|matched| {
                 matched.decision
                     == tickloop_harness_tools::permissions::ExplicitPermissionDecision::Ask
@@ -531,7 +537,6 @@ pub(super) fn host_authority(
     let own = &chats[&receipt.chat_id];
     let (mut decision, mut explicit_ask) = decide(
         &own.snapshot.policy,
-        own.mode_before_plan,
         receipt.loop_id.into(),
         session,
         permission == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
@@ -558,18 +563,12 @@ pub(super) fn host_authority(
         )
         .map_err(|error| error.to_string())?;
         let inherited_session = sessions.evaluate(owner, &session_operation).decision;
-        // The frozen ceiling does not record the mode its Plan was entered from.
-        for (ancestor_policy, mode_before_plan, session) in [
-            (&delegation.ceiling.policy, None, None),
-            (
-                &parent.snapshot.policy,
-                parent.mode_before_plan,
-                inherited_session,
-            ),
+        for (ancestor_policy, session) in [
+            (&delegation.ceiling.policy, None),
+            (&parent.snapshot.policy, inherited_session),
         ] {
             let (ancestor_decision, ancestor_ask) = decide(
                 ancestor_policy,
-                mode_before_plan,
                 delegation.parent_loop_id.into(),
                 session,
                 false,

@@ -2413,7 +2413,9 @@ impl ConsoleExecution {
                 .and_then(tickloop_code_settings::UserSettings::root),
         )
         .map_err(|error| AccessError::storage(error.to_string()))?;
+        // A new Agent starting in Plan entered it from no mode, so it asks as Ask does.
         let uses_auto_admission = configuration.execution_mode.uses_auto_admission(
+            None,
             settings
                 .as_ref()
                 .is_none_or(|settings| settings.load().use_auto_mode_during_plan()),
