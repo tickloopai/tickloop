@@ -161,11 +161,16 @@ fn without_breakpoints(mut value: Value) -> Value {
 }
 
 #[test]
-fn only_the_anthropic_api_sends_cache_breakpoints() {
+fn only_claude_on_the_anthropic_api_and_copilot_sends_cache_breakpoints() {
     let catalog = ModelCatalog::defaults();
     catalog.validate().unwrap();
     for profile in catalog.profiles() {
-        let expected = (profile.provider_id == "anthropic-api").then_some(PromptCache::Anthropic);
+        let is_claude = profile.adapter() == tickloop_harness_protocol::Adapter::Messages
+            && matches!(
+                profile.provider_id.as_str(),
+                "anthropic-api" | "github-copilot"
+            );
+        let expected = is_claude.then_some(PromptCache::Anthropic);
         assert_eq!(
             cards::prompt_cache(&profile),
             expected,
