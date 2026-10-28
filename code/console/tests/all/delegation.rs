@@ -4,6 +4,7 @@ use tickloop_code_local_environment::AgentLocalExt;
 use tickloop_code_settings::local_agent::LocalAgent;
 use tickloop_harness::runtime::Agent;
 
+use crate::non_interactive;
 use tickloop_harness::protocol::{EventKind, ExecutionMode};
 use tickloop_harness::test_support::{ScriptedModel, call, config, text};
 
@@ -829,13 +830,13 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Try the same scoped write."}),
+            json!({"task":"Try the same scoped write.","run_in_background":false}),
         ),
         call("child-denied", "Write", denied_input.clone()),
         text("The child respected the Session denial."),
         text("The delegated check completed."),
     ]));
-    let agent = Agent::open_embedded(store.clone(), config(), model).unwrap();
+    let agent = non_interactive::opened_agent(store.clone(), config(), model);
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::AcceptEdits)
@@ -948,21 +949,20 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
     let directory = tempfile::tempdir().unwrap();
     let input = json!({"file_path":".bashrc","content":"fixture=denied"});
     let store = directory.path().join("state");
-    let agent = Agent::open_embedded(
+    let agent = non_interactive::opened_agent(
         store.clone(),
         config(),
         Arc::new(ScriptedModel::new(vec![
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Prepare the scoped write for approval."}),
+                json!({"task":"Prepare the scoped write for approval.","run_in_background":false}),
             ),
             call("child-write", "Write", input.clone()),
             call("parent-denial", "Write", input.clone()),
             text("The child operation was blocked."),
         ])),
-    )
-    .unwrap();
+    );
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::AcceptEdits)
@@ -1076,7 +1076,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Read task.txt and report the evidence.","name":" File CHECK ","description":"Check file evidence"}),
+            json!({"task":"Read task.txt and report the evidence.","name":" File CHECK ","description":"Check file evidence","run_in_background":false}),
         ),
         call("read", "Read", json!({"file_path":"task.txt"})),
         text("verified child evidence"),
@@ -1084,7 +1084,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         text("The child accepts follow-up input."),
     ]));
     let store = directory.path().join("state");
-    let agent = Agent::open_embedded(store.clone(), config(), model.clone()).unwrap();
+    let agent = non_interactive::opened_agent(store.clone(), config(), model.clone());
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
@@ -1378,7 +1378,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Write the approved report and ask its cadence."}),
+            json!({"task":"Write the approved report and ask its cadence.","run_in_background":false}),
         ),
         call(
             "write",
@@ -1393,7 +1393,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
         text("The approved weekly report is ready."),
         text("The child returned the approved report."),
     ]));
-    let agent = Agent::new_embedded(config(), model);
+    let agent = non_interactive::embedded_agent(model);
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
@@ -1488,7 +1488,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Ask the user for the report cadence."}),
+            json!({"task":"Ask the user for the report cadence.","run_in_background":false}),
         ),
         call(
             "question",
@@ -1499,7 +1499,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         text("The actual child completed."),
         text("The visible child accepted the follow-up in the original Loop."),
     ]));
-    let runtime = Agent::new_embedded(config(), model);
+    let runtime = non_interactive::embedded_agent(model);
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let receipt = access
         .execute(CommandEnvelope {
@@ -1813,7 +1813,7 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Ask which cadence and continue independently."}),
+            json!({"task":"Ask which cadence and continue independently.","run_in_background":false}),
         ),
         call(
             "question",
@@ -1822,7 +1822,7 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         ),
         text("The child completed after the parent stopped waiting."),
     ]));
-    let agent = Agent::new_embedded(config(), model);
+    let agent = non_interactive::embedded_agent(model);
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
@@ -2058,7 +2058,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         call(
             "launch",
             "Subagent",
-            json!({"task":"Check interpreter output","name":"audit"}),
+            json!({"task":"Check interpreter output","name":"audit","run_in_background":false}),
         ),
         call(
             "python",
@@ -2068,7 +2068,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         text("Child finished"),
         text("Root finished"),
     ]));
-    let core = Agent::new_embedded(config(), model);
+    let core = non_interactive::embedded_agent(model);
     core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
@@ -2123,7 +2123,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         call(
             "launch",
             "Subagent",
-            json!({"task":"Check interpreter with approval","name":"audit"}),
+            json!({"task":"Check interpreter with approval","name":"audit","run_in_background":false}),
         ),
         call(
             "python",
@@ -2133,7 +2133,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         text("Child finished"),
         text("Root finished"),
     ]));
-    let core = Agent::new_embedded(config(), model);
+    let core = non_interactive::embedded_agent(model);
     core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
@@ -2383,13 +2383,13 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
             call(
                 "launch",
                 "Subagent",
-                json!({"task":"Check explicit Bash policy"}),
+                json!({"task":"Check explicit Bash policy","run_in_background":false}),
             ),
             call("python", "Bash", json!({"command":command})),
             text("Child done"),
             text("Root done"),
         ]));
-        let core = Agent::new_embedded(config(), model);
+        let core = non_interactive::embedded_agent(model);
         core.install_own_tickhost();
         let root = core.create_chat(directory.path().into()).await.unwrap();
         core.set_execution_mode(root, ExecutionMode::AcceptEdits)
@@ -2575,7 +2575,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
             call(
                 "launch",
                 "Subagent",
-                json!({"task":"Keep a background result","name":"result"}),
+                json!({"task":"Keep a background result","name":"result","run_in_background":false}),
             ),
             call(
                 "background-output",
@@ -2586,7 +2586,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
             text("Root ready"),
         ]),
     });
-    let core = Agent::new_embedded(config(), model.clone());
+    let core = non_interactive::embedded_agent(model.clone());
     core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
@@ -2919,7 +2919,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
             call(
                 "launch",
                 "Subagent",
-                json!({"task":"Keep the scoped Bash denial"}),
+                json!({"task":"Keep the scoped Bash denial","run_in_background":false}),
             ),
             call(
                 "scoped-python",
@@ -2933,7 +2933,7 @@ async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    let core = Agent::new_embedded(config(), model.clone());
+    let core = non_interactive::embedded_agent(model.clone());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::FullAccess)
         .await
@@ -3065,13 +3065,13 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
         call(
             "launch",
             "Subagent",
-            json!({"task":"Use the configured interpreter rule"}),
+            json!({"task":"Use the configured interpreter rule","run_in_background":false}),
         ),
         call("configured-python", "Bash", json!({"command":command})),
         text("Child done"),
         text("Root done"),
     ]));
-    let core = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    let core = non_interactive::opened_agent(directory.path().join("state"), config(), model);
     core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_permission_rules(

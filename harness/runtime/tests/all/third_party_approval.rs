@@ -5,7 +5,7 @@ use tickloop_harness_protocol::{
     mcp::{McpServerConfig, McpTransport},
 };
 use tickloop_harness_runtime::{
-    Agent,
+    Agent, SubagentLaunch,
     mcp::{HostCapabilities, McpConnections, McpServerState, McpToolProvider},
 };
 use tickloop_harness_test_support::{
@@ -13,7 +13,7 @@ use tickloop_harness_test_support::{
 };
 use uuid::Uuid;
 
-use crate::plan_auto::agent_with_plan_setting;
+use crate::plan_auto::{agent_with_plan_setting, agent_with_plan_setting_and_subagents};
 
 async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, String) {
     provider_with_secrets(server, name, Vec::new()).await
@@ -357,12 +357,22 @@ async fn children_receive_mcp_tools_without_expanding_parent_permissions() {
         let server = McpService::start().await;
         let (provider, tool) = provider(&server, "review").await;
         let model = Arc::new(ScriptedModel::new(vec![
-            call("delegate", "Subagent", json!({"task":"Read the service"})),
+            call(
+                "delegate",
+                "Subagent",
+                json!({"task":"Read the service","run_in_background":false}),
+            ),
             call("read", &tool, json!({})),
             text("child done"),
             text("parent done"),
         ]));
-        let agent = Agent::new_embedded(config(), model.clone());
+        // The scripted replies need the parent to wait for its child, which only a
+        // non-interactive host offers.
+        let agent = Agent::new_embedded_with_subagent_launch(
+            config(),
+            model.clone(),
+            SubagentLaunch::BackgroundByDefault,
+        );
         agent.install_host_tools(provider).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let parent = agent.create_chat(dir.path().into()).await.unwrap();
@@ -1378,12 +1388,17 @@ async fn children_of_a_plan_entered_from_full_access_decide_mcp_calls_as_full_ac
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
     let model = Arc::new(ScriptedModel::new(vec![
-        call("delegate", "Subagent", json!({"task":"Look it up"})),
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Look it up","run_in_background":false}),
+        ),
         call("read", &tool, json!({})),
         text("child done"),
         text("parent done"),
     ]));
-    let agent = agent_with_plan_setting(model, false);
+    let agent =
+        agent_with_plan_setting_and_subagents(model, false, SubagentLaunch::BackgroundByDefault);
     let reviewer = Arc::new(ScriptedModel::new(vec![]));
     agent.set_auto_reviewer(reviewer.clone()).await;
     agent.install_host_tools(provider).unwrap();

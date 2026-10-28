@@ -115,7 +115,11 @@ async fn run_child_config_fixture() {
     };
     let replies = if requester {
         vec![
-            tickloop_harness::test_support::call("delegate", "Subagent", json!({"task":TASK})),
+            tickloop_harness::test_support::call(
+                "delegate",
+                "Subagent",
+                json!({"task":TASK,"run_in_background":false}),
+            ),
             tickloop_harness::test_support::call(
                 "child-question",
                 "AskUserQuestion",
@@ -131,7 +135,11 @@ async fn run_child_config_fixture() {
         ]
     } else {
         vec![
-            tickloop_harness::test_support::call("delegate", "Subagent", json!({"task":TASK})),
+            tickloop_harness::test_support::call(
+                "delegate",
+                "Subagent",
+                json!({"task":TASK,"run_in_background":false}),
+            ),
             if auto_permissions {
                 let mut reply = tickloop_harness::test_support::text("child reviewed");
                 reply.extend(tickloop_harness::test_support::call(
@@ -157,9 +165,12 @@ async fn run_child_config_fixture() {
             },
         ]
     };
-    let core = tickloop_harness::runtime::Agent::new_embedded(
+    // The script answers the child before the parent's next turn, so the parent waits for the
+    // child's report, which only a non-interactive host offers.
+    let core = tickloop_harness::runtime::Agent::new_embedded_with_subagent_launch(
         model.clone(),
         Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies)),
+        tickloop_harness::runtime::SubagentLaunch::BackgroundByDefault,
     );
     core.set_auto_reviewer(Arc::new(
         tickloop_harness::test_support::ScriptedModel::new(vec![

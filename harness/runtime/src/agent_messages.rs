@@ -924,7 +924,8 @@ mod child_result_tests {
 
     use super::*;
 
-    /// A root that delegates once in the foreground, and a child that answers or fails.
+    /// A root that waits for its child's report, as a non-interactive host lets it, and a child
+    /// that answers or fails.
     struct Family {
         child_fails: bool,
     }
@@ -967,7 +968,7 @@ mod child_result_tests {
                 false if !has_tool_result(&request, "delegate") => call(
                     "delegate",
                     SUBAGENT_TOOL_NAME,
-                    json!({"task": "check", "name": "checker"}),
+                    json!({"task": "check", "name": "checker", "run_in_background": false}),
                 ),
                 false => text("root done"),
             };
@@ -984,7 +985,11 @@ mod child_result_tests {
     /// to read them, give for the same run.
     async fn both_results(child_fails: bool) -> (Value, Value) {
         let directory = tempfile::tempdir().unwrap();
-        let agent = Agent::new_embedded(config(), Arc::new(Family { child_fails }));
+        let agent = Agent::new_embedded_with_subagent_launch(
+            config(),
+            Arc::new(Family { child_fails }),
+            crate::SubagentLaunch::BackgroundByDefault,
+        );
         let root = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         let receipt = agent.submit(root, "delegate".into()).await.unwrap();

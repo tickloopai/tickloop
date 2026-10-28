@@ -155,7 +155,7 @@ fn asking_family() -> Arc<FamilyModel> {
         _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
             DELEGATION_CALL,
             "Subagent",
-            json!({"task": CHILD_TASK, "name": "writer"}),
+            json!({"task": CHILD_TASK, "name": "writer", "run_in_background": false}),
         )),
         _ => Reply::Says(text(ROOT_DONE)),
     })
@@ -177,7 +177,7 @@ fn held_child_family(held: usize) -> Arc<FamilyModel> {
         _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
             DELEGATION_CALL,
             "Subagent",
-            json!({"task": CHILD_TASK, "name": "writer"}),
+            json!({"task": CHILD_TASK, "name": "writer", "run_in_background": false}),
         )),
         _ => Reply::Says(text(ROOT_DONE)),
     })
@@ -439,7 +439,7 @@ async fn subagent_search_inherits_the_direct_parent_without_following_later_root
         Some(CHILD_TASK) => Reply::Says(call(
             "nested",
             "Subagent",
-            json!({"task": GRANDCHILD_TASK, "name": "grandchild"}),
+            json!({"task": GRANDCHILD_TASK, "name": "grandchild", "run_in_background": false}),
         )),
         Some(GRANDCHILD_TASK) => Reply::Says(call(
             "nested-question",
@@ -449,7 +449,7 @@ async fn subagent_search_inherits_the_direct_parent_without_following_later_root
         _ => Reply::Says(call(
             DELEGATION_CALL,
             "Subagent",
-            json!({"task": CHILD_TASK, "name": "child"}),
+            json!({"task": CHILD_TASK, "name": "child", "run_in_background": false}),
         )),
     });
     let agent = harness(store, model, WaitHosting::Durable);
@@ -603,12 +603,12 @@ async fn fixed_search_defaults_reach_every_chat_and_override_stored_family_setti
             Some(CHILD_TASK) if !has_tool_result(request, "nested") => Reply::Says(call(
                 "nested",
                 "Subagent",
-                json!({"task": GRANDCHILD_TASK, "name": "grandchild"}),
+                json!({"task": GRANDCHILD_TASK, "name": "grandchild", "run_in_background": false}),
             )),
             None if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
                 DELEGATION_CALL,
                 "Subagent",
-                json!({"task": CHILD_TASK, "name": "child"}),
+                json!({"task": CHILD_TASK, "name": "child", "run_in_background": false}),
             )),
             _ => Reply::Says(text("Done.")),
         });
@@ -1132,7 +1132,7 @@ fn nested_family() -> Arc<FamilyModel> {
         _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
             DELEGATION_CALL,
             "Subagent",
-            json!({"task": "member", "name": "member"}),
+            json!({"task": "member", "name": "member", "run_in_background": false}),
         )),
         _ => Reply::Says(text(ROOT_DONE)),
     })
@@ -1250,7 +1250,7 @@ fn handing_back_family() -> Arc<FamilyModel> {
         _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
             DELEGATION_CALL,
             "Subagent",
-            json!({"task": "member", "name": "member"}),
+            json!({"task": "member", "name": "member", "run_in_background": false}),
         )),
         _ => Reply::Says(text(ROOT_DONE)),
     })

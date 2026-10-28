@@ -12,8 +12,8 @@ use tickloop_harness_runtime::transcript::{
     TranscriptError, TranscriptStore,
 };
 use tickloop_harness_runtime::{
-    Agent, CitationStyle, HarnessOptions, HarnessSeams, SearchDefaults, ToolPolicy, WaitHosting,
-    environment::FolderEnvironment, visible_citations_at,
+    Agent, CitationStyle, HarnessOptions, HarnessSeams, SearchDefaults, SubagentLaunch, ToolPolicy,
+    WaitHosting, environment::FolderEnvironment, visible_citations_at,
 };
 use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
 use tickloop_harness_test_support::{harness::ChosenModels, transcripts::InMemoryTranscriptStore};
@@ -102,8 +102,12 @@ fn harness(
                 execution_mode_override: Some(ExecutionMode::FullAccess),
                 ..AgentHostOptions::embedded_defaults()
             },
+            // A host that asks no person is non-interactive: its Subagents may be waited for.
             tools: if local {
-                ToolPolicy::local()
+                ToolPolicy {
+                    subagent_launch: SubagentLaunch::BackgroundByDefault,
+                    ..ToolPolicy::local()
+                }
             } else {
                 ToolPolicy {
                     web_search: true,
@@ -781,7 +785,7 @@ async fn process_host_does_not_publish_a_childs_number_when_the_root_source_writ
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Find evidence","name":"researcher"}),
+                json!({"task":"Find evidence","name":"researcher","run_in_background":false}),
             )
         } else {
             text("Finished")

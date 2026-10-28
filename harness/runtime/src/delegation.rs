@@ -134,18 +134,21 @@ pub(super) struct PreparedDelegation {
 }
 
 impl PreparedDelegation {
-    pub(super) fn parse(input: &Value) -> Result<Self, String> {
+    pub(super) fn parse(input: &Value, launch: SubagentLaunch) -> Result<Self, String> {
         let task = input["task"]
             .as_str()
             .map(str::trim)
             .filter(|task| !task.is_empty())
             .ok_or("delegation task cannot be empty")?
             .to_owned();
-        let run_in_background = input
-            .get("run_in_background")
-            .map(|value| value.as_bool().ok_or("run_in_background must be a boolean"))
-            .transpose()?
-            .unwrap_or(false);
+        let run_in_background = match launch {
+            SubagentLaunch::AlwaysBackground => true,
+            SubagentLaunch::BackgroundByDefault => input
+                .get("run_in_background")
+                .map(|value| value.as_bool().ok_or("run_in_background must be a boolean"))
+                .transpose()?
+                .unwrap_or(true),
+        };
         let requested_name = optional_label(input, "name")?;
         let description =
             optional_label(input, "description")?.unwrap_or_else(|| compact_description(&task));
@@ -166,16 +169,65 @@ impl PreparedDelegation {
     }
 }
 
-pub(super) fn definitions() -> Vec<ToolDefinition> {
+/// The input of a `Subagent` call as `launch` offers the tool: a `run_in_background` the model
+/// is not offered is dropped, so an older call or a habit of the model still runs.
+pub(super) fn offered_input(launch: SubagentLaunch, mut input: Value) -> Value {
+    if launch == SubagentLaunch::AlwaysBackground
+        && let Some(fields) = input.as_object_mut()
+    {
+        fields.remove("run_in_background");
+    }
+    input
+}
+
+/// Whether a `Subagent` call with `input` runs in the background under `launch`; a value that
+/// is no boolean fails the call when it is prepared.
+pub(super) fn runs_in_background(launch: SubagentLaunch, input: &Value) -> bool {
+    match launch {
+        SubagentLaunch::AlwaysBackground => true,
+        SubagentLaunch::BackgroundByDefault => input
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
+/// Claude Code's sentences on background Subagents under each launch.
+fn background_guidance(launch: SubagentLaunch) -> &'static str {
+    match launch {
+        SubagentLaunch::AlwaysBackground => {
+            "Subagents run in the background; you'll be notified when one completes. Never fabricate or predict a pending agent's results — the notification is never something you write yourself; if the user asks before it arrives, say it's still running."
+        }
+        SubagentLaunch::BackgroundByDefault => {
+            "Subagents run in the background by default; you'll be notified when one completes. Pass `run_in_background: false` only when your very next action depends on the result and nothing else could usefully happen while it runs — otherwise background it so the user can interject. Never fabricate or predict a pending agent's results — the notification is never something you write yourself; if the user asks before it arrives, say it's still running."
+        }
+    }
+}
+
+pub(super) fn definitions(launch: SubagentLaunch) -> Vec<ToolDefinition> {
+    let later_runs = match launch {
+        SubagentLaunch::AlwaysBackground => {
+            "Every later run of the child (a user follow-up or your SendMessage) also completes as a task notification."
+        }
+        SubagentLaunch::BackgroundByDefault => {
+            "Interrupting a call that waits for the report does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage)."
+        }
+    };
+    let mut properties = json!({
+        "task":{"type":"string","minLength":1},
+        "name":{"type":"string","minLength":1,"description":"Short lowercase agent name, such as file-check; unique within this parent's children."},
+        "description":{"type":"string","minLength":1,"description":"Short 3–5 word task description for the Subagents list; defaults to task."}
+    });
+    if launch == SubagentLaunch::BackgroundByDefault {
+        properties["run_in_background"] = json!({"type":"boolean","default":true,"description":"false waits for the child's final report and returns it as this call's result."});
+    }
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
-        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Chat and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Delegation is limited to three levels below main; history rewrites are unavailable.".into(),
-        input_schema: json!({"type":"object","properties":{
-            "task":{"type":"string","minLength":1},
-            "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
-            "name":{"type":"string","minLength":1,"description":"Short lowercase agent name, such as file-check; unique within this parent's children."},
-            "description":{"type":"string","minLength":1,"description":"Short 3–5 word task description for the Subagents list; defaults to task."}
-        },"required":["task"],"additionalProperties":false}),
+        description: format!(
+            "Create one bounded independent child under your frozen resource and permission ceiling. {} Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Chat and approval/question requests. {later_runs} Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Delegation is limited to three levels below main; history rewrites are unavailable.",
+            background_guidance(launch)
+        ),
+        input_schema: json!({"type":"object","properties":properties,"required":["task"],"additionalProperties":false}),
     }]
 }
 
@@ -1386,6 +1438,9 @@ impl Agent {
     }
 }
 
+/// Claude Code's guidance in a launched background agent's result.
+const LAUNCHED_MESSAGE: &str = "The agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime. If the user asks for progress, say the agent is still running.";
+
 /// What a background `Subagent` call returns: the child it launched.
 pub(super) fn launched_result(
     ids: &IdContext,
@@ -1396,7 +1451,7 @@ pub(super) fn launched_result(
         content: json!({"status":"async_launched", "child_chat_id":ids.model_text(child.chat_id),
             "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),
             "handle":registration.handle,"description":registration.description,
-            "created_at":registration.created_at})
+            "created_at":registration.created_at,"message":LAUNCHED_MESSAGE})
         .to_string(),
         is_error: false,
         output_ref: None,

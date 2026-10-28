@@ -6,7 +6,7 @@ use tickloop_harness_protocol::{
     ExecutionMode, PermissionRule, PromptPolicy, ToolResult,
 };
 use tickloop_harness_runtime::{
-    Agent, HarnessOptions, HarnessSeams,
+    Agent, HarnessOptions, HarnessSeams, SubagentLaunch, ToolPolicy,
     environment::{
         ExecutionIsolation, NetworkIsolation, WriteIsolation, memory::MemoryEnvironment,
     },
@@ -353,7 +353,7 @@ async fn subagent_bash_skips_approval_under_the_frozen_parent_permissions() {
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Build the project", "name":"builder"}),
+                json!({"task":"Build the project", "name":"builder", "run_in_background":false}),
             )
         }));
         let build_reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -380,6 +380,12 @@ async fn subagent_bash_skips_approval_under_the_frozen_parent_permissions() {
                 host: AgentHostOptions {
                     prompt_policy: PromptPolicy::DenyOnPrompt,
                     ..AgentHostOptions::embedded_defaults()
+                },
+                // The root waits for its child's result, which only a non-interactive host
+                // offers.
+                tools: ToolPolicy {
+                    subagent_launch: SubagentLaunch::BackgroundByDefault,
+                    ..ToolPolicy::local()
                 },
                 ..HarnessOptions::local(config())
             },

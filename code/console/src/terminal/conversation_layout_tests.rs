@@ -512,7 +512,8 @@ impl FamilyScript {
                     serde_json::json!({
                         "task": "Check the config files",
                         "name": "config",
-                        "description": "Check the config"
+                        "description": "Check the config",
+                        "run_in_background": false
                     }),
                 )
             } else if !has_tool_result(request, "logs") {
@@ -613,15 +614,17 @@ fn says(snapshot: &ChatSnapshot, reply: &str) -> bool {
     })
 }
 
-/// A root Chat in `mode` whose family `model` answers; every automatic review allows.
+/// A root Chat in `mode` whose family `model` answers; every automatic review allows. The host is
+/// non-interactive, so a Subagent call may wait in the foreground.
 async fn family(
     model: Arc<FamilyScript>,
     mode: ExecutionMode,
     workdir: &std::path::Path,
 ) -> (tickloop_harness::runtime::Agent, Agent, Uuid) {
-    let core = tickloop_harness::runtime::Agent::new_embedded(
+    let core = tickloop_harness::runtime::Agent::new_embedded_with_subagent_launch(
         tickloop_harness::test_support::config(),
         model,
+        tickloop_harness::runtime::SubagentLaunch::BackgroundByDefault,
     );
     core.set_auto_reviewer(Arc::new(
         tickloop_harness::test_support::ScriptedModel::new(vec![

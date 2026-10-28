@@ -4,7 +4,7 @@ use tickloop_harness::protocol::{
     ChatId, Content, Event, EventKind, ExecutionMode, HostNote, LoopState, PermissionRequest,
     PermissionScope, QuestionAnswer, Receipt, Role,
 };
-use tickloop_harness::runtime::Agent;
+use tickloop_harness::runtime::{Agent, SubagentLaunch};
 use tickloop_harness::test_support::*;
 use tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME;
 use tokio::sync::broadcast::Receiver;
@@ -580,12 +580,19 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
         call(
             "delegate",
             "Subagent",
-            serde_json::json!({"task":"Research the report change and propose a plan."}),
+            serde_json::json!({
+                "task": "Research the report change and propose a plan.",
+                "run_in_background": false
+            }),
         ),
         text("Child findings: change report.rs and add a regression test."),
         submit_plan("plan", "Change report.rs and add a regression test."),
     ]));
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     agent
         .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![text(
             &auto_classification(false).to_string(),

@@ -324,7 +324,7 @@ impl ToolRegistry {
             })
         {
             tools.extend(
-                delegation::definitions()
+                delegation::definitions(policy.subagent_launch)
                     .into_iter()
                     .map(|definition| RegisteredTool {
                         definition,
@@ -646,6 +646,7 @@ impl ToolRegistry {
         input: &Value,
         workspace: &tickloop_harness_tools::Workspace,
         waits: crate::WaitHosting,
+        subagent_launch: crate::SubagentLaunch,
     ) -> bool {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
             return false;
@@ -659,10 +660,7 @@ impl ToolRegistry {
             // hosted Run goes on from exactly one waiting call.
             ToolRoute::Delegation => {
                 waits == crate::WaitHosting::Process
-                    || input
-                        .get("run_in_background")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
+                    || delegation::runs_in_background(subagent_launch, input)
             }
             ToolRoute::McpResource(_) => true,
             ToolRoute::SharedTask => matches!(name, "TaskGet" | "TaskList"),
@@ -1185,6 +1183,14 @@ impl Agent {
             }
             registered
         });
+        let input = if registration
+            .as_ref()
+            .is_some_and(|tool| matches!(tool.route, ToolRoute::Delegation))
+        {
+            delegation::offered_input(self.inner.tool_policy.subagent_launch, input)
+        } else {
+            input
+        };
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
         }
@@ -1450,7 +1456,10 @@ impl Agent {
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::Delegation)
         ) {
-            match delegation::PreparedDelegation::parse(&input) {
+            match delegation::PreparedDelegation::parse(
+                &input,
+                self.inner.tool_policy.subagent_launch,
+            ) {
                 Ok(prepared) => Some(PreparedLocalCall::Delegation(prepared)),
                 Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
             }
@@ -2995,7 +3004,14 @@ mod tests {
                     }),
             )
             .chain([false, true].into_iter().map(interaction::definition))
-            .chain(delegation::definitions())
+            .chain(
+                [
+                    crate::SubagentLaunch::AlwaysBackground,
+                    crate::SubagentLaunch::BackgroundByDefault,
+                ]
+                .into_iter()
+                .flat_map(delegation::definitions),
+            )
             .chain(agent_messages::definitions())
             .chain([crate::handback::definition()])
             .chain(crate::scheduled_tasks::tools::definitions(

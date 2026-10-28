@@ -43,6 +43,9 @@ mod file_tools;
 #[path = "all/plan_auto.rs"]
 mod plan_auto;
 
+#[path = "all/subagent_launch.rs"]
+mod subagent_launch;
+
 #[path = "all/host_tools.rs"]
 mod host_tools;
 

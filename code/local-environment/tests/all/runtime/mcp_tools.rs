@@ -15,7 +15,7 @@ use tickloop_harness::protocol::{
     LoopId, LoopState, ModelIdentity, OperationState, ToolDefinition, ToolResult,
 };
 use tickloop_harness::runtime::{
-    Agent,
+    Agent, SubagentLaunch,
     host_tools::{
         HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
         PreparedHostCall, WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
@@ -1267,13 +1267,19 @@ fn artifact_tick(service: &ArtifactService, artifact_id: &str) -> ArtifactTick {
     }
 }
 
+/// An embedded Agent signed in to `service`, on a non-interactive host so a delegating script
+/// can wait for its child's report with `run_in_background: false`.
 async fn signed_in_agent(
     service: &ArtifactService,
     directory: &std::path::Path,
     model: Arc<dyn ModelClient>,
 ) -> Agent {
     let account = service.login(directory).await;
-    let agent = Agent::new_embedded(config(), model);
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model,
+        SubagentLaunch::BackgroundByDefault,
+    );
     agent
         .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
         .unwrap();
@@ -1789,7 +1795,7 @@ async fn delegated_chat_inherits_the_artifact_tools() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Inspect available Artifact tools"}),
+            json!({"task":"Inspect available Artifact tools","run_in_background":false}),
         ),
         text("Child inspected tools."),
         text("Done."),
@@ -1829,7 +1835,7 @@ async fn delegated_artifact_calls_obey_frozen_allow_ask_and_deny() {
             call(
                 "delegate",
                 "Subagent",
-                json!({"task":"Reply in the fixture thread"}),
+                json!({"task":"Reply in the fixture thread","run_in_background":false}),
             ),
             call(
                 "child-reply",
@@ -4667,7 +4673,7 @@ async fn a_child_delegated_before_sign_in_takes_up_the_artifact_tools() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Prepare an Artifact draft"}),
+            json!({"task":"Prepare an Artifact draft","run_in_background":false}),
         ),
         call(
             "wait",
@@ -4685,7 +4691,11 @@ async fn a_child_delegated_before_sign_in_takes_up_the_artifact_tools() {
         text("Child read the doc."),
         text("Done."),
     ]));
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     agent
         .install_host_tools(Arc::new(McpHostToolProvider::new(
             service.client(directory.path()),
@@ -5651,7 +5661,7 @@ async fn a_subagent_uploads_only_files_its_own_read_could_take() {
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Put the images on the Slides"}),
+            json!({"task":"Put the images on the Slides","run_in_background":false}),
         ),
         upload_call("inside", &inside),
         upload_call("outside", &outside),
@@ -5758,7 +5768,7 @@ async fn a_parent_read_denial_frozen_into_the_delegation_refuses_a_subagent_uplo
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Put the chart on the Slides"}),
+            json!({"task":"Put the chart on the Slides","run_in_background":false}),
         ),
         call(
             "ready",
@@ -5835,7 +5845,7 @@ async fn a_frozen_parent_session_denial_of_reading_the_file_refuses_a_subagent_u
         call(
             "delegate",
             "Subagent",
-            json!({"task":"Put the photo on the Slides"}),
+            json!({"task":"Put the photo on the Slides","run_in_background":false}),
         ),
         upload_call("child-upload", &path),
         text("The child could not send it."),
