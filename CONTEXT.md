@@ -133,7 +133,7 @@ The Loop's single queue of inputs awaiting execution, taken in priority order: u
 _Avoid_: inbox, to-do queue
 
 **Send Now**:
-A way of submitting while the Agent is working that delivers a message to the model immediately (`ctrl+enter`): the current turn's foreground Subagents and Bash commands move to the background without being interrupted, and the turn takes the message at its tool boundary; when nothing can move, or other work still holds the turn after a short grace, the turn is interrupted and the message starts a new one. A normal submission only queues.
+A way of submitting while the Agent is working that makes a message start a new turn immediately (`ctrl+enter`): it first interrupts the current turn, then runs this message. A normal submission only queues.
 _Avoid_: "jump the queue", Steer
 
 **Receiving**:

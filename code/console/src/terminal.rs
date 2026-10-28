@@ -881,7 +881,7 @@ Built-in /model choices and persistent rules are saved in settings.json there; m
 
 Enter a task; follow-up inputs are accepted while the current run continues.
 Queued messages, commands and Shell input appear above the editor; up on the first visual row restores editable queued input.
-While the Agent works, enter queues a message for its next tool boundary; ctrl+enter send now delivers it at once, or with empty input the oldest queued message: running foreground Subagents and Bash commands move to the background and keep running, so the turn takes the message, and otherwise the turn is interrupted. Idle, ctrl+enter is enter.
+While the Agent works, enter queues a message for its next tool boundary; ctrl+enter send now interrupts the turn and sends it at once, or with empty input the oldest queued message. Idle, ctrl+enter is enter.
 ctrl+enter needs a terminal that reports it (kitty keyboard protocol: Ghostty, kitty, WezTerm, iTerm2 with CSI u, or Herdr inside one); elsewhere enter then esc does the same, since esc interrupts and queued messages start right away.
 The footer contains only Subagents N when there are subagents, expanded by default.
 down on the last visual input row, after history ends, enters the Subagents list at the row selected last, without submitting the draft; a folded list unfolds.

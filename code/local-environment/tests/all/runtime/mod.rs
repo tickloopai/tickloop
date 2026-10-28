@@ -58,7 +58,6 @@ mod rewind_points;
 mod rewind_restore;
 mod scheduled_provenance;
 mod scheduled_tasks;
-mod send_now;
 mod session_permission_branching;
 mod shared_tasks;
 mod shell_descriptions;

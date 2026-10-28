@@ -47,7 +47,6 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
-mod send_now;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod tick_adapter;
@@ -345,9 +344,6 @@ struct Inner {
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
-    /// What moves each foreground call send now can move to the background, by its Run and call,
-    /// while the call waits on it.
-    movable_calls: std::sync::Mutex<HashMap<(RunId, String), CancellationToken>>,
     family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
     /// Changes whenever a Chat's input ledger accepts or settles an input.
     ledger_changes: tokio::sync::watch::Sender<()>,
@@ -1926,6 +1922,27 @@ impl Agent {
         Ok(operations)
     }
 
+    /// Sends the queued user message `run_id` now: interrupts the work ahead of it, after which
+    /// it starts at once instead of at the next tool boundary. The check and the interruption
+    /// share one lock, so the run answering a message that has already joined or started it is
+    /// never interrupted. Such a message, an unknown one, or one with no work ahead is left as is.
+    pub async fn send_now(
+        &self,
+        chat_id: ChatId,
+        run_id: RunId,
+    ) -> Result<Vec<OperationRecord>, AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let is_queued_message = chat.snapshot.queued_inputs().iter().any(|queued| {
+            queued.id == run_id && queued.armed && queued.kind == QueuedInputKind::Message
+        });
+        let has_work_ahead = chat.active.is_some() || !chat.parked.is_empty();
+        if !is_queued_message || !has_work_ahead {
+            return Ok(Vec::new());
+        }
+        Ok(chat.interrupt())
+    }
+
     /// Opens a persistent Agent rooted at `root`. No Chat is loaded on open; use
     /// [`Agent::resume_chat`] to resume one by id and [`Agent::saved_chats`] to list saved Chats.
     ///
@@ -2088,7 +2105,6 @@ impl Agent {
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 subagent_invocations: Mutex::new(HashMap::new()),
-                movable_calls: std::sync::Mutex::new(HashMap::new()),
                 family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
                 ledger_changes: tokio::sync::watch::channel(()).0,
                 title_requests: Mutex::new(HashMap::new()),

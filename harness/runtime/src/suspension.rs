@@ -467,17 +467,12 @@ impl Agent {
                     };
                     let call_id = call_id.clone().unwrap_or_default();
                     // The call goes on returning the child's run, so its completion is no
-                    // notification, unless send now resolved the wait before the run ended.
-                    let is_moved = is_resolved
-                        && !chat.snapshot.family_completions.iter().any(|completion| {
-                            completion.child_chat_id == child.chat_id
-                                && completion.child_run_id == child.run_id
-                        });
+                    // notification.
                     invocations.push((
                         (wait.run_id, call_id.clone()),
                         crate::delegation::SubagentInvocation {
                             receipt: child.clone(),
-                            run_in_background: is_moved,
+                            run_in_background: false,
                         },
                     ));
                     chat.snapshot.operations.push(OperationRecord {

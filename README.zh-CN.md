@@ -63,7 +63,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 按键：
 
-- `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 立即发送：正在前台运行的 Subagent 和 Bash 命令转到后台继续运行，其他工作则被打断。
+- `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。
 - `esc` 打断 Agent。输入为空时连按两次，可撤回到之前的某条消息。
 - `shift+tab` 在 Auto 与 Plan 模式之间切换。
 - `ctrl+j` 换行；`ctrl+g` 用外部编辑器编辑消息。
