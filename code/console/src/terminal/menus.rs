@@ -828,6 +828,49 @@ impl Menus {
         self.active.as_ref().map(|(id, _)| *id)
     }
 
+    /// Saves the user's edit of the plan reviewed in `menu_id` and reopens the review on the
+    /// edited version; a review that has since closed or moved on keeps its plan.
+    pub(super) async fn edit_plan(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        menu_id: Uuid,
+        markdown: String,
+    ) -> Result<(), String> {
+        let Some((
+            id,
+            Selection::Workflow(Workflow::Plan {
+                chat,
+                version,
+                request,
+                ..
+            }),
+        )) = &self.active
+        else {
+            return Ok(());
+        };
+        if *id != menu_id {
+            return Ok(());
+        }
+        let reviewed = Workflow::Plan {
+            chat: *chat,
+            version: *version,
+            request: *request,
+            markdown: String::new(),
+        };
+        let (mut menu, mut edited) = reviewed.edit_plan(agent, markdown).await?;
+        if let Workflow::Plan {
+            request: current, ..
+        } = &mut edited
+        {
+            *current = *request;
+        }
+        menu.title = console
+            .menu_snapshot(menu_id)?
+            .map_or(menu.title, |shown| shown.title);
+        self.workflow(console, (menu, edited))
+    }
+
     pub(super) fn locations(
         &mut self,
         console: &Console,
@@ -1044,6 +1087,13 @@ impl Menus {
                 || matches!(&selection, Selection::Permission { request, .. } if is_plan_mode_confirmation(request));
             if plan_dialog {
                 console.show_plan_menu(menu, plan_feedback)?;
+                if let Selection::Workflow(Workflow::Plan { markdown, .. }) = &selection {
+                    console.offer_plan_review(super::console::PlanReview {
+                        menu_id: id,
+                        markdown: markdown.clone(),
+                        feedback_approval: super::workflows::feedback_approval_index(),
+                    })?;
+                }
             } else if matches!(&selection, Selection::Goal { actions, .. } if actions.iter().any(|action| matches!(action, goal::GoalMenuAction::Continue { .. })))
             {
                 console.show_continue_menu(menu)?;

@@ -67,6 +67,10 @@ mod monitor_tests;
 mod plan_flow_pty;
 #[cfg(test)]
 mod plan_markdown_tests;
+mod plan_review;
+pub(super) use plan_review::{PlanReview, RequestedPlanEdit};
+#[cfg(test)]
+mod plan_review_tests;
 mod prompt_suggestion;
 #[cfg(test)]
 mod prompt_suggestion_pty;
@@ -358,6 +362,11 @@ pub(super) enum InputEvent {
         menu_id: Uuid,
         index: usize,
     },
+    /// The user edited the plan under review in the plan approval dialog `menu_id`.
+    PlanEdited {
+        menu_id: Uuid,
+        markdown: String,
+    },
     /// Moves a question menu to the previous or next question.
     SwitchQuestion {
         menu_id: Uuid,
@@ -465,6 +474,11 @@ impl fmt::Debug for InputEvent {
                 .debug_struct("ExpandChoice")
                 .field("menu_id", menu_id)
                 .field("index", index)
+                .finish(),
+            Self::PlanEdited { menu_id, markdown } => formatter
+                .debug_struct("PlanEdited")
+                .field("menu_id", menu_id)
+                .field("bytes", &markdown.len())
                 .finish(),
             Self::SwitchQuestion { menu_id, next } => formatter
                 .debug_struct("SwitchQuestion")
@@ -874,6 +888,8 @@ pub(super) struct State {
     menu_review: Option<MenuReviewState>,
     full_review: bool,
     menu_plan: bool,
+    plan_review: Option<PlanReview>,
+    requested_plan_edit: Option<plan_review::RequestedPlanEdit>,
     menu_continue: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
@@ -6163,6 +6179,8 @@ impl State {
             menu_review: None,
             full_review: false,
             menu_plan: false,
+            plan_review: None,
+            requested_plan_edit: None,
             menu_continue: false,
             menu_comment: None,
             menu_expand_options: Vec::new(),
@@ -7787,6 +7805,8 @@ impl State {
             format!("{} · enter submit · esc close field", comment.label)
         } else if self.question_menu.is_some() {
             "Type your answer · enter submit · esc close field".into()
+        } else if let Some(hint) = self.plan_feedback_hint() {
+            hint
         } else if comment.label == "Guidance" {
             "add context (optional) · enter submit · tab close · esc close".into()
         } else {
@@ -8197,7 +8217,10 @@ impl State {
             let mut hints = Vec::new();
             if !hint.is_empty() {
                 // A narrow question dialog drops navigation before Enter and Esc.
-                if self.input_dialog_has_fixed_height() && self.question_menu.is_none() {
+                if self.input_dialog_has_fixed_height()
+                    && self.question_menu.is_none()
+                    && !self.menu_plan
+                {
                     hints.push((hint, 10));
                 } else {
                     hints.extend(self.user_hint_parts(&hint));
@@ -8216,9 +8239,11 @@ impl State {
                 if !editing {
                     hints.push(("pgup/pgdn plan".into(), 10));
                     self.dialog_scrolls_own_content = true;
+                    // The feedback row's own hint names tab, so a narrow dialog drops this first.
                     if self.menu_comment.is_some() {
-                        hints.push(("tab feedback".into(), 10));
+                        hints.push(("tab feedback".into(), 9));
                     }
+                    hints.extend(self.plan_review_hints());
                 }
             } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
@@ -11297,6 +11322,33 @@ impl State {
     /// Returns `None` when the terminal could not be handed over or taken back;
     /// the status line then carries the reason.
     fn edit_text_in_terminal(&mut self, draft: &str) -> Option<ExternalEditorOutcome> {
+        self.lend_terminal_to_editor(|working_directory| edit_prompt(draft, working_directory))
+    }
+
+    /// Opens `path` itself in the external editor; `None` as for `edit_text_in_terminal`.
+    fn run_external_file_editor(&mut self, path: &Path) -> Option<ExternalEditorOutcome> {
+        match &self.external_editor {
+            ExternalEditorLauncher::Terminal => self.lend_terminal_to_editor(|working_directory| {
+                super::external_editor::edit_file(path, working_directory)
+            }),
+            #[cfg(test)]
+            ExternalEditorLauncher::Scripted {
+                opened_drafts,
+                outcome,
+            } => {
+                opened_drafts
+                    .lock()
+                    .unwrap()
+                    .push(path.display().to_string());
+                Some(outcome.clone())
+            }
+        }
+    }
+
+    fn lend_terminal_to_editor(
+        &mut self,
+        edit: impl FnOnce(&Path) -> ExternalEditorOutcome,
+    ) -> Option<ExternalEditorOutcome> {
         let working_directory = self
             .mention_roots
             .as_ref()
@@ -11327,7 +11379,7 @@ impl State {
             self.status = format!("Cannot leave raw mode for editor: {error}");
             return None;
         }
-        let outcome = edit_prompt(draft, &working_directory);
+        let outcome = edit(&working_directory);
         let raw_result = terminal::enable_raw_mode();
         let screen_result = self.surface.take(self.renderer, &mut output);
         self.screen_initialized = false;
@@ -12674,6 +12726,9 @@ impl State {
         {
             return None;
         }
+        if let Some(event) = self.plan_review_key(key) {
+            return event;
+        }
         if self.menu_focused && self.menu_comment_is_editing() {
             self.escape_confirmation = None;
             match key.code {
@@ -13579,13 +13634,21 @@ fn read_keys(
             // Terminals report motion only when the pointer changes cell, so a drag held at an
             // edge keeps scrolling from here.
             let selection_scrolled = state.scroll_selection(Instant::now());
+            let requested_plan_edit = state.take_requested_plan_edit();
             if state.poll_clipboard_hint(Instant::now())
                 || confirmation_expired
                 || rows_changed
                 || hint_changed
                 || selection_scrolled
+                || requested_plan_edit.is_some()
             {
                 state.draw(&mut io::stdout().lock())?;
+            }
+            drop(state);
+            if let Some(input) = requested_plan_edit.flatten()
+                && !send_input(sender, stop, input)
+            {
+                break;
             }
             continue;
         }

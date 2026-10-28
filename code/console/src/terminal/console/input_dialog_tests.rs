@@ -2361,7 +2361,7 @@ fn a_child_cannot_use_plan_or_change_its_mode() {
 /// into Plan mode.
 #[tokio::test]
 async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
-    use crate::terminal::{execution::ConsoleExecution, menus::Menus, open_current_plan};
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, run_plan_command};
     use tickloop_harness::protocol::{EventKind, ExecutionMode};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
@@ -2407,7 +2407,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
     console.select_chat(Some(child.into())).unwrap();
     console.set_visible_delegation(true).unwrap();
     let mut menus = Menus::default();
-    let refusal = open_current_plan(&agent, &console, &mut menus, Some(child))
+    let refusal = run_plan_command(&agent, &console, &mut menus, Some(child), "")
         .await
         .unwrap_err();
     assert!(

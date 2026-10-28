@@ -1497,15 +1497,26 @@ impl EmbeddedAgentAccess {
                 agent.disable_event_sources_for_chat(chat.into()).await;
                 Ok(CommandResult::Done)
             }
-            LoopAction::ApprovePlan { version, mode } => {
+            LoopAction::ApprovePlan {
+                version,
+                mode,
+                feedback,
+            } => {
                 match agent
-                    .approve_plan(chat.into(), version, mode)
+                    .approve_plan_with_feedback(chat.into(), version, mode, feedback)
                     .await
                     .map_err(agent_access_error)?
                 {
                     Some(continuation) => Ok(CommandResult::Text(continuation)),
                     None => Ok(CommandResult::Done),
                 }
+            }
+            LoopAction::EditPlan { version, markdown } => {
+                agent
+                    .edit_plan(chat.into(), version, markdown)
+                    .await
+                    .map_err(agent_access_error)?;
+                Ok(CommandResult::Done)
             }
             LoopAction::DeclinePlan { version, feedback } => {
                 match agent
@@ -1907,6 +1918,13 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::McpServers => {
                 ObservationValue::McpServers(self.inner.agent.mcp_servers().await)
             }
+            AgentDetailQuery::PlanFile => ObservationValue::PlanFile(
+                self.inner
+                    .agent
+                    .plan_file(chat.into())
+                    .await
+                    .map_err(agent_access_error)?,
+            ),
         })
     }
 

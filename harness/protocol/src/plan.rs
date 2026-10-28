@@ -11,6 +11,9 @@ pub struct Plan {
     pub approved_execution_mode: Option<ExecutionMode>,
     #[serde(default)]
     pub approval_pending: bool,
+    /// The user replaced the model's text in plan review; process-local like the approved mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited_by_user: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

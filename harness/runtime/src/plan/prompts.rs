@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::mcp_tools::ARTIFACT_EDIT_TOOL;
 
-use tickloop_harness_protocol::SUBAGENT_TOOL_NAME;
+use tickloop_harness_protocol::{Plan, SUBAGENT_TOOL_NAME};
 use tickloop_harness_tools::{
     ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
@@ -207,14 +207,26 @@ pub(super) fn declined_plan(feedback: Option<&str>) -> String {
 
 /// Claude Code 2.1.302's approved ExitPlanMode result, also used to continue a saved plan whose
 /// original Run ended. It suggests updating the task list only when the Chat offers the task
-/// tools.
-pub(super) fn approved_plan(path: &Path, markdown: &str, offers_task_tools: bool) -> String {
+/// tools, marks a plan the user edited in review and appends feedback given on approval.
+pub(super) fn approved_plan(
+    path: &Path,
+    plan: &Plan,
+    feedback: Option<&str>,
+    offers_task_tools: bool,
+) -> String {
     let task_list_hint = if offers_task_tools {
         " Start with updating your todo list if applicable"
     } else {
         ""
     };
-    let heading = "Approved Plan";
+    let heading = if plan.edited_by_user {
+        "Approved Plan (edited by user)"
+    } else {
+        "Approved Plan"
+    };
+    let feedback = feedback
+        .map(|feedback| format!("\n\nUser feedback on this plan: {feedback}"))
+        .unwrap_or_default();
     format!(
         "User has approved your plan. You can now start coding.{task_list_hint}
 
@@ -222,8 +234,9 @@ Your plan has been saved to: {}
 You can refer back to it if needed during implementation.
 
 ## {heading}:
-{markdown}",
-        path.display()
+{}{feedback}",
+        path.display(),
+        plan.markdown
     )
 }
 
@@ -535,16 +548,27 @@ mod tests {
     #[test]
     fn the_approved_result_suggests_the_task_list_only_with_task_tools() {
         let path = Path::new(PLAN_FILE);
-        let tail = "\n\nYour plan has been saved to: /root/plans/calm-baking-aurora-loop-x.md\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n1. Do it.";
+        let mut plan = Plan {
+            loop_id: tickloop_harness_protocol::LoopId::new(),
+            version: 1,
+            markdown: "1. Do it.".into(),
+            approved_execution_mode: None,
+            approval_pending: false,
+            edited_by_user: false,
+        };
+        let saved = "\n\nYour plan has been saved to: /root/plans/calm-baking-aurora-loop-x.md\nYou can refer back to it if needed during implementation.\n\n";
         assert_eq!(
-            approved_plan(path, "1. Do it.", true),
+            approved_plan(path, &plan, None, true),
             format!(
-                "User has approved your plan. You can now start coding. Start with updating your todo list if applicable{tail}"
+                "User has approved your plan. You can now start coding. Start with updating your todo list if applicable{saved}## Approved Plan:\n1. Do it."
             )
         );
+        plan.edited_by_user = true;
         assert_eq!(
-            approved_plan(path, "1. Do it.", false),
-            format!("User has approved your plan. You can now start coding.{tail}")
+            approved_plan(path, &plan, Some("Keep it short"), false),
+            format!(
+                "User has approved your plan. You can now start coding.{saved}## Approved Plan (edited by user):\n1. Do it.\n\nUser feedback on this plan: Keep it short"
+            )
         );
     }
 

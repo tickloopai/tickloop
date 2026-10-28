@@ -3288,13 +3288,36 @@ impl ConsoleExecution {
         chat: Uuid,
         version: u64,
         mode: ExecutionMode,
+        feedback: Option<String>,
     ) -> Result<Option<String>, AccessError> {
         match self
-            .loop_command(chat, LoopAction::ApprovePlan { version, mode })
+            .loop_command(
+                chat,
+                LoopAction::ApprovePlan {
+                    version,
+                    mode,
+                    feedback,
+                },
+            )
             .await?
         {
             CommandResult::Text(value) => Ok(Some(value)),
             CommandResult::Done => Ok(None),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn edit_plan(
+        &self,
+        chat: Uuid,
+        version: u64,
+        markdown: String,
+    ) -> Result<(), AccessError> {
+        match self
+            .loop_command(chat, LoopAction::EditPlan { version, markdown })
+            .await?
+        {
+            CommandResult::Done => Ok(()),
             _ => Err(unexpected()),
         }
     }
@@ -3670,6 +3693,16 @@ impl ConsoleExecution {
     ) -> Result<ApprovalHistoryView, AccessError> {
         match self.value(chat, AgentDetailQuery::ApprovalHistory).await? {
             ObservationValue::ApprovalHistory(view) => Ok(view),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn plan_file(
+        &self,
+        chat: Uuid,
+    ) -> Result<Option<std::path::PathBuf>, AccessError> {
+        match self.value(chat, AgentDetailQuery::PlanFile).await? {
+            ObservationValue::PlanFile(path) => Ok(path),
             _ => Err(unexpected()),
         }
     }
