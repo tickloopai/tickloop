@@ -17,10 +17,11 @@ async fn permissions_shows_sandbox_setting_and_bang_shell_obeys_it() {
             view.send(b"!printf allowed > allowed; printf blocked > blocked\r");
             view.wait_for("Shell finished and composer restored", |frame| {
                 frame.lines().any(|line| line.trim() == "❯")
-                    && if enabled { frame.contains("被沙箱拦截") } else { fixture.path("work/blocked").exists() }
+                    && if enabled { frame.contains("被沙箱拦截") } else { frame.contains("(No output)") && fixture.path("work/blocked").exists() }
             }).await;
             assert_eq!(std::fs::read_to_string(fixture.path("work/allowed")).unwrap(), "allowed");
             assert_eq!(fixture.path("work/blocked").exists(), !enabled);
+            view.wait_for_editor("Shell releases the editor", Some("")).await;
             view.send(b"/permissions\r");
             let label = if enabled { "Sandbox: on" } else { "Sandbox: off" };
             view.wait_for("configured sandbox state in permissions", |frame| frame.contains(label)).await;

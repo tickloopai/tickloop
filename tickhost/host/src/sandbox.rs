@@ -52,9 +52,17 @@ pub async fn availability() -> Result<(), String> {
             return Err("sandbox unavailable: process is already sandboxed".into());
         }
     }
-    let output = tokio::process::Command::new(SANDBOX_EXEC)
+    let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+    command
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = tickhost_connect::hosted::spawn_child(|| command.spawn())
+        .map_err(|error| format!("sandbox unavailable: {error}"))?;
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|error| format!("sandbox unavailable: {error}"))?;
     if output.status.success() {
