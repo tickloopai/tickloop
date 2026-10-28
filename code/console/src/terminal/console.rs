@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_layout;
+mod cards;
 mod delayed_submissions;
 use delayed_submissions::DelayedSubmission;
 #[cfg(test)]
@@ -33,6 +34,9 @@ pub(super) use upgrade::ConsoleUpgrade;
 mod file_index_worker;
 mod skill_discovery;
 use file_index_worker::{FileIndexWorker, IndexRequest};
+#[cfg(test)]
+#[path = "console/cards_tests.rs"]
+mod cards_tests;
 #[cfg(test)]
 #[path = "console/connection_tests.rs"]
 mod connection_tests;
@@ -741,12 +745,6 @@ struct Lifetime {
     surface: TerminalSurface,
 }
 
-/// A hosted Tick of `chat` waiting to take the terminal.
-struct FullScreenAttach {
-    chat: Uuid,
-    grant: tickloop_harness::protocol::HostedViewGrant,
-}
-
 pub(super) struct State {
     workspace_trust: Option<WorkspaceTrust>,
     pub(super) interactive: bool,
@@ -924,14 +922,12 @@ pub(super) struct State {
     /// Where the last frame drew Monitor's `│` separator beside the conversation: its column and
     /// rows.
     monitor_separator: Option<(usize, std::ops::Range<usize>)>,
-    /// Whether Monitor may float hosted Ticks in a Herdr popup, as the settings say.
-    monitor_popup: tickloop_code_settings::MonitorPopup,
-    /// The socket of the Herdr session this View runs inside, where Enter floats hosted Ticks.
-    herdr_socket: Option<PathBuf>,
-    /// A hosted Tick waiting to take this terminal; the input thread attaches it between keys.
-    full_screen_attach: Option<FullScreenAttach>,
-    /// An attached view owns the terminal; nothing is drawn until it is taken back.
-    terminal_lent: bool,
+    /// The Monitor cards open in the shown Chat and the one with the focus.
+    cards: super::monitor_cards::MonitorCards,
+    /// The Tick screen size the last frame gave each shown card.
+    card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
+    /// A left press on a card or on a row with a card; it acts on its release.
+    card_press: Option<(Cell, super::monitor::MonitorTarget)>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
     /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
@@ -1292,6 +1288,7 @@ fn tint_prompt(line: &mut RoleLine, prompt: &str, role: Role) {
                 text: rest,
                 role: rest_role,
                 link,
+                literal: None,
             },
         );
     }
@@ -1815,61 +1812,10 @@ impl Console {
             .map_err(|error| error.to_string())?
             .monitor_visible())
     }
-    pub(super) fn set_herdr_socket(&self, socket: PathBuf) -> Result<(), String> {
-        self.state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .herdr_socket = Some(socket);
-        Ok(())
-    }
-
-    pub(super) fn herdr_socket(&self) -> Result<Option<PathBuf>, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .herdr_socket
-            .clone())
-    }
-
     pub(super) fn remove_scheduled_task(&self, chat: Uuid, id: &Uuid) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_for_chat_mut(chat).remove_task(id);
         state.rendered_region = None;
-        Ok(())
-    }
-
-    pub(super) fn monitor_popup(&self) -> Result<tickloop_code_settings::MonitorPopup, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .monitor_popup)
-    }
-
-    pub(super) fn set_monitor_popup(
-        &self,
-        popup: tickloop_code_settings::MonitorPopup,
-    ) -> Result<(), String> {
-        self.state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .monitor_popup = popup;
-        Ok(())
-    }
-
-    /// Hands this terminal to the hosted Tick `grant` names as soon as the input thread is
-    /// between keys, provided `chat` is still shown in this interactive View.
-    pub(super) fn begin_full_screen_attach(
-        &self,
-        chat: Uuid,
-        grant: tickloop_harness::protocol::HostedViewGrant,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat != Some(chat) || !state.interactive {
-            return Err("This View can no longer show the Tick full screen".into());
-        }
-        state.full_screen_attach = Some(FullScreenAttach { chat, grant });
         Ok(())
     }
 
@@ -5416,6 +5362,8 @@ impl Drop for Lifetime {
                 let mut output = io::stdout().lock();
                 reopen_hint = state.chat.filter(|_| state.saves_chats).map(resume_hint);
                 state.transcript = None;
+                // Closing the cards detaches their views and gives the terminal its own keys back.
+                state.cards.close_all();
                 let _ = state.draw(&mut output);
                 if !renderer.uses_alternate_screen() {
                     let _ = write!(output, "{RESET_SCROLL_REGION}");
@@ -5675,11 +5623,13 @@ pub(super) fn input_spans<'a>(
                     text: "! ".into(),
                     role: Some(Role::ShellBorder),
                     link: None,
+                    literal: None,
                 },
                 RoleSpan {
                     text: command.trim_start().into(),
                     role: Some(Role::Text),
                     link: None,
+                    literal: None,
                 },
             ],
         );
@@ -5688,6 +5638,7 @@ pub(super) fn input_spans<'a>(
         text: format!("{} ", display.glyph(Glyph::Prompt)),
         role: Some(Role::Subtle),
         link: None,
+        literal: None,
     }];
     spans.extend(
         hyperlink::runs(line, links)
@@ -5696,6 +5647,7 @@ pub(super) fn input_spans<'a>(
                 text: run.to_owned(),
                 role: Some(Role::Text),
                 link: link.cloned(),
+                literal: None,
             }),
     );
     (Role::UserMessageBg, spans)
@@ -6306,10 +6258,9 @@ impl State {
             monitor_width: None,
             monitor_resizing: false,
             monitor_separator: None,
-            monitor_popup: tickloop_code_settings::MonitorPopup::default(),
-            herdr_socket: None,
-            full_screen_attach: None,
-            terminal_lent: false,
+            cards: Default::default(),
+            card_sizes: HashMap::new(),
+            card_press: None,
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
@@ -6388,6 +6339,11 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        if self.card_focused() {
+            // The focused card reads the mouse from the raw input; only reports crossterm decoded
+            // before it took over arrive here.
+            return false;
+        }
         if !matches!(event.kind, MouseEventKind::Moved) {
             self.monitor_confirmation = None;
             self.monitor_notice = None;
@@ -6677,10 +6633,15 @@ impl State {
                 wheel_scroll(event.kind).is_some_and(|action| self.scroll_conversation(action))
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if !self.input_dialog_visible()
+                let pointer_reaches_monitor = !self.input_dialog_visible()
                     && self.monitor_visible()
                     && !self.menu_submission_is_pending()
-                    && !self.branch_submission_owns_input()
+                    && !self.branch_submission_owns_input();
+                self.card_press = None;
+                if pointer_reaches_monitor && self.press_card(at) {
+                    return true;
+                }
+                if pointer_reaches_monitor
                     && let Some(instance) = self
                         .monitor_row_targets
                         .iter()
@@ -6733,6 +6694,21 @@ impl State {
                 self.back_to_bottom_pressed = false;
                 self.press(event, at, output)
             }
+            MouseEventKind::Up(MouseButton::Left) if self.card_press.is_some() => {
+                self.pointer_input = self.release_card(at);
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+                if self
+                    .card_press
+                    .as_ref()
+                    .is_some_and(|(pressed, _)| *pressed != at) =>
+            {
+                // A drag from a row or a card never toggles or enters it.
+                self.card_press = None;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.card_press.is_some() => true,
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_selection(event.kind, at, output)
             }
@@ -7172,7 +7148,7 @@ impl State {
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.schedule_file_index();
-        if !self.interactive || self.terminal_lent {
+        if !self.interactive {
             return Ok(());
         }
         if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
@@ -7357,6 +7333,14 @@ impl State {
         {
             self.frames_drawn += 1;
         }
+        // A dialog, a menu or anything covering Monitor takes the keys from a focused card.
+        if self.card_focused()
+            && (self.input_dialog_visible()
+                || !self.monitor_visible()
+                || self.monitor.detail.is_some())
+        {
+            self.leave_card();
+        }
         self.monitor_row_targets.clear();
         self.monitor_tick_area = None;
         self.monitor_separator = None;
@@ -7505,6 +7489,23 @@ impl State {
             }
         };
         let side_columns = self.monitor_columns();
+        let card_sources = self.card_sources();
+        let card_screens: Vec<_> = card_sources
+            .iter()
+            .map(|source| source.screen.as_ref().and_then(|screen| screen.lock().ok()))
+            .collect();
+        let card_frames: Vec<_> = card_sources
+            .iter()
+            .zip(&card_screens)
+            .map(|(source, screen)| super::monitor_cards::CardFrame {
+                instance: &source.instance,
+                demand: source.demand,
+                focused: source.focused,
+                screen: screen.as_ref().map(|screen| screen.parser.screen()),
+                note: source.note.clone(),
+            })
+            .collect();
+        let mut card_sizes = Vec::new();
         let monitor_lines = self.monitor_visible().then(|| {
             let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
             let height = if self.monitor.overlay {
@@ -7539,9 +7540,14 @@ impl State {
                 return lines;
             }
             self.monitor.prepare_ticks(height);
-            let frame =
-                self.monitor
-                    .frame(side_columns.saturating_sub(2), height, self.display, now_ms);
+            let frame = self.monitor.frame_with_cards(
+                side_columns.saturating_sub(2),
+                height,
+                self.display,
+                now_ms,
+                &card_frames,
+            );
+            card_sizes = frame.card_sizes;
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
                 self.monitor_tick_area = Some((frame.tick_rows.clone(), columns.clone()));
@@ -7558,6 +7564,8 @@ impl State {
             }
             frame.lines
         });
+        drop(card_frames);
+        drop(card_screens);
         if monitor_lines.is_some() && !self.monitor.overlay {
             self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
         }
@@ -7686,14 +7694,22 @@ impl State {
             })
             .chain(lines.iter().map(RoleLine::text))
             .collect();
-        queue!(
-            output,
-            MoveTo(cursor_column as u16, (start + cursor_row) as u16)
-        )?;
-        if self.shows_cursor() {
-            queue!(output, Show)?;
-        } else {
-            queue!(output, Hide)?;
+        self.settle_cards(card_sizes);
+        write!(output, "{}", self.card_terminal_modes())?;
+        match self.card_cursor() {
+            Some(Some((column, row))) => queue!(output, MoveTo(column, row), Show)?,
+            Some(None) => queue!(output, Hide)?,
+            None => {
+                queue!(
+                    output,
+                    MoveTo(cursor_column as u16, (start + cursor_row) as u16)
+                )?;
+                if self.shows_cursor() {
+                    queue!(output, Show)?;
+                } else {
+                    queue!(output, Hide)?;
+                }
+            }
         }
         output.flush()
     }
@@ -8581,6 +8597,7 @@ impl State {
                     text: prefix,
                     role: Some(Role::Warning),
                     link: None,
+                    literal: None,
                 },
             );
         }
@@ -9272,7 +9289,7 @@ impl State {
                         .monitor
                         .detail
                         .as_ref()
-                        .map_or_else(|| self.monitor.hint(), |detail| detail.hint());
+                        .map_or_else(|| self.monitor_list_hint(), |detail| detail.hint());
                     monitor_hint.as_str()
                 } else if self.foreground_shell {
                     "Shell running · ctrl+b background · ctrl+c stop"
@@ -10240,7 +10257,6 @@ impl State {
         let input_visible = self.interactive
             && self.file_index_focused
             && self.prompt_enabled
-            && !self.terminal_lent
             && self.workspace_trust.is_none()
             && self.menu.is_none()
             && self.conversation_picker.is_none()
@@ -10648,7 +10664,6 @@ impl State {
             && self.scrollback.is_at_bottom()
             && !self.monitor.focused
             && !self.conversation_focused
-            && !self.terminal_lent
             && self.status_area.tasks_can_take_focus()
     }
 
@@ -11069,6 +11084,10 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) -> Option<InputEvent> {
+        if self.card_focused() {
+            self.card_paste(text);
+            return None;
+        }
         self.monitor_confirmation = None;
         self.monitor_notice = None;
         self.shell_background_chord_started_at = None;
@@ -11551,42 +11570,6 @@ impl State {
             return None;
         }
         Some(outcome)
-    }
-
-    /// Hands the terminal to an attached view: from now on nothing is drawn until it is
-    /// taken back, while Agent events keep updating the state.
-    fn lend_terminal(&mut self) -> io::Result<()> {
-        self.terminal_lent = true;
-        self.schedule_file_index();
-        let mut output = io::stdout().lock();
-        self.surface
-            .release(self.renderer, &mut output)
-            .and_then(|()| write!(output, "{RESET_SCROLL_REGION}"))
-            .and_then(|()| execute!(output, Show))
-            .and_then(|()| output.flush())
-    }
-
-    /// Takes the terminal back from an attached view; the Monitor list is shown as it was, with
-    /// `failure` when the view did not end with the user closing it.
-    fn reclaim_terminal(&mut self, failure: Option<&str>) {
-        let mut output = io::stdout().lock();
-        let restored = self.surface.take(self.renderer, &mut output);
-        drop(output);
-        self.terminal_lent = false;
-        self.screen_initialized = false;
-        self.rendered_region = None;
-        match restored {
-            Err(error) => {
-                self.monitor.action_error = Some(super::safe_line(&format!(
-                    "Cannot restore the terminal: {error}"
-                )));
-            }
-            Ok(()) => {
-                if let Some(failure) = failure {
-                    self.monitor.action_error = Some(super::safe_line(failure));
-                }
-            }
-        }
     }
 
     fn can_edit_in_external_editor(&self) -> bool {
@@ -12348,6 +12331,9 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        if self.card_focused() {
+            return self.card_key(key);
+        }
         if key.code != KeyCode::Char('x')
             || key.modifiers != KeyModifiers::NONE
             || !self.monitor_owns_keys()
@@ -12584,6 +12570,24 @@ impl State {
                     self.monitor.open_task_list();
                     self.rendered_region = None;
                 }
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| self.has_card(&entry.instance)) =>
+                {
+                    let instance = self.monitor.selected()?.instance.clone();
+                    return self.toggle_card(instance);
+                }
+                (KeyCode::Enter, KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| self.has_card(&entry.instance)) =>
+                {
+                    let instance = self.monitor.selected()?.instance.clone();
+                    return self.enter_card(instance);
+                }
                 (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.selected_task().is_some() => {
                     let task = self.monitor.selected_task()?.clone();
                     let executor = super::scheduled_tasks::TaskAction::new(task, false);
@@ -12627,6 +12631,9 @@ impl State {
                         if let crate::monitor_rows::TickIntent::Notify(message) = intent {
                             self.monitor.action_error = Some(super::safe_line(message));
                             return None;
+                        }
+                        if let crate::monitor_rows::TickIntent::OpenView(instance) = intent {
+                            return self.enter_card(instance.clone());
                         }
                         let chat = self.chat?;
                         let executor = super::tick_actions::builtin::executor(intent)?;
@@ -13734,6 +13741,9 @@ impl State {
     }
 }
 
+/// The most input bytes one read of a focused card's raw input takes.
+const CARD_INPUT_READ_BYTES: usize = 4096;
+
 fn read_keys(
     state: &Arc<Mutex<State>>,
     stop: &AtomicBool,
@@ -13753,6 +13763,31 @@ fn read_keys(
     // selection re-lays the conversation once per batch instead of once per step.
     let mut deferred_frame = false;
     while !stop.load(Ordering::Acquire) {
+        // A focused Monitor card reads the raw bytes itself, so its Tick gets the keys as the
+        // terminal sent them; crossterm decodes nothing meanwhile.
+        if pause_requested.load(Ordering::Acquire) {
+            // The terminal is about to change hands; it gets the Console's own keys back first.
+            let mut state = state
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            if state.card_focused() {
+                state.leave_card();
+                state.draw(&mut io::stdout().lock())?;
+            }
+        } else if event::input_buffer_is_empty() {
+            let card = {
+                let state = state
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                state.card_focused().then(|| state.card_deadline())
+            };
+            if let Some(deadline) = card {
+                if !read_card_input(state, deadline)? && !idle_tick(state, stop, sender)? {
+                    break;
+                }
+                continue;
+            }
+        }
         let input_was_idle = !event::poll(Duration::ZERO)?;
         if input_was_idle
             && pause_requested.load(Ordering::Acquire)
@@ -13786,42 +13821,7 @@ fn read_keys(
             }
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
-            let attach = state
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .full_screen_attach
-                .take();
-            if let Some(attach) = attach {
-                if !lend_terminal_to_attached_view(state, attach, stop)? {
-                    break;
-                }
-                continue;
-            }
-            let mut state = state
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            state.expire_shell_background_chord();
-            let confirmation_expired = state.expire_key_confirmations();
-            let rows_changed = state
-                .refresh_row_clocks(tickloop_harness::base::private_fs::unix_time_milliseconds());
-            let hint_changed = state.refresh_foreground_command_hint(Instant::now());
-            // Terminals report motion only when the pointer changes cell, so a drag held at an
-            // edge keeps scrolling from here.
-            let selection_scrolled = state.scroll_selection(Instant::now());
-            let requested_plan_edit = state.take_requested_plan_edit();
-            if state.poll_clipboard_hint(Instant::now())
-                || confirmation_expired
-                || rows_changed
-                || hint_changed
-                || selection_scrolled
-                || requested_plan_edit.is_some()
-            {
-                state.draw(&mut io::stdout().lock())?;
-            }
-            drop(state);
-            if let Some(input) = requested_plan_edit.flatten()
-                && !send_input(sender, stop, input)
-            {
+            if !idle_tick(state, stop, sender)? {
                 break;
             }
             continue;
@@ -13887,61 +13887,100 @@ fn read_keys(
     Ok(())
 }
 
-/// Lends the terminal to an attached hosted Tick until the user detaches. The input thread runs
-/// the view, so no key reaches the Console, and the state stays unlocked, so Agent events keep
-/// arriving while nothing is drawn. Returns whether input continues.
-fn lend_terminal_to_attached_view(
+/// The work of an input poll that read nothing: expiring timers, clocks and hints, and a plan edit
+/// asked for meanwhile. Returns whether input continues.
+fn idle_tick(
     state: &Arc<Mutex<State>>,
-    attach: FullScreenAttach,
     stop: &AtomicBool,
+    sender: &mpsc::Sender<InputEvent>,
 ) -> io::Result<bool> {
-    use super::attach::{AttachEnd, AttachedView};
+    let mut state = state
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    state.expire_shell_background_chord();
+    let confirmation_expired = state.expire_key_confirmations();
+    let rows_changed =
+        state.refresh_row_clocks(tickloop_harness::base::private_fs::unix_time_milliseconds());
+    let hint_changed = state.refresh_foreground_command_hint(Instant::now());
+    // Terminals report motion only when the pointer changes cell, so a drag held at an edge keeps
+    // scrolling from here.
+    let selection_scrolled = state.scroll_selection(Instant::now());
+    let requested_plan_edit = state.take_requested_plan_edit();
+    if state.poll_clipboard_hint(Instant::now())
+        || confirmation_expired
+        || rows_changed
+        || hint_changed
+        || selection_scrolled
+        || requested_plan_edit.is_some()
+    {
+        state.draw(&mut io::stdout().lock())?;
+    }
+    drop(state);
+    Ok(requested_plan_edit
+        .flatten()
+        .is_none_or(|input| send_input(sender, stop, input)))
+}
+
+/// Reads the user's raw input for the focused Monitor card, waiting at most until `deadline`,
+/// when a held Esc is due to be settled. Returns whether anything was read; with nothing read the
+/// held Esc is settled and a changed terminal size is taken up, as no resize event is decoded
+/// meanwhile.
+fn read_card_input(state: &Arc<Mutex<State>>, deadline: Option<Instant>) -> io::Result<bool> {
+    let wait = deadline.map_or(INPUT_POLL_INTERVAL, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(INPUT_POLL_INTERVAL)
+    });
+    let mut ready = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let polled = unsafe { libc::poll(&mut ready, 1, wait.as_millis() as i32) };
+    if polled < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
     let lock = || {
         state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))
     };
-    {
+    if polled == 0 {
         let mut state = lock()?;
-        if state.chat != Some(attach.chat) {
-            state.monitor_for_chat_mut(attach.chat).action_error =
-                Some("Not opened: another Chat is shown now".into());
+        let left = state.expire_card_keys(Instant::now());
+        let resized = state.follow_terminal_size();
+        if left || resized {
             state.draw(&mut io::stdout().lock())?;
-            return Ok(!stop.load(Ordering::Acquire));
         }
+        return Ok(false);
     }
-    let attached = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())
-        .and_then(|runtime| {
-            runtime
-                .block_on(AttachedView::attach(&attach.grant))
-                .map(|view| (runtime, view))
-                .map_err(|error| error.to_string())
-        });
-    let (runtime, view) = match attached {
-        Ok(attached) => attached,
-        Err(error) => {
-            let mut state = lock()?;
-            state.monitor_for_chat_mut(attach.chat).action_error =
-                Some(super::safe_line(&format!("Cannot open the Tick: {error}")));
-            state.draw(&mut io::stdout().lock())?;
-            return Ok(!stop.load(Ordering::Acquire));
-        }
-    };
-    let lent = lock()?.lend_terminal();
-    let failure = match lent.map(|()| runtime.block_on(view.run())) {
-        Ok(Ok(AttachEnd::Detached)) => None,
-        Ok(Ok(AttachEnd::Gone)) => Some("The Tick ended while open".to_owned()),
-        Ok(Ok(AttachEnd::Lost(reason))) => Some(format!("The view ended: {reason}")),
-        Ok(Err(error)) => Some(format!("The view ended: {error}")),
-        Err(error) => Some(format!("Cannot hand the terminal to the Tick: {error}")),
-    };
+    let mut buffer = [0_u8; CARD_INPUT_READ_BYTES];
+    let count = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
     let mut state = lock()?;
-    state.reclaim_terminal(failure.as_deref());
+    if count == 0 {
+        // The input ended; the Console's own reader reports it.
+        state.leave_card();
+    } else {
+        state.card_input(&buffer[..count as usize], Instant::now());
+    }
     state.draw(&mut io::stdout().lock())?;
-    Ok(!stop.load(Ordering::Acquire))
+    Ok(true)
 }
 
 fn read_lines(stop: &AtomicBool, sender: &mpsc::Sender<InputEvent>) -> io::Result<()> {

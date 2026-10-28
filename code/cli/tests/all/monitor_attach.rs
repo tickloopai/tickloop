@@ -1,4 +1,4 @@
-//! The attach client a Monitor popup runs: a real PTY in front of `tickloop monitor attach`,
+//! The attach client a Herdr view Pane runs: a real PTY in front of `tickloop monitor attach`,
 //! attached through a one-time view grant to a hosted Tick that shows every byte it receives.
 
 use crate::support;
@@ -88,7 +88,7 @@ impl Drop for Host {
     }
 }
 
-/// `tickloop monitor attach` in its own PTY, as the popup runs it.
+/// `tickloop monitor attach` in its own PTY, as a view Pane runs it.
 struct View {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,

@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import sys
 import threading
 
@@ -50,8 +51,9 @@ def state():
 
 
 def draw():
+    # One short line, usable in a 30-column Monitor card.
     if sys.stderr.isatty():
-        print(f"\r\033[2KCounter: {value}  |  type + then Enter to change; Ctrl+C exits", file=sys.stderr, flush=True)
+        print(f"\r\033[2KCounter {value} · type + Enter", file=sys.stderr, flush=True)
 
 
 def increment(amount):
@@ -107,6 +109,7 @@ def respond(method, params):
             "tools": TOOLS,
             # `recent` grows at its end, so a host that has to shorten it keeps the end.
             "state": {"series": [{"path": "/recent", "newest": "last"}]},
+            "screen": {"min_rows": 6},
         }
     if method == "tick/read":
         with STATE_LOCK:
@@ -117,6 +120,9 @@ def respond(method, params):
 
 
 def main():
+    # Ctrl+C reaches the Tick from its view: it cancels the line being typed (the terminal drops
+    # it), never the Tick. Backspace edits the line; the Tick never relies on Esc.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     draw()
     if sys.stderr.isatty():
         threading.Thread(target=terminal_input, daemon=True).start()

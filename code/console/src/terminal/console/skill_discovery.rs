@@ -38,9 +38,7 @@ impl Console {
                         {
                             state.completion_skills = Some((folder, candidates));
                             state.refresh_completion();
-                            if !state.terminal_lent {
-                                let _ = state.draw(&mut io::stdout().lock());
-                            }
+                            let _ = state.draw(&mut io::stdout().lock());
                         }
                     }
                     drop(shared);

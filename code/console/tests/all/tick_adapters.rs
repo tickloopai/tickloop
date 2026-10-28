@@ -518,6 +518,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     );
     let member = InstanceRef::new("cal", "member").unwrap();
     let member_row = tickloop_code_console::monitor_rows::member_descriptor(&MonitorMember {
+        min_rows: None,
         is_terminal: false,
         instance: member.clone(),
         title: None,

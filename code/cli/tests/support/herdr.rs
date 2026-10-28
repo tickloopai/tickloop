@@ -14,14 +14,6 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
-pub const PLUGIN_ID: &str = "tickloop.monitor";
-/// Expected id for a non-default private configuration root.
-pub fn popup_plugin_id(root: &Path) -> String {
-    format!(
-        "{PLUGIN_ID}.{}",
-        tick_packages::config_root_runtime_key(root).unwrap()
-    )
-}
 
 pub const HERDR_CONFIG: &str = r#"onboarding = false
 [terminal]
@@ -56,7 +48,7 @@ pub fn herdr_executable() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("herdr"))
         .find(|candidate| candidate.is_file())
-        .expect("the popup tests run a private Herdr 0.9 server; put herdr on PATH")
+        .expect("the Herdr tests run a private Herdr 0.9 server; put herdr on PATH")
 }
 
 /// A Herdr server of its own: private config, state, home and socket, stopped when dropped.
@@ -146,30 +138,6 @@ impl PrivateHerdr {
             )
             .unwrap();
         created["root_pane"]["pane_id"].as_str().unwrap().to_owned()
-    }
-
-    pub fn plugins_with_id(&self, id: &str) -> Vec<Value> {
-        self.request("plugin.list", json!({"plugin_id": id}))
-            .unwrap()["plugins"]
-            .as_array()
-            .unwrap()
-            .clone()
-    }
-
-    /// Links a minimal plugin Tickloop did not write under `id` and returns its root.
-    pub fn link_other_plugin(&self, id: &str) -> PathBuf {
-        let directory = self.root.path().join(format!("plugin-{id}"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("herdr-plugin.toml"),
-            format!(
-                "id = \"{id}\"\nname = \"Someone else\"\nversion = \"1.0.0\"\nmin_herdr_version = \"0.9.0\"\n\n[[panes]]\nid = \"attach\"\ntitle = \"Other\"\nplacement = \"popup\"\ncommand = [\"/bin/sh\", \"-c\", \"exit 0\"]\n"
-            ),
-        )
-        .unwrap();
-        let root = directory.canonicalize().unwrap();
-        self.request("plugin.link", json!({"path": root})).unwrap();
-        root
     }
 }
 

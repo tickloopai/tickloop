@@ -327,6 +327,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
                 assert_eq!(&state.monitor.selected_task().unwrap().id, id)
             }
             MonitorTarget::MoreScheduled => panic!("one scheduled task has no overflow row"),
+            MonitorTarget::Card { .. } => panic!("no card is open"),
             MonitorTarget::Goal => {
                 assert!(state.monitor.is_goal_selected());
                 assert!(state.monitor.selected().is_none());
@@ -380,6 +381,13 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     assert!(
         matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == tick.instance.to_string() && action.key == crate::monitor_rows::MONITOR_ENTER_KEY)
     );
+    assert!(state.card_focused(), "Enter enters the Shell's card");
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.card_focused() && state.monitor.focused);
     assert!(
         state
             .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -409,6 +417,8 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     );
 }
 
+/// A click on a row runs the row's Enter action; on a row whose Tick has a card it shows the
+/// card, whose view attaches with the same action key.
 #[test]
 fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
     for (width, overlay) in [(140, false), (80, false), (60, true)] {
@@ -434,16 +444,27 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                 let row = if meta { *rows.last().unwrap() } else { rows[0] };
                 let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
-                state.pointer(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        row: row as u16,
-                        column: column as u16,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &mut Vec::new(),
-                );
+                // A row whose Tick has a card acts on the release, so a drag never toggles it.
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    state.pointer(
+                        MouseEvent {
+                            kind,
+                            row: row as u16,
+                            column: column as u16,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &mut Vec::new(),
+                    );
+                    if state.pointer_input.is_some() {
+                        break;
+                    }
+                }
                 let clicked = tick_action_signature(state.pointer_input.take());
+                // Enter shows a hidden card as the click did.
+                state.cards.close_all();
                 state.monitor.detail = None;
                 state.monitor.focus(overlay, None);
                 let entered = tick_action_signature(
@@ -1532,6 +1553,7 @@ fn each_access_probes_its_own_members_beside_the_others() {
         (hosted.clone(), "hidden"),
     ] {
         snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance,
             title: Some(title.into()),
@@ -1587,6 +1609,7 @@ fn monitor_scrolls_continuously_across_pages_and_caches_earlier_rows() {
             .monitor
             .members
             .push(MonitorMember {
+                min_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: Some(format!("Tick {index:03}")),
@@ -1648,6 +1671,7 @@ fn probed_members_report_their_host_state_and_owner() {
     let mut snapshot = chat_status(chat);
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
@@ -1704,6 +1728,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.prompt_enabled = true;
     let mut snapshot = chat_status(chat);
     snapshot.monitor.members.push(MonitorMember {
+        min_rows: None,
         is_terminal: false,
         instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
@@ -2857,6 +2882,9 @@ fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
             .is_some(),
         "a key the row binds keeps its row action"
     );
+    // The Shell's Enter key entered its card; a lone Esc leaves it.
+    assert!(state.card_focused());
+    state.leave_card();
     state.monitor.detail = None;
     state.monitor.focus(false, None);
     for (code, modifiers) in [
@@ -4013,6 +4041,7 @@ fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_height
         let status = Arc::make_mut(state.monitor.chat_status.as_mut().unwrap());
         for index in 0..130 {
             status.monitor.members.push(MonitorMember {
+                min_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: None,
@@ -4486,6 +4515,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
             .unwrap();
         }
         "hosted" | "terminal" => snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
             is_terminal: content == "terminal",
             title: Some("New Tick".into()),
@@ -4657,6 +4687,7 @@ fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
             .monitor
             .members
             .push(MonitorMember {
+                min_rows: None,
                 instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
                 is_terminal: false,
                 title: Some("Later Tick".into()),
@@ -4733,6 +4764,7 @@ fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monit
         .monitor
         .members
         .push(MonitorMember {
+            min_rows: None,
             instance: row.instance.clone(),
             is_terminal: false,
             title: None,
@@ -5491,6 +5523,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
         } else {
             let instance = tick_protocol::InstanceRef::new("calendar", "stream").unwrap();
             snapshot.monitor.members.push(MonitorMember {
+                min_rows: None,
                 instance: instance.clone(),
                 is_terminal: false,
                 title: Some("Stream Tick".into()),

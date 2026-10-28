@@ -647,6 +647,7 @@ impl Agent {
                 instance,
                 title,
                 is_terminal,
+                min_rows,
             }) => {
                 if let Some(operation) = chat.snapshot.operations.iter().find(|operation| {
                     operation.run_id == receipt.run_id
@@ -661,7 +662,7 @@ impl Agent {
                         },
                     );
                 }
-                self.record_opened_tick(chat, instance, title, is_terminal);
+                self.record_opened_tick(chat, instance, title, is_terminal, min_rows);
             }
             None => {}
         }

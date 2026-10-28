@@ -194,7 +194,6 @@ impl State {
 
     pub(super) fn poll_delayed_submission(&mut self) -> Option<InputEvent> {
         if !self.ordinary_input_is_visible()
-            || self.terminal_lent
             || self.workspace_trust.is_some()
             || self.active_delayed_submission.is_some()
         {

@@ -67,6 +67,10 @@ pub(super) enum Glyph {
     /// A proportion bar's filled and empty cells, such as the tool search pool's.
     BarFilled,
     BarEmpty,
+    /// The rule between a Monitor card's row and its Tick's screen, heavy while the card has the
+    /// focus.
+    CardRule,
+    FocusedCardRule,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -137,6 +141,8 @@ impl DisplayProfile {
             Glyph::ContextReserved => "⛝",
             Glyph::BarFilled => "█",
             Glyph::BarEmpty => "░",
+            Glyph::CardRule => "─",
+            Glyph::FocusedCardRule => "━",
         }
     }
 
@@ -338,6 +344,8 @@ mod tests {
             Glyph::ContextReserved,
             Glyph::BarFilled,
             Glyph::BarEmpty,
+            Glyph::CardRule,
+            Glyph::FocusedCardRule,
         ] {
             assert_eq!(
                 unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),

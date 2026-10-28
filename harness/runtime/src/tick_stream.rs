@@ -1210,6 +1210,7 @@ mod tests {
                 tools: Vec::new(),
                 recover_with: None,
                 state: None,
+                screen: None,
             })
         }
 
@@ -1310,6 +1311,7 @@ mod tests {
                 tools: Vec::new(),
                 recover_with: None,
                 state: None,
+                screen: None,
             })
         }
 

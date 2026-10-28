@@ -507,6 +507,8 @@ pub struct OpenedExecution {
     pub instance: InstanceRef,
     pub title: Option<String>,
     pub is_terminal: bool,
+    /// The fewest terminal rows the Tick declared it stays usable at, when it declared any.
+    pub min_rows: Option<u16>,
 }
 
 #[derive(Clone, Debug)]

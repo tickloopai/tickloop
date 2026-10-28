@@ -13,7 +13,8 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         TickIntent::Notify(_) => return None,
         TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
         TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
-        TickIntent::OpenView(instance) => Arc::new(OpenView { instance }),
+        // The Console shows and enters Monitor cards itself.
+        TickIntent::OpenView(_) => return None,
         TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
         TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted { instance }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
@@ -229,216 +230,36 @@ impl TickActionExecutor for DetailsOpen {
         ))
     }
 }
-/// Enter on a local Tick, a hosted Tick or a Shell, opens its view at once: inside Herdr in
-/// Tickloop's Herdr popup, otherwise full screen in this View's terminal. Either view shows the
-/// same Tick and Esc closes it.
-struct OpenView {
+/// Attaches the view of a Monitor card the user just opened: a one-time view grant from the
+/// Agent, used at once.
+pub(in crate::terminal) fn attach_card(instance: tick_protocol::InstanceRef) -> PreparedTickAction {
+    PreparedTickAction::new(
+        instance.to_string(),
+        crate::monitor_rows::MONITOR_ENTER_KEY,
+        Arc::new(AttachCard { instance }),
+    )
+}
+struct AttachCard {
     instance: tick_protocol::InstanceRef,
 }
-impl TickActionExecutor for OpenView {
-    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        ui.monitor_entry(&self.instance)
-            .ok_or("This Tick is no longer in Monitor")?;
-        Ok(PreparedTickAction::new(
-            self.instance.to_string(),
-            crate::monitor_rows::MONITOR_ENTER_KEY,
-            Arc::new(OpenView {
-                instance: self.instance.clone(),
-            }),
-        ))
-    }
-}
 #[async_trait]
-impl TickActionBackend for OpenView {
+impl TickActionBackend for AttachCard {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        let floated = match HerdrPopup::reach(&ctx).await {
-            Ok(None) => return open_full_screen(&ctx, &self.instance).await,
-            Ok(Some(popup)) => match popup.check(&ctx).await {
-                Ok(()) => popup.float(&ctx, &self.instance).await,
-                Err(reason) if reason.needs_registration() => {
-                    return RegisterPopup {
-                        instance: self.instance.clone(),
-                    }
-                    .execute(ctx)
-                    .await;
-                }
-                Err(reason) => Err(reason),
-            },
-            Err(reason) => Err(reason),
-        };
-        settle_float(&ctx, &self.instance, floated).await
-    }
-}
-
-const HERDR_BUSY: &str = "Herdr is showing another view; close it and press enter again";
-
-/// Why a local Tick did not float in the Herdr popup.
-enum NotFloated {
-    NotRegistered,
-    /// Our plugin is disabled in Herdr, or `monitorPopup` is off.
-    TurnedOff,
-    /// Our plugin runs another tickloop build's attach client.
-    Outdated,
-    /// The popup cannot show it here, such as when another plugin holds our id; nothing opened.
-    Unavailable,
-    /// Opening the Tick needed our plugin, but registration failed.
-    RegistrationFailed(String),
-    /// Herdr is showing something other than its workspace view, such as another popup.
-    Busy,
-    /// Herdr may be showing the popup; opening again could show the Tick twice.
-    Unknown(String),
-}
-
-impl From<crate::terminal::popup::FloatError> for NotFloated {
-    fn from(error: crate::terminal::popup::FloatError) -> Self {
-        use crate::terminal::popup::FloatError;
-        match error {
-            FloatError::Busy => Self::Busy,
-            FloatError::Refused => Self::Unavailable,
-            FloatError::Unknown(reason) => Self::Unknown(reason),
-        }
-    }
-}
-
-impl NotFloated {
-    fn needs_registration(&self) -> bool {
-        matches!(self, Self::NotRegistered | Self::Outdated)
-    }
-}
-
-/// This View's Herdr session together with Tickloop's popup plugin for it.
-struct HerdrPopup {
-    herdr: crate::terminal::popup::HerdrSession,
-    plugin: crate::terminal::popup::PopupPlugin,
-    settings: tickloop_code_settings::UserSettings,
-}
-
-impl HerdrPopup {
-    /// Verifies the Herdr session this View runs inside; `None` outside Herdr.
-    async fn reach(ctx: &TickActionContext<'_>) -> Result<Option<Self>, NotFloated> {
-        use crate::terminal::popup::{HerdrSession, PopupPlugin};
-        let Some(socket) = ctx
-            .console
-            .herdr_socket()
-            .map_err(|_| NotFloated::Unavailable)?
-        else {
-            return Ok(None);
-        };
-        let root = ctx.root.ok_or(NotFloated::Unavailable)?;
-        Ok(Some(Self {
-            herdr: HerdrSession::verify(&socket)
-                .await
-                .map_err(|_| NotFloated::Unavailable)?,
-            plugin: PopupPlugin::for_this_executable(root).map_err(|_| NotFloated::Unavailable)?,
-            settings: tickloop_code_settings::UserSettings::in_root(root),
-        }))
-    }
-
-    /// Whether our plugin is registered and turned on in this session.
-    async fn check(&self, ctx: &TickActionContext<'_>) -> Result<(), NotFloated> {
-        use crate::terminal::popup::PopupReadiness;
-        if ctx
-            .console
-            .monitor_popup()
-            .map_err(|_| NotFloated::Unavailable)?
-            == tickloop_code_settings::MonitorPopup::Disabled
-        {
-            return Err(NotFloated::TurnedOff);
-        }
-
-        match self
-            .herdr
-            .readiness(&self.plugin)
-            .await
-            .map_err(|_| NotFloated::Unavailable)?
-        {
-            PopupReadiness::Ready => {}
-            PopupReadiness::NotInstalled => return Err(NotFloated::NotRegistered),
-            PopupReadiness::Disabled => return Err(NotFloated::TurnedOff),
-            PopupReadiness::Outdated => return Err(NotFloated::Outdated),
-            PopupReadiness::Foreign { .. } => return Err(NotFloated::Unavailable),
-        }
-        Ok(())
-    }
-
-    /// Links our own popup plugin and enables the popup requested by opening the Tick.
-    async fn register(&self, ctx: &TickActionContext<'_>) -> Result<(), NotFloated> {
-        self.herdr
-            .install(&self.plugin, &self.settings)
-            .await
-            .map_err(NotFloated::RegistrationFailed)?;
-        ctx.console
-            .set_monitor_popup(tickloop_code_settings::MonitorPopup::Enabled)
-            .map_err(NotFloated::RegistrationFailed)
-    }
-
-    /// Opens the popup on `instance` with a one-time view grant.
-    async fn float(
-        &self,
-        ctx: &TickActionContext<'_>,
-        instance: &tick_protocol::InstanceRef,
-    ) -> Result<(), NotFloated> {
-        let grant = ctx
+        match ctx
             .agent
-            .attach_hosted_tick(ctx.chat, instance.clone())
+            .attach_hosted_tick(ctx.chat, self.instance.clone())
             .await
-            .map_err(|_| NotFloated::Unavailable)?;
-        Ok(self.herdr.float(&self.plugin, &grant).await?)
-    }
-}
-
-/// Registers, or turns on, Tickloop's popup plugin in this View's Herdr session when the user opens a Tick, then floats it.
-struct RegisterPopup {
-    instance: tick_protocol::InstanceRef,
-}
-#[async_trait]
-impl TickActionBackend for RegisterPopup {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        let floated = async {
-            let popup = HerdrPopup::reach(&ctx)
-                .await?
-                .ok_or(NotFloated::Unavailable)?;
-            popup.register(&ctx).await?;
-            popup.float(&ctx, &self.instance).await
+        {
+            Ok(grant) => {
+                ctx.console
+                    .attach_card(ctx.chat, self.instance.clone(), grant)
+                    .await
+            }
+            Err(error) => ctx
+                .console
+                .card_failed(&self.instance, &format!("Cannot open: {error}")),
         }
-        .await;
-        settle_float(&ctx, &self.instance, floated).await
     }
-}
-
-/// Leaves a floated Tick to its popup and opens it full screen when nothing can be showing it;
-/// otherwise only says what keeps it from opening.
-async fn settle_float(
-    ctx: &TickActionContext<'_>,
-    instance: &tick_protocol::InstanceRef,
-    floated: Result<(), NotFloated>,
-) -> Result<(), String> {
-    match floated {
-        Ok(()) => {}
-        Err(NotFloated::Busy) => ctx.notify(HERDR_BUSY)?,
-        Err(NotFloated::Unknown(reason)) => ctx.notify(&format!(
-            "The Herdr popup may have opened ({reason}); look in Herdr before opening again"
-        ))?,
-        Err(NotFloated::RegistrationFailed(reason)) => {
-            ctx.notify(&format!("Cannot register Tickloop's Herdr popup: {reason}"))?
-        }
-        Err(_) => return open_full_screen(ctx, instance).await,
-    }
-    Ok(())
-}
-
-/// Attaches the local Tick full screen in this View's terminal with a one-time view grant.
-async fn open_full_screen(
-    ctx: &TickActionContext<'_>,
-    instance: &tick_protocol::InstanceRef,
-) -> Result<(), String> {
-    let grant = ctx
-        .agent
-        .attach_hosted_tick(ctx.chat, instance.clone())
-        .await
-        .map_err(|error| format!("Cannot open {instance}: {error}"))?;
-    ctx.console.begin_full_screen_attach(ctx.chat, grant)?;
-    Ok(())
 }
 
 struct NoBackend;

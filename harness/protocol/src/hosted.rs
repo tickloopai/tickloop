@@ -40,8 +40,8 @@ pub struct HostedProgramExit {
     pub signal: Option<i32>,
 }
 
-/// The `tickloop` arguments that run the attach client of one view of a local Tick: a Monitor
-/// popup, or a Herdr Pane that shows the Tick.
+/// The `tickloop` arguments that run the attach client of one view of a local Tick: a Herdr Pane
+/// that shows the Tick.
 pub const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
 /// The environment variable through which an attach client receives its view grant as JSON.
 pub const ATTACH_ENVIRONMENT: &str = "TICKLOOP_MONITOR_ATTACH";

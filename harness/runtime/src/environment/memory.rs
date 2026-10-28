@@ -903,6 +903,10 @@ impl ExecutionPort for MemoryPort {
                     }
                     let instance = InstanceRef::hosted(tickloop_ids::Id::new());
                     let tick = state.tick_programs.get(&open.command[0]).cloned();
+                    let min_rows = tick
+                        .as_ref()
+                        .filter(|_| open.protocol)
+                        .map(|tick| tick.descriptor.min_rows());
                     let terminal = state.terminal_programs.get(&open.command[0]).cloned();
                     let screen = terminal
                         .as_ref()
@@ -945,6 +949,7 @@ impl ExecutionPort for MemoryPort {
                             instance,
                             title: Some(open.command.join(" ")),
                             is_terminal: !open.protocol,
+                            min_rows,
                         }),
                         shell: None,
                         handoff: None,

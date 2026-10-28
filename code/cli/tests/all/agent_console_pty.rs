@@ -741,12 +741,8 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         })
         .await;
     reopened.send(b"\r");
-    // The Shell's own view, drawn by the Tickhost, takes the terminal.
-    view_shows(
-        &reopened,
-        &["$ printf 'shell began'; while [ ! -f finish ]", "running"],
-    )
-    .await;
+    // The Shell's card, drawn by the Tickhost, opens and takes the focus.
+    view_shows(&reopened, &["$ printf 'shell began'", "running"]).await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
@@ -787,12 +783,12 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     view_shows(&reopened, &["shell beganshell ended", "exit 0"]).await;
     reopened.send(b"\x1b");
     tokio::time::timeout(UI_TIMEOUT, async {
-        while terminal_screen(&reopened).contains("$ printf 'shell began'") {
+        while card_focused(&terminal_screen(&reopened)) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("Esc closes the Shell's view");
+    .expect("Esc leaves the Shell's card");
     reopened
         .wait_for("the Shell's row is selected again", |frame| {
             frame.contains("Shells (1)")
@@ -1348,13 +1344,17 @@ fn terminal_screen(view: &PtyView) -> String {
     parser.screen().contents()
 }
 
-/// Waits until an attached view holds the terminal, the Console's Monitor hints gone from it,
-/// and shows every one of `texts`.
+/// Whether a Monitor card has the focus: the key hints are its own.
+fn card_focused(frame: &str) -> bool {
+    frame.lines().any(|line| line.starts_with("esc leave"))
+}
+
+/// Waits until a Monitor card has the focus and the screen shows every one of `texts`.
 async fn view_shows(view: &PtyView, texts: &[&str]) {
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let screen = terminal_screen(view);
-            if !screen.contains("enter open") && texts.iter().all(|text| screen.contains(text)) {
+            if card_focused(&screen) && texts.iter().all(|text| screen.contains(text)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1363,20 +1363,10 @@ async fn view_shows(view: &PtyView, texts: &[&str]) {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "{texts:?} never showed in a view:\n{}",
+            "{texts:?} never showed in a focused card:\n{}",
             terminal_screen(view)
         )
     });
-}
-
-async fn terminal_shows(view: &PtyView, text: &str) {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        while !terminal_screen(view).contains(text) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
 }
 
 /// The host state a model request carries in its system prompt: `delegation` is null for a

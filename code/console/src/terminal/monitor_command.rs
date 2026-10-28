@@ -1,12 +1,8 @@
-//! `tickloop monitor`: the attach client a Monitor popup or a Herdr view Pane runs, and the
-//! explicit commands that install or remove that popup's plugin in one Herdr session.
-
-mod popup;
+//! `tickloop monitor attach`: the attach client a Herdr view Pane runs.
 
 use std::{
     ffi::OsString,
     io::{IsTerminal, Read, Write},
-    path::PathBuf,
 };
 
 use crossterm::style::Stylize;
@@ -17,51 +13,17 @@ use tickhost_connect::herdr::{
 use crate::terminal::attach::{AttachEnd, run_view};
 use tickloop_harness::protocol::{ATTACH_ENVIRONMENT, HostedViewGrant, VIEW_PANE_ENVIRONMENT};
 
-const MONITOR_USAGE: &str = "Usage: tickloop monitor attach
-       tickloop monitor popup install --herdr-socket SOCKET
-       tickloop monitor popup remove --herdr-socket SOCKET";
+const MONITOR_USAGE: &str = "Usage: tickloop monitor attach";
 const CLOSE_HINT: &str = "Press any key to close";
 
-#[derive(Debug, PartialEq, Eq)]
-enum MonitorCommand {
-    Attach,
-    Popup {
-        change: popup::PopupChange,
-        herdr_socket: PathBuf,
-    },
-}
-
 pub async fn run(arguments: &[OsString]) -> Result<(), String> {
-    match parse(arguments)? {
-        MonitorCommand::Attach => attach().await,
-        MonitorCommand::Popup {
-            change,
-            herdr_socket,
-        } => popup::run(change, &herdr_socket).await,
-    }
-}
-
-fn parse(arguments: &[OsString]) -> Result<MonitorCommand, String> {
     match arguments {
-        [command] if command == "attach" => Ok(MonitorCommand::Attach),
-        [command, change, option, herdr_socket]
-            if command == "popup" && option == "--herdr-socket" && !herdr_socket.is_empty() =>
-        {
-            let change = match change.to_str() {
-                Some("install") => popup::PopupChange::Install,
-                Some("remove") => popup::PopupChange::Remove,
-                _ => return Err(MONITOR_USAGE.into()),
-            };
-            Ok(MonitorCommand::Popup {
-                change,
-                herdr_socket: herdr_socket.into(),
-            })
-        }
+        [command] if command == "attach" => attach().await,
         _ => Err(MONITOR_USAGE.into()),
     }
 }
 
-/// Shows the Tick its popup or view Pane was granted in this terminal until the user detaches.
+/// Shows the Tick its view Pane was granted in this terminal until the user detaches.
 /// When it cannot, the reason stays on screen until a key is pressed, so the view never just
 /// vanishes.
 async fn attach() -> Result<(), String> {
@@ -157,62 +119,4 @@ fn hold_until_a_key(reason: &str) {
     .and_then(|()| output.flush());
     drop(output);
     let _ = std::io::stdin().read(&mut [0; 1]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parsed(arguments: &[&str]) -> Result<MonitorCommand, String> {
-        parse(&arguments.iter().map(OsString::from).collect::<Vec<_>>())
-    }
-
-    #[test]
-    fn monitor_commands_take_exactly_their_documented_arguments() {
-        assert_eq!(parsed(&["attach"]), Ok(MonitorCommand::Attach));
-        assert_eq!(
-            parsed(&["popup", "install", "--herdr-socket", "/run/herdr.sock"]),
-            Ok(MonitorCommand::Popup {
-                change: popup::PopupChange::Install,
-                herdr_socket: "/run/herdr.sock".into(),
-            })
-        );
-        assert_eq!(
-            parsed(&["popup", "remove", "--herdr-socket", "/run/herdr.sock"]),
-            Ok(MonitorCommand::Popup {
-                change: popup::PopupChange::Remove,
-                herdr_socket: "/run/herdr.sock".into(),
-            })
-        );
-        for rejected in [
-            &[][..],
-            &["attach", "extra"],
-            &["popup", "install"],
-            &["popup", "install", "--herdr-socket"],
-            &["popup", "install", "--herdr-socket", ""],
-            &["popup", "install", "--socket", "/run/herdr.sock"],
-            &["popup", "enable", "--herdr-socket", "/run/herdr.sock"],
-            &[
-                "popup",
-                "install",
-                "--herdr-socket",
-                "/run/herdr.sock",
-                "--yes",
-            ],
-            &["popup", "--herdr-socket", "/run/herdr.sock", "install"],
-        ] {
-            assert_eq!(parsed(rejected), Err(MONITOR_USAGE.into()), "{rejected:?}");
-        }
-    }
-
-    #[test]
-    fn the_usage_names_every_monitor_command() {
-        for command in [
-            "tickloop monitor attach",
-            "tickloop monitor popup install --herdr-socket SOCKET",
-            "tickloop monitor popup remove --herdr-socket SOCKET",
-        ] {
-            assert!(MONITOR_USAGE.contains(command), "{command}");
-        }
-    }
 }

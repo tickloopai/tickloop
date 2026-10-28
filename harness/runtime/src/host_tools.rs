@@ -233,6 +233,8 @@ pub enum HostEffect {
         is_terminal: bool,
         instance: tick_protocol::InstanceRef,
         title: Option<String>,
+        /// The fewest terminal rows the Tick declared it stays usable at.
+        min_rows: Option<u16>,
     },
 }
 

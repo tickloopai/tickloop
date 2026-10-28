@@ -30,7 +30,7 @@ An extension Tick serves two participants: a person using its terminal interface
 - **Tick**: the program implementing this protocol. It reads requests from standard input, writes protocol messages to standard output, and draws its interface on its controlling terminal.
 - **Host**: the party that starts and communicates with the Tick. In Tickloop, this is the launcher process started for each Tick by Tickhost, together with Tickhost itself.
 - **Client**: a party that uses a Tick through the host, usually an Agent's Loop. The interface between client and host is outside the scope of this specification.
-- **View**: an interface displaying the Tick's controlling terminal, such as a Herdr Pane or Monitor overlay. Multiple views can attach to one Tick. Opening or closing a view does not affect the protocol session.
+- **View**: an interface displaying the Tick's controlling terminal, such as a card in a client's Monitor. Multiple views can attach to one Tick. Opening or closing a view does not affect the protocol session.
 
 <a id="s1-3"></a>
 
@@ -270,8 +270,8 @@ The host starts the Tick using the command supplied by the user:
 
 The Tick runs in the foreground process group of a session whose controlling terminal is the view terminal:
 
-- Initial size is 120 columns by 30 rows.
-- When a view changes size, the host resizes the terminal and the kernel sends `SIGWINCH` to the Tick.
+- Initial size is 120 columns by 30 rows, kept until a view attaches.
+- The terminal takes the size of the view that typed last, or else of the view that attached last; when that view changes size, the host resizes the terminal and the kernel sends `SIGWINCH` to the Tick. When the last view detaches, the terminal keeps its last size.
 - Resizing does not use the protocol.
 
 <a id="s4-2"></a>
@@ -365,6 +365,8 @@ interface TickDescriptor {
   recover_with?: string;
   /** What the Tick declares about the data of its state. */
   state?: StateDeclaration;
+  /** What the Tick declares about the terminal it draws on. */
+  screen?: ScreenDeclaration;
 }
 
 interface TickTool {
@@ -389,6 +391,11 @@ interface StateSeries {
   /** The end of the array holding its newest element. */
   newest: "first" | "last";
 }
+
+interface ScreenDeclaration {
+  /** The fewest terminal rows the Tick stays usable at: an integer from 6 to 14; 6 when absent. */
+  min_rows?: number;
+}
 ```
 
 <a id="s5-3"></a>
@@ -404,6 +411,7 @@ The host **MUST** reject a result unless all of the following hold:
 - Each `input_schema` is an object and a valid JSON Schema.
 - If present, `recover_with` names a catalog tool whose `mutates` is `false`.
 - Each `state.series` path is empty or starts with `/`, and paths are unique.
+- If present, `screen.min_rows` is an integer from 6 to 14.
 - The encoded result is no larger than 512 KiB.
 
 <a id="s5-4"></a>
@@ -432,6 +440,18 @@ A `kind` **SHOULD** be a lowercase, dot-separated name whose first component ide
 - Query tools that only read information declare `mutates: false`.
 
 The host uses `mutates` to decide whether approval is needed before a call and whether an unknown outcome may be retried. Declaring a mutating tool as `false` bypasses approval ([Section 10](#s10)).
+
+<a id="s5-7"></a>
+
+### 5.7 `screen`
+
+`screen.min_rows` counts the rows of the terminal the Tick draws on, its own status line included. It excludes anything the client draws around that terminal, such as a card's title line. The host reads the declaration once, when the Tick initializes; later changes are ignored.
+
+A client may show a Tick's terminal in a card beside its conversation, as the Monitor does. Such a card is at least `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. For Ticks shown this way:
+
+- A Tick **MUST NOT** rely on Esc: Esc leaves the card. Go back a level with Backspace.
+- A Tick **MUST** stay usable at 30 columns.
+- A Tick **MUST** redraw its whole screen after `SIGWINCH`, and **SHOULD NOT** repaint when nothing changed.
 
 <a id="s6"></a>
 
@@ -683,5 +703,6 @@ for line in sys.stdin:
 - [ ] Keep read sequence numbers from moving backwards or falling below the last emitted update.
 - [ ] Do not emit updates for presentation changes such as cursor movement, scrolling, or repaints.
 - [ ] Keep state within a few KiB, expose large content through query tools, and declare time series in `state.series`.
+- [ ] Stay usable at 30 columns and `screen.min_rows` rows, go back with Backspace rather than Esc, and redraw the whole screen after `SIGWINCH`.
 - [ ] Run operations longer than 60 seconds in the background and report results through updates.
 - [ ] Exit promptly on `SIGTERM` or standard-input EOF, without relying on shutdown cleanup.

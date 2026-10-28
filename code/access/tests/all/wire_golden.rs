@@ -401,6 +401,7 @@ fn chat_snapshot() -> ChatSnapshot {
     .unwrap();
     snapshot.monitor = MonitorMembership {
         members: vec![MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance: terminal_instance(),
             title: Some("Counter".into()),
@@ -505,6 +506,7 @@ fn hosted_members() -> Vec<HostedMember> {
 fn monitor_membership() -> MonitorMembership {
     MonitorMembership {
         members: vec![MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance: hosted_instance(),
             title: Some("Quotes".into()),
