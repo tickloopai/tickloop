@@ -69,7 +69,9 @@ pub(crate) fn denial_matches(
 }
 
 fn identity_digest(identity: &Value) -> String {
-    let digest = Sha256::digest(serde_json::to_vec(identity).expect("normalized input serializes"));
+    let digest = Sha256::digest(
+        tickloop_harness_base::canonical_json_bytes(identity).expect("normalized input serializes"),
+    );
     format!("{digest:x}")
 }
 

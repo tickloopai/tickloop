@@ -194,6 +194,7 @@
   {
     "kind": "draft_context_breakdown",
     "launch": {
+      "profile": "local",
       "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {
@@ -343,6 +344,7 @@
   {
     "kind": "draft_mcp_server",
     "launch": {
+      "profile": "local",
       "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {

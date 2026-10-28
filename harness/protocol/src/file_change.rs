@@ -61,6 +61,13 @@ pub struct FileChangeArtifactRef {
     pub sha256: String,
 }
 
+/// A bounded projection of recorded review hunks, not reconstructed whole-file contents.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedFileChangeReview {
+    pub path: PathBuf,
+    pub unified_diff: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedFileChange {
     pub summary: FileChangeReviewSummary,

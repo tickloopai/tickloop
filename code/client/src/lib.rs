@@ -22,6 +22,7 @@ pub mod daemon_stop;
 pub mod frame;
 mod incoming;
 mod local;
+pub mod managed;
 mod recovering;
 #[cfg(test)]
 mod startup_tests;

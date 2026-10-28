@@ -25,6 +25,111 @@ fn parse(value: Value) -> Line {
     serde_json::from_value(value).expect("a generated Line parses")
 }
 
+#[test]
+fn empty_acp_sessions_and_their_latest_configuration_survive_retained_snapshots() {
+    use tickloop_harness_protocol::{ExecutionMode, ModelIdentity, PermissionPolicy, Protocol};
+    use tickloop_harness_transcript::{AcpSessionEntry, AcpSessionOrigin};
+
+    let chat_id = tickloop_ids::generate();
+    let directory = tempfile::tempdir().unwrap();
+    let origin = AcpSessionOrigin::capture(directory.path(), directory.path()).unwrap();
+    assert!(
+        origin
+            .matches_current(directory.path(), directory.path())
+            .unwrap()
+    );
+    let mut entry = AcpSessionEntry {
+        chat_id,
+        origin,
+        startup_permission_ceiling: PermissionPolicy::default(),
+        execution_mode: ExecutionMode::Auto,
+        model: ModelIdentity {
+            profile: "test".into(),
+            protocol: Protocol::Responses,
+            requested_model: "test".into(),
+            provider: Default::default(),
+        },
+    };
+    let mut fold = RetainedFold::default();
+    fold.apply(&Line::AcpSession(entry.clone()));
+    entry.execution_mode = ExecutionMode::AcceptEdits;
+    fold.apply(&Line::AcpSession(entry));
+    let snapshot = fold.snapshot(chat_id);
+    let Line::RetainedSnapshot(retained) = &snapshot else {
+        panic!("snapshot");
+    };
+    assert_eq!(
+        retained
+            .lines
+            .iter()
+            .filter(|line| matches!(line, Line::AcpSession(_)))
+            .count(),
+        1
+    );
+    let stored = StoredTranscript {
+        lines: vec![snapshot],
+        ..Default::default()
+    };
+    let (loaded, reaches_root) = assemble(&stored, None);
+    assert!(reaches_root);
+    let loaded = loaded.expect("ACP metadata materializes an empty Chat");
+    assert!(loaded.chain.is_empty());
+    assert_eq!(
+        loaded.metadata.acp_session.unwrap().execution_mode,
+        ExecutionMode::AcceptEdits
+    );
+}
+
+#[test]
+fn recorded_edits_survive_snapshots_until_their_tool_result_is_compacted() {
+    let chat = tickloop_ids::generate();
+    let operation = tickloop_ids::generate();
+    let run = tickloop_ids::generate();
+    let edit = |diff: &str| {
+        parse(json!({
+            "type":"recorded-edit", "operationId":operation, "runId":run,
+            "callId":"write", "review":{"path":"example.txt","unified_diff":diff}
+        }))
+    };
+    let mut fold = RetainedFold::default();
+    fold.apply(&edit("first review"));
+    fold.apply(&edit("latest review"));
+    let result = parse(json!({
+        "type":"user", "uuid":tickloop_ids::generate(), "parentUuid":null,
+        "chatId":chat, "timestamp":TIMESTAMP, "version":"test",
+        "humanFamilyOrigin":null,
+        "message":{"role":"user","content":[{
+            "type":"tool_result","tool_use_id":"write","content":"done","is_error":false
+        }]}
+    }));
+    fold.apply(&result);
+    let snapshot = fold.snapshot(chat);
+    let Line::RetainedSnapshot(retained) = &snapshot else {
+        panic!("snapshot")
+    };
+    let reviews: Vec<_> = retained
+        .lines
+        .iter()
+        .filter_map(|line| match line {
+            Line::RecordedEdit(entry) => Some(&entry.review.unified_diff),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reviews, vec!["latest review"]);
+    fold.apply(&snapshot);
+    let mut generator = Generator::new(0);
+    fold.apply(&generator.boundary());
+    let Line::RetainedSnapshot(compacted) = fold.snapshot(chat) else {
+        panic!("snapshot")
+    };
+    assert!(
+        !compacted
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::RecordedEdit(_)))
+    );
+}
+
 /// What a generated Transcript refers to so far.
 struct Generator {
     random: fastrand::Rng,

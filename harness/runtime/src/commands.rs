@@ -136,7 +136,7 @@ impl Agent {
         tools.command_state(operation_id).await
     }
 
-    async fn chat_tools(&self, chat_id: ChatId) -> Result<Arc<Tools>, AgentError> {
+    pub(super) async fn chat_tools(&self, chat_id: ChatId) -> Result<Arc<Tools>, AgentError> {
         Ok(self
             .inner
             .chats
@@ -207,7 +207,10 @@ impl Agent {
             .find(|command| command.operation_id == incoming.operation_id)
             .cloned();
         let command = merge_command_snapshot(previous.as_ref(), incoming);
-        let needs_task_notification = command.was_background
+        // Managed requests have one client-owned turn. A background Shell finishing during
+        // settlement must not start a second model run after the client saw Completed.
+        let needs_task_notification = !self.inner.tool_policy.is_managed()
+            && command.was_background
             && !is_stopped_by_model
             && command_state_is_terminal(&command.state)
             && previous
@@ -266,6 +269,7 @@ impl Agent {
         );
         drop(chats);
         if command.was_background
+            && !self.inner.tool_policy.is_managed()
             && !command_state_is_terminal(&command.state)
             && !super::shell_description::has_description(command.description.as_deref())
         {

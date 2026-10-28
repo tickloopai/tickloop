@@ -40,7 +40,9 @@ mod lifecycle;
 mod loop_state_notes;
 pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
+mod acp_claims;
 mod loop_lease;
+mod managed_configuration;
 pub mod mcp;
 mod mcp_http;
 mod mcp_resources;
@@ -51,6 +53,7 @@ mod remote_skills;
 mod scheduled_tasks;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
+pub mod session_mcp;
 pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tick_tools;
@@ -370,6 +373,7 @@ struct Inner {
     chat_leases: loop_lease::ChatLeases,
     /// The Trigger sources' own states, taken over from the store with each newly taken lease.
     trigger_source_states: std::sync::RwLock<Vec<Arc<dyn wakeup::TriggerSourceState>>>,
+    acp_claims: Mutex<HashMap<ChatId, std::fs::File>>,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -1036,7 +1040,8 @@ fn answerable_permission_request(
         .cloned()
         .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
     let answerable = match request.execution {
-        PermissionExecution::ToolCall { run_id, .. } => {
+        PermissionExecution::ToolCall { run_id, .. }
+        | PermissionExecution::HostOperation { run_id, .. } => {
             chat.run_cancel(run_id)
                 .is_some_and(|cancel| !cancel.is_cancelled())
                 && chat.snapshot.chat_loop.run_id == Some(run_id)
@@ -2145,6 +2150,7 @@ impl Agent {
                 recorder,
                 chat_leases: loop_lease::ChatLeases::default(),
                 trigger_source_states: std::sync::RwLock::new(Vec::new()),
+                acp_claims: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2710,7 +2716,19 @@ impl Agent {
             ledger,
             turn,
         } = submission;
-        if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
+        if contexts.len().saturating_add(paths.len()) > input_context::MAX_CONTEXTS {
+            return Err(AgentError::Invalid(format!(
+                "a prompt can attach at most {} contexts",
+                input_context::MAX_CONTEXTS
+            )));
+        }
+        if paths.len().saturating_add(
+            contexts
+                .iter()
+                .filter(|context| context.path().is_some())
+                .count(),
+        ) > input_context::MAX_REFERENCES
+        {
             return Err(AgentError::Invalid(format!(
                 "a prompt can attach at most {} files or directories",
                 input_context::MAX_REFERENCES
@@ -2803,7 +2821,9 @@ impl Agent {
             }
             attached_file_reads = loaded.file_reads;
         }
-        self.submit_internal(
+        // Console approval can reenter submission beneath several adapter frames. Keep the
+        // large run-admission future off that stack, including the folderless path above.
+        Box::pin(self.submit_internal(
             chat_id,
             input,
             SubmissionOptions {
@@ -2817,7 +2837,7 @@ impl Agent {
                 turn,
                 ..Default::default()
             },
-        )
+        ))
         .await
     }
 
@@ -2871,7 +2891,7 @@ impl Agent {
                 "agent is unavailable during shutdown or planned upgrade".into(),
             ));
         }
-        if input.trim().is_empty() {
+        if input.trim().is_empty() && contexts.is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
         let mut family_mailbox = if continues_chat {
@@ -5461,6 +5481,9 @@ impl Agent {
     /// failed turn, or while the Chat is stopped. An already queued input absorbs further task
     /// notifications into the same run.
     fn queue_task_continuation(&self, chat: &mut Chat, loop_id: Option<LoopId>) -> bool {
+        if self.inner.tool_policy.is_managed() {
+            return false;
+        }
         let is_being_interrupted = chat
             .active_run
             .is_some_and(|run| chat.user_cancelled_runs.contains(&run));
@@ -5713,13 +5736,23 @@ fn mcp_resource_authority_allowed(
     chat: &Chat,
     authority: &tickloop_harness_protocol::HostToolAuthority,
 ) -> bool {
-    chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+    mcp_resource_authority_allowed_snapshot(&chat.snapshot, authority)
+}
+
+fn mcp_resource_authority_allowed_snapshot(
+    snapshot: &ChatSnapshot,
+    authority: &tickloop_harness_protocol::HostToolAuthority,
+) -> bool {
+    snapshot.delegation.as_ref().is_none_or(|delegation| {
         delegation
             .ceiling
             .host_tools
             .iter()
             .any(|(name, authorities)| {
-                (name == crate::mcp_tools::ARTIFACT_READ_TOOL || name.starts_with("mcp__"))
+                (name == crate::mcp_tools::ARTIFACT_READ_TOOL
+                    || name == crate::mcp_resources::READ_MCP_RESOURCE_TOOL
+                    || name == crate::mcp_resources::LIST_MCP_RESOURCES_TOOL
+                    || name.starts_with("mcp__"))
                     && authorities.contains(authority)
             })
     })

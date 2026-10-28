@@ -68,6 +68,11 @@ pub(super) struct Reporter {
 impl Reporter {
     /// Starts with Idle. Missing environment or runtime means reporting is disabled.
     pub(super) fn from_environment(interactive: bool) -> Option<Self> {
+        // PTY fixtures rerun this test build as Views that inherit the developer's real Herdr
+        // pane, and their reports overwrite that pane's agent. Reporter tests use `start`.
+        if cfg!(test) {
+            return None;
+        }
         let context = Context::from_values(interactive, |name| std::env::var_os(name))?;
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         Some(Self::start(context, &runtime))

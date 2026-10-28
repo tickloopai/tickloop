@@ -259,6 +259,23 @@ fn separate_frozen_image_submissions_keep_distinct_marker_ids() {
 }
 
 #[test]
+fn saved_client_blocks_preserve_repetitions_and_order() {
+    let mut state = state();
+    let resource = InputContext::Resource(tickloop_harness::protocol::ResourceContext {
+        uri: "context://example/item".into(),
+        mime_type: Some("text/plain".into()),
+        name: None,
+        content: Some("attached material".into()),
+    });
+    let text = InputContext::PromptText {
+        text: "again".into(),
+    };
+    let contexts = vec![resource.clone(), text.clone(), resource, text];
+    state.restore_saved_contexts(&contexts);
+    assert_eq!(state.restored_contexts, contexts);
+}
+
+#[test]
 fn delayed_dispatch_uses_frozen_retry_and_contexts_not_the_new_draft() {
     let mut state = state();
     let chat = state.chat;

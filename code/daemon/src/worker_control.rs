@@ -125,6 +125,47 @@ impl WorkerControl {
         let _ = self.daemon.set(daemon);
     }
 
+    /// The daemon's managed invocation boundary, not a model-callable stop operation.
+    pub(crate) async fn end_managed(
+        &self,
+        config_root: Option<&Path>,
+        chat: Uuid,
+        operation: Uuid,
+    ) -> Result<(), tickloop_code_access::AccessError> {
+        let Some(config_root) = config_root else {
+            return Ok(());
+        };
+        let root = root_identity(config_root).ok_or_else(|| {
+            tickloop_code_access::AccessError::invalid(
+                "managed config root has no ownership identity",
+            )
+        })?;
+        let registry = self
+            .root_registry(config_root, &root)
+            .await
+            .map_err(|error| tickloop_code_access::AccessError::unavailable(error.to_string()))?;
+        let cleanup = async {
+            let _lifecycle = registry.lifecycle(chat).await;
+            self.controller
+                .end_owner(
+                    &TickOwner { root, chat },
+                    registry.revision().await?,
+                    operation,
+                )
+                .await?;
+            for record in registry.launches(chat).await? {
+                registry.remove_launch(chat, record.operation).await?;
+            }
+            Ok::<_, tickhost_connect::host_error::HostError>(())
+        };
+        cleanup.await.map_err(|error| {
+            tickloop_code_access::AccessError::new(
+                tickloop_code_access::AccessErrorCode::OutcomeUnknown,
+                format!("managed hosted cleanup failed: {error}"),
+            )
+        })
+    }
+
     /// A fresh grant for a worker about to start.
     pub fn grant(&self) -> WorkerControlGrant {
         WorkerControlGrant {

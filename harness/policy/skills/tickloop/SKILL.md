@@ -7,6 +7,8 @@ description: Open or operate a Tick, including what an installed plugin shows (e
 
 A Tick is a program the Tickhost runs, a Bash background task or an artifact that this Chat can read, operate and subscribe to. Keep its complete reference: `hosted:` for a program the Tickhost runs (an extension Tick speaks the Tick protocol; any other program is a terminal Tick), `shell:<task id>` for a Bash background task, and `artifact:<origin>/<artifact_id>` for an artifact linked to this Chat, which a host note names when it is linked. Each type keeps its own tools: the Tick tools for `hosted:`, Bash, Read on its `output_file` and TaskStop for Shell, the Artifact tools for artifacts. A program the user starts in a Pane or terminal is not a Tick: open it as one to read or operate it.
 
+Use only tools available in this invocation. ACP and Print do not offer subscriptions, persistent feedback, structured questions or Plan approvals, and clean up their Shells and hosted Ticks when a turn settles. They cannot keep watching after returning an answer.
+
 ## Check the host
 
 Read `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the environment. `tickhost` says whether Ticks can run here. When something is missing, say so in plain words and stop; report only Tick operations that actually succeeded, and never drive a multiplexer through Bash instead.

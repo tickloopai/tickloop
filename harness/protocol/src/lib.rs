@@ -205,4 +205,10 @@ mod tasks;
 pub use tasks::*;
 
 mod isolation;
+pub use file_change::RecordedFileChangeReview;
+pub use input::ResourceContext;
 pub use isolation::{ExecutionIsolation, NetworkIsolation, WriteIsolation};
+pub use mcp::{
+    MAX_SESSION_MCP_DESCRIPTOR_BYTES, MAX_SESSION_MCP_SERVERS, SessionMcpServer,
+    valid_session_mcp_env_key, validate_session_mcp_servers,
+};

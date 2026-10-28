@@ -32,6 +32,8 @@ tickloop-harness = { path = "../../harness/sdk", features = ["connector", "model
 crossterm = "0.29"
 serde_json = "1"
 tickloop-code-access = { path = "../access" }
+tickloop-code-acp = { path = "../acp" }
+tickloop-code-print = { path = "../print" }
 tickloop-code-client = { path = "../client" }
 tickloop-code-settings = { path = "../settings" }
 tickloop-code-console = { path = "../console" }
