@@ -32,6 +32,7 @@ const PHASE_FILE: &str = "phases.jsonl";
 const PLAN_REMINDER: &str = "Plan mode is active.";
 const EXIT_NOTICE: &str = "You have exited plan mode.";
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
+const LIVE_PLAN: &str = "## Live plan\n\n* Implement **after** approval\n* Report the result";
 
 #[test]
 #[ignore]
@@ -109,10 +110,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         ATTACH_ROUTE => (
             ExecutionMode::Plan,
             vec![
-                tickloop_harness::test_support::submit_plan(
-                    "plan",
-                    "# Live plan\nImplement after approval.",
-                ),
+                tickloop_harness::test_support::submit_plan("plan", LIVE_PLAN),
                 tickloop_harness::test_support::text("Implementation started."),
             ],
         ),
@@ -678,9 +676,21 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
 #[test]
 fn plan_flow_pty_a_view_attaching_to_a_waiting_approval_resumes_the_same_run() {
     let mut flow = PlanFlow::start(ATTACH_ROUTE);
-    let (_, state) = flow.wait("the waiting approval on attach", |frame, _| {
+    let (frame, state) = flow.wait("the waiting approval on attach", |frame, _| {
         approval_dialog(frame).is_some_and(|dialog| dialog.contains("Live plan"))
     });
+    // The plan reads as Markdown: its heading, list markers and emphasis are laid out, not shown.
+    let dialog = approval_dialog(&frame).unwrap();
+    for rendered in [
+        "\n  Live plan",
+        "\n  - Implement after approval",
+        "\n  - Report the result",
+    ] {
+        assert!(dialog.contains(rendered), "{rendered}\n{frame}");
+    }
+    for source in ["## ", "**", "* Implement"] {
+        assert!(!dialog.contains(source), "{source}\n{frame}");
+    }
     assert_eq!(state["permissions"], json!(["ExitPlanMode"]), "{state}");
     assert_eq!(state["requests"].as_array().unwrap().len(), 1, "{state}");
 

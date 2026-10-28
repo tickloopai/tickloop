@@ -519,13 +519,35 @@ async fn a_delegated_child_gets_no_plan_mode_tools() {
     completed(&mut events, &parent_run).await;
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3);
-    let offers = |request: &tickloop_harness::model::ModelRequest, name: &str| {
+    let lists = |request: &tickloop_harness::model::ModelRequest, name: &str| {
         request.tools.iter().any(|tool| tool.name == name)
     };
-    for name in ["EnterPlanMode", "ExitPlanMode"] {
-        assert!(offers(&requests[0], name), "the root keeps {name}");
-        assert!(!offers(&requests[1], name), "a child never gets {name}");
+    let defers_enter_plan_mode = |request: &tickloop_harness::model::ModelRequest| {
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == tickloop_harness::protocol::Role::System)
+            .any(|message| {
+                serde_json::to_string(message)
+                    .unwrap()
+                    .contains("# Deferred tools")
+            })
+    };
+    assert!(
+        lists(&requests[0], "ExitPlanMode"),
+        "the root keeps ExitPlanMode"
+    );
+    assert!(
+        defers_enter_plan_mode(&requests[0]),
+        "the root reaches EnterPlanMode through tool search"
+    );
+    for name in ["EnterPlanMode", "ExitPlanMode", "SearchTools"] {
+        assert!(!lists(&requests[1], name), "a child never gets {name}");
     }
+    assert!(
+        !defers_enter_plan_mode(&requests[1]),
+        "a child never hears of EnterPlanMode"
+    );
     assert!(
         requests[1]
             .tools

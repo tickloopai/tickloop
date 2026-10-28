@@ -14,8 +14,8 @@ use tickloop_harness::model::{
     LocalModelClients, ModelClient, ModelClients,
     cards::ModelCatalog,
     codex_test_support::{
-        LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
-        serve_scripted_responses, state_with_credentials, text_stream,
+        LoopbackCodexClient, function_call_stream, reply_stream, reply_stream_with_output,
+        send_ws_stream, serve_scripted_responses, state_with_credentials, text_stream,
     },
 };
 use tickloop_harness::protocol::{
@@ -263,7 +263,12 @@ async fn automatic_compaction_uses_the_subscription_and_can_continue_a_real_file
     let (endpoint, observed) = serve_scripted_responses(vec![
         (
             200,
-            reply_stream("first", &"Older observation ".repeat(40_000), 20_000),
+            reply_stream_with_output(
+                "first",
+                &"Older observation ".repeat(40_000),
+                20_000,
+                240_000,
+            ),
         ),
         (
             200,

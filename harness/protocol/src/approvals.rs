@@ -5,6 +5,10 @@ use crate::{AutoBlockKind, AutoReviewerPreference, AutoRule, Usage, VerdictEvide
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PreparedApprovalFacts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::ExecutionIsolation>,
     pub artifact_publication: Option<crate::ArtifactPublication>,
     pub normalized_input: serde_json::Value,
     pub canonical_path: Option<std::path::PathBuf>,

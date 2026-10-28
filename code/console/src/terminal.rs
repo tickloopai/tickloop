@@ -113,7 +113,7 @@ mod workflows;
 mod workspace_trust;
 
 use agent_messaging::{AgentInput, AgentMessage};
-use console::{Console, InputEvent, RendererSwitch};
+use console::{Console, InputEvent, RendererSwitch, RequestedPlanEdit};
 use diff_catalog::ChangeCatalog;
 use directed_summary::{DirectedSummaryTasks, SummaryTaskCompletion};
 use display::{DisplayProfile, Glyph};
@@ -131,6 +131,7 @@ use renderer::Renderer;
 use reply_lines::ReplyLines;
 use running_shimmer::RunningShimmer;
 use scrollback::InputEcho;
+use status_area::ContextGauge;
 use style::Role;
 
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
@@ -792,6 +793,7 @@ async fn connect_daemon_at_startup(
         id: menu_id,
         title: "Stop the running daemon and continue?".into(),
         context,
+        markdown: None,
         options,
         selected: cancel_index,
         confirmation: true,
@@ -942,7 +944,7 @@ In transcript: / searches, enter accepts, n/N moves between matches; esc cancels
 j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
-/plan enters Plan mode, or opens this Chat's saved plan.
+/plan [open|DESCRIPTION] enters Plan mode, starting on DESCRIPTION when given; in Plan it shows the plan, and open edits it in your editor. A plan awaiting approval reopens its review: ctrl+g edits the plan, shift+tab on the feedback field approves with that feedback.
 Monitor lists this Chat's Ticks, Artifacts, background Shells and scheduled tasks, with its Goal at the bottom. On extension and terminal Tick rows, s cycles subscriptions and u sends an update when unsubscribed; p pauses/resumes a periodic subscription or scheduled task; x twice confirms removal.
 The first new Goal, scheduled task or Tick in each Chat during this console session opens Monitor once without moving input focus, even when hidden. Closing it prevents further automatic opens. Existing content on opening a Chat does not trigger this; narrow terminals flash the Monitor entry instead of covering the conversation.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
@@ -1677,47 +1679,25 @@ fn banner_title_line(agent_runtime: Option<&str>) -> (usize, Vec<(String, Option
     (BANNER_TEXT_FIRST_ROW, line)
 }
 
-async fn open_current_plan(
+const PLAN_OPEN_ARGUMENT: &str = "open";
+const PLAN_MODE_ENABLED: &str = "Plan mode is active. Enter a task to make a plan.";
+const NO_PLAN_WRITTEN: &str = "Already in plan mode. No plan written yet.";
+
+/// `/plan [open|DESCRIPTION]`, after Claude Code: outside Plan it enters Plan and sends a
+/// description as the next prompt; in Plan it shows the current plan, and `open` edits it in the
+/// external editor. A plan awaiting approval reopens its review, where `open` edits that plan.
+/// Returns the description to send.
+async fn run_plan_command(
     agent: &Agent,
     console: &Console,
     menus: &mut Menus,
     chat: Option<ChatId>,
-) -> Result<(), String> {
-    if let Some(chat) = chat {
-        let snapshot = agent
-            .snapshot(chat.into())
-            .await
-            .map_err(|error| error.to_string())?;
-        // Plain input reaches here without the editor's scope check.
-        if snapshot.delegation.is_some() {
-            return Err(completion::command_refusal(
-                completion::CommandScope::Child,
-                "/plan",
-                completion::CHILD_PLAN_REPORTED,
-            ));
-        }
-        if let Some(plan) = snapshot
-            .plans
-            .iter()
-            .find(|plan| plan.loop_id == snapshot.chat_loop.id)
-        {
-            if console.is_interactive() || plan.approval_pending {
-                return menus.workflow(console, Workflow::plan(agent, chat.into()).await?);
-            }
-            outln!(
-                console,
-                "Plan version {} · approved mode {:?}\n{}",
-                plan.version,
-                plan.approved_execution_mode,
-                safe_text(&plan.markdown)
-            );
-            return Ok(());
-        }
-        agent
-            .set_execution_mode(chat.into(), ExecutionMode::Plan)
-            .await
-            .map_err(|error| error.to_string())?;
-    } else {
+    argument: &str,
+) -> Result<Option<String>, String> {
+    let argument = argument.trim();
+    let opens_plan = argument == PLAN_OPEN_ARGUMENT;
+    let description = (!argument.is_empty() && !opens_plan).then(|| argument.to_owned());
+    let Some(chat) = chat else {
         agent
             .change_configuration(
                 ConfigTarget::NewDraft,
@@ -1727,9 +1707,89 @@ async fn open_current_plan(
             )
             .await
             .map_err(|error| error.to_string())?;
+        if description.is_none() {
+            outln!(console, "{PLAN_MODE_ENABLED}");
+        }
+        return Ok(description);
+    };
+    let snapshot = agent
+        .snapshot(chat.into())
+        .await
+        .map_err(|error| error.to_string())?;
+    // Plain input reaches here without the editor's scope check.
+    if snapshot.delegation.is_some() {
+        return Err(completion::command_refusal(
+            completion::CommandScope::Child,
+            "/plan",
+            completion::CHILD_PLAN_REPORTED,
+        ));
     }
-    outln!(console, "Plan mode is active. Enter a task to make a plan.");
-    Ok(())
+    let plan = snapshot
+        .plans
+        .iter()
+        .find(|plan| plan.loop_id == snapshot.chat_loop.id);
+    if description.is_none() && plan.is_some_and(|plan| plan.approval_pending) {
+        menus.workflow(console, Workflow::plan(agent, chat.into()).await?)?;
+        if opens_plan && console.is_interactive() {
+            console.request_plan_edit(RequestedPlanEdit::Review)?;
+        }
+        return Ok(None);
+    }
+    let was_in_plan = snapshot.policy.mode == ExecutionMode::Plan;
+    if !was_in_plan {
+        agent
+            .set_execution_mode(chat.into(), ExecutionMode::Plan)
+            .await
+            .map_err(|error| error.to_string())?;
+        if description.is_some() {
+            return Ok(description);
+        }
+        if !opens_plan {
+            outln!(console, "{PLAN_MODE_ENABLED}");
+            return Ok(None);
+        }
+    } else if !opens_plan {
+        match plan {
+            Some(_) if console.is_interactive() => {
+                menus.workflow(console, Workflow::plan(agent, chat.into()).await?)?;
+            }
+            Some(plan) => outln!(
+                console,
+                "Plan version {} · approved mode {:?}\n{}",
+                plan.version,
+                plan.approved_execution_mode,
+                safe_text(&plan.markdown)
+            ),
+            None => outln!(console, "{NO_PLAN_WRITTEN}"),
+        }
+        return Ok(None);
+    }
+    let Some(path) = agent
+        .plan_file(chat.into())
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        outln!(
+            console,
+            "{}",
+            if was_in_plan {
+                NO_PLAN_WRITTEN
+            } else {
+                PLAN_MODE_ENABLED
+            }
+        );
+        return Ok(None);
+    };
+    if console.is_interactive() {
+        console.request_plan_edit(RequestedPlanEdit::File(path))?;
+    } else {
+        outln!(
+            console,
+            "Plan file: {}",
+            safe_text(&path.display().to_string())
+        );
+    }
+    Ok(None)
 }
 
 fn close_login_session(
@@ -1779,6 +1839,8 @@ fn model_setup_blocks_input(line: &str) -> bool {
     if !command.starts_with('/')
         || command == "/compact"
         || (command == "/goal" && line.trim() != "/goal")
+        || (command == "/plan"
+            && !matches!(line.trim()["/plan".len()..].trim(), "" | PLAN_OPEN_ARGUMENT))
     {
         return true;
     }
@@ -1953,6 +2015,7 @@ async fn interact_with_herdr(
     // The inputs of each Chat still waiting for their echo after the conversation was last read
     // for them; the same waits are not read for again until they change.
     let mut unsettled_echoes: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+    let mut context_warnings = ContextWarnings::default();
     // The catalog's account of each family member whose snapshot this View last applied.
     let mut applied_member_work: HashMap<uuid::Uuid, MemberWork> = HashMap::new();
     let mut running_activity: Option<RunningActivity> = None;
@@ -2372,6 +2435,9 @@ async fn interact_with_herdr(
                     context_usage(&status),
                     visible_task_board,
                 )?;
+                if let Some(notice) = context_warnings.crossing_notice(&status) {
+                    write_warning(console, &notice)?;
+                }
                 let running_receipt = pending
                     .values()
                     .find(|receipt| {
@@ -3089,7 +3155,7 @@ async fn interact_with_herdr(
                     status_dirty = true;
                 },
                 Some(InputEvent::Suspend | InputEvent::OpenRewind | InputEvent::TakeBackQueued { .. }
-                    | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. }
+                    | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. } | InputEvent::PlanEdited { .. }
                     | InputEvent::BackgroundForegroundShell | InputEvent::Permissions(_)
                     | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login_active => {},
                 Some(InputEvent::Escape) => {
@@ -3284,6 +3350,13 @@ async fn interact_with_herdr(
                     match menus.choose(agent,console,menu_id,Some(index),comment).await {
                         Ok(outcome)=>menu_outcome=Some(outcome),
                         Err(error)=>outln!(console,"Cannot apply selection: {}",safe_text(&error)),
+                    }
+                },
+                Some(InputEvent::PlanEdited {menu_id,markdown}) => {
+                    status_dirty=true;
+                    match menus.edit_plan(agent,console,menu_id,markdown).await {
+                        Ok(())=>console.set_status("Plan edited · approve or keep planning on the new version")?,
+                        Err(error)=>console.set_status(&format!("Cannot save the edited plan: {}",safe_line(&error)))?,
                     }
                 },
                 Some(InputEvent::ExpandChoice {menu_id,index}) => {
@@ -3906,10 +3979,13 @@ async fn interact_with_herdr(
                             if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat.into()).await?; }
                         },
-                        "/plan" => {
-                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat).await {
-                                outln!(console,"Cannot open plan: {}",safe_text(&error));
+                        _ if line == "/plan" || line.starts_with("/plan ") => {
+                            match run_plan_command(agent,console,&mut menus,selected_chat,&line["/plan".len()..]).await {
+                                Ok(Some(description)) => paused_inputs.push_front(InputEvent::Line(description)),
+                                Ok(None) => {},
+                                Err(error) => outln!(console,"Cannot open plan: {}",safe_text(&error)),
                             }
+                            status_dirty = true;
                         },
                         "/details" if interactive => {
                             let id = console.start_transcript()?;
@@ -4756,7 +4832,7 @@ async fn interact_with_herdr(
                         },
                         EventKind::QuestionAsked {request} => print_question(console, &request)?,
                         EventKind::PlanUpdated {plan} => {
-                            outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id.public(),plan.version,safe_text(&plan.markdown));
+                            console.write_plan(&format!("Plan: {} · version {}",plan.loop_id.public(),plan.version),&safe_text(&plan.markdown))?;
 
                         },
                         EventKind::ProgressUpdated {progress} => {
@@ -6088,12 +6164,10 @@ fn render_restored_observation(
                     },
                     safe_text(&result.content)
                 ),
-                EventKind::PlanUpdated { plan } => outln!(
-                    console,
-                    "\nPlan version {}:\n{}",
-                    plan.version,
-                    safe_text(&plan.markdown)
-                ),
+                EventKind::PlanUpdated { plan } => console.write_plan(
+                    &format!("Plan version {}:", plan.version),
+                    &safe_text(&plan.markdown),
+                )?,
                 // The Todo list shows progress; only plain output writes it out.
                 EventKind::ProgressUpdated { progress } if !console.is_interactive() => {
                     outln!(console, "\nProgress:");
@@ -7835,20 +7909,48 @@ fn recover_background_chat(
     recovery
 }
 
-fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
+fn initial_context_usage(model: &ModelConfig) -> Option<ContextGauge> {
     model
         .maximum_context_window_tokens()
         .filter(|limit| *limit > 0)
-        .map(|limit| (0, limit))
+        .map(|limit| (0, limit).into())
 }
 
-fn context_usage(status: &ChatStatus) -> Option<(u64, usize)> {
+fn context_usage(status: &ChatStatus) -> Option<ContextGauge> {
     let limit = status
         .model
         .maximum_context_window_tokens()
         .or(status.context_window_tokens)
         .filter(|limit| *limit > 0)?;
-    Some((status.context_tokens?, limit))
+    Some(ContextGauge {
+        used_tokens: status.context_tokens?,
+        window_tokens: limit,
+        is_nearly_full: status.is_context_nearly_full(),
+    })
+}
+
+/// The Chats this View has warned are nearly out of context. A Chat is warned once as it crosses
+/// into the warning buffer, and again only after its context falls back below it, as compaction
+/// makes it.
+#[derive(Default)]
+struct ContextWarnings(HashSet<uuid::Uuid>);
+
+impl ContextWarnings {
+    /// The notice to show when `status` has just crossed into the warning buffer.
+    fn crossing_notice(&mut self, status: &ChatStatus) -> Option<String> {
+        let chat = status.id.uuid();
+        if !status.is_context_nearly_full() {
+            self.0.remove(&chat);
+            return None;
+        }
+        let line = status.auto_compact_tokens?;
+        self.0.insert(chat).then(|| {
+            format!(
+                "Context nearly full · auto-compact at {} tokens · /compact to compact now",
+                presentation::compact_count(line)
+            )
+        })
+    }
 }
 
 /// A model retry as Claude Code reports it: what failed, then the retry and its attempt, which
@@ -8409,6 +8511,8 @@ mod tests {
             "/goal finish the task",
             "/compact",
             "/compact summarize this",
+            "/plan add a cache",
+            "/plan open a pull request",
         ] {
             assert!(super::model_setup_blocks_input(input), "{input}");
         }
@@ -8423,6 +8527,8 @@ mod tests {
             "/help advanced",
             "/resume saved-chat",
             "/clear",
+            "/plan",
+            "/plan  open ",
         ] {
             assert!(!super::model_setup_blocks_input(input), "{input}");
         }
@@ -9121,7 +9227,7 @@ mod tests {
         switch_to_saved_branch, tui_renderer_request,
     };
     use super::{
-        BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
+        BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, ContextWarnings, Receipt,
         UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
         observe_user_shell_record, readable_background_label, recover_background_chat,
         track_run_requests,
@@ -9133,6 +9239,50 @@ mod tests {
     use tickloop_harness::protocol::{Decision, PermissionRule};
     use tickloop_harness::protocol::{ModelRequestKind, RequestOutcome, RequestOwner};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn a_chat_is_warned_once_as_its_context_nears_the_compaction_line_and_again_after_compacting()
+     {
+        let agent = Agent::new_embedded(
+            tickloop_harness::test_support::config_with_window(200_000),
+            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
+                Vec::new(),
+            )),
+        );
+        let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
+        let mut status =
+            tickloop_harness::protocol::ChatStatus::of(&agent.snapshot(chat_id).await.unwrap());
+        status.auto_compact_tokens = Some(167_000);
+        let mut warnings = ContextWarnings::default();
+        let mut observe = |used: u64| {
+            status.context_tokens = Some(used);
+            let gauge = context_usage(&status).unwrap();
+            (gauge.is_nearly_full, warnings.crossing_notice(&status))
+        };
+        assert_eq!(observe(146_999), (false, None), "below the warning");
+        assert_eq!(
+            observe(147_000),
+            (
+                true,
+                Some(
+                    "Context nearly full · auto-compact at 167k tokens · /compact to compact now"
+                        .into()
+                )
+            ),
+            "crossing into the warning buffer warns"
+        );
+        assert_eq!(
+            observe(160_000),
+            (true, None),
+            "the same crossing warns once"
+        );
+        assert_eq!(observe(20_000), (false, None), "compaction resets it");
+        assert!(
+            observe(150_000).1.is_some(),
+            "the next crossing warns again"
+        );
+        agent.shutdown().await;
+    }
 
     #[tokio::test]
     async fn context_starts_at_zero_and_uses_the_effective_model_window() {
@@ -9153,7 +9303,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
 
         let request = snapshot
@@ -9170,7 +9320,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
         let mut without_report = snapshot.clone();
         without_report
@@ -9179,7 +9329,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&without_report)),
-            Some((0, 1_000_000))
+            Some((0, 1_000_000).into())
         );
         let measurement =
             tickloop_harness::protocol::ContextMeasurement::capture(&snapshot, 1000, 1000);
@@ -9201,7 +9351,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((12_500, 1_000_000))
+            Some((12_500, 1_000_000).into())
         );
         snapshot
             .request_usage
@@ -9221,7 +9371,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_harness::protocol::ChatStatus::of(&snapshot)),
-            Some((12_500, 1_000_000))
+            Some((12_500, 1_000_000).into())
         );
     }
 

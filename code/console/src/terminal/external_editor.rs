@@ -203,6 +203,60 @@ pub(super) fn edit_prompt_with_cancellation(
     }
 }
 
+/// Opens `path` itself in the external editor, as `/plan open` does for the plan file.
+pub(super) fn edit_file(path: &Path, working_directory: &Path) -> ExternalEditorOutcome {
+    match ExternalEditor::from_environment() {
+        Ok(Some(editor)) => edit_file_with(&editor, path, working_directory),
+        Ok(None) => ExternalEditorOutcome::Unavailable,
+        Err(error) => ExternalEditorOutcome::Failed(error),
+    }
+}
+
+fn edit_file_with(
+    editor: &ExternalEditor,
+    path: &Path,
+    working_directory: &Path,
+) -> ExternalEditorOutcome {
+    let read = |path: &Path| {
+        read_bounded(path, MAX_PROMPT_BYTES)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let before = match read(path) {
+        Ok(text) => text,
+        Err(error) => return ExternalEditorOutcome::Failed(error),
+    };
+    let status = match Command::new(&editor.program)
+        .args(&editor.arguments)
+        .arg(path)
+        .current_dir(working_directory)
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            return ExternalEditorOutcome::Failed(ExternalEditorFailure::Launch {
+                editor: editor.display_name(),
+                reason: error.to_string(),
+            });
+        }
+    };
+    if let Some(signal) = status.signal() {
+        return ExternalEditorOutcome::Cancelled {
+            signal: Some(signal),
+        };
+    }
+    if !status.success() {
+        return ExternalEditorOutcome::Failed(ExternalEditorFailure::Exit {
+            editor: editor.display_name(),
+            code: status.code().unwrap_or(-1),
+        });
+    }
+    match read(path) {
+        Ok(after) if after == before => ExternalEditorOutcome::Unchanged,
+        Ok(content) => ExternalEditorOutcome::Updated { content },
+        Err(error) => ExternalEditorOutcome::Failed(error),
+    }
+}
+
 pub(super) fn edit_prompt_with(
     editor: &ExternalEditor,
     draft: &str,
@@ -627,6 +681,31 @@ mod tests {
             }
         );
         assert!(!recorded_temporary_path(&record).exists());
+    }
+
+    #[test]
+    fn a_file_is_edited_in_place_and_reports_whether_it_changed() {
+        let directory = TempDir::new().unwrap();
+        let file = directory.path().join("plan.md");
+        fs::write(&file, "1. Draft.\n").unwrap();
+        let appending = fixture(&directory, "printf '2. Test.\\n' >> \"$1\"");
+        assert_eq!(
+            edit_file_with(&command(appending, Vec::new()), &file, directory.path()),
+            ExternalEditorOutcome::Updated {
+                content: "1. Draft.\n2. Test.\n".into()
+            }
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "1. Draft.\n2. Test.\n");
+        let viewing = fixture(&directory, ":");
+        assert_eq!(
+            edit_file_with(&command(viewing, Vec::new()), &file, directory.path()),
+            ExternalEditorOutcome::Unchanged
+        );
+        let failing = fixture(&directory, "exit 3");
+        assert!(matches!(
+            edit_file_with(&command(failing, Vec::new()), &file, directory.path()),
+            ExternalEditorOutcome::Failed(ExternalEditorFailure::Exit { code: 3, .. })
+        ));
     }
 
     #[test]

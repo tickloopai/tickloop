@@ -29,6 +29,7 @@ type ShellEntries = HashMap<(ChatId, InstanceRef), Option<Arc<ShellEntry>>>;
 
 pub(crate) struct LocalShells {
     tasks: Arc<ShellTasks>,
+    sandbox: std::sync::RwLock<Option<tickloop_code_settings::UserSettings>>,
     epoch: Uuid,
     plans: std::sync::Mutex<HashMap<(Uuid, PreparationId), ShellPlan>>,
     stops: std::sync::Mutex<HashMap<(Uuid, PreparationId), PreparedStop>>,
@@ -43,6 +44,9 @@ struct ShellPlan {
     environment: Vec<(Vec<u8>, Vec<u8>)>,
     executable: PreparedProgram,
     directory_identity: FileIdentity,
+    sandbox: Option<tickhost::sandbox::SandboxPolicy>,
+    warning: Option<String>,
+    escape_guidance: bool,
 }
 
 enum PreparedOutput {
@@ -62,16 +66,18 @@ struct ShellEntry {
 }
 
 struct BoundOutput {
+    escape_guidance: bool,
     path: std::path::PathBuf,
     identity: FileIdentity,
     open: std::sync::Mutex<Option<Arc<File>>>,
 }
 
 impl BoundOutput {
-    fn new(file: File, path: String) -> Result<Self, ExecutionError> {
+    fn new(file: File, path: String, escape_guidance: bool) -> Result<Self, ExecutionError> {
         let identity = FileIdentity::opened(&file).map_err(preparation_error)?;
         Ok(Self {
             path: path.into(),
+            escape_guidance,
             identity,
             open: std::sync::Mutex::new(Some(Arc::new(file))),
         })
@@ -126,6 +132,7 @@ impl LocalShells {
         }
         let environment = Arc::new(Self {
             tasks: tasks.clone(),
+            sandbox: Default::default(),
             epoch: tickloop_ids::generate(),
             plans: Default::default(),
             stops: Default::default(),
@@ -133,6 +140,10 @@ impl LocalShells {
         });
         *existing = Arc::downgrade(&environment);
         environment
+    }
+
+    pub(crate) fn set_sandbox(&self, settings: tickloop_code_settings::UserSettings) {
+        *self.sandbox.write().unwrap() = Some(settings);
     }
 
     pub(crate) fn tasks(&self) -> Arc<ShellTasks> {
@@ -146,6 +157,8 @@ impl LocalShells {
         mut spec: ShellSpec,
         staged: Option<ShellLaunch>,
     ) -> Result<PreparedExecution, ExecutionError> {
+        let settings = self.sandbox.read().unwrap().clone();
+        let sandbox = super::sandbox::prepare(settings.as_ref(), &spec).await?;
         let shell = Path::new(&spec.shell).canonicalize().map_err(io_error)?;
         let cwd = Path::new(&spec.cwd).canonicalize().map_err(io_error)?;
         let output_path = if Path::new(&spec.output).is_absolute() {
@@ -241,6 +254,9 @@ impl LocalShells {
                 },
             },
         );
+        let prepared = prepared
+            .with_isolation(sandbox.isolation)
+            .with_required_approval(sandbox.requires_approval);
         let preparation = prepared.preparation();
         let prepared = prepared.with_cleanup(move || {
             if let Some(owner) = owner.upgrade() {
@@ -263,6 +279,9 @@ impl LocalShells {
                 environment: launch_environment(),
                 executable,
                 directory_identity,
+                sandbox: sandbox.policy,
+                warning: sandbox.warning,
+                escape_guidance: sandbox.escape_guidance,
             },
         );
         Ok(prepared)
@@ -500,7 +519,7 @@ impl LocalShells {
         let output = match output_file
             .try_clone()
             .map_err(io_error)
-            .and_then(|file| BoundOutput::new(file, spec.output.clone()))
+            .and_then(|file| BoundOutput::new(file, spec.output.clone(), plan.escape_guidance))
         {
             Ok(output) => Arc::new(output),
             Err(error) => {
@@ -508,6 +527,14 @@ impl LocalShells {
                 return ExecutionOutcome::NotDispatched(error);
             }
         };
+        if let Some(warning) = &plan.warning {
+            use std::io::Write;
+            let written = writeln!(&output_file, "Warning: {warning}");
+            if let Err(error) = written {
+                self.entries.lock().await.remove(&key);
+                return ExecutionOutcome::NotDispatched(io_error(error));
+            }
+        }
         let launch = ShellLaunch {
             operation_id: operation,
             shell: spec.shell.clone().into(),
@@ -521,7 +548,13 @@ impl LocalShells {
         };
         let process = match self
             .tasks
-            .start_prepared(chat.into(), launch, plan.environment, Some(&dispatch))
+            .start_prepared(
+                chat.into(),
+                launch,
+                plan.environment,
+                plan.sandbox,
+                Some(&dispatch),
+            )
             .await
         {
             Ok(process) => process,
@@ -611,6 +644,13 @@ impl LocalShells {
                     }
                 }
             };
+            if exit.state == CommandState::Failed
+                && let Some(output) = &output
+                && output.escape_guidance
+                && let Ok(file) = output.file()
+            {
+                super::sandbox::annotate_escape_guidance(&file);
+            }
             updates.send_modify(|status| {
                 status.state = exit.state;
                 status.exit_code = exit.exit_code;

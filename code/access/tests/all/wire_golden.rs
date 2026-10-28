@@ -195,8 +195,9 @@ fn permission_policy() -> PermissionPolicy {
         rules: vec![permission_rule(0x71, Decision::Allow, true)],
         project_constraints: vec![permission_rule(0x72, Decision::Ask, false)],
         managed_constraints: vec![permission_rule(0x73, Decision::Deny, true)],
-        // Never on the wire: the golden shows none.
+        // Never on the wire: the golden shows neither.
         host_rules: vec![permission_rule(0x74, Decision::Allow, false)],
+        plan_without_auto: true,
         launch_rules: Vec::new(),
         revision: 4,
     }
@@ -415,6 +416,7 @@ fn chat_snapshot() -> ChatSnapshot {
     snapshot.additional_directories = vec!["/work/shared".into()];
     snapshot.last_sequence = 9;
     snapshot.context_window_tokens = Some(200_000);
+    snapshot.auto_compact_window = Some(150_000);
     snapshot.last_model_run = Some(tickloop_ids::Id::from(id(0x20)));
     snapshot
         .pending_thinking
@@ -934,6 +936,10 @@ fn context_breakdown() -> ContextBreakdown {
                 tokens: 6_000,
             },
             ContextCategoryUsage {
+                category: ContextCategory::ToolSearchIndex,
+                tokens: 100,
+            },
+            ContextCategoryUsage {
                 category: ContextCategory::ToolSearchResults,
                 tokens: 1_000,
             },
@@ -952,6 +958,10 @@ fn context_breakdown() -> ContextBreakdown {
         mcp_tools: vec![ContextToolServer {
             server: "office".into(),
             tools: vec![context_item("mcp__office__open", 300)],
+        }],
+        tool_search_index: vec![ContextToolServer {
+            server: "market".into(),
+            tools: vec![context_item("mcp__market__quote", 100)],
         }],
         instruction_files: vec![context_item("/work/project/AGENTS.md", 2_000)],
         skills: vec![context_item("tickloop", 120)],

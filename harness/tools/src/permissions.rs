@@ -1,3 +1,6 @@
+mod command_selection;
+pub use command_selection::shell_command_matches_pattern;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -188,8 +191,9 @@ impl PermissionPolicyExt for PermissionPolicy {
                 });
             }
         }
+        let uses_auto = self.uses_auto_admission();
         let host_allows = allow_rules_cover_call(
-            &admitted_allow_rules(self.mode, RuleSource::Host, &self.host_rules),
+            &admitted_allow_rules(uses_auto, RuleSource::Host, &self.host_rules),
             name,
             input,
             loop_id,
@@ -204,7 +208,7 @@ impl PermissionPolicyExt for PermissionPolicy {
             .iter()
             .find(|(source, rules)| {
                 allow_rules_cover_call(
-                    &admitted_allow_rules(self.mode, *source, rules),
+                    &admitted_allow_rules(uses_auto, *source, rules),
                     name,
                     input,
                     loop_id,
@@ -214,7 +218,7 @@ impl PermissionPolicyExt for PermissionPolicy {
             .or_else(|| {
                 let combined = sources
                     .iter()
-                    .flat_map(|(source, rules)| admitted_allow_rules(self.mode, *source, rules))
+                    .flat_map(|(source, rules)| admitted_allow_rules(uses_auto, *source, rules))
                     .collect::<Vec<_>>();
                 allow_rules_cover_call(&combined, name, input, loop_id).then_some(RuleSource::User)
             });
@@ -307,9 +311,11 @@ impl PermissionPolicyExt for PermissionPolicy {
         let is_accept_edits = self.mode == ExecutionMode::AcceptEdits;
         let decision = if safety_check.is_some() {
             Decision::Ask
-        } else if explicit == Some(ExplicitPermissionDecision::Allow)
-            || is_accept_edits && operation.is_allowed_in_accept_edits(workspace)
-        {
+        } else if explicit == Some(ExplicitPermissionDecision::Allow) {
+            Decision::Allow
+        } else if operation.requires_environment_approval() && self.mode != ExecutionMode::Plan {
+            Decision::Ask
+        } else if is_accept_edits && operation.is_allowed_in_accept_edits(workspace) {
             Decision::Allow
         } else if is_accept_edits && operation.accept_edits_supersedes_read_only() {
             Decision::Ask
@@ -318,7 +324,7 @@ impl PermissionPolicyExt for PermissionPolicy {
         } else {
             Decision::Ask
         };
-        if self.mode != ExecutionMode::Auto || decision != Decision::Ask {
+        if !self.uses_auto_admission() || decision != Decision::Ask {
             return decision;
         }
         if safety_check
@@ -330,7 +336,8 @@ impl PermissionPolicyExt for PermissionPolicy {
         let accept_edits_admits = operation.is_allowed_in_accept_edits(workspace)
             || operation.is_allowed_in_accept_edits_with_sibling_worktrees(workspace)
             || !operation.accept_edits_supersedes_read_only() && !operation.requires_permission;
-        let passes_fast_path = safety_check.is_none()
+        let passes_fast_path = !operation.requires_environment_approval()
+            && safety_check.is_none()
             && !content_rule_asks(self, &operation.name, &operation.input, loop_id)
             && accept_edits_admits;
         if passes_fast_path || AUTO_ALLOWLISTED_TOOLS.contains(&operation.name.as_str()) {
@@ -381,10 +388,10 @@ fn rule_sources(policy: &PermissionPolicy) -> [(RuleSource, &[PermissionRule]); 
     ]
 }
 
-/// The rules of `source` whose Allow counts under `mode`: Claude Code sets aside the user's and
-/// the project's broad Allow rules while Auto is on.
+/// The rules of `source` whose Allow counts: Claude Code sets aside the user's and the project's
+/// broad Allow rules while Auto's admission is on, in Auto and in Plan with Auto.
 fn admitted_allow_rules(
-    mode: ExecutionMode,
+    uses_auto: bool,
     source: RuleSource,
     rules: &[PermissionRule],
 ) -> Vec<&PermissionRule> {
@@ -392,7 +399,7 @@ fn admitted_allow_rules(
         .iter()
         .filter(|rule| {
             matches!(source, RuleSource::Host | RuleSource::Managed)
-                || mode != ExecutionMode::Auto
+                || !uses_auto
                 || !bypasses_auto_classifier(rule)
         })
         .collect()
@@ -464,7 +471,7 @@ pub fn rule_views(
     rules: &[PermissionRule],
     rule_project: impl Fn(&PermissionRule) -> PathBuf,
     workdir: &Path,
-    mode: ExecutionMode,
+    uses_auto_admission: bool,
     project_constraints: &[PermissionRule],
     managed_constraints: &[PermissionRule],
     host_rules: &[PermissionRule],
@@ -486,7 +493,7 @@ pub fn rule_views(
                 PermissionRuleScope::Chat
             },
             editable: true,
-            effective_note: (mode == ExecutionMode::Auto && bypasses_auto_classifier(rule))
+            effective_note: (uses_auto_admission && bypasses_auto_classifier(rule))
                 .then(|| "broad Allow does not bypass Auto review".into()),
         })
         .chain(project_constraints.iter().map(|rule| PermissionRuleView {
@@ -516,7 +523,7 @@ pub fn rule_views(
 /// Launch rules appear separately from editable and persistent user rules.
 pub fn launch_rule_views(
     rules: &[PermissionRule],
-    mode: ExecutionMode,
+    uses_auto_admission: bool,
 ) -> impl Iterator<Item = PermissionRuleView> + '_ {
     rules.iter().map(move |rule| PermissionRuleView {
         rule: rule.clone(),
@@ -524,7 +531,7 @@ pub fn launch_rule_views(
         scope: PermissionRuleScope::Chat,
         editable: false,
         effective_note: Some(
-            if mode == ExecutionMode::Auto && bypasses_auto_classifier(rule) {
+            if uses_auto_admission && bypasses_auto_classifier(rule) {
                 "launch argument; broad Allow does not bypass Auto review"
             } else {
                 "launch argument; cannot be edited or saved"
@@ -802,6 +809,10 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 }
 
 fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
+    split_shell_parts(command, false)
+}
+
+fn split_shell_parts(command: &str, allow_special_syntax: bool) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
     let mut commands = Vec::new();
     let mut start = 0;
@@ -830,8 +841,9 @@ fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
             continue;
         }
         if quote.is_none() {
-            if matches!(byte, b'`' | b'(' | b')' | b'{' | b'}' | b'<' | b'>')
-                || (byte == b'$' && bytes.get(index + 1) == Some(&b'('))
+            if !allow_special_syntax
+                && (matches!(byte, b'`' | b'(' | b')' | b'{' | b'}' | b'<' | b'>')
+                    || (byte == b'$' && bytes.get(index + 1) == Some(&b'(')))
             {
                 return None;
             }
@@ -1114,6 +1126,75 @@ mod tests {
             ),
             Decision::Deny
         );
+    }
+
+    /// Claude Code's `useAutoModeDuringPlan`: Plan still refuses side effects, and what it would
+    /// ask about goes through Auto's admission instead, unless the user turned that off.
+    #[test]
+    fn plan_admits_as_auto_unless_the_user_turned_it_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("notes.txt"), "notes").unwrap();
+        let (workspace, workspace_write) = prepared_tool(directory.path());
+        let external_read = prepare_in(
+            &workspace,
+            "Read",
+            json!({"file_path":external.path().join("notes.txt")}),
+        );
+        let web_fetch = prepare_in(
+            &workspace,
+            crate::WEB_FETCH_TOOL_NAME,
+            json!({"url":"https://docs.example.com/guide","prompt":"Summarize"}),
+        );
+        let mutating_shell = prepare_in(
+            &workspace,
+            BASH_TOOL_NAME,
+            json!({"command":"rm -rf build"}),
+        );
+        let decide = |plan_without_auto, rules: Vec<PermissionRule>, operation: &PreparedTool| {
+            PermissionPolicy {
+                mode: ExecutionMode::Plan,
+                rules,
+                plan_without_auto,
+                ..PermissionPolicy::default()
+            }
+            .decide(operation, &workspace, Uuid::nil())
+        };
+        let broad_allow = || vec![tool_rule(Decision::Allow, "*", None)];
+
+        assert_eq!(decide(false, vec![], &web_fetch), Decision::Check);
+        assert_eq!(decide(false, vec![], &external_read), Decision::Allow);
+        assert_eq!(
+            decide(false, broad_allow(), &web_fetch),
+            Decision::Check,
+            "a broad Allow does not bypass the review, as in Auto"
+        );
+        for operation in [&workspace_write, &mutating_shell] {
+            assert_eq!(decide(false, broad_allow(), operation), Decision::Deny);
+        }
+        assert_eq!(
+            decide(
+                false,
+                vec![tool_rule(Decision::Ask, "Read", None)],
+                &external_read
+            ),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(
+                false,
+                vec![web_fetch_rule(Decision::Deny, "domain:docs.example.com")],
+                &web_fetch
+            ),
+            Decision::Deny
+        );
+
+        assert_eq!(decide(true, vec![], &web_fetch), Decision::Ask);
+        assert_eq!(decide(true, vec![], &external_read), Decision::Ask);
+        assert_eq!(decide(true, broad_allow(), &web_fetch), Decision::Allow);
+        for operation in [&workspace_write, &mutating_shell] {
+            assert_eq!(decide(true, vec![], operation), Decision::Deny);
+        }
     }
 
     fn git(directory: &std::path::Path, arguments: &[&str]) {

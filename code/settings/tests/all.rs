@@ -1,5 +1,7 @@
 //! Every code/settings integration test, compiled as one binary.
 
+#[path = "all/auto_compact_settings.rs"]
+mod auto_compact_settings;
 #[path = "all/claude_auto_import.rs"]
 mod claude_auto_import;
 
@@ -17,6 +19,8 @@ mod loop_skill;
 mod model_configuration;
 #[path = "all/monitor_settings.rs"]
 mod monitor_settings;
+#[path = "all/plan_settings.rs"]
+mod plan_settings;
 #[path = "all/plugin_skills.rs"]
 mod plugin_skills;
 #[path = "all/settings_store.rs"]

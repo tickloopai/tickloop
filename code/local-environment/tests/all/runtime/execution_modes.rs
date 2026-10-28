@@ -125,17 +125,20 @@ async fn changing_the_execution_mode_keeps_the_prefix_and_announces_the_mode_at_
     agent.shutdown().await;
 }
 
+/// As in Claude Code, entering Plan needs no confirmation in any mode; only an Ask rule makes the
+/// user confirm it.
 #[tokio::test]
-async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
+async fn the_agent_enters_plan_mode_without_asking_unless_an_ask_rule_matches() {
     let directory = tempfile::tempdir().unwrap();
     let enter = |id| call(id, ENTER_PLAN_MODE_TOOL_NAME, serde_json::json!({}));
     let model = Arc::new(ScriptedModel::new(vec![
-        enter("declined"),
-        enter("full-access-declined"),
-        enter("accepted"),
+        enter("entered"),
         text("Planning first."),
         enter("again"),
         text("Still planning."),
+        enter("declined"),
+        enter("accepted"),
+        text("Planning with consent."),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -144,48 +147,25 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
         .await
         .unwrap();
 
-    // Auto mode still asks; a bare refusal ends the run and keeps the mode.
     let (receipt, requested, results) =
-        run_answering_permissions(&agent, chat, "Add caching", false).await;
+        run_answering_permissions(&agent, chat, "Plan it first", false).await;
     let goal = receipt.loop_id;
-    assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
-    let (_, declined) = &results[0];
-    assert!(declined.is_error);
-    assert_eq!(declined.content, "User declined to enter plan mode.");
+    assert!(requested.is_empty(), "{requested:?}");
+    let (_, entered) = &results[0];
+    assert!(!entered.is_error, "{}", entered.content);
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().policy.mode,
-        ExecutionMode::Auto
-    );
+        entered.content,
+        "Entered plan mode. You should now focus on exploring the codebase and designing an implementation approach.
 
-    agent
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    let (_, requested, _) = run_answering_permissions(&agent, chat, "Plan it anyway", false).await;
-    assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().policy.mode,
-        ExecutionMode::FullAccess
-    );
+In plan mode, you should:
+1. Thoroughly explore the codebase to understand existing patterns
+2. Identify similar features and architectural approaches
+3. Consider multiple approaches and their trade-offs
+4. Use AskUserQuestion if you need to clarify the approach
+5. Design a concrete implementation strategy
+6. When ready, use ExitPlanMode to present your plan for approval
 
-    let (_, requested, results) =
-        run_answering_permissions(&agent, chat, "Plan it first", true).await;
-    assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
-    let (_, accepted) = &results[0];
-    assert!(!accepted.is_error, "{}", accepted.content);
-    assert!(
-        accepted.content.starts_with(
-            "Entered plan mode. You should now focus on exploring the codebase and designing an implementation approach."
-        ),
-        "{}",
-        accepted.content
-    );
-    assert!(
-        accepted
-            .content
-            .contains("6. When ready, use ExitPlanMode to present your plan for approval"),
-        "{}",
-        accepted.content
+Remember: DO NOT write or edit any files yet. This is a read-only exploration and planning phase."
     );
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
@@ -200,7 +180,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
     );
 
     let (_, requested, results) =
-        run_answering_permissions(&agent, chat, "Keep planning", true).await;
+        run_answering_permissions(&agent, chat, "Keep planning", false).await;
     assert!(requested.is_empty(), "{requested:?}");
     let (_, again) = &results[0];
     assert!(!again.is_error);
@@ -209,6 +189,42 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
         "{}",
         again.content
     );
+
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Ask,
+                tool: ENTER_PLAN_MODE_TOOL_NAME.into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    // A bare refusal ends the run and keeps the mode.
+    let (_, requested, results) =
+        run_answering_permissions(&agent, chat, "Add caching", false).await;
+    assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
+    let (_, declined) = &results[0];
+    assert!(declined.is_error);
+    assert_eq!(declined.content, "User declined to enter plan mode.");
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+
+    let (_, requested, results) =
+        run_answering_permissions(&agent, chat, "Plan it after all", true).await;
+    assert_eq!(requested, [ENTER_PLAN_MODE_TOOL_NAME]);
+    assert!(!results[0].1.is_error, "{}", results[0].1.content);
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
         ExecutionMode::Plan
@@ -217,7 +233,7 @@ async fn the_agent_enters_plan_mode_only_after_the_user_confirms() {
 }
 
 #[tokio::test]
-async fn entering_plan_mode_is_refused_when_prompts_are_unavailable_or_denied_by_rule() {
+async fn entering_plan_mode_needs_no_prompt_and_is_refused_only_by_a_deny_rule() {
     let directory = tempfile::tempdir().unwrap();
     let enter = |id| call(id, ENTER_PLAN_MODE_TOOL_NAME, serde_json::json!({}));
     let headless = Agent::new_with_options(
@@ -238,10 +254,10 @@ async fn entering_plan_mode_is_refused_when_prompts_are_unavailable_or_denied_by
     let (_, requested, results) =
         run_answering_permissions(&headless, chat, "Add caching", true).await;
     assert!(requested.is_empty());
-    assert!(results[0].1.is_error);
+    assert!(!results[0].1.is_error, "{}", results[0].1.content);
     assert_eq!(
         headless.snapshot(chat).await.unwrap().policy.mode,
-        initial_mode
+        ExecutionMode::Plan
     );
     headless.shutdown().await;
 

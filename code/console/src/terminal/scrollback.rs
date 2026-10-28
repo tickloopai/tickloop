@@ -1815,6 +1815,37 @@ fn push_markdown_rows(rows: &mut Vec<Row>, block: &mut MarkdownBlock, line: usiz
     }
 }
 
+/// Lays `source` out as Markdown rows of `width` columns, styled as a reply's rows are, for
+/// surfaces outside the conversation such as a dialog.
+pub(super) fn markdown_lines(source: &str, width: usize) -> Vec<RoleLine> {
+    let width = width.max(1);
+    tickloop_ui::markdown::layout(source, width, AmbiguousWidth::Narrow)
+        .iter()
+        .flat_map(|markdown_line| {
+            split_overflow(markdown_line, width)
+                .into_iter()
+                .enumerate()
+                .map(|(row_index, content)| {
+                    let mut styled = RoleLine {
+                        continuation: if row_index == 0 {
+                            markdown_line.continuation
+                        } else {
+                            Some(Continuation {
+                                indent: 0,
+                                after_space: false,
+                            })
+                        },
+                        ..RoleLine::default()
+                    };
+                    for (text, role, link) in content {
+                        styled.push_linked(text, role, link);
+                    }
+                    styled
+                })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct Lead {
     text: String,

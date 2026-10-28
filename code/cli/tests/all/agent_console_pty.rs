@@ -23,6 +23,7 @@ mod provider_errors;
 mod question_decline;
 mod reply_visibility;
 mod resume_picker;
+mod sandbox;
 mod skill_discovery;
 mod task_tools_setting;
 mod unified_footer;

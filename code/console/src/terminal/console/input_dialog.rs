@@ -495,24 +495,13 @@ impl State {
             let content = self
                 .menu
                 .as_ref()
-                .map(|menu| {
-                    menu.context
-                        .iter()
-                        .flat_map(|line| wrap_text(&display_text(line), self.width))
-                        .collect::<Vec<_>>()
-                })
+                .map(|menu| self.menu_context_lines(menu, &menu.context, self.width))
                 .unwrap_or_default();
             self.context_offset = self
                 .context_offset
                 .min(content.len().saturating_sub(capacity));
             let mut lines = vec![RoleLine::role("Plan", Role::DialogTitle)];
-            lines.extend(
-                content
-                    .into_iter()
-                    .skip(self.context_offset)
-                    .take(capacity)
-                    .map(RoleLine::plain),
-            );
+            lines.extend(content.into_iter().skip(self.context_offset).take(capacity));
             lines.resize(self.height.saturating_sub(1), RoleLine::default());
             lines.push(RoleLine::role(
                 "v / esc return to plan approval",
@@ -596,13 +585,44 @@ impl State {
                 }
             }
         } else {
-            self.picker_context(menu)
-                .iter()
-                .map(|line| {
-                    wrap_text(&display_text(line), self.width.saturating_sub(2).max(1)).len()
-                })
-                .sum()
+            self.menu_context_lines(
+                menu,
+                &self.picker_context(menu),
+                self.width.saturating_sub(2),
+            )
+            .len()
         }
+    }
+
+    /// The rows of `context` and then of the menu's Markdown, laid out for `width` columns; the
+    /// line naming the menu's link carries it.
+    pub(super) fn menu_context_lines(
+        &self,
+        menu: &Menu,
+        context: &[String],
+        width: usize,
+    ) -> Vec<RoleLine> {
+        let width = width.max(1);
+        let mut lines = context
+            .iter()
+            .flat_map(|line| {
+                let link = self
+                    .menu_link
+                    .as_ref()
+                    .filter(|(id, address)| *id == menu.id && address == line)
+                    .map(|(_, address)| address.clone());
+                wrap_text(&display_text(line), width)
+                    .into_iter()
+                    .map(move |row| match &link {
+                        Some(address) => RoleLine::linked(row, Role::Accent, address),
+                        None => RoleLine::role(row, Role::MutedText),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if let Some(markdown) = &menu.markdown {
+            lines.extend(super::super::scrollback::markdown_lines(markdown, width));
+        }
+        lines
     }
 
     fn menu_content_rows(&self, menu: &Menu, limit: usize) -> usize {

@@ -507,7 +507,7 @@ impl Agent {
             let mut policy_revision = authority.policy_revision;
             let decision = self.apply_prompt_policy_keeping_required_approval(
                 authority.decision,
-                authority.explicit_ask,
+                authority.explicit_ask || prepared.requires_environment_approval(),
             );
             if decision == Decision::Deny {
                 return Err(AgentError::Invalid(

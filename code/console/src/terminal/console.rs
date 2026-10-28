@@ -65,6 +65,12 @@ mod model_dialog_pty;
 mod monitor_tests;
 #[cfg(test)]
 mod plan_flow_pty;
+#[cfg(test)]
+mod plan_markdown_tests;
+mod plan_review;
+pub(super) use plan_review::{PlanReview, RequestedPlanEdit};
+#[cfg(test)]
+mod plan_review_tests;
 mod prompt_suggestion;
 #[cfg(test)]
 mod prompt_suggestion_pty;
@@ -144,7 +150,7 @@ use super::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
     },
-    status_area::{BackgroundStatusNotice, StatusArea},
+    status_area::{BackgroundStatusNotice, ContextGauge, StatusArea},
     style::{ColourDepth, Role, RoleLine, RoleSpan, Span, StyledLine, ThemeName},
     transcript::{Transcript, TranscriptDocument, TranscriptEvent},
 };
@@ -175,6 +181,8 @@ pub(super) const UNCHECKED_OPTION: &str = "[ ] ";
 /// takes at most this fraction of the border, as `width / N`.
 const IDENTITY_LABEL_WIDTH_DIVISOR: usize = 3;
 const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
+/// A body laid out as Markdown sits two columns in, as a block's body rows do.
+const MARKDOWN_BODY_INDENT: &str = "  ";
 
 /// A foreground Bash command of the model, the call that started it, and when it was first seen.
 struct ForegroundCommand {
@@ -354,6 +362,11 @@ pub(super) enum InputEvent {
         menu_id: Uuid,
         index: usize,
     },
+    /// The user edited the plan under review in the plan approval dialog `menu_id`.
+    PlanEdited {
+        menu_id: Uuid,
+        markdown: String,
+    },
     /// Moves a question menu to the previous or next question.
     SwitchQuestion {
         menu_id: Uuid,
@@ -461,6 +474,11 @@ impl fmt::Debug for InputEvent {
                 .debug_struct("ExpandChoice")
                 .field("menu_id", menu_id)
                 .field("index", index)
+                .finish(),
+            Self::PlanEdited { menu_id, markdown } => formatter
+                .debug_struct("PlanEdited")
+                .field("menu_id", menu_id)
+                .field("bytes", &markdown.len())
                 .finish(),
             Self::SwitchQuestion { menu_id, next } => formatter
                 .debug_struct("SwitchQuestion")
@@ -644,6 +662,9 @@ pub(super) struct Menu {
     pub id: Uuid,
     pub title: String,
     pub context: Vec<String>,
+    /// Markdown shown after `context`, such as a plan: laid out again for the width of each
+    /// frame, while plain output receives its source.
+    pub markdown: Option<String>,
     pub options: Vec<String>,
     pub selected: usize,
     pub confirmation: bool,
@@ -867,6 +888,8 @@ pub(super) struct State {
     menu_review: Option<MenuReviewState>,
     full_review: bool,
     menu_plan: bool,
+    plan_review: Option<PlanReview>,
+    requested_plan_edit: Option<plan_review::RequestedPlanEdit>,
     menu_continue: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
@@ -2521,7 +2544,7 @@ impl Console {
         &self,
         mode: String,
         model: String,
-        context: Option<(u64, usize)>,
+        context: Option<ContextGauge>,
         tasks: Option<TaskBoard>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -3558,6 +3581,22 @@ impl Console {
             text: text.to_owned(),
             starts_message,
         }])
+    }
+
+    /// Writes a plan as a block under `heading`. The conversation lays its Markdown out as it
+    /// does a reply's; plain output receives the source.
+    pub(super) fn write_plan(&self, heading: &str, markdown: &str) -> Result<(), String> {
+        if !self.is_interactive() {
+            return self.write_line(&format!("\n{heading}\n{markdown}"));
+        }
+        let mut pieces = vec![
+            ConversationPiece::Block,
+            ConversationPiece::Styled(format!("{heading}\n"), None),
+        ];
+        if !markdown.is_empty() {
+            pieces.push(ConversationPiece::BodyMarkdown(markdown.to_owned()));
+        }
+        self.write_pieces(&pieces)
     }
 
     /// Writes a run's completion notice as a block of its own; in the conversation it replaces
@@ -5361,6 +5400,9 @@ pub(super) enum ConversationPiece {
         text: String,
         starts_message: bool,
     },
+    /// A Markdown document laid out on the rows under the line above it, indented as a block's
+    /// body is, such as a plan under its heading.
+    BodyMarkdown(String),
     ToolCall {
         run_id: Uuid,
         text: String,
@@ -5467,6 +5509,10 @@ impl ConversationPiece {
                 let lead = format!("{} ", display.glyph(Glyph::Assistant));
                 scrollback.append_markdown(text, &lead, *starts_message);
             }
+            Self::BodyMarkdown(text) => {
+                scrollback.begin_markdown(MARKDOWN_BODY_INDENT);
+                scrollback.append_markdown(text, MARKDOWN_BODY_INDENT, false);
+            }
         }
     }
 
@@ -5478,6 +5524,7 @@ impl ConversationPiece {
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
+            | Self::BodyMarkdown(text)
             | Self::ToolCall { text, .. } => text.as_str().into(),
             Self::Response(runs)
             | Self::Body(runs)
@@ -6132,6 +6179,8 @@ impl State {
             menu_review: None,
             full_review: false,
             menu_plan: false,
+            plan_review: None,
+            requested_plan_edit: None,
             menu_continue: false,
             menu_comment: None,
             menu_expand_options: Vec::new(),
@@ -7756,6 +7805,8 @@ impl State {
             format!("{} · enter submit · esc close field", comment.label)
         } else if self.question_menu.is_some() {
             "Type your answer · enter submit · esc close field".into()
+        } else if let Some(hint) = self.plan_feedback_hint() {
+            hint
         } else if comment.label == "Guidance" {
             "add context (optional) · enter submit · tab close · esc close".into()
         } else {
@@ -7898,7 +7949,9 @@ impl State {
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
         let context_rows = if self.input_dialog_has_fixed_height() {
-            2 * usize::from(!picker_context.is_empty() || self.menu_review.is_some())
+            2 * usize::from(
+                !picker_context.is_empty() || menu.markdown.is_some() || self.menu_review.is_some(),
+            )
         } else {
             self.menu_context_rows(menu, capacity).min(2)
         };
@@ -8040,19 +8093,8 @@ impl State {
                     }
                 }));
             } else {
-                let context = picker_context
-                    .iter()
-                    .flat_map(|line| {
-                        let link = self
-                            .menu_link
-                            .as_ref()
-                            .filter(|(id, address)| *id == menu.id && address == line)
-                            .map(|(_, address)| address.clone());
-                        wrap_text(&display_text(line), self.width.saturating_sub(2).max(1))
-                            .into_iter()
-                            .map(move |line| (line, link.clone()))
-                    })
-                    .collect::<Vec<_>>();
+                let context =
+                    self.menu_context_lines(menu, &picker_context, self.width.saturating_sub(2));
                 self.context_offset = self
                     .context_offset
                     .min(context.len().saturating_sub(context_capacity));
@@ -8061,13 +8103,11 @@ impl State {
                         .into_iter()
                         .skip(self.context_offset)
                         .take(context_capacity)
-                        .map(|(line, link)| {
-                            let text = format!("  {line}");
-                            if let Some(address) = link {
-                                RoleLine::linked(text, Role::Accent, &address)
-                            } else {
-                                RoleLine::role(text, Role::MutedText)
-                            }
+                        .map(|line| {
+                            let mut indented = RoleLine::plain("  ");
+                            indented.spans.extend(line.spans);
+                            indented.link = line.link;
+                            indented
                         }),
                 );
             }
@@ -8177,7 +8217,10 @@ impl State {
             let mut hints = Vec::new();
             if !hint.is_empty() {
                 // A narrow question dialog drops navigation before Enter and Esc.
-                if self.input_dialog_has_fixed_height() && self.question_menu.is_none() {
+                if self.input_dialog_has_fixed_height()
+                    && self.question_menu.is_none()
+                    && !self.menu_plan
+                {
                     hints.push((hint, 10));
                 } else {
                     hints.extend(self.user_hint_parts(&hint));
@@ -8196,20 +8239,18 @@ impl State {
                 if !editing {
                     hints.push(("pgup/pgdn plan".into(), 10));
                     self.dialog_scrolls_own_content = true;
+                    // The feedback row's own hint names tab, so a narrow dialog drops this first.
                     if self.menu_comment.is_some() {
-                        hints.push(("tab feedback".into(), 10));
+                        hints.push(("tab feedback".into(), 9));
                     }
+                    hints.extend(self.plan_review_hints());
                 }
             } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
                 hints.push(("shift+tab review".into(), 7));
-            } else if menu
-                .context
-                .iter()
-                .flat_map(|line| {
-                    wrap_text(&display_text(line), self.width.saturating_sub(2).max(1))
-                })
-                .count()
+            } else if self
+                .menu_context_lines(menu, &menu.context, self.width.saturating_sub(2))
+                .len()
                 > context_capacity
             {
                 hints.push(("pgup/pgdn details".into(), 6));
@@ -11281,6 +11322,33 @@ impl State {
     /// Returns `None` when the terminal could not be handed over or taken back;
     /// the status line then carries the reason.
     fn edit_text_in_terminal(&mut self, draft: &str) -> Option<ExternalEditorOutcome> {
+        self.lend_terminal_to_editor(|working_directory| edit_prompt(draft, working_directory))
+    }
+
+    /// Opens `path` itself in the external editor; `None` as for `edit_text_in_terminal`.
+    fn run_external_file_editor(&mut self, path: &Path) -> Option<ExternalEditorOutcome> {
+        match &self.external_editor {
+            ExternalEditorLauncher::Terminal => self.lend_terminal_to_editor(|working_directory| {
+                super::external_editor::edit_file(path, working_directory)
+            }),
+            #[cfg(test)]
+            ExternalEditorLauncher::Scripted {
+                opened_drafts,
+                outcome,
+            } => {
+                opened_drafts
+                    .lock()
+                    .unwrap()
+                    .push(path.display().to_string());
+                Some(outcome.clone())
+            }
+        }
+    }
+
+    fn lend_terminal_to_editor(
+        &mut self,
+        edit: impl FnOnce(&Path) -> ExternalEditorOutcome,
+    ) -> Option<ExternalEditorOutcome> {
         let working_directory = self
             .mention_roots
             .as_ref()
@@ -11311,7 +11379,7 @@ impl State {
             self.status = format!("Cannot leave raw mode for editor: {error}");
             return None;
         }
-        let outcome = edit_prompt(draft, &working_directory);
+        let outcome = edit(&working_directory);
         let raw_result = terminal::enable_raw_mode();
         let screen_result = self.surface.take(self.renderer, &mut output);
         self.screen_initialized = false;
@@ -12658,6 +12726,9 @@ impl State {
         {
             return None;
         }
+        if let Some(event) = self.plan_review_key(key) {
+            return event;
+        }
         if self.menu_focused && self.menu_comment_is_editing() {
             self.escape_confirmation = None;
             match key.code {
@@ -13563,13 +13634,21 @@ fn read_keys(
             // Terminals report motion only when the pointer changes cell, so a drag held at an
             // edge keeps scrolling from here.
             let selection_scrolled = state.scroll_selection(Instant::now());
+            let requested_plan_edit = state.take_requested_plan_edit();
             if state.poll_clipboard_hint(Instant::now())
                 || confirmation_expired
                 || rows_changed
                 || hint_changed
                 || selection_scrolled
+                || requested_plan_edit.is_some()
             {
                 state.draw(&mut io::stdout().lock())?;
+            }
+            drop(state);
+            if let Some(input) = requested_plan_edit.flatten()
+                && !send_input(sender, stop, input)
+            {
+                break;
             }
             continue;
         }
@@ -14194,6 +14273,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Run this command?".into(),
             context: vec!["find crates docs .scratch -maxdepth 4 | head -100".into()],
+            markdown: None,
             options: vec![
                 "Allow once".into(),
                 "Allow for this session".into(),
@@ -14377,6 +14457,7 @@ mod tests {
             id,
             title: "Codex login".into(),
             context: vec!["Open this link:".into(), address.into()],
+            markdown: None,
             options: vec!["Cancel".into()],
             selected: 0,
             confirmation: false,
@@ -16753,6 +16834,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Which report?".into(),
             context: vec!["☐ Report".into()],
+            markdown: None,
             options: options.iter().map(|option| (*option).into()).collect(),
             selected: 0,
             confirmation: false,
@@ -17263,8 +17345,9 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// Entering Plan asks only when an Ask rule matches, as in Claude Code.
     #[tokio::test]
-    async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
+    async fn an_ask_rules_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
         use tickloop_harness::tools::ENTER_PLAN_MODE_TOOL_NAME;
 
@@ -17285,6 +17368,21 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                vec![tickloop_harness::protocol::PermissionRule {
+                    id: Uuid::new_v4(),
+                    decision: tickloop_harness::protocol::Decision::Ask,
+                    tool: ENTER_PLAN_MODE_TOOL_NAME.into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
             .await
             .unwrap();
         let console = InteractiveConsoleFixture::new(State::new(true, 100, 30));
@@ -21194,9 +21292,12 @@ mod tests {
         state.prompt_enabled = true;
         state.insert("inspect current work");
         let draft = state.editor.draft().to_owned();
-        state
-            .status_area
-            .update("Auto".into(), "model".into(), Some((42000, 200000)), None);
+        state.status_area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((42000, 200000).into()),
+            None,
+        );
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
@@ -21472,7 +21573,7 @@ mod tests {
         state.status_area.update(
             "Auto".into(),
             "deepseek-flash".into(),
-            Some((12_500, 1_000_000)),
+            Some((12_500, 1_000_000).into()),
             None,
         );
         state.scrollback.append(
@@ -23362,6 +23463,7 @@ mod tests {
                 id: secret_id,
                 title: "API key".into(),
                 context: vec![],
+                markdown: None,
                 options: vec!["Save".into()],
                 selected: 0,
                 confirmation: false,

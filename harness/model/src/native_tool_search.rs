@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use tickloop_harness_protocol::{
-    Adapter, Content, ModelConfig, NativeToolSearch, Protocol, ToolDefinition,
+    Adapter, Content, ContextTokenCounter, ModelConfig, NativeToolSearch, Protocol, ToolDefinition,
 };
 
 use crate::ModelError;
@@ -45,6 +45,24 @@ pub(crate) fn check_request(
         Err(ModelError::Configuration(
             "this model offers no native tool search for deferred tools".into(),
         ))
+    }
+}
+
+/// What one deferred tool a request carries over `protocol` adds to the context its service
+/// reports, before any search loads it.
+pub fn deferred_tool_context_tokens(
+    protocol: Protocol,
+    counter: &dyn ContextTokenCounter,
+    tool: &ToolDefinition,
+) -> usize {
+    match protocol {
+        // "The API excludes deferred tools from the system-prompt prefix"; a loaded definition
+        // counts with the search result that names it.
+        Protocol::Messages => 0,
+        // "For an individual deferred function, the model still sees the function name and
+        // description"; its parameters load on search.
+        Protocol::Responses => counter.text_tokens(&format!("{}\n{}", tool.name, tool.description)),
+        Protocol::ChatCompletions | Protocol::Google | Protocol::SystemOne => 0,
     }
 }
 

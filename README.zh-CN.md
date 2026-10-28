@@ -69,6 +69,12 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
 
+在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad，网络断开。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱中的命令不能穿过敏感符号链接（包括读取），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。沙箱默认关闭，不改变审批规则；`/permissions` 显示配置状态。
+
+Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`sandbox.allowUnsandboxedCommands` 默认为真，设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。疑似被沙箱拦截的失败仅在允许越出时提示该参数，不会自动重试命令。
+
+在已有沙箱中或其他平台上不可用时，命令会警告并按无隔离运行；设置 `sandbox.failIfUnavailable: true` 则拒绝执行。其余沙箱字段会提示“暂不支持”。沙箱内失败且输出包含权限拒绝特征的命令会附加诊断说明，退出状态保持不变。
+
 按键：
 
 - `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。
@@ -78,6 +84,8 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - 列表和菜单中用 `j`／`k` 或方向键移动，`enter` 选择，`esc` 返回。
 - 在 Monitor 中 `enter` 打开 Tick，`esc` 再隐藏；程序会继续运行。
 - 在 Monitor 同一行三秒内按两次普通 `x`，可关闭或移除 Tick、停止 Shell、解除 Artifact 关联或删除定时任务。第一次只在按键提示行显示红色 `Press x again to …`，没有确认弹窗；超时、移动选择、按其他键或离开会取消。`Ctrl+X` 不执行这些操作；文本输入和筛选框中的 `x` 仍是文字。
+
+对话接近模型的上下文窗口上限时，Agent 会在下一次请求前先把对话压缩成摘要。触发点是窗口减去摘要所需的输出空间（模型的输出上限，最多 20,000 tokens）再减去 13,000 tokens 的缓冲，但不低于窗口的一半；触发点之后的空间就是 `/context` 中显示的 Autocompact buffer。距触发点不到 20,000 tokens 时，状态行的 `Context N% used` 改为警示色，对话中也会提示一次；随时可以用 `/compact` 手动压缩。想更早压缩，可在 `settings.json` 中把 `autoCompactWindow` 设为 token 数，例如 `"autoCompactWindow": 400000`；它小于模型窗口时，触发点改按它计算。此后新建或重新打开的对话生效。
 
 Herdr 内的 Monitor 按配置根分别注册浮窗插件。默认 `~/.tickloop` 继续使用 `tickloop.monitor` 和 `~/.tickloop/herdr-popup-plugin`；其他根（包括 `make dev` 的 `~/.tickloop-dev`）使用 `tickloop.monitor.<root-key>`，目录仍为 `<配置根>/herdr-popup-plugin`，显示名包含根路径。稳定的 root key 与 daemon、Tickhost 共用，两套插件可在同一 Herdr 会话共存。每个根首次使用时接受 Monitor 的注册提示，或执行 `tickloop monitor popup install --herdr-socket SOCKET`；`remove` 只移除当前根的插件。默认根已有注册无需重做。
 

@@ -59,6 +59,7 @@ fn parts(messages: Vec<Message>, search: Option<SearchParts>) -> ContextParts {
 fn search_parts(mode: ToolSearchMode) -> SearchParts {
     SearchParts {
         mode,
+        protocol: Protocol::Messages,
         pool: vec![
             (
                 "market".into(),
@@ -277,6 +278,102 @@ fn native_search_records_count_with_each_loaded_definition_once() {
     assert_eq!(category(&breakdown, ContextCategory::Messages), 3);
 }
 
+/// Native search over Responses, where each deferred tool's name and description count.
+fn responses_search_parts() -> SearchParts {
+    SearchParts {
+        protocol: Protocol::Responses,
+        ..search_parts(ToolSearchMode::Native)
+    }
+}
+
+#[test]
+fn responses_native_search_counts_its_index_by_server_in_context() {
+    let without = parts(Vec::new(), None).count(&WordCounter);
+    let breakdown = parts(Vec::new(), Some(responses_search_parts())).count(&WordCounter);
+    let index = (1 + 3) + (1 + 1) + (1 + 4);
+    assert_eq!(
+        category(&breakdown, ContextCategory::ToolSearchIndex),
+        index
+    );
+    assert_eq!(breakdown.used_tokens, without.used_tokens + index);
+    assert_eq!(
+        breakdown
+            .tool_search_index
+            .iter()
+            .map(|server| (server.server.as_str(), server.tokens()))
+            .collect::<Vec<_>>(),
+        vec![("market", 4 + 2), ("office", 5)]
+    );
+    let order = breakdown
+        .categories
+        .iter()
+        .map(|usage| usage.category)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order[order
+            .iter()
+            .position(|category| *category == ContextCategory::McpTools)
+            .unwrap()
+            + 1],
+        ContextCategory::ToolSearchIndex,
+        "the index follows the MCP tools"
+    );
+    assert_eq!(
+        breakdown.tool_search.unwrap().tokens(),
+        3 * (1 + 1) + 3 + 1 + 4,
+        "the pool still shows whole definitions"
+    );
+
+    let mut measured = parts(Vec::new(), Some(responses_search_parts()));
+    measured.reported_total = Some(breakdown.used_tokens + 2);
+    let measured = measured.count(&WordCounter);
+    assert_eq!(category(&measured, ContextCategory::Unattributed), 0);
+    assert_eq!(category_sum(&measured), breakdown.used_tokens + 2);
+}
+
+#[test]
+fn messages_native_search_and_search_tools_count_no_index() {
+    for search in [
+        search_parts(ToolSearchMode::Native),
+        SearchParts {
+            protocol: Protocol::Responses,
+            ..search_parts(ToolSearchMode::SearchTools)
+        },
+    ] {
+        let breakdown = parts(Vec::new(), Some(search)).count(&WordCounter);
+        assert_eq!(category(&breakdown, ContextCategory::ToolSearchIndex), 0);
+        assert!(breakdown.tool_search_index.is_empty());
+        assert!(breakdown.tool_search.is_some());
+    }
+}
+
+#[test]
+fn a_native_search_index_like_chat_01a17fd4_explains_the_service_total() {
+    let words = |count: usize| vec!["word"; count].join(" ");
+    let mut search = responses_search_parts();
+    search.pool = (0..180)
+        .map(|index| {
+            (
+                "longbridge".to_owned(),
+                definition(&format!("mcp__longbridge__tool_{index}"), &words(96)),
+            )
+        })
+        .collect();
+    let mut measured = parts(
+        vec![message(Role::User, vec![text(&words(26_950))])],
+        Some(search),
+    );
+    measured.reported_total = Some(44_700);
+    let breakdown = measured.count(&WordCounter);
+    assert_eq!(category(&breakdown, ContextCategory::Unattributed), 0);
+    let index = category(&breakdown, ContextCategory::ToolSearchIndex);
+    assert!(
+        (17_460 * 99 / 100..=17_460 * 102 / 100).contains(&index),
+        "the index scales by about 1: {index}"
+    );
+    assert_eq!(category_sum(&breakdown), 44_700);
+}
+
 #[test]
 fn the_search_pool_groups_by_server_and_stays_out_of_the_total() {
     let without = parts(Vec::new(), None).count(&WordCounter);
@@ -345,7 +442,7 @@ impl HostToolProvider for SearchCatalog {
 fn exposure_tool(server: &str, name: &str, exposure: ToolExposure) -> ExposureTool {
     let full_name = format!("mcp__{server}__{name}");
     ExposureTool {
-        server: server.into(),
+        server: Some(server.into()),
         original_name: name.into(),
         definition: Arc::new(definition(&full_name, &format!("{name} for {server}"))),
         original_schema: Arc::new(json!({"type": "object"})),
@@ -389,9 +486,17 @@ async fn a_chat_sends_direct_tools_searches_the_rest_and_never_names_hidden_ones
     );
     let pool = breakdown.tool_search.as_ref().unwrap();
     assert_eq!(pool.mode, ToolSearchMode::SearchTools);
-    assert_eq!(pool.servers.len(), 1);
-    assert_eq!(pool.servers[0].server, "market");
-    assert_eq!(pool.servers[0].tools.len(), 2);
+    let market = pool
+        .servers
+        .iter()
+        .find(|server| server.server == "market")
+        .unwrap();
+    assert_eq!(market.tools.len(), 2);
+    assert_eq!(
+        pool.servers.len(),
+        2,
+        "market and the runtime's EnterPlanMode"
+    );
     assert!(pool.tokens() > 0);
     assert_eq!(
         pool.unavailable_servers[0].state,
@@ -618,8 +723,181 @@ async fn a_draft_counts_its_first_request_without_creating_a_chat() {
             .any(|tool| tool.name == "ExitPlanMode")
     );
     let pool = breakdown.tool_search.unwrap();
-    assert_eq!(pool.tool_count(), 2, "the catalog the host offers now");
+    assert_eq!(
+        pool.tool_count(),
+        3,
+        "the catalog the host offers now, and EnterPlanMode"
+    );
     assert!(breakdown.free_tokens.is_some() && breakdown.autocompact_buffer_tokens.is_some());
     let _ = existing;
     agent.shutdown().await;
+}
+
+async fn draft_breakdown(
+    agent: &Agent,
+    folder: &std::path::Path,
+    model: tickloop_harness_protocol::ModelConfig,
+) -> ContextBreakdown {
+    agent
+        .draft_context_breakdown(
+            Some(folder.into()),
+            tickloop_harness_protocol::ContextDraft {
+                model,
+                execution_mode: tickloop_harness_protocol::ExecutionMode::default(),
+                search_config: None,
+                task_tools_enabled: false,
+            },
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_openai_native_search_model_counts_the_index_of_the_tools_it_defers() {
+    let (agent, _chat, directory) = agent_with_catalog().await;
+    let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+    let sol = catalog.get("openai-codex", "gpt-6.1-sol").unwrap();
+    let breakdown = draft_breakdown(&agent, directory.path(), sol).await;
+    let counter = &*tickloop_harness_model::context_tokens::TOKEN_COUNTER;
+    let expected = ["quote", "news"]
+        .iter()
+        .map(|name| {
+            native_tool_search::deferred_tool_context_tokens(
+                Protocol::Responses,
+                counter,
+                &definition(
+                    &format!("mcp__market__{name}"),
+                    &format!("{name} for market"),
+                ),
+            ) as u64
+        })
+        .sum::<u64>();
+    assert!(expected > 0);
+    let market = breakdown
+        .tool_search_index
+        .iter()
+        .find(|server| server.server == "market")
+        .unwrap();
+    assert_eq!(market.tokens(), expected);
+    assert_eq!(market.tools.len(), 2);
+    assert_eq!(
+        breakdown.tool_search_index.len(),
+        2,
+        "market and the runtime's EnterPlanMode"
+    );
+    assert_eq!(breakdown.used_tokens, category_sum(&breakdown));
+    assert_eq!(breakdown.tool_search.unwrap().mode, ToolSearchMode::Native);
+
+    let opus = catalog.get("anthropic-api", "claude-opus-5-5").unwrap();
+    let breakdown = draft_breakdown(&agent, directory.path(), opus).await;
+    assert_eq!(category(&breakdown, ContextCategory::ToolSearchIndex), 0);
+    assert!(breakdown.tool_search_index.is_empty());
+    agent.shutdown().await;
+}
+
+/// EnterPlanMode waits behind tool search like an MCP tool: a Chat without MCP servers still has
+/// a search pool, and the tool counts there and in the native index, never as a system tool.
+#[tokio::test]
+async fn enter_plan_mode_counts_in_the_search_pool_from_the_runtimes_own_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        tickloop_harness_test_support::config(),
+        Arc::new(tickloop_harness_test_support::ScriptedModel::new(vec![])),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let breakdown = agent.context_breakdown(chat).await.unwrap();
+    let names = |items: &[ContextItem]| {
+        items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(!names(&breakdown.system_tools).contains(&"EnterPlanMode".to_owned()));
+    assert!(names(&breakdown.system_tools).contains(&"ExitPlanMode".to_owned()));
+    for name in FOLD_TOOLS {
+        assert!(
+            names(&breakdown.system_tools).contains(&name.to_owned()),
+            "{name}"
+        );
+    }
+    let pool = breakdown.tool_search.as_ref().unwrap();
+    assert_eq!(pool.mode, ToolSearchMode::SearchTools);
+    assert_eq!(pool.servers.len(), 1);
+    assert_eq!(pool.servers[0].server, RUNTIME_TOOL_SOURCE);
+    assert_eq!(names(&pool.servers[0].tools), ["EnterPlanMode"]);
+
+    let catalog = tickloop_harness_model::cards::ModelCatalog::defaults();
+    let sol = catalog.get("openai-codex", "gpt-6.1-sol").unwrap();
+    let breakdown = draft_breakdown(&agent, directory.path(), sol).await;
+    assert_eq!(breakdown.tool_search_index.len(), 1);
+    assert_eq!(breakdown.tool_search_index[0].server, RUNTIME_TOOL_SOURCE);
+    assert_eq!(
+        names(&breakdown.tool_search_index[0].tools),
+        ["EnterPlanMode"]
+    );
+    assert!(category(&breakdown, ContextCategory::ToolSearchIndex) > 0);
+    assert!(
+        !names(&breakdown.system_tools)
+            .iter()
+            .any(|name| FOLD_TOOLS.contains(&name.as_str())),
+        "native search needs no Fold tools"
+    );
+    assert_eq!(breakdown.used_tokens, category_sum(&breakdown));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_autocompact_buffer_ends_where_compaction_starts_under_the_window_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    for cap in [None, Some(100_000)] {
+        let mut options = crate::local_options(
+            tickloop_harness_test_support::config_with_window(200_000),
+            None,
+            tickloop_harness_protocol::AgentHostOptions::embedded_defaults(),
+        );
+        options.settings = Some(Arc::new(
+            tickloop_harness_policy::settings::MemorySettingsStore::new(
+                tickloop_harness_policy::settings::SettingsSnapshot {
+                    auto_compact_window: cap,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let agent = Agent::with_seams(
+            crate::HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(crate::environment::FolderEnvironment::bare())),
+                models: tickloop_harness_test_support::harness::ChosenModels::new(Arc::new(
+                    tickloop_harness_test_support::ScriptedModel::new(vec![]),
+                )),
+            },
+            options,
+        )
+        .unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.auto_compact_window, cap);
+        let line = crate::context::auto_compact_tokens(&snapshot).unwrap() as u64;
+        assert_eq!(
+            line,
+            tickloop_harness_protocol::auto_compact_line(
+                cap.unwrap_or(200_000),
+                snapshot.model.max_output_tokens,
+                None,
+            ) as u64
+        );
+        assert_eq!(
+            agent.status(chat).await.unwrap().auto_compact_tokens,
+            Some(line)
+        );
+        let breakdown = agent.context_breakdown(chat).await.unwrap();
+        assert_eq!(breakdown.autocompact_buffer_tokens, Some(200_000 - line));
+        assert_eq!(
+            breakdown.free_tokens,
+            Some(line - breakdown.used_tokens),
+            "free space runs out exactly at the compaction line"
+        );
+        agent.shutdown().await;
+    }
 }

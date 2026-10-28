@@ -121,6 +121,8 @@ pub(super) struct PromptScope<'a> {
     pub compacts: bool,
     /// The `# Environment` section of a Chat with a Folder.
     pub environment: Option<&'a str>,
+    /// The tools offered only through tool search, by name.
+    pub deferred_tools: &'a [String],
 }
 
 impl PromptScope<'_> {
@@ -133,6 +135,7 @@ impl PromptScope<'_> {
         citation_style: crate::CitationStyle::MarkdownLinks,
         compacts: false,
         environment: None,
+        deferred_tools: &[],
     };
 }
 
@@ -162,6 +165,17 @@ fn pane_display_section(workspace_host: &serde_json::Value) -> Option<String> {
 /// stays in Current host state, so this section is the same in every Chat.
 const SCRATCHPAD_SECTION: &str = "# Scratchpad Directory\n\nIMPORTANT: Always use the scratchpad directory named by `scratchpad` in Current host state for temporary files instead of `/tmp` or other system temp directories. Use it for ALL temporary file needs: intermediate results, temporary scripts or configuration files, outputs that don't belong in the user's project, and working files during analysis. Only use `/tmp` if the user explicitly requests it. The scratchpad is private to this Agent family and isolated from the user's project.";
 
+/// Claude Code's deferred tools announcement, which names the tools whose definitions a tool
+/// search loads. Here it is part of the instructions: the deferred tools of a Chat never change.
+fn deferred_tools_section(names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "# Deferred tools\nThe following deferred tools are available via tool search. Their schemas are NOT loaded: search for them by name to load their schemas before calling them:\n{}",
+            names.join("\n")
+        )
+    })
+}
+
 /// Claude Code's `getSessionSpecificGuidanceSection`.
 fn session_guidance_section(tools: crate::ToolPolicy) -> String {
     let items = [
@@ -189,6 +203,7 @@ pub(super) fn conversation_system_prompt(
         citation_style,
         compacts,
         environment,
+        deferred_tools,
     } = scope;
     let style_section = output_style.system_prompt_section();
     let mut intro = if has_folder && tools.questions {
@@ -228,6 +243,7 @@ pub(super) fn conversation_system_prompt(
         has_folder.then(|| ACTIONS_SECTION.to_owned()),
         has_folder.then(|| USING_TOOLS_SECTION.to_owned()),
         has_folder.then(|| session_guidance_section(tools)),
+        deferred_tools_section(deferred_tools),
         (tools.delegation || tools.family_messages).then(|| AGENT_MESSAGE_SECTION.to_owned()),
         has_folder
             .then(|| pane_display_section(&host_state["workspace_host"]))
@@ -255,6 +271,7 @@ impl crate::Agent {
         &self,
         chat: &crate::Chat,
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
+        deferred_tools: &[String],
     ) -> tickloop_harness_protocol::Message {
         let environment = chat
             .snapshot
@@ -270,6 +287,7 @@ impl crate::Agent {
             citation_style: self.inner.citation_style,
             compacts: crate::context::context_window(&chat.snapshot).is_some(),
             environment: environment.as_deref(),
+            deferred_tools,
         };
         let family_temp = chat.tools.family_temp_directory();
         let mut state = serde_json::json!({

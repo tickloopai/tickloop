@@ -188,13 +188,23 @@ pub fn tool_stream() -> String {
 }
 
 pub fn reply_stream(response_id: &str, text: &str, input_tokens: u64) -> String {
+    reply_stream_with_output(response_id, text, input_tokens, 6)
+}
+
+/// [`reply_stream`] reporting `output_tokens`, as a long reply's usage does.
+pub fn reply_stream_with_output(
+    response_id: &str,
+    text: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> String {
     let item = json!({"type":"message","id":format!("msg-{response_id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]});
     [
         event("response.created", 0, json!({"response":{"id":response_id,"status":"in_progress"}})),
         event("response.output_item.added", 1, json!({"output_index":0,"item":{"type":"message","id":format!("msg-{response_id}"),"role":"assistant","status":"in_progress","content":[]}})),
         event("response.output_text.delta", 2, json!({"output_index":0,"item_id":format!("msg-{response_id}"),"content_index":0,"delta":text})),
         event("response.output_item.done", 3, json!({"output_index":0,"item":item})),
-        event("response.done", 4, json!({"response":{"id":response_id,"status":"completed","output":[item],"usage":{"input_tokens":input_tokens,"output_tokens":6}}})),
+        event("response.done", 4, json!({"response":{"id":response_id,"status":"completed","output":[item],"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens}}})),
     ].concat()
 }
 

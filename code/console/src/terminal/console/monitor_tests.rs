@@ -490,6 +490,7 @@ fn monitor_row_clicks_ignore_non_targets_and_other_input_surfaces() {
                     id: Uuid::new_v4(),
                     title: "Modal".into(),
                     context: Vec::new(),
+                    markdown: None,
                     options: vec!["Close".into()],
                     selected: 0,
                     confirmation: false,
@@ -1086,7 +1087,7 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
             .replace_draft("unchanged input across list toggle".into(), 20);
         state
             .status_area
-            .update("Auto".into(), "model".into(), Some((10, 100)), None);
+            .update("Auto".into(), "model".into(), Some((10, 100).into()), None);
         state
             .monitor
             .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "echo A")]);

@@ -20,6 +20,7 @@ mod execution_mode;
 pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
+pub mod sandbox;
 mod store;
 pub use execution_mode::parse_execution_mode;
 pub use tickloop_harness::policy::{AutoSettings, ProjectRuleChanges};
@@ -67,11 +68,15 @@ const EFFORT_LEVEL_KEY: &str = "effortLevel";
 const THINKING_ENABLED_KEY: &str = "alwaysThinkingEnabled";
 const DEFAULT_MODE_KEY: &str = "defaultMode";
 const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
+/// Claude Code's `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: a window in tokens that caps the one the
+/// automatic compaction line is measured in.
+const AUTO_COMPACT_WINDOW_KEY: &str = "autoCompactWindow";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
 const MONITOR_POPUP_KEY: &str = "monitorPopup";
 const MONITOR_WIDTH_KEY: &str = "monitorWidth";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
+const USE_AUTO_MODE_DURING_PLAN_KEY: &str = "useAutoModeDuringPlan";
 /// The execution modes Shift+Tab visits, in Claude Code's order; at least one.
 const SHIFT_TAB_MODES_KEY: &str = "shiftTabModes";
 pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, ExecutionMode::Plan];
@@ -335,6 +340,22 @@ impl LoadedSettings {
         }
     }
 
+    pub fn auto_compact_window(&mut self) -> Option<usize> {
+        let value = self.settings.get(AUTO_COMPACT_WINDOW_KEY)?;
+        match value
+            .as_u64()
+            .and_then(|tokens| usize::try_from(tokens).ok())
+        {
+            Some(tokens) if tokens > 0 => Some(tokens),
+            _ => {
+                self.warn(format!(
+                    "`{AUTO_COMPACT_WINDOW_KEY}` must be a positive integer of tokens and is ignored"
+                ));
+                None
+            }
+        }
+    }
+
     pub fn goal_check_model(&mut self) -> Option<ModelConfig> {
         let value = self.settings.get(GOAL_CHECK_MODEL_KEY)?.clone();
         let model = serde_json::from_value::<ModelSelection>(value)
@@ -494,6 +515,19 @@ impl LoadedSettings {
             Some(_) => {
                 self.warn(format!(
                     "`{PROMPT_SUGGESTION_ENABLED_KEY}` is not a boolean and is ignored"
+                ));
+                true
+            }
+        }
+    }
+
+    pub fn use_auto_mode_during_plan(&mut self) -> bool {
+        match self.settings.get(USE_AUTO_MODE_DURING_PLAN_KEY) {
+            Some(Value::Bool(enabled)) => *enabled,
+            None => true,
+            Some(_) => {
+                self.warn(format!(
+                    "`{USE_AUTO_MODE_DURING_PLAN_KEY}` is not a boolean and is ignored"
                 ));
                 true
             }
@@ -765,6 +799,10 @@ impl UserSettings {
         Self::new(root.join(SETTINGS_FILE_NAME))
     }
 
+    pub fn file_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn root_directory(&self) -> Option<&Path> {
         self.path.parent()
     }
@@ -806,6 +844,9 @@ impl UserSettings {
             read_error,
         };
         loaded.cleanup_period_days();
+        if let Err(error) = loaded.sandbox() {
+            loaded.warn(error);
+        }
         if has_retired_model_settings(&loaded.settings, parent_directory(&loaded.path)) {
             loaded.warn(BUILTIN_ONLY_NOTICE.into());
         }
@@ -836,6 +877,10 @@ impl UserSettings {
 
     pub fn goal_check_model(&self) -> Option<ModelConfig> {
         self.load().goal_check_model()
+    }
+
+    pub fn auto_compact_window(&self) -> Option<usize> {
+        self.load().auto_compact_window()
     }
 
     pub fn context_window_tokens(&self) -> Option<usize> {

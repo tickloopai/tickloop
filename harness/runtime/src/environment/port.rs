@@ -1,4 +1,5 @@
 use std::sync::Arc;
+pub use tickloop_harness_protocol::{ExecutionIsolation, NetworkIsolation, WriteIsolation};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -280,6 +281,9 @@ pub struct OpenSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellSpec {
+    pub dangerously_disable_sandbox: bool,
+    pub additional_directories: Vec<String>,
+    pub family_temp: Option<String>,
     pub operation: Uuid,
     pub shell: String,
     pub command: String,
@@ -378,6 +382,7 @@ pub struct PreparedExecution {
     authority: Uuid,
     chat: ChatId,
     facts: ExecutionFacts,
+    isolation: ExecutionIsolation,
     lifetime: Arc<()>,
     cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
@@ -409,9 +414,29 @@ impl PreparedExecution {
             authority: authority.identity,
             chat: authority.chat,
             facts,
+            isolation: ExecutionIsolation::default(),
             lifetime: Arc::new(()),
             cleanup: None,
         }
+    }
+
+    pub fn with_required_approval(mut self, required: bool) -> Self {
+        self.facts.approval.requires_approval = required.then_some(true);
+        self
+    }
+
+    pub fn requires_approval(&self) -> bool {
+        self.facts.approval.requires_approval.unwrap_or(false)
+    }
+
+    pub fn with_isolation(mut self, isolation: ExecutionIsolation) -> Self {
+        self.isolation = isolation;
+        self.facts.approval.isolation = Some(isolation);
+        self
+    }
+
+    pub fn isolation(&self) -> ExecutionIsolation {
+        self.isolation
     }
 
     pub fn preparation(&self) -> PreparationId {

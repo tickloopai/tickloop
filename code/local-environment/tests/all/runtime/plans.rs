@@ -190,7 +190,10 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"EnterPlanMode"), "{tool_names:?}");
+    assert!(
+        !tool_names.contains(&"EnterPlanMode"),
+        "EnterPlanMode waits behind tool search: {tool_names:?}"
+    );
     assert!(
         tool_names.contains(&EXIT_PLAN_MODE_TOOL_NAME),
         "{tool_names:?}"
@@ -363,6 +366,80 @@ async fn approving_a_plan_returns_claude_codes_approval_and_the_plan_file_to_the
         result.content,
         format!(
             "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
+        )
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_plan_the_user_edits_in_review_is_approved_as_a_new_user_edited_version_with_feedback() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let model = Arc::new(ScriptedModel::new(vec![
+        submit_plan("plan", "1. Read the notes."),
+        text("Approved execution started."),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    enter_plan_mode(&agent, chat).await;
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Plan the report".into()).await.unwrap();
+    plan_request(&mut events).await;
+    let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
+    let edited = "1. Read the notes.\n2. Add a test.";
+
+    assert!(agent.edit_plan(chat, 1, "   ".into()).await.is_err());
+    agent.edit_plan(chat, 1, edited.into()).await.unwrap();
+    assert!(
+        agent.edit_plan(chat, 1, "stale".into()).await.is_err(),
+        "an edit binds to the reviewed version"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let plan = &snapshot.plans[0];
+    assert_eq!(
+        (
+            plan.version,
+            plan.markdown.as_str(),
+            plan.approval_pending,
+            plan.edited_by_user
+        ),
+        (2, edited, true, true)
+    );
+    assert_eq!(plan_files(&root, snapshot.chat_loop.id), [edited]);
+    assert!(
+        agent
+            .approve_plan(chat, 1, ExecutionMode::AcceptEdits)
+            .await
+            .is_err(),
+        "the version the user replaced cannot be approved"
+    );
+
+    assert!(
+        agent
+            .approve_plan_with_feedback(
+                chat,
+                2,
+                ExecutionMode::AcceptEdits,
+                Some("Keep commits small.".into()),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let result = loop {
+        if let EventKind::ToolCompleted {
+            call_id, result, ..
+        } = next_event(&mut events).await.kind
+            && call_id == "plan"
+        {
+            break result;
+        }
+    };
+    assert!(!result.is_error);
+    assert_eq!(
+        result.content,
+        format!(
+            "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep commits small."
         )
     );
     agent.shutdown().await;

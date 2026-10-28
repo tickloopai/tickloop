@@ -17,6 +17,7 @@ fn choices(count: usize) -> Menu {
         id: USER_MENU,
         title: "Height picker".into(),
         context: vec!["Changes apply immediately".into()],
+        markdown: None,
         options: (0..count).map(|index| format!("Choice {index}")).collect(),
         selected: 0,
         confirmation: false,
@@ -74,7 +75,7 @@ fn dialog_height_pty_fixture() {
                 event = input.recv() => match event {
                     Some(InputEvent::Line(text) | InputEvent::Prompt { text, .. }) => match text.as_str() {
                         "/short" | "/long" => console.show_presented_picker_menu(choices(if text == "/short" { 2 } else { 80 }), PickerKind::Actions, PickerPresentation { hint: "enter · esc back".into(), ..Default::default() }).unwrap(),
-                        "/login" => console.show_login_menu(Menu { id: LOGIN, title: "Browser height".into(), context: vec!["https://fixture.test/authorize".into(), "Complete authorization".into()], options: vec!["Submit callback".into(), "Cancel login".into()], selected: 0, confirmation: false }, "https://fixture.test/authorize", true).unwrap(),
+                        "/login" => console.show_login_menu(Menu { id: LOGIN, title: "Browser height".into(), context: vec!["https://fixture.test/authorize".into(), "Complete authorization".into()], markdown: None, options: vec!["Submit callback".into(), "Cancel login".into()], selected: 0, confirmation: false }, "https://fixture.test/authorize", true).unwrap(),
                         "/exit" => break,
                         _ => panic!("Unexpected fixture input"),
                     },

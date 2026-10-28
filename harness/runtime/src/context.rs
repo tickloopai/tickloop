@@ -13,6 +13,9 @@ use tickloop_harness_protocol::{
     Content, EventKind, Message, ModelChange, ModelConfig, ModelRequestKind, ReasoningEffort,
     Receipt, RequestOutcome, ResponseRejection, Role, RunId, ToolDefinition,
 };
+use tickloop_harness_protocol::{
+    ContextTokenCounter, context_token_counter, current_context_tokens_counted,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(super) fn model_messages(chat: &Chat) -> Result<Vec<Message>, AgentError> {
@@ -281,27 +284,31 @@ impl Agent {
         tools: &[ToolDefinition],
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
-        let budget = {
+        {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-            let messages = model_messages(chat)?;
-            let Some(window) = context_window(&chat.snapshot) else {
-                return Ok(false);
-            };
-            let trigger = input_token_budget(window);
-            if estimate_tokens_for_request(&chat.snapshot, &messages, tools) <= trigger {
+            if !is_beyond_auto_compact_line(
+                &chat.snapshot,
+                &model_messages(chat)?,
+                tools,
+                context_token_counter(),
+            ) {
                 return Ok(false);
             };
             if !chat.parked.is_empty() {
                 return Err(AgentError::Invalid("context requires compaction while a turn waits for an answer; resolve its pending interaction before compacting".into()));
             }
-            trigger
-        };
+        }
         self.compact_history(receipt.chat_id, Some(receipt.run_id), None, cancel)
             .await?;
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-        if estimate_tokens_for_request(&chat.snapshot, &model_messages(chat)?, tools) > budget {
+        if is_beyond_auto_compact_line(
+            &chat.snapshot,
+            &model_messages(chat)?,
+            tools,
+            context_token_counter(),
+        ) {
             return Err(AgentError::Invalid("context is still too large after compaction; shorten the input or select a model with a larger verified context window".into()));
         }
         Ok(true)
@@ -506,18 +513,19 @@ impl Agent {
                     };
                     crate::lifecycle::claim_response_messages(chat);
                     let (snapshot, bookkeeping) = layout.apply(&chat.snapshot, &chat.bookkeeping);
-                    if let Some(window) = context_window(&snapshot) {
-                        let candidate_messages = projection::projected_messages(
-                            &snapshot,
-                            &bookkeeping.denial_references,
-                        )
-                        .map_err(|error| (ResponseRejection::InvalidSummary, error.to_string()))?;
-                        if estimate_request_tokens_for_snapshot(&snapshot, &candidate_messages)
-                            > input_token_budget(window)
-                        {
-                            return Err((ResponseRejection::SummaryTooLarge,
-                                "summary still exceeds the configured model capacity; the previous context was retained".into()));
-                        }
+                    let candidate_messages = projection::projected_messages(
+                        &snapshot,
+                        &bookkeeping.denial_references,
+                    )
+                    .map_err(|error| (ResponseRejection::InvalidSummary, error.to_string()))?;
+                    if is_beyond_auto_compact_line(
+                        &snapshot,
+                        &candidate_messages,
+                        &tickloop_harness_tools::Tools::definitions(),
+                        context_token_counter(),
+                    ) {
+                        return Err((ResponseRejection::SummaryTooLarge,
+                            "summary still exceeds the configured model capacity; the previous context was retained".into()));
                     }
                     Ok((snapshot, bookkeeping, layout, summary))
                 })();
@@ -613,19 +621,22 @@ fn pinned_state(ids: &tickloop_ids::IdContext, snapshot: &ChatSnapshot) -> serde
 }
 
 pub(super) use tickloop_harness_protocol::ESTIMATED_CONTEXT_BYTES_PER_TOKEN as ESTIMATED_UTF8_BYTES_PER_TOKEN;
-const CALIBRATED_USAGE_HEADROOM_PERCENT: u128 = 20;
-const COMPACTION_INPUT_PERCENT: usize = 80;
 
 pub(super) fn context_window(snapshot: &ChatSnapshot) -> Option<usize> {
-    snapshot
-        .model
-        .maximum_context_window_tokens()
-        .or(snapshot.context_window_tokens)
+    tickloop_harness_protocol::context_window_tokens(
+        &snapshot.model,
+        snapshot.context_window_tokens,
+    )
 }
 
-/// The input tokens beyond which a conversation request first compacts the Chat.
-pub(super) fn input_token_budget(window: usize) -> usize {
-    window.saturating_mul(COMPACTION_INPUT_PERCENT) / 100
+/// The context tokens beyond which a conversation request first compacts the Chat; `/context`
+/// and the status line read the same line.
+pub(super) fn auto_compact_tokens(snapshot: &ChatSnapshot) -> Option<usize> {
+    tickloop_harness_protocol::auto_compact_tokens(
+        &snapshot.model,
+        snapshot.context_window_tokens,
+        snapshot.auto_compact_window,
+    )
 }
 
 pub(super) fn request_output_token_limit(
@@ -646,7 +657,7 @@ pub(super) fn request_output_token_limit(
     } else {
         &request.messages
     };
-    let input = estimate_tokens_for_request(snapshot, messages, &request.tools);
+    let input = context_tokens(snapshot, messages, &request.tools, context_token_counter());
     let remaining = window.saturating_sub(input);
     if remaining == 0 && kind == ModelRequestKind::Conversation {
         return Err(tickloop_harness_model::ModelError::ResponseRejected(
@@ -667,12 +678,13 @@ pub(super) fn directed_summary_fits(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
 ) -> Result<bool, AgentError> {
-    let Some(window) = context_window(snapshot) else {
-        return Ok(true);
-    };
-    let available = input_token_budget(window);
     let messages = projection::projected_messages(snapshot, &bookkeeping.denial_references)?;
-    Ok(estimate_request_tokens_for_snapshot(snapshot, &messages) <= available)
+    Ok(!is_beyond_auto_compact_line(
+        snapshot,
+        &messages,
+        &tickloop_harness_tools::Tools::definitions(),
+        context_token_counter(),
+    ))
 }
 
 pub(super) fn estimate_request_tokens(messages: &[Message]) -> usize {
@@ -686,44 +698,61 @@ pub(super) fn estimate_request_tokens(messages: &[Message]) -> usize {
 /// token estimate: its base64 size says nothing about its token cost.
 pub(super) use tickloop_harness_protocol::serialized_context_bytes as serialized_request_bytes;
 
-fn estimate_request_tokens_for_snapshot(snapshot: &ChatSnapshot, messages: &[Message]) -> usize {
-    estimate_tokens_for_request(
-        snapshot,
-        messages,
-        &tickloop_harness_tools::Tools::definitions(),
-    )
+/// Whether a conversation request of the Chat's model measured its context, which later counts
+/// start from.
+pub(super) fn is_context_measured(snapshot: &ChatSnapshot) -> bool {
+    let identity = snapshot.model.identity();
+    snapshot.request_usage.entries().iter().any(|entry| {
+        entry.kind == ModelRequestKind::Conversation
+            && entry.model == identity
+            && entry.context_measurement.is_some()
+    })
 }
 
-fn estimate_tokens_for_request(
+/// Whether the Chat's context lies beyond its automatic compaction line; never while the
+/// context window is unknown.
+fn is_beyond_auto_compact_line(
     snapshot: &ChatSnapshot,
     messages: &[Message],
     tools: &[ToolDefinition],
+    counter: Option<&dyn ContextTokenCounter>,
+) -> bool {
+    auto_compact_tokens(snapshot)
+        .is_some_and(|line| context_tokens(snapshot, messages, tools, counter) > line)
+}
+
+/// The tokens the Chat's context holds, counted as the status line and `/context` count them:
+/// with `counter` (serialized bytes without one), calibrated by the input the service reported
+/// for the model's last conversation request. Before any request of the model was measured,
+/// `messages` and `tools` stand in for it, with the request overhead.
+fn context_tokens(
+    snapshot: &ChatSnapshot,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    counter: Option<&dyn ContextTokenCounter>,
 ) -> usize {
-    let current_bytes = serialized_request_bytes(messages, tools);
-    let identity = snapshot.model.identity();
-    let calibrated = snapshot
-        .request_usage
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| {
-            if entry.kind != ModelRequestKind::Conversation || entry.model != identity {
-                return None;
-            }
-            let previous_bytes = entry.serialized_request_bytes.filter(|bytes| *bytes > 0)?;
-            let used = entry.context_input_tokens()?;
-            if used == 0 {
-                return None;
-            }
-            let estimate = (current_bytes as u128)
-                .saturating_mul(used as u128)
-                .saturating_mul(100 + CALIBRATED_USAGE_HEADROOM_PERCENT)
-                .div_ceil((previous_bytes as u128).saturating_mul(100));
-            Some(usize::try_from(estimate).unwrap_or(usize::MAX))
-        });
-    calibrated
-        .unwrap_or_else(|| current_bytes.div_ceil(ESTIMATED_UTF8_BYTES_PER_TOKEN))
-        .saturating_add(REQUEST_OVERHEAD_TOKENS)
+    let measured = is_context_measured(snapshot)
+        .then(|| {
+            current_context_tokens_counted(
+                snapshot,
+                &snapshot.request_usage,
+                &snapshot.model,
+                counter,
+            )
+        })
+        .flatten();
+    if let Some(tokens) = measured {
+        return usize::try_from(tokens).unwrap_or(usize::MAX);
+    }
+    let unmeasured = match counter {
+        Some(counter) => messages
+            .iter()
+            .map(|message| counter.message_tokens(message))
+            .chain(tools.iter().map(|tool| counter.definition_tokens(tool)))
+            .sum(),
+        None => serialized_request_bytes(messages, tools).div_ceil(ESTIMATED_UTF8_BYTES_PER_TOKEN),
+    };
+    unmeasured.saturating_add(REQUEST_OVERHEAD_TOKENS)
 }
 
 #[cfg(test)]
@@ -976,5 +1005,161 @@ mod tests {
         assert_eq!(selection.await.unwrap().unwrap(), ModelChange::Applied);
         assert_eq!(agent.snapshot(chat).await.unwrap().model, replacement);
         agent.shutdown().await;
+    }
+
+    /// Counts whitespace-separated words, so expected counts are easy to read.
+    struct WordCounter;
+
+    impl ContextTokenCounter for WordCounter {
+        fn name(&self) -> &'static str {
+            "words"
+        }
+
+        fn text_tokens(&self, text: &str) -> usize {
+            text.split_whitespace().count()
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![Content::Text { text: text.into() }],
+        }
+    }
+
+    /// A Chat with a 200k window whose one conversation request the tokenizer counted at
+    /// `request_tokens` and the service reported at `reported_input`.
+    fn measured_chat(request_tokens: usize, reported_input: u64) -> ChatSnapshot {
+        let mut snapshot = crate::empty_snapshot(
+            tickloop_ids::generate().into(),
+            Some("/work".into()),
+            tickloop_harness_test_support::config_with_window(200_000),
+        );
+        snapshot.messages.push(user("first question"));
+        let sequence = snapshot
+            .request_usage
+            .start(
+                tickloop_harness_protocol::RequestOwner {
+                    chat_id: snapshot.id,
+                    loop_id: Some(snapshot.chat_loop.id),
+                    run_id: Some(RunId::new()),
+                },
+                ModelRequestKind::Conversation,
+                snapshot.model.identity(),
+            )
+            .unwrap();
+        let measurement =
+            tickloop_harness_protocol::ContextMeasurement::capture(&snapshot, 4_000, 3_000)
+                .with_tokens(request_tokens, 3_000);
+        snapshot
+            .request_usage
+            .record_context_measurement(sequence, measurement)
+            .unwrap();
+        snapshot
+            .request_usage
+            .observe(
+                sequence,
+                tickloop_harness_protocol::Usage {
+                    input_tokens: Some(reported_input),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        snapshot
+            .request_usage
+            .finish(sequence, RequestOutcome::Accepted)
+            .unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn the_compaction_trigger_counts_what_the_status_line_counts() {
+        let line = auto_compact_tokens(&measured_chat(1, 1)).unwrap();
+        // The tokenizer counted half of what the service reported: every later count doubles.
+        let mut snapshot = measured_chat(line / 2, line as u64);
+        let status_line_count = |snapshot: &ChatSnapshot| {
+            current_context_tokens_counted(
+                snapshot,
+                &snapshot.request_usage,
+                &snapshot.model,
+                Some(&WordCounter),
+            )
+            .unwrap() as usize
+        };
+        let tools = tickloop_harness_tools::Tools::definitions();
+        let count = |snapshot: &ChatSnapshot| {
+            context_tokens(snapshot, &snapshot.messages, &tools, Some(&WordCounter))
+        };
+        assert_eq!(count(&snapshot), line);
+        assert_eq!(count(&snapshot), status_line_count(&snapshot));
+        assert!(
+            !is_beyond_auto_compact_line(&snapshot, &snapshot.messages, &tools, Some(&WordCounter)),
+            "reaching the line does not compact"
+        );
+        snapshot.messages.push(user("one more word"));
+        assert_eq!(count(&snapshot), line + (3 + 3) * 2);
+        assert_eq!(count(&snapshot), status_line_count(&snapshot));
+        assert!(is_beyond_auto_compact_line(
+            &snapshot,
+            &snapshot.messages,
+            &tools,
+            Some(&WordCounter)
+        ));
+    }
+
+    #[test]
+    fn before_a_measured_request_the_messages_and_tools_are_counted_with_the_overhead() {
+        let snapshot = crate::empty_snapshot(
+            tickloop_ids::generate().into(),
+            Some("/work".into()),
+            tickloop_harness_test_support::config_with_window(200_000),
+        );
+        let messages = vec![user("a b c d")];
+        let tools = vec![ToolDefinition {
+            name: "Read".into(),
+            description: "Reads a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        assert_eq!(
+            context_tokens(&snapshot, &messages, &tools, Some(&WordCounter)),
+            (4 + 3) + WordCounter.definition_tokens(&tools[0]) + REQUEST_OVERHEAD_TOKENS
+        );
+        assert_eq!(
+            context_tokens(&snapshot, &messages, &tools, None),
+            serialized_request_bytes(&messages, &tools).div_ceil(ESTIMATED_UTF8_BYTES_PER_TOKEN)
+                + REQUEST_OVERHEAD_TOKENS
+        );
+    }
+
+    #[test]
+    fn the_line_follows_the_cap_and_a_window_that_is_unknown_never_compacts() {
+        let mut snapshot = measured_chat(1, 1);
+        let max_output = snapshot.model.max_output_tokens;
+        assert_eq!(
+            auto_compact_tokens(&snapshot),
+            Some(tickloop_harness_protocol::auto_compact_line(
+                200_000, max_output, None
+            ))
+        );
+        snapshot.auto_compact_window = Some(100_000);
+        assert_eq!(
+            auto_compact_tokens(&snapshot),
+            Some(tickloop_harness_protocol::auto_compact_line(
+                100_000, max_output, None
+            ))
+        );
+        assert_eq!(
+            tickloop_harness_protocol::ChatStatus::of(&snapshot).auto_compact_tokens,
+            auto_compact_tokens(&snapshot).map(|tokens| tokens as u64)
+        );
+        snapshot.model.card = None;
+        assert_eq!(auto_compact_tokens(&snapshot), None);
+        snapshot.messages.push(user(&"word ".repeat(1_000_000)));
+        assert!(!is_beyond_auto_compact_line(
+            &snapshot,
+            &snapshot.messages,
+            &[],
+            Some(&WordCounter)
+        ));
     }
 }

@@ -20,6 +20,8 @@ pub struct MemoryEnvironment {
 
 #[derive(Default)]
 struct MemoryState {
+    isolation: ExecutionIsolation,
+    shell_approval_required: bool,
     epoch: Uuid,
     clock: std::time::Duration,
     shell_programs: HashMap<String, MemoryShellProgram>,
@@ -134,6 +136,14 @@ impl Default for MemoryEnvironment {
 }
 
 impl MemoryEnvironment {
+    pub fn set_shell_approval_required(&self, required: bool) {
+        self.state.lock().unwrap().shell_approval_required = required;
+    }
+
+    pub fn set_isolation(&self, isolation: ExecutionIsolation) {
+        self.state.lock().unwrap().isolation = isolation;
+    }
+
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(MemoryState {
@@ -716,6 +726,11 @@ impl ExecutionPort for MemoryPort {
                 },
             },
         );
+        let prepared = prepared
+            .with_isolation(state.isolation)
+            .with_required_approval(
+                matches!(intent, ExecutionIntent::SpawnShell(_)) && state.shell_approval_required,
+            );
         let mut plans = self.plans.lock().unwrap();
         plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
         plans.insert(

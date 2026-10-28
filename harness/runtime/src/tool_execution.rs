@@ -220,6 +220,11 @@ const UNOFFERED_TASK_TOOLS_MESSAGE: &str = "Task tools are not available in this
 /// Subagent's.
 const UNOFFERED_SCHEDULED_TASK_TOOLS_MESSAGE: &str = "Scheduled task tools are not available in this Chat; only the root Agent schedules tasks. This call was not executed.";
 
+/// Runtime tools offered only through tool search, as Claude Code's `shouldDefer` tools: the
+/// conversation names them, and a search loads their definitions. Never listed, whatever the
+/// execution mode, so a mode switch leaves the tools a request offers unchanged.
+const DEFERRED_RUNTIME_TOOLS: [&str; 1] = [ENTER_PLAN_MODE_TOOL_NAME];
+
 /// Host tools that need the Chat's Folder: they show its Ticks or send its local files.
 const FOLDER_HOST_TOOLS: [&str; 6] = [
     crate::tick_tools::READ_WORKSPACE,
@@ -261,6 +266,8 @@ pub(super) fn search_support(chat: &Chat) -> crate::tool_exposure::SearchSupport
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     folded: std::collections::BTreeSet<String>,
+    /// Runtime tools offered only through tool search, which a call may still name directly.
+    searched: std::collections::BTreeSet<String>,
     /// Callable directly, but offered only through the model's native tool search.
     deferred: Vec<ToolDefinition>,
     /// Whether the Chat's model searches deferred tools natively.
@@ -297,7 +304,7 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         if policy.plan {
             tools.extend(
-                plan::definitions(is_delegated)
+                plan::definitions(is_delegated, policy.delegation)
                     .into_iter()
                     .map(|definition| RegisteredTool {
                         definition,
@@ -395,6 +402,20 @@ impl ToolRegistry {
         }
         let native_search =
             tickloop_harness_model::native_tool_search::offered(&chat.snapshot.model).is_some();
+        let searched: std::collections::BTreeSet<String> = tools
+            .iter()
+            .map(|tool| tool.definition.name.clone())
+            .filter(|name| DEFERRED_RUNTIME_TOOLS.contains(&name.as_str()))
+            .collect();
+        let mut discovery_tools: Vec<_> = tools
+            .iter()
+            .filter(|tool| searched.contains(&tool.definition.name))
+            .map(|tool| {
+                crate::tool_exposure::ExposureTool::deferred_runtime_tool(tool.definition.clone())
+            })
+            .collect();
+        let mut unavailable_servers = Vec::new();
+        let mut offers_search = !discovery_tools.is_empty();
         let mut folded = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
         let mut user_exposure = crate::cache_prefix::UserExposure::default();
@@ -415,43 +436,19 @@ impl ToolRegistry {
                 );
             }
             if provider.has_tool_search() {
-                let discovery_tools = chat_discovery_tools(chat, provider.as_ref());
+                let mcp_tools = chat_discovery_tools(chat, provider.as_ref());
                 user_exposure = crate::cache_prefix::UserExposure {
                     revisions: provider.exposure_revisions(),
-                    tool_servers: discovery_tools
+                    tool_servers: mcp_tools
                         .iter()
-                        .map(|tool| (tool.definition.name.clone(), tool.server.clone()))
+                        .filter_map(|tool| {
+                            Some((tool.definition.name.clone(), tool.server.clone()?))
+                        })
                         .collect(),
                 };
-                let directory = Arc::new(
-                    crate::tool_exposure::ExposureDirectory::new(
-                        discovery_tools,
-                        search_support(chat),
-                    )
-                    .with_unavailable_servers(provider.unavailable_tool_servers()),
-                );
-                deferred = directory.deferred_tools();
-                deferred.sort_by(|first, second| first.name.cmp(&second.name));
-                let deferred_names: HashSet<_> =
-                    deferred.iter().map(|tool| tool.name.as_str()).collect();
-                folded.extend(
-                    directory
-                        .tools()
-                        .filter(|tool| {
-                            tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
-                                && !deferred_names.contains(tool.definition.name.as_str())
-                        })
-                        .map(|tool| tool.definition.name.clone()),
-                );
-                tools.extend(
-                    directory
-                        .discovery_definitions()
-                        .into_iter()
-                        .map(|definition| RegisteredTool {
-                            definition,
-                            route: ToolRoute::Fold(directory.clone()),
-                        }),
-                );
+                discovery_tools.extend(mcp_tools);
+                unavailable_servers = provider.unavailable_tool_servers();
+                offers_search = true;
             }
             tools.extend(
                 provider
@@ -469,11 +466,42 @@ impl ToolRegistry {
                     }),
             );
         }
+        // Tool search is offered whenever a tool waits behind it, with or without MCP servers.
+        if offers_search {
+            let directory = Arc::new(
+                crate::tool_exposure::ExposureDirectory::new(discovery_tools, search_support(chat))
+                    .with_unavailable_servers(unavailable_servers),
+            );
+            deferred = directory.deferred_tools();
+            deferred.sort_by(|first, second| first.name.cmp(&second.name));
+            let deferred_names: HashSet<_> =
+                deferred.iter().map(|tool| tool.name.as_str()).collect();
+            folded.extend(
+                directory
+                    .tools()
+                    .filter(|tool| {
+                        tool.server.is_some()
+                            && tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Direct
+                            && !deferred_names.contains(tool.definition.name.as_str())
+                    })
+                    .map(|tool| tool.definition.name.clone()),
+            );
+            tools.extend(
+                directory
+                    .discovery_definitions()
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Fold(directory.clone()),
+                    }),
+            );
+        }
         let mut tools = merge_tick_management(tools);
         sort_for_listing(&mut tools);
         Self {
             tools,
             folded,
+            searched,
             deferred,
             native_search,
             user_exposure,
@@ -539,7 +567,23 @@ impl ToolRegistry {
     }
 
     fn is_listed(&self, name: &str) -> bool {
-        !self.folded.contains(name) && !self.deferred.iter().any(|tool| tool.name == name)
+        !self.folded.contains(name)
+            && !self.searched.contains(name)
+            && !self.deferred.iter().any(|tool| tool.name == name)
+    }
+
+    /// The names of the runtime tools offered only through tool search.
+    pub(super) fn searched_names(&self) -> Vec<String> {
+        self.searched.iter().cloned().collect()
+    }
+
+    /// The runtime tools offered only through tool search, as tool search shows them.
+    pub(super) fn searched_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|tool| self.searched.contains(&tool.definition.name))
+            .map(|tool| tool.definition.clone())
+            .collect()
     }
 
     pub(super) fn definitions(&self) -> Vec<ToolDefinition> {
@@ -1558,14 +1602,9 @@ impl Agent {
                     policy,
                 )
             };
-            // The user confirms every request to enter Plan mode, whatever the execution mode;
-            // only a Deny rule or a host without prompts refuses it without asking.
-            let requires_plan_mode_consent =
-                name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
-                _ if requires_plan_mode_consent => Decision::Ask,
                 Decision::Ask
                     if execution_mode == ExecutionMode::Auto
                         && !explicit_ask
@@ -1611,8 +1650,6 @@ impl Agent {
                 "{}: {}",
                 if explicit_ask {
                     "an explicit Ask rule requires human approval"
-                } else if requires_plan_mode_consent {
-                    "entering plan mode requires the user's confirmation"
                 } else {
                     "the permission policy requires human approval"
                 },
@@ -2176,11 +2213,13 @@ impl Agent {
                         deterministic_denial_reason =
                             Some(auto_mode::prompts_unavailable_message(&prepared.name));
                     }
-                    let bypassed_by_unrestricted_host = !explicit_ask
+                    let approval_required =
+                        explicit_ask || prepared.requires_environment_approval();
+                    let bypassed_by_unrestricted_host = !approval_required
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision =
-                        self.apply_prompt_policy_keeping_required_approval(decision, explicit_ask);
+                    decision = self
+                        .apply_prompt_policy_keeping_required_approval(decision, approval_required);
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
@@ -2933,7 +2972,13 @@ mod tests {
         let skills = tickloop_harness_policy::skills::SkillRegistry::builtin();
         tickloop_harness_tools::Tools::definitions()
             .into_iter()
-            .chain([false, true].into_iter().flat_map(plan::definitions))
+            .chain(
+                [(false, false), (false, true), (true, false)]
+                    .into_iter()
+                    .flat_map(|(is_delegated, offers_subagent)| {
+                        plan::definitions(is_delegated, offers_subagent)
+                    }),
+            )
             .chain([false, true].into_iter().map(interaction::definition))
             .chain(delegation::definitions())
             .chain(agent_messages::definitions())

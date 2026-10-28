@@ -887,6 +887,7 @@ mod tests {
             markdown: "Plan".into(),
             approved_execution_mode: None,
             approval_pending: true,
+            edited_by_user: false,
         });
         snapshot.events.push(event(
             chat_id,

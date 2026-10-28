@@ -448,6 +448,7 @@ pub(super) fn effective_policy(
                 (ExecutionMode::Auto, _) | (_, ExecutionMode::Auto) => ExecutionMode::Auto,
                 _ => ExecutionMode::FullAccess,
             };
+            policy.plan_without_auto |= ancestor_policy.plan_without_auto;
             for rules in [
                 &ancestor_policy.rules,
                 &ancestor_policy.launch_rules,
@@ -521,7 +522,7 @@ pub(super) fn host_authority(
             None => policy.explicit_rule_match(&operation.name, permission_input, loop_id, session),
         };
         (
-            host_tool_decision(explicit, permission, policy.mode, mode_before_plan, human),
+            host_tool_decision(explicit, permission, policy, mode_before_plan, human),
             explicit.is_some_and(|matched| {
                 matched.decision
                     == tickloop_harness_tools::permissions::ExplicitPermissionDecision::Ask

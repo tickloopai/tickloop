@@ -13,6 +13,8 @@ use tickloop_harness_test_support::{
 };
 use uuid::Uuid;
 
+use crate::plan_auto::agent_with_plan_setting;
+
 async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, String) {
     provider_with_secrets(server, name, Vec::new()).await
 }
@@ -231,11 +233,11 @@ async fn mcp_modes_and_explicit_rules_preserve_human_boundaries() {
                         .await
                         .unwrap();
                 }
-                // Plan is entered from Ask here, so third-party calls are decided as in Ask.
-                let should_review = mode == ExecutionMode::Auto && decision.is_none();
+                // Plan uses Auto's review by default, whichever mode it was entered from.
+                let should_review =
+                    matches!(mode, ExecutionMode::Auto | ExecutionMode::Plan) && decision.is_none();
                 let should_ask = decision == Some(Decision::Ask)
-                    || (decision.is_none()
-                        && matches!(mode, ExecutionMode::AcceptEdits | ExecutionMode::Plan));
+                    || (decision.is_none() && mode == ExecutionMode::AcceptEdits);
                 let mut events = agent.subscribe();
                 agent.submit(chat, "Read the service".into()).await.unwrap();
                 let mut asked = false;
@@ -1073,12 +1075,32 @@ async fn auto_reviews_each_batched_mcp_call_against_the_whole_model_authored_bat
 }
 
 #[tokio::test]
-async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
-    for (before_plan, rule_decision, expect_review, expect_ask, expect_call) in [
-        (ExecutionMode::Auto, None, true, false, true),
-        (ExecutionMode::FullAccess, None, false, false, true),
-        (ExecutionMode::AcceptEdits, None, false, true, true),
+async fn plan_decides_mcp_calls_as_auto_or_as_the_mode_it_was_entered_from() {
+    for (use_auto, before_plan, rule_decision, expect_review, expect_ask, expect_call) in [
+        (true, ExecutionMode::Auto, None, true, false, true),
+        (true, ExecutionMode::AcceptEdits, None, true, false, true),
+        (true, ExecutionMode::FullAccess, None, false, false, true),
         (
+            true,
+            ExecutionMode::AcceptEdits,
+            Some(Decision::Ask),
+            false,
+            true,
+            true,
+        ),
+        (
+            true,
+            ExecutionMode::AcceptEdits,
+            Some(Decision::Deny),
+            false,
+            false,
+            false,
+        ),
+        (false, ExecutionMode::Auto, None, true, false, true),
+        (false, ExecutionMode::FullAccess, None, false, false, true),
+        (false, ExecutionMode::AcceptEdits, None, false, true, true),
+        (
+            false,
             ExecutionMode::FullAccess,
             Some(Decision::Ask),
             false,
@@ -1086,6 +1108,7 @@ async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
             true,
         ),
         (
+            false,
             ExecutionMode::FullAccess,
             Some(Decision::Deny),
             false,
@@ -1093,6 +1116,7 @@ async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
             false,
         ),
         (
+            false,
             ExecutionMode::Auto,
             Some(Decision::Deny),
             false,
@@ -1100,15 +1124,15 @@ async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
             false,
         ),
     ] {
-        let label = format!("{before_plan:?} {rule_decision:?}");
+        let label = format!("{use_auto} {before_plan:?} {rule_decision:?}");
         let server = McpService::start().await;
         let (provider, tool) = provider(&server, "review").await;
-        let agent = Agent::new_embedded(
-            config(),
+        let agent = agent_with_plan_setting(
             Arc::new(ScriptedModel::new(vec![
                 call("read", &tool, json!({})),
                 text("done"),
             ])),
+            use_auto,
         );
         let reviewer = Arc::new(ScriptedModel::new(vec![text(
             &auto_classification(false).to_string(),
@@ -1163,7 +1187,7 @@ async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
 }
 
 #[tokio::test]
-async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
+async fn entering_plan_through_the_tool_asks_nothing_and_keeps_the_auto_review_for_mcp_calls() {
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
     let agent = Agent::new_embedded(
@@ -1202,7 +1226,7 @@ async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
             _ => {}
         }
     }
-    assert_eq!(prompts, ["EnterPlanMode"]);
+    assert!(prompts.is_empty(), "{prompts:?}");
     assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
     assert_eq!(server.calls().len(), 1);
     assert_eq!(
@@ -1216,12 +1240,12 @@ async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
 async fn reentering_plan_forgets_the_mode_an_earlier_plan_was_entered_from() {
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
-    let agent = Agent::new_embedded(
-        config(),
+    let agent = agent_with_plan_setting(
         Arc::new(ScriptedModel::new(vec![
             call("read", &tool, json!({})),
             text("done"),
         ])),
+        false,
     );
     agent.install_host_tools(provider).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1324,7 +1348,7 @@ async fn children_of_a_plan_entered_from_full_access_still_ask_for_mcp_calls() {
         text("child done"),
         text("parent done"),
     ]));
-    let agent = Agent::new_embedded(config(), model);
+    let agent = agent_with_plan_setting(model, false);
     // Creating the child in Plan is itself reviewed.
     let reviewer = Arc::new(ScriptedModel::new(vec![text(
         &auto_classification(false).to_string(),
@@ -1357,14 +1381,14 @@ async fn rewinding_into_plan_leaves_the_earlier_mode_unknown() {
     use tickloop_harness_protocol::RewindMode;
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
-    let agent = Agent::new_embedded(
-        config(),
+    let agent = agent_with_plan_setting(
         Arc::new(ScriptedModel::new(vec![
             text("planned"),
             text("ran"),
             call("read", &tool, json!({})),
             text("done"),
         ])),
+        false,
     );
     agent.install_host_tools(provider).unwrap();
     let dir = tempfile::tempdir().unwrap();

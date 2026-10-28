@@ -158,6 +158,7 @@ async fn check_shell_stop(command: &str, interrupted_handoff: bool, disconnect: 
             command: command.into(),
             cwd: service.config_root.directory.path().to_path_buf(),
             environment: shell::environment_digest(&[]),
+            sandbox: None,
         },
     };
     let grant = service

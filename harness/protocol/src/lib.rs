@@ -2,6 +2,7 @@
 
 mod approvals;
 mod artifact;
+mod auto_compact;
 mod auto_rules;
 mod auto_settings;
 mod auto_setup;
@@ -52,6 +53,9 @@ pub use approvals::{
     PreparedApprovalFacts,
 };
 pub use artifact::{ArtifactAudience, ArtifactFeedbackHistory, ArtifactPublication, ArtifactTick};
+pub use auto_compact::{
+    auto_compact_line, auto_compact_tokens, auto_compact_warning_tokens, context_window_tokens,
+};
 pub use auto_rules::{
     AutoBlockKind, AutoEnvironment, AutoEnvironmentSource, AutoPolicy, AutoRule, AutoRuleSource,
     RuleApplicability, RuleFinding, SoftDenyClearance, TaskScopeFinding, VerdictEvidence,
@@ -77,8 +81,9 @@ pub use context_breakdown::{
 };
 pub use context_usage::{
     ContextMeasurement, ContextTokenCounter, ESTIMATED_CONTEXT_BYTES_PER_TOKEN,
-    context_token_counter, current_context_tokens, estimated_image_tokens, message_content_tokens,
-    serialized_context_bytes, set_context_token_counter,
+    context_token_counter, current_context_tokens, current_context_tokens_counted,
+    estimated_image_tokens, message_content_tokens, serialized_context_bytes,
+    set_context_token_counter,
 };
 pub use denials::{
     AUTO_REJECTION_PREFIX, ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult,
@@ -198,3 +203,6 @@ pub use usage::{
 
 mod tasks;
 pub use tasks::*;
+
+mod isolation;
+pub use isolation::{ExecutionIsolation, NetworkIsolation, WriteIsolation};

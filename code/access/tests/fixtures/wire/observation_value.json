@@ -506,6 +506,7 @@
         "entries": []
       },
       "context_window_tokens": 200000,
+      "auto_compact_window": 150000,
       "last_model_run": "00000000-0000-0000-0000-000000000020",
       "warnings": [
         "slow disk"
@@ -1020,6 +1021,7 @@
         "provider_failures": {},
         "context_window_tokens": 200000,
         "context_tokens": null,
+        "auto_compact_tokens": 117000,
         "highest_pasted_image_id": null,
         "request_order": [],
         "command_started_at_ms": {},
@@ -1121,6 +1123,10 @@
           "tokens": 6000
         },
         {
+          "category": "tool_search_index",
+          "tokens": 100
+        },
+        {
           "category": "tool_search_results",
           "tokens": 1000
         },
@@ -1148,6 +1154,17 @@
             {
               "name": "mcp__office__open",
               "tokens": 300
+            }
+          ]
+        }
+      ],
+      "tool_search_index": [
+        {
+          "server": "market",
+          "tools": [
+            {
+              "name": "mcp__market__quote",
+              "tokens": 100
             }
           ]
         }

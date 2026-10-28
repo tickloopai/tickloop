@@ -37,6 +37,7 @@ fn breakdown() -> ContextBreakdown {
             server: "office".into(),
             tools: vec![item("mcp__office__open", 900)],
         }],
+        tool_search_index: Vec::new(),
         instruction_files: vec![
             item("/home/user/.tickloop/AGENTS.md", 9_000),
             item("/work/project/AGENTS.md", 4_500),
@@ -354,11 +355,75 @@ fn what_the_service_reports_beyond_the_count_has_its_own_row() {
     gap.categories
         .push(usage(ContextCategory::Unattributed, 12_000));
     let lines = texts(&render(&gap, 120, false));
+    assert!(lines.iter().any(|line| {
+        line.ends_with("⛁ Not itemized (service total beyond the count): 12k tokens (6.0%)")
+    }));
+}
+
+fn with_tool_search_index() -> ContextBreakdown {
+    let mut breakdown = breakdown();
+    breakdown.tool_search.as_mut().unwrap().mode = ToolSearchMode::Native;
+    breakdown
+        .categories
+        .insert(3, usage(ContextCategory::ToolSearchIndex, 17_600));
+    breakdown.used_tokens += 17_600;
+    breakdown.tool_search_index = vec![
+        ContextToolServer {
+            server: "longbridge".into(),
+            tools: vec![
+                item("mcp__longbridge__quote", 9_000),
+                item("mcp__longbridge__news", 8_000),
+            ],
+        },
+        ContextToolServer {
+            server: "ui5".into(),
+            tools: vec![item("mcp__ui5__create", 600)],
+        },
+    ];
+    breakdown
+}
+
+#[test]
+fn what_native_search_counts_for_deferred_tools_is_its_own_category_by_server() {
+    let breakdown = with_tool_search_index();
+    let lines = texts(&render(&breakdown, 120, false));
     assert!(
         lines
             .iter()
-            .any(|line| line
-                .ends_with("⛁ Unattributed (reported by the service): 12k tokens (6.0%)"))
+            .any(|line| line.ends_with("⛁ Tool search index: 17.6k tokens (8.8%)")),
+        "{lines:#?}"
+    );
+    assert!(!lines.iter().any(|line| line.contains("Not itemized")));
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("Tool search index"))
+        .unwrap();
+    assert_eq!(
+        &lines[start..start + 2],
+        [
+            "Tool search index · names and descriptions the service counts for native search",
+            "└ 3 tools on 2 servers · 17.6k tokens",
+        ]
+    );
+    assert!(lines.contains(
+        &"Tool search pool · native (names and descriptions are in context; full definitions load on search)"
+            .into()
+    ));
+
+    let expanded = texts(&render(&breakdown, 120, true));
+    let start = expanded
+        .iter()
+        .position(|line| line.starts_with("Tool search index"))
+        .unwrap();
+    assert_eq!(
+        &expanded[start + 2..start + 7],
+        [
+            "  longbridge",
+            "  └ mcp__longbridge__quote: 9k tokens",
+            "  └ mcp__longbridge__news: 8k tokens",
+            "  ui5",
+            "  └ mcp__ui5__create: 600 tokens",
+        ]
     );
 }
 

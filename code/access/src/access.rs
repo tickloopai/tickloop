@@ -83,7 +83,15 @@ use tickloop_harness::protocol::{
 /// and appending custom Auto rules and Environment entries in one permission change.
 /// 32.0 adds launch-argument permission rule sources and optional launch rules and additional
 /// directories on Create.
-pub const PROTOCOL_MAJOR: u16 = 32;
+/// 32.1 adds the automatic compaction line to the Chat status and the `autoCompactWindow` cap
+/// to the live Chat snapshot.
+/// 33.0 adds the context breakdown's Tool search index category, which older readers reject as
+/// unknown, and its per-server items.
+/// 34.0 adds the host notes that announce the execution mode and the Loop's state, and the MCP
+/// configuration warnings guidance note, which older readers reject as unknown, in the Chat
+/// snapshot's host notes; the host state of the system prompt no longer carries what changes
+/// during a Chat.
+pub const PROTOCOL_MAJOR: u16 = 34;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -550,6 +558,14 @@ pub enum LoopAction {
     ApprovePlan {
         version: u64,
         mode: ExecutionMode,
+        /// The user's feedback on the plan, sent along with the approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+    /// Replaces the reviewed plan version with the user's edit; the edit awaits approval.
+    EditPlan {
+        version: u64,
+        markdown: String,
     },
     DeclinePlan {
         version: u64,
@@ -685,6 +701,8 @@ pub enum AgentDetailQuery {
     Warnings,
     /// The Agent's MCP servers, once it has taken up its current configuration.
     McpServers,
+    /// The current Loop's plan file, when one has been written.
+    PlanFile,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -826,6 +844,8 @@ pub struct LiveChatSnapshot {
     pub user_shells: Vec<UserShellRecord>,
     pub request_usage: RequestUsageLedger,
     pub context_window_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_window: Option<usize>,
     pub last_model_run: Option<RunId>,
     pub warnings: Vec<String>,
     pub request_refs: Vec<RequestRef>,
@@ -867,6 +887,7 @@ impl LiveChatSnapshot {
             user_shells: snapshot.user_shells.clone(),
             request_usage: snapshot.request_usage.clone(),
             context_window_tokens: snapshot.context_window_tokens,
+            auto_compact_window: snapshot.auto_compact_window,
             last_model_run: snapshot.last_model_run,
             request_refs: RequestRef::pending(
                 execution,
@@ -900,6 +921,7 @@ impl LiveChatSnapshot {
                     commands: &self.commands,
                     request_usage: &self.request_usage,
                     context_window_tokens: self.context_window_tokens,
+                    auto_compact_window: self.auto_compact_window,
                     events: &self.events,
                     last_sequence: self.last_sequence,
                 },
@@ -933,6 +955,7 @@ impl LiveChatSnapshot {
         snapshot.user_shells = self.user_shells;
         snapshot.request_usage = self.request_usage;
         snapshot.context_window_tokens = self.context_window_tokens;
+        snapshot.auto_compact_window = self.auto_compact_window;
         snapshot.last_model_run = self.last_model_run;
         snapshot
     }
@@ -1009,6 +1032,7 @@ pub enum ObservationValue {
     Receipt(Option<Box<CommandReceipt>>),
     OtherTickhost(Option<OtherTickhost>),
     RuntimeVersion(Box<crate::RuntimeVersion>),
+    PlanFile(Option<PathBuf>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

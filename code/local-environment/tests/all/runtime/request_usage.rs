@@ -627,7 +627,7 @@ async fn automatic_compaction_is_owned_by_its_run_but_excluded_from_reply_usage(
         let receipt = agent.submit(chat, prompt.into()).await.unwrap();
         completed_usage(&mut events, receipt.run_id).await;
     }
-    agent.set_context_window(chat, 20_000).await.unwrap();
+    agent.set_context_window(chat, 30_000).await.unwrap();
     let receipt = agent.submit(chat, "Continue".into()).await.unwrap();
     assert_eq!(
         completed_usage(&mut events, receipt.run_id).await,

@@ -809,6 +809,7 @@ fn bash_takes_claude_code_parameters_and_the_old_command_tools_are_gone() {
             vec![
                 "command".to_owned(),
                 "cwd".into(),
+                "dangerouslyDisableSandbox".into(),
                 "description".into(),
                 "run_in_background".into(),
                 "timeout".into()

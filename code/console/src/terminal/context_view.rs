@@ -303,7 +303,18 @@ impl ContextView<'_> {
             ));
         }
         if !breakdown.mcp_tools.is_empty() {
-            lines.extend(self.server_section(&breakdown.mcp_tools));
+            lines.extend(self.server_section(
+                "MCP tools",
+                " · /mcp (sent with every request)",
+                &breakdown.mcp_tools,
+            ));
+        }
+        if !breakdown.tool_search_index.is_empty() {
+            lines.extend(self.server_section(
+                "Tool search index",
+                " · names and descriptions the service counts for native search",
+                &breakdown.tool_search_index,
+            ));
         }
         let files = breakdown
             .instruction_files
@@ -398,7 +409,7 @@ impl ContextView<'_> {
         lines
     }
 
-    fn server_section(&self, servers: &[ContextToolServer]) -> Vec<Line> {
+    fn server_section(&self, title: &str, hint: &str, servers: &[ContextToolServer]) -> Vec<Line> {
         let tools = servers
             .iter()
             .map(|server| server.tools.len())
@@ -406,7 +417,7 @@ impl ContextView<'_> {
         let tokens = servers.iter().map(ContextToolServer::tokens).sum::<u64>();
         let mut lines = vec![
             Vec::new(),
-            heading("MCP tools", " · /mcp (sent with every request)"),
+            heading(title, hint),
             tree_line(
                 "",
                 format!(
@@ -438,15 +449,17 @@ impl ContextView<'_> {
             ToolSearchMode::Native => "native",
             ToolSearchMode::SearchTools => "SearchTools",
         };
+        let cost = if self.breakdown.tool_search_index.is_empty() {
+            "loaded on demand, not in context"
+        } else {
+            "names and descriptions are in context; full definitions load on search"
+        };
         let servers = pool.servers.len();
         let mut lines = vec![
             Vec::new(),
             vec![
                 ("Tool search pool".into(), Some(Role::ContextToolSearch)),
-                (
-                    format!(" · {mode} (loaded on demand, not in context)"),
-                    Some(Role::MutedText),
-                ),
+                (format!(" · {mode} ({cost})"), Some(Role::MutedText)),
             ],
             tree_line(
                 "",
@@ -585,11 +598,12 @@ fn category_name(category: ContextCategory) -> &'static str {
         ContextCategory::SystemPrompt => "System prompt",
         ContextCategory::SystemTools => "System tools",
         ContextCategory::McpTools => "MCP tools",
+        ContextCategory::ToolSearchIndex => "Tool search index",
         ContextCategory::InstructionFiles => "Instruction files",
         ContextCategory::Skills => "Skills",
         ContextCategory::ToolSearchResults => "Tool search results",
         ContextCategory::Messages => "Messages",
-        ContextCategory::Unattributed => "Unattributed (reported by the service)",
+        ContextCategory::Unattributed => "Not itemized (service total beyond the count)",
     }
 }
 
@@ -599,6 +613,7 @@ fn category_role(category: ContextCategory) -> Role {
         ContextCategory::SystemPrompt => Role::PromptBorder,
         ContextCategory::SystemTools => Role::MutedText,
         ContextCategory::McpTools => Role::ContextMcpTools,
+        ContextCategory::ToolSearchIndex => Role::ContextToolSearch,
         ContextCategory::InstructionFiles => Role::Accent,
         ContextCategory::Skills => Role::Warning,
         ContextCategory::ToolSearchResults => Role::ContextToolSearch,

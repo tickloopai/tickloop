@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::mcp_tools::ARTIFACT_EDIT_TOOL;
 
-use tickloop_harness_protocol::SUBAGENT_TOOL_NAME;
+use tickloop_harness_protocol::{Plan, SUBAGENT_TOOL_NAME};
 use tickloop_harness_tools::{
     ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
@@ -25,7 +25,14 @@ Plan mode is active. The user indicated that they do not want you to execute yet
 
 Instead, research the task with read-only tools (call only read-only MCP tools) and answer it comprehensively in your final reply: your findings, or the approach you recommend with the files to change, the existing code to reuse and how to verify it. Your parent Agent writes the plan and submits it for the user's approval. Use AskUserQuestion if you need to ask the user clarifying questions; if you do, ask all of them before proceeding.";
 
-pub(super) fn enter_plan_mode_description() -> String {
+/// Claude Code 2.1.302's `EnterPlanMode` prompt. Its "Pure research/exploration tasks" item
+/// points to the Agent tool by default; here to Subagent, when the Chat offers it.
+pub(super) fn enter_plan_mode_description(offers_subagent: bool) -> String {
+    let research_note = if offers_subagent {
+        format!(" (use the {SUBAGENT_TOOL_NAME} tool instead)")
+    } else {
+        String::new()
+    };
     format!(
         "Use this tool proactively when you're about to start a non-trivial implementation task. Getting user sign-off on your approach before writing code prevents wasted effort and ensures alignment. This tool transitions you into plan mode where you can explore the codebase and design an implementation approach for user approval.
 
@@ -67,12 +74,12 @@ Only skip {ENTER_PLAN_MODE_TOOL_NAME} for simple tasks:
 - Single-line or few-line fixes (typos, obvious bugs, small tweaks)
 - Adding a single function with clear requirements
 - Tasks where the user has given very specific, detailed instructions
-- Pure research/exploration tasks
+- Pure research/exploration tasks{research_note}
 
 ## What Happens in Plan Mode
 
 In plan mode, you'll:
-1. Thoroughly explore the codebase using {GLOB_TOOL_NAME}, {GREP_TOOL_NAME}, and {READ_TOOL_NAME} tools
+1. Thoroughly explore the codebase using {GLOB_TOOL_NAME}, {GREP_TOOL_NAME}, and {READ_TOOL_NAME}
 2. Understand existing patterns and architecture
 3. Design an implementation approach
 4. Present your plan to the user for approval
@@ -116,6 +123,7 @@ User: \"What files handle routing?\"
     )
 }
 
+/// Claude Code 2.1.302's `ExitPlanMode` prompt.
 pub(super) fn exit_plan_mode_description() -> String {
     format!(
         "Use this tool when you are in plan mode and have finished writing your plan to the plan file and are ready for user approval.
@@ -145,8 +153,8 @@ Ensure your plan is complete and unambiguous:
     )
 }
 
-/// Claude Code's result for an approved `EnterPlanMode`. Its closing line forbids every edit
-/// because the plan file exception arrives in the plan mode reminder; here it names the exception.
+/// Claude Code 2.1.302's `EnterPlanMode` result. Its closing line forbids every edit; the plan
+/// file and Artifact exceptions arrive with the plan mode section of the next request.
 pub(super) fn entered_plan_mode() -> String {
     format!(
         "Entered plan mode. You should now focus on exploring the codebase and designing an implementation approach.
@@ -159,7 +167,7 @@ In plan mode, you should:
 5. Design a concrete implementation strategy
 6. When ready, use {EXIT_PLAN_MODE_TOOL_NAME} to present your plan for approval
 
-Remember: DO NOT write or edit any files except the plan file. {ARTIFACT_EDIT_TOOL} may also create or revise Artifact documents, subject to the host's permission checks. Stay in Plan mode for this; the host handles the first-publication confirmation. This is an exploration and planning phase."
+Remember: DO NOT write or edit any files yet. This is a read-only exploration and planning phase."
     )
 }
 
@@ -206,16 +214,26 @@ pub(super) fn declined_plan(feedback: Option<&str>) -> String {
 }
 
 /// The approved ExitPlanMode result, also used to continue a saved plan whose original Run ended.
-pub(super) fn approved_plan(path: &Path, markdown: &str) -> String {
+/// Claude Code marks a plan the user edited in review and appends feedback given on approval.
+pub(super) fn approved_plan(path: &Path, plan: &Plan, feedback: Option<&str>) -> String {
+    let heading = if plan.edited_by_user {
+        "Approved Plan (edited by user)"
+    } else {
+        "Approved Plan"
+    };
+    let feedback = feedback
+        .map(|feedback| format!("\n\nUser feedback on this plan: {feedback}"))
+        .unwrap_or_default();
     format!(
         "User has approved your plan. You can now start coding. Proceed with the approved work
 
 Your plan has been saved to: {}
 You can refer back to it if needed during implementation.
 
-## Approved Plan:
-{markdown}",
-        path.display()
+## {heading}:
+{}{feedback}",
+        path.display(),
+        plan.markdown
     )
 }
 

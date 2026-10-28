@@ -166,6 +166,7 @@ impl Agent {
             events: Vec::new(),
             pending_thinking: BTreeMap::new(),
             context_window_tokens: None,
+            auto_compact_window: None,
             pending_model: None,
             plans: Vec::new(),
             progress: Vec::new(),

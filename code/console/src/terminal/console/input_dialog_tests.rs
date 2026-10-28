@@ -12,6 +12,7 @@ fn completed_login_has_one_return_option() {
                 id,
                 title: "Codex browser login".into(),
                 context: Vec::new(),
+                markdown: None,
                 options: vec!["Submit callback URL…".into(), "Cancel login".into()],
                 selected,
                 confirmation: false,
@@ -854,6 +855,7 @@ fn menu(id: Uuid) -> Menu {
         id,
         title: "Settings".into(),
         context: vec!["Choose a setting".into()],
+        markdown: None,
         options: vec!["Theme".into(), "Output style".into()],
         selected: 0,
         confirmation: false,
@@ -1547,6 +1549,7 @@ fn provider_model_and_connection_dialogs_fit_their_content_and_isolate_input() {
                         id,
                         title: "Builtin picker".into(),
                         context: vec!["Connection scope".into()],
+                        markdown: None,
                         options: (0..20).map(|index| format!("Choice {index}")).collect(),
                         selected: 12,
                         confirmation: false,
@@ -1600,6 +1603,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
                 id,
                 title: "API key · DeepSeek".into(),
                 context: vec!["Credential belongs to this connection".into()],
+                markdown: None,
                 options: vec!["Save API key".into(), "Cancel".into()],
                 selected: 0,
                 confirmation: false,
@@ -1732,6 +1736,7 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
                 id,
                 title: "Providers".into(),
                 context: Vec::new(),
+                markdown: None,
                 options: vec!["First connection".into(), "Second connection".into()],
                 selected: 0,
                 confirmation: false,
@@ -2356,7 +2361,7 @@ fn a_child_cannot_use_plan_or_change_its_mode() {
 /// into Plan mode.
 #[tokio::test]
 async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
-    use crate::terminal::{execution::ConsoleExecution, menus::Menus, open_current_plan};
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, run_plan_command};
     use tickloop_harness::protocol::{EventKind, ExecutionMode};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
@@ -2402,7 +2407,7 @@ async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
     console.select_chat(Some(child.into())).unwrap();
     console.set_visible_delegation(true).unwrap();
     let mut menus = Menus::default();
-    let refusal = open_current_plan(&agent, &console, &mut menus, Some(child))
+    let refusal = run_plan_command(&agent, &console, &mut menus, Some(child), "")
         .await
         .unwrap_err();
     assert!(

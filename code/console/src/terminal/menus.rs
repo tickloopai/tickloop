@@ -657,6 +657,7 @@ impl Menus {
                     "Abandoned messages stay in the Transcript file.".into(),
                 ],
                 selected: points.len(),
+                markdown: None,
                 options,
                 confirmation: false,
             },
@@ -700,7 +701,7 @@ impl Menus {
                     point.file_history_description(),
                     "Only files changed by the Agent's file tools are restored; Shell and external side effects are not covered.".into(),
                 ],
-                options: actions.iter().map(|action| action.label().into()).collect(),
+                markdown: None, options: actions.iter().map(|action| action.label().into()).collect(),
                 selected,
                 confirmation: false,
             },
@@ -732,6 +733,7 @@ impl Menus {
                             )
                         })
                         .collect(),
+                    markdown: None,
                     options: vec!["Back to command groups".into()],
                     selected: 0,
                     confirmation: false,
@@ -771,6 +773,7 @@ impl Menus {
                 id: tickloop_ids::generate(),
                 title: title.into(),
                 context: vec!["Choose an action, or use its slash command directly.".into()],
+                markdown: None,
                 options,
                 selected: 0,
                 confirmation: false,
@@ -825,6 +828,49 @@ impl Menus {
         self.active.as_ref().map(|(id, _)| *id)
     }
 
+    /// Saves the user's edit of the plan reviewed in `menu_id` and reopens the review on the
+    /// edited version; a review that has since closed or moved on keeps its plan.
+    pub(super) async fn edit_plan(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        menu_id: Uuid,
+        markdown: String,
+    ) -> Result<(), String> {
+        let Some((
+            id,
+            Selection::Workflow(Workflow::Plan {
+                chat,
+                version,
+                request,
+                ..
+            }),
+        )) = &self.active
+        else {
+            return Ok(());
+        };
+        if *id != menu_id {
+            return Ok(());
+        }
+        let reviewed = Workflow::Plan {
+            chat: *chat,
+            version: *version,
+            request: *request,
+            markdown: String::new(),
+        };
+        let (mut menu, mut edited) = reviewed.edit_plan(agent, markdown).await?;
+        if let Workflow::Plan {
+            request: current, ..
+        } = &mut edited
+        {
+            *current = *request;
+        }
+        menu.title = console
+            .menu_snapshot(menu_id)?
+            .map_or(menu.title, |shown| shown.title);
+        self.workflow(console, (menu, edited))
+    }
+
     pub(super) fn locations(
         &mut self,
         console: &Console,
@@ -855,6 +901,7 @@ impl Menus {
                     "Several live Views exist in this Herdr instance. Choose a verified location."
                         .into(),
                 ],
+                markdown: None,
                 options,
                 selected: 0,
                 confirmation: false,
@@ -975,6 +1022,7 @@ impl Menus {
                 id: tickloop_ids::generate(),
                 title: "Sign out of Tickloop Accounts?".into(),
                 context: vec!["Stops feedback listening before revoking the credential.".into()],
+                markdown: None,
                 options: vec!["Cancel".into(), "Sign out".into()],
                 selected: 0,
                 confirmation: true,
@@ -1018,7 +1066,14 @@ impl Menus {
             return Ok(());
         }
         if !console.is_interactive() {
-            console.write(&format!("{}\n{}\n", menu.title, menu.context.join("\n")))?;
+            let context = menu
+                .context
+                .iter()
+                .map(String::as_str)
+                .chain(menu.markdown.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            console.write(&format!("{}\n{context}\n", menu.title))?;
             for (index, option) in menu.options.iter().enumerate() {
                 console.write(&format!("  {}. {}\n", index + 1, option))?;
             }
@@ -1032,6 +1087,13 @@ impl Menus {
                 || matches!(&selection, Selection::Permission { request, .. } if request.name == ENTER_PLAN_MODE_TOOL_NAME);
             if plan_dialog {
                 console.show_plan_menu(menu, plan_feedback)?;
+                if let Selection::Workflow(Workflow::Plan { markdown, .. }) = &selection {
+                    console.offer_plan_review(super::console::PlanReview {
+                        menu_id: id,
+                        markdown: markdown.clone(),
+                        feedback_approval: super::workflows::feedback_approval_index(),
+                    })?;
+                }
             } else if matches!(&selection, Selection::Goal { actions, .. } if actions.iter().any(|action| matches!(action, goal::GoalMenuAction::Continue { .. })))
             {
                 console.show_continue_menu(menu)?;
@@ -1613,7 +1675,7 @@ impl Menus {
                     "Effort levels depend on the current model; auto uses its default. Use Settings to turn Thinking on or off. The choice is saved in user settings.".into(),
                     "Thinking is collapsed in conversation; ctrl+o opens the detailed transcript.".into(),
                 ],
-                options,
+                markdown: None, options,
                 selected: choices
                     .iter()
                     .position(|choice| *choice == snapshot.reasoning_effort)
@@ -1676,6 +1738,7 @@ impl Menus {
                 id: tickloop_ids::generate(),
                 title: "Settings".into(),
                 context,
+                markdown: None,
                 options: vec![
                     format!(
                         "Model: {}",
@@ -1826,6 +1889,7 @@ impl Menus {
                     "shift+tab cycles the checked modes in this order.".into(),
                     "Entering or leaving Plan starts a new model cache.".into(),
                 ],
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -1857,6 +1921,7 @@ impl Menus {
                     "This changes how the Agent communicates with you.".into(),
                     "Applies to Chats opened after the change; open Chats keep their style.".into(),
                 ],
+                markdown: None,
                 options,
                 selected: OutputStyle::ALL
                     .into_iter()
@@ -1911,6 +1976,7 @@ impl Menus {
                     "Applies to this terminal session. Colours only; layout and text are unchanged."
                         .into(),
                 ],
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -1950,6 +2016,7 @@ impl Menus {
                     id: tickloop_ids::generate(),
                     title: if usage { "Usage" } else { "Session status" }.into(),
                     context,
+                    markdown: None,
                     options: vec!["Back to settings".into()],
                     selected: 0,
                     confirmation: false,
@@ -1990,6 +2057,7 @@ impl Menus {
                 id: tickloop_ids::generate(),
                 title: if usage { "Usage" } else { "Session status" }.into(),
                 context,
+                markdown: None,
                 options: vec!["Back to settings".into()],
                 selected: 0,
                 confirmation: false,
@@ -2029,6 +2097,7 @@ impl Menus {
                 id: tickloop_ids::generate(),
                 title: "Choose execution mode".into(),
                 context: vec!["Applies to this Chat. Explicit deny rules remain effective.".into()],
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -2083,13 +2152,28 @@ impl Menus {
         } else {
             "Choose a mode for this Chat, or view activity without changing it."
         };
+        let sandbox = self.user_settings.as_ref().map_or_else(
+            || Ok(tickloop_code_settings::sandbox::SandboxSettings::default()),
+            |settings| settings.load().sandbox(),
+        );
+        let sandbox_status = match sandbox {
+            Ok(settings) if settings.enabled && settings.fail_if_unavailable => {
+                "Sandbox: on · refuse if unavailable"
+            }
+            Ok(settings) if settings.enabled => {
+                "Sandbox: on · warn and run without isolation if unavailable"
+            }
+            Ok(_) => "Sandbox: off",
+            Err(_) => "Sandbox: invalid configuration · Shell execution refused",
+        };
         options.push("↗ View recent activity · keep current mode".into());
         self.show(
             console,
             Menu {
                 id: tickloop_ids::generate(),
                 title: "Permissions · Choose mode".into(),
-                context: vec![context.into()],
+                context: vec![context.into(), sandbox_status.into()],
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -2380,6 +2464,7 @@ impl Menus {
                 super::presentation::tool_name(&request.name)
             ),
             context,
+            markdown: None,
             options,
             selected: 0,
             confirmation: true,
@@ -2454,7 +2539,7 @@ impl Menus {
                     "The first rule is exact; * matches the remaining command text, with broader rules lower down."
                         .into(),
                 ],
-                options,
+                markdown: None, options,
                 selected: 0,
                 confirmation: true,
             },
@@ -2844,14 +2929,14 @@ impl Menus {
                             let context = if matches!(action, providers::ConnectionAction::RemoveKey) {
                                 vec!["This removes the saved value of this connection's credential reference. Other connections using that reference are also affected.".into(), if fallback { "An environment key will still be used.".into() } else { "No environment key is configured.".into() }]
                             } else { vec!["This signs out this provider's saved login. Connections and Chats using the same login also need sign-in.".into()] };
-                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("{label} · {}", provider.model_page_name()), context, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
+                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("{label} · {}", provider.model_page_name()), context, markdown: None, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
                         }
                         providers::ConnectionAction::CredentialDetails => {
                             self.provider.provider_nav.back_stack.push(parent);
                             let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
                             let reference = &provider.models[0].api_key_env;
                             let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
-                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Credential details · {}", provider.model_page_name()), context, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
+                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Credential details · {}", provider.model_page_name()), context, markdown: None, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
                         }
                     }
                 }
@@ -3348,6 +3433,7 @@ fn enter_plan_mode_menu(request_id: Uuid, requester: String) -> Menu {
             " · Design an implementation strategy".into(),
             " · Present a plan for your approval".into(),
         ],
+        markdown: None,
         options: vec![
             "Yes, enter plan mode".into(),
             "No, start implementing now".into(),

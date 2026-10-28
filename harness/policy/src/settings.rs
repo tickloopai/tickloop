@@ -33,11 +33,17 @@ pub struct SettingsSnapshot {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_enabled: bool,
     pub context_window_tokens: Option<usize>,
+    /// The `autoCompactWindow` setting: caps the window the automatic compaction line is measured
+    /// in.
+    pub auto_compact_window: Option<usize>,
     pub search: Option<SearchConfig>,
     pub output_style: OutputStyle,
     pub goal_token_budget: Option<u64>,
     pub goal_check_model: Option<ModelConfig>,
     pub skips_transcripts: bool,
+    /// Claude Code's `useAutoModeDuringPlan`: Plan admits and reviews as Auto does. On unless
+    /// settings turn it off.
+    pub use_auto_mode_during_plan: bool,
     pub auto: Result<(AutoSettings, AutoSettingsRevision), String>,
     pub jev: Result<JevConfig, String>,
     pub warnings: Vec<String>,
@@ -54,11 +60,13 @@ impl Default for SettingsSnapshot {
             reasoning_effort: None,
             thinking_enabled: true,
             context_window_tokens: None,
+            auto_compact_window: None,
             search: SearchConfig::enabled_default(),
             output_style: OutputStyle::default(),
             goal_token_budget: None,
             goal_check_model: None,
             skips_transcripts: false,
+            use_auto_mode_during_plan: true,
             auto: Ok((AutoSettings::default(), empty_auto_settings_revision())),
             jev: Ok(JevConfig::default()),
             warnings: Vec::new(),
