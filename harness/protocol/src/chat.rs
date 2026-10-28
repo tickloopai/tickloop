@@ -35,6 +35,11 @@ pub struct ChatSnapshot {
     pub task_boards: BTreeMap<LoopId, crate::TaskBoard>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_board: Option<crate::TaskBoard>,
+    /// Claude Code's `prePlanMode` as the process running the Chat knows it, filled in when the
+    /// Chat is read: the mode the Chat entered Plan from, while it is in Plan. Unknown after a load,
+    /// a rewind or branch switch that changes the mode, or for a Chat that started in Plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_before_plan: Option<crate::ExecutionMode>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subagent_reports: BTreeMap<RunId, crate::SubagentReport>,
     #[serde(default)]
@@ -424,6 +429,8 @@ pub enum HostNote {
     /// The Loop's Tick Subscriptions, its receiving or its running Subagents, as they changed
     /// without the model's own calls or stand after a compaction or a load.
     LoopState,
+    /// Claude Code's `task_reminder` attachment: the task tools have not been used for a while.
+    TaskReminder,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
@@ -448,6 +455,7 @@ impl HostNote {
             Self::PlanModeExit
             | Self::ExecutionMode(_)
             | Self::LoopState
+            | Self::TaskReminder
             | Self::Guidance(_)
             | Self::DateChange(_) => None,
         }

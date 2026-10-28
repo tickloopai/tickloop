@@ -11,8 +11,8 @@ use tickloop_harness_model::{ModelConfigExt, REQUEST_OVERHEAD_TOKENS};
 use tickloop_harness_protocol::{
     ChatId, CommandState, Content, EventKind, ExecutionMode, GoalAction, GoalAuthor, GoalNotice,
     GoalSnapshot, GoalStatus, GoalVerdict, LoopState, ModelConfig, ModelRequestKind,
-    OperationRecord, Receipt, RequestOutcome, ResponseRejection, Role, RunId, ToolResult,
-    TriggerIdentity, TriggerSource, Usage, UserShellState, local_messages,
+    OperationRecord, Receipt, RequestOutcome, RequestUsageRecord, ResponseRejection, Role, RunId,
+    ToolResult, TriggerIdentity, TriggerSource, UserShellState, local_messages,
 };
 use tickloop_harness_transcript::{GoalEntry, GoalEventEntry, Line};
 use tokio_util::sync::CancellationToken;
@@ -53,13 +53,13 @@ fn prompt_context(goal: &GoalSnapshot) -> GoalPromptContext<'_> {
     }
 }
 
-/// The tokens a model usage report charges to a goal: fresh input and output, as Codex counts
+/// The tokens a request's usage report charges to a goal: fresh input and output, as Codex counts
 /// them; cached input is not charged again.
-pub(crate) fn charged_tokens(usage: &Usage) -> u64 {
-    usage
-        .input_tokens
+pub(crate) fn charged_tokens(record: &RequestUsageRecord) -> u64 {
+    record
+        .fresh_input_tokens()
         .unwrap_or_default()
-        .saturating_add(usage.output_tokens.unwrap_or_default())
+        .saturating_add(record.usage.output_tokens.unwrap_or_default())
 }
 
 /// The goal's state with its running usage left out: what changing makes a goal record.

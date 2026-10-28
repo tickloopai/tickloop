@@ -17511,6 +17511,124 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// ExitPlanMode without a plan opens Claude Code's yes/no "Exit plan mode?" dialog instead of
+    /// the plan approval: Esc keeps Plan, Enter on Yes leaves it for the mode it was entered from.
+    #[tokio::test]
+    async fn exit_plan_mode_without_a_plan_asks_yes_or_no() {
+        use crate::terminal::menus::Menus;
+        use tickloop_harness::test_support::{exit_plan_mode, next_event, text};
+
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            exit_plan_mode("kept"),
+            exit_plan_mode("left"),
+            text("Proceeding."),
+        ]));
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+            agent.set_execution_mode(chat, mode).await.unwrap();
+        }
+        let console = InteractiveConsoleFixture::new(State::new(true, 100, 30));
+        let mut menus = Menus::default();
+        let mut events = agent.subscribe();
+
+        async fn show_request(
+            agent: &Agent,
+            console: &Console,
+            menus: &mut Menus,
+            chat: Uuid,
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
+        ) -> Uuid {
+            let request = loop {
+                if let EventKind::PermissionRequested { request } = next_event(events).await.kind {
+                    break request;
+                }
+            };
+            menus
+                .refresh_permissions(
+                    agent,
+                    console,
+                    Some(chat),
+                    &HashMap::from([(
+                        request.id,
+                        crate::terminal::PermissionRequestOwner::new(chat.into(), &request),
+                    )]),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            request.id
+        }
+        async fn finished(
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_harness::protocol::Event>,
+        ) -> EventKind {
+            loop {
+                let kind = next_event(events).await.kind;
+                if matches!(kind, EventKind::Completed { .. } | EventKind::Interrupted) {
+                    return kind;
+                }
+            }
+        }
+
+        agent.submit(chat, "Plan it".into()).await.unwrap();
+        let request = show_request(&agent, &console, &mut menus, chat, &mut events).await;
+        {
+            let mut state = console.state.lock().unwrap();
+            let menu = state.menu.as_ref().unwrap();
+            assert_eq!(menu.title, "Exit plan mode?");
+            assert_eq!(menu.options, ["Yes", "No"]);
+            let frame = state.frame().0.join("\n");
+            assert!(
+                frame.contains("The Agent wants to exit plan mode"),
+                "{frame}"
+            );
+            assert!(matches!(
+                state.key(key(KeyCode::Esc)),
+                Some(InputEvent::Cancel { menu_id }) if menu_id == request
+            ));
+        }
+        menus
+            .choose(&agent, &console, request, None, None)
+            .await
+            .unwrap();
+        console.state.lock().unwrap().release_finished_submissions();
+        assert!(matches!(
+            finished(&mut events).await,
+            EventKind::Interrupted
+        ));
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Plan
+        );
+
+        agent.submit(chat, "Never mind".into()).await.unwrap();
+        let request = show_request(&agent, &console, &mut menus, chat, &mut events).await;
+        let choice = console.state.lock().unwrap().key(key(KeyCode::Enter));
+        let Some(InputEvent::Choice {
+            menu_id,
+            index,
+            comment,
+        }) = choice
+        else {
+            panic!("Enter must confirm the dialog: {choice:?}");
+        };
+        assert_eq!((menu_id, index), (request, 0));
+        menus
+            .choose(&agent, &console, menu_id, Some(index), comment)
+            .await
+            .unwrap();
+        assert!(matches!(
+            finished(&mut events).await,
+            EventKind::Completed { .. }
+        ));
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Auto
+        );
+        agent.shutdown().await;
+    }
+
     #[test]
     fn file_path_input_uses_normal_editing_and_external_editor_without_touching_prompt() {
         let mut state = State::new(true, 80, 24);

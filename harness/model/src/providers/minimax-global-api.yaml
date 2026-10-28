@@ -19,7 +19,21 @@ selection:
       name: "MiniMax"
       model: "MiniMax-M3"
       capability_order: 0
+    - id: "minimax-flash"
+      name: "MiniMax Flash"
+      model: "MiniMax-M3.1-Flash"
+      capability_order: 1
 models:
+  - id: "MiniMax-M3.1-Flash"
+    display_name: "MiniMax-M3.1-Flash"
+    adapter: "minimax_messages"
+    max_output_tokens: 131072
+    context_window_tokens: 1000000
+    thinking: "always_on"
+    adaptive_by_default: true
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
+    temperature_control: "unsupported"
   - id: "MiniMax-M3"
     display_name: "MiniMax-M3"
     adapter: "minimax_messages"

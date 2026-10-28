@@ -1504,6 +1504,7 @@ fn chain_entry(
             _ => None,
         },
         loop_state_note: snapshot.host_notes.get(&index) == Some(&HostNote::LoopState),
+        task_reminder: snapshot.host_notes.get(&index) == Some(&HostNote::TaskReminder),
         date_change: match snapshot.host_notes.get(&index) {
             Some(HostNote::DateChange(date)) => Some(date.clone()),
             _ => None,
@@ -1668,6 +1669,7 @@ fn record_loop(
         plan_mode_exit: false,
         execution_mode_note: None,
         loop_state_note: false,
+        task_reminder: false,
         date_change: None,
         guidance: None,
         execution_mode: None,
@@ -1974,6 +1976,8 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::ExecutionMode(note));
         } else if entry.loop_state_note {
             restored.host_notes.insert(index, HostNote::LoopState);
+        } else if entry.task_reminder {
+            restored.host_notes.insert(index, HostNote::TaskReminder);
         } else if let Some(date) = &entry.date_change {
             restored
                 .host_notes

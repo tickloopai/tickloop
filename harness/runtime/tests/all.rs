@@ -64,6 +64,8 @@ mod model_image_capability;
 mod model_live;
 #[path = "all/model_stream_replay.rs"]
 mod model_stream_replay;
+#[path = "all/prompt_cache_wire.rs"]
+mod prompt_cache_wire;
 
 #[path = "all/output_limit_recovery.rs"]
 mod output_limit_recovery;
@@ -103,3 +105,8 @@ mod environment_approval;
 
 #[path = "all/deferred_plan_tool.rs"]
 mod deferred_plan_tool;
+#[path = "all/plan_reminders.rs"]
+mod plan_reminders;
+
+#[path = "all/sandbox_auto_approval.rs"]
+mod sandbox_auto_approval;

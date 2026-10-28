@@ -7,8 +7,8 @@ use tickloop_code_local_environment::AgentLocalExt;
 use serde_json::json;
 use tickloop_harness::base::network::Reach;
 use tickloop_harness::protocol::{
-    AgentHostOptions, Content, Decision, EventKind, ImageContext, ImageOrigin, InputContext,
-    PermissionRule, PromptPolicy, Role,
+    AgentHostOptions, Content, Decision, EventKind, ExecutionMode, ImageContext, ImageOrigin,
+    InputContext, PermissionRule, PromptPolicy, Role,
 };
 use tickloop_harness::runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::FolderEnvironment,
@@ -586,5 +586,29 @@ async fn folderless_turn_in_child() {
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     agent.flush_transcripts().await;
+    agent.shutdown().await;
+}
+
+/// A Chat without a Folder has no plan file: in Plan it hears Claude Code 2.1.302's reminder
+/// for that case, at the end of the conversation, and its instructions stay unchanged.
+#[tokio::test]
+async fn a_folderless_chat_in_plan_hears_the_reminder_without_a_plan_file() {
+    let model = Arc::new(ScriptedModel::new(vec![text("Before."), text("Planned.")]));
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    run_turn(&agent, chat.uuid(), "Hello").await;
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    run_turn(&agent, chat.uuid(), "Plan a trip").await;
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(system_prompt(&requests[0]), system_prompt(&requests[1]));
+    let notes = tickloop_harness::test_support::host_note_texts(&requests[1]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains(
+        "This session has no plan file. Give your plan to the user as text in your reply"
+    ));
+    assert!(notes[0].contains("### Phase 5: Hand Over To The User"));
     agent.shutdown().await;
 }

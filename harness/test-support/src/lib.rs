@@ -299,6 +299,21 @@ pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
     })
 }
 
+/// The text of every host note in a request's conversation, in order: user-role text wrapped in
+/// `<system-reminder>` tags, other than the user context.
+pub fn host_note_texts(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| is_host_note(message) && !is_user_context(message))
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// How long [`next_event`] waits for the next runtime event.
 const EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 

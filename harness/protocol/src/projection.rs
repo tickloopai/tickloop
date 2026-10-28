@@ -123,6 +123,7 @@ impl ChatSnapshot {
                 | HostNote::PlanModeExit
                 | HostNote::ExecutionMode(_)
                 | HostNote::LoopState
+                | HostNote::TaskReminder
                 | HostNote::DateChange(_) => {}
             }
         }

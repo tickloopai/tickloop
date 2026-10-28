@@ -381,7 +381,7 @@ pub fn serialized_context_bytes(messages: &[Message], tools: &[ToolDefinition]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RequestOwner;
+    use crate::{Protocol, RequestOwner};
     use serde_json::json;
 
     /// Counts whitespace-separated words, so expected totals are easy to read.
@@ -486,6 +486,47 @@ mod tests {
             (100u64 + 13) * 150 / 100 + 1,
             "the 13 appended tokens are scaled like the request they follow"
         );
+    }
+
+    /// Messages reports the input it read from and wrote to the prompt cache apart from
+    /// `input_tokens`; the other protocols count cached input within it.
+    #[test]
+    fn the_context_counts_cached_input_in_each_protocols_terms() {
+        for (protocol, expected) in [
+            (Protocol::Messages, 10 + 900 + 90),
+            (Protocol::Responses, 10),
+        ] {
+            let mut snapshot = chat(&["one two three"]);
+            snapshot.model.protocol = protocol;
+            let sequence = start(&mut snapshot);
+            let measurement =
+                ContextMeasurement::capture(&snapshot, 4_000, 3_000).with_tokens(100, 40);
+            snapshot
+                .request_usage
+                .record_context_measurement(sequence, measurement)
+                .unwrap();
+            snapshot
+                .request_usage
+                .observe(
+                    sequence,
+                    Usage {
+                        input_tokens: Some(10),
+                        cache_read_input_tokens: Some(900),
+                        cache_write_input_tokens: Some(90),
+                        ..Usage::default()
+                    },
+                )
+                .unwrap();
+            snapshot
+                .request_usage
+                .finish(sequence, RequestOutcome::Accepted)
+                .unwrap();
+            assert_eq!(
+                counted(&snapshot, Some(&WordCounter)),
+                expected,
+                "{protocol:?}"
+            );
+        }
     }
 
     #[test]

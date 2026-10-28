@@ -105,17 +105,36 @@ fn a_report_of_the_goal_adds_its_remaining_budget() {
     assert!(goal_report(&unbudgeted).get("tokens_remaining").is_none());
 }
 
+/// Messages reports cache writes apart from `input_tokens` and they are fresh input; the other
+/// protocols count cached input within `input_tokens`.
 #[test]
 fn only_fresh_input_and_output_are_charged() {
-    assert_eq!(
-        charged_tokens(&Usage {
-            input_tokens: Some(100),
-            output_tokens: Some(20),
-            cache_read_input_tokens: Some(5_000),
-            cache_write_input_tokens: Some(300),
-        }),
-        120
-    );
+    let charged = |protocol| {
+        charged_tokens(&tickloop_harness_protocol::RequestUsageRecord {
+            sequence: tickloop_harness_protocol::RequestSequence(1),
+            chat_id: tickloop_ids::generate().into(),
+            loop_id: None,
+            run_id: None,
+            kind: tickloop_harness_protocol::ModelRequestKind::Conversation,
+            model: tickloop_harness_protocol::ModelIdentity {
+                provider: tickloop_harness_protocol::ModelProvider::Api,
+                profile: "fixture".into(),
+                protocol,
+                requested_model: "fixture".into(),
+            },
+            outcome: tickloop_harness_protocol::RequestOutcome::Accepted,
+            usage: tickloop_harness_protocol::Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cache_read_input_tokens: Some(5_000),
+                cache_write_input_tokens: Some(300),
+            },
+            serialized_request_bytes: None,
+            context_measurement: None,
+        })
+    };
+    assert_eq!(charged(tickloop_harness_protocol::Protocol::Messages), 420);
+    assert_eq!(charged(tickloop_harness_protocol::Protocol::Responses), 120);
 }
 
 /// A planned upgrade can take its checkpoint between a turn's end and the goal's continuation,

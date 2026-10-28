@@ -40,6 +40,13 @@ const MONITOR_LISTING_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Grants spawns of commands a Chat approved, and views of the commands it started.
 #[async_trait::async_trait]
 pub trait ShellGrants: Send + Sync {
+    async fn sandbox_proxy_port(&self, _chat: Uuid) -> Result<u16, HostError> {
+        Err(HostError::before(
+            "Unsupported",
+            "sandbox networking is unavailable",
+        ))
+    }
+
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -56,6 +63,14 @@ pub trait ShellGrants: Send + Sync {
 
 #[async_trait::async_trait]
 impl ShellGrants for DaemonControl {
+    async fn sandbox_proxy_port(&self, chat: Uuid) -> Result<u16, HostError> {
+        serde_json::from_value(
+            self.request(WorkerRequest::SandboxProxyPort { chat })
+                .await?,
+        )
+        .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+    }
+
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -217,6 +232,10 @@ impl OwnTickhost {
 
 #[async_trait::async_trait]
 impl ShellGrants for OwnTickhost {
+    async fn sandbox_proxy_port(&self, _: Uuid) -> Result<u16, HostError> {
+        self.controller().await?.sandbox_proxy_port().await
+    }
+
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -263,6 +282,15 @@ pub struct ShellTasks {
 }
 
 impl ShellTasks {
+    pub(crate) async fn sandbox_proxy_port(&self, chat: Uuid) -> Result<u16, HostError> {
+        let grants = self
+            .grants
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        grants.sandbox_proxy_port(chat).await
+    }
+
     pub(crate) fn has_grants(&self) -> bool {
         self.available.load(std::sync::atomic::Ordering::SeqCst)
     }

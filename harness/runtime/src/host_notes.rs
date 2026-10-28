@@ -2,15 +2,15 @@
 //! conversation and checkpointed so a resumed Chat does not announce it again. The host tool set
 //! can change between requests (an Artifact sign-in, a resumed Chat in a newer host) while history
 //! still claims the old set; the system prompt never names the execution mode, so a change of it
-//! reaches the model as a note; and invoked Skills and MCP server instructions guide the rest of
-//! the Chat from where they first apply.
+//! reaches the model as a note; the task tools get an occasional reminder; and invoked Skills
+//! and MCP server instructions guide the rest of the Chat from where they first apply.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 use tickloop_harness_protocol::{
     ChatSnapshot, Content, ExecutionMode, ExecutionModeNote, GuidanceNote, HostNote, InvokedSkill,
-    Message, Receipt, Role, SkillSource,
+    Message, Receipt, Role, SharedTask, SkillSource,
 };
 
 use crate::{Agent, AgentError, Chat, host_tools::McpServerInstructions};
@@ -137,6 +137,7 @@ impl Agent {
                 chat.snapshot.delegation.is_some(),
                 current.plan_file.as_deref(),
                 pending != PendingModeNote::PlanReminder { is_full: false },
+                self.inner.tool_policy.delegation,
             ),
             ExecutionMode::Auto => AUTO_MODE_NOTE.into(),
             ExecutionMode::AcceptEdits => ASK_MODE_NOTE.into(),
@@ -244,6 +245,35 @@ fn pending_mode_note(
 }
 
 impl Agent {
+    /// Claude Code's `task_reminder` attachment, for a Chat with its task tools enabled: once ten
+    /// replies passed since the model last created or updated a task and since the last such
+    /// reminder, a note nudges it toward the task list and shows the current tasks.
+    pub(super) async fn announce_task_reminder(&self, receipt: &Receipt) -> Result<(), AgentError> {
+        let (snapshot, bookkeeping) = {
+            let mut chats = self.inner.chats.lock().await;
+            if chats
+                .get(&receipt.chat_id)
+                .is_none_or(|chat| chat.active_run != Some(receipt.run_id))
+            {
+                return Ok(());
+            }
+            let chat = &chats[&receipt.chat_id];
+            if !chat.snapshot.task_tools_enabled || !is_task_reminder_due(&chat.snapshot) {
+                return Ok(());
+            }
+            let tasks = crate::shared_tasks::view(&chats, receipt.chat_id)
+                .map(|board| board.tasks)
+                .unwrap_or_default();
+            let text = task_reminder_text(&chat.ids, &tasks);
+            let chat = chats.get_mut(&receipt.chat_id).unwrap();
+            append_note(&mut chat.snapshot, receipt, text, HostNote::TaskReminder);
+            (chat.snapshot.clone(), chat.bookkeeping.clone())
+        };
+        self.checkpoint_transcript(&snapshot, &bookkeeping)
+            .await
+            .map_err(AgentError::Storage)
+    }
+
     /// Writes the guidance in effect that the model cannot see yet, after the history it already
     /// has: Claude Code keeps a Skill's guidance where its call put it and announces MCP server
     /// instructions as `mcp_instructions_delta` attachments, so every later request resends the
@@ -280,6 +310,79 @@ impl Agent {
             .await
             .map_err(AgentError::Storage)
     }
+}
+
+/// Claude Code 2.1.302's `TURNS_SINCE_WRITE` and `TURNS_BETWEEN_REMINDERS` for task reminders.
+const REPLIES_SINCE_TASK_WRITE: usize = 10;
+const REPLIES_BETWEEN_TASK_REMINDERS: usize = 10;
+const TASK_WRITE_TOOLS: [&str; 2] = ["TaskCreate", "TaskUpdate"];
+
+/// Claude Code 2.1.302's task reminder condition over the conversation the model sees: at least
+/// ten replies since the last reply creating or updating a task, directly or inside a tool
+/// batch, and at least ten since the last task reminder.
+fn is_task_reminder_due(snapshot: &ChatSnapshot) -> bool {
+    let start = snapshot.active_start();
+    let mut replies_since_write = None;
+    let mut replies_since_reminder = None;
+    let mut replies = 0;
+    for index in (start..snapshot.messages.len()).rev() {
+        if replies_since_reminder.is_none()
+            && snapshot.host_notes.get(&index) == Some(&HostNote::TaskReminder)
+        {
+            replies_since_reminder = Some(replies);
+        }
+        let message = &snapshot.messages[index];
+        if message.role == Role::Assistant {
+            if replies_since_write.is_none() && writes_tasks(message) {
+                replies_since_write = Some(replies);
+            }
+            replies += 1;
+        }
+        if replies_since_write.is_some() && replies_since_reminder.is_some() {
+            break;
+        }
+    }
+    replies_since_write.unwrap_or(replies) >= REPLIES_SINCE_TASK_WRITE
+        && replies_since_reminder.unwrap_or(replies) >= REPLIES_BETWEEN_TASK_REMINDERS
+}
+
+fn writes_tasks(message: &Message) -> bool {
+    message.content.iter().any(|content| match content {
+        Content::ToolUse { name, input, .. } if name == crate::tool_exposure::EXECUTE_TOOLS => {
+            input["calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["name"]
+                        .as_str()
+                        .is_some_and(|name| TASK_WRITE_TOOLS.contains(&name))
+                })
+            })
+        }
+        Content::ToolUse { name, .. } => TASK_WRITE_TOOLS.contains(&name.as_str()),
+        _ => false,
+    })
+}
+
+/// Claude Code 2.1.302's `task_reminder` text with Tickloop's task actions, followed by the
+/// current tasks as `#id. [status] title`.
+fn task_reminder_text(ids: &tickloop_ids::IdContext, tasks: &[SharedTask]) -> String {
+    let mut text = String::from(
+        "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (claim a task when starting it, complete it when done). Also consider cleaning up the task list if it has become stale. Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable.",
+    );
+    if !tasks.is_empty() {
+        let list = tasks
+            .iter()
+            .map(|task| {
+                let status = serde_json::to_value(task.status)
+                    .ok()
+                    .and_then(|status| status.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                format!("#{}. [{status}] {}", ids.model_text(task.id), task.title)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push_str(&format!("\n\nHere are the existing tasks:\n\n{list}"));
+    }
+    text
 }
 
 /// Appends the notes that bring the guidance the model sees up to the guidance in effect, and

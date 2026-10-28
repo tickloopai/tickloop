@@ -435,23 +435,54 @@ impl HostController {
         };
         let grant: SpawnGrant = serde_json::from_value(granted)
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?;
+        self.hold_shell_host(grant.epoch).await?;
+        Ok(grant)
+    }
+
+    pub async fn sandbox_proxy_port(&self) -> Result<u16, HostError> {
+        #[derive(serde::Deserialize)]
+        struct Endpoint {
+            port: u16,
+            epoch: Uuid,
+        }
+        let endpoint: Endpoint = serde_json::from_value(
+            self.request(
+                "sandbox_proxy_port",
+                json!({}),
+                CONTROL_TIMEOUT,
+                Start::OnDemand,
+            )
+            .await?,
+        )
+        .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?;
+        if endpoint.port == 0 {
+            return Err(HostError::after(
+                "ProtocolViolation",
+                "invalid sandbox proxy port",
+            ));
+        }
+        self.hold_shell_host(endpoint.epoch).await?;
+        Ok(endpoint.port)
+    }
+
+    async fn hold_shell_host(&self, epoch: Uuid) -> Result<(), HostError> {
         let mut lifeline = self.lifeline.lock().await;
         if lifeline
             .as_ref()
-            .is_none_or(|connection| connection.epoch() != grant.epoch)
+            .is_none_or(|connection| connection.epoch() != epoch)
         {
             let key = std::fs::read_to_string(&self.key_file)
                 .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
             let connection = self.connect(key.trim()).await?;
-            if connection.epoch() != grant.epoch {
+            if connection.epoch() != epoch {
                 return Err(HostError::before(
                     "EpochChanged",
-                    "another Tickhost started while the spawn was granted",
+                    "another Tickhost started while preparing a Shell",
                 ));
             }
             *lifeline = Some(connection);
         }
-        Ok(grant)
+        Ok(())
     }
 
     /// Lets one view attach to `owner`'s Tick `instance` on the running host. The grant works

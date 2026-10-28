@@ -4,11 +4,14 @@ use serde_json::{Value, json};
 use tickloop_harness_model::{
     LocalModelClients, ModelClients, ModelConfigExt, ModelFailureKind, ModelRequest,
     ModelRequestContext, StructuredOutput,
+    access::AccessCatalog,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::save_api_key,
+    validate_reasoning_effort,
 };
 use tickloop_harness_protocol::{
-    Content, ImageMediaType, ImageSource, Message, ReasoningEffort, Role,
+    Adapter, Content, ImageMediaType, ImageSource, InputModality, Message, ReasoningEffort, Role,
+    TemperatureControl, ThinkingControl, ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +57,86 @@ fn kimi_for_coding_has_a_verified_context_window() {
         .get("kimi-code-oauth", "kimi-for-coding")
         .unwrap();
     assert_eq!(model.maximum_context_window_tokens(), Some(1_048_576));
+}
+
+#[test]
+fn kimi_k31_pro_series_preserve_older_cards_code_and_oauth_defaults() {
+    let catalog = ModelCatalog::defaults();
+    let access = AccessCatalog::defaults();
+    catalog.validate().unwrap();
+    access.validate(&catalog).unwrap();
+    let visible = built_in_model_profiles();
+    for provider in ["kimi-cn-api", "kimi-global-api"] {
+        let selection = access.provider(provider).unwrap();
+        assert_eq!(selection.auxiliary_model.as_deref(), Some("kimi-k3"));
+        assert_eq!(selection.series.len(), 3);
+        assert_eq!(access.recommended_model(provider), Some("kimi-k3.1-pro"));
+        for (model, series_id) in [
+            ("kimi-k3.1-pro", "kimi"),
+            ("kimi-k3.1-pro-highspeed", "kimi-highspeed"),
+        ] {
+            let config = catalog.get(provider, model).unwrap();
+            assert_eq!(config.model, model);
+            assert!(visible.contains(&config));
+            assert_eq!(access.series_for(&config).unwrap().id, series_id);
+            assert_eq!(config.maximum_context_window_tokens(), Some(1_048_576));
+            assert_eq!(config.max_output_tokens, 131_072);
+            let card = config.card.as_ref().unwrap();
+            assert_eq!(card.adapter, Adapter::KimiChatCompletions);
+            assert_eq!(card.thinking, ThinkingControl::AlwaysOn);
+            assert_eq!(
+                card.effort_levels,
+                [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max
+                ]
+            );
+            assert_eq!(
+                card.input_modalities,
+                [InputModality::Text, InputModality::Image]
+            );
+            assert_eq!(
+                card.temperature_control,
+                Some(Some(TemperatureControl::Unsupported))
+            );
+            assert!(validate_reasoning_effort(&config, None).is_ok());
+            for effort in [
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ] {
+                assert!(validate_reasoning_effort(&config, Some(effort)).is_ok());
+            }
+            for effort in [
+                ReasoningEffort::Off,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Xhigh,
+            ] {
+                assert!(validate_reasoning_effort(&config, Some(effort)).is_err());
+            }
+        }
+        let retained = catalog.get(provider, "kimi-k3").unwrap();
+        assert_eq!(retained.model, "kimi-k3");
+        assert_eq!(retained.maximum_context_window_tokens(), Some(1_048_576));
+        assert_eq!(retained.max_output_tokens, 131_072);
+        assert!(access.series_for(&retained).is_none());
+        assert!(!visible.contains(&retained));
+        let code = catalog.get(provider, "kimi-k2.7-code").unwrap();
+        assert_eq!(access.series_for(&code).unwrap().id, "kimi-code");
+        assert!(visible.contains(&code));
+        assert_eq!(code.maximum_context_window_tokens(), Some(262_144));
+        assert_eq!(code.max_output_tokens, 32_768);
+    }
+    assert_eq!(access.recommended_model("kimi-code-oauth"), Some("k3"));
+    assert_eq!(
+        access
+            .provider("kimi-code-oauth")
+            .unwrap()
+            .auxiliary_model
+            .as_deref(),
+        Some("k3-256k")
+    );
 }
 
 #[test]
@@ -203,6 +286,166 @@ async fn kimi_uses_completion_budget_preserved_thought_and_stable_cache_key() {
         second.1["messages"][1]["reasoning_content"],
         "private reasoning"
     );
+}
+
+#[tokio::test]
+async fn kimi_k31_pro_variants_preserve_wire_efforts_images_cache_and_tool_reasoning() {
+    for provider in ["kimi-cn-api", "kimi-global-api"] {
+        for model in ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"] {
+            for effort in [
+                None,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Max),
+            ] {
+                let root =
+                    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+                let responses = vec![
+                    (
+                        200,
+                        chat_reply(
+                            json!({"reasoning_content":"private reasoning","tool_calls":[{"index":0,"id":"echo-1","type":"function","function":{"name":"Echo","arguments":"{}"}}]}),
+                            "tool_calls",
+                        ),
+                    ),
+                    (200, chat_reply(json!({"content":"done"}), "stop")),
+                ];
+                let (endpoint, mut captured) = model_http_support::serve_responses(responses).await;
+                let mut config = ModelCatalog::defaults().get(provider, model).unwrap();
+                config.base_url = endpoint;
+                save_api_key(root.path(), &config.api_key_env, "test-kimi-key").unwrap();
+                let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+                    .client(&config)
+                    .unwrap();
+                let mut next = request(effort);
+                next.messages[0].content.push(Content::Image {
+                    source: ImageSource::Base64 {
+                        media_type: ImageMediaType::Png,
+                        data: "image".into(),
+                    },
+                    width: 1,
+                    height: 1,
+                });
+                next.tools.push(ToolDefinition {
+                    name: "Echo".into(),
+                    description: "Inert fixture".into(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                });
+                let (events, _) = mpsc::unbounded_channel();
+                let first = client
+                    .complete(next.clone(), events.clone(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert_eq!(first.stop_reason, "tool_use");
+                assert_eq!(first.usage.cache_read_input_tokens, Some(50));
+                assert_eq!(first.usage.cache_write_input_tokens, Some(10));
+                assert!(first.content.iter().any(
+                    |content| matches!(content, Content::ToolUse { id, name, input } if id == "echo-1" && name == "Echo" && input == &json!({}))
+                ));
+                next.messages.push(Message {
+                    role: Role::Assistant,
+                    content: first.content,
+                });
+                next.history_sources.push(first.private_source);
+                next.messages.push(Message {
+                    role: Role::User,
+                    content: vec![Content::ToolResult {
+                        tool_use_id: "echo-1".into(),
+                        content: "done".into(),
+                        is_error: false,
+                    }],
+                });
+                next.history_sources.push(None);
+                let output = client
+                    .complete(next, events, CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    output.content,
+                    vec![Content::Text {
+                        text: "done".into()
+                    }]
+                );
+                let (headers, first) = captured.recv().await.unwrap();
+                let (_, second) = captured.recv().await.unwrap();
+                assert!(headers.starts_with("POST /anthropic/chat/completions "));
+                assert!(
+                    headers
+                        .to_lowercase()
+                        .contains("authorization: bearer test-kimi-key")
+                );
+                for body in [&first, &second] {
+                    assert_eq!(body["model"], model);
+                    assert_eq!(body["max_completion_tokens"], 131_072);
+                    for field in ["max_tokens", "temperature", "thinking"] {
+                        assert!(
+                            body.get(field).is_none(),
+                            "{provider}/{model}: {field}: {body}"
+                        );
+                    }
+                    assert_eq!(
+                        body.get("reasoning_effort"),
+                        effort.map(|effort| json!(effort.label())).as_ref()
+                    );
+                    assert_eq!(body["tools"][0]["function"]["name"], "Echo");
+                    assert_eq!(
+                        body["messages"][0]["content"][1],
+                        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,image"}})
+                    );
+                }
+                assert!(
+                    first["prompt_cache_key"]
+                        .as_str()
+                        .is_some_and(|key| !key.is_empty())
+                );
+                assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+                assert_eq!(
+                    second["messages"][1]["reasoning_content"],
+                    "private reasoning"
+                );
+                assert_eq!(second["messages"][1]["tool_calls"][0]["id"], "echo-1");
+                assert_eq!(second["messages"][2]["role"], "tool");
+                assert_eq!(second["messages"][2]["tool_call_id"], "echo-1");
+                assert_eq!(second["messages"][2]["content"], "done");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn kimi_k31_pro_variants_encode_structured_output_without_sampling() {
+    for provider in ["kimi-cn-api", "kimi-global-api"] {
+        for model in ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"] {
+            let root = tempfile::tempdir().unwrap();
+            let (endpoint, captured) = model_http_support::serve_response(
+                200,
+                chat_reply(json!({"content":"{\"allow\":false}"}), "stop"),
+            )
+            .await;
+            let mut config = ModelCatalog::defaults().get(provider, model).unwrap();
+            config.base_url = endpoint;
+            save_api_key(root.path(), &config.api_key_env, "test-kimi-key").unwrap();
+            let mut input = request(Some(ReasoningEffort::Low));
+            input.structured_output = Some(StructuredOutput {
+                name: "verdict".into(),
+                schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"],"additionalProperties":false}),
+            });
+            let (events, _) = mpsc::unbounded_channel();
+            LocalModelClients::new(Some(root.path().to_path_buf()))
+                .client(&config)
+                .unwrap()
+                .complete(input, events, CancellationToken::new())
+                .await
+                .unwrap();
+            let (_, body) = captured.await.unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["max_completion_tokens"], 131_072);
+            assert_eq!(body["response_format"]["type"], "json_schema");
+            assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("max_tokens").is_none());
+        }
+    }
 }
 
 #[tokio::test]

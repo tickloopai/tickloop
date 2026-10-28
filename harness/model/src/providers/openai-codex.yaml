@@ -23,7 +23,7 @@ selection:
       capability_order: 0
     - id: "terra"
       name: "GPT Terra"
-      model: "gpt-5.6-terra"
+      model: "gpt-6.1-terra"
       capability_order: 2
     - id: "luna"
       name: "GPT Luna"
@@ -50,7 +50,7 @@ models:
     display_name: "GPT-5.6 Sol"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "toggle"
     adaptive_by_default: false
     effort_levels:
@@ -62,11 +62,19 @@ models:
     input_modalities:
       - "text"
       - "image"
+  - id: "gpt-6.1-terra"
+    display_name: "GPT-6.1 Terra"
+    adapter: "codex_responses"
+    max_output_tokens: 128000
+    context_window_tokens: 872000
+    thinking: "toggle"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
   - id: "gpt-5.6-terra"
     display_name: "GPT-5.6 Terra"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "toggle"
     adaptive_by_default: false
     effort_levels:
@@ -82,7 +90,7 @@ models:
     display_name: "GPT-5.6 Luna"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "toggle"
     adaptive_by_default: false
     effort_levels:
@@ -98,7 +106,7 @@ models:
     display_name: "GPT-6 Astra"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "always_on"
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
@@ -107,7 +115,7 @@ models:
     display_name: "GPT-6.1 Sol"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "always_on"
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
@@ -115,7 +123,7 @@ models:
     display_name: "GPT-6 Luna"
     adapter: "codex_responses"
     max_output_tokens: 128000
-    context_window_tokens: 272000
+    context_window_tokens: 872000
     thinking: "toggle"
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]

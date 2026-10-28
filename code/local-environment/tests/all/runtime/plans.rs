@@ -178,10 +178,10 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
     for expected in [
         "Plan mode is active.",
         "No plan file exists yet. You should create your plan at",
-        "This is the only filesystem file you may edit.",
+        "NOTE that this is the only file you are allowed to edit",
         "ArtifactEdit may create or revise an Artifact while staying in Plan mode.",
         "The host handles the first-publication confirmation",
-        "Calling ExitPlanMode when the plan is ready for approval",
+        "### Phase 5: Call ExitPlanMode",
     ] {
         assert!(planning.contains(expected), "{expected}\n{planning}");
     }
@@ -246,10 +246,19 @@ async fn plan_mode_admits_writes_only_to_the_current_plan_file() {
         let result = result_of(&results, call_id);
         assert!(!result.is_error, "{call_id}: {}", result.content);
     }
-    for call_id in ["other-write", "shell"] {
-        assert!(result_of(&results, call_id).is_error, "{call_id}");
-    }
     let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
+    for call_id in ["other-write", "shell"] {
+        let refused = result_of(&results, call_id);
+        assert!(refused.is_error, "{call_id}");
+        assert!(
+            refused.content.starts_with("Plan mode is active.")
+                && refused.content.contains(&format!(
+                    "write your plan to {plan_file}, and call ExitPlanMode"
+                )),
+            "{call_id}: {}",
+            refused.content
+        );
+    }
     assert_eq!(std::fs::read_to_string(plan_file).unwrap(), "Final plan.");
     assert!(!directory.path().join("notes.txt").exists());
     assert!(!directory.path().join("touched.txt").exists());
@@ -263,9 +272,6 @@ async fn exit_plan_mode_submits_the_written_plan_file_for_approval() {
     let root = directory.path().join("root");
     let markdown = "1. Read the notes.\n2. Draft the report.";
     let model = Arc::new(ScriptedModel::new(vec![
-        exit_plan_mode("missing"),
-        write_plan("empty-write", ""),
-        exit_plan_mode("empty"),
         write_plan("plan-write", markdown),
         call(
             "submit",
@@ -279,24 +285,7 @@ async fn exit_plan_mode_submits_the_written_plan_file_for_approval() {
     enter_plan_mode(&agent, chat).await;
     let mut events = agent.subscribe();
     let results = run_turn_results(&agent, chat, "Plan the report").await;
-    let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
 
-    let missing = result_of(&results, "missing");
-    assert!(missing.is_error);
-    assert_eq!(
-        missing.content,
-        format!(
-            "No plan file found at {plan_file}. Please write your plan to this file before calling ExitPlanMode."
-        )
-    );
-    let empty = result_of(&results, "empty");
-    assert!(empty.is_error);
-    assert_eq!(
-        empty.content,
-        format!(
-            "The plan file at {plan_file} is empty. Please write your plan to this file before calling ExitPlanMode."
-        )
-    );
     let submitted = result_of(&results, "submit");
     assert!(submitted.is_error);
     assert!(
@@ -365,7 +354,7 @@ async fn approving_a_plan_returns_claude_codes_approval_and_the_plan_file_to_the
     assert_eq!(
         result.content,
         format!(
-            "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
+            "User has approved your plan. You can now start coding.\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
         )
     );
     agent.shutdown().await;
@@ -439,7 +428,7 @@ async fn a_plan_the_user_edits_in_review_is_approved_as_a_new_user_edited_versio
     assert_eq!(
         result.content,
         format!(
-            "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep commits small."
+            "User has approved your plan. You can now start coding.\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep commits small."
         )
     );
     agent.shutdown().await;
@@ -461,7 +450,7 @@ async fn exit_plan_mode_outside_plan_mode_explains_that_no_plan_is_being_made() 
     assert!(result.is_error);
     assert_eq!(
         result.content,
-        "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation."
+        "You are not in plan mode. To enter plan mode, call the EnterPlanMode tool first. If your plan was already approved, continue with implementation."
     );
     assert!(agent.snapshot(chat).await.unwrap().plans.is_empty());
     agent.shutdown().await;

@@ -773,7 +773,7 @@ fn host_tool_decision(
         let mode = match (execution_mode, mode_before_plan) {
             (ExecutionMode::Plan, Some(ExecutionMode::FullAccess)) => ExecutionMode::FullAccess,
             (ExecutionMode::Plan, _) if policy.uses_auto_admission() => ExecutionMode::Auto,
-            (ExecutionMode::Plan, _) => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
+            (ExecutionMode::Plan, _) => ExecutionMode::Plan.leaving_plan(mode_before_plan),
             (mode, _) => mode,
         };
         return match (configured, mode) {
@@ -1091,6 +1091,7 @@ fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> Ch
         scheduled_tasks: Vec::new(),
         scheduled_task_revocations: Vec::new(),
         task_board: None,
+        mode_before_plan: None,
         goal: None,
         goal_history: Vec::new(),
         family_inputs: BTreeMap::new(),
@@ -3190,6 +3191,9 @@ impl Agent {
         let timing = timing::Phase::new("announce_execution_mode");
         Box::pin(self.announce_execution_mode(receipt)).await?;
         drop(timing);
+        let timing = timing::Phase::new("announce_task_reminder");
+        Box::pin(self.announce_task_reminder(receipt)).await?;
+        drop(timing);
         // Only a Chat with a Folder probes the host it runs in.
         let workspace_host = self
             .inner
@@ -5032,6 +5036,10 @@ impl Agent {
                 chat.snapshot.permissions.iter().any(|request| {
                     request.id == request_id
                         && request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME
+                        && !tickloop_harness_tools::exits_plan_mode_without_plan(
+                            &request.name,
+                            &request.input,
+                        )
                 })
             }) {
                 return Err(AgentError::Invalid(
@@ -5201,6 +5209,7 @@ impl Agent {
             .cloned()
             .collect();
         snapshot.task_board = shared_tasks::view(&chats, chat_id);
+        snapshot.mode_before_plan = chats[&chat_id].mode_before_plan;
         snapshot.trigger_origins = chats[&chat_id].bookkeeping.lifecycle.trigger_origins();
         snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(snapshot)

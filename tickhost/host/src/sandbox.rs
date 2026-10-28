@@ -5,6 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod network;
+pub(crate) use network::{NetworkProxy, NetworkSession};
+
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DENIAL_SCAN_BYTES: u64 = 64 * 1024;
 pub const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
@@ -30,6 +33,10 @@ pub struct ProtectedPathPattern {
 #[serde(rename_all = "snake_case")]
 pub enum SandboxNetwork {
     Disconnected,
+    Allowlist {
+        allowed_domains: Vec<String>,
+        proxy_port: u16,
+    },
 }
 
 pub async fn availability() -> Result<(), String> {
@@ -82,8 +89,11 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
     let mut profile = include_str!("sandbox_base.sbpl").to_owned();
     // F_MAKECOMPRESSED (80) and F_TRANSFEREXTENTS (110) can mutate through read-only descriptors.
     profile.push_str("\n(allow file-read*)\n(deny system-fcntl (fcntl-command 80 110))\n");
-    match policy.network {
+    match &policy.network {
         SandboxNetwork::Disconnected => profile.push_str("(deny network*)\n"),
+        SandboxNetwork::Allowlist { proxy_port, .. } => profile.push_str(&format!(
+            "(allow network-outbound (remote tcp4 \"localhost:{proxy_port}\"))\n"
+        )),
     }
     for root in &policy.writable_roots {
         let path = quote_path(root)?;

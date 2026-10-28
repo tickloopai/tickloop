@@ -837,6 +837,7 @@ mod tests {
             request_details: None,
             outcome,
             path: ApprovalPath::Direct,
+            direct_reason: None,
             denial_category: None,
             approval_source: None,
             reason: "Operation allowed".into(),

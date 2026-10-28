@@ -153,12 +153,23 @@ impl LocalShells {
     pub async fn prepare(
         self: &Arc<Self>,
         port: Uuid,
+        chat: ChatId,
         authority: &ExecutionAuthority,
         mut spec: ShellSpec,
         staged: Option<ShellLaunch>,
     ) -> Result<PreparedExecution, ExecutionError> {
         let settings = self.sandbox.read().unwrap().clone();
-        let sandbox = super::sandbox::prepare(settings.as_ref(), &spec).await?;
+        let mut sandbox = super::sandbox::prepare(settings.as_ref(), &spec).await?;
+        if let Some(policy) = &mut sandbox.policy
+            && let tickhost::sandbox::SandboxNetwork::Allowlist { proxy_port, .. } =
+                &mut policy.network
+        {
+            *proxy_port = self
+                .tasks
+                .sandbox_proxy_port(chat.into())
+                .await
+                .map_err(|error| ExecutionError::new(error.code, error.message))?;
+        }
         let shell = Path::new(&spec.shell).canonicalize().map_err(io_error)?;
         let cwd = Path::new(&spec.cwd).canonicalize().map_err(io_error)?;
         let output_path = if Path::new(&spec.output).is_absolute() {
@@ -256,7 +267,8 @@ impl LocalShells {
         );
         let prepared = prepared
             .with_isolation(sandbox.isolation)
-            .with_required_approval(sandbox.requires_approval);
+            .with_required_approval(sandbox.requires_approval)
+            .with_approval_skipped_when_isolated(sandbox.skips_approval_when_isolated);
         let preparation = prepared.preparation();
         let prepared = prepared.with_cleanup(move || {
             if let Some(owner) = owner.upgrade() {

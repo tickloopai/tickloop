@@ -4819,7 +4819,8 @@ async fn interact_with_herdr(
                         // The terminal UI asks in its request dialog, outside the conversation.
                         EventKind::PermissionRequested {request} if !interactive => {
                             event_frame.take();
-                            if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id.into()).await?)?;}
+                            if tickloop_harness::tools::exits_plan_mode_without_plan(&request.name, &request.input) {outln!(console, "\nExit plan mode? Request: {}\nThe Agent wants to exit plan mode.\nUse /allow {0} to exit plan mode or /deny {0} to stay in plan mode.", shown_id(request.id));}
+                            else if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id.into()).await?)?;}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {0} to enter plan mode or /deny {0} to stay in the current mode.", shown_id(request.id));}
                             else {outln!(console, "\nPermission request: {0} · {1}\nOperation: {2}\nUse /allow {0} [once|session|persistent] or /deny {0}.", shown_id(request.id), safe_text(&request.name), safe_text(&request.input.to_string()));}
                         },

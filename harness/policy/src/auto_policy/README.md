@@ -21,7 +21,6 @@ The mapping is verified by config tests and a Jev test double; test-double resul
 - Instruction Poisoning
 - Auto-Mode Bypass
 - Session Transcript Tampering
-- Sandbox Network Callback
 
 The entries above replace only the actual product interfaces, sources or scope; Artifact account roles and collaboration permissions are still enforced by the original host.
 Tick cleanup must match a trusted creation credential from the same Loop and instance. Automatic triggers and Agent messages do not create new human authorization.
@@ -76,6 +75,17 @@ CreateGoal or UpdateGoal; no separate subagent mapping is needed, and delegation
 For a stateless host's durable Chat, host rules directly admit tools such as CronCreate, CronUpdate, CronDelete and ScheduleWakeup
 without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harness.rs`.
 
+## Sandbox Network Callback
+
+This native entry is remapped to Tickhost's deterministic HTTP/HTTPS CONNECT proxy.
+The user's `sandbox.network.allowedDomains` is frozen with each prepared Shell and its
+single-use spawn authorization. Only matching destinations are reachable through that
+Shell's authenticated route through the Tickhost's lifetime-bound loopback proxy; direct network access remains blocked. A denied domain is
+reported in the Shell output. The proxy neither asks a model nor grants a new domain;
+only the user can change the allowlist in their settings. The proxy checks a random per-Tickhost token and a private per-Shell routing identity; a Shell's route is revoked at exit without releasing the listener. Detached descendants surviving a Tickhost restart retain the old OS port permission, as documented in the README sandbox limitation. There is no model-callable
+SandboxNetworkAccess tool, and this mapping adds no policy rule. Existing permission
+rules and the separate sandboxed-Bash admission path retain their own conditions.
+
 ## Native Entries Not Currently Applicable
 
 - Memory Directory: No managed memory directory is provided by Tickloop.
@@ -90,7 +100,7 @@ without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harne
 Not applicable means only that the specific entry point does not exist; it does not exempt real side effects of the same kind. Data exfiltration,
 persistence or out-of-scope actions carried out through Bash or other exposed tools are still judged by the corresponding general rules. When a corresponding product entry point is added, it must be remapped.
 
-There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 9.
+There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 10.
 One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently eight native entry points that are not applicable.
 Custom rules and group replacements stay independent; users who replace the built-in Soft allow are not forced to have the Scheduling exception added back.
 
@@ -111,7 +121,11 @@ Permission history uses the same prepared service identity for matching as admis
 
 ## Plan with Auto
 
-Claude Code 2.1.302 keeps Auto active in Plan when the `useAutoModeDuringPlan` setting is on, its default (`prepareContextForPlanMode`, `isAutoModeActive`). Tickloop reads the same key from the user's `settings.json` when a Chat is created, resumed or branched; it is filled into the permission policy like the host's rules, never recorded, and children take their parent's. Plan first refuses its side effects as before (`Write`, `Edit`, mutating `Bash`, Automatic, Reviewable and Confirmation host tools; Artifact writes still ask). Everything it would otherwise ask about then follows Auto: broad user and project Allow rules are set aside, the Accept Edits fast path and the safe-tool allowlist admit, and the rest goes to the classifier, so `WebFetch`, reads outside the workspace and read-only `Bash` outside it are admitted or reviewed instead of asked. Explicit Ask and Deny rules and safety checks the classifier cannot approve still win, and Classified host tools were already reviewed in Plan. Third-party MCP calls are reviewed unless Plan was entered from Full Access, which keeps allowing them, as Claude Code's Plan after `bypassPermissions` does. With the setting off, Plan asks as it did before. No rule text changes: the 82-rule policy and nine inapplicable native entries remain unchanged.
+Claude Code 2.1.302 keeps Auto active in Plan when the `useAutoModeDuringPlan` setting is on, its default (`prepareContextForPlanMode`, `isAutoModeActive`). Tickloop reads the same key from the user's `settings.json` when a Chat is created, resumed or branched; it is filled into the permission policy like the host's rules, never recorded, and children take their parent's. Plan first refuses its side effects as before (`Write`, `Edit`, mutating `Bash`, Automatic, Reviewable and Confirmation host tools; Artifact writes still ask). Everything it would otherwise ask about then follows Auto: broad user and project Allow rules are set aside, the Accept Edits fast path and the safe-tool allowlist admit, and the rest goes to the classifier, so `WebFetch`, reads outside the workspace and read-only `Bash` outside it are admitted or reviewed instead of asked. Explicit Ask and Deny rules and safety checks the classifier cannot approve still win, and Classified host tools were already reviewed in Plan. Third-party MCP calls are reviewed unless Plan was entered from Full Access, which keeps allowing them, as Claude Code's Plan after `bypassPermissions` does. With the setting off, Plan asks as it did before. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
+
+## Plan file
+
+Following Claude Code 2.1.302 (`checkWritePermissionForTool` admits the session's plan files before its other checks), the current Loop's plan file is readable and writable without asking in every execution mode, not only in Plan: `Read`, `Write` and `Edit` of exactly that file are allowed before the mode's admission, the Accept Edits fast path and Auto review, so Auto never sends them to the classifier. Explicit Ask and Deny rules still win. In Plan it remains the only writable file, and other side effects are refused with Claude Code's Plan mode rule, the plan file's path and a pointer to ExitPlanMode. Delegated children have no plan file. ExitPlanMode stays outside the policy: with a plan it opens the plan approval, and without one (a missing or blank plan file) it asks the user Claude Code's "Exit plan mode?" yes/no question, an explicit Ask that only a person answers; yes restores the mode Plan was entered from (Ask when unknown). No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
 
 ## Fold and nested calls
 
@@ -129,10 +143,9 @@ Claude Code 2.1.302 has a linked-worktree Accept Edits fast path behind a flag t
 
 Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
 
-
 ## Commands outside the sandbox
 
-`Sandbox Network Callback` is mapped to Bash's per-call escape request, not to a new callback tool.
+Bash's per-call escape request uses ordinary command approval; it does not add a callback tool or grant a proxy domain.
 When the user enables the local sandbox, `dangerouslyDisableSandbox: true` or a matching
 `sandbox.excludedCommands` entry prepares that invocation with unrestricted writes and networking,
 and with an execution-environment requirement for ordinary approval. The immutable preparation is
@@ -140,7 +153,8 @@ used for approval and execution; neither a model argument nor an exclusion is an
 Auto sends such calls to its reviewer instead of the read-only or Accept Edits fast paths; Ask
 requires human approval. Explicit Permission Rules retain their precedence, Full Access retains its
 normal behavior, and Plan retains its existing read-only handling. An Unrestricted prompt host does
-not waive a required reviewer or human decision. No sandbox-based fast path is introduced here.
+not waive a required reviewer or human decision. Such calls never take the sandboxed Bash fast path
+below.
 
 The ordinary frozen policy judges the command's actual effects and the user's authorization.
 Routine authorized builds are not automatically a Containment Escape merely because they request
@@ -154,10 +168,38 @@ request has no effect. These controls are read only from the user's settings by 
 repository content or Harness Settings Store configuration.
 
 No rules are added or removed: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, with eight
-inapplicable native entries. Policy and built-in group version **9** records this mapping change.
+inapplicable native entries. Policy and built-in group version **10** covers this mapping and the
+Sandbox Network Callback remapping above.
 Portable Agent tests in `harness/runtime/tests/all/environment_approval.rs` use the reference
 Execution Environment, ScriptedModel and a reviewer double. Local integration tests in
 `code/local-environment/tests/all/sandbox.rs` cover the settings and actual macOS execution.
 Both verify admission and rejection, including normally safe commands. This is routing evidence,
 not semantic acceptance by a real review model. The conditional escape hint is appended by Code
 using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.
+
+## Sandboxed Bash
+
+Following Claude Code's `autoAllowBashIfSandboxed` (`checkSandboxAutoAllow` in `bashPermissions.ts`),
+a Shell call (foreground or background `Bash`, including a delegated child's under its frozen parent
+permissions) is allowed directly in Accept Edits and Auto when its preparation reports writes confined to the
+Folder and additional directories and networking that is not unrestricted (an allowlist or
+disconnected), and the execution environment's owner allows it. Locally that is the user's
+`sandbox.autoAllowBashIfSandboxed`, default true, read by Code only from the user's settings. The
+call is neither asked about nor sent to the reviewer, so none of the frozen rules is consulted for
+it; the sandbox, not the classifier, bounds what it can write and reach. Its approval record is
+`Direct` with the optional reason `sandbox`.
+
+The fast path reads only the frozen preparation, after the deterministic checks: Plan's side-effect
+refusal, explicit Deny and Ask rules (whole-tool and content rules, unlike Claude Code, which lets a
+sandboxed command pass a whole-tool Ask) and safety checks. As in Claude Code it comes before
+explicit Allow rules, so such a call is recorded as sandboxed even when an Allow rule also covers
+it. A Shell whose environment requires approval never qualifies. A call outside the sandbox (`dangerouslyDisableSandbox`, `excludedCommands`, or a
+fallback without isolation) reports unrestricted isolation and keeps ordinary approval. Plan and
+Full Access are unchanged. A whole-environment isolation report, as a future virtual machine would
+give, does not qualify. Sensitive paths stay unwritable inside the sandbox itself.
+
+No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**,
+eight inapplicable native entries, and policy and built-in group version **10** are unchanged.
+`harness/runtime/tests/all/sandbox_auto_approval.rs` covers the routing with the reference
+Execution Environment and a reviewer double; `code/local-environment/tests/all/sandbox.rs` covers
+the setting and actual macOS execution.
