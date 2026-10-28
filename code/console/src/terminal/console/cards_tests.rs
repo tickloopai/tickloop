@@ -346,3 +346,41 @@ fn a_focused_hosted_card_hints_sending_esc() {
     assert!(state.card_focused());
     assert_eq!(state.monitor_list_hint(), FOCUSED_CARD_HINT);
 }
+
+#[test]
+fn a_card_stays_open_while_its_row_is_on_a_page_the_monitor_has_not_loaded() {
+    let mut state = State::new(true, 140, 40);
+    let chat = Uuid::new_v4();
+    state.switch_view_chat(Some(chat));
+    let mut status = tickloop_harness::protocol::ChatStatus::of(
+        &serde_json::from_value(serde_json::json!({
+            "id": chat, "folder":"/fixture", "messages":[],
+            "chat_loop":{"id":Uuid::nil(),"state":"Idle"}
+        }))
+        .unwrap(),
+    );
+    for index in 0..270 {
+        status
+            .monitor
+            .members
+            .push(tickloop_harness::protocol::MonitorMember {
+                instance: format!("calendar:{index:03}").parse().unwrap(),
+                title: Some(format!("Tick {index:03}")),
+                is_terminal: false,
+                min_rows: None,
+            });
+    }
+    state.monitor.set_chat_status(Arc::new(status));
+    let last: tick_protocol::InstanceRef = "calendar:269".parse().unwrap();
+    assert!(
+        !state
+            .monitor
+            .entries()
+            .iter()
+            .any(|entry| entry.instance == last),
+        "the last row's page is not loaded yet"
+    );
+    state.cards.open(chat, last.clone());
+    state.card_sources();
+    assert!(state.cards.is_open(&last));
+}

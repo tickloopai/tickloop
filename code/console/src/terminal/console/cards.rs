@@ -273,16 +273,12 @@ impl State {
     }
 
     /// The open cards of the shown Chat whose rows are still listed, for the next frame. A Chat
-    /// switch or a row leaving closes its cards.
+    /// switch or a row leaving the list closes its cards; a row on a page not loaded yet is
+    /// still listed.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
-        let listed: std::collections::HashSet<InstanceRef> = self
-            .monitor
-            .entries()
-            .iter()
-            .map(|entry| entry.instance.clone())
-            .collect();
+        let monitor = &self.monitor;
         self.cards
-            .retain(self.chat, |instance| listed.contains(instance));
+            .retain(self.chat, |instance| monitor.lists(instance));
         self.card_sizes
             .retain(|instance, _| self.cards.is_open(instance));
         let focused = self.cards.focused().cloned();

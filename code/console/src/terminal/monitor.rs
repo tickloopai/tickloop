@@ -341,6 +341,11 @@ impl Monitor {
     pub(super) fn entries(&self) -> &[MonitorEntry] {
         &self.entries
     }
+    /// Whether `instance` has a row, loaded or on a page still to load.
+    pub(super) fn lists(&self, instance: &InstanceRef) -> bool {
+        self.listing.iter().any(|entry| &entry.instance == instance)
+            || self.entries.iter().any(|entry| &entry.instance == instance)
+    }
     /// Ticks, scheduled tasks and an optional Goal, shown as `Monitor N`.
     pub(super) fn total(&self) -> usize {
         self.total + usize::from(self.goal().is_some())
