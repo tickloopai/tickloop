@@ -22,9 +22,11 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`<package>:usage`",
         "`<package>:<skill>`",
         "`tick-<package>`",
-        "`login`",
-        "`logged_in`",
-        "`not_required`",
+        "`plugin_login`",
+        "`logged_out`",
+        "`expired`",
+        "`unknown`",
+        "carried no `plugin_login`",
         "from `/ticks` in this Agent",
         "Available page of `/ticks`",
         "Installed page of `/ticks`",
@@ -42,6 +44,11 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
     }
     for retired in [
+        // Login states left the system prompt: an open reports a missing login instead.
+        "`login` state",
+        "`logged_in`",
+        "`not_required`",
+        "the state is read again for every request",
         "read the body with `ArtifactRead` when the task needs it",
         "herdr:",
         "every_seconds",

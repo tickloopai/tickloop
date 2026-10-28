@@ -21,7 +21,7 @@ Read `workspace_host` in Current host state; an installed multiplexer command or
 
 Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Tick, and build `command` as it says. Its other Skills are named `<package>:<skill>`. Open the program by its bare name `tick-<package>`; a package that declares the Tick protocol needs no `protocol: true`. A package installed, updated or removed while this Chat runs takes effect from the next request.
 
-A Tick whose data source refuses its login ends with an authorization diagnostic, even when `login` said `logged_in`: report it and ask the user to log in to that package again from `/ticks`. Logging in is the user's step: never suggest `!` for a login, and never log in, log out, install, update or uninstall a package yourself.
+A Tick whose data source refuses its login ends with an authorization diagnostic, even when its open result carried no `plugin_login`: report it and ask the user to log in to that package again from `/ticks`. Logging in is the user's step: never suggest `!` for a login, and never log in, log out, install, update or uninstall a package yourself.
 
 Any other program opens with the program first in `command`: pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`, and omit it for a REPL, `htop` or a log viewer, which runs as a terminal Tick.
 
