@@ -57,7 +57,7 @@ fn message_text(messages: &[Message]) -> String {
 }
 
 enum SummaryBehavior {
-    Output(ModelOutput),
+    Output(Box<ModelOutput>),
     Error(ModelError),
 }
 
@@ -101,7 +101,7 @@ impl ModelClient for SummaryBehaviorModel {
             });
         }
         match self.behaviors.lock().unwrap().pop_front().unwrap() {
-            SummaryBehavior::Output(output) => Ok(output),
+            SummaryBehavior::Output(output) => Ok(*output),
             SummaryBehavior::Error(error) => Err(error),
         }
     }
@@ -240,16 +240,16 @@ async fn from_here_replaces_the_selected_suffix_and_restores_only_a_draft() {
 async fn rejected_or_failed_summaries_leave_no_trace_in_the_conversation() {
     let cases = [
         (
-            SummaryBehavior::Output(ModelOutput {
+            SummaryBehavior::Output(Box::new(ModelOutput {
                 private_source: None,
                 content: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
-            }),
+            })),
             RequestOutcome::HostRejected(ResponseRejection::EmptySummary),
         ),
         (
-            SummaryBehavior::Output(ModelOutput {
+            SummaryBehavior::Output(Box::new(ModelOutput {
                 private_source: None,
                 content: vec![Content::ToolUse {
                     id: "unexpected-tool".into(),
@@ -258,7 +258,7 @@ async fn rejected_or_failed_summaries_leave_no_trace_in_the_conversation() {
                 }],
                 usage: Usage::default(),
                 stop_reason: "tool_use".into(),
-            }),
+            })),
             RequestOutcome::HostRejected(ResponseRejection::InvalidSummary),
         ),
         (
@@ -334,12 +334,12 @@ async fn directed_summary_retries_a_transient_service_failure() {
         behaviors: Mutex::new(
             vec![
                 SummaryBehavior::Error(ModelError::Http { status: 503 }),
-                SummaryBehavior::Output(ModelOutput {
+                SummaryBehavior::Output(Box::new(ModelOutput {
                     private_source: None,
                     content: text("recovered summary"),
                     usage: Usage::default(),
                     stop_reason: "end_turn".into(),
-                }),
+                })),
             ]
             .into(),
         ),
@@ -381,12 +381,12 @@ async fn a_summary_that_exceeds_the_verified_context_keeps_the_previous_projecti
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(SummaryBehaviorModel {
         behaviors: Mutex::new(
-            vec![SummaryBehavior::Output(ModelOutput {
+            vec![SummaryBehavior::Output(Box::new(ModelOutput {
                 private_source: None,
                 content: text(&"oversized summary ".repeat(20_000)),
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
-            })]
+            }))]
             .into(),
         ),
     });

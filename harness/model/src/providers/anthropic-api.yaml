@@ -12,6 +12,11 @@ endpoints:
   messages: "https://api.anthropic.com"
 # Explicit cache_control breakpoints (harness/model/src/prompt_cache.rs).
 prompt_cache: "anthropic"
+# Claude models spend more tokens than o200k_base counts: Opus 5.5 conversation 1.56 and a first
+# request's system prompt and tools 1.72, Sonnet 5.5 conversation 1.50. /context starts from this
+# ratio and refines it from each Chat's own requests.
+context_token_ratios:
+  messages: 1.6
 selection:
   auxiliary_model: claude-haiku-5-5
   series:

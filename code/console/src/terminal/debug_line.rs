@@ -426,6 +426,7 @@ mod tests {
             output_tokens: Some(output),
             cache_read_input_tokens: read,
             cache_write_input_tokens: write,
+            reasoning_output_tokens: None,
         }
     }
 

@@ -6,11 +6,76 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 
-use tickloop_harness_protocol::{ContextTokenCounter, Message, message_content_tokens};
+use serde_json::Value;
+use tickloop_harness_protocol::{
+    Content, ContextTokenCounter, Message, Protocol, message_content_tokens,
+};
+
+use crate::{native_tool_search, responses};
 
 pub const TOKENIZER_NAME: &str = "o200k_base";
 /// Counted messages kept before the cache starts over; a long Chat stays well inside it.
 const MESSAGE_CACHE_ENTRIES: usize = 16_384;
+/// Fields Tickloop keeps on a protocol record for itself; adapters drop them before sending.
+const PRIVATE_FIELD_PREFIX: &str = "_tickloop_";
+
+/// Whether `content` is the model's reasoning, whose size in context is the reasoning its
+/// service reported for the response rather than any text history holds: thinking, often empty
+/// when the service omits it, or a sealed reasoning record.
+pub fn is_reasoning(content: &Content) -> bool {
+    match content {
+        Content::Thinking { .. } => true,
+        Content::ProtocolData { protocol, value } => is_reasoning_record(*protocol, value),
+        _ => false,
+    }
+}
+
+fn is_reasoning_record(protocol: Protocol, value: &Value) -> bool {
+    match protocol {
+        Protocol::Responses => value["type"] == "reasoning",
+        Protocol::Google => value["part"].get("thoughtSignature").is_some(),
+        Protocol::Messages | Protocol::ChatCompletions | Protocol::SystemOne => false,
+    }
+}
+
+/// The tokens a protocol record takes in a request as its adapter sends it. A sealed reasoning
+/// record counts nothing here: its encrypted payload says nothing about its size.
+pub fn protocol_record_tokens<C: ContextTokenCounter + ?Sized>(
+    counter: &C,
+    protocol: Protocol,
+    value: &Value,
+) -> usize {
+    if is_reasoning_record(protocol, value) {
+        return 0;
+    }
+    match (protocol, value["type"].as_str()) {
+        // Sent as the `phase` of the assistant message that follows.
+        (Protocol::Responses, Some(responses::ASSISTANT_PHASE_TYPE)) => {
+            counter.text_tokens(value["phase"].as_str().unwrap_or_default())
+        }
+        // Sent as the `namespace` of the function call it names.
+        (Protocol::Responses, Some(native_tool_search::RESPONSES_CALL_NAMESPACE)) => {
+            counter.text_tokens(&value["namespace"].to_string())
+        }
+        // Sent in place of the readable block beside it, which counts on its own.
+        (Protocol::Google, _) => 0,
+        _ => match value.as_object() {
+            Some(object)
+                if object
+                    .keys()
+                    .any(|key| key.starts_with(PRIVATE_FIELD_PREFIX)) =>
+            {
+                let sent = object
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with(PRIVATE_FIELD_PREFIX))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                counter.text_tokens(&Value::Object(sent).to_string())
+            }
+            _ => counter.text_tokens(&value.to_string()),
+        },
+    }
+}
 
 pub struct O200kTokenCounter {
     /// Message counts by a hash of the serialized message: a message never changes once written,
@@ -40,6 +105,10 @@ impl ContextTokenCounter for O200kTokenCounter {
         tiktoken_rs::o200k_base_singleton().count_ordinary(text)
     }
 
+    fn protocol_data_tokens(&self, protocol: Protocol, value: &Value) -> usize {
+        protocol_record_tokens(self, protocol, value)
+    }
+
     fn message_tokens(&self, message: &Message) -> usize {
         let Ok(serialized) = serde_json::to_vec(message) else {
             return message_content_tokens(self, message);
@@ -63,7 +132,7 @@ impl ContextTokenCounter for O200kTokenCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_harness_protocol::{Content, Role, ToolDefinition};
+    use tickloop_harness_protocol::{Role, ToolDefinition};
 
     fn user(text: &str) -> Message {
         Message {
@@ -86,6 +155,55 @@ mod tests {
             "{tokens} tokens for {characters} characters"
         );
         assert_eq!(TOKEN_COUNTER.text_tokens(""), 0);
+    }
+
+    #[test]
+    fn records_count_as_their_adapter_sends_them() {
+        let origin = "9f".repeat(32);
+        let sealed = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "gAAAAB".repeat(400),
+            "summary": [],
+            "_tickloop_codex_origin": origin,
+        });
+        assert_eq!(
+            TOKEN_COUNTER.protocol_data_tokens(Protocol::Responses, &sealed),
+            0
+        );
+        assert!(is_reasoning(&Content::ProtocolData {
+            protocol: Protocol::Responses,
+            value: sealed,
+        }));
+        let phase = serde_json::json!({
+            "type": responses::ASSISTANT_PHASE_TYPE,
+            "phase": "final_answer",
+            "_tickloop_codex_origin": origin,
+        });
+        assert_eq!(
+            TOKEN_COUNTER.protocol_data_tokens(Protocol::Responses, &phase),
+            TOKEN_COUNTER.text_tokens("final_answer")
+        );
+        let search =
+            serde_json::json!({"type": "tool_search_call", "arguments": {"query": "quote"}});
+        let mut tagged = search.clone();
+        tagged["_tickloop_codex_origin"] = serde_json::json!(origin);
+        assert_eq!(
+            TOKEN_COUNTER.protocol_data_tokens(Protocol::Responses, &tagged),
+            TOKEN_COUNTER.text_tokens(&search.to_string())
+        );
+        let google = serde_json::json!({"part": {"text": "done", "thoughtSignature": "opaque"}, "paired": true});
+        assert_eq!(
+            TOKEN_COUNTER.protocol_data_tokens(Protocol::Google, &google),
+            0
+        );
+        assert!(is_reasoning(&Content::Thinking {
+            thinking: String::new(),
+            signature: Some("sealed".into()),
+        }));
+        assert!(!is_reasoning(&Content::Text {
+            text: "done".into()
+        }));
     }
 
     #[test]

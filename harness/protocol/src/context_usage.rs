@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ChatSnapshot, Content, ImageSource, Message, ModelConfig, ModelRequestKind, RequestOutcome,
-    RequestUsageLedger, Role, ToolDefinition, ToolResultBlock, ToolResultContent, Usage,
+    ChatSnapshot, Content, ImageSource, Message, ModelConfig, ModelRequestKind, Protocol,
+    RequestOutcome, RequestUsageLedger, Role, ToolDefinition, ToolResultBlock, ToolResultContent,
+    Usage,
 };
 
 pub const ESTIMATED_CONTEXT_BYTES_PER_TOKEN: usize = 2;
@@ -32,6 +33,12 @@ pub trait ContextTokenCounter: Send + Sync {
             + self.text_tokens(&definition.description)
             + self.text_tokens(&definition.input_schema.to_string())
     }
+
+    /// The tokens a protocol record takes in a request. The record's JSON stands in until the
+    /// counter knows how its adapter sends it.
+    fn protocol_data_tokens(&self, _protocol: Protocol, value: &serde_json::Value) -> usize {
+        self.text_tokens(&value.to_string())
+    }
 }
 
 static CONTEXT_TOKEN_COUNTER: OnceLock<&'static dyn ContextTokenCounter> = OnceLock::new();
@@ -46,8 +53,8 @@ pub fn context_token_counter() -> Option<&'static dyn ContextTokenCounter> {
     CONTEXT_TOKEN_COUNTER.get().copied()
 }
 
-/// The tokens of a message's content as `counter` counts text: tool inputs and protocol records
-/// as their JSON, images by their pixels.
+/// The tokens of a message's content as `counter` counts text: tool inputs as their JSON, protocol
+/// records as the counter reads them, images by their pixels.
 pub fn message_content_tokens<C: ContextTokenCounter + ?Sized>(
     counter: &C,
     message: &Message,
@@ -73,7 +80,9 @@ pub fn message_content_tokens<C: ContextTokenCounter + ?Sized>(
                     .sum(),
             },
             Content::Thinking { thinking, .. } => counter.text_tokens(thinking),
-            Content::ProtocolData { value, .. } => counter.text_tokens(&value.to_string()),
+            Content::ProtocolData { protocol, value } => {
+                counter.protocol_data_tokens(*protocol, value)
+            }
             Content::Image { width, height, .. } => estimated_image_tokens(*width, *height),
         })
         .sum::<usize>();

@@ -233,6 +233,9 @@ impl GoogleStream {
                     }
                 }
             }
+            if let Some(thoughts) = self.thought_tokens {
+                observation["output_tokens_details"] = json!({"reasoning_tokens": thoughts});
+            }
             super::observe_usage(
                 &mut self.usage,
                 &observation,

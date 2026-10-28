@@ -176,6 +176,7 @@ fn counters(input: u64, output: u64, read: u64, write: u64) -> Usage {
         output_tokens: Some(output),
         cache_read_input_tokens: Some(read),
         cache_write_input_tokens: Some(write),
+        reasoning_output_tokens: None,
     }
 }
 

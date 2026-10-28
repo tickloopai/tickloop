@@ -176,7 +176,7 @@ async fn replay(use_jev: bool) {
                             jev_review::verdict(&evaluation, &context.auto_policy)
                         }
                         Ok(Err(error)) => {
-                            usage = error.usage;
+                            usage = error.usage.map(|usage| *usage);
                             Err(match &error.error {
                                 tickloop_harness_model::ModelError::InvalidResponse(detail) => {
                                     format!("provider InvalidResponse: {detail}")

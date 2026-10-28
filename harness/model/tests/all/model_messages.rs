@@ -525,6 +525,7 @@ async fn streams_messages_with_multiround_history_and_actual_cumulative_usage() 
             output_tokens: Some(1),
             cache_read_input_tokens: Some(34),
             cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: None,
         }))
     );
     assert_eq!(receiver.recv().await, Some(ModelDelta::Text("你好".into())));

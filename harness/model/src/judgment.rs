@@ -118,7 +118,7 @@ pub struct Evaluation {
 pub struct JudgmentError {
     #[source]
     pub error: ModelError,
-    pub usage: Option<Usage>,
+    pub usage: Option<Box<Usage>>,
 }
 
 impl From<ModelError> for JudgmentError {
@@ -487,7 +487,7 @@ impl JudgmentClient for JevClient {
             .validate(request)
             .map_err(|error| JudgmentError {
                 error,
-                usage: Some(evaluation.usage.clone()),
+                usage: Some(Box::new(evaluation.usage.clone())),
             })?;
         Ok(evaluation)
     }

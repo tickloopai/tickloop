@@ -387,7 +387,7 @@ impl Agent {
                     }
                 }
                 Err(error) => {
-                    if let Some(usage) = error.usage.clone() {
+                    if let Some(usage) = error.usage.as_deref().cloned() {
                         self.change_request_usage(receipt.chat_id, |ledger| {
                             ledger.observe(sequence, usage)
                         })
@@ -410,7 +410,7 @@ impl Agent {
                         elapsed_ms,
                         outcome: ApprovalAttemptOutcome::TechnicalFailure,
                         failure: Some(failure),
-                        usage: error.usage,
+                        usage: error.usage.map(|usage| *usage),
                     });
                     model_error
                 }

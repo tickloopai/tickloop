@@ -1385,6 +1385,7 @@ mod tests {
                 output_tokens: Some(3),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
+                reasoning_output_tokens: None,
             };
             events.send(ModelDelta::Usage(usage.clone())).unwrap();
             match &self.behavior {

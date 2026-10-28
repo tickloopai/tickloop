@@ -31,6 +31,7 @@ const ANSWER_USAGE: Usage = Usage {
     output_tokens: Some(20),
     cache_read_input_tokens: Some(7),
     cache_write_input_tokens: Some(3),
+    reasoning_output_tokens: None,
 };
 
 fn zero_usage() -> Usage {
@@ -39,6 +40,7 @@ fn zero_usage() -> Usage {
         output_tokens: Some(0),
         cache_read_input_tokens: Some(0),
         cache_write_input_tokens: Some(0),
+        reasoning_output_tokens: None,
     }
 }
 

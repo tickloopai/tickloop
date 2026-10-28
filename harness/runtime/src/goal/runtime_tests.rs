@@ -128,6 +128,7 @@ fn only_fresh_input_and_output_are_charged() {
                 output_tokens: Some(20),
                 cache_read_input_tokens: Some(5_000),
                 cache_write_input_tokens: Some(300),
+                reasoning_output_tokens: None,
             },
             serialized_request_bytes: None,
             context_measurement: None,

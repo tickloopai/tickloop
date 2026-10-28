@@ -379,6 +379,7 @@ pub fn title_output(request: ModelRequest) -> ModelOutput {
             output_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: None,
         },
         stop_reason: "end_turn".into(),
     }

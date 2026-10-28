@@ -2,10 +2,10 @@
 //! with the tokenizer, and the MCP tools that only tool search reaches. Reading it calls no
 //! model, connects no MCP server and changes nothing in the Chat.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
-use tickloop_harness_model::native_tool_search;
+use tickloop_harness_model::{context_tokens, native_tool_search};
 use tickloop_harness_policy::instructions::{InstructionFile, user_context_message};
 use tickloop_harness_policy::skills::SKILL_TOOL_NAME;
 use tickloop_harness_protocol::mcp::ToolExposure;
@@ -13,7 +13,7 @@ use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, CompactionMarker, Content, ContextBreakdown, ContextCategory,
     ContextCategoryUsage, ContextDraft, ContextItem, ContextTokenCounter, ContextToolServer,
     GuidanceNote, HostNote, Message, Protocol, Role, ToolDefinition, ToolSearchMode,
-    ToolSearchPool, UnavailableToolServer, message_content_tokens,
+    ToolSearchPool, UnavailableToolServer, Usage, message_content_tokens,
 };
 
 use crate::tool_exposure::{DESCRIBE_TOOLS, EXECUTE_TOOLS, SEARCH_TOOLS, SearchSupport};
@@ -27,8 +27,15 @@ const RUNTIME_TOOL_SOURCE: &str = "(built-in)";
 const USER_MESSAGES: &str = "User messages";
 const ASSISTANT_MESSAGES: &str = "Assistant messages";
 const TOOL_RESULTS: &str = "Tool results";
-/// How far the service-reported total may exceed the count before the excess is shown apart.
+/// How far the service-reported total may exceed the count at the measured token ratio before
+/// the excess is shown apart.
 const MAX_CALIBRATION_GAP_PERCENT: u64 = 15;
+/// How many counted tokens of a Chat's own measurements weigh as much as the starting ratio.
+const PRIOR_RATIO_WEIGHT_TOKENS: usize = 4_000;
+/// The token ratios one measurement may report; beyond them it measured something else, such as
+/// a system prompt that changed between the two requests.
+const MIN_TOKEN_RATIO: f64 = 0.5;
+const MAX_TOKEN_RATIO: f64 = 3.0;
 
 impl Agent {
     /// The current context of `chat_id` by category, as `/context` shows it.
@@ -203,8 +210,22 @@ impl Agent {
         });
         let (mut messages, _, origins) = crate::context::model_history_with_origins(chat)?;
         let message_labels = origins
-            .into_iter()
+            .iter()
             .map(|index| index.and_then(|index| host_message_label(&chat.snapshot, index)))
+            .collect();
+        let model = chat.snapshot.model.identity();
+        let mut responses = HashSet::new();
+        let message_usage = origins
+            .iter()
+            .zip(&messages)
+            .map(|(index, message)| {
+                let index = (*index)?;
+                (message.role == Role::Assistant
+                    && chat.snapshot.message_models.get(&index) == Some(&model)
+                    && responses.insert(index))
+                .then(|| chat.snapshot.message_usage.get(&index).cloned())
+                .flatten()
+            })
             .collect();
         match chat.tools.chat_directory() {
             Some(_) => crate::tool_results::apply_tool_result_replacements(
@@ -240,6 +261,11 @@ impl Agent {
                 .collect(),
             messages,
             message_labels,
+            message_usage,
+            protocol: chat.snapshot.model.protocol,
+            prior_token_ratio: tickloop_harness_model::cards::context_token_ratio(
+                &chat.snapshot.model,
+            ),
             search,
             window,
             compaction_trigger: crate::context::auto_compact_tokens(&chat.snapshot),
@@ -314,6 +340,12 @@ struct ContextParts {
     messages: Vec<Message>,
     /// For each message the host wrote, what it is.
     message_labels: Vec<Option<String>>,
+    /// For each response of the Chat's current model, the usage its service reported.
+    message_usage: Vec<Option<Usage>>,
+    /// The protocol of the Chat's current model, which decides what its usage counts as input.
+    protocol: Protocol,
+    /// Service tokens per counted token the model's catalog gives, before the Chat measures it.
+    prior_token_ratio: Option<f64>,
     search: Option<SearchParts>,
     window: Option<usize>,
     compaction_trigger: Option<usize>,
@@ -351,6 +383,48 @@ impl MessageSplit {
 }
 
 impl ContextParts {
+    /// Service tokens per counted token for the Chat's current model: the catalog's ratio, or
+    /// one, weighed against what consecutive responses measured. A request's input exceeds the
+    /// one before by that request's response, which the service counted as its output, and by
+    /// what was appended after it, which the counter counts.
+    fn token_ratio(&self, counter: &dyn ContextTokenCounter) -> f64 {
+        let mut samples = vec![(
+            self.prior_token_ratio.unwrap_or(1.0),
+            PRIOR_RATIO_WEIGHT_TOKENS,
+        )];
+        let responses = self
+            .message_usage
+            .iter()
+            .enumerate()
+            .filter_map(|(index, usage)| {
+                let usage = usage.as_ref()?;
+                Some((
+                    index,
+                    usage.context_input_tokens(self.protocol)?,
+                    usage.output_tokens?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for pair in responses.windows(2) {
+            let [(earlier, earlier_input, output), (later, later_input, _)] = pair else {
+                continue;
+            };
+            let appended = self.messages[earlier + 1..*later]
+                .iter()
+                .map(|message| counter.message_tokens(message))
+                .sum::<usize>();
+            if appended == 0 {
+                continue;
+            }
+            let grown = *later_input as f64 - *earlier_input as f64 - *output as f64;
+            let ratio = grown / appended as f64;
+            if (MIN_TOKEN_RATIO..=MAX_TOKEN_RATIO).contains(&ratio) {
+                samples.push((ratio, appended));
+            }
+        }
+        weighted_median(samples)
+    }
+
     fn count(self, counter: &dyn ContextTokenCounter) -> ContextBreakdown {
         let definition_items = |definitions: &[ToolDefinition]| {
             definitions
@@ -413,9 +487,12 @@ impl ContextParts {
             .iter()
             .map(|(path, content)| (path.display().to_string(), counter.text_tokens(content)))
             .collect::<Vec<_>>();
+        let token_ratio = self.token_ratio(counter);
         let split = split_messages(
             &self.messages,
             &self.message_labels,
+            &self.message_usage,
+            token_ratio,
             self.search.as_ref(),
             counter,
         );
@@ -444,14 +521,18 @@ impl ContextParts {
             .map(|(_, tokens)| *tokens as u64)
             .sum::<u64>();
         let used_tokens = self.reported_total.unwrap_or(counted_total);
-        // Service usage close to the count calibrates it; a total well beyond it holds something
-        // the count cannot see, so that part stands apart instead of inflating every category.
-        let unattributed = used_tokens
-            .saturating_sub(counted_total.saturating_mul(100 + MAX_CALIBRATION_GAP_PERCENT) / 100);
-        let unattributed = if unattributed > 0 {
-            used_tokens - counted_total
-        } else {
-            0
+        // The count in the service's tokens; a total close to it calibrates every category, while
+        // a total well beyond it holds something the count cannot see, so that part stands apart
+        // instead of inflating every category.
+        let expected_total = (counted_total as f64 * token_ratio).round() as u64;
+        let unattributed = match self.reported_total {
+            Some(reported)
+                if reported
+                    > expected_total.saturating_mul(100 + MAX_CALIBRATION_GAP_PERCENT) / 100 =>
+            {
+                reported - expected_total
+            }
+            _ => 0,
         };
         let scale = Scale {
             counted: counted_total,
@@ -536,12 +617,40 @@ impl ContextParts {
     }
 }
 
+/// The middle value of weighted samples: half the weight lies at or below it.
+fn weighted_median(mut samples: Vec<(f64, usize)>) -> f64 {
+    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let total = samples.iter().map(|(_, weight)| weight).sum::<usize>();
+    let mut seen = 0;
+    for (value, weight) in &samples {
+        seen += weight;
+        if seen * 2 >= total {
+            return *value;
+        }
+    }
+    1.0
+}
+
+/// What a response's reasoning holds in context, in counted tokens: what its service reported,
+/// else the rest of its output beside the visible part, else the reasoning text history keeps.
+fn reasoning_tokens(usage: Option<&Usage>, visible: usize, text: usize, token_ratio: f64) -> usize {
+    let counted = |service_tokens: u64| (service_tokens as f64 / token_ratio).round() as usize;
+    match usage.map(|usage| (usage.reasoning_output_tokens, usage.output_tokens)) {
+        Some((Some(reasoning), _)) => counted(reasoning),
+        Some((None, Some(output))) => counted(output).saturating_sub(visible).max(text),
+        _ => text,
+    }
+}
+
 /// Splits the conversation into tool search's part and the rest. SearchTools, DescribeTools and
 /// ExecuteTools calls count with their results, one item per call; a vendor search record counts
-/// as it is, plus each deferred definition its result loads, once.
+/// as it is, plus each deferred definition its result loads, once. Reasoning counts as its
+/// response's usage says.
 fn split_messages(
     messages: &[Message],
     message_labels: &[Option<String>],
+    message_usage: &[Option<Usage>],
+    token_ratio: f64,
     search: Option<&SearchParts>,
     counter: &dyn ContextTokenCounter,
 ) -> MessageSplit {
@@ -549,7 +658,7 @@ fn split_messages(
     let mut fold_calls = HashMap::<String, usize>::new();
     let mut loaded = BTreeSet::new();
     let deferred = search.map_or(&[][..], |search| search.deferred.as_slice());
-    for (message, label) in messages.iter().zip(message_labels) {
+    for (index, (message, label)) in messages.iter().zip(message_labels).enumerate() {
         if let Some(label) = label {
             *split.notes.entry(label.clone()).or_default() +=
                 message_content_tokens(counter, message);
@@ -566,6 +675,8 @@ fn split_messages(
             Role::Assistant => split.assistant += framing,
             _ => split.user += framing,
         }
+        let mut visible = 0;
+        let mut reasoning = None::<usize>;
         for block in &message.content {
             let tokens = message_content_tokens(
                 counter,
@@ -575,6 +686,11 @@ fn split_messages(
                 },
             )
             .saturating_sub(framing);
+            if context_tokens::is_reasoning(block) {
+                *reasoning.get_or_insert(0) += tokens;
+                continue;
+            }
+            visible += tokens;
             match block {
                 Content::ToolUse { id, name, input } if FOLD_TOOLS.contains(&name.as_str()) => {
                     fold_calls.insert(id.clone(), split.search.len());
@@ -605,6 +721,14 @@ fn split_messages(
                 }
                 Content::ToolResult { .. } => split.tool_results += tokens,
                 _ if message.role == Role::Assistant => split.assistant += tokens,
+                _ => split.user += tokens,
+            }
+        }
+        if let Some(text) = reasoning {
+            let usage = message_usage.get(index).and_then(Option::as_ref);
+            let tokens = reasoning_tokens(usage, visible, text, token_ratio);
+            match message.role {
+                Role::Assistant => split.assistant += tokens,
                 _ => split.user += tokens,
             }
         }
