@@ -44,7 +44,10 @@ impl Describe for Counter {
                     newest: SeriesEnd::Last,
                 }],
             }),
-            screen: Some(ScreenDeclaration { min_rows: Some(8) }),
+            screen: Some(ScreenDeclaration {
+                min_rows: Some(8),
+                max_rows: Some(20),
+            }),
         })
     }
 }
@@ -122,7 +125,10 @@ async fn any_tick_answers_describe_and_read_with_what_it_declares_and_publishes(
         answer(1)["result"]["state"],
         json!({"series":[{"path":"/history","newest":"last"}]})
     );
-    assert_eq!(answer(1)["result"]["screen"], json!({"min_rows": 8}));
+    assert_eq!(
+        answer(1)["result"]["screen"],
+        json!({"min_rows": 8, "max_rows": 20})
+    );
     assert_eq!(answer(2)["result"], update["params"]);
 }
 

@@ -59,6 +59,7 @@ impl HostToolProvider for OpeningHost {
             },
             Box::new(HostEffect::OpenedTick {
                 min_rows: None,
+                max_rows: None,
                 is_terminal: false,
                 instance: calendar("opened"),
                 title: Some("Earnings calendar".into()),

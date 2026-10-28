@@ -276,11 +276,13 @@ impl HostedTickTools {
                 title,
                 is_terminal,
                 min_rows,
+                max_rows,
             }) => Some(OpenedExecution {
                 instance,
                 title,
                 is_terminal,
                 min_rows,
+                max_rows,
             }),
             _ => None,
         };
@@ -912,6 +914,7 @@ impl HostedTickTools {
             instance: instance.clone(),
             title,
             min_rows: None,
+            max_rows: None,
             result,
         };
         // The lifecycle reply is final; cancellation of enrichment must not discard it.
@@ -946,6 +949,7 @@ impl HostedTickTools {
         {
             confirmed.title = Some(described.title);
             confirmed.min_rows = Some(described.min_rows);
+            confirmed.max_rows = described.max_rows;
         }
         confirmed.confirm(dispatch);
         Ok(confirmed)
@@ -1334,6 +1338,7 @@ impl DataBinding {
 struct DescribedTick {
     title: String,
     min_rows: u16,
+    max_rows: Option<u16>,
 }
 
 /// Reads the declaration of a just opened Tick through the binding the open received, validated
@@ -1353,6 +1358,7 @@ async fn describe_opened(
     Some(DescribedTick {
         title: tickhost_connect::naming::tick_title(&descriptor.title, &descriptor.kind, command),
         min_rows: descriptor.min_rows(),
+        max_rows: descriptor.max_rows(),
     })
 }
 
@@ -1362,6 +1368,7 @@ struct OpenedTick {
     instance: InstanceRef,
     title: Option<String>,
     min_rows: Option<u16>,
+    max_rows: Option<u16>,
     result: Value,
 }
 
@@ -1379,6 +1386,7 @@ impl OpenedTick {
                     title: self.title.clone(),
                     is_terminal: self.is_terminal,
                     min_rows: self.min_rows,
+                    max_rows: self.max_rows,
                 }),
                 shell: None,
                 handoff: None,
@@ -1395,6 +1403,7 @@ impl OpenedTick {
             },
             Box::new(HostEffect::OpenedTick {
                 min_rows: self.min_rows,
+                max_rows: self.max_rows,
                 is_terminal: self.is_terminal,
                 instance: self.instance,
                 title: self.title,

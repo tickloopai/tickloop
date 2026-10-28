@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tick_protocol::KeySignal;
 use tickhost_connect::hosted::CONTROL_TIMEOUT;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::pty::TerminalSize;
@@ -37,18 +39,24 @@ impl ViewGrants {
 }
 
 /// The views attached to one screen. The screen takes the size of the view that typed last, or
-/// of the newest view while none of them typed; without views it keeps its size.
+/// of the newest view while none of them typed; without views it keeps its size. The same view
+/// gets the keys a Tick bubbles; every listening view learns whether it bubbles keys.
 #[derive(Default)]
 pub(crate) struct Views {
     /// Orders attaches and input; a view is named by the moment it attached.
     clock: u64,
     attached: HashMap<u64, AttachedView>,
+    /// Whether the Tick declared it bubbles the keys it does not use.
+    bubbling: bool,
 }
 
 struct AttachedView {
     size: TerminalSize,
     attached_at: u64,
     typed_at: Option<u64>,
+    /// Where this view takes key-bubbling signals, once it listens; a view that does not take
+    /// them in time misses them.
+    signals: Option<mpsc::Sender<KeySignal>>,
 }
 
 impl Views {
@@ -60,6 +68,7 @@ impl Views {
                 size,
                 attached_at: view,
                 typed_at: None,
+                signals: None,
             },
         );
         view
@@ -91,10 +100,41 @@ impl Views {
     }
 
     pub(crate) fn leading_size(&self) -> Option<TerminalSize> {
+        self.leading().map(|view| view.size)
+    }
+
+    fn leading(&self) -> Option<&AttachedView> {
         self.attached
             .values()
             .max_by_key(|view| (view.typed_at, view.attached_at))
-            .map(|view| view.size)
+    }
+
+    /// Sends `view` the key-bubbling signals from now on; returns whether the Tick bubbles keys
+    /// now, which no signal sent later repeats.
+    pub(crate) fn listen(&mut self, view: u64, signals: mpsc::Sender<KeySignal>) -> bool {
+        if let Some(attached) = self.attached.get_mut(&view) {
+            attached.signals = Some(signals);
+        }
+        self.bubbling
+    }
+
+    /// Records a key-bubbling signal of the Tick: a change of whether it bubbles keys reaches
+    /// every listening view, and a bubbled key, while it bubbles keys, the leading view.
+    pub(crate) fn signal(&mut self, signal: KeySignal) {
+        let send = |view: &AttachedView| {
+            if let Some(signals) = &view.signals {
+                let _ = signals.try_send(signal);
+            }
+        };
+        match signal {
+            KeySignal::Bubbling(enabled) if enabled != self.bubbling => {
+                self.bubbling = enabled;
+                self.attached.values().for_each(send);
+            }
+            KeySignal::Bubbling(_) => {}
+            KeySignal::Key(_) if self.bubbling => self.leading().into_iter().for_each(send),
+            KeySignal::Key(_) => {}
+        }
     }
 
     fn advance(&mut self) -> u64 {
@@ -176,5 +216,49 @@ mod tests {
         views.detach(third);
         assert!(views.is_empty());
         assert_eq!(views.leading_size(), None);
+    }
+
+    #[test]
+    fn bubbled_keys_go_to_the_leading_view_and_bubbling_to_every_view() {
+        use tick_protocol::BubbledKey;
+        let size = TerminalSize::validated(10, 40).unwrap();
+        let mut views = Views::default();
+        let first = views.attach(size);
+        let (first_signals, mut first_received) = mpsc::channel(8);
+        assert!(!views.listen(first, first_signals));
+        views.signal(KeySignal::Key(BubbledKey::Down));
+        assert!(
+            first_received.try_recv().is_err(),
+            "a key bubbled while bubbling is off goes nowhere"
+        );
+        views.signal(KeySignal::Bubbling(true));
+        assert_eq!(first_received.try_recv(), Ok(KeySignal::Bubbling(true)));
+        views.signal(KeySignal::Bubbling(true));
+        assert!(first_received.try_recv().is_err(), "only changes are sent");
+
+        let second = views.attach(size);
+        let (second_signals, mut second_received) = mpsc::channel(8);
+        assert!(views.listen(second, second_signals), "a new view learns it");
+        views.signal(KeySignal::Key(BubbledKey::Down));
+        assert_eq!(
+            second_received.try_recv(),
+            Ok(KeySignal::Key(BubbledKey::Down)),
+            "the newest view while none typed"
+        );
+        assert!(first_received.try_recv().is_err());
+        views.typed(first);
+        views.signal(KeySignal::Key(BubbledKey::Esc));
+        assert_eq!(
+            first_received.try_recv(),
+            Ok(KeySignal::Key(BubbledKey::Esc)),
+            "the view that typed last"
+        );
+        assert!(second_received.try_recv().is_err());
+
+        views.signal(KeySignal::Bubbling(false));
+        assert_eq!(first_received.try_recv(), Ok(KeySignal::Bubbling(false)));
+        assert_eq!(second_received.try_recv(), Ok(KeySignal::Bubbling(false)));
+        views.signal(KeySignal::Key(BubbledKey::Esc));
+        assert!(first_received.try_recv().is_err());
     }
 }

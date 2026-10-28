@@ -4,6 +4,7 @@
 pub mod cli;
 pub mod host;
 pub mod in_process;
+mod key_bubbling;
 pub mod paths;
 pub mod process;
 pub mod pty;

@@ -32,6 +32,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         .unwrap();
         snapshot.monitor.members.push(MonitorMember {
             min_rows: None,
+            max_rows: None,
             is_terminal: false,
             instance: instance.clone(),
             title: Some("Counter".into()),

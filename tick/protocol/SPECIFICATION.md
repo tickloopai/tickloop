@@ -395,6 +395,9 @@ interface StateSeries {
 interface ScreenDeclaration {
   /** The fewest terminal rows the Tick stays usable at: an integer from 6 to 14; 6 when absent. */
   min_rows?: number;
+  /** The most terminal rows the Tick can use: an integer no less than `min_rows`. When absent,
+   *  a card shows the Tick at `min_rows`. */
+  max_rows?: number;
 }
 ```
 
@@ -412,6 +415,7 @@ The host **MUST** reject a result unless all of the following hold:
 - If present, `recover_with` names a catalog tool whose `mutates` is `false`.
 - Each `state.series` path is empty or starts with `/`, and paths are unique.
 - If present, `screen.min_rows` is an integer from 6 to 14.
+- If present, `screen.max_rows` is an integer no less than `screen.min_rows` (6 when absent) and no greater than 65535.
 - The encoded result is no larger than 512 KiB.
 
 <a id="s5-4"></a>
@@ -445,13 +449,48 @@ The host uses `mutates` to decide whether approval is needed before a call and w
 
 ### 5.7 `screen`
 
-`screen.min_rows` counts the rows of the terminal the Tick draws on, its own status line included. It excludes anything the client draws around that terminal, such as a card's title line. The host reads the declaration once, when the Tick initializes; later changes are ignored.
+`screen.min_rows` and `screen.max_rows` count the rows of the terminal the Tick draws on, its own status line included. They exclude anything the client draws around that terminal, such as a card's title line. The host reads the declaration once, when the Tick initializes; later changes are ignored.
 
-A client may show a Tick's terminal in a card beside its conversation, as the Monitor does. Such a card is at least `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. For Ticks shown this way:
+A client may show a Tick's terminal in a card beside its conversation, as the Monitor does. Such a card is exactly `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. A Tick that declares `screen.max_rows` may get more rows, up to `screen.max_rows`, when the client has height to spare; a client never takes rows from another card's `min_rows` to grow one. For Ticks shown this way:
 
-- A Tick **MUST NOT** rely on Esc: Esc leaves the card. Go back a level with Backspace.
+- A Tick **MAY** use Esc, but **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick. The first Esc is delivered at once.
+- A Tick **SHOULD** declare key bubbling and bubble the keys listed in [Section 5.8](#s5-8) that it does not use, so the person can move between cards with them.
 - A Tick **MUST** stay usable at 30 columns.
 - A Tick **MUST** redraw its whole screen after `SIGWINCH`, and **SHOULD NOT** repaint when nothing changed.
+
+<a id="s5-8"></a>
+
+### 5.8 Key bubbling
+
+A Tick shown in a card can hand keys it does not use back to the client, which then acts on them, for example by moving to the next card. Key bubbling travels as private OSC sequences in the Tick's terminal output, not as protocol messages, so it works for any program running in a Tick's terminal, extension or not.
+
+Each sequence is `ESC ] 7777 ; tickloop ; <field>` followed by BEL (`0x07`) or ST (`ESC \`), with no spaces:
+
+| Sequence | Meaning |
+| --- | --- |
+| `\x1b]7777;tickloop;bubble=on\x07` | The Tick bubbles the listed keys it does not use. |
+| `\x1b]7777;tickloop;bubble=off\x07` | The Tick bubbles no keys. |
+| `\x1b]7777;tickloop;key=<name>\x07` | The Tick did not use the key `<name>` it just read. |
+
+Key names are `esc`, `up`, `down`, `left`, `right`, `tab` and `backtab` (Shift+Tab).
+
+Rules:
+
+- A Tick declares `bubble=on` once it is ready for input, typically at startup. The declaration holds for the rest of the instance, across views and resizes, until the Tick writes `bubble=off`. A Tick starts with bubbling off.
+- A Tick **SHOULD** write `key=<name>` right after reading one of the listed keys that it does not use in its current state, and **MUST NOT** write it for a key it acted on.
+- The host ignores `key=` while bubbling is off, and unknown fields and key names. It removes every such sequence from the screen it keeps, so views never show them.
+- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice; the Monitor moves between cards and back to its list or input, and leaves Esc's card.
+- Other keys, including letters such as `h`, `j`, `k` and `l`, are never bubbled.
+- A Tick that never declares bubbling works unchanged; the person leaves its card with a double Esc.
+
+The host ignores an OSC longer than 1024 bytes. For example, a Neovim configuration can bubble Esc in Normal mode:
+
+```lua
+vim.api.nvim_create_autocmd('VimEnter', {
+  callback = function() io.stdout:write('\27]7777;tickloop;bubble=on\7') end,
+})
+vim.keymap.set('n', '<Esc>', function() io.stdout:write('\27]7777;tickloop;key=esc\7') end)
+```
 
 <a id="s6"></a>
 
@@ -703,6 +742,7 @@ for line in sys.stdin:
 - [ ] Keep read sequence numbers from moving backwards or falling below the last emitted update.
 - [ ] Do not emit updates for presentation changes such as cursor movement, scrolling, or repaints.
 - [ ] Keep state within a few KiB, expose large content through query tools, and declare time series in `state.series`.
-- [ ] Stay usable at 30 columns and `screen.min_rows` rows, go back with Backspace rather than Esc, and redraw the whole screen after `SIGWINCH`.
+- [ ] Stay usable at 30 columns and `screen.min_rows` rows, declare `screen.max_rows` if more rows help, and redraw the whole screen after `SIGWINCH`.
+- [ ] Never require a double Esc; declare `bubble=on` and bubble `esc`, `up`, `down`, `left`, `right`, `tab` and `backtab` whenever the Tick does not use them.
 - [ ] Run operations longer than 60 seconds in the background and report results through updates.
 - [ ] Exit promptly on `SIGTERM` or standard-input EOF, without relying on shutdown cleanup.

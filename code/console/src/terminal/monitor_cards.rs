@@ -202,6 +202,7 @@ async fn read_frames(
                 screen.parser.process(data.as_bytes());
             }
             Some("gone") => break "Tick ended".to_owned(),
+            Some("bubbling" | "bubble") => continue,
             _ => {
                 break event["error"]["message"]
                     .as_str()

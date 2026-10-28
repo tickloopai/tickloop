@@ -3000,6 +3000,7 @@ mod manual_admission_tests {
                 instance: instance.clone(),
                 title: None,
                 min_rows: None,
+                max_rows: None,
             });
         assert_eq!(
             manual_eligibility(&snapshot, &instance),

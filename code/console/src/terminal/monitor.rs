@@ -3530,6 +3530,7 @@ mod scrolling_tests {
                     title: Some(format!("Tick {index:03}")),
                     is_terminal: false,
                     min_rows: None,
+                    max_rows: None,
                 });
         }
         monitor.set_chat_status(Arc::new(status));

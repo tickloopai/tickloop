@@ -368,6 +368,7 @@ fn a_card_stays_open_while_its_row_is_on_a_page_the_monitor_has_not_loaded() {
                 title: Some(format!("Tick {index:03}")),
                 is_terminal: false,
                 min_rows: None,
+                max_rows: None,
             });
     }
     state.monitor.set_chat_status(Arc::new(status));

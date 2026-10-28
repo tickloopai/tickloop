@@ -1273,6 +1273,107 @@ async fn shrinking_a_view_keeps_the_newest_output_of_a_scrolling_program_in_view
     shutdown(&fixture).await;
 }
 
+/// Paints the attached view's frames until another event comes, and returns that event.
+async fn view_signal(events: &mut BufReader<OwnedReadHalf>, view: &mut vt100::Parser) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = read_frame(events, BUSINESS_FRAME_BYTES)
+                .await
+                .unwrap()
+                .expect("the view stays attached");
+            if event["event"] != "frame" {
+                return event;
+            }
+            view.process(event["data"].as_str().unwrap().as_bytes());
+        }
+    })
+    .await
+    .expect("the view was never told a key-bubbling signal")
+}
+
+/// A Tick's key-bubbling sequences never reach the screen. Every view learns whether the Tick
+/// bubbles keys, when it attaches and when that changes; each bubbled key goes only to the view
+/// that typed last, and unknown names to none.
+#[tokio::test(flavor = "multi_thread")]
+async fn bubbled_keys_reach_the_view_that_typed_last_and_never_the_screen() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let opened = fixture
+        .open_terminal(
+            &mut controller,
+            &[
+                "/bin/sh",
+                "-c",
+                r#"stty -echo; printf 'ready\033]7777;tickloop;bubble=on\007'
+while read line; do
+  if [ "$line" = off ]; then printf '\033]7777;tickloop;bubble=off\033\\'
+  else printf '\033]7777;tickloop;key=%s\033\\' "$line"; fi
+  printf ' got-%s' "$line"
+done"#,
+            ],
+        )
+        .await;
+    let (mut first_events, mut first_requests) =
+        attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut first = vt100::Parser::new(30, 120, 0);
+    assert_eq!(
+        view_signal(&mut first_events, &mut first).await,
+        json!({"event":"bubbling","enabled":true})
+    );
+    let (mut second_events, mut second_requests) =
+        attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut second = vt100::Parser::new(30, 120, 0);
+    assert_eq!(
+        view_signal(&mut second_events, &mut second).await,
+        json!({"event":"bubbling","enabled":true}),
+        "a view that attaches later is told at once"
+    );
+
+    send(
+        &mut first_requests,
+        json!({"method":"input","params":{"data":b"down\n".to_vec()}}),
+    )
+    .await;
+    assert_eq!(
+        view_signal(&mut first_events, &mut first).await,
+        json!({"event":"bubble","key":"down"})
+    );
+    view_shows(&mut second_events, &mut second, "got-down").await;
+    send(
+        &mut second_requests,
+        json!({"method":"input","params":{"data":b"enter\nesc\n".to_vec()}}),
+    )
+    .await;
+    assert_eq!(
+        view_signal(&mut second_events, &mut second).await,
+        json!({"event":"bubble","key":"esc"}),
+        "an unknown name is not bubbled"
+    );
+    view_shows(&mut first_events, &mut first, "got-esc").await;
+    assert_eq!(
+        first.screen().contents(),
+        "ready got-down got-enter got-esc",
+        "no sequence reaches the screen"
+    );
+
+    send(
+        &mut first_requests,
+        json!({"method":"input","params":{"data":b"off\nup\n".to_vec()}}),
+    )
+    .await;
+    for (events, view) in [
+        (&mut first_events, &mut first),
+        (&mut second_events, &mut second),
+    ] {
+        assert_eq!(
+            view_signal(events, view).await,
+            json!({"event":"bubbling","enabled":false})
+        );
+        view_shows(events, view, "got-up").await;
+    }
+    shutdown(&fixture).await;
+}
+
 /// The owner lets a view attach to its Tick's terminal without handing out the Tick's data
 /// token: every grant admits its own view once, only to attach and only for the Tick it names,
 /// and a newer grant leaves earlier ones usable, so the views of several grants are attached at

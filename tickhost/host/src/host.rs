@@ -19,7 +19,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tick_protocol::InstanceRef;
+use tick_protocol::{InstanceRef, KeySignal};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
@@ -38,7 +38,7 @@ use tokio::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
     process::{Child, Command},
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -88,6 +88,9 @@ const UNTITLED_TICK: &str = "an opening Tick";
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// The key-bubbling signals a view may have waiting; a view that reads none of them misses the
+/// signals after them.
+const VIEW_SIGNALS: usize = 16;
 /// How long a terminal Tick's program may hold off input written for it before the write is
 /// abandoned, well within the reader's control timeout.
 const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1463,10 +1466,15 @@ async fn drain_terminal(tick: Arc<HostedTick>) {
             read = tick.pty.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
+                    let mut signals = Vec::new();
                     tick.change_screen(|screen| {
-                        screen.process(&buffer[..count]);
+                        signals = screen.process(&buffer[..count]);
                         true
                     });
+                    if !signals.is_empty() {
+                        let mut views = tick.views.lock().unwrap();
+                        signals.into_iter().for_each(|signal| views.signal(signal));
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -3018,6 +3026,9 @@ impl Viewed {
 struct ViewLease {
     viewed: Viewed,
     view: u64,
+    /// A Tick's key-bubbling signals for this view, and whether it bubbled keys when the view
+    /// attached; a Shell's screen has none.
+    signals: Option<(mpsc::Receiver<KeySignal>, bool)>,
 }
 
 impl ViewLease {
@@ -3028,18 +3039,24 @@ impl ViewLease {
             size: TerminalSize,
         }
         let Attach { size } = parameters(params)?;
-        let (view, followed) = match &viewed {
+        let (view, signals, followed) = match &viewed {
             Viewed::Tick(tick) => {
                 if tick.terminal_closed.is_cancelled() {
                     return Err(HostError::before("TargetGone", "the Tick has ended"));
                 }
                 let mut views = tick.views.lock().unwrap();
                 let view = views.attach(size);
-                (view, tick.follow_views(&views))
+                let (sender, receiver) = mpsc::channel(VIEW_SIGNALS);
+                let bubbling = views.listen(view, sender);
+                (view, Some((receiver, bubbling)), tick.follow_views(&views))
             }
-            Viewed::Shell(task) => (task.change_views(|views| views.attach(size)), Ok(())),
+            Viewed::Shell(task) => (task.change_views(|views| views.attach(size)), None, Ok(())),
         };
-        let lease = Self { viewed, view };
+        let lease = Self {
+            viewed,
+            view,
+            signals,
+        };
         followed.map(|()| lease)
     }
 
@@ -3103,7 +3120,7 @@ async fn attach_view(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     host: &Arc<Host>,
-    lease: ViewLease,
+    mut lease: ViewLease,
     id: &Value,
 ) -> Result<(), HostError> {
     let viewed = lease.viewed.clone();
@@ -3116,6 +3133,22 @@ async fn attach_view(
         CONTROL_TIMEOUT,
     )
     .await?;
+    // A view takes a Tick to bubble no keys until it is told otherwise.
+    let mut signals = match lease.signals.take() {
+        Some((signals, bubbling)) => {
+            if bubbling {
+                write_within(
+                    &mut writer,
+                    &view_signal_event(KeySignal::Bubbling(true)),
+                    BUSINESS_FRAME_BYTES,
+                    STREAM_WRITE_TIMEOUT,
+                )
+                .await?;
+            }
+            Some(signals)
+        }
+        None => None,
+    };
     let output = async {
         let mut shown = None;
         loop {
@@ -3136,8 +3169,25 @@ async fn attach_view(
                 )
                 .await?;
             }
-            if changes.changed().await.is_err() {
-                return Ok(());
+            let next_signal = async {
+                match &mut signals {
+                    Some(signals) => signals.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = changes.changed() => if changed.is_err() {
+                    return Ok(());
+                },
+                Some(signal) = next_signal => {
+                    write_within(
+                        &mut writer,
+                        &view_signal_event(signal),
+                        BUSINESS_FRAME_BYTES,
+                        STREAM_WRITE_TIMEOUT,
+                    )
+                    .await?;
+                }
             }
         }
     };
@@ -3184,6 +3234,15 @@ async fn attach_view(
         .await;
     }
     outcome
+}
+
+/// The view event that tells a view a Tick's key-bubbling signal: `bubbling` whether it bubbles
+/// keys, `bubble` a key it bubbled.
+fn view_signal_event(signal: KeySignal) -> Value {
+    match signal {
+        KeySignal::Bubbling(enabled) => json!({"event":"bubbling","enabled":enabled}),
+        KeySignal::Key(key) => json!({"event":"bubble","key":key.name()}),
+    }
 }
 
 /// Writes one frame unless its reader leaves it unread for `limit`; a stalled reader then loses

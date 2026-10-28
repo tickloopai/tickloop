@@ -149,7 +149,7 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     use tickloop_harness_protocol::MonitorMembership;
     let saved: MonitorMembership = serde_json::from_value(serde_json::json!({
         "members": [
-            { "instance": "hosted:opened", "source": "opened", "title": "Quotes", "min_rows": 9 },
+            { "instance": "hosted:opened", "source": "opened", "title": "Quotes", "min_rows": 9, "max_rows": 30 },
             { "instance": "hosted:added", "source": "added" },
         ],
         "removed": ["hosted:hidden"],
@@ -163,12 +163,14 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
                 instance: "hosted:opened".parse().unwrap(),
                 title: Some("Quotes".into()),
                 min_rows: Some(9),
+                max_rows: Some(30),
             },
             MonitorMember {
                 is_terminal: false,
                 instance: "hosted:added".parse().unwrap(),
                 title: None,
                 min_rows: None,
+                max_rows: None,
             },
         ]
     );
@@ -176,7 +178,7 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     assert!(
         serde_json::to_string(&saved.members[1]).unwrap()
             == r#"{"is_terminal":false,"instance":"hosted:added"}"#,
-        "an undeclared minimum is left out"
+        "an undeclared minimum and maximum are left out"
     );
     assert!(
         !serde_json::to_string(&saved).unwrap().contains("source"),
