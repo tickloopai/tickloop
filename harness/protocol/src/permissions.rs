@@ -42,6 +42,16 @@ impl ExecutionMode {
             .find(|mode| *mode != self && enabled.contains(mode))
     }
 
+    /// The mode leaving Plan continues in: the mode Plan was entered from, Ask when that is
+    /// unknown, as Claude Code's `prePlanMode ?? "default"`. Outside Plan, the mode itself.
+    pub const fn leaving_plan(self, mode_before_plan: Option<Self>) -> Self {
+        match (self, mode_before_plan) {
+            (Self::Plan, Some(mode)) => mode,
+            (Self::Plan, None) => Self::AcceptEdits,
+            (mode, _) => mode,
+        }
+    }
+
     /// Whether Auto's admission and review decide what this mode would otherwise ask about: in
     /// Auto, and in Plan with Claude Code's `useAutoModeDuringPlan`, which is on by default.
     pub const fn uses_auto_admission(self, use_auto_mode_during_plan: bool) -> bool {

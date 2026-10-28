@@ -28,46 +28,30 @@ const PROCESS_LOCAL_TASKS_NOTE: &str =
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanApprovalChoice {
-    Auto,
-    Ask,
-    FullAccess,
+    Approve,
     KeepPlanning,
 }
 
-/// "Keep planning" is always the last choice; the plan dialog takes its feedback there.
-pub(super) const PLAN_APPROVAL_CHOICES: [PlanApprovalChoice; 4] = [
-    PlanApprovalChoice::Auto,
-    PlanApprovalChoice::Ask,
-    PlanApprovalChoice::FullAccess,
+/// As in Claude Code, the plan is approved in the mode the Chat entered Plan from; "Keep
+/// planning" is always the last choice, and the plan dialog takes its feedback there.
+pub(super) const PLAN_APPROVAL_CHOICES: [PlanApprovalChoice; 2] = [
+    PlanApprovalChoice::Approve,
     PlanApprovalChoice::KeepPlanning,
 ];
 
-/// The choice Shift+Tab approves with from the feedback field: Claude Code's accept-edits
-/// approval, Ask here.
+/// The choice Shift+Tab approves with from the feedback field: the only approval.
 pub(super) fn feedback_approval_index() -> usize {
     PLAN_APPROVAL_CHOICES
         .iter()
-        .position(|choice| *choice == PlanApprovalChoice::Ask)
-        .expect("plan approval offers Ask")
+        .position(|choice| *choice == PlanApprovalChoice::Approve)
+        .expect("plan approval offers an approval")
 }
 
 impl PlanApprovalChoice {
-    /// The execution mode the approval starts with; keeping planning starts none.
-    fn mode(self) -> Option<ExecutionMode> {
+    fn label(self, approval_mode: ExecutionMode) -> String {
         match self {
-            Self::Auto => Some(ExecutionMode::Auto),
-            Self::Ask => Some(ExecutionMode::AcceptEdits),
-            Self::FullAccess => Some(ExecutionMode::FullAccess),
-            Self::KeepPlanning => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Approve and start · Auto",
-            Self::Ask => "Approve and start · Ask",
-            Self::FullAccess => "Approve and start · Full Access",
-            Self::KeepPlanning => "No, keep planning",
+            Self::Approve => format!("Yes, approve · {}", approval_mode.label()),
+            Self::KeepPlanning => "No, keep planning".into(),
         }
     }
 }
@@ -92,6 +76,8 @@ pub(super) enum Workflow {
         request: Option<Uuid>,
         /// The reviewed plan, which the editor opens.
         markdown: String,
+        /// The mode the dialog's approval names and starts the plan in.
+        approval_mode: ExecutionMode,
     },
     PlanView {
         chat: Uuid,
@@ -289,12 +275,13 @@ impl Workflow {
                     && request.loop_id == chat_loop
             })
             .map(|request| request.id);
+        let approval_mode = status.policy.mode.leaving_plan(status.mode_before_plan);
         let mut menu = menu(
             "Plan approval",
             context,
             PLAN_APPROVAL_CHOICES
                 .iter()
-                .map(|choice| choice.label().into())
+                .map(|choice| choice.label(approval_mode))
                 .collect(),
         );
         menu.markdown = markdown;
@@ -306,6 +293,7 @@ impl Workflow {
                 version: plan.version,
                 request,
                 markdown: plan.markdown.clone(),
+                approval_mode,
             },
         ))
     }
@@ -532,12 +520,17 @@ impl Workflow {
                     }
                 }
             }
-            Self::Plan { chat, version, .. } => {
+            Self::Plan {
+                chat,
+                version,
+                approval_mode: mode,
+                ..
+            } => {
                 let choice = PLAN_APPROVAL_CHOICES
                     .get(index)
                     .ok_or("Invalid plan selection.")?;
                 let feedback = feedback.filter(|text| !text.trim().is_empty());
-                let Some(mode) = choice.mode() else {
+                if *choice == PlanApprovalChoice::KeepPlanning {
                     // As in Claude Code, keeping planning needs feedback; without it the review
                     // stays open rather than cancelling the waiting Run as Esc does.
                     if feedback.is_none() {
@@ -549,7 +542,7 @@ impl Workflow {
                         .await
                         .map_err(|error| error.to_string())?;
                     return Ok(effect);
-                };
+                }
                 let approval = agent
                     .approve_plan(chat, version, mode, feedback)
                     .await
@@ -2657,10 +2650,9 @@ mod tests {
         ]));
         let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        agent
-            .set_execution_mode(chat, ExecutionMode::Plan)
-            .await
-            .unwrap();
+        for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+            agent.set_execution_mode(chat, mode).await.unwrap();
+        }
         let mut events = agent.subscribe();
         let run = agent.submit(chat, "Prepare a plan.".into()).await.unwrap();
         async fn approval(
@@ -2685,18 +2677,13 @@ mod tests {
         let (stale_menu, stale) = Workflow::plan(&agent, chat).await.unwrap();
         assert_eq!(
             stale_menu.options,
-            [
-                "Approve and start · Auto",
-                "Approve and start · Ask",
-                "Approve and start · Full Access",
-                "No, keep planning"
-            ]
+            ["Yes, approve · Auto", "No, keep planning"]
         );
         let (console, _) = Console::start(false).unwrap();
         let (_, review) = Workflow::plan(&agent, chat).await.unwrap();
         assert!(
             review
-                .choose_with_feedback(&agent, &console, Some(3), Some("Add the summary.".into()))
+                .choose_with_feedback(&agent, &console, Some(1), Some("Add the summary.".into()))
                 .await
                 .unwrap()
                 .receipt
@@ -2763,14 +2750,45 @@ mod tests {
         let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies));
         let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        agent
-            .set_execution_mode(chat, ExecutionMode::Plan)
-            .await
-            .unwrap();
+        for mode in [ExecutionMode::Auto, ExecutionMode::Plan] {
+            agent.set_execution_mode(chat, mode).await.unwrap();
+        }
         let mut events = agent.subscribe();
         agent.submit(chat, "Prepare a plan.".into()).await.unwrap();
         plan_approval_requested(&mut events).await;
         (directory, model, agent, chat, events)
+    }
+
+    #[tokio::test]
+    async fn the_plan_dialog_approves_only_in_the_mode_plan_was_entered_from() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
+            tickloop_harness::test_support::submit_plan("p1", "Read notes first."),
+            tickloop_harness::test_support::text("Approved implementation finished."),
+        ]));
+        let agent = Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
+            agent.set_execution_mode(chat, mode).await.unwrap();
+        }
+        let mut events = agent.subscribe();
+        agent.submit(chat, "Prepare a plan.".into()).await.unwrap();
+        plan_approval_requested(&mut events).await;
+        let (console, _) = Console::start(false).unwrap();
+        let (menu, review) = Workflow::plan(&agent, chat).await.unwrap();
+        assert_eq!(
+            menu.options,
+            ["Yes, approve · Full Access", "No, keep planning"]
+        );
+        review.choose(&agent, &console, Some(0)).await.unwrap();
+        completed(&mut events).await;
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(
+            snapshot.plans[0].approved_execution_mode,
+            Some(ExecutionMode::FullAccess)
+        );
+        assert_eq!(snapshot.policy.mode, ExecutionMode::FullAccess);
+        agent.shutdown().await;
     }
 
     #[tokio::test]
@@ -2829,20 +2847,23 @@ mod tests {
         assert_eq!(menu.markdown.as_deref(), Some(edited));
         assert!(matches!(edited_review, Workflow::Plan { version: 2, .. }));
 
-        let ask = PLAN_APPROVAL_CHOICES
-            .iter()
-            .position(|choice| *choice == PlanApprovalChoice::Ask)
-            .unwrap();
         edited_review
-            .choose_with_feedback(&agent, &console, Some(ask), Some("Keep it short.".into()))
+            .choose_with_feedback(
+                &agent,
+                &console,
+                Some(feedback_approval_index()),
+                Some("Keep it short.".into()),
+            )
             .await
             .unwrap();
         completed(&mut events).await;
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(
             snapshot.plans[0].approved_execution_mode,
-            Some(ExecutionMode::AcceptEdits)
+            Some(ExecutionMode::Auto),
+            "Shift+Tab approves in the mode Plan was entered from"
         );
+        assert_eq!(snapshot.policy.mode, ExecutionMode::Auto);
         let requests = model.requests.lock().unwrap().clone();
         assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult {tool_use_id, content, is_error:false} if tool_use_id == "p1" && content.text().contains(&format!("## Approved Plan (edited by user):\n{edited}\n\nUser feedback on this plan: Keep it short.")))));
         agent.shutdown().await;

@@ -25,7 +25,9 @@ impl Agent {
     /// What the Chat is doing now, without its history.
     pub async fn status(&self, chat: ChatId) -> Result<ChatStatus, AgentError> {
         let chats = self.inner.chats.lock().await;
-        let mut status = ChatStatus::of(&chats.get(&chat).ok_or(AgentError::NotFound)?.snapshot);
+        let read = chats.get(&chat).ok_or(AgentError::NotFound)?;
+        let mut status = ChatStatus::of(&read.snapshot);
+        status.mode_before_plan = read.mode_before_plan;
         status.task_board = shared_tasks::view(&chats, chat);
         status.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(status)

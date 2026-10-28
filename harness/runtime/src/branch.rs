@@ -126,6 +126,7 @@ impl Agent {
             scheduled_tasks: Vec::new(),
             scheduled_task_revocations: Vec::new(),
             task_board: None,
+            mode_before_plan: None,
             goal: None,
             goal_history: Vec::new(),
             family_inputs: BTreeMap::new(),

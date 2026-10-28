@@ -2483,6 +2483,12 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     })
     .await
     .unwrap();
+    // Plan was entered from the starting Ask mode, which the only approval continues in.
+    assert!(
+        transcript.contains("1. Yes, approve · Ask"),
+        "the plain dialog offers one approval in the mode Plan was entered from\n{transcript}"
+    );
+    assert!(!transcript.contains("approve · Auto"), "{transcript}");
     // Plain output keeps the plan's Markdown source.
     for source in [
         "## Steps",
@@ -2491,7 +2497,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
         assert!(transcript.contains(source), "{source}\n{transcript}");
     }
     assert!(!directory.path().join("reviewed.txt").exists());
-    input.write_all(b"2\n").await.unwrap();
+    input.write_all(b"1\n").await.unwrap();
     drop(input);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while let Some(line) = output.next_line().await.unwrap() {

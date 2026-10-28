@@ -315,6 +315,7 @@ mod tests {
                         version: 1,
                         request: None,
                         markdown: String::new(),
+                        approval_mode: tickloop_harness::protocol::ExecutionMode::Auto,
                     },
                 ),
             )

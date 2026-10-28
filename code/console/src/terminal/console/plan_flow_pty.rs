@@ -1,8 +1,9 @@
 //! The Plan hand-off through the real View loop and a PTY: Shift+Tab enters Plan while a Run is
 //! working, ExitPlanMode opens the approval in the Agent's Input Dialog by itself, feedback keeps
-//! planning, approval resumes the same Run in the chosen mode, leaving Plan by Shift+Tab tells the
-//! next request once that plan mode ended, and a cancelled, re-attached or restored approval stays
-//! pending until it is approved, a restored one as an explicit continuation.
+//! planning, approval resumes the same Run in the mode Plan was entered from, leaving Plan by
+//! Shift+Tab tells the next request once that plan mode ended, and a cancelled, re-attached or
+//! restored approval stays pending until it is approved, a restored one as an explicit
+//! continuation.
 use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture};
 use super::*;
 use serde_json::{Value, json};
@@ -75,9 +76,9 @@ fn record_phase(directory: &Path, phase: &str) {
 async fn run_plan_flow_fixture(directory: PathBuf) {
     record_phase(&directory, "fixture-started");
     let route = std::fs::read_to_string(directory.join(ROUTE_FILE)).unwrap();
-    let (initial_mode, replies) = match route.as_str() {
+    let (initial_modes, replies) = match route.as_str() {
         SHIFT_TAB_ROUTE => (
-            ExecutionMode::Auto,
+            &[ExecutionMode::Auto][..],
             vec![
                 tickloop_harness::test_support::call(
                     "wait",
@@ -102,7 +103,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
             ],
         ),
         CANCEL_ROUTE => (
-            ExecutionMode::Plan,
+            &[ExecutionMode::Plan][..],
             vec![
                 tickloop_harness::test_support::submit_plan(
                     "plan",
@@ -111,15 +112,16 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
                 tickloop_harness::test_support::text("Continuing the approved plan."),
             ],
         ),
+        // Plan entered from Auto, which the approval continues in.
         ATTACH_ROUTE => (
-            ExecutionMode::Plan,
+            &[ExecutionMode::Auto, ExecutionMode::Plan][..],
             vec![
                 tickloop_harness::test_support::submit_plan("plan", LIVE_PLAN),
                 tickloop_harness::test_support::text("Implementation started."),
             ],
         ),
         RESTORED_ROUTE => (
-            ExecutionMode::Plan,
+            &[ExecutionMode::Plan][..],
             vec![tickloop_harness::test_support::text(
                 "Restored implementation started.",
             )],
@@ -183,7 +185,9 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         }
         None => {
             let chat = agent.create_chat(directory.clone()).await.unwrap();
-            agent.set_execution_mode(chat, initial_mode).await.unwrap();
+            for mode in initial_modes {
+                agent.set_execution_mode(chat, *mode).await.unwrap();
+            }
             chat
         }
     };
@@ -202,7 +206,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
         &console,
         Some(&model),
         &directory,
-        initial_mode,
+        *initial_modes.last().expect("a flow starts in a mode"),
         vec![],
     )
     .unwrap();
@@ -503,16 +507,15 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     assert_eq!(requests[1]["offers_exit_plan_mode"], true);
     assert_eq!(state["permissions"], json!(["ExitPlanMode"]));
     assert_eq!(frame.matches("Plan approval").count(), 1, "{frame}");
-    for option in [
-        "Approve and start · Auto",
-        "Approve and start · Ask",
-        "Approve and start · Full Access",
-        "No, keep planning",
-    ] {
+    // Plan was entered from Ask, so the only approval continues in Ask.
+    for option in ["Yes, approve · Ask", "No, keep planning"] {
         assert!(frame.contains(option), "{option}\n{frame}");
     }
+    for option in ["approve · Auto", "approve · Full Access"] {
+        assert!(!frame.contains(option), "{option}\n{frame}");
+    }
 
-    flow.fixture.send(b"jjj\r");
+    flow.fixture.send(b"j\r");
     flow.fixture.send(b"Add a test note");
     flow.wait("typed feedback", |frame, _| {
         frame.contains("Add a test note")
@@ -539,7 +542,7 @@ fn plan_flow_pty_shift_tab_plans_mid_run_then_feedback_and_approval_resume_the_s
     assert!(!dialog.contains("Add a test note"), "{frame}");
     assert_eq!(state["mode"], "plan");
 
-    flow.fixture.send(b"j\r");
+    flow.fixture.send(b"\r");
     let (_, state) = flow.wait("the approved implementation in Ask", |frame, state| {
         frame.contains("Implementation complete.")
             && frame.contains("⏵⏵ Ask · fixture")
@@ -648,7 +651,10 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
     flow.wait("the reopened plan approval", |frame, _| {
         approval_dialog(frame).is_some_and(|dialog| dialog.contains("Pending plan"))
     });
-    flow.fixture.send(b"jj\r");
+    // Outside Plan the approval continues in the current mode.
+    let frame = flow.fixture.frame();
+    assert!(frame.contains("Yes, approve · Full Access"), "{frame}");
+    flow.fixture.send(b"\r");
     let (_, state) = flow.wait(
         "the approved continuation in Full Access",
         |frame, state| {
@@ -697,6 +703,7 @@ fn plan_flow_pty_a_view_attaching_to_a_waiting_approval_resumes_the_same_run() {
     }
     assert_eq!(state["permissions"], json!(["ExitPlanMode"]), "{state}");
     assert_eq!(state["requests"].as_array().unwrap().len(), 1, "{state}");
+    assert!(dialog.contains("Yes, approve · Auto"), "{frame}");
 
     flow.fixture.send(b"\r");
     let (_, state) = flow.wait("the approved Run in Auto", |frame, state| {
@@ -736,7 +743,10 @@ fn plan_flow_pty_a_restarted_daemon_reopens_the_pending_approval_and_continues_e
         json!([{"version": 1, "pending": true, "approved": null}])
     );
 
-    flow.fixture.send(b"j\r");
+    // A restart forgets the mode Plan was entered from, so the approval falls back to Ask.
+    let frame = flow.fixture.frame();
+    assert!(frame.contains("Yes, approve · Ask"), "{frame}");
+    flow.fixture.send(b"\r");
     flow.wait("the receiving continuation prompt", |frame, _| {
         frame.contains("Continue Chat?") && frame.contains("Continue receiving")
     });

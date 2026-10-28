@@ -1,7 +1,7 @@
 use super::*;
 
-const KEEP_PLANNING: usize = 3;
-const FEEDBACK_APPROVAL: usize = 1;
+const KEEP_PLANNING: usize = 1;
+const FEEDBACK_APPROVAL: usize = 0;
 
 fn plan_review(selected: usize) -> (Console, Uuid, Arc<Mutex<Vec<String>>>) {
     let console = tests::console_with_state(State::new(true, 80, 24));
@@ -12,12 +12,7 @@ fn plan_review(selected: usize) -> (Console, Uuid, Arc<Mutex<Vec<String>>>) {
                 id,
                 title: "Plan approval".into(),
                 context: vec!["Plan version: 1".into(), "Original plan".into()],
-                options: vec![
-                    "Approve and start · Auto".into(),
-                    "Approve and start · Ask".into(),
-                    "Approve and start · Full Access".into(),
-                    "No, keep planning".into(),
-                ],
+                options: vec!["Yes, approve · Auto".into(), "No, keep planning".into()],
                 selected,
                 confirmation: true,
                 markdown: None,
@@ -121,7 +116,7 @@ fn the_feedback_field_needs_text_to_keep_planning_and_shift_tab_approves_with_it
     let hint = hint_row(&mut state);
     for part in [
         "enter keep planning",
-        "shift+tab approve in Ask",
+        "shift+tab approve in Auto",
         "esc close",
     ] {
         assert!(hint.contains(part), "{part}: {hint}");
