@@ -46,6 +46,32 @@ fn tool(name: &str, description: &str) -> ToolDefinition {
     }
 }
 
+struct WordCounter;
+
+impl tickloop_harness_protocol::ContextTokenCounter for WordCounter {
+    fn name(&self) -> &'static str {
+        "words"
+    }
+
+    fn text_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+}
+
+#[test]
+fn only_responses_counts_a_deferred_tool_in_context_and_only_its_name_and_description() {
+    let weather = tool(WEATHER, "Current weather for a city");
+    let tokens = |protocol| {
+        tickloop_harness_model::native_tool_search::deferred_tool_context_tokens(
+            protocol,
+            &WordCounter,
+            &weather,
+        )
+    };
+    assert_eq!(tokens(Protocol::Responses), 1 + 5);
+    assert_eq!(tokens(Protocol::Messages), 0);
+}
+
 fn catalog_model(root: &Path, provider: &str, model: &str, endpoint: String) -> ModelConfig {
     let mut config = ModelCatalog::defaults().get(provider, model).unwrap();
     if !config.api_key_env.is_empty() {

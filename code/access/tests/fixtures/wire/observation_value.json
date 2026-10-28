@@ -1123,6 +1123,10 @@
           "tokens": 6000
         },
         {
+          "category": "tool_search_index",
+          "tokens": 100
+        },
+        {
           "category": "tool_search_results",
           "tokens": 1000
         },
@@ -1150,6 +1154,17 @@
             {
               "name": "mcp__office__open",
               "tokens": 300
+            }
+          ]
+        }
+      ],
+      "tool_search_index": [
+        {
+          "server": "market",
+          "tools": [
+            {
+              "name": "mcp__market__quote",
+              "tokens": 100
             }
           ]
         }

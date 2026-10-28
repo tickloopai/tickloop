@@ -935,6 +935,10 @@ fn context_breakdown() -> ContextBreakdown {
                 tokens: 6_000,
             },
             ContextCategoryUsage {
+                category: ContextCategory::ToolSearchIndex,
+                tokens: 100,
+            },
+            ContextCategoryUsage {
                 category: ContextCategory::ToolSearchResults,
                 tokens: 1_000,
             },
@@ -953,6 +957,10 @@ fn context_breakdown() -> ContextBreakdown {
         mcp_tools: vec![ContextToolServer {
             server: "office".into(),
             tools: vec![context_item("mcp__office__open", 300)],
+        }],
+        tool_search_index: vec![ContextToolServer {
+            server: "market".into(),
+            tools: vec![context_item("mcp__market__quote", 100)],
         }],
         instruction_files: vec![context_item("/work/project/AGENTS.md", 2_000)],
         skills: vec![context_item("tickloop", 120)],

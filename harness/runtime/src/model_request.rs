@@ -6,12 +6,12 @@ use tokio_util::sync::CancellationToken;
 use super::{Agent, AgentError};
 use tickloop_harness_model::{
     ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
-    ModelRequestContext, ModelResponseRejection,
+    ModelRequestContext, ModelResponseRejection, native_tool_search,
 };
 use tickloop_harness_protocol::{
     ChatId, ChatSnapshot, Content, Event, EventKind, LedgerError, Message, ModelIdentity,
-    ModelRequestKind, ProtocolFailure, Receipt, RequestFailure, RequestOutcome, RequestOwner,
-    RequestSequence, RequestUsageLedger, ResponseRejection, Role, UsageCounter,
+    ModelRequestKind, Protocol, ProtocolFailure, Receipt, RequestFailure, RequestOutcome,
+    RequestOwner, RequestSequence, RequestUsageLedger, ResponseRejection, Role, UsageCounter,
 };
 
 const MODEL_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
@@ -736,7 +736,9 @@ impl Agent {
         let request_tokens = match tickloop_harness_protocol::context_token_counter()
             .filter(|_| request_bytes.is_some())
         {
-            Some(counter) => Some(count_request_tokens(counter, &request).await?),
+            Some(counter) => {
+                Some(count_request_tokens(counter, client.identity().protocol, &request).await?)
+            }
             None => None,
         };
         let was_cancelled = {
@@ -1036,17 +1038,23 @@ impl Agent {
 }
 
 /// The tokens of a conversation request, and of its system prompt and tool definitions, counted
-/// off the executor: a long Chat's first request after loading counts every message once.
+/// off the executor: a long Chat's first request after loading counts every message once. Deferred
+/// tools count as much as the service carrying them over `protocol` counts, as `/context` does.
 async fn count_request_tokens(
     counter: &'static dyn tickloop_harness_protocol::ContextTokenCounter,
+    protocol: Protocol,
     request: &ModelRequest,
 ) -> Result<(usize, usize), AgentError> {
     let messages = request.messages.clone();
     let tools = request.tools.clone();
+    let deferred_tools = request.deferred_tools.clone();
     tokio::task::spawn_blocking(move || {
         let definitions = tools
             .iter()
             .map(|tool| counter.definition_tokens(tool))
+            .chain(deferred_tools.iter().map(|tool| {
+                native_tool_search::deferred_tool_context_tokens(protocol, counter, tool)
+            }))
             .sum::<usize>();
         let system = messages
             .first()
@@ -1579,6 +1587,115 @@ mod tests {
             }
             agent.shutdown().await;
         }
+    }
+
+    /// Counts whitespace-separated words, so expected counts are easy to read.
+    struct WordCounter;
+
+    impl tickloop_harness_protocol::ContextTokenCounter for WordCounter {
+        fn name(&self) -> &'static str {
+            "words"
+        }
+
+        fn text_tokens(&self, text: &str) -> usize {
+            text.split_whitespace().count()
+        }
+    }
+
+    static WORD_COUNTER: WordCounter = WordCounter;
+
+    /// About Chat 01a17fd4's first Sol request: ~27k tokens of its own and 180 deferred MCP
+    /// tools whose names and descriptions take ~97 tokens each, which the service reported as
+    /// ~44.7k input tokens.
+    fn native_search_request() -> ModelRequest {
+        let words = |count: usize| vec!["word"; count].join(" ");
+        let mut request = empty_request();
+        request.messages = vec![
+            Message {
+                role: Role::System,
+                content: vec![Content::Text { text: words(6_000) }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: words(21_000),
+                }],
+            },
+        ];
+        request.tools = vec![tickloop_harness_protocol::ToolDefinition {
+            name: "Read".into(),
+            description: "reads files".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.deferred_tools = (0..180)
+            .map(|index| tickloop_harness_protocol::ToolDefinition {
+                name: format!("mcp__longbridge__tool_{index}"),
+                description: words(96),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"symbol": {"type": "string", "description": words(300)}},
+                }),
+            })
+            .collect();
+        request
+    }
+
+    #[tokio::test]
+    async fn responses_requests_count_each_deferred_tool_by_its_name_and_description() {
+        let request = native_search_request();
+        let mut without_deferred = request.clone();
+        without_deferred.deferred_tools.clear();
+        let (local, local_overhead) =
+            count_request_tokens(&WORD_COUNTER, Protocol::Responses, &without_deferred)
+                .await
+                .unwrap();
+        let (total, overhead) = count_request_tokens(&WORD_COUNTER, Protocol::Responses, &request)
+            .await
+            .unwrap();
+        let index = request
+            .deferred_tools
+            .iter()
+            .map(|tool| {
+                native_tool_search::deferred_tool_context_tokens(
+                    Protocol::Responses,
+                    &WORD_COUNTER,
+                    tool,
+                )
+            })
+            .sum::<usize>();
+        assert_eq!(index, 180 * 97);
+        assert_eq!(total, local + index);
+        assert_eq!(
+            overhead,
+            local_overhead + index,
+            "deferred tools sit in the prefix"
+        );
+
+        let reported_input = 44_700_f64;
+        let calibration = reported_input / total as f64;
+        assert!(
+            (0.98..1.03).contains(&calibration),
+            "calibration {calibration} with the index counted"
+        );
+        assert!(
+            reported_input / local as f64 > 1.6,
+            "without it the calibration ratio inflates"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_requests_count_deferred_tools_as_nothing() {
+        let request = native_search_request();
+        let mut without_deferred = request.clone();
+        without_deferred.deferred_tools.clear();
+        assert_eq!(
+            count_request_tokens(&WORD_COUNTER, Protocol::Messages, &request)
+                .await
+                .unwrap(),
+            count_request_tokens(&WORD_COUNTER, Protocol::Messages, &without_deferred)
+                .await
+                .unwrap()
+        );
     }
 
     fn empty_request() -> ModelRequest {
