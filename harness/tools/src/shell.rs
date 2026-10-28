@@ -1622,6 +1622,14 @@ fn process_output(
     })
 }
 
+/// Names that the file-write permission checks treat as sensitive.
+pub(crate) fn sensitive_write_names() -> impl Iterator<Item = &'static str> {
+    path_constraints::DANGEROUS_FILES
+        .iter()
+        .chain(path_constraints::DANGEROUS_DIRECTORIES.iter())
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io::Write, time::Duration};
@@ -2639,12 +2647,4 @@ mod tests {
         let stopped = registry.stop_user(operation_id, chat_id).await.unwrap();
         assert_eq!(stopped.reason.as_deref(), Some("cancelled"));
     }
-}
-
-/// Names that the file-write permission checks treat as sensitive.
-pub(crate) fn sensitive_write_names() -> impl Iterator<Item = &'static str> {
-    path_constraints::DANGEROUS_FILES
-        .iter()
-        .chain(path_constraints::DANGEROUS_DIRECTORIES.iter())
-        .copied()
 }
