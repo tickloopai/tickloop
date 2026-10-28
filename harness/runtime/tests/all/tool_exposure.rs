@@ -5,7 +5,7 @@ use tickloop_harness_runtime::tool_exposure::{ExposureDirectory, ExposureTool, S
 
 fn tool(name: &str, description: &str, exposure: ToolExposure) -> ExposureTool {
     ExposureTool {
-        server: "office".into(),
+        server: Some("office".into()),
         original_name: name.into(),
         definition: Arc::new(ToolDefinition {
             name: format!("mcp__office__{name}"),
@@ -1425,10 +1425,13 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
         assert!(native_request.tools.iter().all(|tool| {
             !tool.name.starts_with("mcp__") && !fold_tools.contains(&tool.name.as_str())
         }));
+        let deferred = serde_json::to_value(&native_request.deferred_tools).unwrap();
+        assert_eq!(deferred[0]["name"], "EnterPlanMode");
         assert_eq!(
-            serde_json::to_value(&native_request.deferred_tools).unwrap(),
-            json!([{"name":"mcp__office__mail","description":"Send email","input_schema":original_schema}])
+            deferred[1],
+            json!({"name":"mcp__office__mail","description":"Send email","input_schema":original_schema})
         );
+        assert_eq!(deferred.as_array().unwrap().len(), 2);
         assert_eq!(
             serde_json::to_vec(&native_request.tools).unwrap(),
             serde_json::to_vec(&native_requests[0].tools).unwrap()
@@ -1448,7 +1451,7 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
 
 fn server_tool(server: &str, name: &str, description: &str) -> ExposureTool {
     let mut tool = tool(name, description, ToolExposure::Search);
-    tool.server = server.into();
+    tool.server = Some(server.into());
     Arc::make_mut(&mut tool.definition).name = format!("mcp__{server}__{name}");
     tool
 }

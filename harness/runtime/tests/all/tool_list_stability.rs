@@ -465,12 +465,17 @@ async fn native_search_keeps_the_listed_tools_while_deferred_tools_grow_sorted_a
     }
     assert_eq!(
         tool_names(&requests[0].deferred_tools),
-        ["mcp__gamma__beta", "mcp__gamma__zeta"]
+        ["EnterPlanMode", "mcp__gamma__beta", "mcp__gamma__zeta"]
     );
     for request in &requests[1..] {
         assert_eq!(
             tool_names(&request.deferred_tools),
-            ["mcp__delta__omega", "mcp__gamma__beta", "mcp__gamma__zeta"]
+            [
+                "EnterPlanMode",
+                "mcp__delta__omega",
+                "mcp__gamma__beta",
+                "mcp__gamma__zeta"
+            ]
         );
     }
     agent.shutdown().await;

@@ -3639,6 +3639,7 @@ impl Agent {
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
         if let Some(delegation) = &mut snapshot.delegation {
             self.apply_host_rules(&mut delegation.ceiling.policy);
+            delegation.ceiling.policy.plan_without_auto = snapshot.policy.plan_without_auto;
             delegation.ceiling.policy.launch_rules.clear();
             folder = delegation.ceiling.folder.clone();
             let ceiling = delegation.ceiling.clone();

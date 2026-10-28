@@ -759,16 +759,20 @@ fn permission_denial_message(comment: Option<&str>) -> String {
 fn host_tool_decision(
     configured: Option<tickloop_harness_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
-    execution_mode: ExecutionMode,
+    policy: &tickloop_harness_protocol::PermissionPolicy,
     mode_before_plan: Option<ExecutionMode>,
     has_human_input: bool,
 ) -> Decision {
+    let execution_mode = policy.mode;
     if host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty) {
-        // As in Claude Code, Plan decides third-party calls as the mode it was entered from; an
-        // unknown one is treated as Ask.
-        let mode = match execution_mode {
-            ExecutionMode::Plan => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
-            mode => mode,
+        // As in Claude Code, Plan entered from Full Access keeps allowing third-party calls, and
+        // otherwise uses Auto's review unless the user turned that off; then Plan decides them as
+        // the mode it was entered from, an unknown one as Ask.
+        let mode = match (execution_mode, mode_before_plan) {
+            (ExecutionMode::Plan, Some(ExecutionMode::FullAccess)) => ExecutionMode::FullAccess,
+            (ExecutionMode::Plan, _) if policy.uses_auto_admission() => ExecutionMode::Auto,
+            (ExecutionMode::Plan, _) => mode_before_plan.unwrap_or(ExecutionMode::AcceptEdits),
+            (mode, _) => mode,
         };
         return match (configured, mode) {
             (Some(rule), _) => Decision::from(rule.decision),
@@ -3226,6 +3230,7 @@ impl Agent {
                     &family_roster,
                     workspace_host.as_ref(),
                     plan_mode.as_deref(),
+                    &registry.searched_names(),
                 ),
             );
             request.history_sources.insert(1, None);
@@ -3250,6 +3255,7 @@ impl Agent {
             .iter()
             .chain(&request.deferred_tools)
             .map(|tool| tool.name.clone())
+            .chain(registry.searched_names())
             .collect::<HashSet<_>>();
         let mut recovered_text = String::new();
         let mut continuations = 0;
@@ -5566,7 +5572,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
         .chain(tool_exposure::fold_definitions())
-        .chain(plan::definitions(false))
+        .chain(plan::definitions(false, false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())
         .chain(delegation::definitions())

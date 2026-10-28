@@ -561,6 +561,7 @@ fn goal_menu_esc_closes_before_it_interrupts_and_full_condition_scrolls() {
         context: (0..100)
             .map(|index| format!("Condition line {index}"))
             .collect(),
+        markdown: None,
         options: vec![
             "Edit".into(),
             "Pause".into(),
@@ -594,6 +595,7 @@ fn goal_condition_ctrl_g_preserves_multiline_text_and_draft() {
                 id: Uuid::new_v4(),
                 title: "Edit Goal".into(),
                 context: vec![],
+                markdown: None,
                 options: vec!["Save".into()],
                 selected: 0,
                 confirmation: false,

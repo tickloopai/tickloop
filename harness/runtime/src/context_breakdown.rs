@@ -21,6 +21,9 @@ use crate::{Agent, AgentError, Chat};
 
 const FOLD_TOOLS: [&str; 3] = [SEARCH_TOOLS, DESCRIBE_TOOLS, EXECUTE_TOOLS];
 const MAX_SEARCH_LABEL_CHARS: usize = 60;
+/// Where the tool search pool lists the runtime's own deferred tools, beside MCP servers; no MCP
+/// server can take this name.
+const RUNTIME_TOOL_SOURCE: &str = "(built-in)";
 const USER_MESSAGES: &str = "User messages";
 const ASSISTANT_MESSAGES: &str = "Assistant messages";
 const TOOL_RESULTS: &str = "Tool results";
@@ -132,7 +135,7 @@ impl Agent {
         let direct_servers = discovery
             .iter()
             .filter(|tool| tool.exposure == ToolExposure::Direct)
-            .map(|tool| (tool.definition.name.clone(), tool.server.clone()))
+            .filter_map(|tool| Some((tool.definition.name.clone(), tool.server.clone()?)))
             .collect::<HashMap<_, _>>();
         let mut system_tools = Vec::new();
         let mut skill_tool = None;
@@ -158,27 +161,38 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default();
-        let search = search_provider.map(|provider| {
+        let searched = registry.searched_definitions();
+        let search = (search_provider.is_some() || !searched.is_empty()).then(|| {
             let mode = match crate::tool_execution::search_support(chat) {
                 SearchSupport::Native => ToolSearchMode::Native,
                 SearchSupport::Fold => ToolSearchMode::SearchTools,
             };
+            let runtime_pool = searched.into_iter().map(|definition| {
+                (
+                    RUNTIME_TOOL_SOURCE.to_owned(),
+                    crate::tool_exposure::ExposureTool::deferred_runtime_tool(definition),
+                )
+            });
+            let mcp_pool = discovery
+                .iter()
+                .filter(|tool| tool.exposure == ToolExposure::Search)
+                .filter_map(|tool| Some((tool.server.clone()?, tool.clone())));
             SearchParts {
                 mode,
                 protocol: chat.snapshot.model.adapter().protocol(),
-                pool: discovery
-                    .iter()
-                    .filter(|tool| tool.exposure == ToolExposure::Search)
-                    .map(|tool| {
+                pool: runtime_pool
+                    .chain(mcp_pool)
+                    .map(|(source, tool)| {
                         let definition = match mode {
                             ToolSearchMode::Native => tool.deferred_definition(),
                             ToolSearchMode::SearchTools => (*tool.definition).clone(),
                         };
-                        (tool.server.clone(), definition)
+                        (source, definition)
                     })
                     .collect(),
-                unavailable: provider
-                    .unavailable_tool_servers()
+                unavailable: search_provider
+                    .map(|provider| provider.unavailable_tool_servers())
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|server| UnavailableToolServer {
                         name: server.name,
@@ -219,6 +233,7 @@ impl Agent {
                 family_roster,
                 workspace_host.as_ref(),
                 plan_mode.as_deref(),
+                &registry.searched_names(),
             ),
             system_tools,
             skill_tool,
@@ -310,7 +325,8 @@ struct SearchParts {
     mode: ToolSearchMode,
     /// The protocol that carries the deferred tools, which decides what native search counts.
     protocol: Protocol,
-    /// Tools only search reaches, with their servers, as a load would send them.
+    /// Tools only search reaches, with their servers or the runtime's own source, as a load would
+    /// send them.
     pool: Vec<(String, ToolDefinition)>,
     unavailable: Vec<UnavailableToolServer>,
     /// The definitions native search can load, which its results name instead of carrying.

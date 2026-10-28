@@ -2413,6 +2413,11 @@ impl ConsoleExecution {
                 .and_then(tickloop_code_settings::UserSettings::root),
         )
         .map_err(|error| AccessError::storage(error.to_string()))?;
+        let uses_auto_admission = configuration.execution_mode.uses_auto_admission(
+            settings
+                .as_ref()
+                .is_none_or(|settings| settings.load().use_auto_mode_during_plan()),
+        );
         let rules = saved_rules
             .into_iter()
             .chain(
@@ -2434,7 +2439,7 @@ impl ConsoleExecution {
                 &rules,
                 |_| project.clone(),
                 &project,
-                configuration.execution_mode,
+                uses_auto_admission,
                 &[],
                 &[],
                 &[],
@@ -2442,7 +2447,7 @@ impl ConsoleExecution {
             .into_iter()
             .chain(launch_rule_views(
                 &self.inner.launch_rules.lock().unwrap(),
-                configuration.execution_mode,
+                uses_auto_admission,
             ))
             .collect(),
             working_directory: project.clone(),
