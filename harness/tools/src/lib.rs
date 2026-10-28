@@ -867,7 +867,19 @@ impl Tools {
         self.commands.restore(checkpoint).await
     }
     pub async fn background(&self, id: uuid::Uuid) -> Result<CommandSnapshot, ToolError> {
-        self.commands.background(id).await
+        self.commands
+            .background(id, shell::BackgroundTrigger::User)
+            .await
+    }
+    /// Moves the foreground command `id` to the background so a queued message reaches the
+    /// model; its waiting call tells the model so.
+    pub async fn background_to_deliver_message(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<CommandSnapshot, ToolError> {
+        self.commands
+            .background(id, shell::BackgroundTrigger::DeliverMessage)
+            .await
     }
     pub async fn stop_command(&self, id: uuid::Uuid) -> Result<CommandSnapshot, ToolError> {
         self.commands.stop(id).await

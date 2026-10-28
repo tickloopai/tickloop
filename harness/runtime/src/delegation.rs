@@ -1389,6 +1389,7 @@ impl Agent {
                 return Ok(launched_result(&ids, &child, &registration));
             }
             let release = self.suspend_for_subagent(parent, call_id, &child).await?;
+            let movable = self.movable_call(parent.run_id, call_id);
             loop {
                 if let Some(result) = self.recorded_child_result(parent.chat_id, &child).await? {
                     return Ok(result);
@@ -1398,6 +1399,9 @@ impl Agent {
                     _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
                     _ = cancel.cancelled() => {
                         return self.end_interrupted_observation(parent, call_id, &child).await;
+                    }
+                    () = movable.moved() => {
+                        return self.end_moved_observation(parent, call_id, &child).await;
                     }
                     event = events.recv() => match event {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
@@ -1436,6 +1440,53 @@ impl Agent {
             registration.as_ref(),
         ))
     }
+
+    /// Ends a foreground observation that send now moved to the background: as an interrupted
+    /// one does, except that the Run goes on, so the call's wait ends with what it returns.
+    async fn end_moved_observation(
+        &self,
+        parent: &Receipt,
+        call_id: &str,
+        child: &Receipt,
+    ) -> Result<ToolResult, String> {
+        let ids = self.chat_ids(parent.chat_id).await;
+        let mut invocations = self.inner.subagent_invocations.lock().await;
+        if let Some(result) = self.recorded_child_result(parent.chat_id, child).await? {
+            return Ok(result);
+        }
+        let registration = self
+            .subagent_registration(child.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(invocation) = invocations.get_mut(&(parent.run_id, call_id.to_owned())) {
+            invocation.run_in_background = true;
+        }
+        let result = moved_observation_result(&ids, child, registration.as_ref());
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&parent.chat_id)
+            .ok_or("parent is unavailable")?;
+        if let Some(wait_id) = chat
+            .bookkeeping
+            .lifecycle
+            .open_subagent_wait(child.run_id)
+            .map(|wait| wait.wait_id)
+        {
+            let tool =
+                crate::tool_results::waited_call_result(chat, SUBAGENT_TOOL_NAME, result.clone());
+            chat.bookkeeping.lifecycle.resolve_wait(
+                wait_id,
+                tickloop_harness_transcript::ModelVisibleResult {
+                    content: tool.content.clone().into(),
+                    tool,
+                    ends_run: false,
+                },
+                None,
+            );
+            self.save(&chat.snapshot);
+        }
+        Ok(result)
+    }
 }
 
 /// Claude Code's guidance in a launched background agent's result.
@@ -1452,6 +1503,26 @@ pub(super) fn launched_result(
             "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),
             "handle":registration.handle,"description":registration.description,
             "created_at":registration.created_at,"message":LAUNCHED_MESSAGE})
+        .to_string(),
+        is_error: false,
+        output_ref: None,
+    }
+}
+
+/// What a foreground `Subagent` call returns when send now moves its child to the background:
+/// Claude Code's launched agent, with why it moved.
+pub(super) fn moved_observation_result(
+    ids: &IdContext,
+    child: &Receipt,
+    registration: Option<&SubagentRegistration>,
+) -> ToolResult {
+    ToolResult {
+        content: json!({"status":"async_launched","child_chat_id":ids.model_text(child.chat_id),
+            "child_loop_id":ids.model_text(child.loop_id),"child_run_id":ids.model_text(child.run_id),
+            "handle":registration.map(|registration|registration.handle.as_str()),
+            "description":registration.map(|registration|registration.description.as_str()),
+            "created_at":registration.map(|registration|registration.created_at),
+            "message":"Moved to the background so that a message that arrived while it was running can reach you; it was not interrupted and keeps running. Its completion arrives as a task notification; you know nothing of its results until then, so do not report or predict them."})
         .to_string(),
         is_error: false,
         output_ref: None,

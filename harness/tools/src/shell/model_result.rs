@@ -55,6 +55,20 @@ pub(super) fn background_started(
     }
 }
 
+/// Claude Code's result for a foreground command that send now moved to the background so a
+/// queued message reaches the model.
+pub(super) fn moved_to_deliver_message(ids: &IdContext, snapshot: &CommandSnapshot) -> ToolResult {
+    ToolResult {
+        content: format!(
+            "Command was moved to the background (ID: {}) so that a message that arrived while it was running can reach you; it was not interrupted. Output is being written to: {}. You will be notified when it completes.",
+            ids.model_text(ShellTaskId::from(snapshot.operation_id)),
+            snapshot.output_ref.display()
+        ),
+        is_error: false,
+        output_ref: Some(snapshot.output_ref.clone()),
+    }
+}
+
 /// The result of a command that has finished; `timeout` is the foreground limit it ran under.
 pub(super) fn finished(snapshot: &CommandSnapshot, timeout: Duration) -> ToolResult {
     let path = snapshot.output_ref.as_path();
