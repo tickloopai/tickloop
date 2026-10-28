@@ -66,6 +66,7 @@ mod menus;
 #[cfg(test)]
 mod mode_cycle_tests;
 mod monitor;
+mod monitor_cards;
 pub mod monitor_command;
 #[cfg(test)]
 mod navigation_tests;
@@ -75,7 +76,6 @@ mod paste_blocks;
 mod pasted_image_paths;
 mod permissions_surface;
 mod plugin_configuration;
-pub mod popup;
 mod presentation;
 mod process_registry;
 mod prompt_suggestion;
@@ -902,7 +902,6 @@ Usage: tickloop [--cwd DIRECTORY]
        [--no-session-persistence]
        tickloop update [--check | --status]
        tickloop daemon stop
-       tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
@@ -910,8 +909,7 @@ Usage: tickloop [--cwd DIRECTORY]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
-monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
-monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
+monitor attach is the attach client of a Herdr view Pane: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
 plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
 mcp lists the MCP servers an Agent here would have without starting any, adds or removes your own servers in the global settings or, with --dir, this directory's, and logs in to or out of a remote server.
@@ -942,7 +940,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; inside Herdr enter enters the card, or a click in it does: keys, ctrl+c included, go to the Tick until a lone esc leaves the card, which stays shown, esc esc sends esc and a click outside leaves too; outside Herdr enter opens the view full screen, a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's screen only shows it. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -1291,10 +1289,6 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .as_ref()
         .map(LoadedSettings::monitor_preference)
         .unwrap_or_default();
-    let monitor_popup = saved_settings
-        .as_ref()
-        .map(LoadedSettings::monitor_popup)
-        .unwrap_or_default();
     let monitor_width = saved_settings
         .as_mut()
         .and_then(LoadedSettings::monitor_width);
@@ -1459,7 +1453,6 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     console.set_saves_chats(agent.saves_chats())?;
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
-    console.set_monitor_popup(monitor_popup)?;
     console.set_monitor_width(monitor_width.map(usize::from))?;
     if let Some(socket) = herdr_socket {
         console.set_herdr_socket(socket)?;
@@ -10594,7 +10587,7 @@ mod status_agents_help_tests {
     #[test]
     fn help_names_the_monitor_commands_and_hosted_tick_keys() {
         let help = super::help_text();
-        assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
+        assert!(!help.contains("monitor popup"));
         assert!(help.contains("tickloop monitor attach"));
         for expected in [
             "Press x twice within 3 seconds",

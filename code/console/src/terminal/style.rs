@@ -59,6 +59,9 @@ impl AnsiColour {
 pub(super) enum Colour {
     Rgb(Rgb),
     Ansi(AnsiColour),
+    /// An index into the terminal's 256-colour palette, sent as it is, as a program running in
+    /// that terminal would.
+    Indexed(u8),
 }
 
 impl From<Rgb> for Colour {
@@ -908,6 +911,15 @@ fn push_colour(sequence: &mut String, colour: Colour, depth: ColourDepth, backgr
             "\x1b[{}m",
             colour.foreground_code() + if background { 10 } else { 0 }
         )),
+        (Colour::Indexed(index @ 0..=7), _) => sequence.push_str(&format!(
+            "\x1b[{}m",
+            index + if background { 40 } else { 30 }
+        )),
+        (Colour::Indexed(index @ 8..=15), _) => sequence.push_str(&format!(
+            "\x1b[{}m",
+            index - 8 + if background { 100 } else { 90 }
+        )),
+        (Colour::Indexed(index), _) => sequence.push_str(&format!("\x1b[{lead};5;{index}m")),
         (Colour::Rgb(colour), ColourDepth::TrueColour) => sequence.push_str(&format!(
             "\x1b[{lead};2;{};{};{}m",
             colour.red, colour.green, colour.blue
@@ -1067,6 +1079,9 @@ pub(super) struct RoleSpan {
     pub(super) text: String,
     pub(super) role: Option<Role>,
     pub(super) link: Option<Hyperlink>,
+    /// A style of the span's own that no theme resolves, such as a Tick's cell colours shown
+    /// in a Monitor card; it replaces `role` and the row's fill.
+    pub(super) literal: Option<Style>,
 }
 
 /// One screen row described by roles. `fill` paints the whole row width with a
@@ -1152,11 +1167,36 @@ impl RoleLine {
         if let Some(last) = self.spans.last_mut()
             && last.role == role
             && last.link == link
+            && last.literal.is_none()
         {
             last.text.push_str(&text);
             return;
         }
-        self.spans.push(RoleSpan { text, role, link });
+        self.spans.push(RoleSpan {
+            text,
+            role,
+            link,
+            literal: None,
+        });
+    }
+
+    /// Pushes `text` in a `style` of its own that no theme resolves; see [`RoleSpan::literal`].
+    pub(super) fn push_literal(&mut self, text: impl Into<String>, style: Style) {
+        let text = text.into();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.spans.last_mut()
+            && last.literal == Some(style)
+        {
+            last.text.push_str(&text);
+            return;
+        }
+        self.spans.push(RoleSpan {
+            text,
+            literal: Some(style),
+            ..RoleSpan::default()
+        });
     }
 
     /// Pushes `text` in `role` with every match of `filter` in [`Role::FilterMatch`]; see
@@ -1196,6 +1236,7 @@ impl RoleLine {
                     text,
                     role: span.role,
                     link: span.link,
+                    literal: span.literal,
                 });
             }
             if full {
@@ -1236,10 +1277,10 @@ impl RoleLine {
                     Some(boundary) => split_at_column(rest, boundary - column),
                     None => (rest, ""),
                 };
-                line.push(
-                    Span::styled(piece, self.style_at(theme, column, span.role))
-                        .linked(span.link.clone()),
-                );
+                let style = span
+                    .literal
+                    .unwrap_or_else(|| self.style_at(theme, column, span.role));
+                line.push(Span::styled(piece, style).linked(span.link.clone()));
                 column += piece.width();
                 rest = after;
             }

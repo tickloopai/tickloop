@@ -73,7 +73,6 @@ const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
 const AUTO_COMPACT_WINDOW_KEY: &str = "autoCompactWindow";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
-const MONITOR_POPUP_KEY: &str = "monitorPopup";
 const MONITOR_WIDTH_KEY: &str = "monitorWidth";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
 const USE_AUTO_MODE_DURING_PLAN_KEY: &str = "useAutoModeDuringPlan";
@@ -207,17 +206,6 @@ pub enum MonitorPreference {
     #[default]
     Auto,
     Hidden,
-}
-
-/// Whether Monitor may float a hosted Tick in a Herdr popup. Installing the popup plugin, with
-/// `tickloop monitor popup install` or Monitor's confirmed offer, enables it; the setting itself
-/// never installs anything.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MonitorPopup {
-    Disabled,
-    #[default]
-    Enabled,
 }
 
 impl LoadedSettings {
@@ -478,14 +466,6 @@ impl LoadedSettings {
             ));
         }
         columns
-    }
-
-    pub fn monitor_popup(&self) -> MonitorPopup {
-        self.settings
-            .get(MONITOR_POPUP_KEY)
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default()
     }
 
     /// The modes Shift+Tab visits, in [`ExecutionMode::CYCLE_ORDER`]. An empty or invalid list
@@ -1091,16 +1071,6 @@ impl UserSettings {
     pub fn save_monitor_width(&self, columns: u16) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(MONITOR_WIDTH_KEY.into(), columns.into());
-            Ok(())
-        })
-    }
-
-    pub fn save_monitor_popup(&self, popup: MonitorPopup) -> Result<(), SettingsError> {
-        self.update(|settings| {
-            settings.insert(
-                MONITOR_POPUP_KEY.into(),
-                serde_json::to_value(popup).expect("Monitor popup setting serializes to JSON"),
-            );
             Ok(())
         })
     }

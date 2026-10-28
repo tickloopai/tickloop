@@ -327,6 +327,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
                 assert_eq!(&state.monitor.selected_task().unwrap().id, id)
             }
             MonitorTarget::MoreScheduled => panic!("one scheduled task has no overflow row"),
+            MonitorTarget::Card { .. } => panic!("no card is open"),
             MonitorTarget::Goal => {
                 assert!(state.monitor.is_goal_selected());
                 assert!(state.monitor.selected().is_none());
@@ -409,6 +410,8 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     );
 }
 
+/// A click on a row runs the row's Enter action; on a row whose Tick has a card it shows the
+/// card, whose view attaches with the same action key.
 #[test]
 fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
     for (width, overlay) in [(140, false), (80, false), (60, true)] {
@@ -434,15 +437,24 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                 let row = if meta { *rows.last().unwrap() } else { rows[0] };
                 let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
-                state.pointer(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        row: row as u16,
-                        column: column as u16,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &mut Vec::new(),
-                );
+                // A row whose Tick has a card acts on the release, so a drag never toggles it.
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    state.pointer(
+                        MouseEvent {
+                            kind,
+                            row: row as u16,
+                            column: column as u16,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &mut Vec::new(),
+                    );
+                    if state.pointer_input.is_some() {
+                        break;
+                    }
+                }
                 let clicked = tick_action_signature(state.pointer_input.take());
                 state.monitor.detail = None;
                 state.monitor.focus(overlay, None);

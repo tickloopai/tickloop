@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::{
     display::{DisplayProfile, Glyph},
     list_row::{self, ListRow, RowFlash},
+    monitor_cards::{CardAllocation, CardFrame, CardRows, CardSize},
     style::{Role, RoleLine},
     subscription_detail::SubscriptionDetail,
 };
@@ -31,6 +32,19 @@ const GOAL_ROWS: usize = 2;
 const MINIMUM_TICK_SECTION_ROWS: usize = 3;
 const TICK_PREFETCH_ROWS: usize = 8;
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
+/// The end of the row whose card has the focus: keys go to its Tick.
+const FOCUSED_CARD_MARK: &str = "input";
+/// The rule of a card cropped because not even its minimum fits.
+const TOO_SHORT_NOTE: &str = "terminal too short";
+
+/// How a row shows that its card is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardMark {
+    Shown,
+    Focused,
+    /// Open, but other cards took the room.
+    Collapsed,
+}
 
 /// Monitor's column beside a content area `width` columns wide: the user's preferred width or
 /// the default, narrowed so the conversation keeps its minimum, or `None` when even the narrowest
@@ -112,6 +126,11 @@ impl MonitorEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MonitorTarget {
     Tick(InstanceRef),
+    /// A line of the open card under a Tick's row: its rule, or row `row` of the Tick's screen.
+    Card {
+        instance: InstanceRef,
+        row: Option<u16>,
+    },
     ScheduledTask(Uuid),
     MoreScheduled,
     Goal,
@@ -196,6 +215,55 @@ pub(super) struct MonitorFrame {
     pub(super) lines: Vec<RoleLine>,
     pub(super) targets: Vec<(usize, MonitorTarget)>,
     pub(super) tick_rows: std::ops::Range<usize>,
+    /// The Tick screen size of each card shown, which its view's terminal takes.
+    pub(super) card_sizes: Vec<(InstanceRef, CardSize)>,
+}
+
+/// How the open cards show in one frame: each card's rows when shown, by its place in `cards`.
+struct CardLayout<'a> {
+    cards: &'a [CardFrame<'a>],
+    allocation: CardAllocation,
+    /// The card's width: the column's, whether or not the list shows a scrollbar.
+    columns: usize,
+}
+
+impl CardLayout<'_> {
+    fn of(&self, instance: &InstanceRef) -> Option<(&CardFrame<'_>, Option<CardRows>)> {
+        let index = self
+            .cards
+            .iter()
+            .position(|card| card.instance == instance)?;
+        Some((&self.cards[index], self.allocation.cards[index]))
+    }
+
+    /// The lines the shown cards add to the list, their `+N collapsed` line included.
+    fn extra_lines(&self) -> usize {
+        self.allocation
+            .cards
+            .iter()
+            .flatten()
+            .map(|rows| 1 + usize::from(rows.shown))
+            .sum::<usize>()
+            + usize::from(self.allocation.collapsed > 0)
+    }
+
+    fn sizes(&self) -> Vec<(InstanceRef, CardSize)> {
+        self.cards
+            .iter()
+            .zip(&self.allocation.cards)
+            .filter_map(|(card, rows)| {
+                rows.map(|rows| {
+                    (
+                        card.instance.clone(),
+                        CardSize {
+                            rows: rows.screen,
+                            columns: u16::try_from(self.columns).unwrap_or(u16::MAX),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 struct TickLines {
@@ -307,7 +375,9 @@ impl Monitor {
             self.tick_anchor = Some(entry.instance.clone());
         }
         match target {
-            MonitorTarget::Tick(instance) => self.select(instance),
+            MonitorTarget::Tick(instance) | MonitorTarget::Card { instance, .. } => {
+                self.select(instance)
+            }
             MonitorTarget::ScheduledTask(id) => {
                 let limit = if self.expanded_tasks {
                     self.tasks().len()
@@ -1259,15 +1329,42 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> Vec<RoleLine> {
+        self.entry_lines_with_card(entry, width, display, now_ms, None)
+    }
+
+    /// The row of `entry`, marked `▾` while its card shows, `▸` while it is open but collapsed,
+    /// and in the accent colour on the selection background, ending with `input`, while its card
+    /// has the focus.
+    fn entry_lines_with_card(
+        &self,
+        entry: &MonitorEntry,
+        width: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+        card: Option<CardMark>,
+    ) -> Vec<RoleLine> {
         let title = super::safe_line(&entry.title);
         let paused = entry.subscription.is_some_and(|mark| mark.paused);
+        let focused_card = card == Some(CardMark::Focused);
+        let mut details = list_row::row_details(entry.tone, &entry.notes, now_ms);
+        if focused_card {
+            if !details.is_empty() {
+                details.push_str(" · ");
+            }
+            details.push_str(FOCUSED_CARD_MARK);
+        }
+        let glyph = match card {
+            None => display.glyph(entry.glyph),
+            Some(CardMark::Collapsed) => display.glyph(Glyph::Collapsed),
+            Some(CardMark::Shown | CardMark::Focused) => display.glyph(Glyph::Expanded),
+        };
         let mut lines = ListRow {
             selected: self.focused
                 && matches!(&self.selected, Some(MonitorTarget::Tick(instance)) if instance == &entry.instance),
-            glyph: display.glyph(entry.glyph),
+            glyph,
             glyph_role: self.glyph_role(entry, display, now_ms),
             name: &title,
-            details: list_row::row_details(entry.tone, &entry.notes, now_ms),
+            details,
             fill: if paused {
                 None
             } else {
@@ -1281,6 +1378,16 @@ impl Monitor {
                 for span in &mut line.spans {
                     span.role = Some(Role::MutedText);
                 }
+            }
+        }
+        if focused_card {
+            for line in &mut lines {
+                for span in &mut line.spans {
+                    span.role = Some(Role::Accent);
+                }
+                line.fill = Some(Role::Selection);
+                line.fill_start = 0;
+                line.preserve_selection_colours = true;
             }
         }
         lines
@@ -1359,6 +1466,7 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
         group_gaps: bool,
+        cards: &CardLayout<'_>,
     ) -> TickLines {
         let mut rows = Vec::new();
         let mut row_ids = Vec::new();
@@ -1395,15 +1503,61 @@ impl Monitor {
             ));
             row_ids.push(None);
             for entry in entries {
-                let entry_lines = self.entry_lines(entry, width, display, now_ms);
-                if scroll_target == Some(&entry.instance) {
-                    selected_rows = rows.len()..rows.len() + entry_lines.len();
-                }
+                let card = cards.of(&entry.instance);
+                let mark = card.map(|(card, rows)| match rows {
+                    None => CardMark::Collapsed,
+                    Some(_) if card.focused => CardMark::Focused,
+                    Some(_) => CardMark::Shown,
+                });
+                let entry_lines = self.entry_lines_with_card(entry, width, display, now_ms, mark);
+                let start = rows.len();
                 for line in entry_lines {
                     rows.push(line);
                     row_ids.push(Some(MonitorTarget::Tick(entry.instance.clone())));
                 }
+                if let Some((card, Some(card_rows))) = card {
+                    let note = if card_rows.is_cropped() {
+                        Some(TOO_SHORT_NOTE)
+                    } else {
+                        card.note.as_deref()
+                    };
+                    rows.push(super::monitor_cards::rule_line(
+                        cards.columns,
+                        card.focused,
+                        note,
+                        display,
+                    ));
+                    row_ids.push(Some(MonitorTarget::Card {
+                        instance: entry.instance.clone(),
+                        row: None,
+                    }));
+                    for row in 0..card_rows.shown {
+                        rows.push(card.screen.map_or_else(
+                            || RoleLine::plain(" ".repeat(cards.columns)),
+                            |screen| {
+                                super::monitor_cards::screen_line(
+                                    screen,
+                                    row,
+                                    u16::try_from(cards.columns).unwrap_or(u16::MAX),
+                                )
+                            },
+                        ));
+                        row_ids.push(Some(MonitorTarget::Card {
+                            instance: entry.instance.clone(),
+                            row: Some(row),
+                        }));
+                    }
+                }
+                if scroll_target == Some(&entry.instance) {
+                    selected_rows = start..rows.len();
+                }
             }
+        }
+        if cards.allocation.collapsed > 0 {
+            rows.push(super::monitor_cards::collapsed_line(
+                cards.allocation.collapsed,
+            ));
+            row_ids.push(None);
         }
         TickLines {
             lines: rows,
@@ -1482,9 +1636,11 @@ impl Monitor {
             lines,
             targets,
             tick_rows: 0..0,
+            card_sizes: Vec::new(),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn frame(
         &self,
         width: usize,
@@ -1492,7 +1648,19 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> MonitorFrame {
-        self.frame_with_ascii(width, height, display, now_ms, false)
+        self.frame_with_cards(width, height, display, now_ms, &[])
+    }
+
+    /// The frame with `cards` open under their rows.
+    pub(super) fn frame_with_cards(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+        cards: &[CardFrame<'_>],
+    ) -> MonitorFrame {
+        self.frame_with_ascii(width, height, display, now_ms, false, cards)
     }
 
     fn frame_with_ascii(
@@ -1502,6 +1670,7 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
         ascii: bool,
+        cards: &[CardFrame<'_>],
     ) -> MonitorFrame {
         if self.expanded_tasks {
             return self.task_list_frame(width, height, display, now_ms);
@@ -1570,12 +1739,22 @@ impl Monitor {
             (usize::from(scheduled_heading) + visible_tasks * TASK_ROWS + usize::from(more))
                 .min(fixed_budget);
         let tick_capacity = fixed_budget.saturating_sub(scheduled_rows);
-        let mut rendered = self.tick_lines(width, display, now_ms, group_gaps);
-        let total_rows = self.tick_line_count(group_gaps);
+        let list_rows = self.tick_line_count(group_gaps);
+        let cards = CardLayout {
+            cards,
+            allocation: super::monitor_cards::allocate(
+                tick_capacity,
+                list_rows,
+                &cards.iter().map(|card| card.demand).collect::<Vec<_>>(),
+            ),
+            columns: width,
+        };
+        let mut rendered = self.tick_lines(width, display, now_ms, group_gaps, &cards);
+        let total_rows = list_rows + cards.extra_lines();
         let scrollbar = width > 0 && tick_capacity > 0 && total_rows > tick_capacity;
         let tick_width = width.saturating_sub(usize::from(scrollbar));
         if scrollbar {
-            rendered = self.tick_lines(tick_width, display, now_ms, group_gaps);
+            rendered = self.tick_lines(tick_width, display, now_ms, group_gaps, &cards);
         }
         let TickLines {
             lines: mut rows,
@@ -1603,6 +1782,12 @@ impl Monitor {
             self.wheel_offset.set(Some(offset));
         }
         let tick_start = lines.len();
+        let card_lines: Vec<bool> = row_ids
+            .iter()
+            .skip(offset)
+            .take(tick_capacity)
+            .map(|id| matches!(id, Some(MonitorTarget::Card { .. })))
+            .collect();
         let mut targets = row_ids
             .into_iter()
             .skip(offset)
@@ -1616,6 +1801,10 @@ impl Monitor {
         if scrollbar {
             let thumb = scrollbar_thumb(tick_capacity, total_rows, offset);
             for (row, line) in lines[tick_rows.clone()].iter_mut().enumerate() {
+                // A card keeps the column's whole width; the scrollbar skips its lines.
+                if card_lines.get(row).copied().unwrap_or(false) {
+                    continue;
+                }
                 line.truncate(tick_width);
                 line.push(
                     " ".repeat(
@@ -1716,6 +1905,7 @@ impl Monitor {
             lines,
             targets,
             tick_rows,
+            card_sizes: cards.sizes(),
         }
     }
 }
@@ -3359,7 +3549,17 @@ mod scrolling_tests {
             .collect();
         monitor.replace(TickGroup::Shells, shells);
         let display = DisplayProfile::default();
-        let rendered = monitor.tick_lines(23, display, 0, true);
+        let rendered = monitor.tick_lines(
+            23,
+            display,
+            0,
+            true,
+            &CardLayout {
+                cards: &[],
+                allocation: crate::terminal::monitor_cards::allocate(0, 0, &[]),
+                columns: 23,
+            },
+        );
         assert_eq!(rendered.lines.len(), 9);
         assert_eq!(rendered.lines[4].text(), "");
         assert_eq!(rendered.targets[4], None);
@@ -3402,7 +3602,7 @@ mod scrolling_tests {
     fn scrollbar_tracks_the_whole_listing_and_has_an_ascii_fallback() {
         let monitor = monitor(130);
         for ascii in [false, true] {
-            let frame = monitor.frame_with_ascii(24, 12, DisplayProfile::default(), 0, ascii);
+            let frame = monitor.frame_with_ascii(24, 12, DisplayProfile::default(), 0, ascii, &[]);
             let rows = &frame.lines[frame.tick_rows.clone()];
             assert_eq!(rows.len(), 12);
             let thumb = if ascii { '#' } else { '┃' };

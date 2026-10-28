@@ -16,7 +16,7 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`medium`",
         "`low`",
         "`ready: true`",
-        "Esc hides the view",
+        "Esc leaves the card",
         "An artifact takes no Tick Subscription",
         "`workspace_host.plugins`",
         "`<package>:usage`",

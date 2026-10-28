@@ -63,8 +63,8 @@ pub enum TickIntent {
     ShowDetails(InstanceRef),
     /// Hides the row in this Chat and cancels its Tick Subscriptions.
     RemoveFromMonitor(InstanceRef),
-    /// Opens the attached view of a local Tick the Tickhost runs, a hosted Tick or a Shell: a
-    /// Herdr popup inside Herdr, otherwise full screen in this terminal.
+    /// Shows the live screen of a hosted Tick or a Shell: a Monitor card under its row, entered
+    /// with Enter inside Herdr; outside Herdr Enter opens it full screen in this terminal.
     OpenView(InstanceRef),
     /// Ends a hosted Tick this Chat opened, or forgets the record of one that already ended, and
     /// takes its row out with the Tick Subscriptions on it.
