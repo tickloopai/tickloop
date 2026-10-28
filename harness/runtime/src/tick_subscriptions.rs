@@ -2999,6 +2999,7 @@ mod manual_admission_tests {
                 is_terminal: false,
                 instance: instance.clone(),
                 title: None,
+                min_rows: None,
             });
         assert_eq!(
             manual_eligibility(&snapshot, &instance),

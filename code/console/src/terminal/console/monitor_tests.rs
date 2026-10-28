@@ -1532,6 +1532,7 @@ fn each_access_probes_its_own_members_beside_the_others() {
         (hosted.clone(), "hidden"),
     ] {
         snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance,
             title: Some(title.into()),
@@ -1587,6 +1588,7 @@ fn monitor_scrolls_continuously_across_pages_and_caches_earlier_rows() {
             .monitor
             .members
             .push(MonitorMember {
+                min_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: Some(format!("Tick {index:03}")),
@@ -1648,6 +1650,7 @@ fn probed_members_report_their_host_state_and_owner() {
     let mut snapshot = chat_status(chat);
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             is_terminal: false,
             instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
@@ -1704,6 +1707,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.prompt_enabled = true;
     let mut snapshot = chat_status(chat);
     snapshot.monitor.members.push(MonitorMember {
+        min_rows: None,
         is_terminal: false,
         instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
@@ -4013,6 +4017,7 @@ fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_height
         let status = Arc::make_mut(state.monitor.chat_status.as_mut().unwrap());
         for index in 0..130 {
             status.monitor.members.push(MonitorMember {
+                min_rows: None,
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: None,
@@ -4486,6 +4491,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
             .unwrap();
         }
         "hosted" | "terminal" => snapshot.monitor.members.push(MonitorMember {
+            min_rows: None,
             instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
             is_terminal: content == "terminal",
             title: Some("New Tick".into()),
@@ -4657,6 +4663,7 @@ fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
             .monitor
             .members
             .push(MonitorMember {
+                min_rows: None,
                 instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
                 is_terminal: false,
                 title: Some("Later Tick".into()),
@@ -4733,6 +4740,7 @@ fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monit
         .monitor
         .members
         .push(MonitorMember {
+            min_rows: None,
             instance: row.instance.clone(),
             is_terminal: false,
             title: None,
@@ -5491,6 +5499,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
         } else {
             let instance = tick_protocol::InstanceRef::new("calendar", "stream").unwrap();
             snapshot.monitor.members.push(MonitorMember {
+                min_rows: None,
                 instance: instance.clone(),
                 is_terminal: false,
                 title: Some("Stream Tick".into()),

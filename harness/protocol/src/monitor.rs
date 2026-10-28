@@ -11,6 +11,9 @@ pub struct MonitorMember {
     pub instance: InstanceRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The fewest terminal rows the Tick declared, when it opened, that it stays usable at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u16>,
 }
 
 /// The most handled marks a Chat keeps, and the most used marks; the oldest go first, since an
@@ -187,6 +190,7 @@ impl MonitorMembership {
                     instance,
                     title,
                     is_terminal: false,
+                    min_rows: None,
                 });
                 self.members.len() - 1
             }

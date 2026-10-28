@@ -15,6 +15,10 @@ pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 pub const MAX_DESCRIPTION_BYTES: usize = 512 * 1024;
 pub const MAX_UPDATE_BYTES: usize = 512 * 1024;
 pub const MAX_TOOL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// The range of terminal rows a Tick may declare as the fewest it stays usable at; a Tick that
+/// declares none gets the fewest.
+pub const MIN_SCREEN_ROWS: u16 = 6;
+pub const MAX_SCREEN_ROWS: u16 = 14;
 /// The identity a host launches a Tick under. A Tick may log it; no frame carries it.
 pub const INSTANCE_ID_ENV: &str = "TICKLOOP_INSTANCE_ID";
 
@@ -77,6 +81,19 @@ pub struct TickDescriptor {
     /// What the Tick declares about its state beside the state itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateDeclaration>,
+    /// What the Tick declares about the terminal it draws on. A host reads it once, when the
+    /// Tick initializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<ScreenDeclaration>,
+}
+
+/// What a Tick declares about the terminal it draws on.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScreenDeclaration {
+    /// The fewest terminal rows the Tick stays usable at, its own status line included:
+    /// from [`MIN_SCREEN_ROWS`] to [`MAX_SCREEN_ROWS`]; [`MIN_SCREEN_ROWS`] when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u16>,
 }
 
 /// What a Tick declares about the `data` of its state.
@@ -116,6 +133,15 @@ impl TickDescriptor {
                 ));
             }
             None => return Err("Tick description names no protocol version".into()),
+        }
+        if let Some(rows) = result
+            .pointer("/screen/min_rows")
+            .filter(|rows| !rows.is_null())
+            && !rows
+                .as_u64()
+                .is_some_and(|rows| screen_rows_are_valid(rows))
+        {
+            return Err(invalid_min_rows());
         }
         let descriptor: Self = serde_json::from_value(result).map_err(|error| error.to_string())?;
         check_encoded_size(&descriptor, MAX_DESCRIPTION_BYTES, "Tick description")?;
@@ -176,8 +202,32 @@ impl TickDescriptor {
                 return Err(format!("state series {:?} declared twice", declared.path));
             }
         }
+        if self
+            .screen
+            .as_ref()
+            .and_then(|screen| screen.min_rows)
+            .is_some_and(|rows| !screen_rows_are_valid(u64::from(rows)))
+        {
+            return Err(invalid_min_rows());
+        }
         Ok(())
     }
+
+    /// The fewest terminal rows the Tick declared it stays usable at, or [`MIN_SCREEN_ROWS`].
+    pub fn min_rows(&self) -> u16 {
+        self.screen
+            .as_ref()
+            .and_then(|screen| screen.min_rows)
+            .unwrap_or(MIN_SCREEN_ROWS)
+    }
+}
+
+fn screen_rows_are_valid(rows: u64) -> bool {
+    (u64::from(MIN_SCREEN_ROWS)..=u64::from(MAX_SCREEN_ROWS)).contains(&rows)
+}
+
+fn invalid_min_rows() -> String {
+    format!("screen.min_rows must be an integer from {MIN_SCREEN_ROWS} to {MAX_SCREEN_ROWS}")
 }
 
 /// What `tick/read` answers and every `tick/update` carries.
@@ -511,5 +561,42 @@ mod tests {
             json!({"tools":[{"name":"old","description":"Old","params":{"type":"object"},"mutates":true}]}),
         );
         assert!(TickDescriptor::parse(renamed).is_err());
+    }
+
+    #[test]
+    fn a_screen_may_declare_the_fewest_rows_from_6_to_14() {
+        let without = TickDescriptor::parse(counter(json!({}))).unwrap();
+        assert_eq!(without.screen, None);
+        assert_eq!(without.min_rows(), MIN_SCREEN_ROWS);
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("screen")
+                .is_none()
+        );
+        let empty = TickDescriptor::parse(counter(json!({"screen":{}}))).unwrap();
+        assert_eq!(empty.min_rows(), 6);
+        for rows in [6, 9, 14] {
+            let declared =
+                TickDescriptor::parse(counter(json!({"screen":{"min_rows":rows}}))).unwrap();
+            assert_eq!(declared.min_rows(), rows);
+        }
+        for refused in [
+            json!(5),
+            json!(15),
+            json!(6.5),
+            json!(0),
+            json!(-7),
+            json!("8"),
+        ] {
+            assert_eq!(
+                TickDescriptor::parse(counter(json!({"screen":{"min_rows":refused}}))).unwrap_err(),
+                "screen.min_rows must be an integer from 6 to 14",
+                "{refused}"
+            );
+        }
+        let mut built = TickDescriptor::parse(counter(json!({}))).unwrap();
+        built.screen = Some(ScreenDeclaration { min_rows: Some(15) });
+        assert!(built.validate().is_err(), "a Tick cannot declare it either");
     }
 }

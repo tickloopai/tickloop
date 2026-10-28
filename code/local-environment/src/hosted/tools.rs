@@ -310,10 +310,12 @@ impl HostedTickTools {
                 instance,
                 title,
                 is_terminal,
+                min_rows,
             }) => Some(OpenedExecution {
                 instance,
                 title,
                 is_terminal,
+                min_rows,
             }),
             _ => None,
         };
@@ -997,6 +999,7 @@ impl HostedTickTools {
                                     instance: opened.instance,
                                     title: opened.title,
                                     is_terminal: opened.is_terminal,
+                                    min_rows: opened.min_rows,
                                 }),
                             );
                         }
@@ -1261,6 +1264,7 @@ impl HostedTickTools {
             is_terminal: adapter == Some(TickAdapter::Terminal),
             instance: instance.clone(),
             title,
+            min_rows: None,
             result,
         };
         // The lifecycle reply is final; cancellation of enrichment must not discard it.
@@ -1289,14 +1293,13 @@ impl HostedTickTools {
         // The command named the Tick until now; an extension Tick's declaration names it from here
         // on. Only the binding this open received is asked, so naming never costs a lookup of the
         // daemon.
-        confirmed.title = match (confirmed.title, &binding) {
-            (Some(command), Some(binding)) if binding.adapter == TickAdapter::Protocol => Some(
-                described_title(binding, &instance, &command)
-                    .await
-                    .unwrap_or(command),
-            ),
-            (title, _) => title,
-        };
+        if let (Some(command), Some(binding)) = (&confirmed.title, &binding)
+            && binding.adapter == TickAdapter::Protocol
+            && let Some(described) = describe_opened(binding, &instance, command).await
+        {
+            confirmed.title = Some(described.title);
+            confirmed.min_rows = Some(described.min_rows);
+        }
         confirmed.confirm(dispatch, view_requested);
         Ok(confirmed)
     }
@@ -1721,22 +1724,27 @@ impl DataBinding {
 
 /// A just opened Tick's name from its declaration and `command`, asked through the binding the
 /// open received; `None` when the declaration cannot be read that way.
-async fn described_title(
+/// What a just opened extension Tick declares about itself for its Monitor row.
+struct DescribedTick {
+    title: String,
+    min_rows: u16,
+}
+
+async fn describe_opened(
     binding: &DataBinding,
     instance: &InstanceRef,
     command: &str,
-) -> Option<String> {
+) -> Option<DescribedTick> {
     let mut connection = binding.connect(instance).await.ok()?;
     let descriptor = connection
         .request("describe", json!({}), CONTROL_TIMEOUT)
         .await
         .ok()?;
     let descriptor: TickDescriptor = serde_json::from_value(descriptor).ok()?;
-    Some(tickhost_connect::naming::tick_title(
-        &descriptor.title,
-        &descriptor.kind,
-        command,
-    ))
+    Some(DescribedTick {
+        title: tickhost_connect::naming::tick_title(&descriptor.title, &descriptor.kind, command),
+        min_rows: descriptor.min_rows(),
+    })
 }
 
 /// A just opened Tick: its instance, the name it joins the Monitor under and what the call reports.
@@ -1744,6 +1752,7 @@ struct OpenedTick {
     is_terminal: bool,
     instance: InstanceRef,
     title: Option<String>,
+    min_rows: Option<u16>,
     result: Value,
 }
 
@@ -1765,6 +1774,7 @@ impl OpenedTick {
                         instance: self.instance.clone(),
                         title: self.title.clone(),
                         is_terminal: self.is_terminal,
+                        min_rows: self.min_rows,
                     }),
                     shell: None,
                     handoff: None,
@@ -1782,6 +1792,7 @@ impl OpenedTick {
                 output_ref: None,
             },
             Box::new(HostEffect::OpenedTick {
+                min_rows: self.min_rows,
                 is_terminal: self.is_terminal,
                 instance: self.instance,
                 title: self.title,

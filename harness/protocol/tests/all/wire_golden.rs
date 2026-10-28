@@ -333,6 +333,7 @@ fn chat_snapshot() -> ChatSnapshot {
             is_terminal: false,
             instance: terminal_instance(),
             title: Some("Counter".into()),
+            min_rows: None,
         }],
         removed: [hosted_instance()].into(),
         handled: [(terminal_instance(), 7_500)].into(),

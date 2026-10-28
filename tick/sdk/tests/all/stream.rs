@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use tick_protocol::{
     CALL_METHOD, DESCRIBE_METHOD, FRAME_TOO_LARGE, INVALID_PARAMS, INVALID_REQUEST,
     MAX_REQUEST_BYTES, MAX_TOOL_RESPONSE_BYTES, NATIVE_PROTOCOL_VERSION, READ_METHOD,
-    REVISION_MISMATCH, SeriesEnd, StateDeclaration, StateSeries, TOOL_FAILED, TickDescriptor,
-    TickTool, UPDATE_METHOD,
+    REVISION_MISMATCH, ScreenDeclaration, SeriesEnd, StateDeclaration, StateSeries, TOOL_FAILED,
+    TickDescriptor, TickTool, UPDATE_METHOD,
 };
 use tick_sdk::stream::{Describe, InboundFrame, TickStream, ToolRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +44,7 @@ impl Describe for Counter {
                     newest: SeriesEnd::Last,
                 }],
             }),
+            screen: Some(ScreenDeclaration { min_rows: Some(8) }),
         })
     }
 }
@@ -121,6 +122,7 @@ async fn any_tick_answers_describe_and_read_with_what_it_declares_and_publishes(
         answer(1)["result"]["state"],
         json!({"series":[{"path":"/history","newest":"last"}]})
     );
+    assert_eq!(answer(1)["result"]["screen"], json!({"min_rows": 8}));
     assert_eq!(answer(2)["result"], update["params"]);
 }
 

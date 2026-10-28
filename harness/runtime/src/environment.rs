@@ -68,6 +68,7 @@ impl EnvironmentPreparedCall {
                     instance: opened.instance,
                     title: opened.title,
                     is_terminal: opened.is_terminal,
+                    min_rows: opened.min_rows,
                 }),
             ),
             ExecutionOutcome::Completed(ExecutionResult { result, .. }) => {

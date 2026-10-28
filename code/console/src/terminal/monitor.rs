@@ -3334,6 +3334,7 @@ mod scrolling_tests {
                     instance: format!("calendar:{index:03}").parse().unwrap(),
                     title: Some(format!("Tick {index:03}")),
                     is_terminal: false,
+                    min_rows: None,
                 });
         }
         monitor.set_chat_status(Arc::new(status));
