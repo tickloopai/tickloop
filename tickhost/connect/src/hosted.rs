@@ -46,7 +46,8 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// host of any other major is refused at hello.
 pub const BUSINESS_MAJOR: u16 = 10;
 /// 10.1: optional immutable Shell sandbox policy in the single-use spawn authorization.
-pub const BUSINESS_MINOR: u16 = 1;
+/// 10.2: optional per-policy guidance for requesting approval outside the sandbox.
+pub const BUSINESS_MINOR: u16 = 2;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 /// One pushed observation on a watch stream: a Tick Update of at most

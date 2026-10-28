@@ -251,7 +251,9 @@ impl LocalShells {
                 },
             },
         );
-        let prepared = prepared.with_isolation(sandbox.isolation);
+        let prepared = prepared
+            .with_isolation(sandbox.isolation)
+            .with_required_approval(sandbox.requires_approval);
         let preparation = prepared.preparation();
         let prepared = prepared.with_cleanup(move || {
             if let Some(owner) = owner.upgrade() {

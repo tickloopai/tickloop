@@ -886,8 +886,10 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
         exit.outcome = ShellOutcome::Unknown;
         exit.reason = Some(format!("cannot save command output: {error}"));
     }
-    if task.binding.approval.sandbox.is_some() && exit.outcome == ShellOutcome::Failed {
-        crate::sandbox::annotate_denial(&task.output);
+    if let Some(policy) = &task.binding.approval.sandbox
+        && exit.outcome == ShellOutcome::Failed
+    {
+        crate::sandbox::annotate_denial(&task.output, policy.allow_unsandboxed_commands);
     }
     exit.ended_at_ms = now_ms();
     task.follow_output();

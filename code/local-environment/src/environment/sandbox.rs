@@ -15,6 +15,7 @@ pub(super) struct PreparedSandbox {
     pub policy: Option<SandboxPolicy>,
     pub isolation: ExecutionIsolation,
     pub warning: Option<String>,
+    pub requires_approval: bool,
 }
 
 pub(super) async fn prepare(
@@ -27,6 +28,20 @@ pub(super) async fn prepare(
     let config = settings.load().sandbox().map_err(configuration_error)?;
     if !config.enabled {
         return Ok(PreparedSandbox::default());
+    }
+    if config.allow_unsandboxed_commands
+        && (spec.dangerously_disable_sandbox
+            || config.excluded_commands.iter().any(|pattern| {
+                tickloop_harness::tools::permissions::shell_command_matches_pattern(
+                    pattern,
+                    &spec.command,
+                )
+            }))
+    {
+        return Ok(PreparedSandbox {
+            requires_approval: true,
+            ..Default::default()
+        });
     }
     if let Err(reason) = tickhost::sandbox::availability().await {
         if config.fail_if_unavailable {
@@ -49,6 +64,7 @@ pub(super) async fn prepare(
             network: NetworkIsolation::Disconnected,
         },
         warning: None,
+        requires_approval: false,
     })
 }
 
@@ -145,6 +161,7 @@ fn prepare_policy(
     protected_paths.sort();
     protected_paths.dedup();
     Ok(SandboxPolicy {
+        allow_unsandboxed_commands: config.allow_unsandboxed_commands,
         writable_roots,
         deny_write,
         protected_paths,
