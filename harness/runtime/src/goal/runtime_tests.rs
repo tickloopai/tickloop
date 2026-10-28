@@ -131,6 +131,7 @@ fn only_fresh_input_and_output_are_charged() {
             },
             serialized_request_bytes: None,
             context_measurement: None,
+            cache_break: None,
         })
     };
     assert_eq!(charged(tickloop_harness_protocol::Protocol::Messages), 420);
