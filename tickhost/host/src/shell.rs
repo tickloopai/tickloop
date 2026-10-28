@@ -85,6 +85,8 @@ pub struct ShellApproval {
     pub command: String,
     pub cwd: PathBuf,
     pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Box<crate::sandbox::SandboxPolicy>>,
 }
 
 /// How a spawn grant binds an environment: SHA-256 over its variables in sorted order, each name
@@ -478,7 +480,12 @@ impl ShellTask {
         let output = std::fs::File::from(output);
         let launch_failed =
             |error: std::io::Error| HostError::before("LaunchFailed", error.to_string());
-        let mut command = tokio::process::Command::new(&binding.approval.shell);
+        let mut command = match &binding.approval.sandbox {
+            Some(policy) => {
+                crate::sandbox::command(policy, &binding.approval.shell).map_err(launch_failed)?
+            }
+            None => tokio::process::Command::new(&binding.approval.shell),
+        };
         command
             .arg("-c")
             .arg(&binding.approval.command)
@@ -875,6 +882,9 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
         exit.reason = Some(OUTPUT_LIMIT_REASON.into());
         exit.outcome = ShellOutcome::Failed;
     }
+    if task.binding.approval.sandbox.is_some() && exit.outcome == ShellOutcome::Failed {
+        crate::sandbox::annotate_denial(&task.output);
+    }
     if let Err(error) = task.output.sync_all() {
         exit.outcome = ShellOutcome::Unknown;
         exit.reason = Some(format!("cannot save command output: {error}"));
@@ -950,6 +960,7 @@ mod tests {
                 command: "true".into(),
                 cwd: "/".into(),
                 environment: environment_digest(&[]),
+                sandbox: None,
             },
         }
     }

@@ -19,7 +19,7 @@ use super::{
     syntax::{QuoteToken, quote_tokens},
 };
 
-const DANGEROUS_FILES: &[&str] = &[
+pub(crate) const DANGEROUS_FILES: &[&str] = &[
     ".gitconfig",
     ".gitmodules",
     ".bashrc",
@@ -32,7 +32,7 @@ const DANGEROUS_FILES: &[&str] = &[
 ];
 /// Claude Code protects its own `.claude` directory; Tickloop's counterpart
 /// is `.tickloop`, which holds the Agent's settings and permission rules.
-const DANGEROUS_DIRECTORIES: &[&str] = &[".git", ".vscode", ".idea", ".tickloop"];
+pub(crate) const DANGEROUS_DIRECTORIES: &[&str] = &[".git", ".vscode", ".idea", ".tickloop"];
 const MAX_SYMLINK_DEPTH: usize = 40;
 const GLOB_CHARACTERS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 

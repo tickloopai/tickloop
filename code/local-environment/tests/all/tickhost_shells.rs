@@ -565,6 +565,7 @@ fn own_tickhost_cleans_its_runtime_after_the_callers_runtime_is_gone() {
                 command: "true".into(),
                 cwd: std::env::temp_dir(),
                 environment: tickhost::shell::environment_digest(&[]),
+                sandbox: None,
             },
         ))
         .unwrap();

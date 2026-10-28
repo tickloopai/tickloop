@@ -125,6 +125,7 @@ impl Fixture {
                 command: command.into(),
                 cwd: cwd.to_path_buf(),
                 environment: shell::environment_digest(&[]),
+                sandbox: None,
             },
         }
     }
@@ -611,6 +612,19 @@ async fn only_a_live_unused_grant_and_the_request_it_binds_start_a_task() {
     );
 
     for differing in [
+        SpawnBinding {
+            approval: ShellApproval {
+                sandbox: Some(Box::new(tickhost::sandbox::SandboxPolicy {
+                    writable_roots: vec![workdir.clone()],
+                    deny_write: Vec::new(),
+                    protected_paths: Vec::new(),
+                    denied_path_patterns: Vec::new(),
+                    network: tickhost::sandbox::SandboxNetwork::Disconnected,
+                })),
+                ..binding.approval.clone()
+            },
+            ..binding.clone()
+        },
         SpawnBinding {
             approval: ShellApproval {
                 command: format!("{command}; rm -rf {}", workdir.display()),

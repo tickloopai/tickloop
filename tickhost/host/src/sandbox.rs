@@ -1,0 +1,141 @@
+//! Converts an approved execution policy into the local operating-system sandbox.
+use serde::{Deserialize, Serialize};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxPolicy {
+    pub writable_roots: Vec<PathBuf>,
+    pub deny_write: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
+    pub denied_path_patterns: Vec<String>,
+    pub network: SandboxNetwork,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetwork {
+    Disconnected,
+}
+
+pub async fn availability() -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("sandbox unavailable on this platform".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "sandbox")]
+        unsafe extern "C" {
+            fn sandbox_check(
+                pid: libc::pid_t,
+                operation: *const libc::c_char,
+                filter: libc::c_int,
+                ...
+            ) -> libc::c_int;
+        }
+        // A null operation queries membership, including profiles that permit another sandbox.
+        if unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) } != 0 {
+            return Err("sandbox unavailable: process is already sandboxed".into());
+        }
+    }
+    let output = tokio::process::Command::new(SANDBOX_EXEC)
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .output()
+        .await
+        .map_err(|error| format!("sandbox unavailable: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sandbox unavailable (possibly already sandboxed): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio::process::Command> {
+    if !cfg!(target_os = "macos") {
+        return Err(io::Error::other("sandbox unavailable on this platform"));
+    }
+    let mut profile = include_str!("sandbox_base.sbpl").to_owned();
+    profile.push_str(
+        "\n(allow file-read*)\n(deny network*)\n(deny system-fcntl (fcntl-command 80 110))\n",
+    );
+    for root in &policy.writable_roots {
+        let path = quote_path(root)?;
+        profile.push_str(&format!("(allow file-write* (subpath {path}))\n"));
+        profile.push_str(&format!("(deny file-write-unlink (literal {path}))\n"));
+    }
+    for path in &policy.protected_paths {
+        profile.push_str(&format!(
+            "(deny file-write* (literal {}))\n",
+            quote_path(path)?
+        ));
+    }
+    for path in &policy.deny_write {
+        let quoted = quote_path(path)?;
+        profile.push_str(&format!(
+            "(deny file-write* (literal {quoted}) (subpath {quoted}))\n"
+        ));
+        // A rename of an ancestor must not move a protected path out of its deny rule.
+        for ancestor in path.ancestors().skip(1) {
+            profile.push_str(&format!(
+                "(deny file-write-unlink (literal {}))\n",
+                quote_path(ancestor)?
+            ));
+        }
+    }
+    for pattern in &policy.denied_path_patterns {
+        if pattern.contains('"') || pattern.chars().any(char::is_control) {
+            return Err(io::Error::other("unsupported protected-path pattern"));
+        }
+        // SBPL regex literals preserve backslashes; Scheme string escaping changes the pattern.
+        profile.push_str(&format!("(deny file-write* (regex #\"{pattern}\"))\n"));
+    }
+    let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+    command.args(["-p", &profile]).arg(shell);
+    Ok(command)
+}
+
+fn quote_path(path: &Path) -> io::Result<String> {
+    if !path.is_absolute() {
+        return Err(io::Error::other("sandbox paths must be absolute"));
+    }
+    path.to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+        .map(quote)
+        .ok_or_else(|| io::Error::other("unsupported sandbox path"))
+}
+
+fn quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub(crate) fn annotate_denial(output: &std::fs::File) {
+    use std::{io::Write, os::unix::fs::FileExt};
+    let Ok(length) = output.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    let mut bytes = vec![0; length.min(64 * 1024) as usize];
+    let offset = length.saturating_sub(bytes.len() as u64);
+    let Ok(read) = output.read_at(&mut bytes, offset) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&bytes[..read]).to_ascii_lowercase();
+    if [
+        "operation not permitted",
+        "permission denied",
+        "operation not allowed",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        let _ = writeln!(&mut &*output, "\n{DENIAL_NOTE}");
+    }
+}

@@ -17,3 +17,5 @@ mod workspace_host_context;
 
 #[path = "all/runtime/mod.rs"]
 mod runtime;
+#[path = "all/sandbox.rs"]
+mod sandbox;

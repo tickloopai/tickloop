@@ -69,6 +69,10 @@ These sources merge into the Chat's existing additional directories, with duplic
 
 In `/permissions` → Auto mode, you can preview and select a one-time import of custom Auto rules. Built-in rules stay in place; imported rules do not override explicit Ask or Deny. Use `space` to toggle entries, `enter` to save and `esc` to cancel without changes.
 
+On macOS, set `"sandbox": {"enabled": true}` in your own `settings.json` to isolate Bash, background Shells and `!` Shells. Commands may write the Folder, additional directories, verified linked worktrees, temporary directories and the family's scratchpad; networking is blocked. `sandbox.filesystem.allowWrite` adds literal paths and `denyWrite` protects paths, with deny rules and sensitive paths taking precedence. Relative paths resolve from the Folder. The sandbox is off by default and does not change approval rules. `/permissions` shows the configured state.
+
+When the sandbox is unavailable, including inside another sandbox or on a different platform, commands warn and run without isolation. Set `sandbox.failIfUnavailable` to `true` to refuse execution instead. Other sandbox fields produce an unsupported-setting warning. A failed sandboxed command whose output indicates a permission denial receives a diagnostic note; its exit status is preserved.
+
 Keys:
 
 - `enter` sends a message. While the agent works it waits for the next step; `ctrl+enter` interrupts and sends right away.

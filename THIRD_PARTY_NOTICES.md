@@ -35,3 +35,12 @@ The adaptation adds configurable ambiguous width, grapheme-aware truncation, and
 - Vendored source: `vendor/crossterm`, patched through the root Cargo manifest. `vendor/crossterm/UPSTREAM.json` records the hashes of the copied upstream files.
 - Changes: both Unix event sources share one parser that keeps a second Escape as the start of a new sequence instead of consuming `ESC ESC` as a single Escape event, and a lone Escape briefly waits for a possible continuation. Details are in [the patch notes](./vendor/crossterm/UPSTREAM.md).
 - Applicable license: MIT. The upstream [LICENSE](./vendor/crossterm/LICENSE) is retained unchanged.
+
+## macOS sandbox policy
+
+- Upstream: [OpenAI Codex](https://github.com/openai/codex), revision `c587d6e54cb1e4013bf0cf9ea769edde48a23a1e`.
+- Sources: `codex-rs/sandboxing/src/seatbelt_base_policy.sbpl` and `seatbelt.rs`.
+- Adapted files: `tickhost/host/src/sandbox_base.sbpl` and `sandbox.rs`.
+- License: Apache License, Version 2.0; retained in [licenses/Codex-Apache-2.0.txt](./licenses/Codex-Apache-2.0.txt), with the upstream [NOTICE](./licenses/Codex-NOTICE.txt).
+
+The base profile is retained; the policy builder uses Tickhost's immutable spawn policy, blocks networking, and adds protected write paths and boundary-rename restrictions. OpenAI Codex, Copyright 2025 OpenAI.

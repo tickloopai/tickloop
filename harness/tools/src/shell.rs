@@ -732,6 +732,8 @@ impl Registry {
         input: &ShellInput,
         output: &PrivateDirectory,
         operation: Uuid,
+        workspace: &crate::Workspace,
+        family_temp: Option<&Path>,
     ) -> Result<Option<ShellPreparation>, ToolError> {
         output
             .create()
@@ -743,6 +745,8 @@ impl Registry {
             .map_err(|error| ToolError::Rejected(error.clone()))?;
         self.host
             .prepare(ShellPreparationRequest {
+                additional_directories: workspace.additional_directories.clone(),
+                family_temp: family_temp.map(Path::to_path_buf),
                 operation,
                 shell: shell.clone(),
                 command: input.command.clone(),
@@ -2635,4 +2639,12 @@ mod tests {
         let stopped = registry.stop_user(operation_id, chat_id).await.unwrap();
         assert_eq!(stopped.reason.as_deref(), Some("cancelled"));
     }
+}
+
+/// Names that the file-write permission checks treat as sensitive.
+pub(crate) fn sensitive_write_names() -> impl Iterator<Item = &'static str> {
+    path_constraints::DANGEROUS_FILES
+        .iter()
+        .chain(path_constraints::DANGEROUS_DIRECTORIES.iter())
+        .copied()
 }

@@ -69,6 +69,10 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
 
+在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、临时目录和家族 scratchpad，网络断开。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱默认关闭，不改变审批规则；`/permissions` 显示配置状态。
+
+在已有沙箱中或其他平台上不可用时，命令会警告并按无隔离运行；设置 `sandbox.failIfUnavailable: true` 则拒绝执行。其余沙箱字段会提示“暂不支持”。沙箱内失败且输出包含权限拒绝特征的命令会附加诊断说明，退出状态保持不变。
+
 按键：
 
 - `enter` 发送消息。Agent 工作时消息会等到下一步再处理；`ctrl+enter` 打断并立即发送。
