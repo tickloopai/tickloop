@@ -572,3 +572,21 @@ async fn sandbox_ignores_sensitive_ancestors_above_a_folder_inside_the_temp_root
         "allowed"
     );
 }
+
+#[tokio::test]
+async fn sandbox_denied_paths_cannot_gain_a_new_symlink_ancestor_after_preparation() {
+    let fixture = SandboxFixture::new(
+        serde_json::json!({"enabled":true,"failIfUnavailable":true,"filesystem":{"denyWrite":["missing/protected"]}}),
+    );
+    let folder = fixture.workspace.folder.as_ref().unwrap();
+    std::fs::create_dir(folder.join("ordinary")).unwrap();
+    let result = fixture
+        .run(
+            fixture
+                .prepare("ln -s ordinary missing; printf bypass > missing/protected")
+                .await,
+        )
+        .await;
+    assert!(result.is_error, "{}", result.content);
+    assert!(!folder.join("ordinary/protected").exists());
+}

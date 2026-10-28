@@ -882,12 +882,12 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
         exit.reason = Some(OUTPUT_LIMIT_REASON.into());
         exit.outcome = ShellOutcome::Failed;
     }
-    if task.binding.approval.sandbox.is_some() && exit.outcome == ShellOutcome::Failed {
-        crate::sandbox::annotate_denial(&task.output);
-    }
     if let Err(error) = task.output.sync_all() {
         exit.outcome = ShellOutcome::Unknown;
         exit.reason = Some(format!("cannot save command output: {error}"));
+    }
+    if task.binding.approval.sandbox.is_some() && exit.outcome == ShellOutcome::Failed {
+        crate::sandbox::annotate_denial(&task.output);
     }
     exit.ended_at_ms = now_ms();
     task.follow_output();

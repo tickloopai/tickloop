@@ -93,11 +93,11 @@ pub(crate) fn command(policy: &SandboxPolicy, shell: &Path) -> io::Result<tokio:
         profile.push_str(&format!(
             "(deny file-write* (literal {quoted}) (subpath {quoted}))\n(deny file-read-metadata (require-all (vnode-type SYMLINK) (require-any (literal {quoted}) (subpath {quoted}))))\n"
         ));
-        // A rename of an ancestor must not move a protected path out of its deny rule.
+        // Ancestors cannot be renamed or traversed as symlinks, even if created after preparation.
         for ancestor in path.ancestors().skip(1) {
+            let ancestor = quote_path(ancestor)?;
             profile.push_str(&format!(
-                "(deny file-write-unlink (literal {}))\n",
-                quote_path(ancestor)?
+                "(deny file-write-unlink (literal {ancestor}))\n(deny file-read-metadata (require-all (vnode-type SYMLINK) (literal {ancestor})))\n"
             ));
         }
     }
