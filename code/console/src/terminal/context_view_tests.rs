@@ -405,7 +405,10 @@ fn what_native_search_counts_for_deferred_tools_is_its_own_category_by_server() 
             "└ 3 tools on 2 servers · 17.6k tokens",
         ]
     );
-    assert!(lines.contains(&"Their names and descriptions count under Tool search index.".into()));
+    assert!(lines.contains(
+        &"Tool search pool · native (names and descriptions are in context; full definitions load on search)"
+            .into()
+    ));
 
     let expanded = texts(&render(&breakdown, 120, true));
     let start = expanded
