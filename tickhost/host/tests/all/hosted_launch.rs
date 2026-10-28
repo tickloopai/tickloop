@@ -1207,6 +1207,72 @@ async fn several_views_share_one_terminal_sized_by_the_view_that_typed_last() {
     shutdown(&fixture).await;
 }
 
+/// Paints the attached view's frames until it shows a screen of `rows` rows, the size the host
+/// gives every frame after a resize.
+async fn view_resized(events: &mut BufReader<OwnedReadHalf>, view: &mut vt100::Parser, rows: u16) {
+    let resized = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = read_frame(events, BUSINESS_FRAME_BYTES)
+                .await
+                .unwrap()
+                .expect("the view stays attached");
+            assert_eq!(event["event"], "frame", "{event}");
+            let size = |dimension: &str| event["size"][dimension].as_u64().unwrap() as u16;
+            let (frame_rows, columns) = (size("rows"), size("columns"));
+            view.screen_mut().set_size(frame_rows, columns);
+            view.process(event["data"].as_str().unwrap().as_bytes());
+            if frame_rows == rows {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(resized.is_ok(), "the view was never resized to {rows} rows");
+}
+
+/// A program that neither redraws nor even notices a resize keeps its newest output in view as
+/// a view shrinks its terminal: the rows above scroll off the top, as on a real terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn shrinking_a_view_keeps_the_newest_output_of_a_scrolling_program_in_view() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let opened = fixture
+        .open_terminal(
+            &mut controller,
+            &[
+                "/bin/sh",
+                "-c",
+                "for line in $(seq 1 40); do printf 'log %02d\\n' \"$line\"; done; exec sleep 60",
+            ],
+        )
+        .await;
+    let (mut events, mut requests) = attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut view = vt100::Parser::new(30, 120, 0);
+    view_shows(&mut events, &mut view, "log 40").await;
+    let newest = |first: usize| {
+        (first..=40)
+            .map(|line| format!("log {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    for (rows, first) in [(10, 32), (8, 34)] {
+        send(
+            &mut requests,
+            json!({"method":"resize","params":{"size":{"rows":rows,"columns":120}}}),
+        )
+        .await;
+        view_resized(&mut events, &mut view, rows).await;
+        assert_eq!(
+            view.screen().contents(),
+            newest(first),
+            "a {rows}-row view shows the newest lines over the cursor's empty row"
+        );
+        assert_eq!(view.screen().cursor_position(), (rows - 1, 0));
+    }
+    shutdown(&fixture).await;
+}
+
 /// The owner lets a view attach to its Tick's terminal without handing out the Tick's data
 /// token: every grant admits its own view once, only to attach and only for the Tick it names,
 /// and a newer grant leaves earlier ones usable, so the views of several grants are attached at
