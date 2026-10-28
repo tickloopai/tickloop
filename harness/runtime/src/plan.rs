@@ -31,7 +31,9 @@ use tickloop_harness_tools::{
 };
 
 mod prompts;
-pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_rules};
+pub(super) use prompts::{
+    enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reentry, plan_mode_rules,
+};
 
 /// Components of the plan file's directory and file name `<slug>-loop-<loopId>.md`.
 const PLANS_DIRECTORY: &str = "plans";

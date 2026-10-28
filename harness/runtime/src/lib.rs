@@ -3214,12 +3214,7 @@ impl Agent {
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
-                self.conversation_system_message(
-                    chat,
-                    receipt.loop_id,
-                    &family_roster,
-                    workspace_host.as_ref(),
-                ),
+                self.conversation_system_message(chat, &family_roster, workspace_host.as_ref()),
             );
             request.history_sources.insert(1, None);
             request.messages.insert(1, user_context);

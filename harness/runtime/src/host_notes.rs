@@ -160,6 +160,13 @@ impl Agent {
                     crate::plan::plan_mode_exit_notice(plan_file.as_deref())
                 )
             }
+            PendingModeNote::Changed { .. }
+                if let Some(plan_file) = current.plan_file.as_deref()
+                    && plan_file.exists()
+                    && planned_before_with(&chat.snapshot, plan_file) =>
+            {
+                format!("{}\n\n{rules}", crate::plan::plan_mode_reentry(plan_file))
+            }
             _ => rules,
         };
         append_note(
@@ -182,6 +189,17 @@ enum PendingModeNote {
     /// The Chat still plans, and its plan file moved or enough prompts passed since Plan's
     /// rules were last given.
     PlanReminder { is_full: bool },
+}
+
+/// Whether the model planned with `plan_file` earlier in the history it can still see, Claude
+/// Code's condition for its `plan_mode_reentry` attachment.
+fn planned_before_with(snapshot: &ChatSnapshot, plan_file: &std::path::Path) -> bool {
+    snapshot
+        .host_notes
+        .range(snapshot.active_start()..)
+        .any(|(_, note)| {
+            matches!(note, HostNote::ExecutionMode(note) if note.plan_file.as_deref() == Some(plan_file))
+        })
 }
 
 fn pending_mode_note(

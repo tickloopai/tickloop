@@ -237,6 +237,27 @@ You have exited plan mode. You can now make edits, run tools, and take actions.{
     )
 }
 
+/// Claude Code's `plan_mode_reentry` attachment, ahead of the full reminder when the user returns
+/// to Plan mode after leaving it and the plan file from that planning remains.
+pub(crate) fn plan_mode_reentry(plan_file: &Path) -> String {
+    format!(
+        "## Re-entering Plan Mode
+
+You are returning to plan mode after having previously exited it. A plan file exists at {} from your previous planning session.
+
+**Before proceeding with any new planning, you should:**
+1. Read the existing plan file to understand what was previously planned
+2. Evaluate the user's current request against that plan
+3. Decide how to proceed:
+   - **Different task**: If the user's request is for a different task\u{2014}even if it's similar or related\u{2014}start fresh by overwriting the existing plan
+   - **Same task, continuing**: If this is explicitly a continuation or refinement of the exact same task, modify the existing plan while cleaning up outdated or irrelevant sections
+4. Continue on with the plan process and most importantly you should always edit the plan file one way or the other before calling {EXIT_PLAN_MODE_TOOL_NAME}
+
+Treat this as a fresh planning session. Do not assume the existing plan is relevant without evaluating it first.",
+        plan_file.display()
+    )
+}
+
 /// Claude Code's plan mode reminder for a session without a plan file, for a Chat without a
 /// Folder in Plan mode.
 const PLAN_MODE_WITHOUT_PLAN_FILE_REMINDER: &str = "# Plan mode

@@ -253,7 +253,6 @@ impl crate::Agent {
     pub(super) fn conversation_system_message(
         &self,
         chat: &crate::Chat,
-        loop_id: tickloop_harness_protocol::LoopId,
         family_roster: &[crate::family::FamilyAgent],
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
     ) -> tickloop_harness_protocol::Message {
@@ -282,7 +281,6 @@ impl crate::Agent {
                 "name": member.handle, "depth": member.depth, "state": member.availability,
                 })).collect::<Vec<_>>(),
             "loop": loop_state(&chat.snapshot.chat_loop),
-            "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == loop_id),
             "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
         if let Some(folder) = &chat.snapshot.folder {

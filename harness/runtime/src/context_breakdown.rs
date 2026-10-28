@@ -196,7 +196,6 @@ impl Agent {
             ),
             None => crate::tool_results::cut_tool_results_over_budget(&mut messages),
         }
-        let loop_id = chat.snapshot.chat_loop.id;
         let workspace_host = chat
             .snapshot
             .folder
@@ -216,7 +215,6 @@ impl Agent {
         Ok(ContextParts {
             system_prompt: self.conversation_system_message(
                 chat,
-                loop_id,
                 family_roster,
                 workspace_host.as_ref(),
             ),

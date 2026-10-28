@@ -723,3 +723,91 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     assert_eq!(exit_notices(&model.requests.lock().unwrap()[0]), 1);
     restarted.shutdown().await;
 }
+
+/// Entering Plan, planning, reviewing, leaving and returning keep the request prefix byte for
+/// byte the same: the plan, its approval and the mode reach the model only through tool results
+/// and host notes at the end of the conversation.
+#[tokio::test]
+async fn every_planning_phase_keeps_the_prefix_and_returning_to_plan_reenters_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        submit_plan("plan", "First plan."),
+        submit_plan("revised", "Second plan."),
+        text("Implementing."),
+        text("Replanning."),
+        text("Still planning."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, "Plan the report".into()).await.unwrap();
+    request(&mut events).await;
+    agent
+        .decline_plan(chat, 1, Some("Tighten it".into()))
+        .await
+        .unwrap();
+    request(&mut events).await;
+    agent
+        .approve_plan(chat, 2, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    for prompt in ["Plan the next step", "Keep planning"] {
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+        completed(&mut events, &receipt).await;
+    }
+
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_vec(&request.messages[..2]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[..2]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let system = system_prompt(&requests[0]);
+    for absent in ["\"plan\"", "approval_pending", "First plan."] {
+        assert!(!system.contains(absent), "{absent}");
+    }
+    let new_note = |index: usize| {
+        let last = requests[index].messages.last().unwrap();
+        is_host_note(last).then(|| match &last.content[0] {
+            Content::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        })
+    };
+    assert!(new_note(0).unwrap().contains("Plan mode is active."));
+    assert_eq!(
+        new_note(1),
+        None,
+        "feedback keeps planning without a new note"
+    );
+    let left = new_note(2).unwrap();
+    assert!(left.contains("## Exited Plan Mode\n") && left.contains("## Auto Mode Active\n"));
+    let reentered = new_note(3).unwrap();
+    let plan_file = reminded_plan_file(&requests[0]).unwrap();
+    assert!(
+        reentered.starts_with(&format!(
+            "<system-reminder>\n## Re-entering Plan Mode\n\nYou are returning to plan mode after having previously exited it. A plan file exists at {plan_file} from your previous planning session."
+        )),
+        "{reentered}"
+    );
+    assert!(
+        reentered.contains("A plan file already exists at"),
+        "{reentered}"
+    );
+    assert_eq!(new_note(4), None);
+    agent.shutdown().await;
+}

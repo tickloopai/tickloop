@@ -6611,7 +6611,6 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
     for field in [
         "loop",
-        "plan",
         "service_connections",
         "artifact_ticks",
         "delegation",
@@ -6623,7 +6622,7 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         state["service_connections"]["artifacts"]["authentication"],
         "signed_in"
     );
-    for absent in ["web_search", "execution_mode"] {
+    for absent in ["web_search", "execution_mode", "plan"] {
         assert!(state.get(absent).is_none(), "{absent}");
     }
     assert!(!prompt.contains("/websearch"));
