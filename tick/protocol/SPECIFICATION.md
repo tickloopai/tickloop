@@ -4,7 +4,7 @@
 | --- | --- |
 | Protocol version | 3 |
 | Status | Draft; describes the Tickloop 0.2 implementation in this repository |
-| Date | 2026-10-14 |
+| Date | 2026-10-28 |
 | Reference implementation | Host types and validation in `tick/protocol`; Tick-side SDK in `tick/sdk`; example in `tick/examples/counter.py` |
 
 ## Agent tools and package guidance
@@ -479,11 +479,11 @@ Rules:
 - A Tick declares `bubble=on` once it is ready for input, typically at startup. The declaration holds for the rest of the instance, across views and resizes, until the Tick writes `bubble=off`. A Tick starts with bubbling off.
 - A Tick **SHOULD** write `key=<name>` right after reading one of the listed keys that it does not use in its current state, and **MUST NOT** write it for a key it acted on.
 - The host ignores `key=` while bubbling is off, and unknown fields and key names. It removes every such sequence from the screen it keeps, so views never show them.
-- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice; the Monitor moves between cards and back to its list or input, and leaves Esc's card.
+- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice: the Monitor moves between cards, back to its list or to its input, and leaves the card on `esc`.
 - Other keys, including letters such as `h`, `j`, `k` and `l`, are never bubbled.
 - A Tick that never declares bubbling works unchanged; the person leaves its card with a double Esc.
 
-The host ignores an OSC longer than 1024 bytes. For example, a Neovim configuration can bubble Esc in Normal mode:
+The host ignores any OSC longer than 1024 bytes. In Rust, `tick_protocol::KeySignal::sequence` writes these sequences. A Neovim configuration, for example, can bubble Esc in Normal mode:
 
 ```lua
 vim.api.nvim_create_autocmd('VimEnter', {

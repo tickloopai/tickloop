@@ -118,11 +118,7 @@ impl MonitorEntry {
     /// subscriptions while they hold one for a check, any other row until the Chat handles its
     /// latest update.
     fn is_unread(&self) -> bool {
-        self.subscription.is_some_and(|mark| mark.is_waiting)
-            || self
-                .update
-                .as_ref()
-                .is_some_and(|update| update.unread.is_some())
+        holds_unread(self.subscription, self.update.as_ref())
     }
 
     /// The check that hands over what the row's periodic subscriptions hold, once the Agent
@@ -1319,7 +1315,7 @@ impl Monitor {
     fn unseen_rows(&self) -> Vec<InstanceRef> {
         self.listing
             .iter()
-            .filter(|row| MonitorEntry::from((*row).clone()).is_unread())
+            .filter(|row| holds_unread(row.subscription, row.update.as_ref()))
             .map(|row| row.instance.clone())
             .collect()
     }
@@ -2154,6 +2150,13 @@ impl Monitor {
             card_sizes: cards.sizes(),
         }
     }
+}
+
+/// Whether a row with this subscription mark and latest update holds an update the Chat has not
+/// handled; see [`MonitorEntry::is_unread`].
+fn holds_unread(subscription: Option<SubscriptionMark>, update: Option<&RowUpdate>) -> bool {
+    subscription.is_some_and(|mark| mark.is_waiting)
+        || update.is_some_and(|update| update.unread.is_some())
 }
 
 /// The rows with unseen updates out of view of a list frame.
