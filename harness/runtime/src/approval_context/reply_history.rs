@@ -60,7 +60,8 @@ struct ObservedMessage<'a> {
     is_human: bool,
     is_agent: bool,
     is_summary: bool,
-    /// Skill or MCP server guidance the host wrote for the model, which no one said in the turn.
+    /// Skill or MCP server guidance or an execution mode note the host wrote for the model, which
+    /// no one said in the turn.
     is_guidance: bool,
     is_proposed_batch: bool,
     message: &'a Message,
@@ -123,7 +124,7 @@ pub(crate) fn capture(
                 && entry.agent_message_origin.is_none(),
             is_agent: entry.agent_message_origin.is_some(),
             is_summary: entry.is_compact_summary,
-            is_guidance: entry.guidance.is_some(),
+            is_guidance: entry.guidance.is_some() || entry.execution_mode_note.is_some(),
             is_proposed_batch: false,
             message: &entry.message,
         });
@@ -164,7 +165,10 @@ pub(crate) fn capture(
                     snapshot.message_compactions.get(&index),
                     Some(CompactionMarker::Summary { .. })
                 ),
-                is_guidance: matches!(snapshot.host_notes.get(&index), Some(HostNote::Guidance(_))),
+                is_guidance: matches!(
+                    snapshot.host_notes.get(&index),
+                    Some(HostNote::Guidance(_) | HostNote::ExecutionMode(_))
+                ),
                 is_proposed_batch: proposed_position.is_some_and(|(proposed, _)| proposed == index),
                 message,
             })

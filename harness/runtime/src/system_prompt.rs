@@ -1,4 +1,5 @@
-//! Conversation instructions, output style, plan reminders and dynamic host state.
+//! Conversation instructions, output style and dynamic host state. The execution mode reaches the
+//! model through host notes, so changing it keeps the prompt cache.
 
 use tickloop_harness_base::output_style::OutputStyle;
 
@@ -177,7 +178,6 @@ fn session_guidance_section(tools: crate::ToolPolicy) -> String {
 pub(super) fn conversation_system_prompt(
     host_state: &serde_json::Value,
     output_style: OutputStyle,
-    plan_mode: Option<&str>,
     scope: PromptScope<'_>,
 ) -> String {
     let PromptScope {
@@ -239,7 +239,6 @@ pub(super) fn conversation_system_prompt(
         host_section.map(str::to_owned),
         environment.map(str::to_owned),
         has_scratchpad.then(|| SCRATCHPAD_SECTION.to_owned()),
-        plan_mode.map(str::to_owned),
         Some(format!("Current host state: {host_state}")),
     ]
     .into_iter()
@@ -257,7 +256,6 @@ impl crate::Agent {
         loop_id: tickloop_harness_protocol::LoopId,
         family_roster: &[crate::family::FamilyAgent],
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
-        plan_mode: Option<&str>,
     ) -> tickloop_harness_protocol::Message {
         let environment = chat
             .snapshot
@@ -284,7 +282,6 @@ impl crate::Agent {
                 "name": member.handle, "depth": member.depth, "state": member.availability,
                 })).collect::<Vec<_>>(),
             "loop": loop_state(&chat.snapshot.chat_loop),
-            "execution_mode": chat.snapshot.policy.mode,
             "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == loop_id),
             "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
@@ -300,7 +297,7 @@ impl crate::Agent {
         tickloop_harness_protocol::Message {
             role: tickloop_harness_protocol::Role::System,
             content: vec![tickloop_harness_protocol::Content::Text {
-                text: conversation_system_prompt(&state, chat.output_style, plan_mode, scope),
+                text: conversation_system_prompt(&state, chat.output_style, scope),
             }],
         }
     }
@@ -330,7 +327,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope::LOCAL,
         );
         assert_eq!(
@@ -353,7 +349,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({"workdir": "/w"}),
             OutputStyle::Standard,
-            None,
             PromptScope::LOCAL,
         );
         assert!(prompt.starts_with(INTRO));
@@ -367,7 +362,7 @@ mod tests {
     fn a_selected_style_is_announced_in_the_intro_and_precedes_host_state() {
         for style in [OutputStyle::Concise, OutputStyle::Detailed] {
             let prompt =
-                conversation_system_prompt(&serde_json::json!({}), style, None, PromptScope::LOCAL);
+                conversation_system_prompt(&serde_json::json!({}), style, PromptScope::LOCAL);
             let section = style.system_prompt_section().unwrap();
             assert!(prompt.contains(OUTPUT_STYLE_INTRO));
             let section_start = prompt.find(&section).unwrap();
@@ -382,7 +377,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope::LOCAL,
         );
         for retired in [
@@ -412,7 +406,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({"workspace_host": {"name": "herdr", "integration": "available", "tickhost": "available"}}),
             OutputStyle::Standard,
-            None,
             PromptScope::LOCAL,
         );
         for absent in [
@@ -434,7 +427,7 @@ mod tests {
         let section = |name: &str, integration: &str, tickhost: &str| {
             let state = serde_json::json!({"workspace_host": {"name": name, "integration": integration, "tickhost": tickhost}});
             let prompt =
-                conversation_system_prompt(&state, OutputStyle::Standard, None, PromptScope::LOCAL);
+                conversation_system_prompt(&state, OutputStyle::Standard, PromptScope::LOCAL);
             prompt
                 .split("\n\n")
                 .find(|part| part.starts_with("# Pane display\n"))
@@ -473,7 +466,6 @@ mod tests {
         let local = conversation_system_prompt(
             &serde_json::json!({"scratchpad": "/tmp/family/scratchpad"}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 compacts: true,
                 environment: Some(
@@ -514,7 +506,6 @@ mod tests {
         let narrow = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 tools: crate::ToolPolicy {
                     questions: false,
@@ -541,7 +532,6 @@ mod tests {
         let folderless = conversation_system_prompt(
             &serde_json::json!({"scratchpad": "/tmp/family/scratchpad"}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 has_folder: false,
                 tools: crate::ToolPolicy::durable_chat(),
@@ -568,26 +558,22 @@ mod tests {
         assert!(!INTRO.contains("TaskCreate"));
     }
 
-    /// Plan guidance comes only from the plan mode section, which differs for a delegated child
-    /// that has no `ExitPlanMode`.
+    /// Plan guidance and the execution mode reach the model only through host notes.
     #[test]
-    fn the_plan_mode_reminder_alone_guides_planning_and_precedes_host_state() {
+    fn the_prompt_names_no_execution_mode_or_plan_guidance() {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope::LOCAL,
         );
-        assert!(!prompt.contains(tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME));
-        let prompt = conversation_system_prompt(
-            &serde_json::json!({"execution_mode": "plan"}),
-            OutputStyle::Standard,
-            Some("# Plan mode\n\nPlan mode is active."),
-            PromptScope::LOCAL,
-        );
-        let reminder = prompt.find("# Plan mode").unwrap();
-        assert!(reminder > prompt.find("# Output efficiency").unwrap());
-        assert!(reminder < prompt.find("Current host state:").unwrap());
+        for absent in [
+            tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME,
+            "# Plan mode",
+            "execution_mode",
+            "Mode Active",
+        ] {
+            assert!(!prompt.contains(absent), "{absent}");
+        }
     }
 
     #[test]
@@ -595,7 +581,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 has_folder: false,
                 tools: crate::ToolPolicy::web_fetch_only(),
@@ -629,7 +614,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 tools: crate::ToolPolicy {
                     questions: false,
@@ -649,7 +633,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({"uncertain_operations": []}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 has_folder: false,
                 tools: crate::ToolPolicy::web_fetch_only(),
@@ -681,7 +664,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({"uncertain_operations": []}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 has_folder: false,
                 tools: crate::ToolPolicy::durable_chat(),
@@ -715,7 +697,6 @@ mod tests {
         let process = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 has_folder: false,
                 tools: crate::ToolPolicy::durable_chat(),
@@ -725,20 +706,18 @@ mod tests {
         assert!(process.starts_with(CHAT_INTRO));
     }
 
-    /// The host's own section follows the Output Style and precedes the plan reminder and host
-    /// state; without one the prompt is exactly what it was.
+    /// The host's own section follows the Output Style and precedes host state; without one the
+    /// prompt is exactly what it was.
     #[test]
     fn the_hosts_section_follows_the_output_style_and_adds_nothing_else() {
         const ADDITION: &str = "# Sources\nCite each source inline where you use it.";
         let scope = PromptScope::LOCAL;
         let state = serde_json::json!({"workdir": "/w"});
-        let plan = Some("# Plan mode\n\nPlan mode is active.");
         for style in [OutputStyle::Standard, OutputStyle::Detailed] {
-            let without = conversation_system_prompt(&state, style, plan, scope);
+            let without = conversation_system_prompt(&state, style, scope);
             let with = conversation_system_prompt(
                 &state,
                 style,
-                plan,
                 PromptScope {
                     host_section: Some(ADDITION),
                     ..scope
@@ -750,7 +729,6 @@ mod tests {
             if let Some(style_section) = style.system_prompt_section() {
                 assert!(section > with.find(&style_section).unwrap());
             }
-            assert!(section < with.find("# Plan mode").unwrap());
             assert!(section < with.find("Current host state:").unwrap());
         }
     }
@@ -762,7 +740,6 @@ mod tests {
             let prompt = conversation_system_prompt(
                 &serde_json::json!({}),
                 OutputStyle::Standard,
-                None,
                 PromptScope {
                     has_folder: false,
                     tools: crate::ToolPolicy {
@@ -794,7 +771,6 @@ mod tests {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
-            None,
             PromptScope {
                 citation_style: crate::CitationStyle::Numbered,
                 host_section: Some("Host citation preferences"),

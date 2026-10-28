@@ -6612,7 +6612,6 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
     for field in [
         "loop",
         "plan",
-        "execution_mode",
         "service_connections",
         "artifact_ticks",
         "delegation",
@@ -6624,7 +6623,9 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         state["service_connections"]["artifacts"]["authentication"],
         "signed_in"
     );
-    assert!(state.get("web_search").is_none());
+    for absent in ["web_search", "execution_mode"] {
+        assert!(state.get(absent).is_none(), "{absent}");
+    }
     assert!(!prompt.contains("/websearch"));
     assert!(!prompt.contains("# Artifacts"));
     let edit = requests[0]

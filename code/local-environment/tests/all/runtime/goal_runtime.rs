@@ -145,7 +145,9 @@ fn newest_user_text(request: &ModelRequest) -> String {
         .messages
         .iter()
         .rev()
-        .find(|message| message.role == Role::User)
+        .find(|message| {
+            message.role == Role::User && !tickloop_harness::test_support::is_host_note(message)
+        })
         .map(|message| {
             message
                 .content

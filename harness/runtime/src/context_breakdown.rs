@@ -202,7 +202,6 @@ impl Agent {
             .folder
             .is_some()
             .then(|| crate::host_tools::current_workspace_host(provider.as_deref()));
-        let plan_mode = self.plan_mode_preview(chat, loop_id);
         let user_context = chat
             .user_context
             .get()
@@ -220,7 +219,6 @@ impl Agent {
                 loop_id,
                 family_roster,
                 workspace_host.as_ref(),
-                plan_mode.as_deref(),
             ),
             system_tools,
             skill_tool,
@@ -268,6 +266,7 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),
             HostNote::PlanModeExit => "Plan mode exit".into(),
+            HostNote::ExecutionMode(note) => format!("Execution mode · {}", note.mode.label()),
         });
     }
     matches!(

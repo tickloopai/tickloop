@@ -475,9 +475,6 @@ struct Chat {
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
-    /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
-    /// plan, so the next request owes the model the exited-plan-mode notice.
-    needs_plan_mode_exit_notice: bool,
     /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
     /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
     /// it unknown.
@@ -3169,8 +3166,8 @@ impl Agent {
         let timing = timing::Phase::new("announce_host_tool_changes");
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         drop(timing);
-        let timing = timing::Phase::new("announce_plan_mode_exit");
-        Box::pin(self.announce_plan_mode_exit(receipt)).await?;
+        let timing = timing::Phase::new("announce_execution_mode");
+        Box::pin(self.announce_execution_mode(receipt)).await?;
         drop(timing);
         // Only a Chat with a Folder probes the host it runs in.
         let workspace_host = self
@@ -3214,7 +3211,6 @@ impl Agent {
                 }
                 None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
@@ -3223,7 +3219,6 @@ impl Agent {
                     receipt.loop_id,
                     &family_roster,
                     workspace_host.as_ref(),
-                    plan_mode.as_deref(),
                 ),
             );
             request.history_sources.insert(1, None);
@@ -4789,15 +4784,8 @@ impl Agent {
         let _settings_gate = self.inner.settings_writes.lock().await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        // Claude Code's `handlePlanModeTransition`: leaving Plan owes the model an exit notice, and
-        // returning to Plan before it is sent withdraws it.
         let leaves_plan =
             chat.snapshot.policy.mode == ExecutionMode::Plan && mode != ExecutionMode::Plan;
-        match (chat.snapshot.policy.mode, mode) {
-            (_, ExecutionMode::Plan) => chat.needs_plan_mode_exit_notice = false,
-            (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
-            _ => {}
-        }
         chat.change_execution_mode(mode);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
@@ -5720,7 +5708,6 @@ impl NewChat {
             snapshot,
             bookkeeping,
             start_new_tool_result_message: false,
-            needs_plan_mode_exit_notice: false,
             mode_before_plan: None,
             active: None,
             active_run: None,

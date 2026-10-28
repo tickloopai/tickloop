@@ -25,8 +25,8 @@ impl ExecutionMode {
     }
 
     /// Shift+Tab's fixed order, like Claude Code's: Plan follows Ask and precedes Full Access.
-    /// The user's `shiftTabModes` setting chooses which of these the cycle visits. Entering or
-    /// leaving Plan changes the system prompt and tools, so it starts a new prompt cache.
+    /// The user's `shiftTabModes` setting chooses which of these the cycle visits. Changing the
+    /// mode keeps the prompt cache: a host note at the end of the conversation announces it.
     pub const CYCLE_ORDER: [Self; 4] =
         [Self::Auto, Self::AcceptEdits, Self::Plan, Self::FullAccess];
 

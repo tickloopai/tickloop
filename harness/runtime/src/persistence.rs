@@ -1499,6 +1499,10 @@ fn chain_entry(
             .and_then(HostNote::announced_host_tools)
             .cloned(),
         plan_mode_exit: snapshot.host_notes.get(&index) == Some(&HostNote::PlanModeExit),
+        execution_mode_note: match snapshot.host_notes.get(&index) {
+            Some(HostNote::ExecutionMode(note)) => serde_json::to_value(note).ok(),
+            _ => None,
+        },
         date_change: match snapshot.host_notes.get(&index) {
             Some(HostNote::DateChange(date)) => Some(date.clone()),
             _ => None,
@@ -1661,6 +1665,7 @@ fn record_loop(
         is_meta: false,
         host_tools: None,
         plan_mode_exit: false,
+        execution_mode_note: None,
         date_change: None,
         guidance: None,
         execution_mode: None,
@@ -1957,6 +1962,14 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::HostTools(announced.clone()));
         } else if entry.plan_mode_exit {
             restored.host_notes.insert(index, HostNote::PlanModeExit);
+        } else if let Some(note) = entry
+            .execution_mode_note
+            .clone()
+            .and_then(|note| serde_json::from_value(note).ok())
+        {
+            restored
+                .host_notes
+                .insert(index, HostNote::ExecutionMode(note));
         } else if let Some(date) = &entry.date_change {
             restored
                 .host_notes
@@ -3754,7 +3767,6 @@ impl Agent {
                 snapshot: snapshot.clone(),
                 bookkeeping,
                 start_new_tool_result_message: false,
-                needs_plan_mode_exit_notice: false,
                 mode_before_plan: None,
                 active: None,
                 active_run: None,
@@ -3885,7 +3897,6 @@ impl StagedBranch {
         chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
         chat.content_replacements = self.content_replacements;
         chat.file_history = self.file_history;
-        chat.needs_plan_mode_exit_notice = false;
         chat.start_new_tool_result_message = false;
         chat.branch_reservation = None;
         chat.active = None;

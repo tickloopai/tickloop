@@ -102,11 +102,19 @@ async fn every_approval_mode_returns_the_reviewed_plan_and_continues_the_same_ru
         let requests = model.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult { tool_use_id, content, is_error: false } if tool_use_id == "plan" && content.text().contains("User has approved your plan.") && content.text().ends_with("Create the reviewed report."))));
-        assert_eq!(
-            exit_notices(&requests[1]),
-            0,
-            "the approval result already resumes the model"
+        // As in Claude Code, the request after the approval result also says Plan mode ended,
+        // and names the mode the user approved in.
+        assert_eq!(exit_notices(&requests[1]), 1);
+        let note =
+            tickloop_harness::test_support::latest_execution_mode_note(&requests[1]).unwrap();
+        assert!(note.contains(EXIT_NOTICE), "{note}");
+        assert!(
+            note.contains(&format!("## {} Mode Active", mode.label())),
+            "{note}"
         );
+        assert!(tickloop_harness::test_support::is_host_note(
+            requests[1].messages.last().unwrap()
+        ));
         agent.shutdown().await;
     }
 }
@@ -479,8 +487,8 @@ async fn closing_a_plan_review_keeps_the_plan_pending_and_the_chosen_mode() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         exit_notices(&requests[1]),
-        0,
-        "approving after Shift+Tab left Plan resumes with the approved plan alone"
+        1,
+        "the continuation carries the approved plan and one note that Plan ended"
     );
     agent.shutdown().await;
 }
@@ -590,12 +598,14 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
     assert_eq!(child.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3);
-    assert!(system_prompt(&requests[0]).contains(
+    let mode_note = tickloop_harness::test_support::latest_execution_mode_note;
+    assert!(mode_note(&requests[0]).unwrap().contains(
         "Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
     ));
-    let child_prompt = system_prompt(&requests[1]);
-    assert!(child_prompt.contains("Your parent Agent writes the plan"));
-    assert!(!child_prompt.contains("ExitPlanMode"), "{child_prompt}");
+    let child_note = mode_note(&requests[1]).unwrap();
+    assert!(child_note.contains("Your parent Agent writes the plan"));
+    assert!(!child_note.contains("ExitPlanMode"), "{child_note}");
+    assert!(!system_prompt(&requests[1]).contains("ExitPlanMode"));
     assert!(reminded_plan_file(&requests[1]).is_none());
     assert!(
         requests[1]
@@ -661,12 +671,27 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     let notice = requests[2].messages.last().unwrap();
     assert_eq!(notice.role, Role::User);
     assert!(
-        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.ends_with(&format!("The plan file is located at {plan_file} if you need to reference it.\n</system-reminder>")))
+        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.contains(&format!("The plan file is located at {plan_file} if you need to reference it.\n\n## Full Access Mode Active\n\n")))
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(
-        snapshot.host_notes.values().collect::<Vec<_>>(),
-        [&HostNote::PlanModeExit]
+        snapshot
+            .host_notes
+            .values()
+            .map(|note| match note {
+                HostNote::ExecutionMode(note) => (
+                    note.mode,
+                    note.plan_file
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [
+            (ExecutionMode::Plan, Some(plan_file.clone())),
+            (ExecutionMode::FullAccess, None)
+        ]
     );
     let public = serde_json::to_string(&snapshot.public_conversation_items().unwrap()).unwrap();
     assert!(!public.contains(EXIT_NOTICE), "{public}");
