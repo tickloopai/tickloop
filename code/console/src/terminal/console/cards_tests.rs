@@ -395,6 +395,18 @@ fn a_frame_that_covers_the_monitor_gives_the_terminal_its_own_keys_back() {
         String::from_utf8_lossy(&output).contains("\x1b[>0u"),
         "a focused card turns on legacy keys"
     );
+    cover_monitor(&mut state);
+    let mut output = Vec::new();
+    state.draw_frame(&mut output).unwrap();
+    assert!(!state.card_focused());
+    assert!(
+        String::from_utf8_lossy(&output).contains("\x1b[<u"),
+        "the card's keys are popped although the frame shows no Monitor"
+    );
+}
+
+/// Shows a screen over the whole terminal, which returns from the frame before Monitor.
+fn cover_monitor(state: &mut State) {
     state.diff_screen = Some(DiffScreen {
         chat_id: state.chat.unwrap(),
         catalog: ChangeCatalog {
@@ -407,11 +419,16 @@ fn a_frame_that_covers_the_monitor_gives_the_terminal_its_own_keys_back() {
         },
         dialog: DiffDialog::new(),
     });
-    let mut output = Vec::new();
-    state.draw_frame(&mut output).unwrap();
-    assert!(!state.card_focused());
-    assert!(
-        String::from_utf8_lossy(&output).contains("\x1b[<u"),
-        "the card's keys are popped although the frame shows no Monitor"
-    );
+}
+
+#[test]
+fn only_a_card_on_screen_has_its_frames_redraw_the_console() {
+    let mut state = cards_fixture();
+    state.key(key(KeyCode::Char(' ')));
+    assert!(!state.card_in_view(), "not drawn yet");
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.card_in_view());
+    cover_monitor(&mut state);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(!state.card_in_view(), "the card is open but not on screen");
 }

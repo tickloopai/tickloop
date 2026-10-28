@@ -127,6 +127,13 @@ impl State {
         self.rendered_region = None;
     }
 
+    /// Whether the last frame showed a card, so that a frame of its Tick changes the screen.
+    pub(super) fn card_in_view(&self) -> bool {
+        self.monitor_row_targets
+            .iter()
+            .any(|target| matches!(target.target, MonitorTarget::Card { .. }))
+    }
+
     /// When the focused card's held Esc or unfinished sequence next has to be settled.
     pub(super) fn card_deadline(&self) -> Option<Instant> {
         self.card_focused()
@@ -494,7 +501,9 @@ impl Console {
     }
 }
 
-/// Redraws the screen when a card's frame arrives, at most once per [`CARD_FRAME_INTERVAL`].
+/// Redraws the screen when a card's frame arrives, at most once per [`CARD_FRAME_INTERVAL`], and
+/// only while a card is on screen: a hidden card stays attached, and the next frame that shows it
+/// draws its latest screen.
 fn spawn_card_painter(state: std::sync::Weak<Mutex<State>>, redraw: Arc<tokio::sync::Notify>) {
     tokio::spawn(async move {
         loop {
@@ -502,7 +511,9 @@ fn spawn_card_painter(state: std::sync::Weak<Mutex<State>>, redraw: Arc<tokio::s
             let Some(state) = state.upgrade() else {
                 return;
             };
-            if let Ok(mut state) = state.lock() {
+            if let Ok(mut state) = state.lock()
+                && state.card_in_view()
+            {
                 let _ = state.draw(&mut io::stdout().lock());
             }
             drop(state);
