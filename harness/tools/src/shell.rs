@@ -70,6 +70,12 @@ pub(super) struct ShellInput {
     description: Option<String>,
     #[serde(default, deserialize_with = "semantic_boolean")]
     run_in_background: bool,
+    #[serde(
+        default,
+        rename = "dangerouslyDisableSandbox",
+        deserialize_with = "semantic_boolean"
+    )]
+    dangerously_disable_sandbox: bool,
     cwd: Option<String>,
     /// Internal directories whose files shell commands may read without approval.
     #[serde(skip)]
@@ -268,6 +274,10 @@ pub(super) fn definition() -> ToolDefinition {
                     "type": "boolean",
                     "description": format!("Set to true to run this command in the background. Use {} to read the output later.", super::READ_TOOL_NAME)
                 },
+                "dangerouslyDisableSandbox": {
+                    "type": "boolean",
+                    "description": "Request execution outside the sandbox for this call, subject to user settings and normal approval."
+                },
                 "cwd": {
                     "type": "string",
                     "description": "Optional directory to run the command in, instead of this Chat's working directory"
@@ -293,6 +303,9 @@ pub(super) fn prepare_input(input: &Value) -> Result<(String, Operation, Value),
     }
     if let Some(run_in_background) = normalized_input.get_mut("run_in_background") {
         *run_in_background = json!(parsed.run_in_background);
+    }
+    if let Some(value) = normalized_input.get_mut("dangerouslyDisableSandbox") {
+        *value = json!(parsed.dangerously_disable_sandbox);
     }
     Ok((
         parsed.cwd.clone().unwrap_or_else(|| ".".into()),
@@ -745,6 +758,7 @@ impl Registry {
             .map_err(|error| ToolError::Rejected(error.clone()))?;
         self.host
             .prepare(ShellPreparationRequest {
+                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
                 additional_directories: workspace.additional_directories.clone(),
                 family_temp: family_temp.map(Path::to_path_buf),
                 operation,
@@ -1838,6 +1852,7 @@ mod tests {
                 timeout: None,
                 description: None,
                 run_in_background: false,
+                dangerously_disable_sandbox: false,
                 cwd: None,
                 readable_directories: Vec::new(),
                 editable_directory: None,

@@ -336,8 +336,14 @@ pub struct ExecutionContext {
 }
 
 impl PreparedTool {
+    pub fn requires_environment_approval(&self) -> bool {
+        matches!(&self.operation, Operation::Shell(input)
+            if input.preparation.as_ref().is_some_and(ShellPreparation::requires_approval))
+    }
+
     pub fn approval_facts(&self) -> tickloop_harness_protocol::PreparedApprovalFacts {
         tickloop_harness_protocol::PreparedApprovalFacts {
+            requires_approval: self.requires_environment_approval().then_some(true),
             isolation: match &self.operation {
                 Operation::Shell(input) => {
                     input.preparation.as_ref().map(ShellPreparation::isolation)

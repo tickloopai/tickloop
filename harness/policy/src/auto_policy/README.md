@@ -21,6 +21,7 @@ The mapping is verified by config tests and a Jev test double; test-double resul
 - Instruction Poisoning
 - Auto-Mode Bypass
 - Session Transcript Tampering
+- Sandbox Network Callback
 
 The entries above replace only the actual product interfaces, sources or scope; Artifact account roles and collaboration permissions are still enforced by the original host.
 Tick cleanup must match a trusted creation credential from the same Loop and instance. Automatic triggers and Agent messages do not create new human authorization.
@@ -79,7 +80,6 @@ without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harne
 
 - Memory Directory: No managed memory directory is provided by Tickloop.
 - Browser Trusted Navigation: The authenticated Chrome-MCP browser surface is not exposed.
-- Sandbox Network Callback: There is no SandboxNetworkAccess callback in this runtime.
 - Command Network Lists: Bash does not grant network access through allowed_domains.
 - Browser Navigate Exfil: The authenticated Chrome-MCP browser surface is not exposed.
 - Browser Input Exfil: The authenticated Chrome-MCP browser surface is not exposed.
@@ -90,8 +90,8 @@ without Auto review; see `durable_chat_host_rules` in `harness/runtime/src/harne
 Not applicable means only that the specific entry point does not exist; it does not exempt real side effects of the same kind. Data exfiltration,
 persistence or out-of-scope actions carried out through Bash or other exposed tools are still judged by the corresponding general rules. When a corresponding product entry point is added, it must be remapped.
 
-There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 8.
-One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently nine native entry points that are not applicable.
+There are currently **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 rules in total**; the policy and built-in group versions are both 9.
+One of the two Hard deny rules is Tickloop Agent Daemon Shutdown. There are currently eight native entry points that are not applicable.
 Custom rules and group replacements stay independent; users who replace the built-in Soft allow are not forced to have the Scheduling exception added back.
 
 ## Third-party MCP tools
@@ -103,7 +103,7 @@ Custom rules and group replacements stay independent; users who replace the buil
 | Third-party `mcp__<server>__<tool>` | ThirdParty; Ask: human confirmation; Auto: classifier review without a user rule; Plan: classifier review, Allow after Full Access, or as the mode it was entered from with `useAutoModeDuringPlan` off | Review judges the single call against the general rules; a rejection returns to the model and escalates to a person at the existing denial limits. A user-saved tool/server rule in this directory skips review; explicit Ask is single-use only |
 | ListMcpResourcesTool / ReadMcpResourceTool | ReadOnly; no review | Prepared service authority and delegated resource scope still apply |
 
-Review uses the existing frozen rules: the MCP tool name and the model-written input are the proposed action, while server instructions, descriptions, annotations and results stay untrusted data and are redacted of the server's sensitive values before they reach any model. No rule is added or removed: the 82-rule policy and nine inapplicable native entry points above are unchanged. Review is not waived by an Unrestricted host (`--dangerously-skip-permissions`): there a third-party call is still reviewed in Auto and still asks in Ask, and an escalation reaches a person; a host that cannot ask denies what the reviewer does not allow. Resource discovery and reading use ReadOnly admission with the same frozen server authority.
+Review uses the existing frozen rules: the MCP tool name and the model-written input are the proposed action, while server instructions, descriptions, annotations and results stay untrusted data and are redacted of the server's sensitive values before they reach any model. No rule is added or removed: the 82-rule policy and eight inapplicable native entry points above are unchanged. Review is not waived by an Unrestricted host (`--dangerously-skip-permissions`): there a third-party call is still reviewed in Auto and still asks in Ask, and an escalation reaches a person; a host that cannot ask denies what the reviewer does not allow. Resource discovery and reading use ReadOnly admission with the same frozen server authority.
 
 The browser-specific entries above remain inapplicable: connecting an arbitrary MCP browser does not implement the trusted native browser admission paths. Its tools follow ThirdParty admission, so in Auto the general rules (exfiltration, out-of-scope actions and the rest) judge them like any other action. Automated coverage is in `harness/runtime/tests/all/third_party_approval.rs`, the Fold and MCP server tests and the Console MCP confirmation tests: an admitted call runs without a prompt, a rejected one is not dispatched and the third consecutive rejection asks a person, and batch calls carry the whole batch. These use a reviewer test double; they prove deterministic routing, persistence and denial boundaries, not semantic acceptance by a real reviewer.
 
@@ -125,10 +125,43 @@ Following Claude Code 2.1.302 (`checkWritePermissionForTool` admits the session'
 | ExecuteTools | No wrapper approval | Each independent child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
 | EnterPlanMode | Deferred behind tool search, like Claude Code 2.1.302's `shouldDefer`; callable directly, or inside ExecuteTools only as the batch's sole call (its calls run concurrently). No approval and no review in any mode, as in Claude Code, which gives it no permission check | Only an explicit Ask rule asks the user (the Enter plan mode dialog) and a Deny rule refuses it; it only switches the Chat to Plan, which narrows what later calls may do. Delegated children never get it |
 
-Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and nine inapplicable entries remain unchanged.
+Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and eight inapplicable entries remain unchanged.
 
 ## Linked worktrees of the Folder's repository
 
 Claude Code 2.1.302 has a linked-worktree Accept Edits fast path behind a flag that is off by default, and it applies only when the session starts in the main checkout. Tickloop applies it in Auto whenever the Folder belongs to a git repository: the other linked worktrees registered in that repository count as workspace directories when Auto checks its Accept Edits fast path, so `Write`, `Edit` and Accept-Edits-admissible `Bash` into a sibling worktree run without review. Each worktree must link back to the same common git directory (`harness/base/src/git_worktree.rs`); the main checkout, worktrees enclosing the Folder or the git directory, unverified entries and more than 32 worktrees are left out. Sensitive paths, explicit Ask and Deny rules and the other fast-path conditions still apply, Accept Edits and Plan are unchanged. Delegated children still cannot `Write` or `Edit` outside their frozen workspace; their `Bash` gets the same Auto decision as the parent's.
 
-Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and nine inapplicable native entries remain unchanged.
+Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
+
+
+## Commands outside the sandbox
+
+`Sandbox Network Callback` is mapped to Bash's per-call escape request, not to a new callback tool.
+When the user enables the local sandbox, `dangerouslyDisableSandbox: true` or a matching
+`sandbox.excludedCommands` entry prepares that invocation with unrestricted writes and networking,
+and with an execution-environment requirement for ordinary approval. The immutable preparation is
+used for approval and execution; neither a model argument nor an exclusion is an approval grant.
+Auto sends such calls to its reviewer instead of the read-only or Accept Edits fast paths; Ask
+requires human approval. Explicit Permission Rules retain their precedence, Full Access retains its
+normal behavior, and Plan retains its existing read-only handling. An Unrestricted prompt host does
+not waive a required reviewer or human decision. No sandbox-based fast path is introduced here.
+
+The ordinary frozen policy judges the command's actual effects and the user's authorization.
+Routine authorized builds are not automatically a Containment Escape merely because they request
+this per-call route. Unauthorized reach, exfiltration and standing permission changes remain subject
+to Containment Escape, the exfiltration rules and Self-Modification. Permission Rule Ask/Deny and
+non-classifier-approvable safety checks cannot be cleared by the reviewer.
+
+`sandbox.allowUnsandboxedCommands` defaults to true. When false, both the model's request and the
+exclusion list are ignored and the command retains its sandbox. When the sandbox is disabled, the
+request has no effect. These controls are read only from the user's settings by Code, never from
+repository content or Harness Settings Store configuration.
+
+No rules are added or removed: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, with eight
+inapplicable native entries. Policy and built-in group version **9** records this mapping change.
+Portable Agent tests in `harness/runtime/tests/all/environment_approval.rs` use the reference
+Execution Environment, ScriptedModel and a reviewer double. Local integration tests in
+`code/local-environment/tests/all/sandbox.rs` cover the settings and actual macOS execution.
+Both verify admission and rejection, including normally safe commands. This is routing evidence,
+not semantic acceptance by a real review model. The conditional escape hint is appended by Code
+using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.

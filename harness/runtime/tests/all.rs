@@ -98,6 +98,9 @@ mod tool_list_stability;
 #[path = "all/launch_rules.rs"]
 mod launch_rules;
 
+#[path = "all/environment_approval.rs"]
+mod environment_approval;
+
 #[path = "all/deferred_plan_tool.rs"]
 mod deferred_plan_tool;
 #[path = "all/plan_reminders.rs"]
