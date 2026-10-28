@@ -25,8 +25,6 @@ const FOLDERLESS_FILE_REQUEST_NOTE: &str = "If the user asks you to read or chan
 
 const OUTPUT_STYLE_INTRO: &str = "Respond to the user according to your \"Output Style\" below, which describes how you should respond to user queries.";
 
-const WEB_SEARCH_DISABLED_SECTION: &str = "# Web search is disabled\nTickloop supports web search, but it is currently turned off. WebSearch is not available in this request. If the user asks for web search, explain that it is disabled and that they can enable it with /websearch. Do not enable it yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching.";
-
 /// Claude Code's `getSimpleSystemSection`; host-written messages carry tags instead of hooks.
 const SYSTEM_SECTION: &str = "# System
  - All text you output outside of tool use is displayed to the user. Output text to communicate with the user. You can use Github-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
@@ -233,8 +231,6 @@ pub(super) fn conversation_system_prompt(
         has_folder
             .then(|| pane_display_section(&host_state["workspace_host"]))
             .flatten(),
-        (tools.web_search && host_state["web_search"]["enabled"].as_bool() == Some(false))
-            .then(|| WEB_SEARCH_DISABLED_SECTION.to_owned()),
         Some(TONE_AND_STYLE_SECTION.to_owned()),
         Some(OUTPUT_EFFICIENCY_SECTION.to_owned()),
         style_section,
@@ -279,11 +275,6 @@ impl crate::Agent {
             environment: environment.as_deref(),
         };
         let family_temp = chat.tools.family_temp_directory();
-        let mut web_search =
-            serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
-        if chat.snapshot.folder.is_some() {
-            web_search["settings_command"] = "/websearch".into();
-        }
         let mut state = serde_json::json!({
             "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
             "artifact_ticks": chat.snapshot.artifact_ticks,
@@ -294,7 +285,6 @@ impl crate::Agent {
                 })).collect::<Vec<_>>(),
             "loop": loop_state(&chat.snapshot.chat_loop),
             "execution_mode": chat.snapshot.policy.mode,
-            "web_search": web_search,
             "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == loop_id),
             "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
@@ -603,7 +593,7 @@ mod tests {
     #[test]
     fn a_chat_without_a_folder_offering_only_web_fetch_hears_of_no_unavailable_capability() {
         let prompt = conversation_system_prompt(
-            &serde_json::json!({"web_search": {"enabled": false}}),
+            &serde_json::json!({}),
             OutputStyle::Standard,
             None,
             PromptScope {
@@ -628,11 +618,7 @@ mod tests {
         ] {
             assert!(!prompt.contains(absent), "{absent}");
         }
-        for section in [
-            AGENT_MESSAGE_SECTION,
-            ACTIONS_SECTION,
-            WEB_SEARCH_DISABLED_SECTION,
-        ] {
+        for section in [AGENT_MESSAGE_SECTION, ACTIONS_SECTION] {
             assert!(!prompt.contains(section));
         }
         assert!(prompt.contains("# Tone and style"));
@@ -769,12 +755,12 @@ mod tests {
         }
     }
     /// Artifact usage, including how a Chat without a Folder paces its writing, lives in the
-    /// Artifact tools; the prompt keeps only the disabled web search notice.
+    /// Artifact tools.
     #[test]
     fn folderless_artifacts_add_no_section_whether_or_not_skills_are_enabled() {
         for skills in [true, false] {
             let prompt = conversation_system_prompt(
-                &serde_json::json!({"web_search": {"enabled": false}}),
+                &serde_json::json!({}),
                 OutputStyle::Standard,
                 None,
                 PromptScope {
@@ -788,7 +774,6 @@ mod tests {
                     ..PromptScope::LOCAL
                 },
             );
-            assert!(prompt.contains(WEB_SEARCH_DISABLED_SECTION));
             for absent in [
                 "# Artifacts",
                 "artifact-slides",

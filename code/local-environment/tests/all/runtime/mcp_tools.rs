@@ -6615,7 +6615,6 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         "execution_mode",
         "service_connections",
         "artifact_ticks",
-        "web_search",
         "delegation",
         "family_members",
     ] {
@@ -6625,7 +6624,8 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         state["service_connections"]["artifacts"]["authentication"],
         "signed_in"
     );
-    assert!(prompt.contains("# Web search is disabled"));
+    assert!(state.get("web_search").is_none());
+    assert!(!prompt.contains("/websearch"));
     assert!(!prompt.contains("# Artifacts"));
     let edit = requests[0]
         .tools
