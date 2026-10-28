@@ -22,9 +22,9 @@ use tickloop_harness_base::private_fs::PrivateDirectory;
 use tickloop_harness_protocol::local_messages::LocalMessage;
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatId, ChatSnapshot, CodeRewind, Content, Event, EventKind, ExecutionMode, HostNote,
-    LoopState, Message, RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId,
-    TakenBackPrompt, UserShellRecord, UserShellState,
+    ChatId, ChatSnapshot, CodeRewind, Content, Event, EventKind, ExecutionMode, LoopState, Message,
+    RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId, TakenBackPrompt,
+    UserShellRecord, UserShellState,
 };
 
 impl Agent {
@@ -241,16 +241,6 @@ impl Agent {
         if let Some(recorder) = &self.inner.recorder {
             recorder.truncate(&chat.snapshot, &chat.bookkeeping, index);
         }
-        // The kept history ends where the prompt was submitted, in the mode it restores. Only
-        // an exited-plan-mode notice the prompt's first request carried is owed again.
-        let first_reply = (index..chat.snapshot.messages.len())
-            .find(|index| chat.snapshot.messages[*index].role == Role::Assistant)
-            .unwrap_or(chat.snapshot.messages.len());
-        chat.needs_plan_mode_exit_notice = chat
-            .snapshot
-            .host_notes
-            .range(index..first_reply)
-            .any(|(_, note)| *note == HostNote::PlanModeExit);
         candidate_bookkeeping.citation_sources = chat.bookkeeping.citation_sources.clone();
         chat.replace_snapshot(candidate);
         chat.bookkeeping = candidate_bookkeeping;

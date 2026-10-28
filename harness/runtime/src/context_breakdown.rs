@@ -33,13 +33,12 @@ const MAX_CALIBRATION_GAP_PERCENT: u64 = 15;
 impl Agent {
     /// The current context of `chat_id` by category, as `/context` shows it.
     pub async fn context_breakdown(&self, chat_id: ChatId) -> Result<ContextBreakdown, AgentError> {
-        let family_roster = self.family_agents(chat_id).await?;
         let instruction_files = self.instruction_files(chat_id).await?;
         let current_date = self.current_date();
         let parts = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            self.context_parts(chat, &family_roster, &instruction_files, &current_date)?
+            self.context_parts(chat, &instruction_files, &current_date)?
         };
         // A long Chat takes a while to count; the executor keeps serving other Chats meanwhile.
         tokio::task::spawn_blocking(move || {
@@ -61,7 +60,7 @@ impl Agent {
         let current_date = self.current_date();
         let settings = self.load_user_settings(folder.clone()).await?;
         let chat = self.draft_chat(folder, draft, settings);
-        let parts = self.context_parts(&chat, &[], &instruction_files, &current_date)?;
+        let parts = self.context_parts(&chat, &instruction_files, &current_date)?;
         tokio::task::spawn_blocking(move || {
             parts.count(&*tickloop_harness_model::context_tokens::TOKEN_COUNTER)
         })
@@ -110,6 +109,7 @@ impl Agent {
             bookkeeping: Default::default(),
             client,
             user_context: Default::default(),
+            environment: Default::default(),
             announced_date: None,
             file_history: None,
         }
@@ -119,7 +119,6 @@ impl Agent {
     fn context_parts(
         &self,
         chat: &Chat,
-        family_roster: &[crate::family::FamilyAgent],
         instruction_files: &[InstructionFile],
         current_date: &str,
     ) -> Result<ContextParts, AgentError> {
@@ -214,13 +213,11 @@ impl Agent {
             ),
             None => crate::tool_results::cut_tool_results_over_budget(&mut messages),
         }
-        let loop_id = chat.snapshot.chat_loop.id;
         let workspace_host = chat
             .snapshot
             .folder
             .is_some()
             .then(|| crate::host_tools::current_workspace_host(provider.as_deref()));
-        let plan_mode = self.plan_mode_preview(chat, loop_id);
         let user_context = chat
             .user_context
             .get()
@@ -229,10 +226,7 @@ impl Agent {
         Ok(ContextParts {
             system_prompt: self.conversation_system_message(
                 chat,
-                loop_id,
-                family_roster,
                 workspace_host.as_ref(),
-                plan_mode.as_deref(),
                 &registry.searched_names(),
             ),
             system_tools,
@@ -278,9 +272,14 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
                 servers.keys().cloned().collect::<Vec<_>>().join(", ")
             ),
             HostNote::Guidance(GuidanceNote::Withdrawn { .. }) => "Withdrawn guidance".into(),
+            HostNote::Guidance(GuidanceNote::McpWarnings { .. }) => {
+                "MCP configuration warnings".into()
+            }
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),
             HostNote::PlanModeExit => "Plan mode exit".into(),
+            HostNote::ExecutionMode(note) => format!("Execution mode · {}", note.mode.label()),
+            HostNote::LoopState => "Loop state".into(),
         });
     }
     matches!(

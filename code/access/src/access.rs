@@ -87,7 +87,11 @@ use tickloop_harness::protocol::{
 /// to the live Chat snapshot.
 /// 33.0 adds the context breakdown's Tool search index category, which older readers reject as
 /// unknown, and its per-server items.
-pub const PROTOCOL_MAJOR: u16 = 33;
+/// 34.0 adds the host notes that announce the execution mode and the Loop's state, and the MCP
+/// configuration warnings guidance note, which older readers reject as unknown, in the Chat
+/// snapshot's host notes; the host state of the system prompt no longer carries what changes
+/// during a Chat.
+pub const PROTOCOL_MAJOR: u16 = 34;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

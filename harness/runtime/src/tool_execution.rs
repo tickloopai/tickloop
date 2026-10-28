@@ -270,8 +270,6 @@ pub(super) struct ToolRegistry {
     searched: std::collections::BTreeSet<String>,
     /// Callable directly, but offered only through the model's native tool search.
     deferred: Vec<ToolDefinition>,
-    /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
-    offers_web_search: bool,
     /// Whether the Chat's model searches deferred tools natively.
     native_search: bool,
     /// The user's exposure changes, which reach the Run's held MCP tools at once.
@@ -296,9 +294,7 @@ impl ToolRegistry {
             .into_iter()
             .filter(|definition| match definition.name.as_str() {
                 tickloop_harness_tools::WEB_FETCH_TOOL_NAME => policy.web_fetch,
-                tickloop_harness_tools::WEB_SEARCH_TOOL_NAME => {
-                    policy.web_search && chat.snapshot.search_config.is_some()
-                }
+                tickloop_harness_tools::WEB_SEARCH_TOOL_NAME => policy.web_search,
                 _ => has_folder,
             })
             .map(|definition| RegisteredTool {
@@ -507,7 +503,6 @@ impl ToolRegistry {
             folded,
             searched,
             deferred,
-            offers_web_search: policy.web_search,
             native_search,
             user_exposure,
         }
@@ -529,6 +524,7 @@ impl ToolRegistry {
             .filter(|tool| is_held(tool) && self.is_listed(&tool.definition.name))
             .map(|tool| (listing_group(&tool.route), tool.definition.clone()))
             .collect();
+        state.order_deferred(&mut self.deferred);
         let Some(offer) = state.hold(
             run_id,
             self.native_search,
@@ -603,24 +599,6 @@ impl ToolRegistry {
     }
 
     pub(super) fn refresh(&mut self, chat: &Chat) {
-        if !self.offers_web_search || chat.snapshot.search_config.is_none() {
-            self.tools.retain(|tool| {
-                tool.definition.name != tickloop_harness_tools::WEB_SEARCH_TOOL_NAME
-            });
-        } else if !self
-            .tools
-            .iter()
-            .any(|tool| tool.definition.name == tickloop_harness_tools::WEB_SEARCH_TOOL_NAME)
-            && let Some(definition) = tickloop_harness_tools::Tools::definitions()
-                .into_iter()
-                .find(|definition| definition.name == tickloop_harness_tools::WEB_SEARCH_TOOL_NAME)
-        {
-            self.tools.push(RegisteredTool {
-                definition,
-                route: ToolRoute::BuiltIn,
-            });
-            sort_for_listing(&mut self.tools);
-        }
         if let Some(tool) = self
             .tools
             .iter_mut()
@@ -2883,7 +2861,7 @@ mod tests {
     const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
 
     #[tokio::test]
-    async fn captured_registry_refreshes_search_visibility_in_both_directions() {
+    async fn captured_registry_keeps_search_listed_whether_search_is_on_or_off() {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
             tickloop_harness_test_support::config(),
@@ -2902,12 +2880,17 @@ mod tests {
                 &crate::ToolPolicy::local(),
                 crate::scheduled_tasks::tools::ToolTerms::DEFAULT,
             );
+            let listed = registry.definitions();
             for enabled in [false, true, false] {
                 chat.snapshot.search_config =
                     enabled.then(tickloop_harness_protocol::SearchConfig::default);
                 registry.refresh(chat);
-                assert_eq!(registry.resolve("WebSearch").is_some(), enabled);
+                assert!(registry.resolve("WebSearch").is_some());
                 assert!(registry.resolve("WebFetch").is_some());
+                assert_eq!(
+                    serde_json::to_vec(&registry.definitions()).unwrap(),
+                    serde_json::to_vec(&listed).unwrap()
+                );
             }
         }
         agent.shutdown().await;
