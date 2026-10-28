@@ -131,9 +131,10 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 | `enabled` | `false` | 让 Bash、后台 Shell 和 `!` Shell 在沙箱中运行 |
 | `failIfUnavailable` | `false` | 沙箱不可用时（其他平台，或已在另一个沙箱中）：`false` 警告后按无隔离运行，`true` 拒绝执行 |
 | `autoAllowBashIfSandboxed` | `true` | Ask 与 Auto 下，在沙箱里运行的 Bash 和后台 Shell 直接执行，不问人也不送 Auto 审查 |
-| `allowUnsandboxedCommands` | `true` | 允许命令经 `dangerouslyDisableSandbox` 或 `excludedCommands` 越出沙箱；`false` 同时忽略两者 |
+| `allowUnsandboxedCommands` | `true` | 允许模型通过 `dangerouslyDisableSandbox` 申请越出；`false` 忽略该请求，但 `excludedCommands` 仍生效 |
 | `excludedCommands` | `[]` | 总在沙箱外运行并走正常审批的命令 |
 | `filesystem.allowWrite` | `[]` | 追加可写路径 |
+| `filesystem.allowGitConfig` | `false` | 放开 `.git/config` 写入；Git hooks 与其他保护仍生效 |
 | `filesystem.denyWrite` | `[]` | 保持只读的路径，优先于 `allowWrite` |
 | `network.allowedDomains` | `[]` | 经本机代理可以访问的目标 |
 
@@ -141,7 +142,9 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 
 沙箱开启后，Ask 与 Auto 下在沙箱里运行的 Bash 和后台 Shell（包括 Subagent 的）直接执行，不问人也不送 Auto 审查：能写什么、能连什么由沙箱限定，而不是审查器。显式 Ask/Deny 规则仍先生效，Plan 与 Full Access 不变；设置 `autoAllowBashIfSandboxed: false` 保留隔离但恢复正常审批。
 
-Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`allowUnsandboxedCommands` 设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。
+Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`allowUnsandboxedCommands` 设为假只忽略模型的越出请求；明确排除的命令仍在沙箱外运行并走正常审批。沙箱关闭时 Bash 的这一参数不生效。
+
+默认禁写在可写根下的任意深度生效，不区分文件名大小写：`.gitconfig`、`.gitmodules`、`.bashrc`、`.bash_profile`、`.zshrc`、`.zprofile`、`.profile`、`.ripgreprc`、`.mcp.json`、`.vscode/`、`.idea/`、`.git/hooks/` 与 `.git/config`。还保护 `.tickloop/`、`AGENTS.md`、`CLAUDE.md`、`CLAUDE.local.md`，以及 `.claude/` 下的 `settings.json`、`settings.local.json`、skills、hooks、commands、agents、rules。凭据路径、用户设置文件和配置根仍受保护；家目录文件位于可写根外时同样不可写。普通项目文件与其他 Git 数据仍可写；`filesystem.allowGitConfig: true` 仅放开 `.git/config`，hooks 和显式 `denyWrite` 仍生效。
 
 `filesystem.allowWrite` 与 `denyWrite` 写字面路径：相对路径以 Chat 的 Folder 为基准，不随 Bash 的 `cwd` 改变，`~/` 指你的主目录。`cwd` 位于 Folder 和附加目录之外时走正常审批，沙箱仍保持原有可写范围。禁写规则和敏感路径优先。读取不受限制，但沙箱中的命令不能穿过敏感符号链接（读取也不行），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。
 

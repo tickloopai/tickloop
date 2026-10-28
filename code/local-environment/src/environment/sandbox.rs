@@ -31,14 +31,13 @@ pub(super) async fn prepare(
     if !config.enabled {
         return Ok(PreparedSandbox::default());
     }
-    if config.allow_unsandboxed_commands
-        && (spec.dangerously_disable_sandbox
-            || config.excluded_commands.iter().any(|pattern| {
-                tickloop_harness::tools::permissions::shell_command_matches_pattern(
-                    pattern,
-                    &spec.command,
-                )
-            }))
+    if (config.allow_unsandboxed_commands && spec.dangerously_disable_sandbox)
+        || config.excluded_commands.iter().any(|pattern| {
+            tickloop_harness::tools::permissions::shell_command_matches_pattern(
+                pattern,
+                &spec.command,
+            )
+        })
     {
         return Ok(PreparedSandbox {
             requires_approval: true,
@@ -123,7 +122,21 @@ fn prepare_policy(
     deny_write.push(resolved);
     protected_paths.extend(anchors);
 
-    let patterns = tickloop_harness::tools::sensitive_write_path_patterns();
+    let mut patterns = tickloop_harness::tools::credential_write_path_patterns();
+    for path in config.filesystem.default_deny_write_paths() {
+        patterns
+            .absolute_components
+            .push(case_insensitive_path(path));
+        // Protect the container itself against replacement or symlink traversal, while its
+        // ordinary children (notably Git objects, index and refs) remain writable.
+        for (separator, _) in path.match_indices('/') {
+            patterns
+                .absolute_components
+                .push(format!("{}$", case_insensitive_path(&path[..separator])));
+        }
+    }
+    patterns.absolute_components.sort();
+    patterns.absolute_components.dedup();
     let mut denied_path_patterns = patterns
         .absolute_components
         .iter()
@@ -194,6 +207,22 @@ fn prepare_policy(
         },
         requires_approval,
     ))
+}
+
+fn case_insensitive_path(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphabetic() {
+                format!(
+                    "[{}{}]",
+                    character.to_ascii_lowercase(),
+                    character.to_ascii_uppercase()
+                )
+            } else {
+                regex::escape(&character.to_string())
+            }
+        })
+        .collect()
 }
 
 fn resolve_configured_path(

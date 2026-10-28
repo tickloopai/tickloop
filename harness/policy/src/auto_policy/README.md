@@ -162,8 +162,8 @@ this per-call route. Unauthorized reach, exfiltration and standing permission ch
 to Containment Escape, the exfiltration rules and Self-Modification. Permission Rule Ask/Deny and
 non-classifier-approvable safety checks cannot be cleared by the reviewer.
 
-`sandbox.allowUnsandboxedCommands` defaults to true. When false, both the model's request and the
-exclusion list are ignored and the command retains its sandbox. When the sandbox is disabled, the
+`sandbox.allowUnsandboxedCommands` defaults to true. When false, the model's request is ignored; explicitly excluded commands still run outside the
+sandbox with ordinary approval. Other commands retain their sandbox. When the sandbox is disabled, the
 request has no effect. These controls are read only from the user's settings by Code, never from
 repository content or Harness Settings Store configuration.
 

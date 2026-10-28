@@ -37,7 +37,7 @@ Every Tick appears in this Chat's Monitor, where the user opens a view of it fro
 
 ## Shell permissions
 
-Bash background tasks use the same permissions and optional macOS sandbox as foreground Bash and `!` Shells. With the user's sandbox enabled, sufficiently isolated Bash calls can run without review in Ask and Auto; explicit Ask and Deny rules still win. A permitted `dangerouslyDisableSandbox` request or excluded command uses ordinary approval outside the sandbox. Programs opened as `hosted:` Ticks do not enter that Shell sandbox; opening a Tick is not a way to bypass a blocked Shell command.
+Bash background tasks use the same permissions and optional macOS sandbox as foreground Bash and `!` Shells. With the user's sandbox enabled, sufficiently isolated Bash calls can run without review in Ask and Auto; explicit Ask and Deny rules still win. A permitted `dangerouslyDisableSandbox` request or excluded command uses ordinary approval outside the sandbox. Strict mode ignores model escape requests but still honors explicitly excluded commands. Sandboxed commands cannot write protected startup files, Git hooks/config, editor/MCP settings or Agent project configuration, even when they run without review. The user can allow Git config writes with `sandbox.filesystem.allowGitConfig`; hooks remain protected. Programs opened as `hosted:` Ticks do not enter that Shell sandbox; opening a Tick is not a way to bypass a blocked Shell command.
 
 ## Keep this Chat informed
 
