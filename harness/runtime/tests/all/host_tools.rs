@@ -6,8 +6,9 @@ use std::sync::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Decision, EventKind, ExecutionMode, LoopState, OperationState,
-    PermissionApprovalSource, PermissionRule, PromptPolicy, ToolDefinition, ToolResult,
+    AgentHostOptions, ChatId, Content, Decision, EventKind, ExecutionMode, LoopState,
+    OperationState, PermissionApprovalSource, PermissionRule, PromptPolicy, ToolDefinition,
+    ToolResult,
 };
 use tickloop_harness_runtime::{
     Agent,
@@ -212,13 +213,11 @@ async fn dispatched_host_call_with_lost_response_keeps_unknown_outcome() {
     let provider = Arc::new(ResolvedTargetTool::default());
     provider.target.store(7, Ordering::SeqCst);
     provider.uncertain.store(true, Ordering::SeqCst);
-    let agent = Agent::new_embedded(
-        config(),
-        Arc::new(ScriptedModel::new(vec![
-            call("uncertain", "change_current", json!({})),
-            text("The outcome is unknown."),
-        ])),
-    );
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("uncertain", "change_current", json!({})),
+        text("The outcome is unknown."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
     agent.install_host_tools(provider.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -249,6 +248,31 @@ async fn dispatched_host_call_with_lost_response_keeps_unknown_outcome() {
             .contains("outcome unknown")
     );
     assert_eq!(provider.executed.lock().unwrap().as_slice(), [7]);
+    // The unknown outcome answers the call where it was made; the system prompt names no
+    // uncertain operation and stays byte for byte the same.
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::to_vec(&requests[1].messages[0]).unwrap(),
+        serde_json::to_vec(&requests[0].messages[0]).unwrap()
+    );
+    let system = serde_json::to_string(&requests[0].messages[0]).unwrap();
+    assert!(!system.contains("uncertain_operations"));
+    let call_at = requests[1]
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolUse { id, .. } if id == "uncertain"))
+        })
+        .unwrap();
+    assert!(matches!(
+        requests[1].messages[call_at + 1].content.as_slice(),
+        [Content::ToolResult { tool_use_id, content, is_error: true }]
+            if tool_use_id == "uncertain" && content.text().contains("outcome unknown")
+    ));
     agent.shutdown().await;
 }
 

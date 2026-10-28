@@ -356,7 +356,7 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         SettledOutcome::Completed { .. }
     ));
 
-    let offered = model
+    let mut offered = model
         .requests
         .lock()
         .unwrap()
@@ -367,6 +367,8 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<BTreeSet<_>>();
+    // ArtifactLogin stays listed while an account is signed in, where it starts nothing.
+    assert!(offered.remove("ArtifactLogin"));
     let snapshot = agent.snapshot(root).await.unwrap();
     let called = snapshot
         .operations

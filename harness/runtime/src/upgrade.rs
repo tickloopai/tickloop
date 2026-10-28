@@ -52,9 +52,6 @@ struct ChatCheckpoint {
     bookkeeping: ChatBookkeeping,
     family_generation: u64,
     start_new_tool_result_message: bool,
-    needs_plan_mode_exit_notice: bool,
-    #[serde(default)]
-    has_exited_plan_mode: bool,
     #[serde(default)]
     mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
     deferred_messages: Vec<Message>,
@@ -148,8 +145,6 @@ impl Agent {
                 bookkeeping: chat.bookkeeping.clone(),
                 family_generation: chat.family_generation,
                 start_new_tool_result_message: chat.start_new_tool_result_message,
-                needs_plan_mode_exit_notice: chat.needs_plan_mode_exit_notice,
-                has_exited_plan_mode: chat.has_exited_plan_mode,
                 mode_before_plan: chat.mode_before_plan,
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
@@ -344,9 +339,8 @@ impl Agent {
                     task_checkpoint_pending: false,
                     family_finishing: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
-                    needs_plan_mode_exit_notice: saved.needs_plan_mode_exit_notice,
-                    has_exited_plan_mode: saved.has_exited_plan_mode,
                     mode_before_plan: saved.mode_before_plan,
+                    announced_loop_state: None,
                     active: saved
                         .waiting
                         .as_ref()

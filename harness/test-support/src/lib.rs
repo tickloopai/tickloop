@@ -245,46 +245,70 @@ pub fn submit_plan(id: &str, markdown: &str) -> Vec<Content> {
     .concat()
 }
 
-/// The plan file path named by the latest Plan mode reminder in a request's conversation.
-pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
+/// The texts that mark the host note announcing an execution mode.
+const EXECUTION_MODE_NOTE_MARKERS: [&str; 4] = [
+    "Plan mode is active.",
+    "Plan mode still active",
+    "Mode Active\n",
+    "## Exited Plan Mode\n",
+];
+
+/// Whether a message is a host note, which the host writes inside `<system-reminder>` tags.
+pub fn is_host_note(message: &tickloop_harness_protocol::Message) -> bool {
+    message.role == Role::User
+        && matches!(message.content.first(), Some(Content::Text { text }) if text.starts_with("<system-reminder>\n"))
+}
+
+/// The latest host note in a request announcing the execution mode the model is in.
+pub fn latest_execution_mode_note(request: &ModelRequest) -> Option<&str> {
     request
         .messages
         .iter()
         .rev()
         .filter(|message| message.role == Role::User)
         .flat_map(|message| message.content.iter().rev())
-        .filter_map(|content| match content {
-            Content::Text { text } => Some(text.as_str()),
+        .find_map(|content| match content {
+            Content::Text { text }
+                if text.starts_with("<system-reminder>\n")
+                    && EXECUTION_MODE_NOTE_MARKERS
+                        .iter()
+                        .any(|marker| text.contains(marker)) =>
+            {
+                Some(text.as_str())
+            }
             _ => None,
-        })
-        .find_map(|text| {
-            [
-                ("create your plan at ", " using the Write tool."),
-                ("A plan file already exists at ", ". You can read it"),
-                ("Read-only except plan file (", ")."),
-                (
-                    "A plan file exists at ",
-                    " from your previous planning session.",
-                ),
-            ]
-            .into_iter()
-            .find_map(|(before, after)| {
-                let (_, rest) = text.split_once(before)?;
-                Some(rest.split_once(after)?.0.to_owned())
-            })
         })
 }
 
-/// The text of every Plan mode reminder and other host note in a request's conversation, in
-/// order: user-role text wrapped in `<system-reminder>` tags.
+/// The plan file path the latest execution mode note of a request names, while that note holds
+/// the model to Plan's rules.
+pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
+    let note = latest_execution_mode_note(request)?;
+    if note.contains("## Exited Plan Mode\n") || note.contains("Mode Active\n") {
+        return None;
+    }
+    [
+        ("create your plan at ", " using the Write tool."),
+        ("A plan file already exists at ", ". You can read it"),
+        ("Read-only except plan file (", ")"),
+    ]
+    .into_iter()
+    .find_map(|(before, after)| {
+        let (_, rest) = note.split_once(before)?;
+        Some(rest.split_once(after)?.0.to_owned())
+    })
+}
+
+/// The text of every host note in a request's conversation, in order: user-role text wrapped in
+/// `<system-reminder>` tags, other than the user context.
 pub fn host_note_texts(request: &ModelRequest) -> Vec<String> {
     request
         .messages
         .iter()
-        .filter(|message| message.role == Role::User && !is_user_context(message))
+        .filter(|message| is_host_note(message) && !is_user_context(message))
         .flat_map(|message| &message.content)
         .filter_map(|content| match content {
-            Content::Text { text } if text.starts_with("<system-reminder>\n") => Some(text.clone()),
+            Content::Text { text } => Some(text.clone()),
             _ => None,
         })
         .collect()

@@ -441,8 +441,11 @@ fn user_text(text: &str) -> Message {
     }
 }
 
+/// Escapes the brackets of text the host did not write, lookalikes included, so it can neither
+/// close the tag that frames it nor open one of the host's.
 fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
+    crate::tags::fold_bracket_lookalikes(text)
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }

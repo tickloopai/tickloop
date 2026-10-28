@@ -23,9 +23,8 @@ use tickloop_harness_base::private_fs::{
 };
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatSnapshot, EventKind, FileReadRecord, HostNote, LoopId, OperationRecord,
-    PermissionApprovalSource, PermissionRequest, Plan, PlanModeNote, PlanModeReminder, Progress,
-    PromptPolicy, Receipt, Role, TodoItem, ToolDefinition, ToolResult,
+    ChatSnapshot, EventKind, FileReadRecord, LoopId, OperationRecord, PermissionApprovalSource,
+    PermissionRequest, Plan, Progress, PromptPolicy, Receipt, TodoItem, ToolDefinition, ToolResult,
 };
 use tickloop_harness_tools::{
     ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_WITHOUT_PLAN,
@@ -33,7 +32,9 @@ use tickloop_harness_tools::{
 };
 
 mod prompts;
-pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice};
+pub(super) use prompts::{
+    enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reentry, plan_mode_rules,
+};
 
 /// Components of the plan file's directory and file name `<slug>-loop-<loopId>.md`.
 const PLANS_DIRECTORY: &str = "plans";
@@ -52,10 +53,6 @@ const MAX_TODO_TEXT_BYTES: usize = 4096;
 /// Following Claude Code's `MAX_SLUG_RETRIES`: regenerate when the generated slug is already taken
 /// by a plan file.
 const MAX_SLUG_RETRIES: usize = 10;
-/// Claude Code 2.1.302's `TURNS_BETWEEN_ATTACHMENTS` and `FULL_REMINDER_EVERY_N_ATTACHMENTS`: a
-/// Plan mode reminder at most every five user turns, every fifth one in full.
-const TURNS_BETWEEN_PLAN_REMINDERS: usize = 5;
-const FULL_PLAN_REMINDER_EVERY: usize = 5;
 
 /// Following the "adjective-verb-noun" format of Claude Code's `generateWordSlug`, with words taken
 /// from the first part of its word lists.
@@ -657,69 +654,6 @@ pub(super) fn rebuild_plans_and_progress(
     Ok(warnings)
 }
 
-/// Which Plan mode reminder is due, following Claude Code 2.1.302's `getPlanModeAttachments`:
-/// none while fewer than five user turns followed the last reminder of this stretch in Plan,
-/// otherwise the next in the sequence since the Chat last left Plan, every fifth in full. A
-/// reminder that named another plan file, as after a fork or a recovered plan file prefix, is
-/// replaced at once by a full one. Only the conversation the model still sees counts.
-fn due_plan_mode_reminder(
-    snapshot: &ChatSnapshot,
-    plan_file: Option<&Path>,
-) -> Option<PlanModeReminder> {
-    let start = snapshot.active_start();
-    let mut user_turns = 0;
-    let mut last_reminder = None;
-    for index in (start..snapshot.messages.len()).rev() {
-        match snapshot.host_notes.get(&index) {
-            Some(HostNote::PlanMode(note)) => {
-                last_reminder = Some(note);
-                break;
-            }
-            Some(HostNote::PlanModeExit) => break,
-            Some(_) => continue,
-            None => {}
-        }
-        let message = &snapshot.messages[index];
-        if message.role == Role::User
-            && !message
-                .content
-                .iter()
-                .any(|content| matches!(content, Content::ToolResult { .. }))
-        {
-            user_turns += 1;
-        }
-    }
-    let names_another_file =
-        last_reminder.is_some_and(|note| note.plan_file.as_deref() != plan_file);
-    if names_another_file {
-        return Some(PlanModeReminder::Full);
-    }
-    if last_reminder.is_some() && user_turns < TURNS_BETWEEN_PLAN_REMINDERS {
-        return None;
-    }
-    let earlier_reminders = snapshot
-        .host_notes
-        .range(start..)
-        .rev()
-        .map(|(_, note)| note)
-        .take_while(|note| **note != HostNote::PlanModeExit)
-        .filter(|note| {
-            matches!(
-                note,
-                HostNote::PlanMode(PlanModeNote {
-                    reminder: PlanModeReminder::Full | PlanModeReminder::Sparse,
-                    ..
-                })
-            )
-        })
-        .count();
-    Some(if earlier_reminders % FULL_PLAN_REMINDER_EVERY == 0 {
-        PlanModeReminder::Full
-    } else {
-        PlanModeReminder::Sparse
-    })
-}
-
 impl Agent {
     /// Declines the reviewed version. A waiting ExitPlanMode receives the feedback, or the
     /// cancellation that ends its Run. Without a waiting tool, feedback starts a planning
@@ -974,8 +908,6 @@ impl Agent {
         snapshot.policy.mode = mode;
         snapshot.policy.revision += 1;
         self.save(&snapshot);
-        // Like Claude Code's approval, leaving Plan here owes the exit notice as well.
-        chat.record_plan_mode_transition(chat.snapshot.policy.mode, mode);
         let offers_task_tools = snapshot.task_tools_enabled;
         chat.replace_snapshot(snapshot);
         if let Some(request) = request {
@@ -1032,86 +964,21 @@ impl Agent {
         }
     }
 
-    /// The Plan mode reminders the next request of a Chat in Plan owes, as host notes: like
-    /// Claude Code's `plan_mode` attachment, the first request in Plan gets the full reminder,
-    /// later ones another reminder every five user turns, every fifth in full and the rest
-    /// sparse; returning to Plan with an earlier plan file adds the `plan_mode_reentry` notice
-    /// first. Names the Loop's plan file, choosing the Chat's plan file prefix on first use. A
-    /// delegated child has no plan file: it researches read-only and reports in its final reply.
-    pub(super) fn plan_mode_notes(
-        &self,
-        chat: &mut Chat,
-        loop_id: LoopId,
-    ) -> Vec<(String, HostNote)> {
-        if chat.snapshot.policy.mode != ExecutionMode::Plan {
-            return Vec::new();
-        }
-        let note = |reminder, plan_file: Option<&Path>| {
-            HostNote::PlanMode(PlanModeNote {
-                reminder,
-                plan_file: plan_file.map(Path::to_path_buf),
-            })
-        };
+    /// The Loop's plan file for a request of a root Chat with a Folder in Plan mode, choosing the
+    /// Chat's plan file prefix on first use. A delegated child or a Chat without a Folder has
+    /// none.
+    pub(super) fn prepare_plan_file(&self, chat: &mut Chat, loop_id: LoopId) -> Option<PathBuf> {
         if chat.snapshot.delegation.is_some() {
-            return due_plan_mode_reminder(&chat.snapshot, None)
-                .map(|reminder| {
-                    (
-                        prompts::delegated_plan_mode_reminder(),
-                        note(reminder, None),
-                    )
-                })
-                .into_iter()
-                .collect();
+            return None;
         }
-        // A Chat without a Folder has no plan file: its plan goes in the reply.
-        let Some(folder) = chat.snapshot.folder.as_deref() else {
-            return due_plan_mode_reminder(&chat.snapshot, None)
-                .map(|reminder| {
-                    let text = match reminder {
-                        PlanModeReminder::Sparse => {
-                            prompts::SPARSE_FOLDERLESS_PLAN_MODE_REMINDER.to_owned()
-                        }
-                        _ => prompts::folderless_plan_mode_reminder(
-                            self.inner.tool_policy.delegation,
-                        ),
-                    };
-                    (text, note(reminder, None))
-                })
-                .into_iter()
-                .collect();
-        };
-        let directory = self.plans_directory(folder);
+        let directory = self.plans_directory(&chat.snapshot.folder.clone()?);
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
         if ensure_plan_slug(&mut chat.bookkeeping, directory.path()) {
             self.save(&chat.snapshot);
         }
-        let Some(plan_file) = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
-        else {
-            return Vec::new();
-        };
-        let Some(reminder) = due_plan_mode_reminder(&chat.snapshot, Some(&plan_file)) else {
-            return Vec::new();
-        };
-        let plan_exists = plan_file.exists();
-        let mut notes = Vec::new();
-        if std::mem::take(&mut chat.has_exited_plan_mode) && plan_exists {
-            notes.push((
-                prompts::plan_mode_reentry_reminder(&plan_file),
-                note(PlanModeReminder::Reentry, Some(&plan_file)),
-            ));
-        }
-        let text = match reminder {
-            PlanModeReminder::Sparse => prompts::sparse_plan_mode_reminder(&plan_file),
-            _ => prompts::plan_mode_reminder(
-                &plan_file,
-                plan_exists,
-                self.inner.tool_policy.delegation,
-            ),
-        };
-        notes.push((text, note(reminder, Some(&plan_file))));
-        notes
+        current_plan_file(&chat.bookkeeping, directory.path(), loop_id)
     }
 
     /// The result of a side effect Plan mode refused, naming the Loop's plan file.
@@ -1174,10 +1041,6 @@ impl Agent {
                     );
                     snapshot.policy.mode = ExecutionMode::Plan;
                     snapshot.policy.revision += 1;
-                    chat.record_plan_mode_transition(
-                        chat.snapshot.policy.mode,
-                        ExecutionMode::Plan,
-                    );
                     (None, ControlStep::Done(prompts::entered_plan_mode()))
                 }
                 EXIT_PLAN_MODE_TOOL_NAME => {

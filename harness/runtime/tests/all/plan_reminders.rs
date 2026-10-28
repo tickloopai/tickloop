@@ -179,8 +179,8 @@ async fn plan_reminders_follow_claude_codes_five_turn_cadence() {
 }
 
 /// Approving a plan leaves Plan like any other way out: the next request tells the model once.
-/// Returning to Plan with that plan file then starts with Claude Code's re-entry notice and the
-/// full reminder.
+/// Returning to Plan with that plan file then leads the full reminder with Claude Code's re-entry
+/// notice.
 #[tokio::test]
 async fn returning_to_plan_after_an_approved_plan_announces_the_reentry() {
     let model = Arc::new(ScriptedModel::new(vec![
@@ -220,12 +220,14 @@ async fn returning_to_plan_after_an_approved_plan_announces_the_reentry() {
     assert_eq!(kinds(&new_notes(&requests, 1)), [EXITED]);
     assert!(new_notes(&requests, 2).is_empty());
     let reentry = new_notes(&requests, 3);
-    assert_eq!(kinds(&reentry), [REENTRY, FULL]);
+    assert_eq!(reentry.len(), 1, "{reentry:?}");
     let plan_file = reminded_plan_file(&requests[0]).unwrap();
-    assert!(reentry[0].contains(&format!(
-        "A plan file exists at {plan_file} from your previous planning session."
+    let reentry = &reentry[0];
+    assert!(reentry.contains(&format!(
+        "{REENTRY}\n\nYou are returning to plan mode after having previously exited it. A plan file exists at {plan_file} from your previous planning session."
     )));
-    assert!(reentry[1].contains(&format!("A plan file already exists at {plan_file}.")));
+    assert!(reentry.contains(FULL));
+    assert!(reentry.contains(&format!("A plan file already exists at {plan_file}.")));
     agent.shutdown().await;
 }
 
@@ -402,8 +404,6 @@ async fn the_plan_file_stays_writable_without_asking_outside_plan_mode() {
         let model = Arc::new(ScriptedModel::new(vec![
             write_plan("draft", "1. Draft."),
             text("Drafted."),
-            write_plan("revise", "1. Revised."),
-            text("Revised."),
         ]));
         let agent = Agent::new_embedded(config(), model.clone());
         let directory = tempfile::tempdir().unwrap();
@@ -413,12 +413,18 @@ async fn the_plan_file_stays_writable_without_asking_outside_plan_mode() {
             .await
             .unwrap();
         run_turn(&agent, chat, "Plan it", no_requests).await;
+        let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
+        model.enqueue(call(
+            "revise",
+            "Write",
+            json!({"file_path": plan_file, "content": "1. Revised."}),
+        ));
+        model.enqueue(text("Revised."));
         agent.set_execution_mode(chat, mode).await.unwrap();
         run_turn(&agent, chat, "Revise the plan", no_requests).await;
 
         let requests = model.requests.lock().unwrap().clone();
         assert!(!tool_result(&requests[3], "revise").1, "{mode:?}");
-        let plan_file = reminded_plan_file(&requests[0]).unwrap();
         assert_eq!(std::fs::read_to_string(plan_file).unwrap(), "1. Revised.");
         agent.shutdown().await;
     }

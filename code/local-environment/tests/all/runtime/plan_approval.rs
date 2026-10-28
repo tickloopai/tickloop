@@ -102,11 +102,19 @@ async fn every_approval_mode_returns_the_reviewed_plan_and_continues_the_same_ru
         let requests = model.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult { tool_use_id, content, is_error: false } if tool_use_id == "plan" && content.text().contains("User has approved your plan.") && content.text().ends_with("Create the reviewed report."))));
-        assert_eq!(
-            exit_notices(&requests[1]),
-            1,
-            "like Claude Code 2.1.302, the approval leaves Plan and says so once"
+        // As in Claude Code, the request after the approval result also says Plan mode ended,
+        // and names the mode the user approved in.
+        assert_eq!(exit_notices(&requests[1]), 1);
+        let note =
+            tickloop_harness::test_support::latest_execution_mode_note(&requests[1]).unwrap();
+        assert!(note.contains(EXIT_NOTICE), "{note}");
+        assert!(
+            note.contains(&format!("## {} Mode Active", mode.label())),
+            "{note}"
         );
+        assert!(tickloop_harness::test_support::is_host_note(
+            requests[1].messages.last().unwrap()
+        ));
         agent.shutdown().await;
     }
 }
@@ -432,11 +440,7 @@ async fn a_mode_change_during_a_run_applies_from_the_next_model_request() {
         .iter()
         .map(|request| reminded_plan_file(request).is_some())
         .collect::<Vec<_>>();
-    assert_eq!(
-        planning,
-        [false, true, true],
-        "reminders stay in the history"
-    );
+    assert_eq!(planning, [false, true, false]);
     assert_eq!(
         requests.iter().map(exit_notices).collect::<Vec<_>>(),
         [0, 0, 1],
@@ -487,7 +491,7 @@ async fn closing_a_plan_review_keeps_the_plan_pending_and_the_chosen_mode() {
     assert_eq!(
         exit_notices(&requests[1]),
         1,
-        "Shift+Tab left Plan, so the continuation says so once, as in Claude Code 2.1.302"
+        "the continuation carries the approved plan and one note that Plan ended"
     );
     agent.shutdown().await;
 }
@@ -619,12 +623,13 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
     assert_eq!(child.chat_loop.state, LoopState::Idle);
     let requests = model.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3);
-    assert!(host_note_texts(&requests[0]).concat().contains(
+    let mode_note = tickloop_harness::test_support::latest_execution_mode_note;
+    assert!(mode_note(&requests[0]).unwrap().contains(
         "Subagent children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
     ));
-    let child_notes = host_note_texts(&requests[1]).concat();
-    assert!(child_notes.contains("Answer the query you were given comprehensively in your final message, and do not write a plan or anything else to a file."));
-    assert!(!child_notes.contains("ExitPlanMode"), "{child_notes}");
+    let child_note = mode_note(&requests[1]).unwrap();
+    assert!(child_note.contains("Answer the query you were given comprehensively in your final message, and do not write a plan or anything else to a file."));
+    assert!(!child_note.contains("ExitPlanMode"), "{child_note}");
     assert!(!system_prompt(&requests[1]).contains("ExitPlanMode"));
     assert!(reminded_plan_file(&requests[1]).is_none());
     assert!(
@@ -691,13 +696,28 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     let notice = requests[2].messages.last().unwrap();
     assert_eq!(notice.role, Role::User);
     assert!(
-        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.ends_with(&format!("The plan file is located at {plan_file} if you need to reference it.\n</system-reminder>")))
+        matches!(&notice.content[..], [Content::Text { text }] if text.starts_with("<system-reminder>\n## Exited Plan Mode\n\n") && text.contains(&format!("The plan file is located at {plan_file} if you need to reference it.\n\n## Full Access Mode Active\n\n")))
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert!(matches!(
-        snapshot.host_notes.values().collect::<Vec<_>>()[..],
-        [HostNote::PlanMode(_), HostNote::PlanModeExit]
-    ));
+    assert_eq!(
+        snapshot
+            .host_notes
+            .values()
+            .map(|note| match note {
+                HostNote::ExecutionMode(note) => (
+                    note.mode,
+                    note.plan_file
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [
+            (ExecutionMode::Plan, Some(plan_file.clone())),
+            (ExecutionMode::FullAccess, None)
+        ]
+    );
     let public = serde_json::to_string(&snapshot.public_conversation_items().unwrap()).unwrap();
     assert!(!public.contains(EXIT_NOTICE), "{public}");
     agent.shutdown().await;
@@ -727,4 +747,92 @@ async fn leaving_plan_without_approval_tells_the_next_request_once() {
     completed(&mut events, &run).await;
     assert_eq!(exit_notices(&model.requests.lock().unwrap()[0]), 1);
     restarted.shutdown().await;
+}
+
+/// Entering Plan, planning, reviewing, leaving and returning keep the request prefix byte for
+/// byte the same: the plan, its approval and the mode reach the model only through tool results
+/// and host notes at the end of the conversation.
+#[tokio::test]
+async fn every_planning_phase_keeps_the_prefix_and_returning_to_plan_reenters_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        submit_plan("plan", "First plan."),
+        submit_plan("revised", "Second plan."),
+        text("Implementing."),
+        text("Replanning."),
+        text("Still planning."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, "Plan the report".into()).await.unwrap();
+    request(&mut events).await;
+    agent
+        .decline_plan(chat, 1, Some("Tighten it".into()))
+        .await
+        .unwrap();
+    request(&mut events).await;
+    agent
+        .approve_plan(chat, 2, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    for prompt in ["Plan the next step", "Keep planning"] {
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .unwrap();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+        completed(&mut events, &receipt).await;
+    }
+
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_vec(&request.messages[..2]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[..2]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let system = system_prompt(&requests[0]);
+    for absent in ["\"plan\"", "approval_pending", "First plan."] {
+        assert!(!system.contains(absent), "{absent}");
+    }
+    let new_note = |index: usize| {
+        let last = requests[index].messages.last().unwrap();
+        is_host_note(last).then(|| match &last.content[0] {
+            Content::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        })
+    };
+    assert!(new_note(0).unwrap().contains("Plan mode is active."));
+    assert_eq!(
+        new_note(1),
+        None,
+        "feedback keeps planning without a new note"
+    );
+    let left = new_note(2).unwrap();
+    assert!(left.contains("## Exited Plan Mode\n") && left.contains("## Auto Mode Active\n"));
+    let reentered = new_note(3).unwrap();
+    let plan_file = reminded_plan_file(&requests[0]).unwrap();
+    assert!(
+        reentered.starts_with(&format!(
+            "<system-reminder>\n## Re-entering Plan Mode\n\nYou are returning to plan mode after having previously exited it. A plan file exists at {plan_file} from your previous planning session."
+        )),
+        "{reentered}"
+    );
+    assert!(
+        reentered.contains("A plan file already exists at"),
+        "{reentered}"
+    );
+    assert_eq!(new_note(4), None);
+    agent.shutdown().await;
 }

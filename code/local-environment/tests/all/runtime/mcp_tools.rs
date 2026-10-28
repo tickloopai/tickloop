@@ -76,7 +76,7 @@ async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
             McpHostToolProvider::new(service.login(directory.path()).await, None)
         });
         provider.refresh(CancellationToken::new()).await.unwrap();
-        assert_eq!(provider.definitions().len(), 4);
+        assert_eq!(artifact_tools(&provider).len(), 4);
 
         if method == "server/discover" {
             service
@@ -114,7 +114,11 @@ async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
             assert!(!diagnostic.contains("test-service-token-0"), "{diagnostic}");
             assert!(!diagnostic.contains("Method not found"), "{diagnostic}");
         }
-        assert!(provider.definitions().is_empty());
+        assert_eq!(
+            artifact_tools(&provider).len(),
+            4,
+            "a failed refresh keeps the tools listed"
+        );
         assert_eq!(
             provider.service_connections()["artifacts"]["authentication"],
             "signed_in"
@@ -130,11 +134,8 @@ async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
         agent.install_host_tools(provider.clone()).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         submit_and_wait(&agent, chat, "Keep going without Artifacts").await;
-        assert!(
-            !tool_names(&model.requests.lock().unwrap()[0])
-                .iter()
-                .any(|name| name.starts_with("Artifact"))
-        );
+        // The tools the directory listed before the failure stay listed; their calls explain.
+        assert!(tool_names(&model.requests.lock().unwrap()[0]).contains(&"ArtifactEdit"));
         agent.shutdown().await;
 
         service
@@ -146,7 +147,7 @@ async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
             .reject_tool_listing
             .store(false, Ordering::SeqCst);
         provider.refresh(CancellationToken::new()).await.unwrap();
-        assert_eq!(provider.definitions().len(), 4);
+        assert_eq!(artifact_tools(&provider).len(), 4);
     }
 }
 
@@ -1235,6 +1236,17 @@ fn current_host_state(request: &ModelRequest) -> Value {
         .unwrap()
 }
 
+/// The Artifact tools a provider lists, leaving out ArtifactLogin, which it lists whenever it
+/// signs in itself.
+fn artifact_tools(provider: &McpHostToolProvider) -> Vec<String> {
+    provider
+        .definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .filter(|name| name != "ArtifactLogin")
+        .collect()
+}
+
 fn tool_names(request: &ModelRequest) -> Vec<&str> {
     request
         .tools
@@ -1342,7 +1354,8 @@ async fn directory_presents_exactly_the_three_artifact_tools_and_the_host_upload
             "ArtifactComment",
             "ArtifactEdit",
             "ArtifactRead",
-            "ArtifactUpload"
+            "ArtifactUpload",
+            "ArtifactLogin"
         ]
     );
     let chat = uuid::Uuid::new_v4();
@@ -1410,7 +1423,7 @@ async fn a_server_other_than_tickloop_artifacts_provides_no_tools() {
             .unwrap_err()
             .contains("directory_rejected")
     );
-    assert!(provider.definitions().is_empty());
+    assert!(artifact_tools(&provider).is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
         "signed_in"
@@ -1438,7 +1451,7 @@ async fn a_directory_without_all_three_artifact_tools_provides_none() {
             .unwrap_err()
             .contains("directory_rejected")
     );
-    assert!(provider.definitions().is_empty());
+    assert!(artifact_tools(&provider).is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["tool_directory"],
         "unavailable"
@@ -1797,14 +1810,7 @@ async fn delegated_chat_inherits_the_artifact_tools() {
             "Artifact tools missing from parent or delegated child"
         );
         let host = current_host_state(request);
-        assert_eq!(
-            host["service_connections"]["artifacts"]["authentication"],
-            "signed_in"
-        );
-        assert_eq!(
-            host["service_connections"]["artifacts"]["email"],
-            "one@example.test"
-        );
+        assert!(host.get("service_connections").is_none());
         assert!(
             !serde_json::to_string(&request.messages)
                 .unwrap()
@@ -2097,7 +2103,7 @@ async fn artifact_login_state_is_independent_of_directory_and_connection_failure
         .directory_unavailable
         .store(true, Ordering::SeqCst);
     assert!(provider.refresh(CancellationToken::new()).await.is_err());
-    assert!(provider.definitions().is_empty());
+    assert!(artifact_tools(&provider).is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
         "signed_in"
@@ -2197,7 +2203,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
         .find(|tool| tool.name == "ArtifactEdit")
         .unwrap();
     assert!(edit.description.contains("one picture per Slide"));
-    assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
+    assert!(tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["TickCall", "TickRead"] {
         let definition = requests[0]
             .tools
@@ -2301,7 +2307,7 @@ async fn logout_after_an_approval_request_prevents_dispatch_and_hides_the_tools(
     assert!(service.tool_calls().is_empty());
     {
         let requests = model.requests.lock().unwrap();
-        assert!(!tool_names(&requests[1]).contains(&"ArtifactEdit"));
+        assert!(tool_names(&requests[1]).contains(&"ArtifactEdit"));
         assert!(tool_result_text(&requests[1], "replace").contains(NOTHING_SENT));
     }
     agent.shutdown().await;
@@ -2682,7 +2688,7 @@ async fn an_expired_artifacts_token_is_renewed_when_a_call_needs_it() {
 }
 
 #[tokio::test]
-async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
+async fn remote_unauthorized_keeps_tools_listed_and_invalidates_local_login() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
@@ -2697,7 +2703,13 @@ async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["ArtifactLogin"]
+        [
+            "ArtifactComment",
+            "ArtifactEdit",
+            "ArtifactRead",
+            "ArtifactUpload",
+            "ArtifactLogin"
+        ]
     );
     assert!(
         service
@@ -4325,7 +4337,7 @@ async fn a_resumed_chat_is_told_once_which_host_tools_became_available() {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
             notices[0].contains(
-                "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
+                "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactLogin, ArtifactRead, ArtifactUpload."
             ),
             "{}",
             notices[0]
@@ -4392,40 +4404,53 @@ async fn a_new_chat_is_not_told_about_tools_its_first_request_lists() {
     }
 }
 
+/// Signing out leaves the listed tools as they were: a call made while signed out explains how
+/// to sign in instead, and only the server's instructions are withdrawn.
 #[tokio::test]
-async fn signing_out_announces_the_removed_tools_and_offers_sign_in() {
+async fn signing_out_keeps_the_tools_listed_and_a_call_explains_sign_in() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         text("Ready."),
+        call("read", "ArtifactRead", json!({"artifact_id": "doc"})),
         text("Signed out."),
     ]));
     let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     submit_and_wait(&agent, chat, "Hello").await;
     service.client(directory.path()).logout().await.unwrap();
-    submit_and_wait(&agent, chat, "Make a design").await;
+    submit_and_wait(&agent, chat, "Read the doc").await;
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
+    for request in &requests[1..] {
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.messages[0]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[0]).unwrap()
+        );
+    }
+    for name in ["ArtifactLogin", "ArtifactRead", "ArtifactEdit"] {
+        assert!(tool_names(&requests[1]).contains(&name), "{name}");
+    }
     let notices = host_notices(&requests[1]);
-    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
-        notices[1].contains("tickloop-artifacts")
-            && notices[1].contains("Their instructions above no longer apply"),
-        "{}",
-        notices[1]
-    );
-    assert!(
-        notices[0].contains("Now available: ArtifactLogin.")
-            && notices[0].contains(
-                "No longer available: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
-            ),
+        notices[0].contains("tickloop-artifacts")
+            && notices[0].contains("Their instructions above no longer apply"),
         "{}",
         notices[0]
     );
-    let names = tool_names(&requests[1]);
-    assert!(names.contains(&"ArtifactLogin"));
-    assert!(!names.contains(&"ArtifactEdit"));
+    let result = tool_result_text(&requests[2], "read");
+    assert!(
+        result.contains(
+            "Tickloop Artifacts is signed out, so this call was not executed. Call ArtifactLogin"
+        ),
+        "{result}"
+    );
+    assert!(service.tool_calls().is_empty());
 }
 
 #[tokio::test]
@@ -4434,8 +4459,8 @@ async fn signed_out_offers_only_artifact_login() {
     let directory = tempfile::tempdir().unwrap();
     let provider = McpHostToolProvider::new(service.client(directory.path()), None);
     assert!(
-        provider.definitions().is_empty(),
-        "an unverified account offers nothing"
+        artifact_tools(&provider).is_empty(),
+        "an unverified account offers no Artifact tool"
     );
     provider.refresh(CancellationToken::new()).await.unwrap();
     let definitions = provider.definitions();
@@ -4564,16 +4589,20 @@ async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools(
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
     let names = tool_names(&requests[3]);
-    for name in ["ArtifactRead", "ArtifactEdit", "ArtifactComment"] {
+    for name in [
+        "ArtifactRead",
+        "ArtifactEdit",
+        "ArtifactComment",
+        "ArtifactLogin",
+    ] {
         assert!(names.contains(&name), "{name}");
     }
-    assert!(!names.contains(&"ArtifactLogin"));
     let notices = host_notices(&requests[3]);
     assert_eq!(notices.len(), 1);
     assert!(
         notices[0].contains(
             "Now available: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
-        ) && notices[0].contains("No longer available: ArtifactLogin."),
+        ) && !notices[0].contains("No longer available"),
         "{}",
         notices[0]
     );
@@ -4754,9 +4783,10 @@ async fn a_passing_outage_writes_no_tool_notices() {
     submit_and_wait(&agent, chat, "Back?").await;
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
-    assert!(!tool_names(&requests[1]).contains(&"ArtifactEdit"));
-    assert!(!tool_names(&requests[2]).contains(&"ArtifactEdit"));
-    assert!(tool_names(&requests[3]).contains(&"ArtifactEdit"));
+    // The tools the directory listed stay listed through the outage.
+    for request in requests.iter() {
+        assert!(tool_names(request).contains(&"ArtifactEdit"));
+    }
     for request in requests.iter() {
         assert!(
             host_notices(request).is_empty(),
@@ -4797,7 +4827,7 @@ async fn a_request_after_compaction_still_carries_the_tool_notice() {
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].contains(
-            "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
+            "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactLogin, ArtifactRead, ArtifactUpload."
         ),
         "{}",
         notices[0]
@@ -6609,21 +6639,19 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         .unwrap();
     let state: Value =
         serde_json::from_str(prompt.split_once("Current host state: ").unwrap().1).unwrap();
-    for field in [
+    assert!(state.get("delegation").is_some());
+    for absent in [
+        "web_search",
+        "execution_mode",
+        "plan",
         "loop",
+        "family_members",
         "service_connections",
         "artifact_ticks",
-        "web_search",
-        "delegation",
-        "family_members",
     ] {
-        assert!(state.get(field).is_some(), "{field}");
+        assert!(state.get(absent).is_none(), "{absent}");
     }
-    assert_eq!(
-        state["service_connections"]["artifacts"]["authentication"],
-        "signed_in"
-    );
-    assert!(prompt.contains("# Web search is disabled"));
+    assert!(!prompt.contains("/websearch"));
     assert!(!prompt.contains("# Artifacts"));
     let edit = requests[0]
         .tools

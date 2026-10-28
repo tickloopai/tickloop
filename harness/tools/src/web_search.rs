@@ -29,7 +29,9 @@ const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const PERPLEXITY_MAX_DOMAIN_BYTES: usize = 253;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
-pub const DISABLED_MESSAGE: &str = "Web search is disabled for this request. The user can enable it with /websearch. This call was not executed.";
+/// The result of a `WebSearch` call while the user has search turned off. The tool stays listed
+/// so turning search on or off never changes the prompt cache prefix; the call explains instead.
+pub const DISABLED_MESSAGE: &str = "Web search is turned off, so this call was not executed. If the user asks for web search, explain that it is off and that they can turn it on with /websearch. Do not turn it on yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching.";
 const DUCKDUCKGO_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
 

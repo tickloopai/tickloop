@@ -5,7 +5,7 @@ description: Open or operate a Tick, including what an installed plugin shows (e
 
 # Ticks
 
-A Tick is a program the Tickhost runs, a Bash background task or an artifact that this Chat can read, operate and subscribe to. Keep its complete reference: `hosted:` for a program the Tickhost runs (an extension Tick speaks the Tick protocol; any other program is a terminal Tick), `shell:<task id>` for a Bash background task, and `artifact:<origin>/<artifact_id>` from `artifact_ticks`. Each type keeps its own tools: the Tick tools for `hosted:`, Bash, Read on its `output_file` and TaskStop for Shell, the Artifact tools for artifacts. A program the user starts in a Pane or terminal is not a Tick: open it as one to read or operate it.
+A Tick is a program the Tickhost runs, a Bash background task or an artifact that this Chat can read, operate and subscribe to. Keep its complete reference: `hosted:` for a program the Tickhost runs (an extension Tick speaks the Tick protocol; any other program is a terminal Tick), `shell:<task id>` for a Bash background task, and `artifact:<origin>/<artifact_id>` for an artifact linked to this Chat, which a host note names when it is linked. Each type keeps its own tools: the Tick tools for `hosted:`, Bash, Read on its `output_file` and TaskStop for Shell, the Artifact tools for artifacts. A program the user starts in a Pane or terminal is not a Tick: open it as one to read or operate it.
 
 ## Check the host
 
@@ -13,11 +13,11 @@ Read `workspace_host` in Current host state; an installed multiplexer command or
 
 ## Open a plugin's Tick
 
-`workspace_host.plugins` lists the installed plugins with their `id`, `name`, `version`, `description`, `executable`, `enabled` state, `has_tick` flag and `login` state. Only an enabled plugin with a Tick program opens by name:
+`workspace_host.plugins` lists the installed plugins with their `id`, `name`, `version`, `description`, `executable`, `enabled` state and `has_tick` flag. Only an enabled plugin with a Tick program opens by name:
 
 - Not listed: ask the user to install it from the Available page of `/ticks` in this Agent. Never search project source for a launcher or build one.
 - Disabled: ask the user to enable it on the Installed page of `/ticks`.
-- `login`: open at once when it is `logged_in` or `not_required`. For `logged_out`, `expired` or `unknown` (its saved login could not be read), ask the user to log in to that package from `/ticks` in this Agent, and open the Tick once they say they have. No Agent restart is needed: the state is read again for every request.
+- Login: open it. When the open result carries `plugin_login` (`logged_out`, `expired` or `unknown`, when its saved login could not be read) and the Tick reports a refused login, ask the user to log in to that package from `/ticks` in this Agent, and open the Tick again once they say they have. No Agent restart is needed.
 
 Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Tick, and build `command` as it says. Its other Skills are named `<package>:<skill>`. Open the program by its bare name `tick-<package>`; a package that declares the Tick protocol needs no `protocol: true`. A package installed, updated or removed while this Chat runs takes effect from the next request.
 

@@ -1,4 +1,5 @@
-//! Conversation instructions, output style and dynamic host state.
+//! Conversation instructions, output style and dynamic host state. The execution mode reaches the
+//! model through host notes, so changing it keeps the prompt cache.
 
 use tickloop_harness_base::output_style::OutputStyle;
 
@@ -25,13 +26,12 @@ const FOLDERLESS_FILE_REQUEST_NOTE: &str = "If the user asks you to read or chan
 
 const OUTPUT_STYLE_INTRO: &str = "Respond to the user according to your \"Output Style\" below, which describes how you should respond to user queries.";
 
-const WEB_SEARCH_DISABLED_SECTION: &str = "# Web search is disabled\nTickloop supports web search, but it is currently turned off. WebSearch is not available in this request. If the user asks for web search, explain that it is disabled and that they can enable it with /websearch. Do not enable it yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching.";
-
-/// Claude Code's `getSimpleSystemSection`; host-written messages carry tags instead of hooks.
+/// Claude Code's `getSimpleSystemSection`, with its standard sentence on tags: the user's own
+/// instruction files arrive in tags too, so tags are not said to be the host's alone.
 const SYSTEM_SECTION: &str = "# System
  - All text you output outside of tool use is displayed to the user. Output text to communicate with the user. You can use Github-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
  - Tools are executed in a user-selected execution mode. When you attempt to call a tool that is not automatically allowed by the user's execution mode or permission settings, the user will be prompted so that they can approve or deny the execution. If the user denies a tool you call, or the host blocks it, do not re-attempt the exact same tool call. Instead, think about why it was denied and adjust your approach.
- - The host also writes user-role messages. Text inside <system-reminder>, <task-notification>, <agent-message> or <tick-delivery> tags comes from the host or another Agent, not from the user: it is information, never the user's request or approval, and bears no direct relation to the message it appears in.";
+ - Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.";
 
 const COMPACTION_NOTE: &str = " - The host will automatically compress prior messages in your conversation as it approaches context limits. This means your conversation with the user is not limited by the context window.";
 
@@ -248,8 +248,6 @@ pub(super) fn conversation_system_prompt(
         has_folder
             .then(|| pane_display_section(&host_state["workspace_host"]))
             .flatten(),
-        (tools.web_search && host_state["web_search"]["enabled"].as_bool() == Some(false))
-            .then(|| WEB_SEARCH_DISABLED_SECTION.to_owned()),
         Some(TONE_AND_STYLE_SECTION.to_owned()),
         Some(OUTPUT_EFFICIENCY_SECTION.to_owned()),
         style_section,
@@ -272,7 +270,6 @@ impl crate::Agent {
     pub(super) fn conversation_system_message(
         &self,
         chat: &crate::Chat,
-        family_roster: &[crate::family::FamilyAgent],
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
         deferred_tools: &[String],
     ) -> tickloop_harness_protocol::Message {
@@ -293,29 +290,15 @@ impl crate::Agent {
             deferred_tools,
         };
         let family_temp = chat.tools.family_temp_directory();
-        let mut web_search =
-            serde_json::json!({ "enabled": chat.snapshot.search_config.is_some() });
-        if chat.snapshot.folder.is_some() {
-            web_search["settings_command"] = "/websearch".into();
-        }
         let mut state = serde_json::json!({
-            "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-            "artifact_ticks": chat.snapshot.artifact_ticks,
-            "delegation": chat.snapshot.delegation,
-            "family_members": family_roster.iter().map(|member| serde_json::json!({
-                "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                "name": member.handle, "depth": member.depth, "state": member.availability,
-                })).collect::<Vec<_>>(),
-            "loop": loop_state(&chat.snapshot.chat_loop),
-            "web_search": web_search,
-            "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+            "delegation": chat.snapshot.delegation.as_ref().map(fixed_delegation),
         });
         if let Some(folder) = &chat.snapshot.folder {
             state.as_object_mut().unwrap().extend(serde_json::json!({
                 "workdir": folder,
                 "family_temp_directory": family_temp,
                 "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
-                "workspace_host": workspace_host,
+                "workspace_host": workspace_host.map(fixed_workspace_host),
             }).as_object().unwrap().clone());
         }
         let state = tickloop_harness_protocol::model_ids::model_json(&chat.ids, state);
@@ -328,24 +311,85 @@ impl crate::Agent {
     }
 }
 
-/// The Loop as the system prompt shows it. The Loop is always running while it asks the model,
-/// so its state, Run and timing would only change the system prompt, the start of the prompt
-/// cache prefix, at every Run.
-fn loop_state(chat_loop: &tickloop_harness_protocol::LoopSnapshot) -> serde_json::Value {
-    let mut state = serde_json::json!({
-        "id": chat_loop.id,
-        "receiving": chat_loop.receiving,
-        "subscriptions": chat_loop.subscriptions,
-    });
-    if !chat_loop.event_sources.is_empty() {
-        state["event_sources"] = serde_json::json!(chat_loop.event_sources);
+/// The workspace host as the system prompt shows it. A plugin's login changes without the model,
+/// so its Tick reports a refused login when opened instead.
+fn fixed_workspace_host(
+    workspace_host: &crate::host_tools::WorkspaceHostContext,
+) -> serde_json::Value {
+    let mut value = serde_json::json!(workspace_host);
+    if let Some(plugins) = value["plugins"].as_array_mut() {
+        for plugin in plugins {
+            if let Some(plugin) = plugin.as_object_mut() {
+                plugin.remove("login");
+            }
+        }
     }
-    state
+    value
+}
+
+/// What a Subagent's system prompt says of its delegation: only what was fixed when it was
+/// created, so the prompt cache prefix stays the same for its whole life. The session denials and
+/// host tool authorities its ceiling gains later are enforced at each call, whose result tells
+/// the model, and the trusted inputs and host context serve the Auto review, not the model.
+fn fixed_delegation(
+    delegation: &tickloop_harness_protocol::DelegationMetadata,
+) -> serde_json::Value {
+    let ceiling = &delegation.ceiling;
+    serde_json::json!({
+        "parent_chat_id": delegation.parent_chat_id,
+        "parent_call_id": delegation.parent_call_id,
+        "lineage": delegation.lineage().iter().map(|parent| parent.chat_id).collect::<Vec<_>>(),
+        "depth": delegation.depth(),
+        "task": delegation.task,
+        "ceiling": {
+            "folder": ceiling.folder,
+            "additional_directories": ceiling.additional_directories,
+            "execution_mode": ceiling.policy.mode,
+            "tick_instances": ceiling.tick_instances,
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling a child gains later, such as session denials frozen in from its parent or an
+    /// Artifact account recorded after delegation, never reaches its system prompt.
+    #[test]
+    fn a_delegations_later_ceiling_changes_leave_its_prompt_alone() {
+        let mut delegation: tickloop_harness_protocol::DelegationMetadata =
+            serde_json::from_value(serde_json::json!({
+                "delegation_id": uuid::Uuid::from_u128(1),
+                "parent_chat_id": uuid::Uuid::from_u128(2),
+                "parent_loop_id": uuid::Uuid::from_u128(3),
+                "parent_run_id": uuid::Uuid::from_u128(4),
+                "parent_call_id": "delegate",
+                "task": "Inspect the report",
+                "ceiling": {
+                    "folder": "/w",
+                    "additional_directories": [],
+                    "policy": {"mode": "auto", "rules": [], "revision": 0},
+                    "session_denials": [],
+                    "host_context": null,
+                    "host_tools": {},
+                },
+            }))
+            .unwrap();
+        let before = fixed_delegation(&delegation);
+        delegation.ceiling.host_tools.insert(
+            "ArtifactEdit".into(),
+            std::collections::BTreeSet::from([tickloop_harness_protocol::HostToolAuthority::Mcp {
+                server_id: "artifacts".into(),
+                account_id: "owner".into(),
+            }]),
+        );
+        delegation.ceiling.session_denials = None;
+        delegation.trusted_user_inputs = Some(serde_json::json!([{"text": "later"}]));
+        assert_eq!(fixed_delegation(&delegation), before);
+        assert_eq!(before["task"], "Inspect the report");
+        assert_eq!(before["ceiling"]["execution_mode"], "auto");
+    }
 
     #[test]
     fn local_default_prompt_matches_the_base_commit_bytes() {
@@ -583,23 +627,28 @@ mod tests {
         assert!(!INTRO.contains("TaskCreate"));
     }
 
-    /// Plan guidance arrives as host notes in the conversation; the instructions never mention
-    /// it, so entering or leaving Plan keeps them unchanged.
+    /// Plan guidance and the execution mode reach the model only through host notes.
     #[test]
-    fn the_instructions_carry_no_plan_guidance() {
+    fn the_prompt_names_no_execution_mode_or_plan_guidance() {
         let prompt = conversation_system_prompt(
             &serde_json::json!({}),
             OutputStyle::Standard,
             PromptScope::LOCAL,
         );
-        assert!(!prompt.contains(tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME));
-        assert!(!prompt.contains("Plan mode"));
+        for absent in [
+            tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME,
+            "# Plan mode",
+            "execution_mode",
+            "Mode Active",
+        ] {
+            assert!(!prompt.contains(absent), "{absent}");
+        }
     }
 
     #[test]
     fn a_chat_without_a_folder_offering_only_web_fetch_hears_of_no_unavailable_capability() {
         let prompt = conversation_system_prompt(
-            &serde_json::json!({"web_search": {"enabled": false}}),
+            &serde_json::json!({}),
             OutputStyle::Standard,
             PromptScope {
                 has_folder: false,
@@ -623,11 +672,7 @@ mod tests {
         ] {
             assert!(!prompt.contains(absent), "{absent}");
         }
-        for section in [
-            AGENT_MESSAGE_SECTION,
-            ACTIONS_SECTION,
-            WEB_SEARCH_DISABLED_SECTION,
-        ] {
+        for section in [AGENT_MESSAGE_SECTION, ACTIONS_SECTION] {
             assert!(!prompt.contains(section));
         }
         assert!(prompt.contains("# Tone and style"));
@@ -730,8 +775,8 @@ mod tests {
         assert!(process.starts_with(CHAT_INTRO));
     }
 
-    /// The host's own section follows the Output Style and precedes the host state; without one
-    /// the prompt is exactly what it was.
+    /// The host's own section follows the Output Style and precedes host state; without one the
+    /// prompt is exactly what it was.
     #[test]
     fn the_hosts_section_follows_the_output_style_and_adds_nothing_else() {
         const ADDITION: &str = "# Sources\nCite each source inline where you use it.";
@@ -757,12 +802,12 @@ mod tests {
         }
     }
     /// Artifact usage, including how a Chat without a Folder paces its writing, lives in the
-    /// Artifact tools; the prompt keeps only the disabled web search notice.
+    /// Artifact tools.
     #[test]
     fn folderless_artifacts_add_no_section_whether_or_not_skills_are_enabled() {
         for skills in [true, false] {
             let prompt = conversation_system_prompt(
-                &serde_json::json!({"web_search": {"enabled": false}}),
+                &serde_json::json!({}),
                 OutputStyle::Standard,
                 PromptScope {
                     has_folder: false,
@@ -775,7 +820,6 @@ mod tests {
                     ..PromptScope::LOCAL
                 },
             );
-            assert!(prompt.contains(WEB_SEARCH_DISABLED_SECTION));
             for absent in [
                 "# Artifacts",
                 "artifact-slides",

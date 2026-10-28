@@ -24,7 +24,7 @@ const DESIGN_SUBAGENTS: usize = 1;
 /// Claude Code 2.1.302's Plan mode reminder for a subagent without a plan file (`Wbs`), for a
 /// child frozen in Plan: its final reply carries the findings or plan to the parent, which
 /// submits the plan. Tickloop adds the read-only MCP rule.
-pub(super) fn delegated_plan_mode_reminder() -> String {
+fn delegated_plan_mode_reminder() -> String {
     format!(
         "{} Answer the query you were given comprehensively in your final message, and do not write a plan or anything else to a file. Call only read-only MCP tools.",
         plan_mode_is_active("")
@@ -257,13 +257,19 @@ pub(super) fn declined_plan_mode_exit(feedback: Option<&str>) -> String {
     }
 }
 
+/// A plan file path as a mode note shows it: the Folder it lies in is the user's, so the path
+/// keeps to its line.
+fn shown(path: &Path) -> String {
+    tickloop_harness_protocol::tags::single_line(&path.display().to_string())
+}
+
 /// Claude Code's `plan_mode_exit` attachment, sent once after the Chat leaves Plan mode.
 pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
     let plan_reference = plan_file
         .map(|path| {
             format!(
                 " The plan file is located at {} if you need to reference it.",
-                path.display()
+                shown(path)
             )
         })
         .unwrap_or_default();
@@ -367,7 +373,7 @@ fn questions_note() -> String {
 
 /// Claude Code 2.1.302's full `plan_mode` attachment without a plan file (`Wbs`), for a Chat
 /// without a Folder: the plan goes in the reply, and only the user leaves Plan.
-pub(crate) fn folderless_plan_mode_reminder(offers_subagent: bool) -> String {
+fn folderless_plan_mode_reminder(offers_subagent: bool) -> String {
     let (phase1, phase2) = planning_phases(offers_subagent);
     format!(
         "{}
@@ -399,7 +405,7 @@ When your plan is final, end your turn with it. You cannot leave plan mode yours
 }
 
 /// Claude Code 2.1.302's sparse `plan_mode` attachment without a plan file.
-pub(crate) const SPARSE_FOLDERLESS_PLAN_MODE_REMINDER: &str = "Plan mode still active (see full instructions earlier in conversation). Read-only, and there is no plan file. Follow 5-phase workflow. When the plan is final, give it in your reply. Only the user can end plan mode, by changing the session's permission mode.";
+const SPARSE_FOLDERLESS_PLAN_MODE_REMINDER: &str = "Plan mode still active (see full instructions earlier in conversation). Read-only, and there is no plan file. Follow 5-phase workflow. When the plan is final, give it in your reply. Only the user can end plan mode, by changing the session's permission mode.";
 
 /// Claude Code 2.1.302's full `plan_mode` attachment (`Bbs`) with its five-phase workflow. With
 /// Subagent, the phases that launch Explore and Plan agents launch read-only Subagent children,
@@ -410,7 +416,7 @@ pub(crate) fn plan_mode_reminder(
     plan_exists: bool,
     offers_subagent: bool,
 ) -> String {
-    let plan_file = plan_file.display();
+    let plan_file = shown(plan_file);
     let plan_file_info = if plan_exists {
         format!(
             "A plan file already exists at {plan_file}. You can read it and make incremental edits using the {EDIT_TOOL_NAME} tool."
@@ -466,16 +472,16 @@ This is critical - your turn should only end with either using the {ASK_USER_QUE
 }
 
 /// Claude Code 2.1.302's sparse `plan_mode` attachment (`Ubs`), sent between full ones.
-pub(crate) fn sparse_plan_mode_reminder(plan_file: &Path) -> String {
+fn sparse_plan_mode_reminder(plan_file: &Path) -> String {
     format!(
         "Plan mode still active (see full instructions earlier in conversation). Read-only except plan file ({}). Follow 5-phase workflow. End turns with {ASK_USER_QUESTION_TOOL_NAME} (for clarifications) or {EXIT_PLAN_MODE_TOOL_NAME} (for plan approval). Never ask about plan approval via text or AskUserQuestion.",
-        plan_file.display()
+        shown(plan_file)
     )
 }
 
-/// Claude Code 2.1.302's `plan_mode_reentry` attachment, sent before the full reminder when the
-/// Chat returns to Plan and the Loop's plan file exists from an earlier planning session.
-pub(crate) fn plan_mode_reentry_reminder(plan_file: &Path) -> String {
+/// Claude Code 2.1.302's `plan_mode_reentry` attachment, ahead of the full reminder when the
+/// Chat returns to Plan and the plan file from an earlier planning session remains.
+pub(crate) fn plan_mode_reentry(plan_file: &Path) -> String {
     format!(
         "## Re-entering Plan Mode
 
@@ -490,8 +496,29 @@ You are returning to plan mode after having previously exited it. A plan file ex
 4. Continue on with the plan process and most importantly you should always edit the plan file one way or the other before calling {EXIT_PLAN_MODE_TOOL_NAME}
 
 Treat this as a fresh planning session. Do not assume the existing plan is relevant without evaluating it first.",
-        plan_file.display()
+        shown(plan_file)
     )
+}
+
+/// Plan's rules as an execution mode note carries them: a delegated child, which has no plan
+/// file, researches read-only and reports in its final reply; a Chat without a Folder plans in
+/// its reply; a root Chat hears the full reminder naming its plan file, or the sparse one between
+/// full reminders.
+pub(crate) fn plan_mode_rules(
+    is_delegated: bool,
+    plan_file: Option<&Path>,
+    is_full: bool,
+    offers_subagent: bool,
+) -> String {
+    match plan_file {
+        _ if is_delegated => delegated_plan_mode_reminder(),
+        None if is_full => folderless_plan_mode_reminder(offers_subagent),
+        None => SPARSE_FOLDERLESS_PLAN_MODE_REMINDER.into(),
+        Some(plan_file) if is_full => {
+            plan_mode_reminder(plan_file, plan_file.exists(), offers_subagent)
+        }
+        Some(plan_file) => sparse_plan_mode_reminder(plan_file),
+    }
 }
 
 /// The result of a side effect Plan mode refused: Claude Code's Plan mode rule, then where the
@@ -499,12 +526,7 @@ Treat this as a fresh planning session. Do not assume the existing plan is relev
 pub(crate) fn plan_mode_refusal(plan_file: Option<&Path>, is_delegated: bool) -> String {
     let exception = plan_file
         .filter(|_| !is_delegated)
-        .map(|path| {
-            format!(
-                " (with the exception of the plan file at {})",
-                path.display()
-            )
-        })
+        .map(|path| format!(" (with the exception of the plan file at {})", shown(path)))
         .unwrap_or_default();
     let next = match plan_file {
         _ if is_delegated => {
@@ -513,7 +535,7 @@ pub(crate) fn plan_mode_refusal(plan_file: Option<&Path>, is_delegated: bool) ->
         }
         Some(path) => format!(
             "Continue planning with read-only tools, write your plan to {}, and call {EXIT_PLAN_MODE_TOOL_NAME} when it is ready for approval.",
-            path.display()
+            shown(path)
         ),
         None => format!(
             "Continue planning with read-only tools and call {EXIT_PLAN_MODE_TOOL_NAME} when your plan is ready for approval."
@@ -580,10 +602,35 @@ mod tests {
             sparse_plan_mode_reminder(path),
             "Plan mode still active (see full instructions earlier in conversation). Read-only except plan file (/root/plans/calm-baking-aurora-loop-x.md). Follow 5-phase workflow. End turns with AskUserQuestion (for clarifications) or ExitPlanMode (for plan approval). Never ask about plan approval via text or AskUserQuestion."
         );
-        let reentry = plan_mode_reentry_reminder(path);
+        let reentry = plan_mode_reentry(path);
         assert!(reentry.starts_with("## Re-entering Plan Mode\n\nYou are returning to plan mode after having previously exited it. A plan file exists at /root/plans/calm-baking-aurora-loop-x.md from your previous planning session."));
         assert!(reentry.contains("start fresh by overwriting the existing plan"));
         assert!(reentry.contains("before calling ExitPlanMode"));
+    }
+
+    #[test]
+    fn plan_rules_follow_the_chat_and_the_reminder_kind() {
+        let path = Path::new(PLAN_FILE);
+        assert_eq!(
+            plan_mode_rules(true, Some(path), true, true),
+            delegated_plan_mode_reminder()
+        );
+        assert_eq!(
+            plan_mode_rules(false, None, true, false),
+            folderless_plan_mode_reminder(false)
+        );
+        assert_eq!(
+            plan_mode_rules(false, None, false, false),
+            SPARSE_FOLDERLESS_PLAN_MODE_REMINDER
+        );
+        assert_eq!(
+            plan_mode_rules(false, Some(path), true, true),
+            plan_mode_reminder(path, false, true)
+        );
+        assert_eq!(
+            plan_mode_rules(false, Some(path), false, true),
+            sparse_plan_mode_reminder(path)
+        );
     }
 
     #[test]

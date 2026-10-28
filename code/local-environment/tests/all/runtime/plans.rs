@@ -162,7 +162,7 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
     run_turn(&agent, chat, "Write the report").await;
 
     let requests = model.requests.lock().unwrap().clone();
-    let planning = host_note_texts(&requests[0]).concat();
+    let planning = latest_execution_mode_note(&requests[0]).expect("plan mode note");
     let plan_file = PathBuf::from(reminded_plan_file(&requests[0]).expect("plan file reminder"));
     assert!(plan_file.is_absolute());
     assert_eq!(
@@ -199,19 +199,22 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
         "{tool_names:?}"
     );
     assert!(!tool_names.contains(&"set_plan"), "{tool_names:?}");
-    for request in &requests {
-        assert!(!system_prompt(request).contains("Plan mode"));
-    }
+    // Leaving Plan keeps the request prefix and tells the model at the end of the conversation.
     assert_eq!(
-        system_prompt(&requests[0]),
-        system_prompt(&requests[1]),
-        "leaving Plan keeps the instructions"
+        serde_json::to_vec(&requests[1].messages[..2]).unwrap(),
+        serde_json::to_vec(&requests[0].messages[..2]).unwrap()
     );
-    let leaving = host_note_texts(&requests[1]);
-    assert!(
-        leaving.last().unwrap().contains("## Exited Plan Mode"),
-        "{leaving:?}"
+    assert_eq!(
+        serde_json::to_vec(&requests[1].tools).unwrap(),
+        serde_json::to_vec(&requests[0].tools).unwrap()
     );
+    assert!(!system_prompt(&requests[0]).contains("Plan mode is active."));
+    assert_eq!(reminded_plan_file(&requests[1]), None);
+    let leaving = requests[1].messages.last().unwrap();
+    assert!(tickloop_harness::test_support::is_host_note(leaving));
+    let note = latest_execution_mode_note(&requests[1]).unwrap();
+    assert!(note.contains("## Exited Plan Mode\n"), "{note}");
+    assert!(note.contains("## Auto Mode Active\n"), "{note}");
     agent.shutdown().await;
 }
 

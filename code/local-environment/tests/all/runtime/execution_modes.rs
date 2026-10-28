@@ -47,6 +47,84 @@ async fn run_answering_permissions(
     (receipt, requested, results)
 }
 
+/// Changing the execution mode between requests keeps the request prefix byte for byte the same:
+/// the system prompt never names the mode, and a host note at the end of the conversation tells
+/// the model the new mode once.
+#[tokio::test]
+async fn changing_the_execution_mode_keeps_the_prefix_and_announces_the_mode_at_the_end() {
+    let directory = tempfile::tempdir().unwrap();
+    // The embedded host starts new Chats in Ask, so its first request needs no note.
+    let modes = [
+        ExecutionMode::AcceptEdits,
+        ExecutionMode::Plan,
+        ExecutionMode::Plan,
+        ExecutionMode::Auto,
+        ExecutionMode::FullAccess,
+        ExecutionMode::AcceptEdits,
+    ];
+    let model = Arc::new(ScriptedModel::new(
+        modes.iter().map(|_| text("Done.")).collect(),
+    ));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    for mode in modes {
+        agent.set_execution_mode(chat, mode).await.unwrap();
+        run_answering_permissions(&agent, chat, "Continue", true).await;
+    }
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), modes.len());
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_vec(&request.messages[..2]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[..2]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
+        );
+    }
+    let system = serde_json::to_string(&requests[0].messages[0]).unwrap();
+    for absent in ["execution_mode", "acceptEdits", "Plan mode is active"] {
+        assert!(!system.contains(absent), "{absent}");
+    }
+    let new_notes = requests
+        .iter()
+        .map(|request| {
+            let last = request.messages.last().unwrap();
+            tickloop_harness::test_support::is_host_note(last).then(|| {
+                let tickloop_harness::protocol::Content::Text { text } = &last.content[0] else {
+                    unreachable!("a host note is text");
+                };
+                text.clone()
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(new_notes[0], None);
+    assert!(
+        new_notes[1]
+            .as_ref()
+            .unwrap()
+            .contains("Plan mode is active.")
+    );
+    assert_eq!(
+        new_notes[2], None,
+        "an unchanged mode is not announced again"
+    );
+    let to_auto = new_notes[3].as_ref().unwrap();
+    assert!(to_auto.contains("## Exited Plan Mode\n"), "{to_auto}");
+    assert!(to_auto.contains("## Auto Mode Active\n"), "{to_auto}");
+    assert!(
+        new_notes[4]
+            .as_ref()
+            .unwrap()
+            .contains("## Full Access Mode Active\n")
+    );
+    let to_ask = new_notes[5].as_ref().unwrap();
+    assert!(to_ask.contains("## Ask Mode Active\n"), "{to_ask}");
+    assert!(!to_ask.contains("Exited Plan Mode"), "{to_ask}");
+    agent.shutdown().await;
+}
+
 /// As in Claude Code, entering Plan needs no confirmation in any mode; only an Ask rule makes the
 /// user confirm it.
 #[tokio::test]

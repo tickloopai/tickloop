@@ -415,11 +415,15 @@ pub enum HostNote {
     /// The host tool set changed; the names announced as available once the note was written.
     HostTools(BTreeSet<String>),
     /// Claude Code's `plan_mode_exit` attachment: the user left Plan mode without approving a
-    /// plan.
+    /// plan. Earlier Tickloop versions wrote it; an `ExecutionMode` note now carries the exit.
     PlanModeExit,
-    /// Claude Code's `plan_mode` and `plan_mode_reentry` attachments: the Plan mode instructions,
-    /// written into the conversation while the Chat is in Plan.
-    PlanMode(PlanModeNote),
+    /// Claude Code's `plan_mode`, `plan_mode_exit`, `auto_mode` and `auto_mode_exit`
+    /// attachments: the execution mode the note told the model, which the system prompt never
+    /// names so that changing it keeps the prompt cache.
+    ExecutionMode(ExecutionModeNote),
+    /// The Loop's Tick Subscriptions, its receiving or its running Subagents, as they changed
+    /// without the model's own calls or stand after a compaction or a load.
+    LoopState,
     /// Claude Code's `task_reminder` attachment: the task tools have not been used for a while.
     TaskReminder,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
@@ -430,38 +434,27 @@ pub enum HostNote {
     DateChange(String),
 }
 
+/// What an execution mode note told the model.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutionModeNote {
+    pub mode: ExecutionMode,
+    /// The plan file a Plan note named as the one file the model may edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file: Option<PathBuf>,
+}
+
 impl HostNote {
     pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::HostTools(announced) => Some(announced),
             Self::PlanModeExit
-            | Self::PlanMode(_)
+            | Self::ExecutionMode(_)
+            | Self::LoopState
             | Self::TaskReminder
             | Self::Guidance(_)
             | Self::DateChange(_) => None,
         }
     }
-}
-
-/// A Plan mode reminder note: which reminder, and the plan file it named.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct PlanModeNote {
-    pub reminder: PlanModeReminder,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_file: Option<PathBuf>,
-}
-
-/// Which Plan mode reminder a note carries, following Claude Code's `reminderType` and its
-/// separate `plan_mode_reentry` attachment.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanModeReminder {
-    /// The whole planning workflow.
-    Full,
-    /// The short reminder sent between full ones.
-    Sparse,
-    /// Returning to Plan with an earlier plan file to evaluate.
-    Reentry,
 }
 
 /// What a guidance note announces, like Claude Code's Skill messages and
@@ -483,6 +476,9 @@ pub enum GuidanceNote {
     /// The instructions and states of the MCP servers one note announced, each with the digest
     /// of what it said.
     McpServers { servers: BTreeMap<String, String> },
+    /// The MCP configuration warnings one note announced, by the digest of their text; the
+    /// digest of no warnings withdraws earlier ones.
+    McpWarnings { digest: String },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]

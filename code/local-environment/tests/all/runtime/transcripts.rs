@@ -1671,8 +1671,9 @@ async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
     agent.add_artifact_tick(chat, slides).await.unwrap();
     complete_turn(&agent, chat, "second prompt").await;
     let host_request = request_text(model.requests.lock().unwrap().last().unwrap());
+    // The linked artifacts reach the model as a note, never in the system prompt.
     assert!(
-        host_request.contains("artifact_ticks")
+        host_request.contains("Artifacts linked to this Chat changed")
             && host_request.contains("Research")
             && host_request.contains("Briefing")
     );

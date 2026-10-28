@@ -35,6 +35,7 @@ mod host_notes;
 pub mod host_tools;
 mod jev_review;
 mod lifecycle;
+mod loop_state_notes;
 pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
 mod loop_lease;
@@ -460,6 +461,8 @@ struct InheritedChat {
     client: Arc<dyn ModelClient>,
     output_style: OutputStyle,
     user_context: OnceLock<String>,
+    /// The parent's environment: a child works in its parent's Folder.
+    environment: OnceLock<environment_info::ChatEnvironment>,
     announced_date: Option<String>,
 }
 
@@ -475,16 +478,12 @@ struct Chat {
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
-    /// Claude Code's `needsPlanModeExitAttachment`: the Chat left Plan mode, so the next request
-    /// owes the model the exited-plan-mode notice.
-    needs_plan_mode_exit_notice: bool,
-    /// Claude Code's `hasExitedPlanMode`: the Chat left Plan mode since its last re-entry notice,
-    /// so returning to Plan with an existing plan file tells the model it is re-entering.
-    has_exited_plan_mode: bool,
     /// Claude Code's `prePlanMode`: the mode this Chat entered Plan from, kept in this process and
     /// across a planned upgrade. A load, or a rewind or branch switch that changes the mode, leaves
     /// it unknown.
     mode_before_plan: Option<ExecutionMode>,
+    /// What the model was last told of the Loop in this process; a load starts untold.
+    announced_loop_state: Option<loop_state_notes::AnnouncedLoopState>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     upgrade_wait: Option<Receipt>,
@@ -888,24 +887,9 @@ fn mode_before_plan_after(
 impl Chat {
     /// Changes the execution mode, remembering the mode Plan is entered from.
     fn change_execution_mode(&mut self, mode: ExecutionMode) {
-        self.record_plan_mode_transition(self.snapshot.policy.mode, mode);
         self.mode_before_plan =
             mode_before_plan_after(self.mode_before_plan, self.snapshot.policy.mode, mode);
         self.snapshot.policy.mode = mode;
-    }
-
-    /// Claude Code's `handlePlanModeTransition` and `setHasExitedPlanMode`: leaving Plan owes
-    /// the model the exit notice and makes a later return to Plan a re-entry; returning to Plan
-    /// before the notice is sent withdraws it.
-    fn record_plan_mode_transition(&mut self, from: ExecutionMode, to: ExecutionMode) {
-        match (from, to) {
-            (_, ExecutionMode::Plan) => self.needs_plan_mode_exit_notice = false,
-            (ExecutionMode::Plan, _) => {
-                self.needs_plan_mode_exit_notice = true;
-                self.has_exited_plan_mode = true;
-            }
-            _ => {}
-        }
     }
 
     /// Replaces the snapshot, forgetting the mode Plan was entered from if the mode changes.
@@ -2377,34 +2361,43 @@ impl Agent {
             ..Default::default()
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style, user_context, announced_date) = if let Some(InheritedChat {
-            additional_directory_sources,
-            metadata,
-            parent,
-            client,
-            output_style,
-            user_context,
-            announced_date,
-        }) = inherited
-        {
-            bookkeeping.additional_directory_sources = additional_directory_sources;
-            snapshot.model = parent.model;
-            snapshot.reasoning_effort = parent.reasoning_effort;
-            snapshot.thinking_enabled = parent.thinking_enabled;
-            snapshot.search_config = parent.search_config;
-            snapshot.task_tools_enabled = parent.task_tools_enabled;
-            snapshot.auto_compact_window = parent.auto_compact_window;
-            snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
-            let mut metadata = metadata;
-            self.apply_host_rules(&mut metadata.ceiling.policy);
-            snapshot.policy = metadata.ceiling.policy.clone();
-            snapshot.delegation = Some(metadata);
-            (client, output_style, user_context, announced_date)
-        } else {
-            let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
-            snapshot.policy.launch_rules = launch_rules;
-            (client, output_style, OnceLock::new(), None)
-        };
+        let (client, output_style, user_context, environment, announced_date) =
+            if let Some(InheritedChat {
+                additional_directory_sources,
+                metadata,
+                parent,
+                client,
+                output_style,
+                user_context,
+                environment,
+                announced_date,
+            }) = inherited
+            {
+                bookkeeping.additional_directory_sources = additional_directory_sources;
+                snapshot.model = parent.model;
+                snapshot.reasoning_effort = parent.reasoning_effort;
+                snapshot.thinking_enabled = parent.thinking_enabled;
+                snapshot.search_config = parent.search_config;
+                snapshot.task_tools_enabled = parent.task_tools_enabled;
+                snapshot.auto_compact_window = parent.auto_compact_window;
+                snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
+                let mut metadata = metadata;
+                self.apply_host_rules(&mut metadata.ceiling.policy);
+                snapshot.policy = metadata.ceiling.policy.clone();
+                snapshot.delegation = Some(metadata);
+                (
+                    client,
+                    output_style,
+                    user_context,
+                    environment,
+                    announced_date,
+                )
+            } else {
+                let (client, output_style) =
+                    self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+                snapshot.policy.launch_rules = launch_rules;
+                (client, output_style, OnceLock::new(), OnceLock::new(), None)
+            };
         if let SearchDefaults::Fixed(config) = &self.inner.search {
             snapshot.search_config = config.clone();
         }
@@ -2446,6 +2439,7 @@ impl Agent {
                 client,
                 output_style,
                 user_context,
+                environment,
                 announced_date,
                 tools,
                 skills,
@@ -3193,9 +3187,8 @@ impl Agent {
         let timing = timing::Phase::new("announce_host_tool_changes");
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         drop(timing);
-        let timing = timing::Phase::new("announce_plan_mode");
-        Box::pin(self.announce_plan_mode_exit(receipt)).await?;
-        Box::pin(self.announce_plan_mode(receipt)).await?;
+        let timing = timing::Phase::new("announce_execution_mode");
+        Box::pin(self.announce_execution_mode(receipt)).await?;
         drop(timing);
         let timing = timing::Phase::new("announce_task_reminder");
         Box::pin(self.announce_task_reminder(receipt)).await?;
@@ -3213,10 +3206,12 @@ impl Agent {
                     self.inner.host_tools.read().unwrap().as_deref(),
                 )
             });
+        let timing = timing::Phase::new("announce_loop_state");
+        Box::pin(self.announce_loop_state(receipt)).await?;
+        drop(timing);
         let timing = timing::Phase::new("announce_guidance");
         Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
-        let family_roster = self.family_agents(receipt.chat_id).await?;
         let user_context = self.user_context(receipt.chat_id).await?;
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
@@ -3247,7 +3242,6 @@ impl Agent {
                 0,
                 self.conversation_system_message(
                     chat,
-                    &family_roster,
                     workspace_host.as_ref(),
                     &registry.searched_names(),
                 ),
@@ -3259,6 +3253,11 @@ impl Agent {
                 &request.messages[..2],
                 &request.tools,
             )
+            .with_params(&(
+                request.reasoning_effort,
+                request.temperature,
+                chat.snapshot.thinking_enabled,
+            ))
         };
         let client = self
             .inner
@@ -5716,6 +5715,7 @@ pub(crate) struct NewChat {
     client: Arc<dyn ModelClient>,
     output_style: tickloop_harness_base::output_style::OutputStyle,
     user_context: OnceLock<String>,
+    environment: OnceLock<environment_info::ChatEnvironment>,
     announced_date: Option<String>,
     tools: Arc<tickloop_harness_tools::Tools>,
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
@@ -5730,6 +5730,7 @@ impl NewChat {
             client,
             output_style,
             user_context,
+            environment,
             announced_date,
             tools,
             skills,
@@ -5744,9 +5745,8 @@ impl NewChat {
             snapshot,
             bookkeeping,
             start_new_tool_result_message: false,
-            needs_plan_mode_exit_notice: false,
-            has_exited_plan_mode: false,
             mode_before_plan: None,
+            announced_loop_state: None,
             active: None,
             active_run: None,
             upgrade_wait: None,
@@ -5771,7 +5771,7 @@ impl NewChat {
             user_cancelled_runs: HashSet::new(),
             output_style,
             user_context,
-            environment: OnceLock::new(),
+            environment,
             announced_date,
             auto_denials: auto_mode::DenialTracking::default(),
             denial_window: denials::DenialWindow::default(),
