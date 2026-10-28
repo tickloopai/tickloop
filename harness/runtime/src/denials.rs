@@ -31,6 +31,7 @@ pub(super) enum DirectApprovalBasis {
     Policy,
     FullAccess,
     UnrestrictedHost,
+    Sandbox,
 }
 
 pub(super) struct AllowedDecision<'a> {
@@ -81,9 +82,17 @@ pub(super) fn allowed_approval_record(
             DirectApprovalBasis::UnrestrictedHost => {
                 "Startup unrestricted host policy allowed this operation without ordinary approval"
             }
+            DirectApprovalBasis::Sandbox => {
+                "Sandboxed command allowed without approval by the current execution mode"
+            }
         },
     }
     .into();
+    if decision.path == ApprovalPath::Direct
+        && matches!(decision.direct_basis, DirectApprovalBasis::Sandbox)
+    {
+        record.direct_reason = Some(tickloop_harness_protocol::DirectApprovalReason::Sandbox);
+    }
     record
 }
 

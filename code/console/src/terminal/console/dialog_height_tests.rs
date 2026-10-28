@@ -583,6 +583,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
         request_details: None,
         outcome: ApprovalResult::Deny,
         path: ApprovalPath::Human,
+        direct_reason: None,
         denial_category: None,
         approval_source: None,
         reason: "controlled denial".into(),

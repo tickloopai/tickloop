@@ -88,7 +88,7 @@ pub use denials::{
     AUTO_REJECTION_PREFIX, ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult,
     DenialAutoFinding, DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord,
     DenialReference, DenialReviewFacts, DenialRuleSource, DenialRuleSummary, DenialsView,
-    DisplaySummary, MAX_RECENT_DENIALS, render_reference,
+    DirectApprovalReason, DisplaySummary, MAX_RECENT_DENIALS, render_reference,
 };
 pub use family::{
     AgentColor, AgentMessageSource, ChildRunStatus, DelegatedGoal, DelegationCeiling,

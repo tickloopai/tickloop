@@ -22,6 +22,7 @@ pub struct MemoryEnvironment {
 struct MemoryState {
     isolation: ExecutionIsolation,
     shell_approval_required: bool,
+    isolated_shell_auto_approval: bool,
     epoch: Uuid,
     clock: std::time::Duration,
     shell_programs: HashMap<String, MemoryShellProgram>,
@@ -144,10 +145,16 @@ impl MemoryEnvironment {
         self.state.lock().unwrap().isolation = isolation;
     }
 
+    /// Whether isolated Shells may skip approval; on by default, as `autoAllowBashIfSandboxed`.
+    pub fn set_isolated_shell_auto_approval(&self, allowed: bool) {
+        self.state.lock().unwrap().isolated_shell_auto_approval = allowed;
+    }
+
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(MemoryState {
                 epoch: tickloop_ids::generate(),
+                isolated_shell_auto_approval: true,
                 ..Default::default()
             })),
         }
@@ -730,6 +737,10 @@ impl ExecutionPort for MemoryPort {
             .with_isolation(state.isolation)
             .with_required_approval(
                 matches!(intent, ExecutionIntent::SpawnShell(_)) && state.shell_approval_required,
+            )
+            .with_isolated_auto_approval(
+                matches!(intent, ExecutionIntent::SpawnShell(_))
+                    && state.isolated_shell_auto_approval,
             );
         let mut plans = self.plans.lock().unwrap();
         plans.retain(|_, plan| plan.lifetime.strong_count() > 0);

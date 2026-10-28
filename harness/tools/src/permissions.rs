@@ -128,6 +128,11 @@ pub trait PermissionPolicyExt {
         session: Option<SessionPermissionDecision>,
     ) -> Decision;
 
+    /// Claude Code `autoAllowBashIfSandboxed`: Accept Edits and Auto run a Shell whose environment
+    /// reports sufficient isolation without asking or reviewing. Explicit rules, safety checks and
+    /// required approval are decided before it.
+    fn admits_by_isolation(&self, operation: &PreparedTool) -> bool;
+
     /// Claude Code's refusal when a Deny naming this call's rule content applies, such as
     /// `WebFetch denied access to domain:example.com.`; other denials keep the generic reason.
     fn content_denial_message(
@@ -315,7 +320,9 @@ impl PermissionPolicyExt for PermissionPolicy {
             Decision::Allow
         } else if operation.requires_environment_approval() && self.mode != ExecutionMode::Plan {
             Decision::Ask
-        } else if is_accept_edits && operation.is_allowed_in_accept_edits(workspace) {
+        } else if self.admits_by_isolation(operation)
+            || is_accept_edits && operation.is_allowed_in_accept_edits(workspace)
+        {
             Decision::Allow
         } else if is_accept_edits && operation.accept_edits_supersedes_read_only() {
             Decision::Ask
@@ -345,6 +352,11 @@ impl PermissionPolicyExt for PermissionPolicy {
         } else {
             Decision::Check
         }
+    }
+
+    fn admits_by_isolation(&self, operation: &PreparedTool) -> bool {
+        matches!(self.mode, ExecutionMode::AcceptEdits | ExecutionMode::Auto)
+            && operation.is_auto_approved_by_isolation()
     }
 
     fn content_denial_message(

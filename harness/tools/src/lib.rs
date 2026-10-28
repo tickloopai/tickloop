@@ -332,6 +332,11 @@ impl PreparedTool {
             if input.preparation.as_ref().is_some_and(ShellPreparation::requires_approval))
     }
 
+    pub fn is_auto_approved_by_isolation(&self) -> bool {
+        matches!(&self.operation, Operation::Shell(input)
+            if input.preparation.as_ref().is_some_and(ShellPreparation::is_auto_approved_by_isolation))
+    }
+
     pub fn approval_facts(&self) -> tickloop_harness_protocol::PreparedApprovalFacts {
         tickloop_harness_protocol::PreparedApprovalFacts {
             requires_approval: self.requires_environment_approval().then_some(true),

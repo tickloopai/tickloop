@@ -2609,6 +2609,8 @@ impl Agent {
                                     super::denials::DirectApprovalBasis::FullAccess
                                 } else if bypassed_by_unrestricted_host {
                                     super::denials::DirectApprovalBasis::UnrestrictedHost
+                                } else if chat.snapshot.policy.admits_by_isolation(&prepared) {
+                                    super::denials::DirectApprovalBasis::Sandbox
                                 } else {
                                     super::denials::DirectApprovalBasis::Policy
                                 },
