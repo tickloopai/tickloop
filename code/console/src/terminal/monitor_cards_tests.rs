@@ -471,6 +471,10 @@ async fn a_view_whose_tickhost_stops_reading_ends_and_closes_its_connection() {
     let writing = tokio::spawn(write_requests(
         writer,
         queued,
+        CardSize {
+            rows: 6,
+            columns: 30,
+        },
         reader.abort_handle(),
         screen.clone(),
         Arc::new(Notify::new()),
@@ -498,4 +502,161 @@ async fn a_view_whose_tickhost_stops_reading_ends_and_closes_its_connection() {
         .await
         .expect("the view's connection closes, which detaches it")
         .unwrap();
+}
+
+fn size(columns: u16) -> CardSize {
+    CardSize { rows: 6, columns }
+}
+
+#[test]
+fn a_lone_resize_goes_at_once_and_a_burst_sends_only_its_latest_size_per_interval() {
+    let start = tokio::time::Instant::now();
+    let at = |milliseconds| start + Duration::from_millis(milliseconds);
+    let mut pacing = ResizePacing::new(size(40));
+    assert_eq!(pacing.request(size(40), at(0)), None, "the Tick has it");
+    assert_eq!(
+        pacing.request(size(39), at(0)),
+        Some(size(39)),
+        "a lone change"
+    );
+    assert_eq!(pacing.request(size(38), at(10)), None);
+    assert_eq!(pacing.request(size(37), at(20)), None);
+    assert_eq!(pacing.deadline(), Some(at(100)));
+    assert_eq!(pacing.due(at(99)), None);
+    assert_eq!(pacing.due(at(100)), Some(size(37)), "only the latest size");
+    assert_eq!(pacing.deadline(), None);
+    assert_eq!(
+        pacing.request(size(36), at(150)),
+        None,
+        "still within the interval"
+    );
+    assert_eq!(
+        pacing.request(size(37), at(160)),
+        None,
+        "back to the size the Tick has"
+    );
+    assert_eq!(pacing.deadline(), None, "so nothing waits");
+    assert_eq!(
+        pacing.request(size(30), at(400)),
+        Some(size(30)),
+        "a quiet spell ended"
+    );
+}
+
+#[test]
+fn a_flush_sends_the_waiting_size_at_once() {
+    let start = tokio::time::Instant::now();
+    let at = |milliseconds| start + Duration::from_millis(milliseconds);
+    let mut pacing = ResizePacing::new(size(40));
+    assert_eq!(pacing.flush(at(0)), None, "nothing waits");
+    pacing.request(size(39), at(0));
+    pacing.request(size(30), at(5));
+    assert_eq!(pacing.flush(at(6)), Some(size(30)));
+    assert_eq!(pacing.deadline(), None);
+    assert_eq!(
+        pacing.request(size(29), at(50)),
+        None,
+        "the flush counts as a send"
+    );
+}
+
+/// The resizes a view sent its Tickhost, read from the other end of its connection.
+async fn sent_resizes(
+    remote: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Vec<u64> {
+    let mut columns = Vec::new();
+    while let Ok(Ok(Some(frame))) = tokio::time::timeout(
+        Duration::from_millis(1),
+        hosted::read_frame(remote, ATTACH_REQUEST_FRAME_BYTES),
+    )
+    .await
+    {
+        if frame["method"] == "resize" {
+            columns.push(frame["params"]["size"]["columns"].as_u64().unwrap());
+        }
+    }
+    columns
+}
+
+fn spawn_writer(
+    local: tokio::net::UnixStream,
+) -> (mpsc::Sender<CardRequest>, tokio::task::JoinHandle<()>) {
+    let (_unread, writer) = local.into_split();
+    let screen = Arc::new(Mutex::new(CardScreen {
+        parser: vt100::Parser::new(6, 40, 0),
+        ended: None,
+    }));
+    let (requests, queued) = mpsc::channel(CARD_REQUESTS);
+    let reader = tokio::spawn(std::future::pending::<()>());
+    let writing = tokio::spawn(write_requests(
+        writer,
+        queued,
+        size(40),
+        reader.abort_handle(),
+        screen,
+        Arc::new(Notify::new()),
+        CARD_WRITE_TIMEOUT,
+    ));
+    (requests, writing)
+}
+
+#[tokio::test(start_paused = true)]
+async fn dragging_across_many_columns_sends_a_few_resizes_ending_with_the_final_size() {
+    let (local, remote) = tokio::net::UnixStream::pair().unwrap();
+    let (remote, _remote_writer) = remote.into_split();
+    let mut remote = tokio::io::BufReader::new(remote);
+    let (requests, _writing) = spawn_writer(local);
+    let columns: Vec<u16> = (20..60).collect();
+    for column in &columns {
+        requests
+            .send(CardRequest::Resize(size(*column)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(CARD_RESIZE_INTERVAL).await;
+    let sent = sent_resizes(&mut remote).await;
+    assert!(
+        sent.len() <= 1 + columns.len() * 10 / 100 + 1,
+        "{} changes over {}ms sent {sent:?}",
+        columns.len(),
+        columns.len() * 10
+    );
+    assert_eq!(sent.first(), Some(&20), "the first change goes at once");
+    assert_eq!(
+        sent.last(),
+        Some(&59),
+        "the final size goes once the drag stops"
+    );
+    assert_eq!(sent.iter().filter(|column| **column == 59).count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_release_sends_the_final_size_at_once_and_a_lone_change_never_waits() {
+    let (local, remote) = tokio::net::UnixStream::pair().unwrap();
+    let (remote, _remote_writer) = remote.into_split();
+    let mut remote = tokio::io::BufReader::new(remote);
+    let (requests, _writing) = spawn_writer(local);
+    requests.send(CardRequest::Resize(size(30))).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        [30],
+        "a lone change goes at once"
+    );
+    requests.send(CardRequest::Resize(size(31))).await.unwrap();
+    requests.send(CardRequest::Resize(size(32))).await.unwrap();
+    requests.send(CardRequest::FlushResize).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        [32],
+        "the release sends the final size without waiting out the interval"
+    );
+    tokio::time::sleep(CARD_RESIZE_INTERVAL * 2).await;
+    assert_eq!(
+        sent_resizes(&mut remote).await,
+        Vec::<u64>::new(),
+        "and only once"
+    );
 }

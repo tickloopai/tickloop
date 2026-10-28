@@ -485,3 +485,76 @@ fn keys_decoded_before_the_raw_input_reach_the_tick_as_its_terminal_sends_them()
         None
     );
 }
+
+/// A hosted Tick's row with a live screen, its card open on a view whose requests the test reads.
+fn attached_hosted_card(
+    state: &mut State,
+) -> (
+    tick_protocol::InstanceRef,
+    tokio::sync::mpsc::Receiver<crate::terminal::monitor_cards::CardRequest>,
+) {
+    let chat = state.chat.unwrap();
+    let mut hosted = shell_entry("hosted tick");
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    hosted.instance = instance.clone();
+    hosted.group = TickGroup::Ticks;
+    hosted.actions[0].intent = crate::monitor_rows::TickIntent::OpenView(instance.clone());
+    state.monitor.replace(TickGroup::Ticks, vec![hosted]);
+    state.monitor.select(&instance);
+    attaches(state.key(key(KeyCode::Char(' '))), chat, &instance);
+    let (view, requests) =
+        crate::terminal::monitor_cards::CardView::detached(state.card_size(&instance));
+    assert!(state.cards.attached(chat, &instance, view));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    (instance, requests)
+}
+
+fn queued_requests(
+    requests: &mut tokio::sync::mpsc::Receiver<crate::terminal::monitor_cards::CardRequest>,
+) -> Vec<crate::terminal::monitor_cards::CardRequest> {
+    std::iter::from_fn(|| requests.try_recv().ok()).collect()
+}
+
+#[test]
+fn releasing_the_monitor_separator_sends_the_cards_final_size_at_once() {
+    use crate::terminal::monitor_cards::CardRequest;
+    let mut state = cards_fixture();
+    let (_instance, mut requests) = attached_hosted_card(&mut state);
+    queued_requests(&mut requests);
+    let separator = state.monitor_separator.as_ref().unwrap().0;
+    let mouse = |kind, column: usize| MouseEvent {
+        kind,
+        row: 2,
+        column: column as u16,
+        modifiers: KeyModifiers::NONE,
+    };
+    state.pointer(
+        mouse(MouseEventKind::Down(MouseButton::Left), separator),
+        &mut Vec::new(),
+    );
+    for column in (separator - 6..separator).rev() {
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), column),
+            &mut Vec::new(),
+        );
+        state.draw_frame(&mut Vec::new()).unwrap();
+    }
+    let dragged = queued_requests(&mut requests);
+    assert!(
+        dragged
+            .iter()
+            .all(|request| matches!(request, CardRequest::Resize(_))),
+        "the drag paces its resizes in the view: {dragged:?}"
+    );
+    assert!(
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), separator - 6),
+            &mut Vec::new()
+        ),
+        "the release draws the final frame"
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(queued_requests(&mut requests), [CardRequest::FlushResize]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(queued_requests(&mut requests).is_empty(), "flushed once");
+}

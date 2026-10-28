@@ -52,6 +52,9 @@ const CARD_REQUESTS: usize = 64;
 /// A Tickhost that takes none of a view's requests for this long stopped reading it: the view
 /// ends and its connection closes, which detaches it.
 const CARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A Tick redraws on every resize its terminal gets, so a view sends its resizes at least this
+/// far apart: dragging Monitor's separator or resizing the terminal never floods the Tick.
+pub(super) const CARD_RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
@@ -95,9 +98,75 @@ pub(super) struct CardScreen {
     pub(super) ended: Option<String>,
 }
 
-enum CardRequest {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CardRequest {
     Input(Vec<u8>),
     Resize(CardSize),
+    /// Sends a resize still waiting for [`CARD_RESIZE_INTERVAL`] at once, as when a drag ends.
+    FlushResize,
+}
+
+/// Spaces one view's resizes [`CARD_RESIZE_INTERVAL`] apart: the first change after a quiet
+/// spell goes at once, and of the changes that follow within the interval only the latest goes,
+/// when it is over or at a flush.
+#[derive(Debug)]
+struct ResizePacing {
+    /// The size the Tick's terminal was last given.
+    sent: CardSize,
+    sent_at: Option<tokio::time::Instant>,
+    waiting: Option<CardSize>,
+}
+
+impl ResizePacing {
+    fn new(attached: CardSize) -> Self {
+        Self {
+            sent: attached,
+            sent_at: None,
+            waiting: None,
+        }
+    }
+
+    /// Asks for `size` at `now`; returns it when it is to be sent at once.
+    fn request(&mut self, size: CardSize, now: tokio::time::Instant) -> Option<CardSize> {
+        self.waiting = None;
+        if size == self.sent {
+            return None;
+        }
+        if self
+            .sent_at
+            .is_some_and(|sent_at| now < sent_at + CARD_RESIZE_INTERVAL)
+        {
+            self.waiting = Some(size);
+            return None;
+        }
+        Some(self.mark_sent(size, now))
+    }
+
+    /// When the waiting size is due.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.waiting?;
+        self.sent_at.map(|sent_at| sent_at + CARD_RESIZE_INTERVAL)
+    }
+
+    /// The waiting size once its interval is over.
+    fn due(&mut self, now: tokio::time::Instant) -> Option<CardSize> {
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            self.flush(now)
+        } else {
+            None
+        }
+    }
+
+    fn flush(&mut self, now: tokio::time::Instant) -> Option<CardSize> {
+        let size = self.waiting.take()?;
+        Some(self.mark_sent(size, now))
+    }
+
+    fn mark_sent(&mut self, size: CardSize, now: tokio::time::Instant) -> CardSize {
+        self.sent = size;
+        self.sent_at = Some(now);
+        size
+    }
 }
 
 /// One card's view attached to its Tick. Dropping it detaches the view.
@@ -143,6 +212,7 @@ impl CardView {
         tokio::spawn(write_requests(
             writer,
             queued,
+            size,
             reader.abort_handle(),
             screen.clone(),
             redraw,
@@ -155,11 +225,35 @@ impl CardView {
         })
     }
 
-    /// Asks for `size`; a size the full queue cannot take is asked for again by the next frame.
+    /// A view connected to nothing, whose requests the caller reads.
+    #[cfg(test)]
+    pub(super) fn detached(size: CardSize) -> (Self, mpsc::Receiver<CardRequest>) {
+        let (requests, queued) = mpsc::channel(CARD_REQUESTS);
+        let screen = Arc::new(Mutex::new(CardScreen {
+            parser: vt100::Parser::new(size.rows.max(1), size.columns.max(1), 0),
+            ended: None,
+        }));
+        (
+            Self {
+                size,
+                screen,
+                requests,
+            },
+            queued,
+        )
+    }
+
+    /// Asks for `size`, which reaches the Tick paced by [`CARD_RESIZE_INTERVAL`]; a size the
+    /// full queue cannot take is asked for again by the next frame.
     pub(super) fn resize(&mut self, size: CardSize) {
         if size != self.size && self.requests.try_send(CardRequest::Resize(size)).is_ok() {
             self.size = size;
         }
+    }
+
+    /// Sends the size last asked for at once, without waiting out the pacing interval.
+    pub(super) fn flush_resize(&self) {
+        let _ = self.requests.try_send(CardRequest::FlushResize);
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>) {
@@ -217,17 +311,44 @@ async fn read_frames(
     redraw.notify_one();
 }
 
-/// Sends the card's input and resizes in order; once the card goes, detaches the view. A write
-/// the Tickhost takes nothing of within `write_timeout` ends the view and closes its connection.
+/// Sends the card's input in order and its resizes paced by [`ResizePacing`], starting from the
+/// `attached` size; once the card goes, detaches the view. A write the Tickhost takes nothing of
+/// within `write_timeout` ends the view and closes its connection.
 async fn write_requests(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     mut queued: mpsc::Receiver<CardRequest>,
+    attached: CardSize,
     reader: tokio::task::AbortHandle,
     screen: Arc<Mutex<CardScreen>>,
     redraw: Arc<Notify>,
     write_timeout: Duration,
 ) {
-    while let Some(request) = queued.recv().await {
+    let mut pacing = ResizePacing::new(attached);
+    loop {
+        let deadline = pacing.deadline();
+        let waiting_due = async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        let queued_request = tokio::select! {
+            request = queued.recv() => match request {
+                Some(request) => Some(request),
+                None => break,
+            },
+            () = waiting_due => None,
+        };
+        let now = tokio::time::Instant::now();
+        let request = match queued_request {
+            Some(CardRequest::Resize(size)) => pacing.request(size, now).map(CardRequest::Resize),
+            Some(CardRequest::FlushResize) => pacing.flush(now).map(CardRequest::Resize),
+            Some(input) => Some(input),
+            None => pacing.due(now).map(CardRequest::Resize),
+        };
+        let Some(request) = request else {
+            continue;
+        };
         let sent = match request {
             CardRequest::Input(bytes) => {
                 let mut sent = Ok(());
@@ -252,6 +373,7 @@ async fn write_requests(
                 )
                 .await
             }
+            CardRequest::FlushResize => Ok(()),
         };
         if let Err(error) = sent {
             if let Ok(mut screen) = screen.lock() {

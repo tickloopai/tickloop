@@ -305,14 +305,19 @@ impl State {
             .collect()
     }
 
-    /// After a frame: each shown card's view takes the size the frame gave it, and the focus
-    /// leaves a card the frame did not show, such as when a menu covers Monitor.
+    /// After a frame: each shown card's view takes the size the frame gave it, paced while the
+    /// size keeps changing, or at once after a separator drag ends; the focus leaves a card the
+    /// frame did not show, such as when a menu covers Monitor.
     pub(super) fn settle_cards(&mut self, sizes: Vec<(InstanceRef, CardSize)>) {
+        let resizes_due = std::mem::take(&mut self.card_resizes_due);
         for (instance, size) in &sizes {
             if let Some(card) = self.cards.card_mut(instance)
                 && let CardState::Attached(view) = &mut card.state
             {
                 view.resize(*size);
+                if resizes_due {
+                    view.flush_resize();
+                }
             }
             self.card_sizes.insert(instance.clone(), *size);
         }

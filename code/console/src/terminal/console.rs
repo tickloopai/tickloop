@@ -942,6 +942,8 @@ pub(super) struct State {
     cards: super::monitor_cards::MonitorCards,
     /// The Tick screen size the last frame gave each shown card.
     card_sizes: HashMap<tick_protocol::InstanceRef, super::monitor_cards::CardSize>,
+    /// The next frame sends each card's size at once, as when a separator drag ends.
+    card_resizes_due: bool,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
@@ -6277,6 +6279,7 @@ impl State {
             monitor_separator: None,
             cards: Default::default(),
             card_sizes: HashMap::new(),
+            card_resizes_due: false,
             card_press: None,
             member_probes: Vec::new(),
             member_probe_running: false,
@@ -6316,7 +6319,8 @@ impl State {
     }
 
     /// Drags Monitor's separator: a press on it starts, motion resizes the column within its
-    /// bounds and the release asks to save the width. `None` leaves the event to other handling;
+    /// bounds and the release asks to save the width and draws the cards' final sizes, which
+    /// reach their Ticks at once. `None` leaves the event to other handling;
     /// otherwise whether the frame changed.
     fn resize_monitor(&mut self, kind: MouseEventKind, at: Cell) -> Option<bool> {
         match kind {
@@ -6347,7 +6351,8 @@ impl State {
                 self.pointer_input = self
                     .monitor_width
                     .map(|columns| InputEvent::SaveMonitorWidth { columns });
-                Some(false)
+                self.card_resizes_due = true;
+                Some(true)
             }
             _ => None,
         }
