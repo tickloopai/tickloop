@@ -19,6 +19,10 @@ pub(super) struct CardSource {
 }
 
 const OPENING_NOTE: &str = "opening";
+/// How long the card of a row the Agent used waits for the row to be listed.
+const AGENT_CARD_WAIT: Duration = Duration::from_secs(30);
+/// The most such cards that wait at once.
+const AGENT_CARDS_AWAITED: usize = 16;
 
 impl State {
     pub(super) fn card_focused(&self) -> bool {
@@ -33,15 +37,7 @@ impl State {
 
     /// Whether `instance`'s row shows a live screen: a hosted Tick or a Shell whose view opens.
     pub(super) fn has_card(&self, instance: &InstanceRef) -> bool {
-        self.monitor
-            .entries()
-            .iter()
-            .find(|entry| &entry.instance == instance)
-            .is_some_and(|entry| {
-                entry.actions.iter().any(|action| {
-                    matches!(action.intent, crate::monitor_rows::TickIntent::OpenView(_))
-                })
-            })
+        self.monitor.row_opens_view(instance)
     }
 
     fn card_member(
@@ -241,10 +237,32 @@ impl State {
     /// Monitor, the list also scrolls the newest of them into view. Returns whether a card
     /// opened; the attaches of their views wait for [`State::settle_card_signals`].
     pub(super) fn show_agent_cards(&mut self) -> bool {
-        let touched = self.monitor.take_agent_touched();
+        let now = Instant::now();
+        let mut touched: Vec<(InstanceRef, Instant)> =
+            std::mem::take(&mut self.awaited_agent_cards);
+        touched.extend(
+            self.monitor
+                .take_agent_touched()
+                .into_iter()
+                .map(|instance| (instance, now)),
+        );
         let user_in_monitor = self.monitor.focused || self.card_focused();
         let mut opened = None;
-        for instance in touched {
+        for (instance, touched_at) in touched {
+            // A row the Monitor does not list yet may arrive with the next status; until then
+            // its card waits, for a while.
+            if !self.monitor.lists(&instance) {
+                if now.saturating_duration_since(touched_at) < AGENT_CARD_WAIT
+                    && self.awaited_agent_cards.len() < AGENT_CARDS_AWAITED
+                    && !self
+                        .awaited_agent_cards
+                        .iter()
+                        .any(|(awaited, _)| awaited == &instance)
+                {
+                    self.awaited_agent_cards.push((instance, touched_at));
+                }
+                continue;
+            }
             if !self.has_card(&instance)
                 || self.cards.is_open(&instance)
                 || !self.cards.agent_may_show(&instance)

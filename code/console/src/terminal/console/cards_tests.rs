@@ -1095,3 +1095,70 @@ fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it()
     let (_, inputs) = state.settle_card_signals();
     attaches(inputs.into_iter().next(), chat, one);
 }
+
+/// A View of a Chat whose Monitor lists `count` hosted Ticks it opened, more than one page holds.
+fn many_hosted(count: usize) -> (State, Vec<tick_protocol::InstanceRef>) {
+    let chat = Uuid::new_v4();
+    let mut state = State::new(true, 140, 40);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let mut status = tickloop_harness::protocol::ChatStatus::of(
+        &serde_json::from_value(serde_json::json!({
+            "id": chat, "folder":"/fixture", "messages":[],
+            "chat_loop":{"id":Uuid::nil(),"state":"Idle"}
+        }))
+        .unwrap(),
+    );
+    for _ in 0..count {
+        status.monitor.record_opened(
+            tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
+            Some("Tick".into()),
+        );
+    }
+    state.monitor.set_chat_status(Arc::new(status));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let listed = state
+        .monitor
+        .chat_status
+        .as_ref()
+        .unwrap()
+        .monitor
+        .members
+        .iter()
+        .map(|member| member.instance.clone())
+        .collect();
+    (state, listed)
+}
+
+#[test]
+fn the_agents_use_shows_a_card_whose_row_is_not_loaded_or_not_listed_yet() {
+    let (mut state, members) = many_hosted(400);
+    let chat = state.chat.unwrap();
+    let unloaded = members
+        .iter()
+        .find(|instance| {
+            !state
+                .monitor
+                .entries()
+                .iter()
+                .any(|entry| &entry.instance == *instance)
+        })
+        .expect("a row on a page not loaded yet")
+        .clone();
+    state.monitor.flash_use(unloaded.clone(), 1);
+    let (_, inputs) = state.settle_card_signals();
+    attaches(inputs.into_iter().next(), chat, &unloaded);
+    assert_eq!(origin(&state, &unloaded), Some(CardOrigin::Agent));
+
+    let arriving = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    state.monitor.flash_use(arriving.clone(), 2);
+    let (_, inputs) = state.settle_card_signals();
+    assert!(inputs.is_empty(), "no row yet");
+    let mut status = (**state.monitor.chat_status.as_ref().unwrap()).clone();
+    status
+        .monitor
+        .record_opened(arriving.clone(), Some("Late".into()));
+    state.monitor.set_chat_status(Arc::new(status));
+    let (_, inputs) = state.settle_card_signals();
+    attaches(inputs.into_iter().next(), chat, &arriving);
+}

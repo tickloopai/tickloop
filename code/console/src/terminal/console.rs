@@ -947,6 +947,9 @@ pub(super) struct State {
     /// Until when an Esc on the list is the second of a pair whose first Esc a card's Tick
     /// bubbled back, so it ends there instead of leaving the list too.
     paired_escape_until: Option<Instant>,
+    /// Rows the Agent used before the Monitor listed them, with when; their cards show once
+    /// they are listed.
+    awaited_agent_cards: Vec<(tick_protocol::InstanceRef, Instant)>,
     /// The cards the last frame showed, collapsed ones left out.
     shown_cards: Vec<tick_protocol::InstanceRef>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
@@ -6289,6 +6292,7 @@ impl State {
             card_sizes: HashMap::new(),
             card_resizes_due: false,
             paired_escape_until: None,
+            awaited_agent_cards: Vec::new(),
             shown_cards: Vec::new(),
             queued_card_inputs: Vec::new(),
             card_press: None,

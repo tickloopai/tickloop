@@ -1301,13 +1301,40 @@ impl Monitor {
         self.agent_touched.push(instance.clone());
     }
 
+    /// Whether `instance`'s row, loaded or on a page not loaded yet, shows a live screen.
+    pub(super) fn row_opens_view(&self, instance: &InstanceRef) -> bool {
+        let opens = |actions: &[MonitorAction]| {
+            actions
+                .iter()
+                .any(|action| matches!(action.intent, crate::monitor_rows::TickIntent::OpenView(_)))
+        };
+        match self
+            .entries
+            .iter()
+            .find(|entry| &entry.instance == instance)
+        {
+            Some(entry) => opens(&entry.actions),
+            None => self
+                .listing
+                .iter()
+                .find(|row| &row.instance == instance)
+                .is_some_and(|row| opens(&row.actions)),
+        }
+    }
+
     /// The instances the Agent used or took an update in from since last asked, oldest first.
     pub(super) fn take_agent_touched(&mut self) -> Vec<InstanceRef> {
         std::mem::take(&mut self.agent_touched)
     }
 
-    /// Scrolls `instance`'s row into view in the next frame, leaving the selection alone.
-    pub(super) fn reveal_row(&self, instance: InstanceRef) {
+    /// Scrolls `instance`'s row into view in the next frame, loading the pages up to it, and
+    /// leaves the selection alone.
+    pub(super) fn reveal_row(&mut self, instance: InstanceRef) {
+        while !self.entries.iter().any(|entry| entry.instance == instance)
+            && self.next_page.is_some()
+        {
+            self.load_tick_page();
+        }
         *self.reveal.borrow_mut() = Some(instance);
     }
 
