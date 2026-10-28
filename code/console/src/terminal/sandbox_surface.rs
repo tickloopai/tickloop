@@ -174,7 +174,7 @@ impl SandboxSurface {
         lines.push("Relative paths resolve from this Folder; ~/ resolves from your home.".into());
         lines.push(format!(
             "Sensitive paths [built-in]: {}",
-            tickloop_harness::tools::sensitive_write_path_descriptions().join(", ")
+            tickloop_harness::tools::credential_write_path_descriptions().join(", ")
         ));
         if let Some(root) = self.settings.root() {
             lines.push(format!(

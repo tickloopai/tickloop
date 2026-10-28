@@ -110,6 +110,8 @@ mod ticks_work;
 mod transcript;
 mod update_notice;
 mod user_panel;
+#[cfg(test)]
+mod view_handoff_tests;
 mod view_upgrade;
 mod workflows;
 mod workspace_trust;
@@ -141,6 +143,9 @@ const VIEW_REGISTRATION_UNAVAILABLE_NOTICE: &str = "View registration unavailabl
 const DISPATCH_DIRECTORY_MISSING: &str = "Dispatch directory must exist";
 const EXECUTION_UNAVAILABLE_FOR_INPUT: &str =
     "This execution is unavailable; inspect cached history or use /resume explicitly";
+const VIEW_UPDATE_AFTER_ENDED_AGENT: &str =
+    "View update · waits until the shown Agent runs again; use /resume or open another Agent";
+const HANDOFF_AGENT_ENDED: &str = "The Agent this View showed is no longer running; its unsent draft is kept and /resume opens saved conversations";
 use task_access::ShellTaskCenter;
 use thinking_preview::ThinkingPreview;
 use tickloop_code_access::{
@@ -1161,7 +1166,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
             mode_flag.or(permission_mode_flag).map(|(_, mode)| mode)
         }
     };
-    let view_handoff = view_handoff_path
+    let mut view_handoff = view_handoff_path
         .as_deref()
         .map(view_upgrade::read_handoff)
         .transpose()?;
@@ -1414,30 +1419,13 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         );
     }
     let startup = if let Some(chat) = exact_chat {
-        let opened = if view_handoff.is_some() {
-            agent.snapshot(chat.into()).await
-        } else {
-            agent.resume_chat(chat.into()).await
-        };
-        let (snapshot, has_history) = match opened {
-            Ok(snapshot) => (snapshot, true),
-            Err(error) if error.code == AccessErrorCode::NotFound && view_handoff.is_none() => {
-                agent
-                    .restore_empty_chat(chat.into(), workdir.clone())
-                    .await
-                    .map_err(|error| format!("Failed to create Chat {}: {error}", chat.public()))?;
-                (
-                    agent.snapshot(chat.into()).await.map_err(|error| {
-                        format!("Failed to open Chat {}: {error}", chat.public())
-                    })?,
-                    false,
-                )
-            }
-            Err(error) => {
-                return Err(format!("Failed to resume Chat {}: {error}", chat.public()));
-            }
-        };
-        StartupChat::Resumed(Box::new(snapshot), has_history)
+        open_exact_chat(
+            &agent,
+            chat,
+            &workdir,
+            view_handoff.as_mut().map(|handoff| &mut handoff.console),
+        )
+        .await?
     } else if continue_recent {
         let recent = agent
             .saved_chats(&workdir)
@@ -1541,8 +1529,48 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
 enum StartupChat {
     New,
     Resumed(Box<tickloop_harness::protocol::ChatSnapshot>, bool),
-    Picker { as_new_chat: bool },
+    Picker {
+        as_new_chat: bool,
+    },
     Upgrade(Box<StartupChat>, Box<view_upgrade::ViewHandoff>),
+    /// A View handoff carried a Chat the daemon no longer runs; the View opens without it.
+    Ended,
+}
+
+/// Opens the Chat named at startup. Without a handoff its saved history is loaded, or an empty
+/// Chat with that id is created. A handoff only reconnects the Chat the daemon runs: when the
+/// daemon no longer runs it, the restored View leaves that Chat, and nothing is loaded or created
+/// in place of the live connection.
+async fn open_exact_chat(
+    agent: &Agent,
+    chat: ChatId,
+    workdir: &std::path::Path,
+    handoff: Option<&mut console::ConsoleUpgrade>,
+) -> Result<StartupChat, String> {
+    let opened = if handoff.is_some() {
+        agent.snapshot(chat.into()).await
+    } else {
+        agent.resume_chat(chat.into()).await
+    };
+    match opened {
+        Ok(snapshot) => Ok(StartupChat::Resumed(Box::new(snapshot), true)),
+        Err(error) if error.code == AccessErrorCode::NotFound => {
+            if let Some(console) = handoff {
+                console.leave_chat();
+                return Ok(StartupChat::Ended);
+            }
+            agent
+                .restore_empty_chat(chat.into(), workdir.to_owned())
+                .await
+                .map_err(|error| format!("Failed to create Chat {}: {error}", chat.public()))?;
+            let snapshot = agent
+                .snapshot(chat.into())
+                .await
+                .map_err(|error| format!("Failed to open Chat {}: {error}", chat.public()))?;
+            Ok(StartupChat::Resumed(Box::new(snapshot), false))
+        }
+        Err(error) => Err(format!("Failed to resume Chat {}: {error}", chat.public())),
+    }
 }
 
 struct StartupState {
@@ -2093,7 +2121,9 @@ async fn interact_with_herdr(
         StartupChat::Upgrade(chat, handoff) => (*chat, Some(*handoff)),
         chat => (chat, None),
     };
+    let handoff_agent_ended = matches!(startup_chat, StartupChat::Ended);
     match startup_chat {
+        StartupChat::Ended => {}
         StartupChat::New => {
             if interactive
                 && let Err(error) = menus
@@ -2174,6 +2204,9 @@ async fn interact_with_herdr(
         view_upgrade::complete_handoff();
         let _ = std::fs::remove_file(path);
         console.finish_upgrade_restore();
+    }
+    if handoff_agent_ended {
+        write_warning(console, HANDOFF_AGENT_ENDED)?;
     }
     loop {
         observed_run_starts.retain(|run, _| pending.contains_key(run));
@@ -2826,33 +2859,49 @@ async fn interact_with_herdr(
             && let Some(navigation) = global.prepare_upgrade_navigation()
             && let Some(configuration) = agent.upgrade_configuration()?
         {
-            let selection = view_upgrade::ViewSelection {
-                navigation,
-                chat: selected_chat.map(Into::into),
-                overview: overview_active,
-                configuration,
+            // The new View reconnects the shown Chat live and never loads its history instead;
+            // after the daemon stopped (`make dev` stops it) this View keeps the Chat it caches.
+            let blocked_by_shown_chat = match selected_chat {
+                Some(chat) => match agent.runs_chat(chat.into()).await {
+                    Ok(true) => None,
+                    Ok(false) => Some(VIEW_UPDATE_AFTER_ENDED_AGENT.to_owned()),
+                    Err(error) => Some(format!("View update · {error}")),
+                },
+                None => None,
             };
-            // exec replaces this process without running destructors. Release the old
-            // pane report first; the replacement View will publish its current state.
-            if let Some(reporter) = herdr_reporter.as_mut() {
-                reporter.shutdown().await;
-            }
-            if let Err(error) = view_upgrade::try_reexec(
-                console,
-                &input,
-                &target.executable,
-                startup.launch_arguments.clone(),
-                selection,
-            )
-            .await
-            {
-                view_activation_notice = Some(tickloop_code_updater::UpdateNotice::Deferred {
-                    reason: format!("View update · {error}"),
-                });
+            if let Some(reason) = blocked_by_shown_chat {
+                view_activation_notice =
+                    Some(tickloop_code_updater::UpdateNotice::Deferred { reason });
                 ready_runtime = None;
+            } else {
+                let selection = view_upgrade::ViewSelection {
+                    navigation,
+                    chat: selected_chat.map(Into::into),
+                    overview: overview_active,
+                    configuration,
+                };
+                // exec replaces this process without running destructors. Release the old
+                // pane report first; the replacement View will publish its current state.
+                if let Some(reporter) = herdr_reporter.as_mut() {
+                    reporter.shutdown().await;
+                }
+                if let Err(error) = view_upgrade::try_reexec(
+                    console,
+                    &input,
+                    &target.executable,
+                    startup.launch_arguments.clone(),
+                    selection,
+                )
+                .await
+                {
+                    view_activation_notice = Some(tickloop_code_updater::UpdateNotice::Deferred {
+                        reason: format!("View update · {error}"),
+                    });
+                    ready_runtime = None;
+                }
+                // A postponed upgrade also returns without replacing the process.
+                *herdr_reporter = herdr_agent::Reporter::from_environment(interactive);
             }
-            // A postponed upgrade also returns without replacing the process.
-            *herdr_reporter = herdr_agent::Reporter::from_environment(interactive);
         }
         if interactive {
             let execution = selected_chat

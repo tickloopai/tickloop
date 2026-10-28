@@ -505,69 +505,60 @@ fn is_sensitive_path(path: &Path) -> bool {
     })
 }
 
-/// Case-insensitive component patterns for the same credential and write-sensitive paths
+/// Case-insensitive component patterns for the same credential paths
 /// enforced by file tools. Execution adapters may enforce these at their filesystem boundary.
 pub struct SensitiveWritePathPatterns {
     pub absolute_components: Vec<String>,
     pub relative_components: Vec<String>,
 }
 
-pub fn sensitive_write_path_descriptions() -> Vec<String> {
-    let mut paths = shell::sensitive_write_names()
-        .chain(SENSITIVE_PATH_NAMES.iter().copied())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+pub fn credential_write_path_descriptions() -> Vec<String> {
+    let mut paths = SENSITIVE_PATH_NAMES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
     paths.push(".env.*".into());
-    paths.extend(
-        SENSITIVE_PATH_SIGNALS
-            .iter()
-            .map(|name| format!("*{name}*")),
-    );
-    paths.extend(
-        SENSITIVE_PATH_EXTENSIONS
-            .iter()
-            .map(|extension| format!("*.{extension}")),
-    );
+    paths.extend(SENSITIVE_PATH_SIGNALS.iter().map(|name| format!("*{name}*")));
+    paths.extend(SENSITIVE_PATH_EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
     paths.sort();
     paths.dedup();
     paths
 }
 
-pub fn sensitive_write_path_patterns() -> SensitiveWritePathPatterns {
-    let literal = |value: &str| -> String {
-        value
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphabetic() {
-                    format!(
-                        "[{}{}]",
-                        character.to_ascii_lowercase(),
-                        character.to_ascii_uppercase()
-                    )
-                } else {
-                    regex::escape(&character.to_string())
-                }
-            })
-            .collect()
-    };
-    let absolute_components = shell::sensitive_write_names()
-        .chain(SENSITIVE_PATH_NAMES.iter().copied())
-        .map(literal)
+/// Escapes a literal path for regex engines without case-insensitive flags, including Seatbelt.
+pub fn case_insensitive_path_pattern(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphabetic() {
+                format!(
+                    "[{}{}]",
+                    character.to_ascii_lowercase(),
+                    character.to_ascii_uppercase()
+                )
+            } else {
+                regex::escape(&character.to_string())
+            }
+        })
+        .collect()
+}
+
+pub fn credential_write_path_patterns() -> SensitiveWritePathPatterns {
+    let absolute_components = SENSITIVE_PATH_NAMES
+        .iter()
+        .copied()
+        .map(case_insensitive_path_pattern)
         .collect();
     let mut components = SENSITIVE_PATH_NAMES
         .iter()
-        .map(|name| literal(name))
+        .map(|name| case_insensitive_path_pattern(name))
         .collect::<Vec<_>>();
-    components.push(format!("{}[^/]*", literal(".env.")));
+    components.push(format!("{}[^/]*", case_insensitive_path_pattern(".env.")));
     components.extend(
         SENSITIVE_PATH_SIGNALS
             .iter()
-            .map(|name| format!("[^/]*{}[^/]*", literal(name))),
+            .map(|name| format!("[^/]*{}[^/]*", case_insensitive_path_pattern(name))),
     );
     components.extend(
         SENSITIVE_PATH_EXTENSIONS
             .iter()
-            .map(|name| format!("[^/]*\\.{}", literal(name))),
+            .map(|name| format!("[^/]*\\.{}", case_insensitive_path_pattern(name))),
     );
     SensitiveWritePathPatterns {
         absolute_components,

@@ -59,9 +59,49 @@ pub struct SandboxNetwork {
 #[serde(rename_all = "camelCase")]
 pub struct SandboxFilesystem {
     #[serde(default)]
+    pub allow_git_config: bool,
+    #[serde(default)]
     pub allow_write: Vec<String>,
     #[serde(default)]
     pub deny_write: Vec<String>,
+}
+
+const DEFAULT_DENY_WRITE_PATHS: &[&str] = &[
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".ripgreprc",
+    ".mcp.json",
+    ".vscode",
+    ".idea",
+    ".git/hooks",
+    ".git/config",
+    ".tickloop",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    ".claude/skills",
+    ".claude/hooks",
+    ".claude/commands",
+    ".claude/agents",
+    ".claude/rules",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+];
+
+impl SandboxFilesystem {
+    /// Built-in write protections, matched case-insensitively at every depth below writable roots.
+    /// The execution adapter also preserves credential protections and the user's settings root.
+    pub fn default_deny_write_paths(&self) -> impl Iterator<Item = &'static str> {
+        DEFAULT_DENY_WRITE_PATHS
+            .iter()
+            .copied()
+            .filter(|path| !self.allow_git_config || *path != ".git/config")
+    }
 }
 
 impl LoadedSettings {
@@ -90,7 +130,7 @@ impl LoadedSettings {
                 self.warn_unsupported_sandbox_fields(
                     "sandbox.filesystem",
                     filesystem,
-                    &["allowWrite", "denyWrite"],
+                    &["allowWrite", "denyWrite", "allowGitConfig"],
                 );
             }
             if let Some(network) = object.get("network").and_then(Value::as_object) {
