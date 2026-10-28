@@ -13801,7 +13801,11 @@ fn read_keys(
                 state.card_focused().then(|| state.card_deadline())
             };
             if let Some(deadline) = card {
-                if !read_card_input(state, deadline)? && !idle_tick(state, stop, sender)? {
+                let read = read_card_input(state, deadline)?;
+                // The card's keys are the Tick's, so the Console's own input counts as idle.
+                if (!read && !idle_tick(state, stop, sender)?)
+                    || !settle_background_work(state, stop, sender, true, &mut deferred_frame)?
+                {
                     break;
                 }
                 continue;
@@ -13819,25 +13823,8 @@ fn read_keys(
             paused.store(false, Ordering::Release);
             continue;
         }
-        let delayed = {
-            let mut state = state
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let images_changed = state.poll_prepared_images();
-            let delayed = state.poll_delayed_submission();
-            if images_changed
-                || (input_was_idle && state.release_finished_submissions())
-                || std::mem::take(&mut deferred_frame)
-            {
-                state.draw(&mut io::stdout().lock())?;
-            }
-            delayed
-        };
-        if let Some(delayed) = delayed {
-            // Do not hold the editor or stdout lock while delivering to the consumer.
-            if !send_input(sender, stop, delayed) {
-                break;
-            }
+        if !settle_background_work(state, stop, sender, input_was_idle, &mut deferred_frame)? {
+            break;
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
             if !idle_tick(state, stop, sender)? {
@@ -13904,6 +13891,34 @@ fn read_keys(
         }
     }
     Ok(())
+}
+
+/// The work that finishes apart from the user's keys, on every pass of the input loop, also while
+/// a Monitor card reads the raw input: prepared images, a delayed submission to send, finished
+/// submissions to release and a frame a burst deferred. Returns whether input continues.
+fn settle_background_work(
+    state: &Arc<Mutex<State>>,
+    stop: &AtomicBool,
+    sender: &mpsc::Sender<InputEvent>,
+    input_was_idle: bool,
+    deferred_frame: &mut bool,
+) -> io::Result<bool> {
+    let delayed = {
+        let mut state = state
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let images_changed = state.poll_prepared_images();
+        let delayed = state.poll_delayed_submission();
+        if images_changed
+            || (input_was_idle && state.release_finished_submissions())
+            || std::mem::take(deferred_frame)
+        {
+            state.draw(&mut io::stdout().lock())?;
+        }
+        delayed
+    };
+    // Do not hold the editor or stdout lock while delivering to the consumer.
+    Ok(delayed.is_none_or(|delayed| send_input(sender, stop, delayed)))
 }
 
 /// The work of an input poll that read nothing: expiring timers, clocks and hints, and a plan edit
