@@ -266,6 +266,8 @@ async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() 
         0,
     );
     let first = ShellSpec {
+        additional_directories: Vec::new(),
+        family_temp: None,
         operation: tickloop_ids::generate(),
         shell: "/bin/sh".into(),
         command: "pwd".into(),
@@ -352,6 +354,8 @@ async fn ended_shell_releases_its_output_fd_and_refuses_fifo_replacement_without
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "printf done".into(),
@@ -528,6 +532,8 @@ async fn local_and_memory_shells_share_the_stop_contract() {
             folder: Some("/".into()),
         },
         ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "job".into(),
@@ -551,6 +557,8 @@ async fn local_and_memory_shells_share_the_stop_contract() {
             folder: Some(cwd.to_string_lossy().into_owned()),
         },
         ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "exec /bin/sleep 300".into(),
@@ -577,6 +585,8 @@ async fn local_and_memory_shells_share_the_exit_contract() {
             folder: Some("/".into()),
         },
         ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "job".into(),
@@ -612,6 +622,8 @@ async fn local_and_memory_shells_share_the_exit_contract() {
             folder: Some(cwd.to_string_lossy().into_owned()),
         },
         ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "read ignored < gate; printf 'done\\n'".into(),
@@ -647,6 +659,8 @@ async fn shell_observation_reports_one_exit_and_late_observers_only_get_a_baseli
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::SpawnShell(ShellSpec {
+            additional_directories: Vec::new(),
+            family_temp: None,
             operation: tickloop_ids::generate(),
             shell: "/bin/sh".into(),
             command: "job".into(),
@@ -1385,5 +1399,45 @@ async fn the_memory_environment_refuses_the_same_program_replacement() {
         },
         || environment.install_program("/program"),
     )
+    .await;
+}
+
+#[tokio::test]
+async fn local_and_reference_hosts_report_isolation_at_preparation() {
+    use tickloop_harness::runtime::environment::*;
+    use tickloop_harness::test_support::execution_contracts::isolation_contract;
+    let directory = tempfile::tempdir().unwrap();
+    let scope = ExecutionScope {
+        chat: tickloop_ids::generate().into(),
+        folder: Some(directory.path().display().to_string()),
+    };
+    let spec = ShellSpec {
+        additional_directories: Vec::new(),
+        family_temp: None,
+        operation: tickloop_ids::generate(),
+        shell: "/bin/sh".into(),
+        command: "true".into(),
+        cwd: directory.path().display().to_string(),
+        output: directory.path().join("output").display().to_string(),
+        description: None,
+    };
+    isolation_contract(
+        &LocalEnvironment::with_shells(Arc::new(OwnTickhost::new())),
+        scope.clone(),
+        spec.clone(),
+        ExecutionIsolation::default(),
+        || {},
+    )
+    .await;
+    let memory = tickloop_harness::test_support::execution_environment::MemoryEnvironment::new();
+    memory.define_shell("true", std::time::Duration::ZERO, Vec::new(), 0);
+    let isolated = ExecutionIsolation {
+        writes: WriteIsolation::Environment,
+        network: NetworkIsolation::Allowlist,
+    };
+    memory.set_isolation(isolated);
+    isolation_contract(&memory, scope, spec, isolated, || {
+        memory.set_isolation(ExecutionIsolation::default())
+    })
     .await;
 }

@@ -329,6 +329,12 @@ pub struct ExecutionContext {
 impl PreparedTool {
     pub fn approval_facts(&self) -> tickloop_harness_protocol::PreparedApprovalFacts {
         tickloop_harness_protocol::PreparedApprovalFacts {
+            isolation: match &self.operation {
+                Operation::Shell(input) => {
+                    input.preparation.as_ref().map(ShellPreparation::isolation)
+                }
+                _ => None,
+            },
             normalized_input: self.input.clone(),
             canonical_path: self
                 .operation
@@ -434,6 +440,30 @@ impl PreparedTool {
     }
 }
 
+const SENSITIVE_PATH_NAMES: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".env",
+];
+const SENSITIVE_PATH_SIGNALS: &[&str] = &[
+    "credential",
+    "secret",
+    "token",
+    "keychain",
+    "kubeconfig",
+    "sudoers",
+    "sshd_config",
+    "authorized_keys",
+];
+const SENSITIVE_PATH_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
+
 fn is_sensitive_path(path: &Path) -> bool {
     path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
@@ -443,38 +473,65 @@ fn is_sensitive_path(path: &Path) -> bool {
             return true;
         };
         let name = name.to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            ".ssh"
-                | ".aws"
-                | ".gnupg"
-                | ".kube"
-                | ".docker"
-                | ".netrc"
-                | ".npmrc"
-                | ".pypirc"
-                | ".git-credentials"
-        ) || name == ".env"
+        SENSITIVE_PATH_NAMES.contains(&name.as_str())
             || name.starts_with(".env.")
-            || [
-                "credential",
-                "secret",
-                "token",
-                "keychain",
-                "kubeconfig",
-                "sudoers",
-                "sshd_config",
-                "authorized_keys",
-            ]
-            .iter()
-            .any(|signal| name.contains(signal))
-            || matches!(
-                Path::new(&name)
-                    .extension()
-                    .and_then(|extension| extension.to_str()),
-                Some("pem" | "key" | "p12" | "pfx")
-            )
+            || SENSITIVE_PATH_SIGNALS
+                .iter()
+                .any(|signal| name.contains(signal))
+            || Path::new(&name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| SENSITIVE_PATH_EXTENSIONS.contains(&extension))
     })
+}
+
+/// Case-insensitive component patterns for the same credential and write-sensitive paths
+/// enforced by file tools. Execution adapters may enforce these at their filesystem boundary.
+pub struct SensitiveWritePathPatterns {
+    pub absolute_components: Vec<String>,
+    pub relative_components: Vec<String>,
+}
+
+pub fn sensitive_write_path_patterns() -> SensitiveWritePathPatterns {
+    let literal = |value: &str| -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphabetic() {
+                    format!(
+                        "[{}{}]",
+                        character.to_ascii_lowercase(),
+                        character.to_ascii_uppercase()
+                    )
+                } else {
+                    regex::escape(&character.to_string())
+                }
+            })
+            .collect()
+    };
+    let absolute_components = shell::sensitive_write_names()
+        .chain(SENSITIVE_PATH_NAMES.iter().copied())
+        .map(literal)
+        .collect();
+    let mut components = SENSITIVE_PATH_NAMES
+        .iter()
+        .map(|name| literal(name))
+        .collect::<Vec<_>>();
+    components.push(format!("{}[^/]*", literal(".env.")));
+    components.extend(
+        SENSITIVE_PATH_SIGNALS
+            .iter()
+            .map(|name| format!("[^/]*{}[^/]*", literal(name))),
+    );
+    components.extend(
+        SENSITIVE_PATH_EXTENSIONS
+            .iter()
+            .map(|name| format!("[^/]*\\.{}", literal(name))),
+    );
+    SensitiveWritePathPatterns {
+        absolute_components,
+        relative_components: components,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -619,6 +676,8 @@ impl Tools {
                         input,
                         self.task_output_directory()?,
                         operation,
+                        workspace,
+                        self.family_temp_directory(),
                     )
                     .await?;
             }

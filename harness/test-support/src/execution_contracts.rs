@@ -910,3 +910,29 @@ pub async fn preparation_identity_contract(
         );
     }
 }
+
+/// Isolation facts stay attached to the one preparation through admission and dispatch.
+pub async fn isolation_contract<F: FnOnce()>(
+    environment: &dyn ExecutionEnvironment,
+    scope: ExecutionScope,
+    spec: ShellSpec,
+    expected: ExecutionIsolation,
+    while_awaiting_approval: F,
+) {
+    let authority = ExecutionAuthority::new(scope.chat);
+    let port = environment.bind(scope, authority.clone()).unwrap();
+    let prepared = port
+        .prepare(ExecutionIntent::SpawnShell(spec))
+        .await
+        .unwrap();
+    assert_eq!(prepared.isolation(), expected);
+    assert_eq!(prepared.facts().approval.isolation, Some(expected));
+    while_awaiting_approval();
+    let admission = authority.admit(&prepared).unwrap();
+    assert_eq!(prepared.isolation(), expected);
+    assert!(matches!(
+        port.execute(prepared, admission, CancellationToken::new())
+            .await,
+        ExecutionOutcome::Completed(_)
+    ));
+}
