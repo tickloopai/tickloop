@@ -310,7 +310,7 @@ impl PermissionPolicyExt for PermissionPolicy {
         if explicit == Some(ExplicitPermissionDecision::Ask) {
             return Decision::Ask;
         }
-        if self.mode == ExecutionMode::FullAccess {
+        if self.admission_mode() == ExecutionMode::FullAccess {
             return Decision::Allow;
         }
         let safety_check = operation.safety_check();
@@ -1222,7 +1222,6 @@ mod tests {
         for (mode_before_plan, plan_without_auto) in [
             (after_auto, true),
             (Some(ExecutionMode::AcceptEdits), false),
-            (Some(ExecutionMode::FullAccess), false),
             (None, false),
         ] {
             let decide =
@@ -1233,6 +1232,60 @@ mod tests {
             for operation in [&workspace_write, &mutating_shell] {
                 assert_eq!(decide(vec![], operation), Decision::Deny);
             }
+        }
+    }
+
+    /// As in Claude Code's Plan with bypass available, Plan entered from Full Access allows what
+    /// it would otherwise ask about, whether Auto in Plan is on or off. Plan still refuses its
+    /// side effects, and explicit Ask and Deny rules still win.
+    #[test]
+    fn plan_after_full_access_allows_what_it_does_not_refuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("notes.txt"), "notes").unwrap();
+        let (workspace, workspace_write) = prepared_tool(directory.path());
+        let external_read = prepare_in(
+            &workspace,
+            "Read",
+            json!({"file_path":external.path().join("notes.txt")}),
+        );
+        let web_fetch = prepare_in(
+            &workspace,
+            crate::WEB_FETCH_TOOL_NAME,
+            json!({"url":"https://docs.example.com/guide","prompt":"Summarize"}),
+        );
+        let mutating_shell = prepare_in(
+            &workspace,
+            BASH_TOOL_NAME,
+            json!({"command":"rm -rf build"}),
+        );
+        for plan_without_auto in [false, true] {
+            let decide = |rules: Vec<PermissionRule>, operation: &PreparedTool| {
+                PermissionPolicy {
+                    mode: ExecutionMode::Plan,
+                    rules,
+                    plan_without_auto,
+                    mode_before_plan: Some(ExecutionMode::FullAccess),
+                    ..PermissionPolicy::default()
+                }
+                .decide(operation, &workspace, Uuid::nil())
+            };
+            assert_eq!(decide(vec![], &web_fetch), Decision::Allow);
+            assert_eq!(decide(vec![], &external_read), Decision::Allow);
+            for operation in [&workspace_write, &mutating_shell] {
+                assert_eq!(decide(vec![], operation), Decision::Deny);
+            }
+            assert_eq!(
+                decide(vec![tool_rule(Decision::Ask, "Read", None)], &external_read),
+                Decision::Ask
+            );
+            assert_eq!(
+                decide(
+                    vec![web_fetch_rule(Decision::Deny, "domain:docs.example.com")],
+                    &web_fetch
+                ),
+                Decision::Deny
+            );
         }
     }
 
