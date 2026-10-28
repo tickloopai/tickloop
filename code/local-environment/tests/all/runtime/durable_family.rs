@@ -641,10 +641,9 @@ async fn fixed_search_defaults_reach_every_chat_and_override_stored_family_setti
             assert_eq!(agent.snapshot(member).await.unwrap().search_config, search);
         }
         for request in model.requests.lock().unwrap().iter() {
-            assert_eq!(
+            assert!(
                 request.tools.iter().any(|tool| tool.name == "WebSearch"),
-                search.is_some(),
-                "WebSearch availability follows the fixed host default for every member"
+                "every member lists WebSearch, whether or not the fixed host default turns search on"
             );
         }
 

@@ -55,11 +55,12 @@ pub(super) fn task_of(request: &ModelRequest) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The text of the request's last message.
+/// The text of the request's last message that is not a host note.
 fn last_message(request: &ModelRequest) -> String {
     request
         .messages
-        .last()
+        .iter()
+        .rfind(|message| !tickloop_harness_test_support::is_host_note(message))
         .map(|message| format!("{:?}", message.content))
         .unwrap_or_default()
 }

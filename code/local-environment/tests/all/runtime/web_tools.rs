@@ -786,14 +786,24 @@ fn search_config(url: &str) -> SearchConfig {
     }
 }
 
+/// Turning search off or on keeps WebSearch listed and the request prefix byte for byte the same;
+/// a call while it is off explains how to turn it on, without review or approval in Auto mode.
 #[tokio::test]
-async fn search_off_removes_the_tool_and_explains_how_to_enable_it_without_disabling_fetch() {
+async fn search_off_keeps_the_prefix_and_answers_a_call_with_how_to_enable_it() {
     let directory = tempfile::tempdir().unwrap();
-    let model = WebModel::new(Vec::new(), PageAnswer::Text("unused"));
+    let model = WebModel::new(
+        vec![("WebSearch", json!({"query": "rust"}))],
+        PageAnswer::Text("unused"),
+    );
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, tickloop_harness::protocol::ExecutionMode::Auto)
+        .await
+        .unwrap();
     let mut events = agent.subscribe();
-    for enabled in [true, false, true] {
+    let mut results = Vec::new();
+    for enabled in [false, true, false] {
         agent
             .set_search(chat, enabled.then(SearchConfig::default))
             .await
@@ -809,36 +819,44 @@ async fn search_off_removes_the_tool_and_explains_how_to_enable_it_without_disab
                 .unwrap()
                 .kind
             {
+                EventKind::ToolCompleted { result, .. } => results.push(result),
                 EventKind::Completed { .. } => break,
                 EventKind::Failed(error) => panic!("{error}"),
-                EventKind::PermissionRequested { .. } => panic!("no tool was requested"),
+                EventKind::PermissionRequested { .. } => panic!("no approval was needed"),
                 _ => {}
             }
         }
-        let requests = model.conversation_requests.lock().unwrap();
-        let request = requests.last().unwrap();
+    }
+    let disabled = tickloop_harness::tools::web_search::DISABLED_MESSAGE;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    assert_eq!(results[0].content, disabled);
+    for expected in [
+        "/websearch",
+        "bypass this setting",
+        "WebFetch remains available",
+    ] {
+        assert!(disabled.contains(expected), "{expected}");
+    }
+    assert!(model.page_requests.lock().unwrap().is_empty());
+    let requests = model.conversation_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4);
+    for request in requests.iter() {
         assert_eq!(
-            request.tools.iter().any(|tool| tool.name == "WebSearch"),
-            enabled
+            serde_json::to_vec(&request.tools).unwrap(),
+            serde_json::to_vec(&requests[0].tools).unwrap()
         );
-        assert!(request.tools.iter().any(|tool| tool.name == "WebFetch"));
-        let system = request
-            .messages
-            .iter()
-            .filter(|message| message.role == Role::System)
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(system.contains("# Web search is disabled"), !enabled);
-        if !enabled {
-            assert!(system.contains("enable it with /websearch"));
-            assert!(system.contains("bypass this setting"));
+        assert_eq!(
+            serde_json::to_vec(&request.messages[..2]).unwrap(),
+            serde_json::to_vec(&requests[0].messages[..2]).unwrap()
+        );
+        for name in ["WebSearch", "WebFetch"] {
+            assert!(request.tools.iter().any(|tool| tool.name == name), "{name}");
         }
     }
+    let prefix = serde_json::to_string(&requests[0].messages[..2]).unwrap();
+    assert!(!prefix.contains("/websearch"));
+    assert!(!prefix.contains("web_search"));
     agent.shutdown().await;
 }
 
@@ -960,8 +978,11 @@ async fn search_distinguishes_disabled_empty_rate_limited_and_invalid_responses(
     let disabled_model = search();
     let run = run_web(disabled_model.clone(), None).await;
     assert!(run.failure.is_none(), "{:?}", run.failure);
-    assert!(run.results[0].is_error && run.results[0].content.contains("disabled"));
-    assert!(run.results[0].content.contains("/websearch"));
+    assert!(run.results[0].is_error);
+    assert_eq!(
+        run.results[0].content,
+        tickloop_harness::tools::web_search::DISABLED_MESSAGE
+    );
     assert!(run.permission_requests.is_empty());
     assert!(
         disabled_model
@@ -969,7 +990,7 @@ async fn search_distinguishes_disabled_empty_rate_limited_and_invalid_responses(
             .lock()
             .unwrap()
             .iter()
-            .all(|request| { !request.tools.iter().any(|tool| tool.name == "WebSearch") })
+            .all(|request| request.tools.iter().any(|tool| tool.name == "WebSearch"))
     );
     for (status, body, expected) in [
         (200, "{\"results\":[]}", None),

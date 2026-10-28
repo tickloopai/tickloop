@@ -765,7 +765,6 @@ impl Agent {
         );
         candidate.snapshot = original.snapshot.clone();
         candidate.bookkeeping = original.bookkeeping.clone();
-        candidate.needs_plan_mode_exit_notice = original.needs_plan_mode_exit_notice;
     }
 
     /// Cuts the conversation before message `index`.

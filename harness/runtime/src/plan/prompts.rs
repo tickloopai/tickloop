@@ -237,6 +237,12 @@ You can refer back to it if needed during implementation.
     )
 }
 
+/// A plan file path as a mode note shows it: the Folder it lies in is the user's, so the path
+/// keeps to its line.
+fn shown(path: &Path) -> String {
+    tickloop_harness_protocol::tags::single_line(&path.display().to_string())
+}
+
 /// Claude Code's `plan_mode_exit` attachment, sent once after the user leaves Plan mode without
 /// approving a plan.
 pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
@@ -244,7 +250,7 @@ pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
         .map(|path| {
             format!(
                 " The plan file is located at {} if you need to reference it.",
-                path.display()
+                shown(path)
             )
         })
         .unwrap_or_default();
@@ -255,9 +261,61 @@ You have exited plan mode. You can now make edits, run tools, and take actions.{
     )
 }
 
-/// The plan mode section of every conversation request while a root Chat is in Plan mode.
+/// Claude Code's `plan_mode_reentry` attachment, ahead of the full reminder when the user returns
+/// to Plan mode after leaving it and the plan file from that planning remains.
+pub(crate) fn plan_mode_reentry(plan_file: &Path) -> String {
+    format!(
+        "## Re-entering Plan Mode
+
+You are returning to plan mode after having previously exited it. A plan file exists at {} from your previous planning session.
+
+**Before proceeding with any new planning, you should:**
+1. Read the existing plan file to understand what was previously planned
+2. Evaluate the user's current request against that plan
+3. Decide how to proceed:
+   - **Different task**: If the user's request is for a different task\u{2014}even if it's similar or related\u{2014}start fresh by overwriting the existing plan
+   - **Same task, continuing**: If this is explicitly a continuation or refinement of the exact same task, modify the existing plan while cleaning up outdated or irrelevant sections
+4. Continue on with the plan process and most importantly you should always edit the plan file one way or the other before calling {EXIT_PLAN_MODE_TOOL_NAME}
+
+Treat this as a fresh planning session. Do not assume the existing plan is relevant without evaluating it first.",
+        shown(plan_file)
+    )
+}
+
+/// Claude Code's plan mode reminder for a session without a plan file, for a Chat without a
+/// Folder in Plan mode.
+const PLAN_MODE_WITHOUT_PLAN_FILE_REMINDER: &str = "# Plan mode
+
+Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received. There is no plan file: give your plan to the user as text in your reply.";
+
+/// Claude Code's sparse plan mode reminder, repeated every few prompts between full ones.
+fn sparse_plan_mode_reminder(plan_file: &Path) -> String {
+    format!(
+        "Plan mode still active (see full instructions earlier in conversation). Read-only except plan file ({}) and Artifact documents through {ARTIFACT_EDIT_TOOL}. Follow the iterative planning workflow, and end your turn only with {ASK_USER_QUESTION_TOOL_NAME} or {EXIT_PLAN_MODE_TOOL_NAME}.",
+        shown(plan_file)
+    )
+}
+
+/// Plan's rules as a mode note carries them: a delegated child, which has no plan file,
+/// researches read-only and reports in its final reply; a root Chat hears the full reminder
+/// naming its plan file, or the sparse one between full reminders.
+pub(crate) fn plan_mode_rules(
+    is_delegated: bool,
+    plan_file: Option<&Path>,
+    is_full: bool,
+) -> String {
+    match plan_file {
+        _ if is_delegated => DELEGATED_PLAN_MODE_REMINDER.into(),
+        None => PLAN_MODE_WITHOUT_PLAN_FILE_REMINDER.into(),
+        Some(plan_file) if is_full => plan_mode_reminder(plan_file, plan_file.exists()),
+        Some(plan_file) => sparse_plan_mode_reminder(plan_file),
+    }
+}
+
+/// The full plan mode reminder a root Chat with a Folder hears on entering Plan mode and every
+/// few sparse reminders after.
 pub(crate) fn plan_mode_reminder(plan_file: &Path, plan_exists: bool) -> String {
-    let plan_file = plan_file.display();
+    let plan_file = shown(plan_file);
     let plan_file_info = if plan_exists {
         format!(
             "A plan file already exists at {plan_file}. You can read it and make incremental edits using the {EDIT_TOOL_NAME} tool."
@@ -350,6 +408,26 @@ mod tests {
                 "Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
             ));
         }
+    }
+
+    #[test]
+    fn plan_rules_follow_the_chat_and_the_reminder_kind() {
+        let path = Path::new("/root/plans/calm-baking-aurora-loop-x.md");
+        assert_eq!(
+            plan_mode_rules(true, None, true),
+            DELEGATED_PLAN_MODE_REMINDER
+        );
+        assert_eq!(
+            plan_mode_rules(false, None, false),
+            PLAN_MODE_WITHOUT_PLAN_FILE_REMINDER
+        );
+        assert_eq!(
+            plan_mode_rules(false, Some(path), true),
+            plan_mode_reminder(path, false)
+        );
+        let sparse = plan_mode_rules(false, Some(path), false);
+        assert!(sparse.starts_with("Plan mode still active (see full instructions earlier in conversation). Read-only except plan file (/root/plans/calm-baking-aurora-loop-x.md)"));
+        assert!(sparse.ends_with("end your turn only with AskUserQuestion or ExitPlanMode."));
     }
 
     #[test]

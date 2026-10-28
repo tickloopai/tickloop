@@ -415,8 +415,15 @@ pub enum HostNote {
     /// The host tool set changed; the names announced as available once the note was written.
     HostTools(BTreeSet<String>),
     /// Claude Code's `plan_mode_exit` attachment: the user left Plan mode without approving a
-    /// plan.
+    /// plan. Earlier Tickloop versions wrote it; an `ExecutionMode` note now carries the exit.
     PlanModeExit,
+    /// Claude Code's `plan_mode`, `plan_mode_exit`, `auto_mode` and `auto_mode_exit`
+    /// attachments: the execution mode the note told the model, which the system prompt never
+    /// names so that changing it keeps the prompt cache.
+    ExecutionMode(ExecutionModeNote),
+    /// The Loop's Tick Subscriptions, its receiving or its running Subagents, as they changed
+    /// without the model's own calls or stand after a compaction or a load.
+    LoopState,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
@@ -425,11 +432,24 @@ pub enum HostNote {
     DateChange(String),
 }
 
+/// What an execution mode note told the model.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutionModeNote {
+    pub mode: ExecutionMode,
+    /// The plan file a Plan note named as the one file the model may edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file: Option<PathBuf>,
+}
+
 impl HostNote {
     pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
         match self {
             Self::HostTools(announced) => Some(announced),
-            Self::PlanModeExit | Self::Guidance(_) | Self::DateChange(_) => None,
+            Self::PlanModeExit
+            | Self::ExecutionMode(_)
+            | Self::LoopState
+            | Self::Guidance(_)
+            | Self::DateChange(_) => None,
         }
     }
 }
@@ -453,6 +473,9 @@ pub enum GuidanceNote {
     /// The instructions and states of the MCP servers one note announced, each with the digest
     /// of what it said.
     McpServers { servers: BTreeMap<String, String> },
+    /// The MCP configuration warnings one note announced, by the digest of their text; the
+    /// digest of no warnings withdraws earlier ones.
+    McpWarnings { digest: String },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]

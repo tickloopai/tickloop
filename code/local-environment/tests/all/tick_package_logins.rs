@@ -139,7 +139,8 @@ fn a_package_login_state_follows_its_saved_credentials_at_once() {
 }
 
 #[tokio::test]
-async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_skill_names() {
+async fn each_model_request_lists_the_plugins_without_login_states_with_the_fields_the_tickloop_skill_names()
+ {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
     let packages = PluginStore::in_config_root(&cwd.join("config"));
@@ -185,12 +186,10 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
             .as_array()
             .unwrap()
             .iter()
-            .map(|package| (package["name"].clone(), package["login"].clone()))
+            .map(|package| (package["name"].clone(), package.get("login").cloned()))
             .collect::<Vec<_>>(),
-        [
-            (json!("plain"), json!("not_required")),
-            (json!("sample"), json!("logged_in")),
-        ]
+        [(json!("plain"), None), (json!("sample"), None)],
+        "a login changes without the model, so the system prompt leaves it out"
     );
     for field in listed[0].as_object().unwrap().keys() {
         assert!(
@@ -198,11 +197,10 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
             "the tickloop Skill names the package field {field}"
         );
     }
+    // An open reports the states a plugin's missing login can have.
     for login in [
-        WorkspacePluginLogin::LoggedIn,
         WorkspacePluginLogin::LoggedOut,
         WorkspacePluginLogin::Expired,
-        WorkspacePluginLogin::NotRequired,
         WorkspacePluginLogin::Unknown,
     ] {
         let login = serde_json::to_value(login).unwrap();
@@ -211,6 +209,7 @@ async fn each_model_request_sees_the_login_states_with_the_fields_the_tickloop_s
             "the tickloop Skill names the login state {login}"
         );
     }
+    assert!(TICKLOOP_SKILL.contains("`plugin_login`"));
 }
 
 #[test]

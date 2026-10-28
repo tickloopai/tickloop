@@ -46,7 +46,8 @@ impl EchoModel {
             .filter(|request| {
                 request
                     .messages
-                    .last()
+                    .iter()
+                    .rfind(|message| !tickloop_harness::test_support::is_host_note(message))
                     .is_some_and(|message| message_text(message).contains(needle))
             })
             .count()
@@ -314,8 +315,16 @@ async fn rewind_keeps_the_loop_and_its_subscriptions_across_restarts() {
         .messages
         .iter()
         .filter(|message| tickloop_harness::test_support::is_conversation(message))
+        .filter(|message| !tickloop_harness::test_support::is_host_note(message))
         .map(message_text)
         .collect::<Vec<_>>();
+    assert!(
+        request.messages.iter().any(|message| {
+            tickloop_harness::test_support::is_host_note(message)
+                && message_text(message).contains("Tick Subscriptions:")
+        }),
+        "the loaded and rewound Chat hears what its Loop watches"
+    );
     assert_eq!(sent.first().map(String::as_str), Some("first goal"));
     assert_eq!(sent.last().map(String::as_str), Some("fourth goal"));
     assert!(!sent.iter().any(|text| text == "third goal"));
@@ -442,10 +451,18 @@ async fn subscriptions_survive_restart_after_compaction() {
             "{label}"
         );
         assert!(sent.starts_with(&in_process_conversation), "{label}");
-        let extra = sent[in_process_conversation.len()..]
+        let (notes, extra): (Vec<_>, Vec<_>) = sent[in_process_conversation.len()..]
             .iter()
-            .map(message_text)
-            .collect::<Vec<_>>();
+            .partition(|message| tickloop_harness::test_support::is_host_note(message));
+        let extra = extra.into_iter().map(message_text).collect::<Vec<_>>();
+        // A load leaves the model untold of the Loop, so it hears what the Loop still watches.
+        let [note] = notes.as_slice() else {
+            panic!("{label}: {notes:?}");
+        };
+        assert!(
+            message_text(note).contains("Tick Subscriptions:"),
+            "{label}"
+        );
         assert!(
             extra == ["resume watching"] || extra == ["No response requested.", "resume watching"],
             "{label}: {extra:?}"

@@ -1674,6 +1674,11 @@ impl Agent {
             (TICK_MANAGE, Some("unsubscribe")) => self.tick_unsubscribe(receipt, input).await,
             _ => Err("unknown TickManage subscription action".into()),
         };
+        if outcome.is_ok()
+            && let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id)
+        {
+            crate::loop_state_notes::acknowledge_subscriptions(chat);
+        }
         Ok(match outcome {
             Ok(content) => ToolResult {
                 content,

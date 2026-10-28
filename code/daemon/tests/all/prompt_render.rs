@@ -1,8 +1,11 @@
-//! Renders the first model request of a new Chat for a few host setups, so the always-on model
-//! text can be compared across versions. It writes one JSON file per setup and asserts nothing
-//! about the text. Run on request, alone, since it sets process environment variables:
+//! Renders the first model requests of a new Chat for a few host setups and checks that the
+//! prompt cache prefix, the system part and the listed tools, stays byte for byte the same from
+//! one Run to the next and names none of the state that changes during a Chat. With
+//! `PROMPT_RENDER_DIR` set it also writes one JSON file per setup, so the always-on model text
+//! can be compared across versions. It sets process environment variables, so it runs in a
+//! process of its own, as cargo-nextest runs every test:
 //!
-//! PROMPT_RENDER_DIR=<dir> cargo test -p tickloop-code-daemon --test all prompt_render -- --ignored --test-threads=1
+//! PROMPT_RENDER_DIR=<dir> cargo nextest run -p tickloop-code-daemon prompt_render
 
 use serde_json::json;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
@@ -172,8 +175,8 @@ fn install_plugin(root: &Path, name: &str, description: &str) {
 
 fn set_multiplexer(multiplexer: Multiplexer) {
     for variable in MULTIPLEXER_VARIABLES {
-        // SAFETY: the render runs alone (`--test-threads=1`), so no other thread reads the
-        // environment while it changes.
+        // SAFETY: cargo-nextest runs the render in a process of its own, and no other thread
+        // reads the environment while it changes.
         unsafe { std::env::remove_var(variable) };
     }
     let variable = match multiplexer {
@@ -217,7 +220,21 @@ fn request_json(request: &ModelRequest) -> serde_json::Value {
     })
 }
 
-async fn render(scenario: &Scenario, output: &Path) {
+/// Host state that changes while a Chat runs, which the system prompt must never name.
+const CHANGING_HOST_STATE: [&str; 10] = [
+    "service_connections",
+    "artifact_ticks",
+    "family_members",
+    "\"loop\"",
+    "\"plan\"",
+    "uncertain_operations",
+    "execution_mode",
+    "web_search",
+    "last_request_at_ms",
+    "\"login\"",
+];
+
+async fn render(scenario: &Scenario, output: Option<&Path>) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let folder = root.join("project");
@@ -353,11 +370,30 @@ async fn render(scenario: &Scenario, output: &Path) {
     let before = scripted.requests.lock().unwrap().len();
     scripted.enqueue(text("You're welcome."));
     complete(&agent, chat, "thanks").await;
-    rendered["second_run_system"] = {
-        let requests = scripted.requests.lock().unwrap();
-        request_json(&requests[before])["messages"][0]["text"].clone()
-    };
+    let second = request_json(&scripted.requests.lock().unwrap()[before]);
+    rendered["second_run_system"] = second["messages"][0]["text"].clone();
     agent.shutdown().await;
+    assert_eq!(
+        second["messages"][0], rendered["messages"][0],
+        "{}: the system prompt changed between Runs",
+        scenario.name
+    );
+    assert_eq!(
+        second["tools"], rendered["tools"],
+        "{}: the listed tools changed between Runs",
+        scenario.name
+    );
+    let system = rendered["messages"][0]["text"].as_str().unwrap();
+    for changing in CHANGING_HOST_STATE {
+        assert!(
+            !system.contains(changing),
+            "{}: the system prompt names {changing}",
+            scenario.name
+        );
+    }
+    let Some(output) = output else {
+        return;
+    };
     fs::write(
         output.join(format!("{}.json", scenario.name)),
         serde_json::to_vec_pretty(&rendered).unwrap(),
@@ -366,13 +402,14 @@ async fn render(scenario: &Scenario, output: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "writes rendered model input to PROMPT_RENDER_DIR for manual comparison"]
 async fn prompt_render() {
-    let output = std::path::PathBuf::from(
-        std::env::var("PROMPT_RENDER_DIR").expect("PROMPT_RENDER_DIR names the output directory"),
-    );
-    fs::create_dir_all(&output).unwrap();
+    let output = std::env::var("PROMPT_RENDER_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if let Some(output) = &output {
+        fs::create_dir_all(output).unwrap();
+    }
     for scenario in &SCENARIOS {
-        render(scenario, &output).await;
+        render(scenario, output.as_deref()).await;
     }
 }

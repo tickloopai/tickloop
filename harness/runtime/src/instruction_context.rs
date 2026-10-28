@@ -12,12 +12,32 @@ impl Agent {
     /// The Chat's user context message, read when the Chat has none cached; the instruction
     /// files are read on a blocking thread, outside the Chats lock.
     pub(super) async fn user_context(&self, chat_id: ChatId) -> Result<Message, AgentError> {
-        {
+        let cached = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            if let Some(cached) = chat.user_context.get() {
-                return Ok(context_message(cached.clone()));
+            chat.user_context.get().cloned().map(|cached| {
+                let needs_environment = chat.environment.get().is_none();
+                (
+                    cached,
+                    chat.snapshot.folder.clone().filter(|_| needs_environment),
+                )
+            })
+        };
+        if let Some((cached, folder)) = cached {
+            // A Subagent takes its parent's user context, but reads its own environment.
+            if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
+                let environment = tokio::task::spawn_blocking(move || {
+                    crate::environment_info::ChatEnvironment::capture(&folder)
+                })
+                .await
+                .map_err(|error| {
+                    AgentError::Invalid(format!("reading the environment failed: {error}"))
+                })?;
+                if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
+                    let _ = chat.environment.set(environment);
+                }
             }
+            return Ok(context_message(cached));
         }
         let files = self.instruction_files(chat_id).await?;
         let current_date = self.current_date();
