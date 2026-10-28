@@ -281,29 +281,9 @@ fn plan_mode_is_active(exception: &str) -> String {
     )
 }
 
-/// Claude Code 2.1.302's full `plan_mode` attachment (`Bbs`) with its five-phase workflow. With
-/// Subagent, the phases that launch Explore and Plan agents launch read-only Subagent children,
-/// at Claude Code's default counts; without it, the phases explore directly. Tickloop adds the
-/// Artifact exception and the read-only MCP rule.
-pub(crate) fn plan_mode_reminder(
-    plan_file: &Path,
-    plan_exists: bool,
-    offers_subagent: bool,
-) -> String {
-    let plan_file = plan_file.display();
-    let plan_file_info = if plan_exists {
-        format!(
-            "A plan file already exists at {plan_file}. You can read it and make incremental edits using the {EDIT_TOOL_NAME} tool."
-        )
-    } else {
-        format!(
-            "No plan file exists yet. You should create your plan at {plan_file} using the {WRITE_TOOL_NAME} tool."
-        )
-    };
-    let opening = plan_mode_is_active(&format!(
-        " (with the exception of the plan file mentioned below and Artifact documents through {ARTIFACT_EDIT_TOOL})"
-    ));
-    let (phase1, phase2) = if offers_subagent {
+/// Phases 1 and 2 of Claude Code 2.1.302's planning workflow (`a6n`).
+fn planning_phases(offers_subagent: bool) -> (String, String) {
+    if offers_subagent {
         (
             format!(
                 "### Phase 1: Initial Understanding
@@ -352,7 +332,103 @@ Goal: Design an implementation approach based on the user's intent and your expl
 - Produce a detailed implementation plan"
                 .to_owned(),
         )
+    }
+}
+
+/// Phase 3 of the planning workflow (`d6n`).
+fn review_phase() -> String {
+    format!(
+        "### Phase 3: Review
+Goal: Review the plan(s) from Phase 2 and ensure alignment with the user's intentions.
+1. Read the critical files you identified during exploration to deepen your understanding
+2. Ensure that the plans align with the user's original request
+3. Use {ASK_USER_QUESTION_TOOL_NAME} to clarify any remaining questions with the user"
+    )
+}
+
+/// What the final plan holds (`s6n`), where `plan` names the plan file or the reply's plan.
+fn final_plan_items(plan: &str) -> String {
+    format!(
+        "- Begin with a **Context** section: explain why this change is being made — the problem or need it addresses, what prompted it, and the intended outcome
+- Include only your recommended approach, not all alternatives
+- Ensure that the {plan} is concise enough to scan quickly, but detailed enough to execute effectively
+- Name the critical files to be modified. For changes that repeat a pattern across many files, describe the pattern once and list a few representative paths — do not enumerate every file or line number
+- Reference existing functions and utilities you found that should be reused, with their file paths
+- Include a verification section describing how to test the changes end-to-end (run the code, use MCP tools, run tests)"
+    )
+}
+
+/// The workflow's closing note (`l6n`).
+fn questions_note() -> String {
+    format!(
+        "NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications using the {ASK_USER_QUESTION_TOOL_NAME} tool. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins."
+    )
+}
+
+/// Claude Code 2.1.302's full `plan_mode` attachment without a plan file (`Wbs`), for a Chat
+/// without a Folder: the plan goes in the reply, and only the user leaves Plan.
+pub(crate) fn folderless_plan_mode_reminder(offers_subagent: bool) -> String {
+    let (phase1, phase2) = planning_phases(offers_subagent);
+    format!(
+        "{}
+
+## Where Your Plan Goes:
+This session has no plan file. Give your plan to the user as text in your reply, and do not write it to a file.
+
+## Plan Workflow
+
+{phase1}
+
+{phase2}
+
+{}
+
+### Phase 4: Final Plan
+Goal: Give your final plan in your reply.
+{}
+
+### Phase 5: Hand Over To The User
+When your plan is final, end your turn with it. You cannot leave plan mode yourself, and the user's approval alone does not end it: to have the plan carried out, the user changes this session's permission mode from Plan to another mode in their app and then tells you to go ahead. Close your reply with one sentence that tells the user to do that. If they ask for changes instead, reply with the revised plan. Stay read-only until a system reminder says that you have exited plan mode. If they tell you to go ahead before that, tell them that the session is still in plan mode and how to change it.
+
+{}",
+        plan_mode_is_active(""),
+        review_phase(),
+        final_plan_items("plan"),
+        questions_note()
+    )
+}
+
+/// Claude Code 2.1.302's sparse `plan_mode` attachment without a plan file.
+pub(crate) const SPARSE_FOLDERLESS_PLAN_MODE_REMINDER: &str = "Plan mode still active (see full instructions earlier in conversation). Read-only, and there is no plan file. Follow 5-phase workflow. When the plan is final, give it in your reply. Only the user can end plan mode, by changing the session's permission mode.";
+
+/// Claude Code 2.1.302's full `plan_mode` attachment (`Bbs`) with its five-phase workflow. With
+/// Subagent, the phases that launch Explore and Plan agents launch read-only Subagent children,
+/// at Claude Code's default counts; without it, the phases explore directly. Tickloop adds the
+/// Artifact exception and the read-only MCP rule.
+pub(crate) fn plan_mode_reminder(
+    plan_file: &Path,
+    plan_exists: bool,
+    offers_subagent: bool,
+) -> String {
+    let plan_file = plan_file.display();
+    let plan_file_info = if plan_exists {
+        format!(
+            "A plan file already exists at {plan_file}. You can read it and make incremental edits using the {EDIT_TOOL_NAME} tool."
+        )
+    } else {
+        format!(
+            "No plan file exists yet. You should create your plan at {plan_file} using the {WRITE_TOOL_NAME} tool."
+        )
     };
+    let opening = plan_mode_is_active(&format!(
+        " (with the exception of the plan file mentioned below and Artifact documents through {ARTIFACT_EDIT_TOOL})"
+    ));
+    let (phase1, phase2) = planning_phases(offers_subagent);
+    let (review, final_plan, questions) = (
+        review_phase(),
+        final_plan_items("plan file"),
+        questions_note(),
+    );
     let children_note = if offers_subagent {
         format!(
             " {SUBAGENT_TOOL_NAME} children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call {EXIT_PLAN_MODE_TOOL_NAME}."
@@ -373,20 +449,11 @@ You should build your plan incrementally by writing to or editing this file. NOT
 
 {phase2}
 
-### Phase 3: Review
-Goal: Review the plan(s) from Phase 2 and ensure alignment with the user's intentions.
-1. Read the critical files you identified during exploration to deepen your understanding
-2. Ensure that the plans align with the user's original request
-3. Use {ASK_USER_QUESTION_TOOL_NAME} to clarify any remaining questions with the user
+{review}
 
 ### Phase 4: Final Plan
 Goal: Write your final plan to the plan file (the only file you can edit).
-- Begin with a **Context** section: explain why this change is being made — the problem or need it addresses, what prompted it, and the intended outcome
-- Include only your recommended approach, not all alternatives
-- Ensure that the plan file is concise enough to scan quickly, but detailed enough to execute effectively
-- Name the critical files to be modified. For changes that repeat a pattern across many files, describe the pattern once and list a few representative paths — do not enumerate every file or line number
-- Reference existing functions and utilities you found that should be reused, with their file paths
-- Include a verification section describing how to test the changes end-to-end (run the code, use MCP tools, run tests)
+{final_plan}
 
 ### Phase 5: Call {EXIT_PLAN_MODE_TOOL_NAME}
 At the very end of your turn, once you have asked the user questions and are happy with your final plan file - you should always call {EXIT_PLAN_MODE_TOOL_NAME} to indicate to the user that you are done planning.
@@ -394,7 +461,7 @@ This is critical - your turn should only end with either using the {ASK_USER_QUE
 
 **Important:** Use {ASK_USER_QUESTION_TOOL_NAME} ONLY to clarify requirements or choose between approaches. Use {EXIT_PLAN_MODE_TOOL_NAME} to request plan approval. Do NOT ask about plan approval in any other way - no text questions, no {ASK_USER_QUESTION_TOOL_NAME}. Phrases like \"Is this plan okay?\", \"Should I proceed?\", \"How does this plan look?\", \"Any changes before we start?\", or similar MUST use {EXIT_PLAN_MODE_TOOL_NAME}.
 
-NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications using the {ASK_USER_QUESTION_TOOL_NAME} tool. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins."
+{questions}"
     )
 }
 

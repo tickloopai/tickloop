@@ -282,7 +282,6 @@ async fn exit_plan_mode_submits_the_written_plan_file_for_approval() {
     enter_plan_mode(&agent, chat).await;
     let mut events = agent.subscribe();
     let results = run_turn_results(&agent, chat, "Plan the report").await;
-    let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
 
     let submitted = result_of(&results, "submit");
     assert!(submitted.is_error);

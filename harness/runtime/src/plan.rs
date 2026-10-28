@@ -24,8 +24,8 @@ use tickloop_harness_base::private_fs::{
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
     ChatSnapshot, EventKind, FileReadRecord, HostNote, LoopId, OperationRecord,
-    PermissionApprovalSource, Plan, PlanModeNote, PlanModeReminder, Progress, PromptPolicy,
-    Receipt, Role, TodoItem, ToolDefinition, ToolResult,
+    PermissionApprovalSource, PermissionRequest, Plan, PlanModeNote, PlanModeReminder, Progress,
+    PromptPolicy, Receipt, Role, TodoItem, ToolDefinition, ToolResult,
 };
 use tickloop_harness_tools::{
     ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_WITHOUT_PLAN,
@@ -757,7 +757,7 @@ impl Agent {
             .snapshot
             .permissions
             .iter()
-            .find(|request| request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id)
+            .find(|request| is_plan_approval_request(request, loop_id))
             .map(|request| request.id);
         if let Some(request) = request {
             drop(chats);
@@ -806,9 +806,11 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         let loop_id = chat.snapshot.chat_loop.id;
-        let request = chat.snapshot.permissions.iter().position(|request| {
-            request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id
-        });
+        let request = chat
+            .snapshot
+            .permissions
+            .iter()
+            .position(|request| is_plan_approval_request(request, loop_id));
         if chat.active.is_some() && request.is_none() {
             return Err(AgentError::Busy);
         }
@@ -912,7 +914,7 @@ impl Agent {
             .snapshot
             .permissions
             .iter()
-            .find(|request| request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id)
+            .find(|request| is_plan_approval_request(request, loop_id))
             .cloned();
         let mut approvals = self.inner.approvals.lock().await;
         if let Some(request) = &request {
@@ -1061,9 +1063,22 @@ impl Agent {
                 .into_iter()
                 .collect();
         }
-        // A Chat without a Folder has no plan file; Plan mode there only reads.
+        // A Chat without a Folder has no plan file: its plan goes in the reply.
         let Some(folder) = chat.snapshot.folder.as_deref() else {
-            return Vec::new();
+            return due_plan_mode_reminder(&chat.snapshot, None)
+                .map(|reminder| {
+                    let text = match reminder {
+                        PlanModeReminder::Sparse => {
+                            prompts::SPARSE_FOLDERLESS_PLAN_MODE_REMINDER.to_owned()
+                        }
+                        _ => prompts::folderless_plan_mode_reminder(
+                            self.inner.tool_policy.delegation,
+                        ),
+                    };
+                    (text, note(reminder, None))
+                })
+                .into_iter()
+                .collect();
         };
         let directory = self.plans_directory(folder);
         // The model's Write would create a missing plans directory with ordinary permissions, so
@@ -1465,6 +1480,13 @@ impl Agent {
         snapshot.plans.push(plan.clone());
         Ok(Some(plan))
     }
+}
+
+/// Whether `request` is the Loop's plan approval, not a request to leave Plan without a plan.
+fn is_plan_approval_request(request: &PermissionRequest, loop_id: LoopId) -> bool {
+    request.name == EXIT_PLAN_MODE_TOOL_NAME
+        && request.loop_id == loop_id
+        && !tickloop_harness_tools::exits_plan_mode_without_plan(&request.name, &request.input)
 }
 
 /// What a plan control tool does after its synchronous part.

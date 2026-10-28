@@ -417,7 +417,7 @@ async fn the_plan_file_stays_writable_without_asking_outside_plan_mode() {
         run_turn(&agent, chat, "Revise the plan", no_requests).await;
 
         let requests = model.requests.lock().unwrap().clone();
-        assert_eq!(tool_result(&requests[3], "revise").1, false, "{mode:?}");
+        assert!(!tool_result(&requests[3], "revise").1, "{mode:?}");
         let plan_file = reminded_plan_file(&requests[0]).unwrap();
         assert_eq!(std::fs::read_to_string(plan_file).unwrap(), "1. Revised.");
         agent.shutdown().await;

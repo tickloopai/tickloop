@@ -281,7 +281,7 @@ pub fn host_note_texts(request: &ModelRequest) -> Vec<String> {
     request
         .messages
         .iter()
-        .filter(|message| message.role == Role::User)
+        .filter(|message| message.role == Role::User && !is_user_context(message))
         .flat_map(|message| &message.content)
         .filter_map(|content| match content {
             Content::Text { text } if text.starts_with("<system-reminder>\n") => Some(text.clone()),
