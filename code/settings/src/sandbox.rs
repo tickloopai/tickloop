@@ -52,6 +52,9 @@ pub struct SandboxFilesystem {
 
 impl LoadedSettings {
     pub fn sandbox(&mut self) -> Result<SandboxSettings, String> {
+        if let Some(error) = &self.read_error {
+            return Err(error.clone());
+        }
         let Some(value) = self.settings.get("sandbox").cloned() else {
             return Ok(SandboxSettings::default());
         };

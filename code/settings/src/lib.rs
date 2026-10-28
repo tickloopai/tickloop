@@ -844,7 +844,9 @@ impl UserSettings {
             read_error,
         };
         loaded.cleanup_period_days();
-        if let Err(error) = loaded.sandbox() {
+        if loaded.read_error.is_none()
+            && let Err(error) = loaded.sandbox()
+        {
             loaded.warn(error);
         }
         if has_retired_model_settings(&loaded.settings, parent_directory(&loaded.path)) {

@@ -758,6 +758,7 @@ impl Registry {
             .map_err(|error| ToolError::Rejected(error.clone()))?;
         self.host
             .prepare(ShellPreparationRequest {
+                folder: workspace.folder.clone(),
                 dangerously_disable_sandbox: input.dangerously_disable_sandbox,
                 additional_directories: workspace.additional_directories.clone(),
                 family_temp: family_temp.map(Path::to_path_buf),

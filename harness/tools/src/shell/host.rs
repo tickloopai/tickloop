@@ -60,6 +60,8 @@ pub enum ShellStopError {
 pub type ShellStopAdmission = dyn Fn() -> Result<(), ShellStopError> + Send + Sync;
 
 pub struct ShellPreparationRequest {
+    /// The trusted Chat Folder, independent of the command working directory.
+    pub folder: Option<PathBuf>,
     pub dangerously_disable_sandbox: bool,
     pub additional_directories: Vec<PathBuf>,
     pub family_temp: Option<PathBuf>,
