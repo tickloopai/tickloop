@@ -149,13 +149,14 @@ impl RequestUsageRecord {
 
     /// The input the service processed afresh rather than read from its prompt cache. Messages
     /// reports cache reads and cache writes apart from `input_tokens`, and a cache write is fresh
-    /// input; the other protocols report the input they read from cache within it.
+    /// input; the other protocols count the input they read from cache within `input_tokens`, so
+    /// it comes off.
     pub fn fresh_input_tokens(&self) -> Option<u64> {
         let input = self.usage.input_tokens?;
         Some(if self.model.protocol == Protocol::Messages {
             input.saturating_add(self.usage.cache_write_input_tokens.unwrap_or(0))
         } else {
-            input
+            input.saturating_sub(self.usage.cache_read_input_tokens.unwrap_or(0))
         })
     }
 }
