@@ -29,7 +29,11 @@ const STARTED_FILE: &str = "started";
 const GO_FILE: &str = "go";
 const STATE_FILE: &str = "state.json";
 const PHASE_FILE: &str = "phases.jsonl";
-const PLAN_REMINDER: &str = "Plan mode is active.";
+/// Opens each Plan mode reminder note, full or sparse.
+const PLAN_REMINDERS: [&str; 2] = [
+    "Plan mode is active.",
+    "Plan mode still active (see full instructions earlier in conversation).",
+];
 const EXIT_NOTICE: &str = "You have exited plan mode.";
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
 const LIVE_PLAN: &str = "## Live plan\n\n* Implement **after** approval\n* Report the result";
@@ -335,7 +339,7 @@ fn request_summaries(model: &ScriptedModel) -> Vec<Value> {
                 .count();
             json!({
                 "plan_mode": tickloop_harness::test_support::latest_execution_mode_note(request)
-                    .is_some_and(|note| note.contains(PLAN_REMINDER)),
+                    .is_some_and(|note| PLAN_REMINDERS.iter().any(|reminder| note.contains(reminder))),
                 "exit_notices": exit_notices,
                 "offers_exit_plan_mode": request.tools.iter().any(|tool| tool.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME),
                 "latest": latest,

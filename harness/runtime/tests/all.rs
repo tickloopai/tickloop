@@ -103,3 +103,8 @@ mod environment_approval;
 
 #[path = "all/deferred_plan_tool.rs"]
 mod deferred_plan_tool;
+#[path = "all/plan_reminders.rs"]
+mod plan_reminders;
+
+#[path = "all/sandbox_auto_approval.rs"]
+mod sandbox_auto_approval;

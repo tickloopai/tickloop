@@ -280,6 +280,7 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::PlanModeExit => "Plan mode exit".into(),
             HostNote::ExecutionMode(note) => format!("Execution mode · {}", note.mode.label()),
             HostNote::LoopState => "Loop state".into(),
+            HostNote::TaskReminder => "Task reminder".into(),
         });
     }
     matches!(

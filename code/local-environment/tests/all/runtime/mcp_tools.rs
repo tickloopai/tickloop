@@ -6667,6 +6667,8 @@ async fn a_folderless_durable_chat_excludes_local_skills_and_loads_remote_skills
         "family_temp_directory",
         "scratchpad",
         "workspace_host",
+        "plan",
+        "execution_mode",
     ] {
         assert!(state.get(absent).is_none(), "{absent}");
     }

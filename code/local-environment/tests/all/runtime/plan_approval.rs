@@ -435,14 +435,17 @@ async fn a_mode_change_during_a_run_applies_from_the_next_model_request() {
             .unwrap();
     }
     completed(&mut events, &receipt).await;
-    let planning = model
-        .requests
-        .lock()
-        .unwrap()
+    let requests = model.requests.lock().unwrap().clone();
+    let planning = requests
         .iter()
         .map(|request| reminded_plan_file(request).is_some())
         .collect::<Vec<_>>();
     assert_eq!(planning, [false, true, false]);
+    assert_eq!(
+        requests.iter().map(exit_notices).collect::<Vec<_>>(),
+        [0, 0, 1],
+        "the request after leaving Plan says so"
+    );
     agent.shutdown().await;
 }
 
@@ -622,10 +625,10 @@ async fn a_child_frozen_in_plan_reports_its_findings_and_the_parent_submits_the_
     assert_eq!(requests.len(), 3);
     let mode_note = tickloop_harness::test_support::latest_execution_mode_note;
     assert!(mode_note(&requests[0]).unwrap().contains(
-        "Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
+        "Subagent children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
     ));
     let child_note = mode_note(&requests[1]).unwrap();
-    assert!(child_note.contains("Your parent Agent writes the plan"));
+    assert!(child_note.contains("Answer the query you were given comprehensively in your final message, and do not write a plan or anything else to a file."));
     assert!(!child_note.contains("ExitPlanMode"), "{child_note}");
     assert!(!system_prompt(&requests[1]).contains("ExitPlanMode"));
     assert!(reminded_plan_file(&requests[1]).is_none());

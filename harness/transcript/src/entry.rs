@@ -307,6 +307,10 @@ pub struct ChainEntry {
     /// Subagents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loop_state_note: bool,
+    /// Tickloop extension: marks the host note reminding the model of the task tools, Claude
+    /// Code's `task_reminder` attachment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task_reminder: bool,
     /// Tickloop extension: marks the host note telling the model the date it now is, Claude
     /// Code's `date_change` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]

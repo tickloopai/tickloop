@@ -424,6 +424,8 @@ pub enum HostNote {
     /// The Loop's Tick Subscriptions, its receiving or its running Subagents, as they changed
     /// without the model's own calls or stand after a compaction or a load.
     LoopState,
+    /// Claude Code's `task_reminder` attachment: the task tools have not been used for a while.
+    TaskReminder,
     /// Guidance the model follows for the rest of the Chat, written into history once where it
     /// starts to apply so every later request keeps the earlier conversation as its prefix.
     Guidance(GuidanceNote),
@@ -448,6 +450,7 @@ impl HostNote {
             Self::PlanModeExit
             | Self::ExecutionMode(_)
             | Self::LoopState
+            | Self::TaskReminder
             | Self::Guidance(_)
             | Self::DateChange(_) => None,
         }

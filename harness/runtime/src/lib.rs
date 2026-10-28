@@ -3190,6 +3190,9 @@ impl Agent {
         let timing = timing::Phase::new("announce_execution_mode");
         Box::pin(self.announce_execution_mode(receipt)).await?;
         drop(timing);
+        let timing = timing::Phase::new("announce_task_reminder");
+        Box::pin(self.announce_task_reminder(receipt)).await?;
+        drop(timing);
         // Only a Chat with a Folder probes the host it runs in.
         let workspace_host = self
             .inner
@@ -5032,6 +5035,10 @@ impl Agent {
                 chat.snapshot.permissions.iter().any(|request| {
                     request.id == request_id
                         && request.name == tickloop_harness_tools::EXIT_PLAN_MODE_TOOL_NAME
+                        && !tickloop_harness_tools::exits_plan_mode_without_plan(
+                            &request.name,
+                            &request.input,
+                        )
                 })
             }) {
                 return Err(AgentError::Invalid(

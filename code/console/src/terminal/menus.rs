@@ -1084,7 +1084,7 @@ impl Menus {
             let plan_feedback = matches!(&selection, Selection::Workflow(Workflow::Plan { .. }));
             let plan_dialog = plan_feedback
                 || matches!(&selection, Selection::Workflow(Workflow::PlanView { .. }))
-                || matches!(&selection, Selection::Permission { request, .. } if request.name == ENTER_PLAN_MODE_TOOL_NAME);
+                || matches!(&selection, Selection::Permission { request, .. } if is_plan_mode_confirmation(request));
             if plan_dialog {
                 console.show_plan_menu(menu, plan_feedback)?;
                 if let Selection::Workflow(Workflow::Plan { markdown, .. }) = &selection {
@@ -1885,10 +1885,7 @@ impl Menus {
             Menu {
                 id,
                 title: "shift+tab modes".into(),
-                context: vec![
-                    "shift+tab cycles the checked modes in this order.".into(),
-                    "Entering or leaving Plan starts a new model cache.".into(),
-                ],
+                context: vec!["shift+tab cycles the checked modes in this order.".into()],
                 markdown: None,
                 options,
                 selected,
@@ -2373,7 +2370,9 @@ impl Menus {
             if let Some(request) = status.permissions.iter().find(|request| {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
-                if request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME {
+                if request.name == tickloop_harness::tools::EXIT_PLAN_MODE_TOOL_NAME
+                    && !is_plan_mode_exit_without_plan(request)
+                {
                     let (mut menu, workflow) = Workflow::plan(agent, chat).await?;
                     if console.dialog_chat()? != Some(chat) {
                         menu.title = format!("Plan approval · {requester}");
@@ -2400,8 +2399,7 @@ impl Menus {
         requester: String,
         persistent: bool,
     ) -> Result<(), String> {
-        if request.name == ENTER_PLAN_MODE_TOOL_NAME {
-            let menu = enter_plan_mode_menu(request.id, requester.clone());
+        if let Some(menu) = plan_mode_confirmation_menu(request, requester.clone()) {
             let selection = Selection::Permission {
                 chat,
                 request: request.clone(),
@@ -2644,7 +2642,7 @@ impl Menus {
                     }
                 }
                 Selection::Permission { chat, request, .. }
-                    if request.name == ENTER_PLAN_MODE_TOOL_NAME =>
+                    if is_plan_mode_confirmation(&request) =>
                 {
                     let allow = match index {
                         Some(0) => true,
@@ -3414,6 +3412,41 @@ async fn requester_label(agent: &Agent, console: &Console, status: &ChatStatus) 
         .ok()
         .and_then(|execution| console.agent_name(execution.agent_id, &title).ok())
         .unwrap_or_else(|| format!("Agent {title}"))
+}
+
+/// Whether a permission request is the Agent asking to leave Plan mode without a plan.
+fn is_plan_mode_exit_without_plan(request: &PermissionRequest) -> bool {
+    tickloop_harness::tools::exits_plan_mode_without_plan(&request.name, &request.input)
+}
+
+/// Whether a permission request is a yes/no confirmation of entering or leaving Plan mode.
+fn is_plan_mode_confirmation(request: &PermissionRequest) -> bool {
+    request.name == ENTER_PLAN_MODE_TOOL_NAME || is_plan_mode_exit_without_plan(request)
+}
+
+/// The yes/no dialog for a request to enter Plan mode, or to leave it without a plan.
+fn plan_mode_confirmation_menu(request: &PermissionRequest, requester: String) -> Option<Menu> {
+    if request.name == ENTER_PLAN_MODE_TOOL_NAME {
+        Some(enter_plan_mode_menu(request.id, requester))
+    } else if is_plan_mode_exit_without_plan(request) {
+        Some(exit_plan_mode_menu(request.id, requester))
+    } else {
+        None
+    }
+}
+
+/// The confirmation for the Agent's `ExitPlanMode` request without a plan, following Claude Code
+/// 2.1.302's "Exit plan mode?" dialog.
+fn exit_plan_mode_menu(request_id: Uuid, requester: String) -> Menu {
+    Menu {
+        id: request_id,
+        title: "Exit plan mode?".into(),
+        context: vec![requester, "The Agent wants to exit plan mode".into()],
+        markdown: None,
+        options: vec!["Yes".into(), "No".into()],
+        selected: 0,
+        confirmation: true,
+    }
 }
 
 /// The confirmation for the Agent's `EnterPlanMode` request, following Claude Code's
