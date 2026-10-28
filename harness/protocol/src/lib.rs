@@ -38,6 +38,7 @@ mod provider_failure;
 mod scheduled_tasks;
 mod shell_tasks;
 mod skill;
+pub mod tags;
 mod tick_subscriptions;
 mod tool;
 mod tools;
