@@ -186,6 +186,58 @@ pub(crate) fn messages_replay(mut value: Value, deferred: &[ToolDefinition]) -> 
     value
 }
 
+/// Messages pairs a search call with its result by id, not by position. A call made beside a
+/// client tool runs when the next request answers that tool with nothing but tool results, so it
+/// stays open only while the latest assistant message is followed by tool results alone; any
+/// other request refuses a call without its result, and a result without its call. A record
+/// left unpaired (the response carrying its result failed and the turn moved on) goes as
+/// readable text instead, so the Chat continues; the rule depends on history alone, so every
+/// later request sends the same bytes.
+pub(crate) fn settle_unpaired_messages_records(messages: &mut [Value]) {
+    let record_ids = |kind: &str, id_field: &str| -> BTreeSet<String> {
+        messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == kind)
+            .filter_map(|block| block[id_field].as_str().map(str::to_owned))
+            .collect()
+    };
+    let calls = record_ids(MESSAGES_SEARCH_CALL, "id");
+    let results = record_ids(MESSAGES_SEARCH_RESULT, "tool_use_id");
+    let latest_assistant = messages
+        .iter()
+        .rposition(|message| message["role"] == "assistant");
+    let open_turn = latest_assistant.filter(|latest| {
+        messages[latest + 1..].iter().all(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|content| {
+                    !content.is_empty()
+                        && content.iter().all(|block| block["type"] == "tool_result")
+                })
+        })
+    });
+    for (index, message) in messages.iter_mut().enumerate() {
+        let Some(content) = message["content"].as_array_mut() else {
+            continue;
+        };
+        for block in content {
+            let unpaired = match block["type"].as_str() {
+                Some(MESSAGES_SEARCH_CALL) => {
+                    Some(index) != open_turn
+                        && !block["id"].as_str().is_some_and(|id| results.contains(id))
+                }
+                Some(MESSAGES_SEARCH_RESULT) => !block["tool_use_id"]
+                    .as_str()
+                    .is_some_and(|id| calls.contains(id)),
+                _ => false,
+            };
+            if unpaired && let Some(text) = readable_text(block) {
+                *block = json!({"type": "text", "text": text});
+            }
+        }
+    }
+}
+
 pub(crate) fn responses_tools(tools: &[ToolDefinition], deferred: &[ToolDefinition]) -> Value {
     let function = |tool: &ToolDefinition| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema});
     let mut encoded: Vec<_> = tools.iter().map(function).collect();

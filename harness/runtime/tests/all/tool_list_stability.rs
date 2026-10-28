@@ -482,6 +482,86 @@ async fn native_search_keeps_the_listed_tools_while_deferred_tools_grow_at_the_e
     agent.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_failed_response_adds_nothing_beside_a_search_left_waiting_on_a_call() {
+    use tickloop_harness_model::cards::ModelCatalog;
+    use tickloop_harness_protocol::{Content, Message, Protocol, Role};
+    use tickloop_harness_test_support::{config, text};
+    let gamma = McpService::start().await;
+    gamma.set_tools(json!([{"name":"zeta","inputSchema":{"type":"object"}}]));
+    gamma.set_result(json!({"content":[{"type":"text","text":"ZETA_OK"}]}));
+    let connections = new_connections();
+    let servers = vec![server_config("gamma", &gamma, ToolExposure::Search)];
+    connect(&connections, &servers).await;
+    let configs = Arc::new(RwLock::new(servers));
+    let waiting = json!({"type":"server_tool_use","id":"srvtoolu_waiting","name":"tool_search_tool_bm25","input":{"query":"news"}});
+    // The response answering the call fails, as an unparsable block failed it before.
+    let scripted = Arc::new(ScriptedModel::new(vec![vec![
+        Content::Thinking {
+            thinking: String::new(),
+            signature: Some("signed".into()),
+        },
+        Content::ToolUse {
+            id: "zeta".into(),
+            name: "mcp__gamma__zeta".into(),
+            input: json!({}),
+        },
+        Content::ProtocolData {
+            protocol: Protocol::Messages,
+            value: waiting.clone(),
+        },
+    ]]));
+    let mut native = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-opus-5-5")
+        .unwrap();
+    native.base_url = config().base_url;
+    native.api_key_env.clear();
+    let agent = Agent::new_embedded(native, scripted.clone());
+    agent
+        .install_host_tools(mcp_provider(connections, &configs))
+        .unwrap();
+    let (chat, _directory) = full_access_chat(&agent).await;
+    let mut events = agent.subscribe();
+    let failed = agent.submit(chat, "Use zeta".into()).await.unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::Failed(_) if event.run_id == failed.run_id => break,
+            EventKind::Completed { .. } if event.run_id == failed.run_id => {
+                panic!("the run should fail")
+            }
+            _ => {}
+        }
+    }
+    scripted.enqueue(text("recovered"));
+    run_turn(&agent, chat, "Again").await;
+
+    let requests = scripted.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(gamma.calls().len(), 1);
+    let history = &requests[2].messages;
+    let waiting_at = history
+        .iter()
+        .position(|message| {
+            message.content.contains(&Content::ProtocolData {
+                protocol: Protocol::Messages,
+                value: waiting.clone(),
+            })
+        })
+        .unwrap();
+    assert_eq!(history[waiting_at].role, Role::Assistant);
+    let after: Vec<&Message> = history[waiting_at + 1..].iter().collect();
+    assert!(
+        after.iter().all(|message| message.role == Role::User),
+        "the failed response left content behind: {after:?}"
+    );
+    assert!(matches!(
+        after[0].content.as_slice(),
+        [Content::ToolResult { tool_use_id, .. }] if tool_use_id == "zeta"
+    ));
+    agent.shutdown().await;
+}
+
 #[derive(Clone, Default)]
 struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
 
