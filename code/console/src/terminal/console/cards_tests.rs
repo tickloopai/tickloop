@@ -171,6 +171,17 @@ fn keys_and_clicks_on_a_focused_card_never_reach_the_console() {
 }
 
 #[test]
+fn focus_reports_read_by_a_focused_card_reach_the_console() {
+    let mut state = cards_fixture();
+    state.key(key(KeyCode::Enter));
+    state.file_index_focused = true;
+    state.card_input(b"\x1b[O", Instant::now());
+    assert!(!state.file_index_focused, "the Console lost the terminal's focus");
+    state.card_input(b"\x1b[I", Instant::now());
+    assert!(state.file_index_focused && state.card_focused());
+}
+
+#[test]
 fn a_row_click_toggles_its_card_on_release_a_card_click_enters_and_a_drag_does_neither() {
     let mut state = cards_fixture();
     let chat = state.chat.unwrap();

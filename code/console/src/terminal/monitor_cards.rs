@@ -52,7 +52,8 @@ const LONGEST_KEY_SEQUENCE: usize = 32;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// Focus reports the Console's terminal sends; they are the Console's, never the Tick's.
-const FOCUS_REPORTS: [&[u8]; 2] = [b"\x1b[I", b"\x1b[O"];
+const FOCUS_GAINED: &[u8] = b"\x1b[I";
+const FOCUS_LOST: &[u8] = b"\x1b[O";
 /// While a card has the focus, the terminal reports legacy keys, the ones a Tick's own terminal
 /// sends; leaving pops these flags again.
 const PUSH_LEGACY_KEYS: &str = "\x1b[>0u";
@@ -792,6 +793,8 @@ pub(super) enum CardInput {
     /// Bytes the Tick receives as they came.
     Bytes(Vec<u8>),
     Mouse(SgrMouse),
+    /// The Console's terminal gained (`true`) or lost the focus.
+    Focus(bool),
     /// The focus leaves the card; nothing read after it reaches the Tick.
     Leave,
 }
@@ -801,7 +804,8 @@ pub(super) enum CardInput {
 /// Esc and keeps the focus; any other key after it sends both. Escape sequences such as arrows,
 /// Alt-keys and every other byte, Ctrl keys included, reach the Tick unchanged. Text inside a
 /// bracketed paste is never a key; its markers reach the Tick only when it asked for them.
-/// Mouse reports and the terminal's focus reports are never sent as they came.
+/// Mouse reports and the terminal's focus reports are never sent as they came, and an Esc held
+/// before them stays held.
 #[derive(Debug, Default)]
 pub(super) struct CardKeys {
     /// An escape sequence not ended yet, perhaps a lone Esc, and when its Esc arrived.
@@ -915,7 +919,8 @@ impl CardKeys {
         }
     }
 
-    /// One whole key or report: sent after any Esc held before it.
+    /// One whole key or report. A key is sent after any Esc held before it; a report is no key,
+    /// so the Esc stays held.
     fn token(
         &mut self,
         token: Vec<u8>,
@@ -927,21 +932,22 @@ impl CardKeys {
             self.lone_escape(now, items);
             return;
         }
+        if token == FOCUS_GAINED || token == FOCUS_LOST {
+            items.push(CardInput::Focus(token == FOCUS_GAINED));
+            return;
+        }
+        if let Some(mouse) = SgrMouse::parse(&token) {
+            items.push(CardInput::Mouse(mouse));
+            return;
+        }
         if self.escape_at.take().is_some() {
             push_bytes(items, &[ESCAPE]);
-        }
-        if FOCUS_REPORTS.contains(&token.as_slice()) {
-            return;
         }
         if token == PASTE_START {
             self.in_paste = true;
             if paste_markers {
                 push_bytes(items, PASTE_START);
             }
-            return;
-        }
-        if let Some(mouse) = SgrMouse::parse(&token) {
-            items.push(CardInput::Mouse(mouse));
             return;
         }
         push_bytes(items, &token);

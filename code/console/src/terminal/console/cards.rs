@@ -141,7 +141,7 @@ impl State {
             .cards
             .keys_mut()
             .feed(input, now, paste_markers.unwrap_or(false));
-        self.apply_card_inputs(items);
+        self.apply_card_inputs(items, now);
     }
 
     /// Settles a held Esc once its time passed; returns whether the screen changed.
@@ -151,7 +151,7 @@ impl State {
         }
         let items = self.cards.keys_mut().expire(now);
         let leaves = items.contains(&CardInput::Leave);
-        self.apply_card_inputs(items);
+        self.apply_card_inputs(items, now);
         leaves
     }
 
@@ -161,10 +161,12 @@ impl State {
         Some(read(screen.parser.screen()))
     }
 
-    fn apply_card_inputs(&mut self, items: Vec<CardInput>) {
+    fn apply_card_inputs(&mut self, items: Vec<CardInput>, now: Instant) {
         for item in items {
             match item {
                 CardInput::Bytes(bytes) => self.cards.input(bytes),
+                CardInput::Focus(true) => self.focus_gained(now),
+                CardInput::Focus(false) => self.focus_lost(),
                 CardInput::Mouse(mouse) => {
                     if !self.card_mouse(mouse) {
                         self.leave_card();

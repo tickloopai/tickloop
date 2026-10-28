@@ -73,10 +73,18 @@ fn sequences_and_control_keys_reach_the_tick_unchanged() {
 }
 
 #[test]
-fn focus_reports_never_reach_the_tick_and_a_kitty_escape_counts_as_escape() {
+fn focus_reports_go_to_the_console_and_a_kitty_escape_counts_as_escape() {
     let start = Instant::now();
     let mut keys = CardKeys::default();
-    assert_eq!(keys.feed(b"a\x1b[Ib\x1b[O", start, false), bytes(b"ab"));
+    assert_eq!(
+        keys.feed(b"a\x1b[Ib\x1b[O", start, false),
+        vec![
+            CardInput::Bytes(b"a".to_vec()),
+            CardInput::Focus(true),
+            CardInput::Bytes(b"b".to_vec()),
+            CardInput::Focus(false),
+        ]
+    );
     assert!(keys.feed(b"\x1b[27u", start, false).is_empty());
     assert_eq!(keys.expire(after(start, 400)), vec![CardInput::Leave]);
 }
@@ -101,6 +109,45 @@ fn pasted_text_is_never_a_key_and_its_markers_reach_only_a_tick_that_asked_for_t
             CardInput::Bytes(b"two".to_vec())
         ],
         "markers dropped even when the end marker spans reads"
+    );
+}
+
+#[test]
+fn mouse_and_focus_reports_after_an_escape_neither_send_it_nor_stop_it_leaving() {
+    let start = Instant::now();
+    let mut keys = CardKeys::default();
+    assert!(keys.feed(b"\x1b", start, false).is_empty());
+    assert!(keys.expire(after(start, 60)).is_empty());
+    assert_eq!(
+        keys.feed(b"\x1b[<64;3;4M", after(start, 100), false),
+        vec![CardInput::Mouse(SgrMouse {
+            code: 64,
+            column: 3,
+            row: 4,
+            pressed: true
+        })],
+        "a wheel sends no Esc to the Tick"
+    );
+    assert_eq!(
+        keys.feed(b"\x1b[O", after(start, 150), false),
+        vec![CardInput::Focus(false)]
+    );
+    assert_eq!(
+        keys.expire(after(start, 400)),
+        vec![CardInput::Leave],
+        "the lone Esc still leaves"
+    );
+
+    let mut keys = CardKeys::default();
+    assert_eq!(
+        keys.feed(b"\x1b\x1b[<0;1;1M", start, false),
+        vec![CardInput::Mouse(SgrMouse {
+            code: 0,
+            column: 1,
+            row: 1,
+            pressed: true
+        })],
+        "an Esc and a click in one read: no Esc for the Tick"
     );
 }
 
