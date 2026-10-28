@@ -123,13 +123,13 @@ fn builtin_selections_need_no_definition_file_or_notice() {
 fn saved_terra_selections_keep_old_and_new_identities_on_their_original_connections() {
     let root = tempfile::tempdir().unwrap();
     let catalog = ModelCatalog::defaults();
-    for (provider, context_window) in [("openai-api", 1_050_000), ("openai-codex", 872_000)] {
+    for (provider, context_window) in [("openai-api", 1_050_000), ("openai-codex", 272_000)] {
         for model in ["gpt-5.6-terra", "gpt-6.1-terra"] {
             let current = catalog.get(provider, model).unwrap();
             let mut stale = current.clone();
             stale.max_output_tokens = 1;
             stale.card.as_mut().unwrap().max_output_tokens = 1;
-            stale.card.as_mut().unwrap().context_window_tokens = Some(272_000);
+            stale.card.as_mut().unwrap().context_window_tokens = Some(128_000);
             for (state, expected_warnings) in [
                 (
                     json!({"defaultModel": {"provider": provider, "model": model}}),

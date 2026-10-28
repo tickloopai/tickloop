@@ -87,17 +87,19 @@ fn codex_cards_keep_per_model_limits_and_terra_upgrade_retains_previous_identiti
     let catalog = ModelCatalog::defaults();
     let access = AccessCatalog::defaults();
     let visible = built_in_model_profiles();
-    // Use Codex's max_context_window capability, not its smaller context_window default.
+    // Use Codex's default context_window of 272K (also for Terra, whose default is 500K), not its
+    // max_context_window: OpenAI prices a whole request at the long-context rate once its input
+    // passes 272K.
     // https://github.com/openai/codex/blob/bea47c06dfac12ecce362090418e12a6faeedbf9/codex-rs/models-manager/models.json
     for (model, context_window, compact_threshold, ordinary) in [
         ("gpt-5.5", 272_000, 239_000, false),
-        ("gpt-5.6-sol", 872_000, 839_000, false),
-        ("gpt-5.6-terra", 872_000, 839_000, false),
-        ("gpt-5.6-luna", 872_000, 839_000, false),
-        ("gpt-6-astra", 872_000, 839_000, true),
-        ("gpt-6.1-sol", 872_000, 839_000, true),
-        ("gpt-6.1-terra", 872_000, 839_000, true),
-        ("gpt-6-luna", 872_000, 839_000, true),
+        ("gpt-5.6-sol", 272_000, 239_000, false),
+        ("gpt-5.6-terra", 272_000, 239_000, false),
+        ("gpt-5.6-luna", 272_000, 239_000, false),
+        ("gpt-6-astra", 272_000, 239_000, true),
+        ("gpt-6.1-sol", 272_000, 239_000, true),
+        ("gpt-6.1-terra", 272_000, 239_000, true),
+        ("gpt-6-luna", 272_000, 239_000, true),
     ] {
         let profile = catalog.get("openai-codex", model).unwrap();
         let card = profile.card.as_ref().unwrap();
