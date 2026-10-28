@@ -69,7 +69,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 
 在 `/permissions` → Auto mode 中可预览、勾选并一次性导入自定义 Auto 规则。内置规则会保留；导入规则不能覆盖显式 Ask 或 Deny。空格勾选，`enter` 保存，`esc` 取消且不改动。
 
-在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad，网络断开。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱中的命令不能穿过敏感符号链接（包括读取），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。沙箱默认关闭，不改变审批规则；`/permissions` 显示配置状态。
+在 macOS 上，在用户自己的 `settings.json` 中设置 `"sandbox": {"enabled": true}`，即可隔离 Bash、后台 Shell 和 `!` Shell。命令只能写 Folder、附加目录、已验证的 linked worktree、系统临时目录和家族 scratchpad，网络断开。`sandbox.filesystem.allowWrite` 添加可写的字面路径，`denyWrite` 保护路径；禁写规则和敏感路径优先。相对路径以 Folder 为基准。沙箱中的命令不能穿过敏感符号链接（包括读取），以防别名绕过禁写规则；配置的禁写路径与用户设置文件也会保护解析后的目标。沙箱默认关闭。开启后，Accept Edits 与 Auto 下在沙箱里运行的 Bash 和后台 Shell 直接执行，不问人也不送 Auto 审查；显式 Ask/Deny 规则照常生效，Plan 不变；设置 `sandbox.autoAllowBashIfSandboxed: false` 保留隔离但恢复正常审批。`/permissions` 显示配置状态。
 
 Bash 可为单次调用传入 `dangerouslyDisableSandbox: true` 申请越出沙箱。沙箱开启时，这次调用按无隔离运行并走正常审批；Auto 会送审查器，不走只读或目录内编辑的快速通过。`sandbox.excludedCommands` 可让匹配的调用走相同路径，支持完整命令、`"docker:*"` 这样的前缀以及 `*` 通配；复合命令中的一段命中时，整次调用在沙箱外运行；也识别前置的字面环境变量赋值和安全包装命令。`sandbox.allowUnsandboxedCommands` 默认为真，设为假会同时忽略越出请求和排除列表。沙箱关闭时 Bash 的这一参数不生效。疑似被沙箱拦截的失败仅在允许越出时提示该参数，不会自动重试命令。
 

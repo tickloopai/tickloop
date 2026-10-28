@@ -140,7 +140,8 @@ used for approval and execution; neither a model argument nor an exclusion is an
 Auto sends such calls to its reviewer instead of the read-only or Accept Edits fast paths; Ask
 requires human approval. Explicit Permission Rules retain their precedence, Full Access retains its
 normal behavior, and Plan retains its existing read-only handling. An Unrestricted prompt host does
-not waive a required reviewer or human decision. No sandbox-based fast path is introduced here.
+not waive a required reviewer or human decision. Such calls never take the sandboxed Bash fast path
+below.
 
 The ordinary frozen policy judges the command's actual effects and the user's authorization.
 Routine authorized builds are not automatically a Containment Escape merely because they request
@@ -161,3 +162,30 @@ Execution Environment, ScriptedModel and a reviewer double. Local integration te
 Both verify admission and rejection, including normally safe commands. This is routing evidence,
 not semantic acceptance by a real review model. The conditional escape hint is appended by Code
 using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.
+
+## Sandboxed Bash
+
+Following Claude Code's `autoAllowBashIfSandboxed` (`checkSandboxAutoAllow` in `bashPermissions.ts`),
+a Shell call (foreground or background `Bash`, including a delegated child's under its frozen parent
+permissions) is allowed directly in Accept Edits and Auto when its preparation reports writes confined to the
+Folder and additional directories and networking that is not unrestricted (an allowlist or
+disconnected), and the execution environment's owner allows it. Locally that is the user's
+`sandbox.autoAllowBashIfSandboxed`, default true, read by Code only from the user's settings. The
+call is neither asked about nor sent to the reviewer, so none of the frozen rules is consulted for
+it; the sandbox, not the classifier, bounds what it can write and reach. Its approval record is
+`Direct` with the optional reason `sandbox`.
+
+The fast path reads only the frozen preparation, after the deterministic checks: Plan's side-effect
+refusal, explicit Deny and Ask rules (whole-tool and content rules, unlike Claude Code, which lets a
+sandboxed command pass a whole-tool Ask) and safety checks. As in Claude Code it comes before
+explicit Allow rules, so such a call is recorded as sandboxed even when an Allow rule also covers
+it. A Shell whose environment requires approval never qualifies. A call outside the sandbox (`dangerouslyDisableSandbox`, `excludedCommands`, or a
+fallback without isolation) reports unrestricted isolation and keeps ordinary approval. Plan and
+Full Access are unchanged. A whole-environment isolation report, as a future virtual machine would
+give, does not qualify. Sensitive paths stay unwritable inside the sandbox itself.
+
+No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**,
+eight inapplicable native entries, and policy and built-in group version **9** are unchanged.
+`harness/runtime/tests/all/sandbox_auto_approval.rs` covers the routing with the reference
+Execution Environment and a reviewer double; `code/local-environment/tests/all/sandbox.rs` covers
+the setting and actual macOS execution.

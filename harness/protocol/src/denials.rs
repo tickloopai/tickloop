@@ -128,6 +128,14 @@ pub enum ApprovalPath {
     Human,
 }
 
+/// Why a [`ApprovalPath::Direct`] approval needed no review, when that reason is recorded.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectApprovalReason {
+    /// The Shell ran in the sandbox, which lets Accept Edits and Auto skip approval.
+    Sandbox,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalRecord {
     pub id: Uuid,
@@ -143,6 +151,8 @@ pub struct ApprovalRecord {
     pub request_details: Option<DisplaySummary>,
     pub outcome: ApprovalResult,
     pub path: ApprovalPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_reason: Option<DirectApprovalReason>,
     pub denial_category: Option<DenialCategory>,
     pub approval_source: Option<PermissionApprovalSource>,
     pub reason: String,
@@ -198,6 +208,7 @@ impl ApprovalRecord {
             request_details: record.request_details,
             outcome: ApprovalResult::Deny,
             path,
+            direct_reason: None,
             denial_category: Some(record.category),
             approval_source: record.approval_source,
             reason: record.reason,

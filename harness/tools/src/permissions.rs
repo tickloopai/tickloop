@@ -128,6 +128,12 @@ pub trait PermissionPolicyExt {
         session: Option<SessionPermissionDecision>,
     ) -> Decision;
 
+    /// Claude Code `autoAllowBashIfSandboxed`: Accept Edits and Auto run a Shell whose environment
+    /// reports sufficient isolation without asking or reviewing, ahead of explicit Allow rules as
+    /// in Claude Code. Explicit Deny and Ask rules and safety checks are decided before it; a
+    /// Shell that requires approval never qualifies.
+    fn admits_by_isolation(&self, operation: &PreparedTool) -> bool;
+
     /// Claude Code's refusal when a Deny naming this call's rule content applies, such as
     /// `WebFetch denied access to domain:example.com.`; other denials keep the generic reason.
     fn content_denial_message(
@@ -311,7 +317,9 @@ impl PermissionPolicyExt for PermissionPolicy {
         let is_accept_edits = self.mode == ExecutionMode::AcceptEdits;
         let decision = if safety_check.is_some() {
             Decision::Ask
-        } else if explicit == Some(ExplicitPermissionDecision::Allow) {
+        } else if self.admits_by_isolation(operation)
+            || explicit == Some(ExplicitPermissionDecision::Allow)
+        {
             Decision::Allow
         } else if operation.requires_environment_approval() && self.mode != ExecutionMode::Plan {
             Decision::Ask
@@ -345,6 +353,11 @@ impl PermissionPolicyExt for PermissionPolicy {
         } else {
             Decision::Check
         }
+    }
+
+    fn admits_by_isolation(&self, operation: &PreparedTool) -> bool {
+        matches!(self.mode, ExecutionMode::AcceptEdits | ExecutionMode::Auto)
+            && operation.skips_approval_by_isolation()
     }
 
     fn content_denial_message(
