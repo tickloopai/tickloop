@@ -316,7 +316,6 @@ async fn render(scenario: &Scenario, output: Option<&Path>) {
         &launch,
         ChosenModels::new(scripted.clone()),
         Some(control),
-        &std::env::current_exe().unwrap(),
     )
     .await
     .unwrap();

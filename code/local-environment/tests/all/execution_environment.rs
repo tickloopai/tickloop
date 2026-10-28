@@ -42,7 +42,6 @@ async fn a_prepared_open_refuses_an_in_place_program_change_with_preserved_mtime
             command: vec![program.to_string_lossy().into_owned()],
             cwd: Some(directory.path().to_string_lossy().into_owned()),
             protocol: false,
-            view: None,
         },
         || {
             std::fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
@@ -762,7 +761,6 @@ async fn a_host_restart_ends_the_old_observation_until_an_explicit_reopen() {
             command: vec!["/terminal".into()],
             cwd: Some("/".into()),
             protocol: false,
-            view: None,
         }))
         .await
         .unwrap();
@@ -968,7 +966,6 @@ async fn terminal_sampling_ignores_a_screen_that_changed_back_to_its_baseline() 
             command: vec!["/terminal".into()],
             cwd: Some("/".into()),
             protocol: false,
-            view: None,
         }))
         .await
         .unwrap();
@@ -1055,7 +1052,6 @@ async fn the_harness_stream_consumes_memory_environment_facts_without_tickhost()
             command: vec!["/counter".into()],
             cwd: Some("/".into()),
             protocol: true,
-            view: None,
         }))
         .await
         .unwrap();
@@ -1126,7 +1122,6 @@ async fn observation_registers_its_own_baseline_and_continues_from_a_cursor() {
             command: vec!["/counter".into()],
             cwd: Some("/".into()),
             protocol: true,
-            view: None,
         }))
         .await
         .unwrap();
@@ -1202,7 +1197,6 @@ async fn a_tick_checks_the_prepared_revision_before_running_the_call() {
             command: vec!["/counter".into()],
             cwd: Some("/".into()),
             protocol: true,
-            view: None,
         }))
         .await
         .unwrap();
@@ -1313,7 +1307,6 @@ async fn a_lost_open_reply_can_only_be_queried_and_does_not_open_again() {
             command: vec!["/program".into()],
             cwd: Some("/".into()),
             protocol: false,
-            view: None,
         }))
         .await
         .unwrap();
@@ -1383,7 +1376,6 @@ async fn a_prepared_open_refuses_a_replaced_program_before_contacting_the_host()
             command: vec![program.to_string_lossy().into_owned()],
             cwd: Some(directory.path().to_string_lossy().into_owned()),
             protocol: false,
-            view: None,
         },
         || {
             std::fs::rename(&program, directory.path().join("old-program")).unwrap();
@@ -1409,7 +1401,6 @@ async fn the_memory_environment_refuses_the_same_program_replacement() {
             command: vec!["/program".into()],
             cwd: Some("/".into()),
             protocol: false,
-            view: None,
         },
         || environment.install_program("/program"),
     )

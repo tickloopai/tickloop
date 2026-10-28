@@ -76,13 +76,6 @@ pub struct Pane {
     pub tokens: BTreeMap<String, String>,
 }
 
-impl Pane {
-    /// The Tick this Pane shows a view of, as the view reported it.
-    pub fn view_of(&self) -> Option<&str> {
-        self.tokens.get(VIEW_TOKEN).map(String::as_str)
-    }
-}
-
 /// Reports on Pane `pane_id` the Tick `instance` it shows a view of, for [`VIEW_TOKEN_TTL`], or
 /// with `None` that it shows none.
 pub async fn report_view(

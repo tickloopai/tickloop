@@ -158,7 +158,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
                         observed
                             .host_before_open
                             .store(host_socket.exists(), Ordering::SeqCst);
-                        json!({"type":"tool_use","id":"open","name":"TickManage","input":{"action":"open","command":["tick-counter"],"placement":{"type":"hidden"}}})
+                        json!({"type":"tool_use","id":"open","name":"TickManage","input":{"action":"open","command":["tick-counter"]}})
                     }
                     (2, Some(instance)) => {
                         json!({"type":"tool_use","id":"read","name":"TickRead","input":{"tick_instance_id":instance}})
@@ -356,7 +356,6 @@ for line in sys.stdin:
                 command: vec!["/counter".into()],
                 cwd: Some("/".into()),
                 protocol: true,
-                view: None,
             },
         )
         .await;
@@ -377,7 +376,6 @@ for line in sys.stdin:
                 command: python_program(&script, &[]),
                 cwd: Some(daemon.root.to_string_lossy().into_owned()),
                 protocol: true,
-                view: None,
             },
         )
         .await;
@@ -401,7 +399,6 @@ for line in sys.stdin:
             command,
             cwd: Some(folder.to_string_lossy().into_owned()),
             protocol: true,
-            view: None,
         }
     }
 
@@ -539,50 +536,6 @@ for line in sys.stdin:
                 unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
                 assert!(super::gone(business).await);
             },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn execution_port_view_failure_contract_matches_both_adapters() {
-        use tickloop_harness::runtime::environment::{ViewPlacement, ViewPosition};
-        use tickloop_harness::test_support::{
-            execution_contracts::view_failure_contract, execution_environment::counter_environment,
-        };
-        let view = Some(ViewPlacement {
-            workspace_id: Some(HERDR_WORKSPACE.into()),
-            placement: ViewPosition::NewTab,
-        });
-        let memory = counter_environment();
-        let mut open = port_open(vec!["/counter".into()], Path::new("/"));
-        open.view = view.clone();
-        view_failure_contract(
-            &memory,
-            port_scope(tickloop_ids::generate(), Path::new("/")),
-            open,
-        )
-        .await;
-        let directory = tempfile::Builder::new()
-            .prefix("epv")
-            .tempdir_in(tickloop_harness::test_support::SHORT_TEMP_ROOT)
-            .unwrap();
-        let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
-        let daemon = Daemon::start_in_herdr(
-            Arc::new(tickloop_harness::test_support::ScriptedModel::new(
-                Vec::new(),
-            )),
-            herdr.socket.clone(),
-            1,
-        )
-        .await;
-        let environment =
-            LocalEnvironment::with_ticks(daemon.environments[0].hosted_ticks().unwrap());
-        let mut open = port_open(counter_program(), &daemon.root);
-        open.view = view;
-        view_failure_contract(
-            &environment,
-            port_scope(daemon.chats[0], &daemon.root),
-            open,
         )
         .await;
     }
@@ -762,7 +715,6 @@ for line in sys.stdin:
                         &launch,
                         ChosenModels::new(self.model.clone()),
                         Some(grant.clone()),
-                        &super::support::fixture_cli::executable(),
                     )
                     .await
                     .map_err(AccessError::unavailable)?
@@ -1073,7 +1025,7 @@ for line in sys.stdin:
 
     /// The TickManage input that opens the protocol `program` hidden in the daemon's Tickhost.
     fn open_command(daemon: &Daemon, program: Vec<String>) -> Value {
-        json!({"action":"open","command":program,"protocol":true,"cwd":daemon.root,"placement":{"type":"hidden"}})
+        json!({"action":"open","command":program,"protocol":true,"cwd":daemon.root})
     }
 
     fn counter_command(daemon: &Daemon) -> Value {
@@ -1237,7 +1189,7 @@ for line in sys.stdin:
             .prepare_call(
                 chat.into(),
                 "TickManage",
-                &json!({"action":"open","command":["/bin/sh"],"cwd":work,"placement":{"type":"hidden"}}),
+                &json!({"action":"open","command":["/bin/sh"],"cwd":work}),
                 CancellationToken::new(),
             )
             .await
@@ -1333,7 +1285,7 @@ for line in sys.stdin:
             &tools,
             chat,
             "TickManage",
-            json!({"action":"open","command":["/bin/sh"],"cwd":tickloop_harness::test_support::SHORT_TEMP_ROOT,"placement":{"type":"hidden"}}),
+            json!({"action":"open","command":["/bin/sh"],"cwd":tickloop_harness::test_support::SHORT_TEMP_ROOT}),
         )
         .await;
         let HostCallResult::CompletedWithEffect(result, _) = settled else {
@@ -2838,13 +2790,12 @@ for line in sys.stdin:
         }
     }
 
-    /// A worker in a Herdr View opens a Tick hidden in the Tickhost unless asked for a
-    /// placement: the Tick joins the Chat's Monitor without a subscription or any Herdr layout,
-    /// streams to the Loop that subscribes to it, and closes through its host. An explicit
-    /// placement still runs the Tick in the Tickhost and only then asks Herdr for a view Pane;
-    /// a Herdr that refuses it leaves the Tick running without one.
+    /// A worker in a Herdr View, wired as production wires it, opens a Tick in the Tickhost and
+    /// asks Herdr nothing: the Tick joins the Chat's Monitor without a subscription, streams to
+    /// the Loop that subscribes to it, and closes through its host. A placement an earlier build
+    /// offered, repeated from an old conversation, is refused before anything runs.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_herdr_worker_opens_hidden_by_default_and_streams_the_hosted_tick() {
+    async fn a_herdr_worker_opens_ticks_in_the_tickhost_and_asks_herdr_nothing() {
         use tickloop_code_access::ConfigurationChange;
         use tickloop_harness::protocol::EventKind;
         use tickloop_harness::protocol::ExecutionMode;
@@ -2868,12 +2819,10 @@ for line in sys.stdin:
                 },
             })
             .await;
-        let mut open = counter_command(&daemon);
-        open.as_object_mut().unwrap().remove("placement");
         model.enqueue(tickloop_harness::test_support::call(
             "open",
             "TickManage",
-            open,
+            counter_command(&daemon),
         ));
         model.enqueue(tickloop_harness::test_support::text("opened"));
         let results = run_turn(&runtime, chat, "Open the counter").await;
@@ -2881,7 +2830,9 @@ for line in sys.stdin:
         let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
         assert_eq!(opened["status"], "opened", "{opened}");
         assert_eq!(opened["host"], "tickhost", "{opened}");
-        assert_eq!(opened["visibility"], "hidden", "{opened}");
+        for retired in ["visibility", "view"] {
+            assert!(opened.get(retired).is_none(), "{retired}: {opened}");
+        }
         let instance = opened["tick_instance_id"].as_str().unwrap().to_owned();
         assert!(instance.starts_with("hosted:"), "{instance}");
         assert!(
@@ -2958,7 +2909,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_harness::test_support::call(
             "visible",
             "TickManage",
-            json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"workspace_id":HERDR_WORKSPACE,"placement":{"type":"new_tab"}}),
+            json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"placement":{"type":"new_tab"}}),
         ));
         model.enqueue(tickloop_harness::test_support::call(
             "close",
@@ -2968,36 +2919,29 @@ for line in sys.stdin:
         model.enqueue(tickloop_harness::test_support::text("done"));
         let results = run_turn(&runtime, chat, "Show cat, then close the counter").await;
         assert!(
-            herdr.methods().contains(&"layout.apply".to_owned()),
-            "an explicit placement asks Herdr for a view Pane: {:?}",
+            herdr.methods().is_empty(),
+            "a placement is refused before Herdr is asked: {:?}",
             herdr.methods()
         );
+        let visible = &results["visible"];
+        assert!(visible.is_error, "{}", visible.content);
         assert!(
-            !results["visible"].is_error,
+            visible
+                .content
+                .contains("placement is not allowed for open; open takes command, and optionally cwd, protocol"),
             "{}",
-            results["visible"].content
+            visible.content
         );
-        let visible: Value = serde_json::from_str(&results["visible"].content).unwrap();
-        assert_eq!(visible["host"], "tickhost", "{visible}");
-        assert!(
-            visible["tick_instance_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("hosted:"),
-            "{visible}"
-        );
-        assert_eq!(visible["visibility"], "hidden", "{visible}");
-        assert_eq!(visible["view"]["status"], "failed", "{visible}");
+
         let closed: Value = serde_json::from_str(&results["close"].content).unwrap();
         assert_eq!(closed["status"], "closed", "{closed}");
         assert_eq!(closed["host"], "tickhost", "{closed}");
         assert_eq!(closed["tick_instance_id"], instance);
     }
 
-    /// A child delegated in a Herdr worker inherits the Tickhost's authority for its Tick tools
-    /// and Herdr's for the Panes they place, yet hosted Ticks stay with the Chat that opened them:
-    /// the child cannot open one, and reading its parent's is refused by ownership rather than by
-    /// a Herdr Workspace check.
+    /// A child delegated in a Herdr worker inherits only the Tickhost's authority for its Tick
+    /// tools, and hosted Ticks stay with the Chat that opened them: the child cannot open one, and
+    /// reading its parent's is refused by ownership.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delegated_child_cannot_open_or_use_its_parents_hosted_tick() {
         use tickloop_code_access::ConfigurationChange;
@@ -3024,8 +2968,7 @@ for line in sys.stdin:
         let parents = daemon.tools();
         let opened = run_tool(&parents, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
-        let mut child_open = counter_command(&daemon);
-        child_open.as_object_mut().unwrap().remove("placement");
+        let child_open = counter_command(&daemon);
         for reply in [
             tickloop_harness::test_support::call(
                 "delegate",
@@ -3082,18 +3025,14 @@ for line in sys.stdin:
                 .host_tools,
         )
         .unwrap();
-        for (tool, hosts) in [
-            ("TickRead", 1),
-            ("TickCall", 1),
-            ("TickManage", 2),
-            ("ReadWorkspace", 1),
-        ] {
+        for tool in ["TickRead", "TickCall", "TickManage"] {
             assert_eq!(
                 ceiling[tool].as_array().map(Vec::len),
-                Some(hosts),
+                Some(1),
                 "{tool}: {ceiling}"
             );
         }
+        assert!(ceiling.get("ReadWorkspace").is_none(), "{ceiling}");
         let read = run_tool(
             &parents,
             chat,
@@ -3102,313 +3041,6 @@ for line in sys.stdin:
         )
         .await;
         assert_eq!(read["data"]["value"], 0, "the parent's Tick is untouched");
-    }
-
-    /// The text a private Herdr Pane shows now; nothing once the Pane is gone.
-    fn pane_text(herdr: &super::support::herdr::PrivateHerdr, pane: &str) -> String {
-        herdr
-            .request(
-                "pane.read",
-                json!({"pane_id":pane,"source":"visible","format":"text"}),
-            )
-            .map(|read| {
-                let read = read.get("read").unwrap_or(&read);
-                read["text"].as_str().unwrap_or_default().to_owned()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The Pane of a private Herdr that shows `terminal`, if one does.
-    fn terminal_pane(herdr: &super::support::herdr::PrivateHerdr, terminal: &str) -> Option<Value> {
-        herdr.request("pane.list", json!({})).unwrap()["panes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|pane| pane["terminal_id"] == terminal)
-            .cloned()
-    }
-
-    /// Waits until `probe` holds, polling while the in-process daemon keeps serving.
-    async fn eventually(what: &str, mut probe: impl FnMut() -> bool) {
-        tokio::time::timeout(HOSTED_EVENT_WAIT, async {
-            while !probe() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{what} never happened"));
-    }
-
-    /// The Chat's Tick `instance` as ReadWorkspace lists it, with the Workspace's Panes.
-    async fn listed(
-        tools: &HostedTickTools,
-        chat: Uuid,
-        workspace: &str,
-        instance: &Value,
-    ) -> (Value, Vec<Value>) {
-        let listed = run_tool(
-            tools,
-            chat,
-            "ReadWorkspace",
-            json!({"workspace_id":workspace}),
-        )
-        .await;
-        let tick = listed["ticks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tick| tick["tick_instance_id"] == *instance)
-            .cloned()
-            .unwrap_or_else(|| panic!("{instance} is not listed: {listed}"));
-        (tick, listed["panes"].as_array().unwrap().clone())
-    }
-
-    /// In a private Herdr, a Tick opened with a placement runs in the Tickhost as a `hosted:`
-    /// instance, and a Pane beside the anchor shows it through the attach client. ReadWorkspace
-    /// marks that Pane as the Tick's view. Moving the view keeps the instance; closing the Pane
-    /// leaves the Tick running and readable; a move without a view shows it again. A restarted
-    /// worker, which remembers no view, still finds that view by what its Pane reports, and its
-    /// close ends the Tick and the view.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn herdr_panes_only_show_views_of_ticks_that_run_in_the_tickhost() {
-        use tickhost_connect::{herdr::HerdrContext, layout::HerdrLayout};
-        use tickloop_code_local_environment::hosted::views::HerdrViews;
-        let herdr = super::support::herdr::PrivateHerdr::start();
-        let anchor = herdr.create_workspace();
-        let workspace = herdr
-            .request("pane.get", json!({"pane_id":anchor}))
-            .unwrap()["pane"]["workspace_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let daemon = Daemon::start(1).await;
-        let chat = daemon.chats[0];
-        let tools = daemon.tools().with_herdr_views(HerdrViews::new(
-            HerdrLayout::new(HerdrContext::without_view(herdr.socket())),
-            &super::support::fixture_cli::executable(),
-        ));
-        let beside =
-            |direction: &str| json!({"type":"pane","pane_id":anchor,"direction":direction});
-
-        let opened = run_tool(
-            &tools,
-            chat,
-            "TickManage",
-            json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"workspace_id":workspace,"placement":beside("right")}),
-        )
-        .await;
-        assert_eq!(opened["status"], "opened", "{opened}");
-        assert_eq!(opened["host"], "tickhost", "{opened}");
-        assert_eq!(opened["visibility"], "visible", "{opened}");
-        assert_eq!(opened["view"]["status"], "shown", "{opened}");
-        let instance = opened["tick_instance_id"].clone();
-        assert!(
-            instance.as_str().unwrap().starts_with("hosted:"),
-            "{opened}"
-        );
-        let view = opened["view"]["pane_id"].as_str().unwrap().to_owned();
-        let terminal = opened["view"]["terminal_id"].as_str().unwrap().to_owned();
-        assert_eq!(
-            herdr
-                .request(
-                    "pane.neighbor",
-                    json!({"pane_id":anchor,"direction":"right"})
-                )
-                .unwrap()["neighbor"]["neighbor_pane_id"],
-            view,
-            "the view sits right of its anchor"
-        );
-        let mut attached = false;
-        for _ in 0..200 {
-            if listed(&tools, chat, &workspace, &instance).await.0["views"] == 1 {
-                attached = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(attached, "the Pane's attach client is the Tick's view");
-        run_tool(
-            &tools,
-            chat,
-            "TickManage",
-            json!({"action":"send_input","tick_instance_id":instance,"text":"seen in herdr","keys":["Enter"]}),
-        )
-        .await;
-        eventually("the typed line in the view Pane", || {
-            pane_text(&herdr, &view).contains("seen in herdr")
-        })
-        .await;
-        let (tick, panes) = listed(&tools, chat, &workspace, &instance).await;
-        assert_eq!(tick["view_panes"], json!([view]), "{tick}");
-        for pane in &panes {
-            let expected = if pane["pane_id"] == view.as_str() {
-                instance.clone()
-            } else {
-                Value::Null
-            };
-            assert_eq!(pane["view_of"], expected, "{pane}");
-        }
-
-        let moved = run_tool(
-            &tools,
-            chat,
-            "TickManage",
-            json!({"action":"move","tick_instance_id":instance,"workspace_id":workspace,"placement":beside("left")}),
-        )
-        .await;
-        assert_eq!(moved["tick_instance_id"], instance, "{moved}");
-        assert_eq!(moved["view"]["status"], "moved", "{moved}");
-        assert_eq!(
-            moved["view"]["terminal_id"], terminal,
-            "the same view moved"
-        );
-        let view = moved["view"]["pane_id"].as_str().unwrap().to_owned();
-        assert_eq!(
-            herdr
-                .request(
-                    "pane.neighbor",
-                    json!({"pane_id":anchor,"direction":"left"})
-                )
-                .unwrap()["neighbor"]["neighbor_pane_id"],
-            view,
-            "the view now sits left of its anchor"
-        );
-
-        herdr
-            .request("pane.close", json!({"pane_id":view}))
-            .unwrap();
-        let mut closed_view = false;
-        for _ in 0..200 {
-            if listed(&tools, chat, &workspace, &instance).await.0["views"] == 0 {
-                closed_view = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(closed_view, "closing the Pane disconnects its view");
-        let read = run_tool(
-            &tools,
-            chat,
-            "TickRead",
-            json!({"tick_instance_id":instance}),
-        )
-        .await;
-        assert!(
-            read["data"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("seen in herdr"),
-            "the Tick keeps running without a view: {read}"
-        );
-        assert!(read["data"]["exit"].is_null(), "{read}");
-
-        let shown = run_tool(
-            &tools,
-            chat,
-            "TickManage",
-            json!({"action":"move","tick_instance_id":instance,"workspace_id":workspace,"placement":beside("down")}),
-        )
-        .await;
-        assert_eq!(
-            shown["view"]["status"], "shown",
-            "a move without a view shows one: {shown}"
-        );
-        let terminal = shown["view"]["terminal_id"].as_str().unwrap().to_owned();
-        let view =
-            terminal_pane(&herdr, &terminal).expect("the shown view's Pane")["pane_id"].clone();
-
-        // A view Pane names its Tick itself: one that only its attach client reports on.
-        let layout = HerdrLayout::new(HerdrContext::without_view(herdr.socket()));
-        let CommandResult::HostedTickView(grant) = daemon
-            .command(AgentCommand::AttachHostedTick {
-                execution: daemon.executions[0],
-                instance: serde_json::from_value(instance.clone()).unwrap(),
-            })
-            .await
-        else {
-            panic!("a view grant expected");
-        };
-        let attach = std::iter::once(
-            super::support::fixture_cli::executable()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .chain(tickloop_harness::protocol::ATTACH_ARGUMENTS.map(String::from))
-        .collect::<Vec<_>>();
-        let reported = match layout
-            .create_view(
-                &attach,
-                &std::collections::BTreeMap::from([
-                    (
-                        tickloop_harness::protocol::ATTACH_ENVIRONMENT.to_owned(),
-                        serde_json::to_string(&grant).unwrap(),
-                    ),
-                    (
-                        tickloop_harness::protocol::VIEW_PANE_ENVIRONMENT.to_owned(),
-                        "1".to_owned(),
-                    ),
-                ]),
-                &workspace,
-                &tickhost_connect::layout::Placement::NewTab,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .unwrap()
-        {
-            tickhost_connect::layout::CreatedView::Placed(pane) => pane,
-            tickhost_connect::layout::CreatedView::NotPlaced { error, .. } => panic!("{error}"),
-        };
-        eventually("the attach client naming its Tick on its Pane", || {
-            herdr
-                .request("pane.get", json!({"pane_id":reported.pane_id}))
-                .unwrap()["pane"]["tokens"][tickhost_connect::herdr::VIEW_TOKEN]
-                == instance
-        })
-        .await;
-
-        // A restarted worker remembers no view, and finds both by their Panes.
-        let restarted = daemon.tools().with_herdr_views(HerdrViews::new(
-            HerdrLayout::new(HerdrContext::without_view(herdr.socket())),
-            &super::support::fixture_cli::executable(),
-        ));
-        let views = [view.clone(), json!(reported.pane_id)];
-        let (tick, panes) = listed(&restarted, chat, &workspace, &instance).await;
-        let shown = tick["view_panes"].as_array().unwrap();
-        assert!(
-            shown.len() == views.len() && views.iter().all(|view| shown.contains(view)),
-            "{tick}"
-        );
-        assert!(
-            panes
-                .iter()
-                .all(|pane| views.contains(&pane["pane_id"]) == (pane["view_of"] == instance)),
-            "only the view Panes are marked: {panes:?}"
-        );
-
-        let closed = run_tool(
-            &restarted,
-            chat,
-            "TickManage",
-            json!({"action":"close","tick_instance_id":instance}),
-        )
-        .await;
-        assert_eq!(closed["status"], "closed", "{closed}");
-        assert_eq!(closed["view"]["status"], "closed", "{closed}");
-        eventually("the view Panes closing with their Tick", || {
-            terminal_pane(&herdr, &terminal).is_none()
-                && terminal_pane(&herdr, &reported.terminal_id).is_none()
-        })
-        .await;
-        assert!(matches!(
-            call_tool(
-                &tools,
-                chat,
-                "TickRead",
-                json!({"tick_instance_id":instance}),
-            )
-            .await,
-            HostCallResult::NotDispatched(error) if error.contains("not a running hosted Tick")
-        ));
     }
 
     /// A model reopens a Tick lost with its host through TickManage: the reopen waits for
@@ -3472,7 +3104,7 @@ for line in sys.stdin:
         assert!(!result.is_error, "{}", result.content);
         let reopened: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(reopened["status"], "opened", "{reopened}");
-        assert_eq!(reopened["visibility"], "hidden");
+        assert!(reopened.get("visibility").is_none(), "{reopened}");
         let stored = |text: &str| text.parse::<tick_protocol::InstanceRef>().unwrap();
         assert_eq!(
             stored(reopened["replaces"].as_str().unwrap()),

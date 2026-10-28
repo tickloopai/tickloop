@@ -642,7 +642,7 @@ fn previous_tick_tool_name(name: &str, input: &Value) -> Option<&'static str> {
         "TickManage" => match input["action"].as_str() {
             Some("subscribe") => Some("SubscribeTick"),
             Some("unsubscribe") => Some("UnsubscribeTick"),
-            Some("open" | "close" | "reopen" | "move" | "send_input") => Some("ModifyTick"),
+            Some("open" | "close" | "reopen" | "send_input") => Some("ModifyTick"),
             _ => None,
         },
         _ => None,

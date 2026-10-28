@@ -226,8 +226,7 @@ const UNOFFERED_SCHEDULED_TASK_TOOLS_MESSAGE: &str = "Scheduled task tools are n
 const DEFERRED_RUNTIME_TOOLS: [&str; 1] = [ENTER_PLAN_MODE_TOOL_NAME];
 
 /// Host tools that need the Chat's Folder: they show its Ticks or send its local files.
-const FOLDER_HOST_TOOLS: [&str; 6] = [
-    crate::tick_tools::READ_WORKSPACE,
+const FOLDER_HOST_TOOLS: [&str; 5] = [
     crate::tick_tools::TICK_DESCRIBE,
     crate::tick_tools::TICK_READ,
     crate::tick_tools::TICK_CALL,
@@ -3005,11 +3004,7 @@ mod tests {
             .chain(tick_subscriptions::definitions())
             .chain(skills.tool_definition())
             .chain(crate::mcp_resources::definitions())
-            .chain(
-                [false, true]
-                    .into_iter()
-                    .flat_map(crate::tick_tools::definitions),
-            )
+            .chain(crate::tick_tools::definitions())
             .chain([
                 crate::mcp_tools::login_definition(),
                 crate::mcp_tools::upload_definition(),

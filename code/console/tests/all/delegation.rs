@@ -174,78 +174,6 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
     restored.shutdown().await;
 }
 
-struct ScopedHostSocket {
-    path: std::path::PathBuf,
-    requests: Arc<std::sync::Mutex<Vec<Value>>>,
-    cancel: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl ScopedHostSocket {
-    fn start(path: std::path::PathBuf) -> Self {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = requests.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let stopping = cancel.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let stream = tokio::select! {
-                    _ = stopping.cancelled() => break,
-                    accepted = listener.accept() => accepted.unwrap().0,
-                };
-                let mut stream = BufReader::new(stream);
-                let mut line = String::new();
-                stream.read_line(&mut line).await.unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["method"], "pane.list");
-                recorded.lock().unwrap().push(request.clone());
-                let response = json!({"id":request["id"],"result":{"panes":[]}});
-                let mut bytes = serde_json::to_vec(&response).unwrap();
-                bytes.push(b'\n');
-                stream.get_mut().write_all(&bytes).await.unwrap();
-            }
-        });
-        Self {
-            path,
-            requests,
-            cancel,
-            task,
-        }
-    }
-
-    /// The Tick tools of a worker in the Herdr View this socket serves, with a daemon that runs
-    /// no Ticks for it.
-    fn tools(&self) -> tickloop_code_local_environment::hosted::tools::HostedTickTools {
-        self.tools_behind(&self.path.with_extension("daemon.sock"))
-    }
-
-    /// The same tools behind the daemon at `daemon`.
-    fn tools_behind(
-        &self,
-        daemon: &std::path::Path,
-    ) -> tickloop_code_local_environment::hosted::tools::HostedTickTools {
-        tick_tools(daemon).with_herdr_views(
-            tickloop_code_local_environment::hosted::views::HerdrViews::new(
-                tickhost_connect::layout::HerdrLayout::new(
-                    tickhost_connect::herdr::HerdrContext::without_view(self.path.clone()),
-                ),
-                std::path::Path::new("/tmp/unused/tickloop"),
-            ),
-        )
-    }
-
-    fn install(&self, agent: &Agent) {
-        agent.install_host_tools(Arc::new(self.tools())).unwrap();
-    }
-
-    async fn stop(self) {
-        self.cancel.cancel();
-        self.task.await.unwrap();
-    }
-}
-
 /// Tick tools behind the daemon at `daemon`, which answers every request with a listing of no
 /// Ticks.
 fn tick_tools(
@@ -283,10 +211,10 @@ fn tick_tools(
     )
 }
 
-fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> ScopedHostSocket {
-    let socket = ScopedHostSocket::start(directory.join("routed.sock"));
-    socket.install(agent);
-    socket
+fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) {
+    agent
+        .install_host_tools(Arc::new(tick_tools(&directory.join("routed.daemon.sock"))))
+        .unwrap();
 }
 
 async fn access_command(
@@ -307,13 +235,16 @@ async fn access_command(
     receipt.result.unwrap()
 }
 
+/// A child freezes, per tool, the authorities of the hosts present when it was delegated. A
+/// child an earlier build delegated inside Herdr also froze ReadWorkspace and a Herdr authority
+/// for TickManage: it still restores, its Ticks still run under the frozen Tickhost, and the
+/// retired tool is never offered. A record frozen with one authority per tool is not restored.
 #[tokio::test]
-async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_workspace() {
+async fn a_child_delegated_with_retired_herdr_authorities_keeps_its_tickhost() {
     use tickloop_code_daemon::EmbeddedAgentAccess;
 
     use tickloop_code_access::{
-        AgentCommand, CommandResult, ConfigurationChange, HostLocation, HostWorkContext,
-        InteractionSource, LaunchSpec, TranscriptRef, UserInput, ViewRef,
+        AgentCommand, CommandResult, ConfigurationChange, LaunchSpec, TranscriptRef, UserInput,
     };
 
     let directory = tempfile::Builder::new()
@@ -321,241 +252,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
         .tempdir_in("/tmp")
         .unwrap();
     let store = directory.path().join("state");
-    let original = ScopedHostSocket::start(directory.path().join("h1.sock"));
-    let other = ScopedHostSocket::start(directory.path().join("h2.sock"));
-    let agent = Agent::open_embedded(
-        store.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(vec![
-            call(
-                "delegate",
-                "Subagent",
-                json!({"task":"Read only the inherited Workspace."}),
-            ),
-            call("child-host", "ReadWorkspace", json!({})),
-            text("The inherited host was read."),
-            text("The child completed its task."),
-        ])),
-    )
-    .unwrap();
-    original.install(&agent);
-    let access = EmbeddedAgentAccess::new(agent.clone());
-    let mut launch = LaunchSpec::embedded(directory.path().into());
-    launch.host_work_context = Some(HostWorkContext {
-        socket: original.path.clone(),
-        workspace: Some("W1".into()),
-    });
-    let CommandResult::Created {
-        execution: parent, ..
-    } = access_command(
-        &access,
-        AgentCommand::Create {
-            launch_rules: Vec::new(),
-            launch,
-            initial: None,
-            origin: None,
-        },
-    )
-    .await
-    else {
-        panic!("expected Create");
-    };
-    access_command(
-        &access,
-        AgentCommand::Configure {
-            provider: None,
-            execution: parent,
-            change: ConfigurationChange::ExecutionMode {
-                mode: ExecutionMode::FullAccess,
-            },
-        },
-    )
-    .await;
-    let mut events = agent.subscribe();
-    let CommandResult::Submitted(parent_run) = access_command(
-        &access,
-        AgentCommand::Submit {
-            execution: parent,
-            input: UserInput::Text {
-                text: "Delegate the scoped host read.".into(),
-                contexts: vec![],
-                paths: vec![],
-            },
-            origin: None,
-        },
-    )
-    .await
-    else {
-        panic!("expected Submit");
-    };
-    let mut child = None;
-    loop {
-        let event = tickloop_harness::test_support::next_event(&mut events).await;
-        if let EventKind::Failed(error) = &event.kind {
-            panic!("initial delegation failed: {error}");
-        }
-        if event.chat_id != parent_run.chat_id {
-            child = Some(event.chat_id);
-            if let EventKind::ToolCompleted { result, .. } = &event.kind {
-                assert!(!result.is_error, "{}", result.content);
-            }
-        }
-        if event.run_id == parent_run.run_id && matches!(event.kind, EventKind::Completed { .. }) {
-            break;
-        }
-    }
-    let child = child.unwrap();
-    access.shutdown().await;
-    for (case, provider, workspace, should_read) in [
-        ("same-host-other-workspace", &original, Some("W2"), true),
-        ("same-host-headless-launch", &original, None, true),
-        ("other-host-same-workspace", &other, Some("W1"), false),
-    ] {
-        let restored = Agent::open_embedded(
-            store.clone(),
-            config(),
-            Arc::new(ScriptedModel::new(vec![
-                call("restored-host", "ReadWorkspace", json!({})),
-                text("The scoped request finished."),
-            ])),
-        )
-        .unwrap();
-        provider.install(&restored);
-        let access = EmbeddedAgentAccess::for_worker(restored.clone(), uuid::Uuid::new_v4());
-        let origin = (case == "other-host-same-workspace").then(|| {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = std::fs::symlink_metadata(&other.path).unwrap();
-            InteractionSource {
-                view: ViewRef {
-                    session_id: uuid::Uuid::new_v4(),
-                    view_id: uuid::Uuid::new_v4(),
-                },
-                display_version: 1,
-                host: Some(HostLocation {
-                    host_instance: format!("herdr:{}:{}", metadata.dev(), metadata.ino()),
-                    socket: other.path.clone(),
-                    workspace: Some("W1".into()),
-                    tab: Some("new-view-tab".into()),
-                    pane: Some("new-view-pane".into()),
-                    terminal: Some("new-view-terminal".into()),
-                    client: None,
-                }),
-            }
-        });
-        let mut launch = LaunchSpec::embedded(directory.path().into());
-        if let Some(workspace) = workspace {
-            launch.host_work_context = Some(HostWorkContext {
-                socket: provider.path.clone(),
-                workspace: Some(workspace.into()),
-            });
-        }
-        let CommandResult::Loaded { execution, .. } = access_command(
-            &access,
-            AgentCommand::LoadRecord {
-                record: TranscriptRef {
-                    store_root: store.clone(),
-                    chat_id: child.into(),
-                },
-                as_new: false,
-                launch: Some(launch),
-            },
-        )
-        .await
-        else {
-            panic!("expected LoadRecord");
-        };
-        let mut events = restored.subscribe();
-        let CommandResult::Submitted(run) = access_command(
-            &access,
-            AgentCommand::Submit {
-                execution,
-                input: UserInput::Text {
-                    text: "Read the original host scope.".into(),
-                    contexts: vec![],
-                    paths: vec![],
-                },
-                origin,
-            },
-        )
-        .await
-        else {
-            panic!("expected Submit");
-        };
-        let mut result_seen = false;
-        loop {
-            let event = tickloop_harness::test_support::next_event(&mut events).await;
-            if event.run_id != run.run_id {
-                continue;
-            }
-            if let EventKind::Failed(error) = &event.kind {
-                panic!("{case}: {error}");
-            }
-            if let EventKind::ToolCompleted { result, .. } = &event.kind {
-                result_seen = true;
-                assert_eq!(!result.is_error, should_read, "{case}: {}", result.content);
-                if should_read {
-                    let value: Value = serde_json::from_str(&result.content).unwrap();
-                    assert_eq!(value["workspace_id"], "W1", "{case}");
-                    assert_eq!(value["host_instance"], json!(original.path), "{case}");
-                    assert!(value["caller"].is_null());
-                    assert_eq!(value["ticks"], json!([]), "{case}");
-                } else {
-                    assert!(
-                        result.content.contains("Unsupported"),
-                        "{case}: {}",
-                        result.content
-                    );
-                }
-            }
-            if matches!(event.kind, EventKind::Completed { .. }) {
-                break;
-            }
-        }
-        assert!(result_seen, "{case}");
-        assert!(
-            other.requests.lock().unwrap().is_empty(),
-            "the different host was contacted in {case}"
-        );
-        access.shutdown().await;
-    }
-    assert!(
-        original
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request["params"]["workspace_id"] == "W1")
-    );
-    original.stop().await;
-    other.stop().await;
-}
-
-/// A child freezes, per tool, the authorities of the hosts present when it was delegated.
-/// Herdr views added afterwards are never offered to it, while the frozen Tickhost still serves
-/// it, and a record frozen with one authority per tool is no longer restored.
-#[tokio::test]
-async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
-    use tickloop_code_daemon::EmbeddedAgentAccess;
-
-    use tickloop_code_access::{
-        AgentCommand, CommandResult, ConfigurationChange, HostWorkContext, LaunchSpec,
-        TranscriptRef, UserInput,
-    };
-
-    let directory = tempfile::Builder::new()
-        .prefix("tl-host-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let store = directory.path().join("state");
-    let herdr = ScopedHostSocket::start(directory.path().join("h.sock"));
-    let launch = || {
-        let mut launch = LaunchSpec::embedded(directory.path().into());
-        launch.host_work_context = Some(HostWorkContext {
-            socket: herdr.path.clone(),
-            workspace: Some("W1".into()),
-        });
-        launch
-    };
+    let launch = || LaunchSpec::embedded(directory.path().into());
     let agent = Agent::open_embedded(
         store.clone(),
         config(),
@@ -648,6 +345,28 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     assert!(frozen.get("ReadWorkspace").is_none(), "{frozen}");
     access.shutdown().await;
 
+    let transcript = tickloop_harness::test_support::transcript_file(&store, child.into());
+    let retired_herdr = json!({"kind":"native","endpoint":{"kind":"herdr_socket","path":"/private/tmp/retired-herdr.sock","owner":501,"device":1,"inode":2}});
+    let with_retired_herdr = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut entry: Value = serde_json::from_str(line).unwrap();
+            if entry["type"] == "delegation" {
+                let host_tools = &mut entry["delegation"]["ceiling"]["host_tools"];
+                host_tools["ReadWorkspace"] = json!([retired_herdr]);
+                host_tools["TickManage"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, retired_herdr.clone());
+            }
+            serde_json::to_string(&entry).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&transcript, with_retired_herdr).unwrap();
+
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "child-hosted",
@@ -658,9 +377,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     ]));
     let restored = Agent::open_embedded(store.clone(), config(), model.clone()).unwrap();
     restored
-        .install_host_tools(Arc::new(
-            herdr.tools_behind(&directory.path().join("d.sock")),
-        ))
+        .install_host_tools(Arc::new(tick_tools(&directory.path().join("d.sock"))))
         .unwrap();
     let access = EmbeddedAgentAccess::for_worker(restored.clone(), uuid::Uuid::new_v4());
     let CommandResult::Loaded { execution, .. } = access_command(
@@ -728,12 +445,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         "the frozen Tickhost still serves it: {}",
         hosted.content
     );
-    assert!(
-        herdr.requests.lock().unwrap().is_empty(),
-        "the child never reached Herdr"
-    );
 
-    let transcript = tickloop_harness::test_support::transcript_file(&store, child.into());
     let single_authority = std::fs::read_to_string(&transcript)
         .unwrap()
         .lines()
@@ -762,60 +474,6 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
         "a child frozen with one authority per tool was restored"
     );
     reopened.shutdown().await;
-    herdr.stop().await;
-}
-
-#[tokio::test]
-async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_dispatch() {
-    use tickloop_harness::protocol::HostCallContext;
-    use tickloop_harness::runtime::host_tools::{HostCallResult, HostToolProvider};
-    let directory = tempfile::Builder::new()
-        .prefix("tl-host-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let original = ScopedHostSocket::start(directory.path().join("host.sock"));
-    let provider = original.tools();
-    let local_files = tickloop_harness::tools::Tools::new(directory.path().join("chat"))
-        .local_file_reader(
-            &tickloop_harness::tools::Workspace {
-                folder: Some(directory.path().into()),
-                additional_directories: Vec::new(),
-            },
-            Arc::new(NoLocalReads),
-        );
-    let call = provider
-        .prepare_call_in_scope(
-            uuid::Uuid::new_v4().into(),
-            &tickloop_harness::runtime::host_tools::HostCallScope {
-                local_files: local_files.as_ref(),
-                context: Some(&HostCallContext {
-                    folder: directory.path().into(),
-                    workspace_id: Some("W1".into()),
-                    interaction: None,
-                }),
-            },
-            "ReadWorkspace",
-            &json!({}),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    std::fs::remove_file(&original.path).unwrap();
-    let replacement = ScopedHostSocket::start(original.path.clone());
-    let result = provider
-        .execute_prepared(
-            uuid::Uuid::new_v4().into(),
-            call,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
-    assert!(
-        matches!(result, HostCallResult::NotDispatched(message) if message.contains("endpoint changed"))
-    );
-    assert!(original.requests.lock().unwrap().is_empty());
-    assert!(replacement.requests.lock().unwrap().is_empty());
-    original.stop().await;
-    replacement.stop().await;
 }
 
 #[tokio::test]
@@ -2070,7 +1728,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
     ]));
     let core = Agent::new_embedded(config(), model);
     core.install_own_tickhost();
-    let routed = install_routed_authorities(&core, directory.path());
+    install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::FullAccess)
         .await
@@ -2110,7 +1768,6 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
     assert_eq!(ceiling.host_tools["TickManage"].len(), 2);
     assert!(!ceiling.host_tools.contains_key("Bash"));
     core.shutdown().await;
-    routed.stop().await;
     let result = result.expect("the real delegated Bash call must return");
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("7319"), "{}", result.content);
@@ -2135,7 +1792,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
     ]));
     let core = Agent::new_embedded(config(), model);
     core.install_own_tickhost();
-    let routed = install_routed_authorities(&core, directory.path());
+    install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
         .await
@@ -2185,7 +1842,6 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         }
     }
     core.shutdown().await;
-    routed.stop().await;
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("8426"));
@@ -2588,7 +2244,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
     });
     let core = Agent::new_embedded(config(), model.clone());
     core.install_own_tickhost();
-    let routed = install_routed_authorities(&core, directory.path());
+    install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
         .await
@@ -2642,7 +2298,6 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         }
     }
     core.shutdown().await;
-    routed.stop().await;
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(
@@ -3113,14 +2768,4 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("5438"));
-}
-
-/// Refuses every local file read; the host calls these tests prepare send no file.
-struct NoLocalReads;
-
-#[async_trait::async_trait]
-impl tickloop_harness::tools::LocalReadAdmission for NoLocalReads {
-    async fn admit(&self, _: &tickloop_harness::tools::PreparedTool) -> Result<bool, String> {
-        Err("no local file is read here".into())
-    }
 }

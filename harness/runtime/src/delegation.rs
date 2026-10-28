@@ -6,7 +6,7 @@ use tickloop_ids::IdContext;
 use super::*;
 use crate::{
     host_tools::HostToolProvider,
-    tick_tools::{READ_WORKSPACE, TICK_CALL, TICK_MANAGE, TICK_READ, uses_herdr_layout},
+    tick_tools::{TICK_CALL, TICK_MANAGE, TICK_READ},
 };
 use tickloop_harness_protocol::local_messages;
 use tickloop_harness_protocol::{
@@ -367,7 +367,7 @@ fn check_direct_call(
             return Err("delegated authorization ceiling denies this operation".into());
         }
     }
-    if matches!(name, READ_WORKSPACE | TICK_READ | TICK_CALL | TICK_MANAGE) {
+    if matches!(name, TICK_READ | TICK_CALL | TICK_MANAGE) {
         if name == TICK_MANAGE
             && matches!(
                 input["action"].as_str(),
@@ -379,20 +379,7 @@ fn check_direct_call(
                     .into(),
             );
         }
-        // A Tick belongs to the Chat that opened it, which the daemon enforces on every call;
-        // Herdr Panes stay scoped by the inherited Workspace.
-        if uses_herdr_layout(name, input) {
-            let workspace = ceiling
-                .host_context
-                .as_ref()
-                .and_then(|context| context.workspace_id.as_deref());
-            if workspace.is_none() || input.get("workspace_id").and_then(Value::as_str) != workspace
-            {
-                return Err(
-                    "delegated host operation is outside the inherited Workspace scope".into(),
-                );
-            }
-        }
+        // A Tick belongs to the Chat that opened it, which the daemon enforces on every call.
         if ceiling.policy.mode == ExecutionMode::Plan && matches!(name, TICK_CALL | TICK_MANAGE) {
             return Err("delegated Plan authorization does not admit host mutations".into());
         }

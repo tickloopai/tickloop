@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::host_tools::HostToolPermission;
 
 pub const TERMINAL_INPUT_BYTES: usize = 4 * 1024;
-pub const WORKSPACE_PAGE_SIZE: usize = 128;
 pub const SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,7 +275,6 @@ pub struct OpenSpec {
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub protocol: bool,
-    pub view: Option<ViewPlacement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,31 +335,6 @@ pub struct OutputPage {
     pub data: Vec<u8>,
     pub next_offset: u64,
     pub eof: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewPlacement {
-    pub workspace_id: Option<String>,
-    pub placement: ViewPosition,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ViewPosition {
-    NewTab,
-    CurrentTab {
-        #[serde(default = "default_view_direction")]
-        direction: String,
-    },
-    Pane {
-        pane_id: String,
-        #[serde(default = "default_view_direction")]
-        direction: String,
-    },
-}
-
-fn default_view_direction() -> String {
-    "right".into()
 }
 
 pub enum PreparationKind {}

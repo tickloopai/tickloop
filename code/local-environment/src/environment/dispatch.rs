@@ -10,19 +10,12 @@ use uuid::Uuid;
 type DispatchValidation = Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>;
 
 #[derive(Clone)]
-struct ConfirmedOpen {
-    result: ExecutionResult,
-    view_requested: bool,
-    view_started: bool,
-}
-
-#[derive(Clone)]
 pub(crate) struct ExecutionDispatch {
     authority: ExecutionAuthority,
     chat: ChatId,
     cancel: CancellationToken,
     sent: Arc<AtomicBool>,
-    opened: Arc<Mutex<Option<ConfirmedOpen>>>,
+    opened: Arc<Mutex<Option<ExecutionResult>>>,
     validation: Arc<Mutex<Option<DispatchValidation>>>,
 }
 
@@ -72,17 +65,8 @@ impl ExecutionDispatch {
     pub(crate) fn not_dispatched(&self) {
         self.sent.store(false, Ordering::SeqCst);
     }
-    pub(crate) fn confirm_opened(&self, result: ExecutionResult, view_requested: bool) {
-        *self.opened.lock().unwrap() = Some(ConfirmedOpen {
-            result,
-            view_requested,
-            view_started: false,
-        });
-    }
-    pub(crate) fn begin_view(&self) {
-        if let Some(opened) = self.opened.lock().unwrap().as_mut() {
-            opened.view_started = true;
-        }
+    pub(crate) fn confirm_opened(&self, result: ExecutionResult) {
+        *self.opened.lock().unwrap() = Some(result);
     }
     pub(crate) async fn interrupted(&self) {
         tokio::select! { _ = self.authority.revoked() => {}, _ = self.cancel.cancelled() => {} }
@@ -93,26 +77,8 @@ impl ExecutionDispatch {
             .check(self.chat)
             .err()
             .unwrap_or_else(|| ExecutionError::new("Cancelled", "operation cancelled"));
-        if let Some(mut opened) = self.opened.lock().unwrap().clone() {
-            if opened.view_requested
-                && let Ok(mut value) =
-                    serde_json::from_str::<serde_json::Value>(&opened.result.result.content)
-            {
-                let (status, diagnostic) = if opened.view_started {
-                    (
-                        "unknown",
-                        "The Tick opened. Inspect its views before retrying; do not open another Tick.",
-                    )
-                } else {
-                    (
-                        "not_created",
-                        "The Tick opened, but its view was not started; do not open another Tick.",
-                    )
-                };
-                value["view"] = serde_json::json!({"status":status, "error":error.to_string(), "diagnostic":diagnostic});
-                opened.result.result.content = value.to_string();
-            }
-            return ExecutionOutcome::Completed(opened.result);
+        if let Some(opened) = self.opened.lock().unwrap().clone() {
+            return ExecutionOutcome::Completed(opened);
         }
         if self.sent.load(Ordering::SeqCst) {
             ExecutionOutcome::OutcomeUnknown {

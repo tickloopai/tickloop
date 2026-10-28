@@ -139,28 +139,6 @@ impl PromptScope<'_> {
     };
 }
 
-/// One line for a container whose Panes cannot show Ticks, from `workspace_host`; nothing for a
-/// standalone terminal, or for Herdr when it can.
-fn pane_display_section(workspace_host: &serde_json::Value) -> Option<String> {
-    let still_runs = if workspace_host["tickhost"] == "available" {
-        "; Ticks still run in the Tickhost and appear in this Chat's Monitor"
-    } else {
-        ""
-    };
-    let reason = match (
-        workspace_host["name"].as_str()?,
-        workspace_host["integration"].as_str()?,
-    ) {
-        ("herdr", "unavailable") => {
-            "Herdr is detected, but its integration is unavailable to this Agent, so Ticks cannot be shown in its Panes"
-        }
-        ("tmux", _) => "tmux is detected, but Tickloop cannot show Ticks in tmux Panes yet",
-        ("zellij", _) => "zellij is detected, but Tickloop cannot show Ticks in zellij Panes yet",
-        _ => return None,
-    };
-    Some(format!("# Pane display\n{reason}{still_runs}."))
-}
-
 /// Claude Code's `getScratchpadInstructions`, for a Chat whose family has a scratchpad. Its path
 /// stays in Current host state, so this section is the same in every Chat.
 const SCRATCHPAD_SECTION: &str = "# Scratchpad Directory\n\nIMPORTANT: Always use the scratchpad directory named by `scratchpad` in Current host state for temporary files instead of `/tmp` or other system temp directories. Use it for ALL temporary file needs: intermediate results, temporary scripts or configuration files, outputs that don't belong in the user's project, and working files during analysis. Only use `/tmp` if the user explicitly requests it. The scratchpad is private to this Agent family and isolated from the user's project.";
@@ -245,9 +223,6 @@ pub(super) fn conversation_system_prompt(
         has_folder.then(|| session_guidance_section(tools)),
         deferred_tools_section(deferred_tools),
         (tools.delegation || tools.family_messages).then(|| AGENT_MESSAGE_SECTION.to_owned()),
-        has_folder
-            .then(|| pane_display_section(&host_state["workspace_host"]))
-            .flatten(),
         Some(TONE_AND_STYLE_SECTION.to_owned()),
         Some(OUTPUT_EFFICIENCY_SECTION.to_owned()),
         style_section,
@@ -468,8 +443,7 @@ mod tests {
         assert!(!prompt.contains("StartGoal"));
     }
 
-    /// Tick, Herdr and Artifact usage lives in the tools that only exist with those features;
-    /// the prompt names a container only to say its Panes cannot show Ticks.
+    /// Tick and Artifact usage lives in the tools that only exist with those features.
     #[test]
     fn the_prompt_teaches_no_tick_or_artifact_tool_usage() {
         let prompt = conversation_system_prompt(
@@ -491,42 +465,31 @@ mod tests {
         }
     }
 
+    /// No container's Panes show Ticks, so the prompt names none, whatever the host state says,
+    /// including the integration field earlier builds reported.
     #[test]
-    fn only_a_container_whose_panes_cannot_show_ticks_gets_one_line() {
-        let section = |name: &str, integration: &str, tickhost: &str| {
-            let state = serde_json::json!({"workspace_host": {"name": name, "integration": integration, "tickhost": tickhost}});
-            let prompt =
-                conversation_system_prompt(&state, OutputStyle::Standard, PromptScope::LOCAL);
-            prompt
-                .split("\n\n")
-                .find(|part| part.starts_with("# Pane display\n"))
-                .map(str::to_owned)
-        };
-        assert_eq!(section("standalone", "unavailable", "available"), None);
-        assert_eq!(section("herdr", "available", "available"), None);
-        assert_eq!(
-            section("herdr", "unavailable", "available").as_deref(),
-            Some(
-                "# Pane display\nHerdr is detected, but its integration is unavailable to this Agent, so Ticks cannot be shown in its Panes; Ticks still run in the Tickhost and appear in this Chat's Monitor."
-            )
-        );
-        assert_eq!(
-            section("tmux", "unavailable", "available").as_deref(),
-            Some(
-                "# Pane display\ntmux is detected, but Tickloop cannot show Ticks in tmux Panes yet; Ticks still run in the Tickhost and appear in this Chat's Monitor."
-            )
-        );
-        assert_eq!(
-            section("zellij", "unavailable", "unavailable").as_deref(),
-            Some(
-                "# Pane display\nzellij is detected, but Tickloop cannot show Ticks in zellij Panes yet."
-            )
-        );
-        assert!(
-            !section("tmux", "unavailable", "available")
-                .unwrap()
-                .contains("Herdr")
-        );
+    fn no_container_gets_a_pane_display_section() {
+        for (name, integration) in [
+            ("standalone", None),
+            ("herdr", None),
+            ("herdr", Some("available")),
+            ("herdr", Some("unavailable")),
+            ("tmux", Some("unavailable")),
+            ("zellij", None),
+        ] {
+            let mut workspace_host = serde_json::json!({"name": name, "tickhost": "available"});
+            if let Some(integration) = integration {
+                workspace_host["integration"] = integration.into();
+            }
+            let prompt = conversation_system_prompt(
+                &serde_json::json!({ "workspace_host": workspace_host }),
+                OutputStyle::Standard,
+                PromptScope::LOCAL,
+            );
+            for absent in ["# Pane display", "Panes"] {
+                assert!(!prompt.contains(absent), "{name}: {absent}");
+            }
+        }
     }
 
     /// Claude Code's sections a Chat with a Folder gets, gated by what the Chat can do.

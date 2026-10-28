@@ -1,8 +1,7 @@
 use super::*;
 use tickloop_harness::protocol::{Content, ExecutionMode, OperationState};
 use tickloop_harness::runtime::environment::{
-    ExecutionAuthority, ExecutionEnvironment, ExecutionIntent, ExecutionOutcome, ViewPlacement,
-    ViewPosition,
+    ExecutionAuthority, ExecutionEnvironment, ExecutionIntent, ExecutionOutcome,
 };
 use tickloop_harness::test_support::{ScriptedModel, auto_classification, call, next_event, text};
 use tokio::io::AsyncWriteExt;
@@ -32,7 +31,6 @@ for line in sys.stdin:
 #[derive(Clone, Copy, Debug)]
 enum OpenCase {
     Hidden,
-    WithView,
     Reopen,
 }
 
@@ -58,11 +56,6 @@ impl TitleGate {
                 assert!(super::super::gone(pid).await);
                 input = json!({"action":"reopen","tick_instance_id":instance});
                 Some(instance)
-            }
-            OpenCase::WithView => {
-                input["placement"] = json!({"type":"new_tab"});
-                input["workspace_id"] = json!(HERDR_WORKSPACE);
-                None
             }
             OpenCase::Hidden => None,
         };
@@ -107,7 +100,7 @@ impl TitleGate {
         let returned_instance: tick_protocol::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
         assert_eq!(json!(returned_instance), *instance);
-        assert_eq!(opened["visibility"], "hidden");
+        assert!(opened.get("visibility").is_none(), "{opened}");
         assert!(opened["business_pid"].is_u64());
         if let Some(lost) = &self.lost {
             assert_eq!(
@@ -117,11 +110,7 @@ impl TitleGate {
             );
             assert_ne!(*instance, json!(lost));
         }
-        if matches!(case, OpenCase::WithView) {
-            assert_eq!(opened["view"]["status"], "not_created", "{opened}");
-        } else {
-            assert!(opened.get("view").is_none(), "{opened}");
-        }
+        assert!(opened.get("view").is_none(), "{case:?}: {opened}");
     }
 }
 
@@ -144,17 +133,10 @@ async fn confirmed_open_survives_interruption(case: OpenCase, revoke: bool) {
             instance: instance.clone(),
         }
     } else {
-        let mut open = port_open(
+        ExecutionIntent::Open(port_open(
             serde_json::from_value(gate.input["command"].clone()).unwrap(),
             &daemon.root,
-        );
-        if matches!(case, OpenCase::WithView) {
-            open.view = Some(ViewPlacement {
-                workspace_id: Some(HERDR_WORKSPACE.into()),
-                placement: ViewPosition::NewTab,
-            });
-        }
-        ExecutionIntent::Open(open)
+        ))
     };
     let prepared = port.prepare(intent).await.unwrap();
     let admission = authority.admit(&prepared).unwrap();
@@ -186,25 +168,13 @@ async fn confirmed_open_survives_interruption(case: OpenCase, revoke: bool) {
     assert_eq!(json!(effect.instance), instance);
     assert_eq!(effect.title.as_deref(), Some("python3 -u title-gate.py"));
     assert!(!effect.is_terminal);
-    assert!(
-        !herdr
-            .methods()
-            .iter()
-            .any(|method| method == "layout.apply")
-    );
+    assert!(herdr.methods().is_empty(), "{:?}", herdr.methods());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hidden_open_keeps_its_confirmed_effect_when_title_is_cancelled_or_revoked() {
     for revoke in [false, true] {
         confirmed_open_survives_interruption(OpenCase::Hidden, revoke).await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn visible_open_keeps_its_confirmed_effect_and_reports_the_uncreated_view() {
-    for revoke in [false, true] {
-        confirmed_open_survives_interruption(OpenCase::WithView, revoke).await;
     }
 }
 
@@ -281,12 +251,7 @@ async fn interrupted_open_records_membership_and_creation(case: OpenCase) {
             .unwrap()
             .is_empty()
     );
-    assert!(
-        !herdr
-            .methods()
-            .iter()
-            .any(|method| method == "layout.apply")
-    );
+    assert!(herdr.methods().is_empty(), "{:?}", herdr.methods());
 
     // The Auto review input is the public consumer of the creation receipt, including its
     // binding to this Loop and the completed operation; Monitor membership alone cannot prove it.
@@ -336,11 +301,6 @@ async fn interrupted_open_records_membership_and_creation(case: OpenCase) {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_hidden_title_preserves_monitor_membership_and_creation_receipt() {
     interrupted_open_records_membership_and_creation(OpenCase::Hidden).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn cancelled_visible_title_preserves_monitor_membership_and_creation_receipt() {
-    interrupted_open_records_membership_and_creation(OpenCase::WithView).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

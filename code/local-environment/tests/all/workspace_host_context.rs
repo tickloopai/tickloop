@@ -10,14 +10,8 @@ use tickloop_code_settings::local_agent::LocalAgent;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tickhost_connect::{
-    herdr::{HerdrContext, HerdrPort},
-    host_error::HostError,
-    layout::HerdrLayout,
-};
 use tickloop_code_local_environment::hosted::{
     tools::HostedTickTools,
-    views::HerdrViews,
     worker_control::{DaemonControl, WorkerControlGrant},
 };
 use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
@@ -273,25 +267,18 @@ async fn merged_headless_input_clears_the_old_view_anchor_and_uses_work_context(
     assert_merged_host_source(true).await;
 }
 
-struct UnusedHerdrPort;
-
-#[async_trait]
-impl HerdrPort for UnusedHerdrPort {
-    async fn request(&self, _: &str, _: Value, _: CancellationToken) -> Result<Value, HostError> {
-        panic!("host context must be available before any workspace tool call")
-    }
-}
-
+/// The first request names the container and whether Ticks run here; no container's Panes show
+/// Ticks, so none is advertised as a place to show them, and no tool lists or places Panes.
 #[test]
-fn first_model_request_identifies_host_without_advertising_missing_integrations() {
+fn first_model_request_identifies_host_without_advertising_pane_display() {
     let binary = std::env::current_exe().unwrap();
-    for (case, host, integration) in [
-        ("herdr", "herdr", "available"),
-        ("herdr_without_provider", "herdr", "unavailable"),
-        ("tmux", "tmux", "unavailable"),
-        ("zellij", "zellij", "unavailable"),
-        ("standalone", "standalone", "unavailable"),
-        ("tickhost", "standalone", "unavailable"),
+    for (case, host) in [
+        ("herdr", "herdr"),
+        ("herdr_without_provider", "herdr"),
+        ("tmux", "tmux"),
+        ("zellij", "zellij"),
+        ("standalone", "standalone"),
+        ("tickhost", "standalone"),
     ] {
         let mut child = Command::new(&binary);
         child
@@ -339,23 +326,11 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             .lines()
             .find_map(|line| line.split_once("PANE_DISPLAY:").map(|(_, line)| line))
             .unwrap_or_else(|| panic!("{case}: missing pane display line in {stdout}"));
-        let still_runs = "; Ticks still run in the Tickhost and appear in this Chat's Monitor.";
-        let expected = match case {
-            "herdr" | "standalone" | "tickhost" => "none".to_owned(),
-            "herdr_without_provider" => "# Pane display Herdr is detected, but its integration is unavailable to this Agent, so Ticks cannot be shown in its Panes.".to_owned(),
-            "tmux" => "# Pane display tmux is detected, but Tickloop cannot show Ticks in tmux Panes yet.".to_owned(),
-            "zellij" => "# Pane display zellij is detected, but Tickloop cannot show Ticks in zellij Panes yet.".to_owned(),
-            _ => unreachable!(),
-        };
-        assert_eq!(pane_display, expected, "{case}");
-        assert!(
-            !pane_display.contains(still_runs),
-            "{case}: no Tickhost here"
-        );
+        assert_eq!(pane_display, "none", "{case}");
         assert_eq!(state["workspace_host"]["name"], host, "{case}");
-        assert_eq!(
-            state["workspace_host"]["integration"], integration,
-            "{case}"
+        assert!(
+            state["workspace_host"].get("integration").is_none(),
+            "{case}: no Pane shows Ticks, so no integration is reported"
         );
         let runs_ticks = matches!(case, "herdr" | "tickhost");
         assert!(
@@ -426,17 +401,6 @@ async fn workspace_host_request_probe() {
             }),
             Vec::new(),
         );
-        let hosted = if case == "herdr" {
-            hosted.with_herdr_views(HerdrViews::new(
-                HerdrLayout::with_host(
-                    HerdrContext::without_view("/private/unused-herdr.sock".into()),
-                    Arc::new(UnusedHerdrPort),
-                ),
-                Path::new("/private/unused/tickloop"),
-            ))
-        } else {
-            hosted
-        };
         agent.install_host_tools(Arc::new(hosted)).unwrap();
     }
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -502,12 +466,12 @@ async fn workspace_host_request_probe() {
 
     let requests = model.requests.lock().unwrap();
     let request = &requests[0];
-    assert_eq!(
-        request
+    assert!(
+        !request
             .tools
             .iter()
             .any(|tool| tool.name == "ReadWorkspace"),
-        case == "herdr"
+        "{case}"
     );
     let first = &request.messages[0];
     assert_eq!(first.role, Role::System);

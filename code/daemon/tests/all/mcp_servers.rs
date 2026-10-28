@@ -58,14 +58,9 @@ async fn configured_agent(
             value: value.into_bytes(),
         })
         .collect();
-    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(
-        &launch,
-        models,
-        None,
-        &std::env::current_exe().unwrap(),
-    )
-    .await
-    .unwrap();
+    let (agent, _) = tickloop_code_daemon::build_runtime_with_models(&launch, models, None)
+        .await
+        .unwrap();
     (agent, local, remote)
 }
 #[tokio::test]
@@ -339,7 +334,6 @@ async fn live_model_calls_an_installed_marketplace_plugin() {
         &launch,
         Arc::new(LocalModelClients::new(Some(root.clone()))),
         None,
-        &std::env::current_exe().unwrap(),
     )
     .await
     .unwrap();
@@ -600,7 +594,6 @@ async fn worker_picks_up_a_login_saved_after_startup() {
         &launch,
         ChosenModels::new(scripted.clone()),
         None,
-        &std::env::current_exe().unwrap(),
     )
     .await
     .unwrap();
@@ -725,7 +718,6 @@ async fn before_an_agent_starts_agent_access_connects_only_the_named_server_and_
         &agent_launch,
         ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
         None,
-        &std::env::current_exe().unwrap(),
     )
     .await
     .unwrap();
@@ -1106,7 +1098,6 @@ async fn live_model_calls_logged_in_notion_search_without_recording_content() {
         &launch,
         Arc::new(LocalModelClients::new(Some(root.clone()))),
         None,
-        &std::env::current_exe().unwrap(),
     )
     .await
     .unwrap();

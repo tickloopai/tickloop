@@ -318,7 +318,7 @@ fn seed_queued_tick(checkpoint: &mut Value) -> Uuid {
 async fn queued_tick_revalidates_against_the_real_successor_worker_during_release() {
     let workdir = tempfile::tempdir().unwrap();
     let (url, mut requests) = tickloop_harness::test_support::model_http_support::serve_responses(vec![
-        (200, response(None, Some(("open", "TickManage", json!({"action":"open","command":support::hosted::counter_program(),"cwd":workdir.path().canonicalize().unwrap(),"protocol":true,"placement":{"type":"hidden"}}))))),
+        (200, response(None, Some(("open", "TickManage", json!({"action":"open","command":support::hosted::counter_program(),"cwd":workdir.path().canonicalize().unwrap(),"protocol":true}))))),
         (200, response(Some("counter opened"), None)),
         (200, response(Some("queued tick consumed"), None)),
     ]).await;

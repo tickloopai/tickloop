@@ -343,12 +343,6 @@ impl ExecutionPort for LocalPort {
                     if let Some(cwd) = &open.cwd {
                         input["cwd"] = json!(cwd);
                     }
-                    if let Some(view) = &open.view {
-                        input["placement"] = json!(view.placement);
-                        if let Some(workspace) = &view.workspace_id {
-                            input["workspace_id"] = json!(workspace);
-                        }
-                    }
                     (tickloop_harness::runtime::tick_tools::TICK_MANAGE, input)
                 }
                 ExecutionIntent::SendInput { instance, data } => (
@@ -547,7 +541,6 @@ pub(crate) async fn prepare_hosted_call(
     input: &serde_json::Value,
     context: Option<&tickloop_harness::protocol::HostCallContext>,
     cancel: CancellationToken,
-    views: bool,
 ) -> Result<PreparedHostCall, String> {
     let authority = ExecutionAuthority::with_cancellation(chat, cancel);
     let port: Arc<dyn ExecutionPort> = Arc::new(LocalPort {
@@ -570,7 +563,7 @@ pub(crate) async fn prepare_hosted_call(
         staged_shell: std::sync::Mutex::new(None),
         samples: Default::default(),
     });
-    tools::prepare_on_port(port, authority, chat, name, input, views).await
+    tools::prepare_on_port(port, authority, chat, name, input).await
 }
 
 pub(crate) fn local_shell_host(

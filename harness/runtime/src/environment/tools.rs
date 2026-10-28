@@ -32,13 +32,13 @@ impl ExecutionTools {
 #[async_trait]
 impl HostToolProvider for ExecutionTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        crate::tick_tools::definitions(false)
+        crate::tick_tools::definitions()
     }
     fn is_concurrency_safe(&self, name: &str, _: &Value) -> bool {
         matches!(name, TICK_READ | TICK_DESCRIBE)
     }
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
-        crate::tick_tools::validate_input(name, schema, input, false)
+        crate::tick_tools::validate_input(name, schema, input)
     }
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
         Ok(match &self.authority {
@@ -54,7 +54,7 @@ impl HostToolProvider for ExecutionTools {
         name: &str,
         input: &Value,
     ) -> Result<Option<HostToolAuthority>, String> {
-        crate::tick_tools::check_call(name, input, false)?;
+        crate::tick_tools::check_call(name, input)?;
         Ok(Some(self.authority.clone()))
     }
     fn permission(&self, _: ChatId, name: &str, _: &Value) -> HostToolPermission {
@@ -104,7 +104,7 @@ impl HostToolProvider for ExecutionTools {
                 authority.clone(),
             )
             .map_err(|error| error.to_string())?;
-        prepare_on_port(port, authority, chat, name, input, false).await
+        prepare_on_port(port, authority, chat, name, input).await
     }
     async fn revalidate_call(
         &self,
@@ -140,9 +140,8 @@ pub async fn prepare_on_port(
     chat: ChatId,
     name: &str,
     input: &Value,
-    views: bool,
 ) -> Result<PreparedHostCall, String> {
-    crate::tick_tools::check_call(name, input, views)?;
+    crate::tick_tools::check_call(name, input)?;
     let instance = || {
         serde_json::from_value::<InstanceRef>(input["tick_instance_id"].clone())
             .map_err(|error| error.to_string())
@@ -192,19 +191,10 @@ pub async fn prepare_on_port(
         (TICK_MANAGE, Some("open")) => {
             let command = serde_json::from_value(input["command"].clone())
                 .map_err(|error| format!("invalid command: {error}"))?;
-            let view = match input["placement"]["type"].as_str() {
-                None | Some("hidden") => None,
-                Some(_) => Some(ViewPlacement {
-                    workspace_id: input["workspace_id"].as_str().map(str::to_owned),
-                    placement: serde_json::from_value(input["placement"].clone())
-                        .map_err(|error| error.to_string())?,
-                }),
-            };
             ExecutionIntent::Open(OpenSpec {
                 command,
                 cwd: input["cwd"].as_str().map(str::to_owned),
                 protocol: input["protocol"].as_bool().unwrap_or(false),
-                view,
             })
         }
         (TICK_CALL, _) => {
