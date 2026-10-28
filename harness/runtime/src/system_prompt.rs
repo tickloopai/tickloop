@@ -275,7 +275,6 @@ impl crate::Agent {
             "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
             "artifact_ticks": chat.snapshot.artifact_ticks,
             "delegation": chat.snapshot.delegation.as_ref().map(fixed_delegation),
-            "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
         });
         if let Some(folder) = &chat.snapshot.folder {
             state.as_object_mut().unwrap().extend(serde_json::json!({
