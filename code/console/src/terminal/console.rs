@@ -106,7 +106,7 @@ mod workspace_trust_tests;
 use agent_layout::OverviewState;
 use agent_layout::OverviewTarget;
 pub(super) use agent_layout::{
-    AgentOverview, AgentRow, EndedRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, PeekChoice, PeekRequest,
+    AgentOverview, AgentRow, EndedRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, PeekRequest,
     WIDE_TERMINAL_COLUMNS, status_glyph,
 };
 
@@ -316,6 +316,9 @@ const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const MONITOR_CONFIRMATION_WINDOW: Duration = Duration::from_secs(3);
 const ENDED_HISTORY_MISSING: &str = "This Agent's saved history is no longer on disk, so there is nothing to resume · x twice removes the row";
 const PEEK_COMMAND_REFUSAL: &str = "Commands run in the Agent's own view · → opens it";
+const PEEK_OPTIONS_HIDDEN: &str =
+    "Not every option fits on screen, so a number answers nothing · → opens the Agent to answer";
+const PEEK_ANSWER_IN_AGENT: &str = "Only the Agent's own view answers this request · → opens it";
 const STOPPED_RESUME_OFFER: &str = "Press enter again to resume this Agent (it ended while the daemon was off), or x twice to remove it";
 
 const MONITOR_NOTICE_WINDOW: Duration = Duration::from_secs(2);
@@ -375,11 +378,11 @@ pub(super) enum InputEvent {
         agent_id: Uuid,
         text: String,
     },
-    /// A number typed in the peek panel that answers the Agent's pending request.
+    /// A number typed in the peek panel that picks an option of the Agent's pending question.
     PeekAnswer {
         agent_id: Uuid,
         request_id: Uuid,
-        choice: agent_layout::PeekChoice,
+        option: String,
     },
     /// Removes the ended root Agent of this Chat from the overview; its history stays.
     ForgetEndedAgent(Uuid),
@@ -517,12 +520,12 @@ impl fmt::Debug for InputEvent {
             Self::PeekAnswer {
                 agent_id,
                 request_id,
-                choice,
+                option,
             } => formatter
                 .debug_struct("PeekAnswer")
                 .field("agent_id", agent_id)
                 .field("request_id", request_id)
-                .field("choice", choice)
+                .field("option", option)
                 .finish(),
             Self::ForgetEndedAgent(value) => formatter
                 .debug_tuple("ForgetEndedAgent")
@@ -12577,6 +12580,7 @@ impl State {
         self.overview.peek = Some(agent_layout::Peek {
             agent_id: id,
             request: None,
+            options_visible: false,
         });
         self.overview.input_focused = true;
         InputEvent::PeekOpened(id)
@@ -12653,24 +12657,40 @@ impl State {
             self.hold_status(ENDED_HISTORY_MISSING);
             return None;
         }
-        let choice = self
-            .overview
-            .peek
-            .as_ref()
-            .and_then(|peek| peek.request.as_ref())
-            .and_then(|request| {
-                let number = text.trim().parse::<usize>().ok()?;
-                let (_, choice) = request.choices.get(number.checked_sub(1)?)?;
-                Some((request.request_id, choice.clone()))
-            });
+        // A number answers only a question option the user could read whole on the panel; a
+        // request only the Agent's own view can answer takes no number at all.
+        let number = text.trim().parse::<usize>().ok();
+        let peek = self.overview.peek.as_ref()?;
+        let answer = match (&peek.request, number) {
+            (Some(request), Some(number)) => {
+                let option = number
+                    .checked_sub(1)
+                    .and_then(|index| request.options.get(index));
+                match option {
+                    Some(option) if peek.options_visible => {
+                        Some((request.request_id, option.clone()))
+                    }
+                    Some(_) => {
+                        self.hold_status(PEEK_OPTIONS_HIDDEN);
+                        return None;
+                    }
+                    None if request.options.is_empty() => {
+                        self.hold_status(PEEK_ANSWER_IN_AGENT);
+                        return None;
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
         self.editor.apply(EditorCommand::Clear);
         self.paste_blocks.take();
         self.completion.dismiss();
-        Some(match choice {
-            Some((request_id, choice)) => InputEvent::PeekAnswer {
+        Some(match answer {
+            Some((request_id, option)) => InputEvent::PeekAnswer {
                 agent_id: id,
                 request_id,
-                choice,
+                option,
             },
             None => InputEvent::PeekReply { agent_id: id, text },
         })

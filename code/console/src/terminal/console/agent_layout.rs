@@ -10,7 +10,7 @@ use crate::agent_console::{AgentState, AttentionGroup};
 use crate::terminal::display::{DisplayProfile, Glyph};
 use crate::terminal::list_row::ROW_INDENT;
 use tickloop_code_access::EndReason;
-use tickloop_harness::protocol::{LoopState, PermissionScope, SubagentRegistration};
+use tickloop_harness::protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
 pub(super) const NORMAL_LAYOUT_MIN_ROWS: usize = 16;
@@ -65,25 +65,16 @@ pub(crate) struct EndedRow {
     pub(crate) resumable: bool,
 }
 
-/// What a number typed into the peek panel's reply box answers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PeekChoice {
-    /// A question option, by its label.
-    Answer(String),
-    Permission {
-        allow: bool,
-        scope: PermissionScope,
-    },
-}
-
-/// The request a peeked Agent waits on, with the choices a typed number picks.
+/// The request a peeked Agent waits on, with the question options a typed number picks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PeekRequest {
     pub(crate) request_id: Uuid,
     /// The full question, or which tool asks for permission.
     pub(crate) prompt: String,
-    /// Empty when only the Agent's own view can answer, such as several questions at once.
-    pub(crate) choices: Vec<(String, PeekChoice)>,
+    /// Option labels, numbered from 1. Empty when only the Agent's own view can answer: every
+    /// permission request, whose context and choices only that view shows, and several questions
+    /// at once.
+    pub(crate) options: Vec<String>,
 }
 
 /// Claude Code's peek panel: the selected Agent's state below the overview list, with the input
@@ -92,6 +83,9 @@ pub(crate) struct PeekRequest {
 pub(super) struct Peek {
     pub(super) agent_id: Uuid,
     pub(super) request: Option<PeekRequest>,
+    /// Whether the last drawn panel showed the request's prompt and every option whole; a number
+    /// answers only what the user could read.
+    pub(super) options_visible: bool,
 }
 
 /// The most rows the peek panel takes from the list.
@@ -780,16 +774,21 @@ impl OverviewState {
     }
 
     /// The peek panel's rows: the Agent's state and how long it has waited, its latest sentence,
-    /// and the request it waits on with the numbers that answer it.
-    fn peek_lines(&self, width: usize, now: u64) -> Vec<RoleLine> {
+    /// and the request it waits on with the numbers that answer it. Also says whether the prompt
+    /// and every option fit whole within the panel.
+    fn peek_lines(&self, width: usize, now: u64) -> (Vec<RoleLine>, bool) {
         let Some((peek, row)) = self.peek.as_ref().and_then(|peek| {
             let row = self.projection.as_ref()?.row(peek.agent_id)?;
             Some((peek, row))
         }) else {
-            return Vec::new();
+            return (Vec::new(), false);
+        };
+        let text_columns = width.saturating_sub(4).max(1);
+        let fits = |text: &str, limit: usize| {
+            super::wrap_text(&display_single_line(text), text_columns).len() <= limit
         };
         let wrapped = |text: &str, role: Role, limit: usize| {
-            super::wrap_text(&display_single_line(text), width.saturating_sub(4).max(1))
+            super::wrap_text(&display_single_line(text), text_columns)
                 .into_iter()
                 .take(limit)
                 .map(move |line| RoleLine::role(format!("{ROW_INDENT}  {line}"), role))
@@ -812,12 +811,17 @@ impl OverviewState {
             Some(preview) => lines.extend(wrapped(preview, Role::Text, 3)),
             None => lines.extend(wrapped("Nothing said yet", Role::MutedText, 1)),
         }
+        let mut options_visible = false;
         if let Some(request) = &peek.request {
+            options_visible = !request.options.is_empty() && fits(&request.prompt, 3);
             lines.extend(wrapped(&request.prompt, Role::Warning, 3));
-            for (number, (label, _)) in request.choices.iter().enumerate() {
-                lines.extend(wrapped(&format!("{}. {label}", number + 1), Role::Text, 1));
+            for (number, label) in request.options.iter().enumerate() {
+                let option = format!("{}. {label}", number + 1);
+                options_visible &= fits(&option, 1);
+                lines.extend(wrapped(&option, Role::Text, 1));
             }
-            if request.choices.is_empty() {
+            options_visible &= lines.len() <= MAX_PEEK_ROWS;
+            if request.options.is_empty() {
                 lines.extend(wrapped("→ opens the Agent to answer", Role::MutedText, 1));
             }
         }
@@ -830,7 +834,7 @@ impl OverviewState {
             lines.extend(wrapped(note, Role::MutedText, 1));
         }
         lines.truncate(MAX_PEEK_ROWS);
-        lines
+        (lines, options_visible)
     }
 
     pub(super) fn selected_agent(&self) -> Option<Uuid> {
@@ -1591,12 +1595,15 @@ impl OverviewState {
             1
         };
         let now = tickloop_harness::base::private_fs::unix_time_milliseconds();
-        let peek = self.peek_lines(width, now);
+        let (peek, options_visible) = self.peek_lines(width, now);
         let peek = if height.saturating_sub(header_rows) > peek.len() + MIN_COMPLETED_ROWS {
             peek
         } else {
             Vec::new()
         };
+        if let Some(state) = self.peek.as_mut() {
+            state.options_visible = options_visible && !peek.is_empty();
+        }
         self.capacity = height.saturating_sub(header_rows + peek.len());
         let entries = self.entries();
         let offset = self.scroll_offset(&entries);
@@ -1839,7 +1846,7 @@ pub(super) fn help_lines(
             "enter resume ended Agent (row)".into(),
             "space peek and reply (row)".into(),
             "↑/↓ next Agent, → open (peek)".into(),
-            "1-9 enter answers (peek)".into(),
+            "1-9 enter answers a question (peek)".into(),
             "x twice stops Agent / removes ended row".into(),
             "enter / → fold group (heading)".into(),
             "enter dispatch (input)".into(),

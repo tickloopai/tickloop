@@ -3313,8 +3313,8 @@ async fn interact_with_herdr(
                     }
                     status_dirty = true;
                 },
-                Some(InputEvent::PeekAnswer { agent_id, request_id, choice }) => {
-                    match answer_peek(agent,&global.projection(),agent_id,request_id,choice).await {
+                Some(InputEvent::PeekAnswer { agent_id, request_id, option }) => {
+                    match answer_peek(agent,&global.projection(),agent_id,request_id,option).await {
                         Ok(())=>console.set_status("Answered")?,
                         Err(error)=>console.set_status(&format!("Cannot answer · {}",safe_line(&error.to_string())))?,
                     }
@@ -8471,13 +8471,14 @@ async fn send_peek_reply(
     ))
 }
 
-/// Answers the request the Agent of the overview row `agent_id` waits on with a peek panel choice.
+/// Answers the question the Agent of the overview row `agent_id` waits on with the option a number
+/// in the peek panel picked.
 async fn answer_peek(
     agent: &Agent,
     projection: &crate::agent_console::Projection,
     agent_id: uuid::Uuid,
     request_id: uuid::Uuid,
-    choice: console::PeekChoice,
+    option: String,
 ) -> Result<(), AccessError> {
     let chat = projection
         .rows
@@ -8485,40 +8486,25 @@ async fn answer_peek(
         .find(|row| row.execution.agent_id == agent_id)
         .map(|row| row.chat_id)
         .ok_or_else(|| AccessError::unavailable("this Agent is no longer running"))?;
-    match choice {
-        console::PeekChoice::Answer(label) => {
-            agent
-                .answer_question(
-                    chat,
-                    request_id,
-                    vec![tickloop_harness::protocol::QuestionAnswer::option(label)],
-                )
-                .await
-        }
-        console::PeekChoice::Permission { allow, scope } => {
-            agent
-                .answer_permission_with_scope(chat, request_id, allow, scope)
-                .await
-        }
-    }
+    agent
+        .answer_question(
+            chat,
+            request_id,
+            vec![tickloop_harness::protocol::QuestionAnswer::option(option)],
+        )
+        .await
 }
 
-/// The request a peeked Agent waits on, with what a typed number answers: an option of its one
-/// question, or one of the permission choices its own view offers apart from rules and comments.
+/// The request a peeked Agent waits on. Only the options of a single question take a number: a
+/// permission request, plan approval or file change shows its context and choices only in the
+/// Agent's own view, so the panel names it and points there.
 fn peek_request(snapshot: &ChatSnapshot) -> Option<console::PeekRequest> {
-    use console::PeekChoice;
-    use tickloop_harness::protocol::{PermissionApprovalSource, PermissionScope};
     if let Some(request) = snapshot.questions.first() {
-        let choices = match request.questions.as_slice() {
+        let options = match request.questions.as_slice() {
             [question] if !question.multi_select => question
                 .options
                 .iter()
-                .map(|option| {
-                    (
-                        option.label.clone(),
-                        PeekChoice::Answer(option.label.clone()),
-                    )
-                })
+                .map(|option| option.label.clone())
                 .collect(),
             _ => Vec::new(),
         };
@@ -8529,33 +8515,17 @@ fn peek_request(snapshot: &ChatSnapshot) -> Option<console::PeekRequest> {
                 .first()
                 .map(|question| question.question.clone())
                 .unwrap_or_default(),
-            choices,
+            options,
         });
     }
     let request = snapshot.permissions.first()?;
-    let permission = |allow, scope| PeekChoice::Permission { allow, scope };
-    let choices = if request.approval_source == PermissionApprovalSource::ExplicitAsk {
-        vec![
-            ("Yes, once".into(), permission(true, PermissionScope::Once)),
-            ("No".into(), permission(false, PermissionScope::Once)),
-        ]
-    } else {
-        vec![
-            ("Yes".into(), permission(true, PermissionScope::Once)),
-            (
-                "Yes, for this session".into(),
-                permission(true, PermissionScope::Session),
-            ),
-            ("No".into(), permission(false, PermissionScope::Once)),
-        ]
-    };
     Some(console::PeekRequest {
         request_id: request.id,
         prompt: format!(
             "Permission required · {}",
             presentation::tool_name(&request.name)
         ),
-        choices,
+        options: Vec::new(),
     })
 }
 
@@ -9261,27 +9231,100 @@ mod tests {
         .await;
         let request = super::peek_request(&agent.snapshot(chat).await.unwrap()).unwrap();
         assert_eq!(request.prompt, "Which report?");
-        assert_eq!(
-            request
-                .choices
-                .iter()
-                .map(|(label, _)| label.as_str())
-                .collect::<Vec<_>>(),
-            ["Weekly", "Monthly"]
-        );
+        assert_eq!(request.options, ["Weekly", "Monthly"]);
 
         super::answer_peek(
             &agent,
             &global.projection(),
             waiting.execution.agent_id,
             request.request_id,
-            request.choices[1].1.clone(),
+            request.options[1].clone(),
         )
         .await
         .unwrap();
 
         wait_for_row(&mut global, chat, |row| row.state == LoopState::Idle).await;
         assert!(last_request_text(&model).contains("Monthly"));
+        agent.shutdown().await;
+    }
+
+    /// A permission request, a plan approval or a file change is answered only in the Agent's own
+    /// view, where its context and every choice show: the peek panel gets no option for it, so no
+    /// number approves it and no session scope is reachable from there.
+    #[tokio::test]
+    async fn peek_requests_for_permissions_plans_and_file_changes_offer_no_option() {
+        use tickloop_harness::protocol::{
+            FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileVersion,
+            PermissionApprovalSource, PermissionExecution, PermissionRequest, PreparedFileChange,
+        };
+        use tickloop_harness::test_support::{ScriptedModel, config};
+        let directory = tempfile::tempdir().unwrap();
+        let agent = super::Agent::new_embedded(
+            config(),
+            std::sync::Arc::new(ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let base = agent.snapshot(chat).await.unwrap();
+        let version = |sha256: &str| FileVersion {
+            exists: true,
+            identity: None,
+            byte_len: 3,
+            line_count: 1,
+            ends_with_newline: false,
+            sha256: sha256.into(),
+        };
+        let file_change = PreparedFileChange {
+            summary: FileChangeReviewSummary {
+                action: FileChangeAction::Overwrite,
+                path: directory.path().join("notes.txt"),
+                before: version("before"),
+                after: version("after"),
+                added_lines: 1,
+                removed_lines: 1,
+                hunk_count: 1,
+            },
+            artifact: FileChangeArtifactRef {
+                path: directory.path().join("review.json"),
+                byte_len: 42,
+                sha256: "artifact".into(),
+            },
+        };
+        let requests = [
+            ("Bash", PermissionApprovalSource::PermissionPolicy, None),
+            ("Bash", PermissionApprovalSource::ExplicitAsk, None),
+            ("ExitPlanMode", PermissionApprovalSource::default(), None),
+            (
+                "Write",
+                PermissionApprovalSource::default(),
+                Some(Box::new(file_change)),
+            ),
+        ];
+        for (name, approval_source, file_change) in requests {
+            let mut snapshot = base.clone();
+            snapshot.permissions = vec![PermissionRequest {
+                parent_call: None,
+                mcp_server: None,
+                id: uuid::Uuid::new_v4(),
+                loop_id: uuid::Uuid::new_v4().into(),
+                execution: PermissionExecution::ToolCall {
+                    run_id: uuid::Uuid::new_v4().into(),
+                    call_id: "call".into(),
+                },
+                name: name.into(),
+                input: serde_json::json!({}),
+                file_change,
+                approval_reason: None,
+                approval_source,
+            }];
+
+            let request = super::peek_request(&snapshot).unwrap();
+
+            assert!(request.options.is_empty(), "{name}: {request:?}");
+            assert!(
+                request.prompt.starts_with("Permission required"),
+                "{name}: {request:?}"
+            );
+        }
         agent.shutdown().await;
     }
 

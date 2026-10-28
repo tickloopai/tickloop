@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent_console::{AgentState, AttentionGroup};
-use tickloop_harness::protocol::{LoopState, PermissionScope};
+use tickloop_harness::protocol::LoopState;
 use tickloop_harness::test_support::screen::SELECTED_MARK;
 
 const SHOWN_CHAT: Uuid = Uuid::from_u128(0x10);
@@ -101,11 +101,31 @@ fn question() -> PeekRequest {
     PeekRequest {
         request_id: QUESTION,
         prompt: "Which market should the research cover first?".into(),
-        choices: ["US", "HK"]
-            .into_iter()
-            .map(|label| (label.to_owned(), PeekChoice::Answer(label.into())))
-            .collect(),
+        options: vec!["US".into(), "HK".into()],
     }
+}
+
+/// The panel on the waiting Agent, showing `request` as drawn.
+fn peeking_at(request: PeekRequest, height: u16) -> Console {
+    let mut state = State::new(true, 100, height);
+    state.prompt_enabled = true;
+    state.chat = Some(SHOWN_CHAT);
+    let console = super::tests::console_with_state(state);
+    console
+        .set_global_overview(Some(AgentOverview {
+            rows: vec![row(WAITING, "Research NVDA", AgentState::NeedsInput)],
+            dispatch_directory: PathBuf::from("/work"),
+            created: None,
+            visible: None,
+        }))
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        select(&mut state, WAITING);
+        space(&mut state);
+    }
+    console.set_peek_request(WAITING, Some(request)).unwrap();
+    console
 }
 
 #[test]
@@ -196,8 +216,8 @@ fn a_waiting_agent_shows_its_question_how_long_it_waited_and_a_number_answers_it
     assert!(
         matches!(
             &event,
-            Some(InputEvent::PeekAnswer { agent_id, request_id, choice: PeekChoice::Answer(label) })
-                if *agent_id == WAITING && *request_id == QUESTION && label == "HK"
+            Some(InputEvent::PeekAnswer { agent_id, request_id, option })
+                if *agent_id == WAITING && *request_id == QUESTION && option == "HK"
         ),
         "{event:?}"
     );
@@ -213,55 +233,100 @@ fn a_waiting_agent_shows_its_question_how_long_it_waited_and_a_number_answers_it
 }
 
 #[test]
-fn a_permission_choice_carries_its_scope() {
-    let console = fleet();
-    let mut state = console.state.lock().unwrap();
-    select(&mut state, WAITING);
-    space(&mut state);
-    drop(state);
-    console
-        .set_peek_request(
-            WAITING,
-            Some(PeekRequest {
-                request_id: QUESTION,
-                prompt: "Permission required · Bash".into(),
-                choices: vec![
-                    (
-                        "Yes".into(),
-                        PeekChoice::Permission {
-                            allow: true,
-                            scope: PermissionScope::Once,
-                        },
-                    ),
-                    (
-                        "Yes, for this session".into(),
-                        PeekChoice::Permission {
-                            allow: true,
-                            scope: PermissionScope::Session,
-                        },
-                    ),
-                ],
-            }),
-        )
-        .unwrap();
-    let mut state = console.state.lock().unwrap();
-    type_text(&mut state, "2");
-
-    let event = state.key(key(KeyCode::Enter));
-
-    assert!(
-        matches!(
-            event,
-            Some(InputEvent::PeekAnswer {
-                choice: PeekChoice::Permission {
-                    allow: true,
-                    scope: PermissionScope::Session
-                },
-                ..
-            })
-        ),
-        "{event:?}"
+fn a_permission_request_takes_no_number_and_points_to_the_agents_own_view() {
+    let console = peeking_at(
+        PeekRequest {
+            request_id: QUESTION,
+            prompt: "Permission required · Bash".into(),
+            options: Vec::new(),
+        },
+        32,
     );
+    let mut state = console.state.lock().unwrap();
+    let frame = drawn(&mut state);
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("→ opens the Agent to answer")),
+        "{frame:#?}"
+    );
+    assert!(
+        !frame
+            .iter()
+            .any(|line| line.contains("1. ") || line.contains("for this session")),
+        "the panel offers no choice the Agent's own view decides: {frame:#?}"
+    );
+
+    for number in ["1", "2", "3"] {
+        type_text(&mut state, number);
+        assert!(
+            state.key(key(KeyCode::Enter)).is_none(),
+            "{number} must not approve anything"
+        );
+        assert!(
+            state.status.contains("Only the Agent's own view answers"),
+            "{}",
+            state.status
+        );
+        assert_eq!(state.editor.draft(), number, "the draft is kept");
+        state.editor.apply(EditorCommand::Clear);
+    }
+}
+
+#[test]
+fn a_number_answers_nothing_when_an_option_did_not_fit_on_screen() {
+    let long = "A market whose description runs far past the width of the panel, so that its line \
+                is cut before the user can read where it ends";
+    let console = peeking_at(
+        PeekRequest {
+            request_id: QUESTION,
+            prompt: "Which market?".into(),
+            options: vec!["US".into(), long.into()],
+        },
+        32,
+    );
+    let mut state = console.state.lock().unwrap();
+    drawn(&mut state);
+    type_text(&mut state, "1");
+
+    assert!(state.key(key(KeyCode::Enter)).is_none());
+    assert!(
+        state.status.contains("Not every option fits"),
+        "{}",
+        state.status
+    );
+    assert_eq!(state.editor.draft(), "1");
+    drop(state);
+
+    // A panel too short for its options answers nothing either.
+    let many = (1..=9).map(|index| format!("Market {index}")).collect();
+    let console = peeking_at(
+        PeekRequest {
+            request_id: QUESTION,
+            prompt: "Which market?".into(),
+            options: many,
+        },
+        32,
+    );
+    let mut state = console.state.lock().unwrap();
+    drawn(&mut state);
+    type_text(&mut state, "1");
+    assert!(state.key(key(KeyCode::Enter)).is_none());
+    assert!(
+        state.status.contains("Not every option fits"),
+        "{}",
+        state.status
+    );
+
+    // Every option whole on screen: the number answers.
+    let console = peeking_at(question(), 32);
+    let mut state = console.state.lock().unwrap();
+    drawn(&mut state);
+    type_text(&mut state, "1");
+    assert!(matches!(
+        state.key(key(KeyCode::Enter)),
+        Some(InputEvent::PeekAnswer { option, .. }) if option == "US"
+    ));
 }
 
 #[test]
