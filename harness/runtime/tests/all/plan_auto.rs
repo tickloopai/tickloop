@@ -11,8 +11,22 @@ pub(crate) fn agent_with_plan_setting(
     model: Arc<ScriptedModel>,
     use_auto_mode_during_plan: bool,
 ) -> Agent {
+    agent_with_plan_setting_and_subagents(
+        model,
+        use_auto_mode_during_plan,
+        tickloop_harness_runtime::SubagentLaunch::AlwaysBackground,
+    )
+}
+
+pub(crate) fn agent_with_plan_setting_and_subagents(
+    model: Arc<ScriptedModel>,
+    use_auto_mode_during_plan: bool,
+    subagent_launch: tickloop_harness_runtime::SubagentLaunch,
+) -> Agent {
     use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsSnapshot};
-    use tickloop_harness_runtime::{HarnessOptions, HarnessSeams, environment::FolderEnvironment};
+    use tickloop_harness_runtime::{
+        HarnessOptions, HarnessSeams, ToolPolicy, environment::FolderEnvironment,
+    };
     use tickloop_harness_test_support::harness::ChosenModels;
     let settings = MemorySettingsStore::new(SettingsSnapshot {
         use_auto_mode_during_plan,
@@ -28,6 +42,10 @@ pub(crate) fn agent_with_plan_setting(
         HarnessOptions {
             settings: Some(Arc::new(settings)),
             host: tickloop_harness_protocol::AgentHostOptions::embedded_defaults(),
+            tools: ToolPolicy {
+                subagent_launch,
+                ..ToolPolicy::local()
+            },
             ..HarnessOptions::local(config())
         },
     )
@@ -194,6 +212,164 @@ async fn plan_entered_through_the_tool_uses_auto_admission_only_after_auto() {
         let last = serde_json::to_string(&model.requests.lock().unwrap().last().unwrap().messages)
             .unwrap();
         assert!(last.contains("PLAN_NOTES"), "{label}");
+        agent.shutdown().await;
+    }
+}
+
+/// Serves the same HTML page to every request until dropped.
+struct PageServer {
+    url: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PageServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl PageServer {
+    async fn start() -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/guide", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = requests.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    }
+                }
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = "<h1>Guide</h1><p>GUIDE_PAGE</p>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+}
+
+/// As Claude Code's Plan with bypass available does, Plan entered from Full Access, here through
+/// the model's EnterPlanMode, allows what it would otherwise ask about: an outside `Read` and a
+/// `WebFetch` run without a prompt or review. Plan still refuses an edit, and an explicit Ask rule
+/// still asks.
+#[tokio::test]
+async fn plan_entered_from_full_access_allows_what_it_does_not_refuse() {
+    for ask_for_reads in [false, true] {
+        let external = tempfile::tempdir().unwrap();
+        let notes = external.path().join("notes.txt");
+        std::fs::write(&notes, "PLAN_NOTES").unwrap();
+        let page = PageServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let edited = dir.path().join("edited.txt");
+        let model = Arc::new(ScriptedModel::new(vec![
+            call("plan", "EnterPlanMode", json!({})),
+            call("read", "Read", json!({"file_path": notes})),
+            call(
+                "fetch",
+                "WebFetch",
+                json!({"url": page.url, "prompt": "Summarize"}),
+            ),
+            text("The guide says GUIDE_PAGE."),
+            call(
+                "edit",
+                "Write",
+                json!({"file_path": edited, "content": "changed"}),
+            ),
+            text("done"),
+        ]));
+        let agent = agent_with_plan_setting(model.clone(), true);
+        let reviewer = Arc::new(ScriptedModel::new(vec![]));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        let chat = agent.create_chat(dir.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        if ask_for_reads {
+            agent
+                .set_permission_rules(
+                    chat,
+                    vec![tickloop_harness_protocol::PermissionRule {
+                        id: uuid::Uuid::new_v4(),
+                        decision: tickloop_harness_protocol::Decision::Ask,
+                        tool: "Read".into(),
+                        specifier: None,
+                        input: None,
+                        loop_id: None,
+                        persistent: false,
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, "Plan from the notes".into())
+            .await
+            .unwrap();
+        let mut prompts = Vec::new();
+        let mut results = std::collections::HashMap::new();
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    prompts.push(request.name.clone());
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted {
+                    call_id, result, ..
+                } => {
+                    results.insert(call_id, result);
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let label = format!("ask_for_reads={ask_for_reads}");
+        let expected_prompts: &[&str] = if ask_for_reads { &["Read"] } else { &[] };
+        assert_eq!(prompts, expected_prompts, "{label}");
+        assert!(reviewer.requests.lock().unwrap().is_empty(), "{label}");
+        assert!(results["read"].content.contains("PLAN_NOTES"), "{label}");
+        assert!(
+            !results["fetch"].is_error,
+            "{label} {}",
+            results["fetch"].content
+        );
+        assert_eq!(
+            page.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{label}"
+        );
+        assert!(results["edit"].is_error, "{label}");
+        assert!(
+            results["edit"].content.starts_with("Plan mode is active."),
+            "{label} {}",
+            results["edit"].content
+        );
+        assert!(!edited.exists(), "{label}");
+        assert_eq!(
+            agent.snapshot(chat).await.unwrap().policy.mode,
+            ExecutionMode::Plan,
+            "{label}"
+        );
         agent.shutdown().await;
     }
 }

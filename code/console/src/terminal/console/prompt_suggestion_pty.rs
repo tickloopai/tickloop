@@ -31,7 +31,7 @@ fn prompt_suggestion_pty_fixture() {
                     model.api_key_env.clear();
                     let replies = if user_case {
                         vec![
-                            tickloop_harness::test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child"})),
+                            tickloop_harness::test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child","run_in_background":false})),
                             tickloop_harness::test_support::call("child-report", "SubagentHandback", serde_json::json!({"message":"Child completed."})),
                             tickloop_harness::test_support::text("Parent completed."),
                             tickloop_harness::test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
@@ -54,9 +54,12 @@ fn prompt_suggestion_pty_fixture() {
                     };
                     let scripted =
                         Arc::new(tickloop_harness::test_support::ScriptedModel::new(replies));
-                    let core = tickloop_harness::runtime::Agent::new_embedded(
+                    // The scripted replies need the parent to wait for its child, which only a
+                    // non-interactive host offers.
+                    let core = tickloop_harness::runtime::Agent::new_embedded_with_subagent_launch(
                         model.clone(),
                         scripted.clone(),
+                        tickloop_harness::runtime::SubagentLaunch::BackgroundByDefault,
                     );
                     core.install_own_tickhost();
                     core.set_auto_reviewer(Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![

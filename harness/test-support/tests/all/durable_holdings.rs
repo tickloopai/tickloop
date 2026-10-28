@@ -825,7 +825,7 @@ async fn a_child_stream_past_the_ceiling_reports_once_to_its_waiting_parent_afte
             _ if !has_tool_result(request, "delegate") => Reply::Now(call(
                 "delegate",
                 "Subagent",
-                json!({"task": "child", "name": "writer"}),
+                json!({"task": "child", "name": "writer", "run_in_background": false}),
             )),
             _ => Reply::Now(text(DONE)),
         }
@@ -1457,7 +1457,7 @@ async fn repeated_family_holdings_and_handovers_leave_no_task_behind() {
             None if !has_tool_result(request, &delegate) => Reply::Now(call(
                 &delegate,
                 "Subagent",
-                json!({"task": format!("child {turns}"), "name": format!("writer{turns}")}),
+                json!({"task": format!("child {turns}"), "name": format!("writer{turns}"), "run_in_background": false}),
             )),
             None => Reply::Now(text(DONE)),
         }

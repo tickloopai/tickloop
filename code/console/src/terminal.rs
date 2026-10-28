@@ -20,6 +20,7 @@ mod artifact_ui;
 mod artifacts_picker;
 pub mod attach;
 mod auto_setup_surface;
+mod background_work;
 #[cfg(test)]
 mod child_config_tests;
 mod clipboard;
@@ -935,6 +936,7 @@ Saved Chats and their files are never removed automatically.
 Built-in /model choices and persistent rules are saved in settings.json there; model definitions are owned by the program version.
 
 Enter a task; follow-up inputs are accepted while the current run continues.
+With piped input, tickloop exits once its input and turns are done and its Subagents have finished and reported; a longer wait is announced on stderr, and ctrl+c exits at once.
 Queued messages, commands and Shell input appear above the editor; up on the first visual row restores editable queued input.
 While the Agent works, enter queues a message for its next tool boundary; ctrl+enter send now interrupts the turn and sends it at once, or with empty input the oldest queued message. Idle, ctrl+enter is enter.
 ctrl+enter needs a terminal that reports it (kitty keyboard protocol: Ghostty, kitty, WezTerm, iTerm2 with CSI u, or Herdr inside one); elsewhere enter then esc does the same, since esc interrupts and queued messages start right away.
@@ -2083,6 +2085,9 @@ async fn interact_with_herdr(
     let mut loop_trigger_notices: Vec<(ChatId, String)> = Vec::new();
     let mut displayed_sequences: HashMap<uuid::Uuid, u64> = HashMap::new();
     let mut eof = false;
+    let mut background_work = background_work::BackgroundWork::default();
+    let mut background_poll = tokio::time::interval(background_work::POLL_INTERVAL);
+    background_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut failed = false;
     let mut status_dirty = true;
     let mut completed_task_retention = completed_tasks::CompletedTaskRetention::default();
@@ -2813,7 +2818,11 @@ async fn interact_with_herdr(
         {
             return Err(message);
         }
-        if pending.is_empty()
+        // Runs of other family members the View follows are background work, as are the
+        // completions they leave; a piped View waits for those as Claude Code's print mode does.
+        let is_own_work_done = pending
+            .values()
+            .all(|receipt| !interactive && Some(receipt.chat_id) != selected_chat)
             && compactions.is_empty()
             && directed_summaries.is_empty()
             && deferred_events.is_empty()
@@ -2821,8 +2830,12 @@ async fn interact_with_herdr(
             && logins.is_empty()
             && logout.is_none()
             && paused_inputs.is_empty()
-            && menu_commands.is_empty()
-            && eof
+            && menu_commands.is_empty();
+        if !is_own_work_done {
+            background_work.note_busy();
+        } else if eof
+            && (interactive || !background_work.keeps_open(agent, selected_chat).await)
+            && pending.is_empty()
         {
             return view_exit(interactive, failed);
         }
@@ -2976,6 +2989,7 @@ async fn interact_with_herdr(
         #[cfg(not(test))]
         let global_refresh_enabled = true;
         tokio::select! {
+            _ = background_poll.tick(), if background_work.is_waiting() => {},
             _ = activation_refresh.tick(), if interactive && activation_checks.is_empty() => {
                 let initial = std::mem::take(&mut initial_activation);
                 activation_checks.spawn(runtime_upgrade::check(agent.clone(), initial));

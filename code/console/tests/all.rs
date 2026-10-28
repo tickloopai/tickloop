@@ -12,5 +12,7 @@ mod artifact_auto_attachment;
 mod delegation;
 #[path = "all/monitor_membership.rs"]
 mod monitor_membership;
+#[path = "all/non_interactive.rs"]
+mod non_interactive;
 #[path = "all/tick_adapters.rs"]
 mod tick_adapters;

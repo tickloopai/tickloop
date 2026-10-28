@@ -339,7 +339,13 @@ impl Agent {
             {
                 continue;
             }
-            if registry.is_concurrency_safe(&call.name, &call.input, &workspace, self.inner.waits) {
+            if registry.is_concurrency_safe(
+                &call.name,
+                &call.input,
+                &workspace,
+                self.inner.waits,
+                self.inner.tool_policy.subagent_launch,
+            ) {
                 concurrent.push(call);
                 continue;
             }

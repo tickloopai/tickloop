@@ -3,7 +3,7 @@ use tickloop_code_settings::local_agent::LocalAgent;
 
 use serde_json::json;
 use tickloop_harness::protocol::{EventKind, MAX_SUBAGENT_DEPTH};
-use tickloop_harness::runtime::Agent;
+use tickloop_harness::runtime::{Agent, SubagentLaunch};
 use tickloop_harness::test_support::{ScriptedModel, call, config, text};
 
 #[derive(Default)]
@@ -56,11 +56,15 @@ async fn root_plan_mode_blocks_an_existing_grandchilds_host_mutation() {
     use tickloop_harness::protocol::{ExecutionMode, QuestionAnswer};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("a", "Subagent", json!({"task":"delegate", "name":"a"})),
+        call(
+            "a",
+            "Subagent",
+            json!({"task":"delegate", "name":"a", "run_in_background":false}),
+        ),
         call(
             "b",
             "Subagent",
-            json!({"task":"check then mutate", "name":"b"}),
+            json!({"task":"check then mutate", "name":"b", "run_in_background":false}),
         ),
         call(
             "question",
@@ -72,7 +76,11 @@ async fn root_plan_mode_blocks_an_existing_grandchilds_host_mutation() {
         text("parent done"),
         text("root done"),
     ]));
-    let core = Agent::new_embedded(config(), model);
+    let core = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model,
+        SubagentLaunch::BackgroundByDefault,
+    );
     let host = Arc::new(MutatingHost::default());
     core.install_host_tools(host.clone()).unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
@@ -222,8 +230,16 @@ async fn grandparent_denial_wins_over_a_pending_grandchild_approval() {
     use tickloop_harness::protocol::{Decision, ExecutionMode, PermissionRule};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("a", "Subagent", json!({"task":"delegate", "name":"a"})),
-        call("b", "Subagent", json!({"task":"write report", "name":"b"})),
+        call(
+            "a",
+            "Subagent",
+            json!({"task":"delegate", "name":"a", "run_in_background":false}),
+        ),
+        call(
+            "b",
+            "Subagent",
+            json!({"task":"write report", "name":"b", "run_in_background":false}),
+        ),
         call(
             "write",
             "Write",
@@ -233,7 +249,11 @@ async fn grandparent_denial_wins_over_a_pending_grandchild_approval() {
         text("A done"),
         text("root done"),
     ]));
-    let core = Agent::new_embedded(config(), model);
+    let core = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model,
+        SubagentLaunch::BackgroundByDefault,
+    );
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::FullAccess)
         .await
@@ -341,9 +361,11 @@ fn background_family_model() -> Arc<tickloop_harness::test_support::routed::Rout
                 single_question("Wait for the user"),
             ),
             Some("leaf") => text("leaf report"),
-            _ if !has_tool_result(request, "a") => {
-                call("a", "Subagent", json!({"task":"parent","name":"a"}))
-            }
+            _ if !has_tool_result(request, "a") => call(
+                "a",
+                "Subagent",
+                json!({"task":"parent","name":"a","run_in_background":false}),
+            ),
             _ => text("root report"),
         },
     ))
@@ -354,7 +376,11 @@ async fn delegated_parent_waits_for_its_background_child_without_model_polling()
     use tickloop_harness::protocol::QuestionAnswer;
     let directory = tempfile::tempdir().unwrap();
     let model = background_family_model();
-    let core = Agent::new_embedded(config(), model.clone());
+    let core = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     core.submit(root, "start".into()).await.unwrap();
@@ -461,15 +487,31 @@ async fn stopping_a_member_cancels_its_waiting_descendants() {
 async fn three_levels_keep_direct_parents_and_one_flat_family() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("a", "Subagent", json!({"task":"delegate to b", "name":"a"})),
-        call("b", "Subagent", json!({"task":"delegate to c", "name":"b"})),
-        call("c", "Subagent", json!({"task":"report", "name":"c"})),
+        call(
+            "a",
+            "Subagent",
+            json!({"task":"delegate to b", "name":"a", "run_in_background":false}),
+        ),
+        call(
+            "b",
+            "Subagent",
+            json!({"task":"delegate to c", "name":"b", "run_in_background":false}),
+        ),
+        call(
+            "c",
+            "Subagent",
+            json!({"task":"report", "name":"c", "run_in_background":false}),
+        ),
         text("C report"),
         text("B report"),
         text("A report"),
         text("root report"),
     ]));
-    let core = Agent::new_embedded(config(), model.clone());
+    let core = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let run = core
@@ -541,13 +583,26 @@ async fn restoring_only_a_grandchild_loads_all_ancestors_without_running_models(
     let store = tempfile::tempdir().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        call("a", "Subagent", json!({"task":"delegate", "name":"a"})),
-        call("b", "Subagent", json!({"task":"report", "name":"b"})),
+        call(
+            "a",
+            "Subagent",
+            json!({"task":"delegate", "name":"a", "run_in_background":false}),
+        ),
+        call(
+            "b",
+            "Subagent",
+            json!({"task":"report", "name":"b", "run_in_background":false}),
+        ),
         text("B done"),
         text("A done"),
         text("root done"),
     ]));
-    let core = Agent::open_embedded(store.path().into(), config(), model).unwrap();
+    let core = super::support::open_waiting_agent(
+        store.path().into(),
+        config(),
+        model,
+        tickloop_harness::protocol::AgentHostOptions::embedded_defaults(),
+    );
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let run = core.submit(root, "delegate".into()).await.unwrap();

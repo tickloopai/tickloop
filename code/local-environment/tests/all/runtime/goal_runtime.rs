@@ -18,7 +18,7 @@ use tickloop_harness::protocol::{
     ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalBlock, GoalPause, GoalSnapshot,
     GoalStatus, ModelIdentity, QuestionAnswer, Role, Usage,
 };
-use tickloop_harness::runtime::Agent;
+use tickloop_harness::runtime::{Agent, SubagentLaunch};
 use tickloop_harness::test_support::{ScriptedModel, call, config, single_question, text};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
@@ -1643,7 +1643,11 @@ async fn a_child_inherits_the_users_goal_as_its_auto_review_authorization() {
     const CHILD_COMMAND: &str = "touch child-export.txt";
     let model = HoldingModel::new(
         vec![
-            call("s1", "Subagent", json!({"task": "write the export"})),
+            call(
+                "s1",
+                "Subagent",
+                json!({"task": "write the export", "run_in_background": false}),
+            ),
             call("b1", "Bash", json!({"command": CHILD_COMMAND})),
             call(
                 "h1",
@@ -1659,7 +1663,11 @@ async fn a_child_inherits_the_users_goal_as_its_auto_review_authorization() {
     let allow = tickloop_harness::test_support::auto_classification(false).to_string();
     let checker = Arc::new(ScriptedModel::new(vec![text(&allow); 3]));
     let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     approve_everything(&agent);
     agent.set_auto_reviewer(checker.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -1693,7 +1701,11 @@ async fn a_child_stops_weighing_a_goal_the_user_cleared_or_edited_since_its_dele
         },
     ] {
         let mut replies = vec![
-            call("s1", "Subagent", json!({"task": "write the export"})),
+            call(
+                "s1",
+                "Subagent",
+                json!({"task": "write the export", "run_in_background": false}),
+            ),
             call(
                 "m1",
                 "SendMessage",
@@ -1712,7 +1724,11 @@ async fn a_child_stops_weighing_a_goal_the_user_cleared_or_edited_since_its_dele
         let allow = tickloop_harness::test_support::auto_classification(false).to_string();
         let checker = Arc::new(ScriptedModel::new(vec![text(&allow); 4]));
         let directory = tempfile::tempdir().unwrap();
-        let agent = Agent::new_embedded(config(), model.clone());
+        let agent = Agent::new_embedded_with_subagent_launch(
+            config(),
+            model.clone(),
+            SubagentLaunch::BackgroundByDefault,
+        );
         approve_everything(&agent);
         agent.set_auto_reviewer(checker.clone()).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -1764,7 +1780,11 @@ async fn a_child_stops_weighing_a_goal_the_user_cleared_or_edited_since_its_dele
 /// A continuation that delegates once, the child sending a message its Auto review weighs.
 fn delegating_replies() -> Vec<Vec<Content>> {
     vec![
-        call("s1", "Subagent", json!({"task": "write the export"})),
+        call(
+            "s1",
+            "Subagent",
+            json!({"task": "write the export", "run_in_background": false}),
+        ),
         call(
             "m1",
             "SendMessage",
@@ -1807,7 +1827,11 @@ async fn a_child_delegated_after_an_edit_weighs_the_edited_goal() {
     let model = HoldingModel::new(delegating_replies(), Vec::new());
     let checker = allowing_checker();
     let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(config(), model.clone());
+    let agent = Agent::new_embedded_with_subagent_launch(
+        config(),
+        model.clone(),
+        SubagentLaunch::BackgroundByDefault,
+    );
     approve_everything(&agent);
     agent.set_auto_reviewer(checker.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -1862,7 +1886,12 @@ async fn a_child_delegated_after_a_restore_weighs_the_goal() {
 
     let model = HoldingModel::new(delegating_replies(), Vec::new());
     let checker = allowing_checker();
-    let restored = Agent::open(root.path().into(), config(), model.clone()).unwrap();
+    let restored = super::support::open_waiting_agent(
+        root.path().into(),
+        config(),
+        model.clone(),
+        tickloop_harness::protocol::AgentHostOptions::default(),
+    );
     approve_everything(&restored);
     restored.set_auto_reviewer(checker.clone()).await;
     restored.resume_chat(chat).await.unwrap();

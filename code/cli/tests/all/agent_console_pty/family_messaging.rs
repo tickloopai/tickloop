@@ -1,29 +1,6 @@
 use super::*;
 use tickloop_harness::test_support::screen::SELECTED_MARK;
 
-fn request_state(request: &Value) -> Value {
-    request["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|message| {
-            (message["role"] == "system")
-                .then(|| message["content"].as_str())
-                .flatten()
-                .and_then(|text| text.rsplit_once("Current host state: "))
-                .and_then(|(_, state)| serde_json::from_str(state).ok())
-        })
-        .expect("real model host state")
-}
-
-fn has_result(request: &Value, id: &str) -> bool {
-    request["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["tool_call_id"] == id)
-}
-
 async fn run_family_messaging(fixture: &PrivateFixture) {
     let (url, mut requests) = model_http_support::serve_router(|request| {
         let state = request_state(request);
@@ -379,7 +356,15 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
                 "",
             );
         }
-        chat_reply(None, "REPORT-FLOW-FINISHED")
+        // The child runs in the background: the root finishes once its report arrives.
+        if request["messages"]
+            .to_string()
+            .contains("PTY-HANDBACK-REPORT")
+        {
+            chat_reply(None, "REPORT-FLOW-FINISHED")
+        } else {
+            chat_reply(None, "Report delegated")
+        }
     })
     .await;
     fixture.set_chat_model(&url);
@@ -394,12 +379,14 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
         .await;
     for shown in [
         "⏺ Subagent(@peer · Return the fixture report)",
-        "⎿  SECURITY WARNING: auto review flagged this subagent's report.",
+        "⎿  Backgrounded agent",
+        "⏺ Teammate @peer finished",
+        "SECURITY WARNING: auto review flagged this subagent's report.",
         "PTY-HANDBACK-REPORT",
     ] {
         assert!(
             finished.contains(shown),
-            "the report sits under its call: {finished}"
+            "the report shows with the child's completion: {finished}"
         );
     }
     for hidden in ["delivered its report", "Subagent hand-back", "Message from"] {

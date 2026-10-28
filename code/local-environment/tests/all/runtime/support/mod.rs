@@ -1,7 +1,46 @@
 pub mod provider_transport;
 pub mod tick_admission_contract;
 
-use tickloop_harness::model::ModelRequest;
+use std::{path::PathBuf, sync::Arc};
+use tickloop_code_settings::UserSettings;
+use tickloop_harness::model::{ModelClient, ModelRequest};
+use tickloop_harness::protocol::{AgentHostOptions, ModelConfig};
+use tickloop_harness::runtime::{
+    Agent, HarnessOptions, HarnessSeams, SubagentLaunch, ToolPolicy,
+    environment::FolderEnvironment, transcript::JsonlTranscriptStore,
+};
+use tickloop_harness::test_support::harness::ChosenModels;
+
+/// `LocalAgent::open_with_options` on a non-interactive host, where a Subagent call that passes
+/// `run_in_background: false` still waits for its child's report.
+pub fn open_waiting_agent(
+    root: PathBuf,
+    model: ModelConfig,
+    client: Arc<dyn ModelClient>,
+    host: AgentHostOptions,
+) -> Agent {
+    let store = JsonlTranscriptStore::open(root).unwrap();
+    let root = store.root().to_owned();
+    Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(Arc::new(store)),
+            environment: Some(Arc::new(FolderEnvironment::bare())),
+            models: ChosenModels::new(client),
+        },
+        HarnessOptions {
+            settings: Some(Arc::new(UserSettings::in_root(&root))),
+            local_state_root: Some(root),
+            host,
+            tools: ToolPolicy {
+                subagent_launch: SubagentLaunch::BackgroundByDefault,
+                ..ToolPolicy::local()
+            },
+            ..HarnessOptions::local(model)
+        },
+    )
+    .unwrap()
+}
 
 pub fn model_script_requests(
     snapshot: &tickloop_harness::protocol::ChatSnapshot,

@@ -257,7 +257,7 @@ fn foreground_family() -> Arc<RoutedModel> {
             _ if !has_tool_result(request, "delegate") => call(
                 "delegate",
                 "Subagent",
-                json!({"task": "child", "name": "writer"}),
+                json!({"task": "child", "name": "writer", "run_in_background": false}),
             ),
             _ => text("Report ready."),
         }
@@ -1044,7 +1044,7 @@ fn member_claiming_task() -> Arc<RoutedModel> {
             return call(
                 "delegate",
                 "Subagent",
-                json!({"task":"prepare the report", "name":"writer"}),
+                json!({"task":"prepare the report", "name":"writer", "run_in_background":false}),
             );
         }
         text("Report delivered.")

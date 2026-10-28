@@ -276,6 +276,36 @@ pub async fn serve_router_with_status(
     (format!("http://{address}/anthropic"), receiver)
 }
 
+/// Routes each request to the body `reply` chooses for it, written once the gate `reply` returns
+/// with it opens; a request without a gate is answered at once, and others go on meanwhile.
+pub async fn serve_router_with_gates(
+    mut reply: impl FnMut(&Value) -> (String, Option<oneshot::Receiver<()>>) + Send + 'static,
+) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, request) = accept_script_request(&listener).await;
+            let (response, gate) = reply(&request.1);
+            if sender.send(request).is_err() {
+                break;
+            }
+            match gate {
+                Some(gate) => {
+                    tokio::spawn(async move {
+                        if gate.await.is_ok() {
+                            write_response(&mut socket, 200, "", &response).await;
+                        }
+                    });
+                }
+                None => write_response(&mut socket, 200, "", &response).await,
+            }
+        }
+    });
+    (format!("http://{address}/anthropic"), receiver)
+}
+
 fn header_lines(headers: &[(&str, &str)]) -> String {
     headers
         .iter()

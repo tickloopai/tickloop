@@ -28,7 +28,8 @@ pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
 
 pub use harness::{
     CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
-    Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits, durable_chat_host_rules,
+    Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
+    durable_chat_host_rules,
 };
 mod host_context;
 mod host_notes;
@@ -2011,6 +2012,30 @@ impl Agent {
         host_options: AgentHostOptions,
     ) -> Self {
         Self::new_local(model, client, None, host_options)
+    }
+
+    /// `new_embedded` for a host whose Subagents run as `subagent_launch` says, such as a
+    /// non-interactive one where the model may wait for a child's report.
+    pub fn new_embedded_with_subagent_launch(
+        model: ModelConfig,
+        client: Arc<dyn ModelClient>,
+        subagent_launch: SubagentLaunch,
+    ) -> Self {
+        Self::build(
+            HarnessOptions {
+                host: AgentHostOptions::embedded_defaults(),
+                tools: ToolPolicy {
+                    subagent_launch,
+                    ..ToolPolicy::local()
+                },
+                ..HarnessOptions::local(model)
+            },
+            Arc::new(harness::OneClient(client.clone())),
+            client,
+            None,
+            Some(Arc::new(environment::FolderEnvironment::bare())),
+            None,
+        )
     }
 
     /// An Agent on this computer's files that keeps no Transcript.
@@ -5583,7 +5608,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(plan::definitions(false, false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())
-        .chain(delegation::definitions())
+        .chain(delegation::definitions(SubagentLaunch::AlwaysBackground))
         .chain(agent_messages::definitions())
         .map(|definition| definition.name)
         .chain(std::iter::once(
