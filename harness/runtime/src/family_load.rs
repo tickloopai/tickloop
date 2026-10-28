@@ -528,6 +528,7 @@ fn lost_completion(
         triggering_message_ids: Vec::new(),
         notification: SubagentNotificationDelivery::Foreground,
         usage: Default::default(),
+        total_tokens: None,
         run_status: Some(tickloop_harness_protocol::ChildRunStatus::Failed),
     }
 }

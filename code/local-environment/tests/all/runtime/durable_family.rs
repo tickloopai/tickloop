@@ -837,6 +837,7 @@ async fn a_pending_completion_of_a_foreground_call_is_returned_not_notified() {
             triggering_message_ids: Vec::new(),
             notification: SubagentNotificationDelivery::Pending,
             usage: Default::default(),
+            total_tokens: None,
             run_status: Some(tickloop_harness::protocol::ChildRunStatus::Completed),
         }],
     }));

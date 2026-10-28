@@ -159,6 +159,13 @@ impl RequestUsageRecord {
             input.saturating_sub(self.usage.cache_read_input_tokens.unwrap_or(0))
         })
     }
+
+    /// Every token the request carried, its whole input, cached or not, and its output: what
+    /// Claude Code counts as a request's total tokens.
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.context_input_tokens()?
+            .checked_add(self.usage.output_tokens?)
+    }
 }
 
 /// The in-process request usage ledger. Following Claude Code, usage is recorded only on assistant
@@ -551,11 +558,7 @@ impl RequestUsageLedger {
 
     pub fn run_conversation_usage(&self, run_id: RunId) -> Result<Usage, LedgerError> {
         let mut counters = [CounterSummary::default(); 4];
-        for record in self.entries.iter().filter(|record| {
-            record.run_id == Some(run_id)
-                && record.kind == ModelRequestKind::Conversation
-                && record.outcome == RequestOutcome::Accepted
-        }) {
+        for record in self.run_conversation_records(run_id) {
             for (summary, counter) in counters.iter_mut().zip(UsageCounter::ALL) {
                 summary.include(counter.value(&record.usage));
             }
@@ -566,6 +569,20 @@ impl RequestUsageLedger {
             cache_read_input_tokens: counters[2].run_total(UsageCounter::CacheRead)?,
             cache_write_input_tokens: counters[3].run_total(UsageCounter::CacheWrite)?,
             reasoning_output_tokens: None,
+        })
+    }
+
+    /// The total tokens of the run's last accepted conversation request: the context it ended
+    /// with and its last output, as Claude Code reports a finished Subagent's tokens.
+    pub fn run_final_total_tokens(&self, run_id: RunId) -> Option<u64> {
+        self.run_conversation_records(run_id).last()?.total_tokens()
+    }
+
+    fn run_conversation_records(&self, run_id: RunId) -> impl Iterator<Item = &RequestUsageRecord> {
+        self.entries.iter().filter(move |record| {
+            record.run_id == Some(run_id)
+                && record.kind == ModelRequestKind::Conversation
+                && record.outcome == RequestOutcome::Accepted
         })
     }
 
@@ -1198,6 +1215,90 @@ mod tests {
                 cache_write_input_tokens: Some(0),
                 reasoning_output_tokens: None,
             }
+        );
+    }
+
+    /// Claude Code's finished Subagent tokens: the last request's whole input and its output.
+    /// Messages reports cache reads and writes apart from `input_tokens`; the other protocols
+    /// count them within it.
+    #[test]
+    fn run_final_total_tokens_count_the_last_request_with_its_cached_input() {
+        let total = |protocol, usages: &[Usage]| {
+            let mut ledger = RequestUsageLedger::new();
+            for usage in usages {
+                request(
+                    &mut ledger,
+                    ModelRequestKind::Conversation,
+                    ModelIdentity {
+                        protocol,
+                        ..identity()
+                    },
+                    usage.clone(),
+                    RequestOutcome::Accepted,
+                );
+            }
+            for (kind, outcome) in [
+                (ModelRequestKind::Conversation, RequestOutcome::Cancelled),
+                (ModelRequestKind::PermissionCheck, RequestOutcome::Accepted),
+            ] {
+                request(
+                    &mut ledger,
+                    kind,
+                    identity(),
+                    Usage {
+                        input_tokens: Some(1_000),
+                        output_tokens: Some(1_000),
+                        ..Usage::default()
+                    },
+                    outcome,
+                );
+            }
+            ledger.run_final_total_tokens(owner().run_id.unwrap())
+        };
+        let usage = |input, read, write| Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(50),
+            cache_read_input_tokens: read,
+            cache_write_input_tokens: write,
+            reasoning_output_tokens: None,
+        };
+        assert_eq!(
+            total(
+                Protocol::Messages,
+                &[
+                    usage(10, Some(0), Some(4_000)),
+                    usage(20, Some(4_000), Some(300))
+                ]
+            ),
+            Some(4_370)
+        );
+        for protocol in [Protocol::Responses, Protocol::ChatCompletions] {
+            assert_eq!(
+                total(
+                    protocol,
+                    &[
+                        usage(4_010, Some(0), Some(4_000)),
+                        usage(4_320, Some(4_000), None)
+                    ]
+                ),
+                Some(4_370),
+                "{protocol:?}"
+            );
+        }
+        assert_eq!(total(Protocol::Messages, &[]), None);
+        assert_eq!(
+            total(
+                Protocol::Messages,
+                &[
+                    usage(10, None, None),
+                    Usage {
+                        output_tokens: None,
+                        ..usage(10, None, None)
+                    }
+                ]
+            ),
+            None,
+            "a last request without its output leaves the total unknown"
         );
     }
 

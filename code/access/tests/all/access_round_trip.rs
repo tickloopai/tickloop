@@ -43,6 +43,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
                 output_tokens: Some(7),
                 ..Default::default()
             },
+            total_tokens: Some(18),
             child_chat_id: tickloop_ids::Id::from(Uuid::new_v4()),
             child_loop_id: tickloop_ids::Id::from(Uuid::new_v4()),
             child_run_id: tickloop_ids::Id::from(Uuid::new_v4()),
