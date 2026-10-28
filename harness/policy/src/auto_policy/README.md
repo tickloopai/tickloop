@@ -154,6 +154,9 @@ repository content or Harness Settings Store configuration.
 
 No rules are added or removed: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, with eight
 inapplicable native entries. Policy and built-in group version **9** records this mapping change.
-Agent tests in `code/local-environment/tests/all/sandbox.rs` use ScriptedModel and a reviewer double
-to check both admission and rejection, including normally safe commands. This is routing evidence,
-not semantic acceptance by a real review model.
+Portable Agent tests in `harness/runtime/tests/all/environment_approval.rs` use the reference
+Execution Environment, ScriptedModel and a reviewer double. Local integration tests in
+`code/local-environment/tests/all/sandbox.rs` cover the settings and actual macOS execution.
+Both verify admission and rejection, including normally safe commands. This is routing evidence,
+not semantic acceptance by a real review model. The conditional escape hint is appended by Code
+using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.

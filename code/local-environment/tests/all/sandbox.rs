@@ -1,7 +1,10 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::Arc;
-use tickloop_code_local_environment::{environment::LocalEnvironment, hosted::shells::OwnTickhost};
+use tickloop_code_local_environment::{
+    environment::LocalEnvironment,
+    hosted::shells::{OwnTickhost, ShellGrants},
+};
 use tickloop_code_settings::UserSettings;
 use tickloop_harness::{
     protocol::{ChatId, EventKind, ExecutionMode, ToolResult},
@@ -969,5 +972,121 @@ async fn unsandboxed_calls_keep_explicit_ask_and_deny_ahead_of_auto_review() {
             );
             assert!(reviewer.requests.lock().unwrap().is_empty());
         }
+    }
+}
+
+struct Ticket05Grants(OwnTickhost);
+
+#[async_trait::async_trait]
+impl ShellGrants for Ticket05Grants {
+    async fn allow_spawn(
+        &self,
+        chat: uuid::Uuid,
+        operation: uuid::Uuid,
+        approval: tickhost::shell::ShellApproval,
+    ) -> Result<
+        tickloop_code_local_environment::hosted::worker_control::IssuedSpawn,
+        tickhost_connect::host_error::HostError,
+    > {
+        // The occupied 10.1 host accepts precisely these SandboxPolicy fields.
+        if let Some(policy) = &approval.sandbox {
+            let wire = serde_json::to_value(policy).unwrap();
+            for field in wire.as_object().unwrap().keys() {
+                if ![
+                    "writable_roots",
+                    "deny_write",
+                    "protected_paths",
+                    "denied_path_patterns",
+                    "network",
+                ]
+                .contains(&field.as_str())
+                {
+                    return Err(tickhost_connect::host_error::HostError::before(
+                        "InvalidParams",
+                        format!("10.1 rejects unknown sandbox field {field}"),
+                    ));
+                }
+            }
+        }
+        self.0.allow_spawn(chat, operation, approval).await
+    }
+
+    async fn allow_view(
+        &self,
+        chat: uuid::Uuid,
+        instance: &tick_protocol::InstanceRef,
+    ) -> Result<tickloop_harness::protocol::HostedViewGrant, tickhost_connect::host_error::HostError>
+    {
+        self.0.allow_view(chat, instance).await
+    }
+}
+
+#[tokio::test]
+async fn sandbox_escape_guidance_preserves_ticket05_host_wire_compatibility() {
+    let mut fixture =
+        SandboxFixture::new(serde_json::json!({"enabled":true,"failIfUnavailable":true}));
+    fixture.environment =
+        LocalEnvironment::with_shells(Arc::new(Ticket05Grants(OwnTickhost::new())))
+            .with_sandbox(fixture.settings.clone());
+    let (agent, chat) = fixture
+        .agent(
+            serde_json::json!({"command":"printf compatible > inside"}),
+            ExecutionMode::AcceptEdits,
+        )
+        .await;
+    let (_, result) = fixture.run_with_human_approval(&agent, chat, true).await;
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.folder.as_ref().unwrap().join("inside")).unwrap(),
+        "compatible"
+    );
+}
+
+#[tokio::test]
+async fn unsandboxed_exclusions_recognize_assignments_and_safe_wrappers() {
+    let fixture = SandboxFixture::new(serde_json::json!({
+        "enabled":true,"failIfUnavailable":true,"excludedCommands":["pwd:*"]
+    }));
+    for (command, excluded) in [
+        ("FOO=bar pwd", true),
+        ("FOO='a b' pwd", true),
+        ("FOO=x=y pwd", true),
+        ("FOO+=x pwd", true),
+        ("time FOO=bar nice -n 0 pwd", true),
+        (
+            "timeout --signal TERM --kill-after=2s 30s FOO=bar pwd",
+            true,
+        ),
+        ("nohup -- timeout -k2 -s TERM 5 pwd", true),
+        ("stdbuf -oL pwd", true),
+        ("PATH=/tmp pwd", false),
+        ("LD_PRELOAD=x pwd", false),
+        ("DYLD_LIBRARY_PATH=x pwd", false),
+        ("FOO=$(printf x) pwd", false),
+        ("timeout --unknown 5 pwd", false),
+        ("time echo pwd", false),
+        ("printf 'timeout 30 pwd'", false),
+        ("nice -n nope pwd", false),
+        ("timeout30 pwd", false),
+        ("timeout 30ss pwd", false),
+        ("timeout 30 -- pwd", false),
+        ("FOO=bar -- pwd", false),
+    ] {
+        let prepared = fixture.prepare(command).await;
+        let facts = prepared.0.approval_facts();
+        assert_eq!(
+            facts.requires_approval.unwrap_or(false),
+            excluded,
+            "{command}"
+        );
+        assert_eq!(
+            facts.isolation.unwrap().writes,
+            if excluded {
+                WriteIsolation::Unrestricted
+            } else {
+                WriteIsolation::FolderAndDirectories
+            },
+            "{command}"
+        );
     }
 }

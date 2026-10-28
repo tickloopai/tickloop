@@ -7,14 +7,11 @@ use std::{
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DENIAL_SCAN_BYTES: u64 = 64 * 1024;
-const ESCAPE_HINT: &str = "；可用 dangerouslyDisableSandbox: true 申请在沙箱外运行，仍须正常审批";
-const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
+pub const DENIAL_NOTE: &str = "被沙箱拦截（根据权限拒绝输出推测）";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxPolicy {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_unsandboxed_commands: bool,
     pub writable_roots: Vec<PathBuf>,
     pub deny_write: Vec<PathBuf>,
     pub protected_paths: Vec<PathBuf>,
@@ -147,7 +144,7 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-pub(crate) fn annotate_denial(output: &std::fs::File, allow_unsandboxed_commands: bool) {
+pub(crate) fn annotate_denial(output: &std::fs::File) {
     use std::{io::Write, os::unix::fs::FileExt};
     let Ok(length) = output.metadata().map(|metadata| metadata.len()) else {
         return;
@@ -166,11 +163,6 @@ pub(crate) fn annotate_denial(output: &std::fs::File, allow_unsandboxed_commands
     .iter()
     .any(|pattern| text.contains(pattern))
     {
-        let hint = if allow_unsandboxed_commands {
-            ESCAPE_HINT
-        } else {
-            ""
-        };
-        let _ = writeln!(&mut &*output, "\n{DENIAL_NOTE}{hint}");
+        let _ = writeln!(&mut &*output, "\n{DENIAL_NOTE}");
     }
 }

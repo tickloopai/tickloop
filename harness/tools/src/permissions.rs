@@ -1,3 +1,6 @@
+mod command_selection;
+pub use command_selection::shell_command_matches_pattern;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -749,15 +752,6 @@ fn allow_rules_cover_call(
 
 fn rule_applies_to_tool_and_goal(rule: &PermissionRule, name: &str, loop_id: Uuid) -> bool {
     (rule.tool == name || rule.tool == "*") && rule.loop_id.is_none_or(|id| id == loop_id)
-}
-
-/// Matches command patterns for execution selection, without granting permission. Unlike
-/// Permission Rules, selection can include shell syntax whose effects require review.
-pub fn shell_command_matches_pattern(pattern: &str, command: &str) -> bool {
-    split_shell_parts(command, true)
-        .unwrap_or_else(|| vec![command.trim()])
-        .iter()
-        .any(|part| bash_pattern_matches(pattern, part))
 }
 
 fn shell_rule_matches_any(pattern: &str, input: &Value) -> bool {

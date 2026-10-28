@@ -615,7 +615,6 @@ async fn only_a_live_unused_grant_and_the_request_it_binds_start_a_task() {
         SpawnBinding {
             approval: ShellApproval {
                 sandbox: Some(Box::new(tickhost::sandbox::SandboxPolicy {
-                    allow_unsandboxed_commands: false,
                     writable_roots: vec![workdir.clone()],
                     deny_write: Vec::new(),
                     protected_paths: Vec::new(),
