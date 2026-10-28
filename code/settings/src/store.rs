@@ -77,6 +77,7 @@ impl SettingsStore for UserSettings {
             goal_token_budget: saved.clone().goal_token_budget(),
             goal_check_model: saved.clone().goal_check_model(),
             skips_transcripts: saved.cleanup_period_days() == Some(0),
+            use_auto_mode_during_plan: saved.use_auto_mode_during_plan(),
             auto,
             jev: saved.jev_config(),
             warning_prefix: format!("settings file {}: ", saved.path.display()),

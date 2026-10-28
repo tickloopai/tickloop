@@ -75,6 +75,7 @@ const MONITOR_KEY: &str = "monitor";
 const MONITOR_POPUP_KEY: &str = "monitorPopup";
 const MONITOR_WIDTH_KEY: &str = "monitorWidth";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
+const USE_AUTO_MODE_DURING_PLAN_KEY: &str = "useAutoModeDuringPlan";
 /// The execution modes Shift+Tab visits, in Claude Code's order; at least one.
 const SHIFT_TAB_MODES_KEY: &str = "shiftTabModes";
 pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, ExecutionMode::Plan];
@@ -513,6 +514,19 @@ impl LoadedSettings {
             Some(_) => {
                 self.warn(format!(
                     "`{PROMPT_SUGGESTION_ENABLED_KEY}` is not a boolean and is ignored"
+                ));
+                true
+            }
+        }
+    }
+
+    pub fn use_auto_mode_during_plan(&mut self) -> bool {
+        match self.settings.get(USE_AUTO_MODE_DURING_PLAN_KEY) {
+            Some(Value::Bool(enabled)) => *enabled,
+            None => true,
+            Some(_) => {
+                self.warn(format!(
+                    "`{USE_AUTO_MODE_DURING_PLAN_KEY}` is not a boolean and is ignored"
                 ));
                 true
             }
