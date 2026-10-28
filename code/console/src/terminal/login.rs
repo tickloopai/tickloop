@@ -510,6 +510,7 @@ impl LoginFlow {
                         "Codex browser login".into()
                     },
                     context,
+                    markdown: None,
                     options: vec!["Submit callback URL…".into(), "Cancel login".into()],
                     selected: 0,
                     confirmation: false,
@@ -534,6 +535,7 @@ impl LoginFlow {
                 id,
                 title: format!("Log in to {label}"),
                 context,
+                markdown: None,
                 options: vec!["Cancel login".into()],
                 selected: 0,
                 confirmation: false,
