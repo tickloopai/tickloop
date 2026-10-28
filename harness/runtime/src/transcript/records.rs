@@ -50,6 +50,18 @@ pub async fn saved_records(
         .collect())
 }
 
+/// The root Chat of the family a saved Subagent belongs to; `None` for a Chat of its own or one
+/// with no Transcript under the configuration root.
+pub async fn saved_family_root(root: PathBuf, chat_id: Uuid) -> Result<Option<Uuid>, AgentError> {
+    tokio::task::spawn_blocking(move || match super::path::locate(&root, chat_id)? {
+        Some(path) => super::listing::family_root(&path),
+        None => Ok(None),
+    })
+    .await
+    .map_err(|error| AgentError::Storage(error.to_string()))?
+    .map_err(|error| AgentError::Storage(error.to_string()))
+}
+
 /// One page of the messages of a saved Chat under the configuration root.
 pub async fn transcript(
     root: PathBuf,
