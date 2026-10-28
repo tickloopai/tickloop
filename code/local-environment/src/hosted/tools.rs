@@ -1336,6 +1336,9 @@ struct DescribedTick {
     min_rows: u16,
 }
 
+/// Reads the declaration of a just opened Tick through the binding the open received, validated
+/// as any `tick/describe` result, and names it from it and `command`; `None` when it cannot be
+/// read that way.
 async fn describe_opened(
     binding: &DataBinding,
     instance: &InstanceRef,
@@ -1346,7 +1349,7 @@ async fn describe_opened(
         .request("describe", json!({}), CONTROL_TIMEOUT)
         .await
         .ok()?;
-    let descriptor: TickDescriptor = serde_json::from_value(descriptor).ok()?;
+    let descriptor = TickDescriptor::parse(descriptor).ok()?;
     Some(DescribedTick {
         title: tickhost_connect::naming::tick_title(&descriptor.title, &descriptor.kind, command),
         min_rows: descriptor.min_rows(),
