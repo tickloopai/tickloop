@@ -46,6 +46,7 @@ mod permissions_management;
 mod plan_approval;
 mod plans;
 mod project_rule_freshness;
+mod prompt_cache;
 mod provider_error_security;
 mod provider_errors;
 mod queued_inputs;

@@ -3240,6 +3240,11 @@ impl Agent {
                 &request.messages[..2],
                 &request.tools,
             )
+            .with_params(&(
+                request.reasoning_effort,
+                request.temperature,
+                chat.snapshot.thinking_enabled,
+            ))
         };
         let client = self
             .inner
