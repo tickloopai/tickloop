@@ -13,7 +13,9 @@ use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    future::Future,
     path::PathBuf,
+    pin::Pin,
 };
 
 use tickloop_code_settings::{DisplayPreferences, UserSettings};
@@ -56,6 +58,8 @@ const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 12;
 const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
 const TASK_TOOLS_SETTING_INDEX: usize = 14;
 const SEARCH_SETTING_INDEX: usize = 15;
+
+type MenuFuture<'a> = Pin<Box<dyn Future<Output = Result<MenuOutcome, String>> + 'a>>;
 
 enum Selection {
     Goal {
@@ -2629,40 +2633,90 @@ impl Menus {
         } else {
             None
         };
-        let outcome: Result<MenuOutcome, String> = Box::pin(async {
-            match selection {
-                Selection::Goal { chat, actions } => {
-                    return self.choose_goal(agent, console, chat, &actions, index, comment).await;
+        let outcome = self
+            .choose_selection(agent, console, menu_id, selection, index, comment)
+            .await;
+        if outcome.is_err()
+            && self.active.is_none()
+            && let Some((selection, mut menu)) = retry
+        {
+            menu.id = tickloop_ids::generate();
+            if let Some(index) = index {
+                menu.selected = index;
+            }
+            let restored = menu.id;
+            self.provider.provider_nav = navigation_before;
+            self.provider.model_provider = model_provider_before;
+            if console.recover_menu(menu_id, restored, index)? {
+                self.active = Some((restored, selection));
+            } else {
+                self.show(console, menu, selection)?;
+            }
+            if let Some(flow) = &mut self.provider.discovery_flow
+                && flow.id == menu_id
+            {
+                flow.id = restored;
+            }
+        }
+        console.finish_menu_submission(menu_id)?;
+        outcome
+    }
+
+    /// Each menu's handling is its own boxed future: in unoptimized builds, one future matching
+    /// every menu polls with a stack frame as large as all the menus' awaits together.
+    fn choose_selection<'a>(
+        &'a mut self,
+        agent: &'a Agent,
+        console: &'a Console,
+        menu_id: Uuid,
+        selection: Selection,
+        index: Option<usize>,
+        comment: Option<String>,
+    ) -> MenuFuture<'a> {
+        match selection {
+            Selection::Goal { chat, actions } => Box::pin(async move {
+                self.choose_goal(agent, console, chat, &actions, index, comment)
+                    .await
+            }),
+            Selection::Locations { generation, views } => Box::pin(async move {
+                if let Some(index) = index {
+                    let view = views.get(index).ok_or("location no longer exists")?.view;
+                    return Ok(MenuOutcome {
+                        command: Some(format!(
+                            "/agent-location {generation} {} {}",
+                            view.session_id, view.view_id
+                        )),
+                        ..Default::default()
+                    });
                 }
-                Selection::Locations { generation, views } => {
-                    if let Some(index) = index {
-                        let view = views.get(index).ok_or("location no longer exists")?.view;
-                        return Ok(MenuOutcome { command: Some(format!("/agent-location {generation} {} {}", view.session_id, view.view_id)), ..Default::default() });
+                Ok(MenuOutcome::default())
+            }),
+            Selection::HelpReference => Box::pin(async move {
+                self.help(console, None)?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Help { section } => Box::pin(async move {
+                if let Some(index) = index {
+                    if let Some(section) = section {
+                        let group = *COMMAND_GROUPS
+                            .get(section)
+                            .ok_or("command group does not exist")?;
+                        let command = commands_in_group(group)
+                            .nth(index)
+                            .ok_or("command does not exist")?;
+                        return Ok(MenuOutcome {
+                            command: Some(command.command.into()),
+                            ..Default::default()
+                        });
                     }
+                    self.help(console, Some(index))?;
+                } else if section.is_some() {
+                    self.help(console, None)?;
                 }
-                Selection::HelpReference => self.help(console, None)?,
-                Selection::Help { section } => {
-                    if let Some(index) = index {
-                        if let Some(section) = section {
-                            let group = *COMMAND_GROUPS
-                                .get(section)
-                                .ok_or("command group does not exist")?;
-                            let command = commands_in_group(group)
-                                .nth(index)
-                                .ok_or("command does not exist")?;
-                            return Ok(MenuOutcome {
-                                command: Some(command.command.into()),
-                                ..Default::default()
-                            });
-                        }
-                        self.help(console, Some(index))?;
-                    } else if section.is_some() {
-                        self.help(console, None)?;
-                    }
-                }
-                Selection::Permission { chat, request, .. }
-                    if is_plan_mode_confirmation(&request) =>
-                {
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Permission { chat, request, .. } if is_plan_mode_confirmation(&request) => {
+                Box::pin(async move {
                     let allow = match index {
                         Some(0) => true,
                         Some(1) | None => false,
@@ -2678,42 +2732,31 @@ impl Menus {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    return Ok(MenuOutcome {
+                    Ok(MenuOutcome {
                         permission: Some(request.id),
                         ..Default::default()
-                    });
-                }
-                Selection::Permission {
-                    chat,
-                    request,
-                    persistent,
-                    ..
-                } => {
-                    let explicit_ask =
-                        request.approval_source == PermissionApprovalSource::ExplicitAsk;
-                    if !explicit_ask && persistent && let Some(server) = &request.mcp_server {
-                        let target = match index {
-                            Some(1) => Some(request.name.clone()),
-                            Some(2) => Some(format!("mcp__{server}")),
-                            _ => None,
-                        };
-                        if let Some(target) = target {
-                            agent.answer_permission_with_rule(chat, request.id, target).await.map_err(|error| error.to_string())?;
-                            return Ok(MenuOutcome { permission: Some(request.id), ..Default::default() });
-                        }
-                    }
-                    if !explicit_ask
-                        && persistent
-                        && index == Some(2)
-                        && let Some(exact) =
-                            permission_rule_candidates(&request.name, &request.input).first()
-                    {
+                    })
+                })
+            }
+            Selection::Permission {
+                chat,
+                request,
+                persistent,
+                ..
+            } => Box::pin(async move {
+                let explicit_ask = request.approval_source == PermissionApprovalSource::ExplicitAsk;
+                if !explicit_ask
+                    && persistent
+                    && let Some(server) = &request.mcp_server
+                {
+                    let target = match index {
+                        Some(1) => Some(request.name.clone()),
+                        Some(2) => Some(format!("mcp__{server}")),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
                         agent
-                            .answer_permission_with_rule(
-                                chat,
-                                request.id,
-                                exact.specifier.clone(),
-                            )
+                            .answer_permission_with_rule(chat, request.id, target)
                             .await
                             .map_err(|error| error.to_string())?;
                         return Ok(MenuOutcome {
@@ -2721,25 +2764,15 @@ impl Menus {
                             ..Default::default()
                         });
                     }
-                    let (allow, scope) = if explicit_ask {
-                        match index {
-                            Some(0) => (true, PermissionScope::Once),
-                            Some(1) | None => (false, PermissionScope::Once),
-                            _ => return Err("permission option does not exist".into()),
-                        }
-                    } else {
-                        match (index, persistent) {
-                            (Some(0), _) => (true, PermissionScope::Once),
-                            (Some(1), _) => (true, PermissionScope::Session),
-                            (Some(2), true) => (true, PermissionScope::Persistent),
-                            (Some(3), true) | (Some(2), false) | (None, _) => {
-                                (false, PermissionScope::Once)
-                            }
-                            _ => return Err("permission option does not exist".into()),
-                        }
-                    };
+                }
+                if !explicit_ask
+                    && persistent
+                    && index == Some(2)
+                    && let Some(exact) =
+                        permission_rule_candidates(&request.name, &request.input).first()
+                {
                     agent
-                        .answer_permission_with_comment(chat, request.id, allow, scope, comment)
+                        .answer_permission_with_rule(chat, request.id, exact.specifier.clone())
                         .await
                         .map_err(|error| error.to_string())?;
                     return Ok(MenuOutcome {
@@ -2747,37 +2780,60 @@ impl Menus {
                         ..Default::default()
                     });
                 }
-                Selection::PermissionRule {
-                    chat,
-                    request,
-                    requester,
-                    candidates,
-                } => {
-                    let Some(index) = index else {
+                let (allow, scope) = if explicit_ask {
+                    match index {
+                        Some(0) => (true, PermissionScope::Once),
+                        Some(1) | None => (false, PermissionScope::Once),
+                        _ => return Err("permission option does not exist".into()),
+                    }
+                } else {
+                    match (index, persistent) {
+                        (Some(0), _) => (true, PermissionScope::Once),
+                        (Some(1), _) => (true, PermissionScope::Session),
+                        (Some(2), true) => (true, PermissionScope::Persistent),
+                        (Some(3), true) | (Some(2), false) | (None, _) => {
+                            (false, PermissionScope::Once)
+                        }
+                        _ => return Err("permission option does not exist".into()),
+                    }
+                };
+                agent
+                    .answer_permission_with_comment(chat, request.id, allow, scope, comment)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(MenuOutcome {
+                    permission: Some(request.id),
+                    ..Default::default()
+                })
+            }),
+            Selection::PermissionRule {
+                chat,
+                request,
+                requester,
+                candidates,
+            } => Box::pin(async move {
+                let Some(index) = index else {
+                    self.permission(console, chat, &request, requester, true)?;
+                    return Ok(MenuOutcome::default());
+                };
+                let Some(candidate) = candidates.get(index) else {
+                    if index == candidates.len() {
                         self.permission(console, chat, &request, requester, true)?;
                         return Ok(MenuOutcome::default());
-                    };
-                    let Some(candidate) = candidates.get(index) else {
-                        if index == candidates.len() {
-                            self.permission(console, chat, &request, requester, true)?;
-                            return Ok(MenuOutcome::default());
-                        }
-                        return Err("permission rule option does not exist".into());
-                    };
-                    agent
-                        .answer_permission_with_rule(
-                            chat,
-                            request.id,
-                            candidate.specifier.clone(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Ok(MenuOutcome {
-                        permission: Some(request.id),
-                        ..Default::default()
-                    });
-                }
-                Selection::Question(mut flow) => match flow.choose(index, comment) {
+                    }
+                    return Err("permission rule option does not exist".into());
+                };
+                agent
+                    .answer_permission_with_rule(chat, request.id, candidate.specifier.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(MenuOutcome {
+                    permission: Some(request.id),
+                    ..Default::default()
+                })
+            }),
+            Selection::Question(mut flow) => Box::pin(async move {
+                match flow.choose(index, comment) {
                     FlowUpdate::Show => self.show_question(console, flow)?,
                     FlowUpdate::Submit(answers) => {
                         let request = flow.request();
@@ -2801,27 +2857,43 @@ impl Menus {
                             ..Default::default()
                         });
                     }
-                },
-                Selection::Workflow(workflow) => {
-                    let permission = match &workflow { Workflow::Plan { request, .. } => *request, _ => None };
-                    let effect = Box::pin(workflow.choose_with_feedback(agent, console, index, comment)).await?;
-                    if let Some(request) = permission { self.restored_plans.remove(&request); }
-                    if let Some(next) = effect.next {
-                        self.workflow(console, next)?;
-                    }
-                    return Ok(MenuOutcome {
-                        permission,
-                        selection: effect.selection,
-                        restored: effect.restored,
-                        receipt: effect.receipt,
-                        ..Default::default()
-                    });
                 }
-                Selection::SettingsInfo { target } => self.settings(agent, console, target).await?,
-                selection @ (Selection::Search { .. } | Selection::SearchProvider { .. } | Selection::SearchKey { .. } | Selection::SearchEndpoint { .. }) => {
-                    Box::pin(self.choose_search(agent, console, selection, index, comment)).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Workflow(workflow) => Box::pin(async move {
+                let permission = match &workflow {
+                    Workflow::Plan { request, .. } => *request,
+                    _ => None,
+                };
+                let effect =
+                    Box::pin(workflow.choose_with_feedback(agent, console, index, comment)).await?;
+                if let Some(request) = permission {
+                    self.restored_plans.remove(&request);
                 }
-                Selection::Rewind { chat, mut points } => {
+                if let Some(next) = effect.next {
+                    self.workflow(console, next)?;
+                }
+                Ok(MenuOutcome {
+                    permission,
+                    selection: effect.selection,
+                    restored: effect.restored,
+                    receipt: effect.receipt,
+                    ..Default::default()
+                })
+            }),
+            Selection::SettingsInfo { target } => Box::pin(async move {
+                self.settings(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            selection @ (Selection::Search { .. }
+            | Selection::SearchProvider { .. }
+            | Selection::SearchKey { .. }
+            | Selection::SearchEndpoint { .. }) => Box::pin(async move {
+                Box::pin(self.choose_search(agent, console, selection, index, comment)).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Rewind { chat, mut points } => {
+                Box::pin(async move {
                     match index {
                         None => console
                             .write("Rewind cancelled; conversation and files unchanged.\n")?,
@@ -2838,200 +2910,346 @@ impl Menus {
                         }
                         Some(_) => return Err("rewind point does not exist".into()),
                     }
-                }
-                Selection::RewindActions {
-                    chat,
-                    points,
-                    message_id,
-                    actions,
-                } => {
-                    let action = index
-                        .map(|index| {
-                            actions
-                                .get(index)
-                                .copied()
-                                .ok_or("rewind action does not exist")
-                        })
-                        .transpose()?;
-                    match action {
-                        None | Some(RewindAction::Back) => {
-                            self.show_rewind_points(console, chat, points)?
-                        }
-                        Some(action) if action.summary_direction().is_some() => {
-                            let request = directed_summary_request(action, message_id, comment)
-                                .expect("summary action checked above");
-                            return Ok(MenuOutcome {
-                                summary: Some((chat, request)),
-                                status: Some("Working · Summarizing conversation".into()),
-                                ..Default::default()
-                            });
-                        }
-                        Some(action) => {
-                            let mode = match action {
-                                RewindAction::RestoreCodeAndConversation => {
-                                    RewindMode::CodeAndConversation
-                                }
-                                RewindAction::RestoreConversation => RewindMode::Conversation,
-                                RewindAction::RestoreCode => RewindMode::Code,
-                                _ => unreachable!(),
-                            };
-                            match agent.rewind(chat, message_id, mode).await {
-                                Ok(outcome) => {
-                                    return finish_rewind(console, outcome);
-                                }
-                                Err(error) => {
-                                    let status = format!(
-                                        "Cannot restore checkpoint: {}",
-                                        safe_line(&error.to_string())
-                                    );
-                                    console.set_status(&status)?;
-                                    self.show_rewind_actions(console, chat, points, message_id)?;
-                                    return Ok(MenuOutcome {
-                                        status: Some(status),
-                                        ..Default::default()
-                                    });
-                                }
+                    Ok(MenuOutcome::default())
+                })
+            }
+            Selection::RewindActions {
+                chat,
+                points,
+                message_id,
+                actions,
+            } => Box::pin(async move {
+                let action = index
+                    .map(|index| {
+                        actions
+                            .get(index)
+                            .copied()
+                            .ok_or("rewind action does not exist")
+                    })
+                    .transpose()?;
+                match action {
+                    None | Some(RewindAction::Back) => {
+                        self.show_rewind_points(console, chat, points)?
+                    }
+                    Some(action) if action.summary_direction().is_some() => {
+                        let request = directed_summary_request(action, message_id, comment)
+                            .expect("summary action checked above");
+                        return Ok(MenuOutcome {
+                            summary: Some((chat, request)),
+                            status: Some("Working · Summarizing conversation".into()),
+                            ..Default::default()
+                        });
+                    }
+                    Some(action) => {
+                        let mode = match action {
+                            RewindAction::RestoreCodeAndConversation => {
+                                RewindMode::CodeAndConversation
+                            }
+                            RewindAction::RestoreConversation => RewindMode::Conversation,
+                            RewindAction::RestoreCode => RewindMode::Code,
+                            _ => unreachable!(),
+                        };
+                        match agent.rewind(chat, message_id, mode).await {
+                            Ok(outcome) => {
+                                return finish_rewind(console, outcome);
+                            }
+                            Err(error) => {
+                                let status = format!(
+                                    "Cannot restore checkpoint: {}",
+                                    safe_line(&error.to_string())
+                                );
+                                console.set_status(&status)?;
+                                self.show_rewind_actions(console, chat, points, message_id)?;
+                                return Ok(MenuOutcome {
+                                    status: Some(status),
+                                    ..Default::default()
+                                });
                             }
                         }
                     }
                 }
-                Selection::Provider { target, choices, rows } => {
-                    self.refresh_provider_scope(agent, target).await?;
-                    if let Some(index) = index {
-                        self.provider.provider_selected = index;
-                        if let Some(ProviderRow::Provider(provider_index)) = rows.get(index) {
-                            let provider = choices[*provider_index].clone();
-                            self.provider.provider_choices = choices;
-                            self.provider.provider_nav.focused = Some(provider.key());
-                            self.provider.provider_nav.back_stack.push(self.directory_parent());
-                            return self.enter_connection(agent, console, target, provider).await;
-                        }
-                        if rows.is_empty() && index == 0 {
-                            self.provider.provider_nav.filter = providers::ConnectionFilter::All;
-                            self.provider.provider_nav.query.clear();
-                            self.back_to_providers(console, target)?;
-                        } else {
-                            self.provider.provider_nav.focused = None;
-                            self.judgment_settings(agent, console, JudgmentReturn::Providers { target }).await?;
-                        }
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Provider {
+                target,
+                choices,
+                rows,
+            } => Box::pin(async move {
+                self.refresh_provider_scope(agent, target).await?;
+                if let Some(index) = index {
+                    self.provider.provider_selected = index;
+                    if let Some(ProviderRow::Provider(provider_index)) = rows.get(index) {
+                        let provider = choices[*provider_index].clone();
+                        self.provider.provider_choices = choices;
+                        self.provider.provider_nav.focused = Some(provider.key());
+                        self.provider
+                            .provider_nav
+                            .back_stack
+                            .push(self.directory_parent());
+                        return self
+                            .enter_connection(agent, console, target, provider)
+                            .await;
+                    }
+                    if rows.is_empty() && index == 0 {
+                        self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                        self.provider.provider_nav.query.clear();
+                        self.back_to_providers(console, target)?;
                     } else {
-                        self.provider_back(agent, console, target).await?;
+                        self.provider.provider_nav.focused = None;
+                        self.judgment_settings(
+                            agent,
+                            console,
+                            JudgmentReturn::Providers { target },
+                        )
+                        .await?;
                     }
-                }
-                Selection::ConnectionDetails { target, provider, actions } => {
-                    let Some(index) = index else {
-                        self.provider_back(agent, console, target).await?;
-                        return Ok(MenuOutcome::default());
-                    };
-                    let action = *actions.get(index).ok_or("Connection action no longer exists")?;
-                    let parent = providers::ProviderPage::Details { connection: provider.key(), selected: index };
-                    match action {
-                        providers::ConnectionAction::Browse => {
-                            if matches!(self.provider.provider_nav.back_stack.last(), Some(providers::ProviderPage::Models { connection, .. }) if connection.as_deref().is_none_or(|key| key == provider.key())) {
-                                self.provider_back(agent, console, target).await?;
-                            } else {
-                                self.provider.provider_nav.back_stack.push(parent);
-                                return self.enter_connection(agent, console, target, provider).await;
-                            }
-                        }
-                        providers::ConnectionAction::Configure => {
-                            self.provider.provider_nav.back_stack.push(parent);
-                            self.provider.provider_nav.credential_intent = Some(self.configure_credential_intent(&provider));
-                            return self.provider_auth(console, target, provider);
-                        }
-                        providers::ConnectionAction::RemoveKey | providers::ConnectionAction::SignOut => {
-                            self.provider.provider_nav.back_stack.push(parent);
-                            let label = if matches!(action, providers::ConnectionAction::RemoveKey) { "Remove saved key" } else { "Sign out" };
-                            let fallback = self.provider_environment_key(&provider.models[0].api_key_env);
-                            let context = if matches!(action, providers::ConnectionAction::RemoveKey) {
-                                vec!["This removes the saved value of this connection's credential reference. Other connections using that reference are also affected.".into(), if fallback { "An environment key will still be used.".into() } else { "No environment key is configured.".into() }]
-                            } else { vec!["This signs out this provider's saved login. Connections and Chats using the same login also need sign-in.".into()] };
-                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("{label} · {}", provider.model_page_name()), context, markdown: None, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
-                        }
-                        providers::ConnectionAction::CredentialDetails => {
-                            self.provider.provider_nav.back_stack.push(parent);
-                            let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
-                            let reference = &provider.models[0].api_key_env;
-                            let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
-                            self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Credential details · {}", provider.model_page_name()), context, markdown: None, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
-                        }
-                    }
-                }
-                Selection::ConnectionConfirm { target, provider, action } => {
-                    if index != Some(1) {
-                        self.provider_back(agent, console, target).await?;
-                    } else if matches!(action, providers::ConnectionAction::RemoveKey) {
-                        let root = self.provider_root().ok_or("Cannot locate the Agent credential directory")?;
-                        if let Err(error) = tickloop_harness::model::credentials::remove_api_key(root, &provider.models[0].api_key_env) {
-                            self.provider_back(agent, console, target).await?;
-                            return Err(error.to_string());
-                        }
-                        self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        self.refresh_connections.insert((target.agent(), provider.key()), tickloop_ids::generate());
-                        self.provider_back(agent, console, target).await?;
-                    } else {
-                        let sign_in = super::login::SignInTarget::from_auth(provider.models[0].auth_source).unwrap_or(super::login::SignInTarget::Codex);
-                        self.provider.login_return = Some((target, provider));
-                        self.provider_back(agent, console, target).await?;
-                        return Ok(MenuOutcome { provider_logout: true, logout_target: sign_in, ..Default::default() });
-                    }
-                }
-                Selection::CredentialDetails { target } => self.provider_back(agent, console, target).await?,
-                Selection::LoginMethods { target, provider } => {
-                    if let Some(index) = index {
-                        self.provider.provider_nav.back_stack.push(providers::ProviderPage::LoginMethods { connection: provider.key() });
-                        return self.begin_provider_login(console, target, provider, if index == 0 { super::login::LoginMethod::Device } else { super::login::LoginMethod::Browser });
-                    }
+                } else {
                     self.provider_back(agent, console, target).await?;
                 }
-                Selection::ServiceAccount { target, provider } => {
-                    if index == Some(0) {
-                        let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
-                        let path = comment.as_deref().unwrap_or("").trim();
-                        if let Err(error) = tickloop_harness::model::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
-                            self.provider_service_account(console, target, provider, Some(path))?;
-                            return Err(error.to_string());
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ConnectionDetails {
+                target,
+                provider,
+                actions,
+            } => Box::pin(async move {
+                let Some(index) = index else {
+                    self.provider_back(agent, console, target).await?;
+                    return Ok(MenuOutcome::default());
+                };
+                let action = *actions
+                    .get(index)
+                    .ok_or("Connection action no longer exists")?;
+                let parent = providers::ProviderPage::Details {
+                    connection: provider.key(),
+                    selected: index,
+                };
+                match action {
+                    providers::ConnectionAction::Browse => {
+                        if matches!(self.provider.provider_nav.back_stack.last(), Some(providers::ProviderPage::Models { connection, .. }) if connection.as_deref().is_none_or(|key| key == provider.key()))
+                        {
+                            self.provider_back(agent, console, target).await?;
+                        } else {
+                            self.provider.provider_nav.back_stack.push(parent);
+                            return self
+                                .enter_connection(agent, console, target, provider)
+                                .await;
                         }
-                        self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        console.write("Service-account file configured.\n")?;
-                        self.credential_saved(agent, console, target, &provider).await?;
-                    } else {
-                        self.provider_back(agent, console, target).await?;
+                    }
+                    providers::ConnectionAction::Configure => {
+                        self.provider.provider_nav.back_stack.push(parent);
+                        self.provider.provider_nav.credential_intent =
+                            Some(self.configure_credential_intent(&provider));
+                        return self.provider_auth(console, target, provider);
+                    }
+                    providers::ConnectionAction::RemoveKey
+                    | providers::ConnectionAction::SignOut => {
+                        self.provider.provider_nav.back_stack.push(parent);
+                        let label = if matches!(action, providers::ConnectionAction::RemoveKey) {
+                            "Remove saved key"
+                        } else {
+                            "Sign out"
+                        };
+                        let fallback =
+                            self.provider_environment_key(&provider.models[0].api_key_env);
+                        let context = if matches!(action, providers::ConnectionAction::RemoveKey) {
+                            vec!["This removes the saved value of this connection's credential reference. Other connections using that reference are also affected.".into(), if fallback { "An environment key will still be used.".into() } else { "No environment key is configured.".into() }]
+                        } else {
+                            vec!["This signs out this provider's saved login. Connections and Chats using the same login also need sign-in.".into()]
+                        };
+                        self.show(
+                            console,
+                            Menu {
+                                id: tickloop_ids::generate(),
+                                title: format!("{label} · {}", provider.model_page_name()),
+                                context,
+                                markdown: None,
+                                options: vec!["Cancel".into(), label.into()],
+                                selected: 0,
+                                confirmation: false,
+                            },
+                            Selection::ConnectionConfirm {
+                                target,
+                                provider,
+                                action,
+                            },
+                        )?;
+                    }
+                    providers::ConnectionAction::CredentialDetails => {
+                        self.provider.provider_nav.back_stack.push(parent);
+                        let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_harness::protocol::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
+                        let reference = &provider.models[0].api_key_env;
+                        let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
+                        self.show(
+                            console,
+                            Menu {
+                                id: tickloop_ids::generate(),
+                                title: format!(
+                                    "Credential details · {}",
+                                    provider.model_page_name()
+                                ),
+                                context,
+                                markdown: None,
+                                options: vec!["Back to connection".into()],
+                                selected: 0,
+                                confirmation: false,
+                            },
+                            Selection::CredentialDetails { target },
+                        )?;
                     }
                 }
-                Selection::ApiKey { target, provider } => {
-                    if index == Some(0) {
-                        let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
-                        let result = tickloop_harness::model::credentials::save_api_key(root, &provider.models[0].api_key_env, comment.as_deref().unwrap_or(""));
-                        if let Err(error) = result {
-                            self.provider_api_key(console, target, provider, comment.as_deref())?;
-                            return Err(error.to_string());
-                        }
-                        self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        console.write("API key saved to Agent .env.\n")?;
-                        self.credential_saved(agent, console, target, &provider).await?;
-                    } else {
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ConnectionConfirm {
+                target,
+                provider,
+                action,
+            } => Box::pin(async move {
+                if index != Some(1) {
+                    self.provider_back(agent, console, target).await?;
+                } else if matches!(action, providers::ConnectionAction::RemoveKey) {
+                    let root = self
+                        .provider_root()
+                        .ok_or("Cannot locate the Agent credential directory")?;
+                    if let Err(error) = tickloop_harness::model::credentials::remove_api_key(
+                        root,
+                        &provider.models[0].api_key_env,
+                    ) {
                         self.provider_back(agent, console, target).await?;
+                        return Err(error.to_string());
                     }
+                    self.model_discovery
+                        .invalidate(&provider.models[0].provider_id);
+                    self.refresh_connections
+                        .insert((target.agent(), provider.key()), tickloop_ids::generate());
+                    self.provider_back(agent, console, target).await?;
+                } else {
+                    let sign_in =
+                        super::login::SignInTarget::from_auth(provider.models[0].auth_source)
+                            .unwrap_or(super::login::SignInTarget::Codex);
+                    self.provider.login_return = Some((target, provider));
+                    self.provider_back(agent, console, target).await?;
+                    return Ok(MenuOutcome {
+                        provider_logout: true,
+                        logout_target: sign_in,
+                        ..Default::default()
+                    });
                 }
-                Selection::JudgmentSettings { return_to, has_key } => {
-                    match index {
-                        Some(0) if has_key && matches!(&return_to, JudgmentReturn::AutoSettings { select_reviewer: true, .. }) => {
+                Ok(MenuOutcome::default())
+            }),
+            Selection::CredentialDetails { target } => Box::pin(async move {
+                self.provider_back(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::LoginMethods { target, provider } => Box::pin(async move {
+                if let Some(index) = index {
+                    self.provider.provider_nav.back_stack.push(
+                        providers::ProviderPage::LoginMethods {
+                            connection: provider.key(),
+                        },
+                    );
+                    return self.begin_provider_login(
+                        console,
+                        target,
+                        provider,
+                        if index == 0 {
+                            super::login::LoginMethod::Device
+                        } else {
+                            super::login::LoginMethod::Browser
+                        },
+                    );
+                }
+                self.provider_back(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ServiceAccount { target, provider } => Box::pin(async move {
+                if index == Some(0) {
+                    let root = self.provider_root().ok_or(
+                        "Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.",
+                    )?;
+                    let path = comment.as_deref().unwrap_or("").trim();
+                    if let Err(error) = tickloop_harness::model::auth::google::GoogleAuth::new(root)
+                        .save_service_account_path(path)
+                    {
+                        self.provider_service_account(console, target, provider, Some(path))?;
+                        return Err(error.to_string());
+                    }
+                    self.model_discovery
+                        .invalidate(&provider.models[0].provider_id);
+                    console.write("Service-account file configured.\n")?;
+                    self.credential_saved(agent, console, target, &provider)
+                        .await?;
+                } else {
+                    self.provider_back(agent, console, target).await?;
+                }
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ApiKey { target, provider } => Box::pin(async move {
+                if index == Some(0) {
+                    let root = self.provider_root().ok_or(
+                        "Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.",
+                    )?;
+                    let result = tickloop_harness::model::credentials::save_api_key(
+                        root,
+                        &provider.models[0].api_key_env,
+                        comment.as_deref().unwrap_or(""),
+                    );
+                    if let Err(error) = result {
+                        self.provider_api_key(console, target, provider, comment.as_deref())?;
+                        return Err(error.to_string());
+                    }
+                    self.model_discovery
+                        .invalidate(&provider.models[0].provider_id);
+                    console.write("API key saved to Agent .env.\n")?;
+                    self.credential_saved(agent, console, target, &provider)
+                        .await?;
+                } else {
+                    self.provider_back(agent, console, target).await?;
+                }
+                Ok(MenuOutcome::default())
+            }),
+            Selection::JudgmentSettings { return_to, has_key } => Box::pin(async move {
+                match index {
+                    Some(0)
+                        if has_key
+                            && matches!(
+                                &return_to,
+                                JudgmentReturn::AutoSettings {
+                                    select_reviewer: true,
+                                    ..
+                                }
+                            ) =>
+                    {
+                        console.clear_menu(menu_id)?;
+                        self.finish_judgment_selection(agent, console, return_to, false)
+                            .await?;
+                    }
+                    Some(option)
+                        if option
+                            == usize::from(
+                                has_key
+                                    && matches!(
+                                        &return_to,
+                                        JudgmentReturn::AutoSettings {
+                                            select_reviewer: true,
+                                            ..
+                                        }
+                                    ),
+                            ) =>
+                    {
+                        self.judgment_key(console, return_to)?;
+                    }
+                    _ => {
+                        if matches!(&return_to, JudgmentReturn::AutoSettings { .. }) {
                             console.clear_menu(menu_id)?;
-                            self.finish_judgment_selection(agent, console, return_to, false).await?;
                         }
-                        Some(option) if option == usize::from(has_key && matches!(&return_to, JudgmentReturn::AutoSettings { select_reviewer: true, .. })) => {
-                            self.judgment_key(console, return_to)?;
-                        }
-                        _ => {
-                            if matches!(&return_to, JudgmentReturn::AutoSettings { .. }) {
-                                console.clear_menu(menu_id)?;
-                            }
-                            self.return_from_judgment(agent, console, return_to).await?;
-                        }
+                        self.return_from_judgment(agent, console, return_to).await?;
                     }
                 }
-                Selection::JudgmentKey { return_to } => {
+                Ok(MenuOutcome::default())
+            }),
+            Selection::JudgmentKey { return_to } => {
+                Box::pin(async move {
                     if index == Some(0) {
                         let value = comment.as_deref().unwrap_or("");
                         if let Err(error) = agent.save_jev_key(value).await {
@@ -3039,15 +3257,22 @@ impl Menus {
                             return Err(error.to_string());
                         }
                         match return_to {
-                            JudgmentReturn::AutoSettings { select_reviewer: true, .. } => {
+                            JudgmentReturn::AutoSettings {
+                                select_reviewer: true,
+                                ..
+                            } => {
                                 console.clear_menu(menu_id)?;
-                                self.finish_judgment_selection(agent, console, return_to, true).await?;
+                                self.finish_judgment_selection(agent, console, return_to, true)
+                                    .await?;
                             }
                             JudgmentReturn::Providers { .. } => {
                                 self.judgment_settings(agent, console, return_to).await?;
                                 console.write("Jev (TypeSafe) key saved; authentication has not been verified.\n")?;
                             }
-                            JudgmentReturn::AutoSettings { select_reviewer: false, .. } => {
+                            JudgmentReturn::AutoSettings {
+                                select_reviewer: false,
+                                ..
+                            } => {
                                 self.judgment_settings(agent, console, return_to).await?;
                                 console.write("Jev (TypeSafe) key saved; authentication has not been verified.\n")?;
                             }
@@ -3055,134 +3280,238 @@ impl Menus {
                     } else {
                         self.judgment_settings(agent, console, return_to).await?;
                     }
-                }
-                Selection::Model { target, choices, actions } => {
-                    let Some(index) = index else {
-                        self.remember_model_drafts(&choices);
-                        self.provider_back(agent, console, target).await?;
-                        return Ok(MenuOutcome::default());
-                    };
-                    if let Some(action) = index.checked_sub(choices.len()).and_then(|index| actions.get(index)) {
-                        match action {
-                            providers::ModelAction::ConnectionDetails => self.open_model_providers(console, target, choices, index)?,
-                            providers::ModelAction::RefreshAccountModels => {
-                                self.remember_model_drafts(&choices);
-                                self.refresh_model_choices(agent, console, target, None, Some(providers::ModelAction::RefreshAccountModels)).await?;
-                            }
-                            providers::ModelAction::Providers => {
-                                self.provider.provider_nav.back_stack.push(providers::ProviderPage::Models {
+                    Ok(MenuOutcome::default())
+                })
+            }
+            Selection::Model {
+                target,
+                choices,
+                actions,
+            } => Box::pin(async move {
+                let Some(index) = index else {
+                    self.remember_model_drafts(&choices);
+                    self.provider_back(agent, console, target).await?;
+                    return Ok(MenuOutcome::default());
+                };
+                if let Some(action) = index
+                    .checked_sub(choices.len())
+                    .and_then(|index| actions.get(index))
+                {
+                    match action {
+                        providers::ModelAction::ConnectionDetails => {
+                            self.open_model_providers(console, target, choices, index)?
+                        }
+                        providers::ModelAction::RefreshAccountModels => {
+                            self.remember_model_drafts(&choices);
+                            self.refresh_model_choices(
+                                agent,
+                                console,
+                                target,
+                                None,
+                                Some(providers::ModelAction::RefreshAccountModels),
+                            )
+                            .await?;
+                        }
+                        providers::ModelAction::Providers => {
+                            self.provider.provider_nav.back_stack.push(
+                                providers::ProviderPage::Models {
                                     connection: self.provider.model_provider.clone(),
                                     focused: self.provider.focused_model.clone(),
                                     query: self.provider.model_query.clone(),
                                     action: Some(providers::ModelAction::Providers),
-                                });
-                                self.provider.provider_nav.filter = providers::ConnectionFilter::All;
-                                self.back_to_providers(console, target)?;
-                            }
+                                },
+                            );
+                            self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                            self.back_to_providers(console, target)?;
                         }
-                        return Ok(MenuOutcome::default());
                     }
-                    let choice = choices.get(index).ok_or("model option does not exist")?;
-                    if !choice.availability.selectable() {
-                        let error = choice.availability.label().to_owned();
-                        self.show_model_choices(console, target, choices, index, tickloop_ids::generate())?;
+                    return Ok(MenuOutcome::default());
+                }
+                let choice = choices.get(index).ok_or("model option does not exist")?;
+                if !choice.availability.selectable() {
+                    let error = choice.availability.label().to_owned();
+                    self.show_model_choices(
+                        console,
+                        target,
+                        choices,
+                        index,
+                        tickloop_ids::generate(),
+                    )?;
+                    return Err(error);
+                }
+                let result = agent
+                    .change_configuration(
+                        target,
+                        ConfigurationChange::Model {
+                            config: choice.config.clone(),
+                            thinking: Some(choice.thinking),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                match result {
+                    Ok(change) => {
+                        self.model_selection_saved(target);
+                        console.write(&safe_text(&format!(
+                            "Model selection: {change} · {} · Effort {}\n",
+                            choice.config.name,
+                            choice.thinking.map_or("auto", ReasoningEffort::label)
+                        )))?;
+                    }
+                    Err(error) => {
+                        self.show_model_choices(
+                            console,
+                            target,
+                            choices,
+                            index,
+                            tickloop_ids::generate(),
+                        )?;
                         return Err(error);
                     }
-                    let result = agent
-                        .change_configuration(
-                            target,
-                            ConfigurationChange::Model {
-                                config: choice.config.clone(),
-                                thinking: Some(choice.thinking),
-                            },
-                        )
-                        .await
-                        .map_err(|error| error.to_string());
-                    match result {
-                        Ok(change) => {
-                            self.model_selection_saved(target);
-                            console.write(&safe_text(&format!("Model selection: {change} · {} · Effort {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?;
-                        }
-                        Err(error) => {
-                            self.show_model_choices(console, target, choices, index, tickloop_ids::generate())?;
-                            return Err(error);
-                        }
-                    }
-                    let snapshot = agent.configuration(target).await.map_err(|error| error.to_string())?;
-                    self.provider.current_connection = self.key_for_model(&snapshot.model);
-                    self.provider.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
                 }
-                Selection::PermissionMode {
-                    target,
-                    return_to_settings: true,
-                    ..
-                } if index.is_none() => self.settings(agent, console, target).await?,
-                Selection::PermissionMode { .. } if index.is_none() => {},
-                Selection::Settings { target } if index.is_none() => {
-                    self.settings_positions.remove(&target.agent());
-                }
-                Selection::Effort { target, return_to_settings: true, .. }
-                | Selection::Mode { target, .. }
-                | Selection::OutputStyle { target }
-                | Selection::ShiftTabModes { target }
-                | Selection::ArtifactSignOut { target, return_to_settings: true }
-                    if index.is_none() => self.settings(agent, console, target).await?,
-                Selection::Theme { settings_target: Some(target) }
-                    if index.is_none() => self.settings(agent, console, target).await?,
-                _ if index.is_none() => {
-                    console.write("Selection cancelled; configuration unchanged.\n")?
-                }
-                Selection::Effort { target, choices, .. } => {
-                    let effort = *choices
-                        .get(index.unwrap())
-                        .ok_or("effort option does not exist")?;
-                    let change = agent
-                        .change_configuration(target, ConfigurationChange::ReasoningEffort { effort })
+                let snapshot = agent
+                    .configuration(target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.provider.current_connection = self.key_for_model(&snapshot.model);
+                self.provider.current_model =
+                    Some((snapshot.model.provider_id, snapshot.model.model_id));
+                Ok(MenuOutcome::default())
+            }),
+            Selection::PermissionMode {
+                target,
+                return_to_settings: true,
+                ..
+            } if index.is_none() => Box::pin(async move {
+                self.settings(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::PermissionMode { .. } if index.is_none() => {
+                Box::pin(async { Ok(MenuOutcome::default()) })
+            }
+            Selection::Settings { target } if index.is_none() => Box::pin(async move {
+                self.settings_positions.remove(&target.agent());
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Effort {
+                target,
+                return_to_settings: true,
+                ..
+            }
+            | Selection::Mode { target, .. }
+            | Selection::OutputStyle { target }
+            | Selection::ShiftTabModes { target }
+            | Selection::ArtifactSignOut {
+                target,
+                return_to_settings: true,
+            } if index.is_none() => Box::pin(async move {
+                self.settings(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Theme {
+                settings_target: Some(target),
+            } if index.is_none() => Box::pin(async move {
+                self.settings(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            _ if index.is_none() => Box::pin(async move {
+                console.write("Selection cancelled; configuration unchanged.\n")?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Effort {
+                target, choices, ..
+            } => Box::pin(async move {
+                let effort = *choices
+                    .get(index.unwrap())
+                    .ok_or("effort option does not exist")?;
+                let change = agent
+                    .change_configuration(target, ConfigurationChange::ReasoningEffort { effort })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.write(&format!(
+                    "Effort: {}{}\n",
+                    effort.map_or("auto", ReasoningEffort::label),
+                    change.staged_note()
+                ))?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ArtifactSignOut {
+                target,
+                return_to_settings,
+            } => Box::pin(async move {
+                if index == Some(1) {
+                    let root = self
+                        .config_root
+                        .as_ref()
+                        .ok_or("Tickloop Artifacts needs a state directory")?;
+                    agent
+                        .disable_event_sources()
                         .await
                         .map_err(|error| error.to_string())?;
-                    console.write(&format!(
-                        "Effort: {}{}\n",
-                        effort.map_or("auto", ReasoningEffort::label),
-                        change.staged_note()
-                    ))?;
+                    let client = tickloop_harness::artifacts::ArtifactClient::new(root)
+                        .map_err(|error| error.to_string())?;
+                    Box::pin(client.logout())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    console.write("Signed out of Tickloop Accounts.\n")?;
+                } else if return_to_settings {
+                    self.settings(agent, console, target).await?;
                 }
-                Selection::ArtifactSignOut { target, return_to_settings } => {
-                    if index == Some(1) {
-                        let root = self.config_root.as_ref().ok_or("Tickloop Artifacts needs a state directory")?;
-                        agent.disable_event_sources().await.map_err(|error| error.to_string())?;
-                        let client = tickloop_harness::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
-                        Box::pin(client.logout()).await.map_err(|error| error.to_string())?;
-                        console.write("Signed out of Tickloop Accounts.\n")?;
-                    } else if return_to_settings {
-                        self.settings(agent, console, target).await?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Settings { target } => Box::pin(async move {
+                match index {
+                    Some(SEARCH_SETTING_INDEX) => {
+                        Box::pin(self.search_settings(agent, console, target, true)).await?
                     }
-                },
-                Selection::Settings { target } => match index {
-                    Some(SEARCH_SETTING_INDEX) => Box::pin(self.search_settings(agent, console, target, true)).await?,
                     Some(TASK_TOOLS_SETTING_INDEX) => {
-                        let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
-                        agent.change_configuration(target, ConfigurationChange::TaskToolsEnabled {
-                            enabled: !configuration.task_tools_enabled,
-                        }).await.map_err(|error| error.to_string())?;
+                        let configuration = agent
+                            .configuration(target)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        agent
+                            .change_configuration(
+                                target,
+                                ConfigurationChange::TaskToolsEnabled {
+                                    enabled: !configuration.task_tools_enabled,
+                                },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
                         self.settings(agent, console, target).await?;
                     }
                     Some(PROMPT_SUGGESTION_SETTING_INDEX) => {
                         let enabled = !console.prompt_suggestion_enabled()?;
                         self.user_settings.as_ref().ok_or("cannot save prompt suggestions because the user settings directory is unavailable")?
-                            .save_prompt_suggestion_enabled(enabled).map_err(|error| error.to_string())?;
+                        .save_prompt_suggestion_enabled(enabled).map_err(|error| error.to_string())?;
                         console.set_prompt_suggestion_enabled(enabled)?;
                         self.settings(agent, console, target).await?;
                     }
                     Some(0) => self.open_models(agent, console, target, true).await?,
                     Some(1) => {
-                        let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
+                        let configuration = agent
+                            .configuration(target)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         if matches!(
                             tickloop_harness::model::cards::model_card(&configuration.model)
                                 .map(|card| card.thinking),
                             Some(tickloop_harness::protocol::ThinkingControl::Toggle)
                         ) {
-                            let enabled = !configuration.model.thinking_enabled(configuration.reasoning_effort, configuration.thinking_enabled).unwrap_or(configuration.thinking_enabled);
-                            agent.change_configuration(target, ConfigurationChange::ThinkingEnabled { enabled }).await.map_err(|error| error.to_string())?;
+                            let enabled = !configuration
+                                .model
+                                .thinking_enabled(
+                                    configuration.reasoning_effort,
+                                    configuration.thinking_enabled,
+                                )
+                                .unwrap_or(configuration.thinking_enabled);
+                            agent
+                                .change_configuration(
+                                    target,
+                                    ConfigurationChange::ThinkingEnabled { enabled },
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
                         } else {
                             console.write("Thinking toggle is unavailable for this model.\n")?;
                         }
@@ -3190,7 +3519,9 @@ impl Menus {
                     }
                     Some(2) => self.show_efforts(agent, console, target, true).await?,
                     Some(3) => self.modes(agent, console, target).await?,
-                    Some(SHIFT_TAB_MODES_SETTING_INDEX) => self.shift_tab_modes(console, target, 0)?,
+                    Some(SHIFT_TAB_MODES_SETTING_INDEX) => {
+                        self.shift_tab_modes(console, target, 0)?
+                    }
                     Some(5) => self.settings_info(agent, console, target, false).await?,
                     Some(6) => self.settings_info(agent, console, target, true).await?,
                     Some(7) => {
@@ -3217,201 +3548,186 @@ impl Menus {
                                     "Cannot open Permissions: {}.\n",
                                     super::safe_text(&error)
                                 ))?;
-                            },
+                            }
                         }
                     }
                     _ => return Err("setting does not exist".into()),
-                },
-                Selection::Theme { .. } => {
-                    let theme = *ThemeName::ALL
-                        .get(index.unwrap())
-                        .ok_or("theme option does not exist")?;
-                    console.set_theme(theme)?;
-                    console.write(&format!("Theme: {}\n", theme.label()))?;
                 }
-                Selection::ShiftTabModes { .. } => {
-                    let checks = console
-                        .menu_checks(menu_id)?
-                        .ok_or("the shift+tab modes checklist is no longer open")?;
-                    let modes = ExecutionMode::CYCLE_ORDER
-                        .into_iter()
-                        .zip(checks)
-                        .filter_map(|(mode, checked)| checked.then_some(mode))
-                        .collect::<Vec<_>>();
-                    self.user_settings
-                        .as_ref()
-                        .ok_or("cannot save shift+tab modes because the user settings directory is unavailable")?
-                        .save_shift_tab_modes(&modes)
-                        .map_err(|error| error.to_string())?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Theme { .. } => Box::pin(async move {
+                let theme = *ThemeName::ALL
+                    .get(index.unwrap())
+                    .ok_or("theme option does not exist")?;
+                console.set_theme(theme)?;
+                console.write(&format!("Theme: {}\n", theme.label()))?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::ShiftTabModes { .. } => Box::pin(async move {
+                let checks = console
+                    .menu_checks(menu_id)?
+                    .ok_or("the shift+tab modes checklist is no longer open")?;
+                let modes = ExecutionMode::CYCLE_ORDER
+                    .into_iter()
+                    .zip(checks)
+                    .filter_map(|(mode, checked)| checked.then_some(mode))
+                    .collect::<Vec<_>>();
+                self.user_settings
+                    .as_ref()
+                    .ok_or("cannot save shift+tab modes because the user settings directory is unavailable")?
+                    .save_shift_tab_modes(&modes)
+                    .map_err(|error| error.to_string())?;
+                console.write(&format!(
+                    "shift+tab modes: {}\n",
+                    modes
+                        .iter()
+                        .map(|mode| mode.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))?;
+                console.set_shift_tab_modes(modes)?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::OutputStyle { .. } => Box::pin(async move {
+                let style = *OutputStyle::ALL
+                    .get(index.unwrap())
+                    .ok_or("output style option does not exist")?;
+                self.user_settings
+                    .as_ref()
+                    .ok_or("cannot save the output style because the user settings directory is unavailable")?
+                    .save_output_style(style)
+                    .map_err(|error| error.to_string())?;
+                console.write(&format!("Output style: {}\n", style.label()))?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::Mode { target, choices } => Box::pin(async move {
+                let mode = *choices
+                    .get(index.unwrap())
+                    .ok_or("execution mode does not exist")?;
+                let change = agent
+                    .change_configuration(target, ConfigurationChange::ExecutionMode { mode })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.write(&format!(
+                    "Execution mode: {mode}. Explicit deny rules remain effective.{}\n",
+                    change.staged_note()
+                ))?;
+                Ok(MenuOutcome::default())
+            }),
+            Selection::PermissionMode {
+                target: ConfigTarget::NewDraft,
+                choices,
+                current,
+                return_to_settings,
+            } => Box::pin(async move {
+                let index = index.unwrap();
+                let is_mode_selection = index < choices.len();
+                let mode = if is_mode_selection {
+                    choices[index]
+                } else if index == choices.len() {
+                    current
+                } else {
+                    return Err("permission mode does not exist".into());
+                };
+                let result = async {
+                    if is_mode_selection && mode != current {
+                        agent
+                            .change_configuration(
+                                ConfigTarget::NewDraft,
+                                ConfigurationChange::ExecutionMode { mode },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    console.clear_menu(menu_id)?;
+                    self.open_draft_permissions(
+                        agent,
+                        console,
+                        return_to_settings,
+                        is_mode_selection && mode == ExecutionMode::Auto,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    self.permission_modes(
+                        agent,
+                        console,
+                        ConfigTarget::NewDraft,
+                        return_to_settings,
+                    )
+                    .await?;
                     console.write(&format!(
-                        "shift+tab modes: {}\n",
-                        modes.iter().map(|mode| mode.label()).collect::<Vec<_>>().join(", ")
-                    ))?;
-                    console.set_shift_tab_modes(modes)?;
-                }
-                Selection::OutputStyle { .. } => {
-                    let style = *OutputStyle::ALL
-                        .get(index.unwrap())
-                        .ok_or("output style option does not exist")?;
-                    self.user_settings
-                        .as_ref()
-                        .ok_or("cannot save the output style because the user settings directory is unavailable")?
-                        .save_output_style(style)
-                        .map_err(|error| error.to_string())?;
-                    console.write(&format!("Output style: {}\n", style.label()))?;
-                }
-                Selection::Mode { target, choices } => {
-                    let mode = *choices
-                        .get(index.unwrap())
-                        .ok_or("execution mode does not exist")?;
-                    let change = agent
-                        .change_configuration(target, ConfigurationChange::ExecutionMode { mode })
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    console.write(&format!(
-                        "Execution mode: {mode}. Explicit deny rules remain effective.{}\n",
-                        change.staged_note()
+                        "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
+                        super::safe_text(&error)
                     ))?;
                 }
-                Selection::PermissionMode {
-                    target: ConfigTarget::NewDraft,
-                    choices,
-                    current,
-                    return_to_settings,
-                } => {
-                    let index = index.unwrap();
-                    let is_mode_selection = index < choices.len();
-                    let mode = if is_mode_selection {
-                        choices[index]
-                    } else if index == choices.len() {
+                Ok(MenuOutcome::default())
+            }),
+            Selection::PermissionMode {
+                target: ConfigTarget::Agent(chat),
+                choices,
+                current,
+                return_to_settings,
+            } => Box::pin(async move {
+                let target = ConfigTarget::Agent(chat);
+                if let Some(index) = index {
+                    let mode = if index == choices.len() {
                         current
                     } else {
-                        return Err("permission mode does not exist".into());
+                        *choices.get(index).ok_or("permission mode does not exist")?
                     };
+                    let is_mode_selection = index < choices.len();
                     let result = async {
-                        if is_mode_selection && mode != current {
-                            agent
-                                .change_configuration(
-                                    ConfigTarget::NewDraft,
-                                    ConfigurationChange::ExecutionMode { mode },
-                                )
+                        if is_mode_selection {
+                            let actual = agent
+                                .configuration(target)
                                 .await
-                                .map_err(|error| error.to_string())?;
+                                .map_err(|error| error.to_string())?
+                                .execution_mode;
+                            if mode != actual {
+                                agent
+                                    .set_execution_mode(chat, mode)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
                         }
-                        console.clear_menu(menu_id)?;
-                        self.open_draft_permissions(
-                            agent,
-                            console,
-                            return_to_settings,
-                            is_mode_selection && mode == ExecutionMode::Auto,
-                        )
-                        .await
+                        let view = agent
+                            .permissions_view(chat)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let history = agent
+                            .approval_history_view(chat)
+                            .await
+                            .map_err(|error| super::safe_text(&error.to_string()));
+                        Ok::<_, String>((view, history))
                     }
                     .await;
-                    if let Err(error) = result {
-                        self.permission_modes(
-                            agent,
-                            console,
-                            ConfigTarget::NewDraft,
-                            return_to_settings,
-                        )
-                        .await?;
-                        console.write(&format!(
-                            "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
-                            super::safe_text(&error)
-                        ))?;
-                    }
-                }
-                Selection::PermissionMode {
-                    target: ConfigTarget::Agent(chat),
-                    choices,
-                    current,
-                    return_to_settings,
-                } => {
-                    let target = ConfigTarget::Agent(chat);
-                    if let Some(index) = index {
-                        let mode = if index == choices.len() {
-                            current
-                        } else {
-                            *choices.get(index).ok_or("permission mode does not exist")?
-                        };
-                        let is_mode_selection = index < choices.len();
-                        let result = async {
-                            if is_mode_selection {
-                                let actual = agent
-                                    .configuration(target)
-                                    .await
-                                    .map_err(|error| error.to_string())?
-                                    .execution_mode;
-                                if mode != actual {
-                                    agent
-                                        .set_execution_mode(chat, mode)
-                                        .await
-                                        .map_err(|error| error.to_string())?;
-                                }
-                            }
-                            let view = agent
-                                .permissions_view(chat)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let history = agent
-                                .approval_history_view(chat)
-                                .await
-                                .map_err(|error| super::safe_text(&error.to_string()));
-                            Ok::<_, String>((view, history))
+                    match result {
+                        Ok((view, history)) => {
+                            console.clear_menu(menu_id)?;
+                            let auto_page =
+                                is_mode_selection && view.execution_mode == ExecutionMode::Auto;
+                            console.show_permissions(
+                                view,
+                                history,
+                                return_to_settings,
+                                auto_page,
+                            )?;
                         }
-                        .await;
-                        match result {
-                            Ok((view, history)) => {
-                                console.clear_menu(menu_id)?;
-                                let auto_page = is_mode_selection
-                                    && view.execution_mode == ExecutionMode::Auto;
-                                console.show_permissions(
-                                    view,
-                                    history,
-                                    return_to_settings,
-                                    auto_page,
-                                )?;
-                            }
-                            Err(error) => {
-                                self.permission_modes(agent, console, target, return_to_settings)
-                                    .await?;
-                                console.write(&format!(
-                                    "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
-                                    super::safe_text(&error)
-                                ))?;
-                            }
+                        Err(error) => {
+                            self.permission_modes(agent, console, target, return_to_settings)
+                                .await?;
+                            console.write(&format!(
+                                "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
+                                super::safe_text(&error)
+                            ))?;
                         }
                     }
                 }
-            }
-            Ok(MenuOutcome::default())
-        })
-        .await;
-        if outcome.is_err()
-            && self.active.is_none()
-            && let Some((selection, mut menu)) = retry
-        {
-            menu.id = tickloop_ids::generate();
-            if let Some(index) = index {
-                menu.selected = index;
-            }
-            let restored = menu.id;
-            self.provider.provider_nav = navigation_before;
-            self.provider.model_provider = model_provider_before;
-            if console.recover_menu(menu_id, restored, index)? {
-                self.active = Some((restored, selection));
-            } else {
-                self.show(console, menu, selection)?;
-            }
-            if let Some(flow) = &mut self.provider.discovery_flow
-                && flow.id == menu_id
-            {
-                flow.id = restored;
-            }
+                Ok(MenuOutcome::default())
+            }),
         }
-        console.finish_menu_submission(menu_id)?;
-        outcome
     }
 }
 
