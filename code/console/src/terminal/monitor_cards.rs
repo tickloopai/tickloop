@@ -4,7 +4,7 @@
 //! Tick, so it reads the keys its own terminal would send.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -556,7 +556,22 @@ pub(super) struct OpenCard {
     early_input_overflowed: bool,
 }
 
-/// The cards open in the current Chat and the one with the focus.
+/// What a Chat's cards were while another Chat is shown: the cards shown, without a Tab preview,
+/// and the ones the user hid.
+#[derive(Default)]
+struct RememberedCards {
+    shown: Vec<RememberedCard>,
+    hidden: HashSet<InstanceRef>,
+}
+
+struct RememberedCard {
+    instance: InstanceRef,
+    origin: CardOrigin,
+    sequence: u64,
+}
+
+/// The cards open in the current Chat and the one with the focus, and what the other Chats'
+/// cards were, for this Console's lifetime.
 #[derive(Default)]
 pub(super) struct MonitorCards {
     chat: Option<Uuid>,
@@ -565,6 +580,7 @@ pub(super) struct MonitorCards {
     /// The cards the user hid in this Chat; the Agent's use shows them again only after the user
     /// does.
     hidden: HashSet<InstanceRef>,
+    remembered: HashMap<Uuid, RememberedCards>,
     next_sequence: u64,
     keys: CardKeys,
     redraw: Arc<Notify>,
@@ -614,8 +630,7 @@ impl MonitorCards {
         origin: CardOrigin,
     ) -> bool {
         if self.chat != Some(chat) {
-            self.close_all();
-            self.hidden.clear();
+            self.remember();
             self.chat = Some(chat);
         }
         if origin == CardOrigin::User {
@@ -679,10 +694,77 @@ impl MonitorCards {
         self.open.clear();
     }
 
+    /// Remembers the shown Chat's cards and the ones the user hid, then closes them, which
+    /// detaches their views; no Chat's cards are shown until [`MonitorCards::restore`]. A Tab
+    /// preview and the focus are not remembered.
+    pub(super) fn remember(&mut self) {
+        self.leave_focus();
+        let open = std::mem::take(&mut self.open);
+        let hidden = std::mem::take(&mut self.hidden);
+        let Some(chat) = self.chat.take() else {
+            return;
+        };
+        let shown: Vec<RememberedCard> = open
+            .into_iter()
+            .filter(|card| card.origin != CardOrigin::Preview)
+            .map(|card| RememberedCard {
+                instance: card.instance,
+                origin: card.origin,
+                sequence: card.sequence,
+            })
+            .collect();
+        if shown.is_empty() && hidden.is_empty() {
+            self.remembered.remove(&chat);
+        } else {
+            self.remembered
+                .insert(chat, RememberedCards { shown, hidden });
+        }
+    }
+
+    /// Shows `chat`'s cards again, opening, with their origins and places, those whose rows are
+    /// still `listed` and `have_card`, and keeps the user's hiding of rows still `listed`.
+    /// Returns the cards whose views attach.
+    pub(super) fn restore(
+        &mut self,
+        chat: Uuid,
+        listed: impl Fn(&InstanceRef) -> bool,
+        have_card: impl Fn(&InstanceRef) -> bool,
+    ) -> Vec<InstanceRef> {
+        self.remember();
+        self.chat = Some(chat);
+        let Some(remembered) = self.remembered.remove(&chat) else {
+            return Vec::new();
+        };
+        self.hidden = remembered
+            .hidden
+            .into_iter()
+            .filter(|instance| listed(instance))
+            .collect();
+        self.open = remembered
+            .shown
+            .into_iter()
+            .filter(|card| listed(&card.instance) && have_card(&card.instance))
+            .map(|card| OpenCard {
+                instance: card.instance,
+                sequence: card.sequence,
+                origin: card.origin,
+                state: CardState::Opening,
+                early_input: Vec::new(),
+                early_input_overflowed: false,
+            })
+            .collect();
+        self.open.iter().map(|card| card.instance.clone()).collect()
+    }
+
+    /// Forgets the remembered cards of the Chats that are not `known`.
+    pub(super) fn forget_chats(&mut self, known: impl Fn(Uuid) -> bool) {
+        self.remembered.retain(|chat, _| known(*chat));
+    }
+
     /// Closes the cards that do not belong to `chat`, or whose rows `listed` no longer has.
     pub(super) fn retain(&mut self, chat: Option<Uuid>, listed: impl Fn(&InstanceRef) -> bool) {
         if self.chat != chat {
-            self.close_all();
+            self.remember();
             self.chat = chat;
             return;
         }
@@ -697,20 +779,27 @@ impl MonitorCards {
         }
     }
 
-    /// Stores the view of a card still waiting for it; false when the card closed meanwhile, and
-    /// the view is dropped, which detaches it.
+    /// Stores the view of a card of `chat` still waiting for it; false when the card closed
+    /// meanwhile or another Chat is shown, and the view is dropped, which detaches it.
     pub(super) fn attached(&mut self, chat: Uuid, instance: &InstanceRef, view: CardView) -> bool {
+        if self.chat != Some(chat) {
+            return false;
+        }
         match self.card_mut(instance) {
             Some(card) if matches!(card.state, CardState::Opening) => {
                 view.input(std::mem::take(&mut card.early_input));
                 card.state = CardState::Attached(view);
-                self.chat == Some(chat)
+                true
             }
             _ => false,
         }
     }
 
-    pub(super) fn failed(&mut self, instance: &InstanceRef, reason: String) {
+    /// The view of `chat`'s card could not attach; a card another Chat shows is left alone.
+    pub(super) fn failed(&mut self, chat: Uuid, instance: &InstanceRef, reason: String) {
+        if self.chat != Some(chat) {
+            return;
+        }
         if let Some(card) = self.card_mut(instance)
             && matches!(card.state, CardState::Opening)
         {

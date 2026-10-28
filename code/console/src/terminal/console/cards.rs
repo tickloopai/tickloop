@@ -119,6 +119,46 @@ impl State {
         })
     }
 
+    /// Before a Chat switch: the shown Chat's cards are remembered and closed, which detaches
+    /// their views. A card that had the keyboard does not get it back, so the Monitor list gives
+    /// up the focus too and the input has it on return.
+    pub(super) fn remember_cards(&mut self) {
+        if self.card_focused() {
+            self.monitor.focused = false;
+            self.monitor.overlay = false;
+        }
+        self.monitor.card_focused = false;
+        self.cards.remember();
+    }
+
+    /// After a Chat switch: shows again the cards `chat` had whose rows are still listed with a
+    /// live screen, and queues their views' attaches with fresh grants; attaches still queued
+    /// for other Chats are dropped. The cards of the other Chats without a cached View are
+    /// forgotten.
+    pub(super) fn restore_cards(&mut self, chat: Option<Uuid>) {
+        let views = &self.view_cache;
+        self.cards.forget_chats(|remembered| {
+            Some(remembered) == chat || views.contains_key(&Some(remembered))
+        });
+        self.queued_card_inputs.retain(
+            |input| matches!(input, InputEvent::TickAction { chat: acted, .. } if Some(*acted) == chat),
+        );
+        let Some(chat) = chat else {
+            return;
+        };
+        let monitor = &self.monitor;
+        let restored = self.cards.restore(
+            chat,
+            |instance| monitor.lists(instance),
+            |instance| monitor.row_opens_view(instance),
+        );
+        self.queued_card_inputs
+            .extend(restored.into_iter().map(|instance| InputEvent::TickAction {
+                chat,
+                action: super::super::tick_actions::builtin::attach_card(instance),
+            }));
+    }
+
     /// Takes up a terminal size change no resize event reported, as while a card reads the raw
     /// input; returns whether the size changed.
     pub(super) fn follow_terminal_size(&mut self) -> bool {
@@ -453,10 +493,10 @@ impl State {
         self.cards.input(bytes);
     }
 
-    /// The open cards of the shown Chat whose rows are still listed, for the next frame. A Chat
-    /// switch or a row leaving the list closes its cards; a row on a page not loaded yet is
-    /// still listed. A card whose Tick ended, as its row or its view tells, keeps its last screen
-    /// and says how on its rule.
+    /// The open cards of the shown Chat whose rows are still listed, for the next frame. A row
+    /// leaving the list closes its card; a row on a page not loaded yet is still listed. A card
+    /// whose Tick ended, as its row or its view tells, keeps its last screen and says how on its
+    /// rule.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
         self.monitor.card_focused = self.card_focused();
         let monitor = &self.monitor;
@@ -752,6 +792,7 @@ impl Console {
                 state.cards.attached(chat, &instance, view);
             }
             Err(error) => state.cards.failed(
+                chat,
                 &instance,
                 super::super::safe_line(&format!("Cannot open: {}", error.message)),
             ),
@@ -763,13 +804,14 @@ impl Console {
 
     pub(in crate::terminal) fn card_failed(
         &self,
+        chat: Uuid,
         instance: &InstanceRef,
         reason: &str,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
             .cards
-            .failed(instance, super::super::safe_line(reason));
+            .failed(chat, instance, super::super::safe_line(reason));
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())

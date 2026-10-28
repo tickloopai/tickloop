@@ -566,6 +566,64 @@ fn cards_close_with_their_chat_and_their_rows_and_lose_the_focus_with_them() {
 }
 
 #[test]
+fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_chat() {
+    let chat = Uuid::from_u128(1);
+    let shown: InstanceRef = "hosted:shown".parse().unwrap();
+    let used: InstanceRef = "hosted:used".parse().unwrap();
+    let hidden: InstanceRef = "hosted:hidden".parse().unwrap();
+    let previewed: InstanceRef = "hosted:previewed".parse().unwrap();
+    let gone: InstanceRef = "hosted:gone".parse().unwrap();
+    let mut cards = MonitorCards::default();
+    cards.open(chat, shown.clone());
+    cards.open_as(chat, used.clone(), CardOrigin::Agent);
+    cards.open(chat, gone.clone());
+    cards.open(chat, hidden.clone());
+    cards.hide(&hidden);
+    cards.open_as(chat, previewed.clone(), CardOrigin::Preview);
+    cards.focus(shown.clone());
+    let sequences: Vec<u64> = [&shown, &used]
+        .iter()
+        .map(|instance| cards.card(instance).unwrap().sequence)
+        .collect();
+
+    cards.remember();
+    assert!(cards.cards().is_empty() && cards.focused().is_none());
+    assert!(cards.agent_may_show(&hidden), "no Chat is shown");
+    let restored = cards.restore(chat, |_| true, |instance| instance != &gone);
+    assert_eq!(restored, [shown.clone(), used.clone()]);
+    assert_eq!(
+        [&shown, &used].map(|instance| {
+            let card = cards.card(instance).unwrap();
+            assert!(matches!(card.state, CardState::Opening));
+            (card.origin, card.sequence)
+        }),
+        [
+            (CardOrigin::User, sequences[0]),
+            (CardOrigin::Agent, sequences[1])
+        ]
+    );
+    assert!(cards.focused().is_none(), "the keyboard is not given back");
+    assert!(!cards.agent_may_show(&hidden));
+
+    cards.remember();
+    let restored = cards.restore(chat, |instance| instance != &hidden, |_| true);
+    assert_eq!(restored, [shown.clone(), used.clone()]);
+    assert!(
+        cards.agent_may_show(&hidden),
+        "a hidden row no longer listed is forgotten"
+    );
+
+    cards.hide(&used);
+    cards.remember();
+    cards.forget_chats(|known| known != chat);
+    assert!(cards.restore(chat, |_| true, |_| true).is_empty());
+    assert!(
+        cards.agent_may_show(&used),
+        "a forgotten Chat starts afresh"
+    );
+}
+
+#[test]
 fn input_typed_before_the_view_attaches_is_held_for_it() {
     let chat = Uuid::from_u128(1);
     let card: InstanceRef = "hosted:early".parse().unwrap();

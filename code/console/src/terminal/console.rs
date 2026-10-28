@@ -6156,8 +6156,10 @@ impl State {
             next
         });
         self.switch_editor_chat(chat);
+        self.remember_cards();
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
+        self.restore_cards(chat);
         let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
         self.monitor.settle_flashes(now_ms);
         if let Some(chat) = chat {

@@ -1286,3 +1286,191 @@ fn leaving_a_card_for_the_list_and_switching_chats_tell_each_tick_its_focus() {
     state.draw_frame(&mut Vec::new()).unwrap();
     assert_eq!(focus_requests(&mut queues[1]), [false], "a Chat switch");
 }
+
+/// A View of a Chat whose focused Monitor lists four hosted Ticks; returns them in the list's
+/// order, the first selected.
+fn four_hosted_fixture() -> (State, Vec<tick_protocol::InstanceRef>) {
+    let mut state = State::new(true, 140, 60);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state.monitor.replace(
+        TickGroup::Ticks,
+        ["one", "two", "three", "four"].map(hosted_entry).into(),
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.monitor.focus(false, None);
+    let rows: Vec<_> = state
+        .monitor
+        .entries()
+        .iter()
+        .map(|entry| entry.instance.clone())
+        .collect();
+    state.monitor.select(&rows[0]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    (state, rows)
+}
+
+/// The cards whose views the next settle attaches, all for `chat`.
+fn queued_attaches(state: &mut State, chat: Uuid) -> Vec<tick_protocol::InstanceRef> {
+    let (_, inputs) = state.settle_card_signals();
+    inputs
+        .into_iter()
+        .map(|input| match input {
+            InputEvent::TickAction {
+                chat: acted,
+                action,
+            } => {
+                assert_eq!(acted, chat);
+                assert_eq!(action.key, crate::monitor_rows::MONITOR_ENTER_KEY);
+                action.instance.parse().unwrap()
+            }
+            other => panic!("expected a card's attach, got {other:?}"),
+        })
+        .collect()
+}
+
+fn show_with_space(state: &mut State, instance: &tick_protocol::InstanceRef) {
+    let chat = state.chat.unwrap();
+    state.monitor.select(instance);
+    attaches(state.key(key(KeyCode::Char(' '))), chat, instance);
+}
+
+#[test]
+fn switching_chats_away_and_back_restores_the_shown_cards_and_the_hidden_set() {
+    let (mut state, rows) = four_hosted_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    show_with_space(&mut state, one);
+    state.monitor.flash_use(two.clone(), 1);
+    assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(two));
+    show_with_space(&mut state, three);
+    assert!(state.key(key(KeyCode::Char(' '))).is_none(), "hides it");
+    attaches(state.key(key(KeyCode::Tab)), chat, four);
+    assert_eq!(origin(&state, four), Some(CardOrigin::Preview));
+    for row in [one, two] {
+        let (view, _requests) =
+            crate::terminal::monitor_cards::CardView::detached(state.card_size(row));
+        assert!(state.cards.attached(chat, row, view));
+    }
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    let other = Uuid::new_v4();
+    state.switch_view_chat(Some(other));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.cards.cards().is_empty(), "another Chat shows none");
+    assert!(queued_attaches(&mut state, other).is_empty());
+
+    state.switch_view_chat(Some(chat));
+    assert_eq!(
+        queued_attaches(&mut state, chat),
+        [one.clone(), two.clone()],
+        "the views attach again with fresh grants"
+    );
+    assert_eq!(origin(&state, one), Some(CardOrigin::User));
+    assert_eq!(origin(&state, two), Some(CardOrigin::Agent));
+    assert!(matches!(
+        state.cards.card(one).unwrap().state,
+        CardState::Opening
+    ));
+    assert!(!state.cards.is_open(three));
+    assert!(!state.cards.is_open(four), "a Tab preview is not restored");
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(screen(&state).matches("── opening ──").count(), 2);
+
+    state.monitor.flash_use(three.clone(), 2);
+    assert!(
+        queued_attaches(&mut state, chat).is_empty(),
+        "a card the user hid stays hidden from the Agent's use"
+    );
+    state.monitor.flash_use(four.clone(), 3);
+    assert_eq!(
+        queued_attaches(&mut state, chat),
+        std::slice::from_ref(four)
+    );
+}
+
+#[test]
+fn a_card_that_had_the_keyboard_comes_back_shown_and_the_input_takes_the_keys() {
+    let (mut state, rows) = four_hosted_fixture();
+    let chat = state.chat.unwrap();
+    let one = &rows[0];
+    attaches(state.key(key(KeyCode::Enter)), chat, one);
+    assert!(state.card_focused());
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.switch_view_chat(Some(chat));
+    assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(one));
+    assert_eq!(origin(&state, one), Some(CardOrigin::User));
+    assert!(!state.card_focused(), "no card takes the keyboard back");
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        !state.monitor.focused && !state.monitor.card_focused && !state.conversation_focused,
+        "the input has the keys"
+    );
+    assert_eq!(selected(&state), *one, "the selection stays");
+}
+
+#[test]
+fn cards_whose_ticks_left_the_list_or_ended_while_away_are_not_restored() {
+    let (mut state, rows) = four_hosted_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two, three] = [&rows[0], &rows[1], &rows[2]];
+    for row in [one, two, three] {
+        show_with_space(&mut state, row);
+    }
+    let mut entries = state.monitor.entries().to_vec();
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    entries.retain(|entry| &entry.instance != two);
+    let ended = entries
+        .iter_mut()
+        .find(|entry| &entry.instance == three)
+        .unwrap();
+    ended.actions.clear();
+    ended.ended = Some("exited 0".into());
+    state.update_tick_entries(chat, TickGroup::Ticks, entries);
+
+    state.switch_view_chat(Some(chat));
+    assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(one));
+    assert!(!state.cards.is_open(two) && !state.cards.is_open(three));
+}
+
+#[test]
+fn cards_shown_in_a_subagents_chat_come_back_when_the_user_returns_to_it() {
+    const ROOT_AGENT: Uuid = Uuid::from_u128(100);
+    const CHILD_AGENT: Uuid = Uuid::from_u128(101);
+    let mut state = State::new(true, 140, 60);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    console.activate_agent(ROOT_AGENT).unwrap();
+    console.activate_agent(CHILD_AGENT).unwrap();
+    let tick = {
+        let mut state = console.state.lock().unwrap();
+        state
+            .monitor
+            .replace(TickGroup::Ticks, vec![hosted_entry("child's tick")]);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        state.monitor.focus(false, None);
+        let tick = state.monitor.entries()[0].instance.clone();
+        show_with_space(&mut state, &tick);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        tick
+    };
+
+    console.activate_agent(ROOT_AGENT).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert!(state.cards.cards().is_empty(), "the parent shows none");
+    }
+    assert!(console.activate_agent(CHILD_AGENT).unwrap());
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(
+        queued_attaches(&mut state, CHILD_AGENT),
+        std::slice::from_ref(&tick)
+    );
+    assert_eq!(origin(&state, &tick), Some(CardOrigin::User));
+}

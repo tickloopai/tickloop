@@ -255,9 +255,10 @@ impl TickActionBackend for AttachCard {
                     .attach_card(ctx.chat, self.instance.clone(), grant)
                     .await
             }
-            Err(error) => ctx
-                .console
-                .card_failed(&self.instance, &format!("Cannot open: {error}")),
+            Err(error) => {
+                ctx.console
+                    .card_failed(ctx.chat, &self.instance, &format!("Cannot open: {error}"))
+            }
         }
     }
 }

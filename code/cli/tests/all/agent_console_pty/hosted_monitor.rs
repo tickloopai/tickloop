@@ -1291,3 +1291,157 @@ async fn actual_cli_s_keeps_a_terminal_update_pending_while_changing_frequency()
         std::panic::resume_unwind(panic);
     }
 }
+
+const REMEMBERING_CHILD: &str = "Remembering Child";
+
+/// The rows of the Subagents list under its heading, without the Monitor beside them.
+fn family_rows(frame: &str) -> Vec<&str> {
+    frame
+        .lines()
+        .skip_while(|line| !line.contains("Subagents 1"))
+        .skip(1)
+        .map(|line| line.split_once('│').map_or(line, |(left, _)| left))
+        .collect()
+}
+
+/// Opens the Chat of the Subagents list row titled `title`, `main` for the root, from the input.
+async fn open_family_row(view: &mut PtyView, title: &str) {
+    let selected_row = |frame: &str| {
+        family_rows(frame)
+            .iter()
+            .position(|line| line.starts_with(SELECTED_MARK))
+    };
+    view.send(b"\x1b[B");
+    view.wait_for("the Subagents list takes the keys", |frame| {
+        selected_row(frame).is_some()
+    })
+    .await;
+    for _ in 0..4 {
+        let frame = view.frame();
+        let rows = family_rows(&frame);
+        let target = rows
+            .iter()
+            .position(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("no Subagents row {title}: {frame}"));
+        let selected = selected_row(&frame).unwrap();
+        if selected == target {
+            view.send(b"\r");
+            return;
+        }
+        view.send(if selected < target { b"j" } else { b"k" });
+        view.wait_for("the Subagents selection moves", |frame| {
+            selected_row(frame) != Some(selected)
+        })
+        .await;
+    }
+    panic!(
+        "the Subagents list never selected {title}: {}",
+        view.frame()
+    );
+}
+
+/// A card shown in the main Chat closes while the user reads a Subagent's Chat, whose Monitor does
+/// not list its Tick, and comes back when the user returns: its view attaches again and shows
+/// the Tick's screen, and the input, not the card, has the keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_a_card_shown_before_visiting_a_subagent_comes_back_on_return() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let script = fixture.path("work/keys.py");
+        std::fs::write(&script, include_str!("../../support/keys_tick.py")).unwrap();
+        let command = json!(["/usr/bin/python3", "-u", script.to_string_lossy()]);
+        let (base_url, _requests) = model_http_support::serve_router(move |request| {
+            match delegated_by(request).as_deref() {
+                None if !has_result(request, "open-keys") => chat_reply(
+                    Some((
+                        "TickManage",
+                        "open-keys",
+                        json!({"action":"open","command":command.clone(),"protocol":true}),
+                    )),
+                    "",
+                ),
+                None if !has_result(request, "remembering-child") => chat_reply(
+                    Some((
+                        "Subagent",
+                        "remembering-child",
+                        json!({"name":"remembering-child","description":REMEMBERING_CHILD,"task":REMEMBERING_CHILD}),
+                    )),
+                    "",
+                ),
+                None => chat_reply(None, "Keys and child ready."),
+                Some(_) => chat_reply(None, "CHILD-REPORT"),
+            }
+        })
+        .await;
+        fixture.set_chat_model(&base_url);
+        let mut view = PtyView::start_with_flags(&fixture, &["--dangerously-skip-permissions"]);
+        view.wait_for("input ready", new_input_is_visible).await;
+        view.send(b"Open the keys Tick and delegate.\r");
+        view.wait_for("the Tick and the Subagent are ready", |frame| {
+            frame.contains("Monitor 1")
+                && frame.contains("Keys and child ready.")
+                && family_rows(frame)
+                    .iter()
+                    .any(|line| line.contains(REMEMBERING_CHILD))
+        })
+        .await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        view.send(b" ");
+        view.wait_for("the card shows its Tick", |frame| keys_cards(frame) == 1)
+            .await;
+        view.send(b"\r");
+        view.wait_for("the card has the focus", card_focused).await;
+        view.send(b"q");
+        view.wait_for("the key reaches the Tick", |frame| {
+            card_shows(frame, "keys 71")
+        })
+        .await;
+        view.send(LEAVE_CARD);
+        view.wait_for("back on the list", |frame| !card_focused(frame))
+            .await;
+        view.send(CLOSE);
+        view.wait_for("input focused", input_focused).await;
+
+        open_family_row(&mut view, REMEMBERING_CHILD).await;
+        view.wait_for("the Subagent's Chat shows no card", |frame| {
+            frame.contains("CHILD-REPORT")
+                && !frame.contains("Keys and child ready.")
+                && keys_cards(frame) == 0
+        })
+        .await;
+
+        open_family_row(&mut view, "main").await;
+        let back = view
+            .wait_for("the card comes back with the Tick's screen", |frame| {
+                frame.contains("Keys and child ready.")
+                    && keys_cards(frame) == 1
+                    && card_shows(frame, "keys 71 1b")
+            })
+            .await;
+        assert!(
+            !card_focused(&back),
+            "the card does not take the keys back: {back}"
+        );
+        view.send(b"z");
+        view.wait_for("the input takes the keys", |frame| {
+            frame
+                .lines()
+                .any(|line| line.starts_with('❯') && line.contains('z'))
+        })
+        .await;
+        assert!(
+            card_shows(&view.frame(), "keys 71 1b"),
+            "nothing typed reached the Tick: {}",
+            view.frame()
+        );
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
