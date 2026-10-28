@@ -417,9 +417,11 @@ enum OwnerScope {
 
 /// What moved a foreground command to the background.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BackgroundTrigger {
+pub(super) enum BackgroundTrigger {
     User,
     Timeout,
+    /// Send now, so a queued message reaches the model.
+    DeliverMessage,
 }
 
 impl ProcessSnapshot {
@@ -607,6 +609,9 @@ struct Entry {
     /// Set when the model stopped the command with `TaskStop`; like Claude Code's `stopTask`, its
     /// end then needs no task notification.
     is_stopped_by_model: bool,
+    /// Set when send now moved the foreground command to the background, before that move is
+    /// published, so the waiting call tells the model why.
+    is_moved_to_deliver_message: bool,
     handoff: Option<Value>,
 }
 
@@ -702,6 +707,7 @@ impl Registry {
                     updates: watch::channel(checkpoint.update).0,
                     cancel: cancel.clone(),
                     is_stopped_by_model: checkpoint.is_stopped_by_model,
+                    is_moved_to_deliver_message: false,
                     handoff: checkpoint.handoff,
                 },
             );
@@ -824,27 +830,29 @@ impl Registry {
         &self,
         id: Uuid,
         owner: OwnerScope,
+        trigger: BackgroundTrigger,
     ) -> Result<ProcessSnapshot, ToolError> {
-        let entries = self.entries.lock().await;
-        let entry = entries.get(&id).ok_or_else(|| {
+        let mut entries = self.entries.lock().await;
+        let entry = entries.get_mut(&id).ok_or_else(|| {
             ToolError::InvalidInput("command does not exist in this live host".into())
         })?;
         entry.updates.borrow().snapshot.ensure_owner(owner)?;
-        Ok(self.move_to_background(entry, BackgroundTrigger::User))
+        Ok(self.move_to_background(entry, trigger))
     }
 
     /// Claude Code's `onTimeout` → `startBackgrounding`: a foreground command that outlives its
     /// timeout keeps running in the background.
     async fn background_on_timeout(&self, id: Uuid) -> Option<ProcessSnapshot> {
-        let entries = self.entries.lock().await;
-        let entry = entries.get(&id)?;
+        let mut entries = self.entries.lock().await;
+        let entry = entries.get_mut(&id)?;
         Some(self.move_to_background(entry, BackgroundTrigger::Timeout))
     }
 
     /// Publishes a running command as backgrounded; a command in any other state is left as is.
-    fn move_to_background(&self, entry: &Entry, trigger: BackgroundTrigger) -> ProcessSnapshot {
+    fn move_to_background(&self, entry: &mut Entry, trigger: BackgroundTrigger) -> ProcessSnapshot {
         let mut update = entry.updates.borrow().clone();
         if update.snapshot.state() == &CommandState::Running {
+            entry.is_moved_to_deliver_message = trigger == BackgroundTrigger::DeliverMessage;
             update.snapshot.set_state(CommandState::Background);
             update.snapshot.mark_backgrounded(trigger);
             entry.updates.send_replace(update.clone());
@@ -853,8 +861,12 @@ impl Registry {
         update.snapshot
     }
 
-    pub(super) async fn background(&self, id: Uuid) -> Result<CommandSnapshot, ToolError> {
-        self.background_process(id, OwnerScope::Agent)
+    pub(super) async fn background(
+        &self,
+        id: Uuid,
+        trigger: BackgroundTrigger,
+    ) -> Result<CommandSnapshot, ToolError> {
+        self.background_process(id, OwnerScope::Agent, trigger)
             .await?
             .agent()
             .cloned()
@@ -869,7 +881,7 @@ impl Registry {
         chat_id: Uuid,
     ) -> Result<UserCommandSnapshot, ToolError> {
         let snapshot = self
-            .background_process(id, OwnerScope::User { chat_id })
+            .background_process(id, OwnerScope::User { chat_id }, BackgroundTrigger::User)
             .await?;
         snapshot
             .user()
@@ -1304,6 +1316,7 @@ impl Registry {
                 updates,
                 cancel: command_cancel.clone(),
                 is_stopped_by_model: false,
+                is_moved_to_deliver_message: false,
                 handoff: None,
             },
         );
@@ -1376,11 +1389,21 @@ impl Registry {
             if update.snapshot.state() == &CommandState::Background {
                 return match (&update.snapshot, owner) {
                     (ProcessSnapshot::Agent(command), CommandOwner::Agent { ids, .. }) => {
-                        Ok(model_result::background_started(
-                            &ids,
-                            command,
-                            !input.run_in_background && !command.backgrounded_on_timeout,
-                        ))
+                        let is_moved_to_deliver_message = self
+                            .entries
+                            .lock()
+                            .await
+                            .get(&operation_id)
+                            .is_some_and(|entry| entry.is_moved_to_deliver_message);
+                        Ok(if is_moved_to_deliver_message {
+                            model_result::moved_to_deliver_message(&ids, command)
+                        } else {
+                            model_result::background_started(
+                                &ids,
+                                command,
+                                !input.run_in_background && !command.backgrounded_on_timeout,
+                            )
+                        })
                     }
                     _ => process_output(&update.snapshot, 0, DEFAULT_OUTPUT_BYTES),
                 };
@@ -2568,13 +2591,52 @@ mod tests {
                 break;
             }
         }
-        let background = registry.background(operation_id).await.unwrap();
+        let background = registry
+            .background(operation_id, BackgroundTrigger::User)
+            .await
+            .unwrap();
         assert_eq!(background.state, CommandState::Background);
         assert!(background.was_background);
         execution.await.unwrap().unwrap();
         host.finish(operation_id, "", exited_with(0));
         let terminal = wait_for_terminal_agent_snapshot(&mut updates, operation_id).await;
         assert!(terminal.was_background);
+    }
+
+    #[tokio::test]
+    async fn a_command_moved_to_deliver_a_message_tells_the_model_it_keeps_running() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let mut updates = registry.subscribe();
+        let operation_id = Uuid::new_v4();
+        let execution = agent_command(&registry, &workdir, workdir.input("sleep 30"), operation_id);
+        loop {
+            let snapshot = updates.recv().await.unwrap();
+            if snapshot.operation_id == operation_id && snapshot.state == CommandState::Running {
+                break;
+            }
+        }
+        let moved = registry
+            .background(operation_id, BackgroundTrigger::DeliverMessage)
+            .await
+            .unwrap();
+        assert_eq!(moved.state, CommandState::Background);
+        assert!(moved.was_background && !moved.backgrounded_on_timeout);
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(
+            result.content,
+            format!(
+                "Command was moved to the background (ID: {}) so that a message that arrived while it was running can reach you; it was not interrupted. Output is being written to: {}. You will be notified when it completes.",
+                IdContext::new().model_text(ShellTaskId::from(operation_id)),
+                moved.output_ref.display()
+            )
+        );
+        assert!(!result.is_error);
+        assert!(
+            host.stops(operation_id).is_empty(),
+            "the command keeps running"
+        );
     }
 
     #[tokio::test]
@@ -2627,7 +2689,12 @@ mod tests {
         )
         .await;
 
-        assert!(registry.background(operation_id).await.is_err());
+        assert!(
+            registry
+                .background(operation_id, BackgroundTrigger::User)
+                .await
+                .is_err()
+        );
         assert_eq!(
             user_snapshot(&registry, operation_id).await.state,
             CommandState::Running

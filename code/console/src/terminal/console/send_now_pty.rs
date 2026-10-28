@@ -13,7 +13,8 @@ const TYPED_NOW_REPLY: &str = "Answered the typed message.";
 const QUEUED_REPLY: &str = "Answered the queued message.";
 
 /// A Bash call that only ends when the fixture directory gets a `finish` file, which the
-/// driver never writes: only an interruption ends it.
+/// driver never writes: send now moves it to the background, where it runs until the Agent
+/// shuts down.
 fn waiting_tool(id: &str) -> Vec<tickloop_harness::protocol::Content> {
     tickloop_harness::test_support::call(
         id,
@@ -198,7 +199,13 @@ fn send_now_pty_ctrl_enter_reaches_the_model_without_waiting_for_the_running_too
     fixture.wait(|frame| frame.contains("enter queue · ctrl+enter send now"));
     let typed_at = fixture.raw_output().len();
     fixture.send(CTRL_ENTER);
-    fixture.wait(|frame| frame.contains(TYPED_NOW_REPLY));
+    let answered = fixture.wait(|frame| frame.contains(TYPED_NOW_REPLY));
+    assert!(
+        answered.contains("Command was moved to the background")
+            && answered.contains("was not interrupted")
+            && !answered.contains("Interrupted"),
+        "the running command moved to the background instead of being interrupted: {answered}"
+    );
     assert_taken_once(&fixture, typed_at, typed_at, TYPED_NOW);
 
     fixture.send(b"start the second long work\r");
