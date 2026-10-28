@@ -55,6 +55,8 @@ pub(crate) struct Views {
     clock: u64,
     attached: HashMap<u64, AttachedView>,
     modes: watch::Sender<ViewModes>,
+    /// The focus the Tick was last told while it wants focus reports.
+    reported_focus: Option<bool>,
 }
 
 impl Default for Views {
@@ -63,6 +65,7 @@ impl Default for Views {
             clock: 0,
             attached: HashMap::new(),
             modes: watch::channel(ViewModes::default()).0,
+            reported_focus: None,
         }
     }
 }
@@ -74,6 +77,8 @@ struct AttachedView {
     /// Where this view takes the keys the Tick bubbles, once it listens; a view that does not
     /// take them in time misses them.
     keys: Option<mpsc::Sender<BubbledKey>>,
+    /// Whether the view says it has the keyboard, as a focused card does.
+    focused: bool,
 }
 
 impl Views {
@@ -86,6 +91,7 @@ impl Views {
                 attached_at: view,
                 typed_at: None,
                 keys: None,
+                focused: false,
             },
         );
         view
@@ -155,6 +161,25 @@ impl Views {
     /// Records whether the Tick wants focus reports.
     pub(crate) fn focus_reports(&mut self, enabled: bool) {
         self.change_modes(|modes| modes.focus_reports = enabled);
+    }
+
+    /// Records whether `view` has the keyboard.
+    pub(crate) fn focused(&mut self, view: u64, focused: bool) {
+        if let Some(attached) = self.attached.get_mut(&view) {
+            attached.focused = focused;
+        }
+    }
+
+    /// The focus report the Tick is due, `true` for `ESC [ I` and `false` for `ESC [ O`: while it
+    /// wants focus reports, whenever whether any view has the keyboard differs from what it was
+    /// last told, starting when it asks for them.
+    pub(crate) fn due_focus_report(&mut self) -> Option<bool> {
+        if !self.modes.borrow().focus_reports {
+            self.reported_focus = None;
+            return None;
+        }
+        let focused = self.attached.values().any(|view| view.focused);
+        (self.reported_focus.replace(focused) != Some(focused)).then_some(focused)
     }
 
     fn change_modes(&self, change: impl FnOnce(&mut ViewModes)) {
@@ -300,6 +325,45 @@ mod tests {
         assert!(!first_modes.borrow_and_update().bubbling);
         views.signal(KeySignal::Key(BubbledKey::Esc));
         assert!(first_received.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_tick_is_told_the_focus_of_any_view_only_while_it_wants_focus_reports() {
+        let size = TerminalSize::validated(10, 40).unwrap();
+        let mut views = Views::default();
+        let first = views.attach(size);
+        let second = views.attach(size);
+        views.focused(first, true);
+        assert_eq!(views.due_focus_report(), None, "it asked for no reports");
+        views.focused(first, false);
+        views.focus_reports(true);
+        assert_eq!(views.due_focus_report(), Some(false), "it starts unfocused");
+        assert_eq!(views.due_focus_report(), None, "once");
+        views.focused(first, true);
+        assert_eq!(views.due_focus_report(), Some(true));
+        views.focused(second, true);
+        assert_eq!(views.due_focus_report(), None, "already focused");
+        views.focused(first, false);
+        assert_eq!(
+            views.due_focus_report(),
+            None,
+            "another view still has the keyboard"
+        );
+        views.detach(second);
+        assert_eq!(
+            views.due_focus_report(),
+            Some(false),
+            "the last focused view left"
+        );
+        views.focus_reports(false);
+        views.focused(first, true);
+        assert_eq!(views.due_focus_report(), None);
+        views.focus_reports(true);
+        assert_eq!(
+            views.due_focus_report(),
+            Some(true),
+            "asking again tells the current focus"
+        );
     }
 
     #[test]

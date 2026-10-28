@@ -48,6 +48,7 @@ use crate::{
     process,
     pty::{Pty, READ_CHUNK_BYTES, TerminalSize},
     screen::Screen,
+    screen_signals::ScreenSignals,
     shell::{
         CANCELLED_REASON, ShellIdentity, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants,
         SpawnRequest, environment_digest,
@@ -88,6 +89,9 @@ const UNTITLED_TICK: &str = "an opening Tick";
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// The focus reports a Tick that set DEC private mode 1004 reads: gained and lost.
+const FOCUS_GAINED: &[u8] = b"\x1b[I";
+const FOCUS_LOST: &[u8] = b"\x1b[O";
 /// The bubbled keys a view may have waiting; a view that reads none of them misses the keys after
 /// them, never a change of the Tick's modes.
 const VIEW_SIGNALS: usize = 16;
@@ -382,6 +386,20 @@ impl HostedTick {
             self.screen_changes.send_replace(());
         }
         changed
+    }
+
+    /// Writes a focus report to the Tick's terminal: `ESC [ I` when a view has the keyboard,
+    /// `ESC [ O` when none has. Only a Tick that asked for focus reports is ever sent one.
+    async fn report_focus(&self, focused: bool) -> Result<(), HostError> {
+        if let Adapter::Terminal(program) = &self.adapter
+            && program.exit().is_some()
+        {
+            return Ok(());
+        }
+        self.pty
+            .write_all(if focused { FOCUS_GAINED } else { FOCUS_LOST })
+            .await
+            .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
     }
 
     /// Records how a terminal Tick's program ended, once; the Tick itself keeps running until it
@@ -1466,14 +1484,21 @@ async fn drain_terminal(tick: Arc<HostedTick>) {
             read = tick.pty.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
-                    let mut signals = Vec::new();
+                    let mut signals = ScreenSignals::default();
                     tick.change_screen(|screen| {
                         signals = screen.process(&buffer[..count]);
                         true
                     });
-                    if !signals.is_empty() {
+                    let focus_report = (signals != ScreenSignals::default()).then(|| {
                         let mut views = tick.views.lock().unwrap();
-                        signals.into_iter().for_each(|signal| views.signal(signal));
+                        signals.keys.into_iter().for_each(|signal| views.signal(signal));
+                        if let Some(enabled) = signals.focus_reports {
+                            views.focus_reports(enabled);
+                        }
+                        views.due_focus_report()
+                    });
+                    if let Some(Some(focused)) = focus_report {
+                        let _ = tick.report_focus(focused).await;
                     }
                     tokio::task::yield_now().await;
                 }
@@ -3096,6 +3121,21 @@ impl ViewLease {
             .await
             .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
     }
+
+    /// The view says whether it has the keyboard; the Tick gets the focus report that changes.
+    async fn focus(&self, focused: bool) -> Result<(), HostError> {
+        let Viewed::Tick(tick) = &self.viewed else {
+            return Ok(());
+        };
+        let due = tick.change_views(|views| {
+            views.focused(self.view, focused);
+            views.due_focus_report()
+        })?;
+        match due {
+            Some(focused) => tick.report_focus(focused).await,
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for ViewLease {
@@ -3104,7 +3144,19 @@ impl Drop for ViewLease {
             // The leaving view cannot be told of a failed resize; the terminal then keeps its
             // size.
             Viewed::Tick(tick) => {
-                let _ = tick.change_views(|views| views.detach(self.view));
+                let due = tick.change_views(|views| {
+                    views.detach(self.view);
+                    views.due_focus_report()
+                });
+                // The last view with the keyboard left: the Tick hears it lost the focus.
+                if let Ok(Some(focused)) = due
+                    && let Ok(runtime) = tokio::runtime::Handle::try_current()
+                {
+                    let tick = tick.clone();
+                    runtime.spawn(async move {
+                        let _ = tick.report_focus(focused).await;
+                    });
+                }
             }
             Viewed::Shell(task) => task.change_views(|views| views.detach(self.view)),
         }
@@ -3215,6 +3267,7 @@ async fn attach_view(
         enum ViewRequest {
             Input { data: Vec<u8> },
             Resize { size: TerminalSize },
+            Focus { focused: bool },
             Detach,
         }
         while let Some(request) =
@@ -3223,6 +3276,7 @@ async fn attach_view(
             match parameters(request)? {
                 ViewRequest::Input { data } => lease.input(&data).await?,
                 ViewRequest::Resize { size } => lease.resize(size)?,
+                ViewRequest::Focus { focused } => lease.focus(focused).await?,
                 ViewRequest::Detach => break,
             }
         }

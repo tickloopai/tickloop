@@ -1374,6 +1374,68 @@ done"#,
     shutdown(&fixture).await;
 }
 
+/// A Tick that sets DEC private mode 1004 hears whether any of its views has the keyboard: once
+/// when it asks, then at each change of whether any has it, and nothing more once it resets the
+/// mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_that_wants_focus_reports_hears_whether_any_view_has_the_keyboard() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let script = fixture.directory.path().join("focus.py");
+    std::fs::write(
+        &script,
+        "import os, tty\ntty.setraw(0)\nos.write(1, b'ready\\x1b[?1004h')\nwhile True:\n    data = os.read(0, 64)\n    if not data:\n        break\n    if data == b'x':\n        os.write(1, b'\\x1b[?2004;1004l')\n    os.write(1, (' ' + data.hex()).encode())\n",
+    )
+    .unwrap();
+    let python = which("python3");
+    let opened = fixture
+        .open_terminal(
+            &mut controller,
+            &[&python, "-u", &script.to_string_lossy()],
+        )
+        .await;
+    let (mut first_events, mut first_requests) =
+        attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut first = vt100::Parser::new(30, 120, 0);
+    let focus = |focused: bool| json!({"method":"focus","params":{"focused":focused}});
+    let input = |data: &[u8]| json!({"method":"input","params":{"data":data.to_vec()}});
+    assert_eq!(
+        view_signal(&mut first_events, &mut first).await,
+        json!({"event":"focus_reports","enabled":true})
+    );
+    view_shows(&mut first_events, &mut first, "ready 1b5b4f").await;
+    send(&mut first_requests, focus(true)).await;
+    view_shows(&mut first_events, &mut first, "1b5b4f 1b5b49").await;
+
+    let (mut second_events, mut second_requests) =
+        attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut second = vt100::Parser::new(30, 120, 0);
+    assert_eq!(
+        view_signal(&mut second_events, &mut second).await,
+        json!({"event":"focus_reports","enabled":true}),
+        "a view that attaches later is told at once"
+    );
+    send(&mut second_requests, focus(true)).await;
+    send(&mut first_requests, focus(false)).await;
+    send(&mut second_requests, json!({"method":"detach"})).await;
+    view_shows(&mut first_events, &mut first, "1b5b49 1b5b4f").await;
+
+    send(&mut first_requests, input(b"x")).await;
+    assert_eq!(
+        view_signal(&mut first_events, &mut first).await,
+        json!({"event":"focus_reports","enabled":false})
+    );
+    send(&mut first_requests, focus(true)).await;
+    send(&mut first_requests, input(b"y")).await;
+    view_shows(&mut first_events, &mut first, "1b5b4f 78 79").await;
+    assert_eq!(
+        first.screen().contents(),
+        "ready 1b5b4f 1b5b49 1b5b4f 78 79",
+        "no report once the Tick reset the mode, and none of the sequences on its screen"
+    );
+    shutdown(&fixture).await;
+}
+
 /// The owner lets a view attach to its Tick's terminal without handing out the Tick's data
 /// token: every grant admits its own view once, only to attach and only for the Tick it names,
 /// and a newer grant leaves earlier ones usable, so the views of several grants are attached at

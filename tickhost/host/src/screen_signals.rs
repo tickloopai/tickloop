@@ -1,8 +1,9 @@
-//! Picks the key-bubbling sequences a hosted Tick writes out of its terminal output. The
-//! terminal model's parser splits OSC sequences, whichever reads they arrive in, and drops the
-//! ones it does not handle, so they never reach the screen; its callback keeps the Tick's
-//! signals. The parser buffers an OSC until its terminator without a limit, so every OSC longer
-//! than [`MAX_OSC_BYTES`] is cut off before it reaches the parser.
+//! Picks what a hosted Tick asks of its views out of its terminal output: the key-bubbling
+//! sequences, and whether it wants focus reports (DECSET/DECRST 1004). The terminal model's
+//! parser splits sequences, whichever reads they arrive in, and drops the ones it does not
+//! handle, so they never reach the screen; its callbacks keep the Tick's signals. The parser
+//! buffers an OSC until its terminator without a limit, so every OSC longer than
+//! [`MAX_OSC_BYTES`] is cut off before it reaches the parser.
 
 use tick_protocol::KeySignal;
 
@@ -19,24 +20,56 @@ const CANCEL: u8 = 0x18;
 const SUBSTITUTE: u8 = 0x1a;
 const OSC_INTRODUCER: u8 = b']';
 
-/// Collects the key-bubbling signals among the OSC sequences the parser does not handle.
+/// The DEC private mode a program sets to get focus reports, `ESC [ I` and `ESC [ O`.
+const FOCUS_REPORTING_MODE: u16 = 1004;
+
+/// What one read of a Tick's output asked of its views.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScreenSignals {
+    /// Key-bubbling signals, in order.
+    pub keys: Vec<KeySignal>,
+    /// Whether the Tick wants focus reports, when the read set or reset mode 1004; the last
+    /// such sequence counts.
+    pub focus_reports: Option<bool>,
+}
+
+/// Collects the key-bubbling signals among the OSC sequences the parser does not handle, and
+/// mode 1004 among the DEC private modes it does not handle.
 #[derive(Default)]
 pub(crate) struct SignalCollector {
-    signals: Vec<KeySignal>,
+    signals: ScreenSignals,
 }
 
 impl SignalCollector {
-    pub(crate) fn take(&mut self) -> Vec<KeySignal> {
+    pub(crate) fn take(&mut self) -> ScreenSignals {
         std::mem::take(&mut self.signals)
     }
 }
 
 impl vt100::Callbacks for SignalCollector {
+    /// The parser calls this once for each mode of a `CSI ? … h` or `l` it does not handle, with
+    /// every mode of the sequence, so a combined list such as `CSI ? 1004 ; 2004 h` counts too.
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        first_intermediate: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        action: char,
+    ) {
+        if first_intermediate == Some(b'?')
+            && matches!(action, 'h' | 'l')
+            && params.contains(&&[FOCUS_REPORTING_MODE][..])
+        {
+            self.signals.focus_reports = Some(action == 'h');
+        }
+    }
+
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        if self.signals.len() < MAX_SIGNALS_PER_READ
+        if self.signals.keys.len() < MAX_SIGNALS_PER_READ
             && let Some(signal) = KeySignal::parse(params)
         {
-            self.signals.push(signal);
+            self.signals.keys.push(signal);
         }
     }
 }
@@ -111,7 +144,7 @@ mod tests {
         let mut signals = Vec::new();
         for read in reads {
             parser.process(&limit.filter(read));
-            signals.extend(parser.callbacks_mut().take());
+            signals.extend(parser.callbacks_mut().take().keys);
         }
         (signals, parser.screen().contents())
     }
@@ -169,6 +202,49 @@ mod tests {
         let (signals, screen) = parse(&[&long, b"\x07after\x1b]7777;tickloop;key=esc\x07"]);
         assert_eq!(signals, [KeySignal::Key(BubbledKey::Esc)]);
         assert_eq!(screen, "beforeafter");
+    }
+
+    fn focus_reports(reads: &[&[u8]]) -> Vec<Option<bool>> {
+        let mut parser = vt100::Parser::new_with_callbacks(4, 40, 0, SignalCollector::default());
+        reads
+            .iter()
+            .map(|read| {
+                parser.process(read);
+                parser.callbacks_mut().take().focus_reports
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mode_1004_is_tracked_alone_in_lists_and_across_reads() {
+        assert_eq!(
+            focus_reports(&[b"\x1b[?1004h", b"x", b"\x1b[?1004l"]),
+            [Some(true), None, Some(false)]
+        );
+        assert_eq!(
+            focus_reports(&[b"\x1b[?1004;2004h", b"\x1b[?2004;1004;7l"]),
+            [Some(true), Some(false)],
+            "inside combined lists"
+        );
+        let split = b"a\x1b[?1004hb";
+        for at in 1..split.len() {
+            let reads = focus_reports(&[&split[..at], &split[at..]]);
+            assert_eq!(
+                reads.iter().flatten().collect::<Vec<_>>(),
+                [&true],
+                "split at {at}"
+            );
+        }
+        assert_eq!(
+            focus_reports(&[b"\x1b[?1004h\x1b[?1004l"]),
+            [Some(false)],
+            "the last sequence of a read counts"
+        );
+        assert_eq!(
+            focus_reports(&[b"\x1b[1004h\x1b[?10040h\x1b[?1000h\x1b[?2004l"]),
+            [None],
+            "other modes and ANSI modes are not it"
+        );
     }
 
     #[test]

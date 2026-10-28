@@ -1,12 +1,10 @@
 //! The terminal model of a hidden Tick. Output is parsed continuously so the screen stays current
 //! while nobody watches; no raw output log is kept, only the screen and bounded scrollback.
-//! Key-bubbling sequences in the output are taken out as signals and never reach the screen.
-
-use tick_protocol::KeySignal;
+//! Key-bubbling sequences and focus-report modes in the output are taken out as signals.
 
 use crate::{
-    key_bubbling::{OscLimit, SignalCollector},
     pty::TerminalSize,
+    screen_signals::{OscLimit, ScreenSignals, SignalCollector},
 };
 
 pub const SCROLLBACK_ROWS: usize = 1000;
@@ -38,8 +36,8 @@ impl Screen {
         }
     }
 
-    /// Parses the program's output and returns the key-bubbling signals it carried, in order.
-    pub fn process(&mut self, bytes: &[u8]) -> Vec<KeySignal> {
+    /// Parses the program's output and returns what it asked of the views.
+    pub fn process(&mut self, bytes: &[u8]) -> ScreenSignals {
         let bytes = self.osc_limit.filter(bytes);
         self.parser.process(&bytes);
         self.parser.callbacks_mut().take()
