@@ -495,9 +495,11 @@ async fn handback_availability_and_explicit_rules_preserve_mode_boundaries() {
                 usize::from(mode == ExecutionMode::Auto && rule == Some(Decision::Ask))
             );
             let audit = usize::from(mode == ExecutionMode::Auto && rule != Some(Decision::Deny));
+            // Plan here is entered from Ask, the embedded default, so it delegates as Ask does,
+            // without the review.
             assert_eq!(
                 reviewer.requests.lock().unwrap().len(),
-                usize::from(matches!(mode, ExecutionMode::Auto | ExecutionMode::Plan)) + audit
+                usize::from(mode == ExecutionMode::Auto) + audit
             );
             let requests = model.requests.lock().unwrap();
             let parent = requests

@@ -54,6 +54,8 @@ struct ChatCheckpoint {
     start_new_tool_result_message: bool,
     #[serde(default)]
     mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
+    #[serde(default)]
+    ceiling_mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
     deferred_messages: Vec<Message>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     output_style: OutputStyle,
@@ -145,7 +147,12 @@ impl Agent {
                 bookkeeping: chat.bookkeeping.clone(),
                 family_generation: chat.family_generation,
                 start_new_tool_result_message: chat.start_new_tool_result_message,
-                mode_before_plan: chat.mode_before_plan,
+                mode_before_plan: chat.snapshot.policy.mode_before_plan,
+                ceiling_mode_before_plan: chat
+                    .snapshot
+                    .delegation
+                    .as_ref()
+                    .and_then(|delegation| delegation.ceiling.policy.mode_before_plan),
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
                 deferred_messages: chat.deferred_messages.clone(),
@@ -289,7 +296,11 @@ impl Agent {
             .task_tools_enabled
             .store(checkpoint.task_tools_enabled, Ordering::SeqCst);
         for saved in &checkpoint.chats {
-            let snapshot = saved.snapshot.clone();
+            let mut snapshot = saved.snapshot.clone();
+            snapshot.policy.mode_before_plan = saved.mode_before_plan;
+            if let Some(delegation) = &mut snapshot.delegation {
+                delegation.ceiling.policy.mode_before_plan = saved.ceiling_mode_before_plan;
+            }
             if let Some(folder) = &snapshot.folder {
                 self.require_working_directory_trust(folder)?;
             }
@@ -339,7 +350,6 @@ impl Agent {
                     task_checkpoint_pending: false,
                     family_finishing: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
-                    mode_before_plan: saved.mode_before_plan,
                     announced_loop_state: None,
                     active: saved
                         .waiting

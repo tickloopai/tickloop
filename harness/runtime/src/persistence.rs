@@ -3776,7 +3776,6 @@ impl Agent {
                 snapshot: snapshot.clone(),
                 bookkeeping,
                 start_new_tool_result_message: false,
-                mode_before_plan: None,
                 announced_loop_state: None,
                 active: None,
                 active_run: None,

@@ -27,7 +27,7 @@ impl Agent {
         let chats = self.inner.chats.lock().await;
         let read = chats.get(&chat).ok_or(AgentError::NotFound)?;
         let mut status = ChatStatus::of(&read.snapshot);
-        status.mode_before_plan = read.mode_before_plan;
+        status.mode_before_plan = read.snapshot.policy.mode_before_plan;
         status.task_board = shared_tasks::view(&chats, chat);
         status.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(status)

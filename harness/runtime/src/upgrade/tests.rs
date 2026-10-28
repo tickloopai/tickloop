@@ -810,7 +810,10 @@ async fn planned_upgrade_keeps_the_mode_plan_was_entered_from() {
         .await
         .unwrap();
     assert_eq!(
-        successor.inner.chats.lock().await[&chat].mode_before_plan,
+        successor.inner.chats.lock().await[&chat]
+            .snapshot
+            .policy
+            .mode_before_plan,
         Some(ExecutionMode::FullAccess)
     );
     original.shutdown_for_upgrade().await;
