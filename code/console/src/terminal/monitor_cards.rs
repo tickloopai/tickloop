@@ -46,6 +46,12 @@ pub(super) const PASTE_IDLE: Duration = Duration::from_millis(1500);
 /// The most input a card holds while its view attaches; more, and all input after it, is
 /// dropped.
 const EARLY_INPUT_BYTES: usize = 64 * 1024;
+/// The requests a card's view may have waiting; what is typed beyond them while the Tickhost
+/// takes nothing is dropped.
+const CARD_REQUESTS: usize = 64;
+/// A Tickhost that takes none of a view's requests for this long stopped reading it: the view
+/// ends and its connection closes, which detaches it.
+const CARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most this many card redraws a second, however fast frames arrive.
 pub(super) const CARD_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 pub(super) const FOCUSED_CARD_HINT: &str = "esc leave · esc esc send esc";
@@ -98,7 +104,7 @@ enum CardRequest {
 pub(super) struct CardView {
     size: CardSize,
     pub(super) screen: Arc<Mutex<CardScreen>>,
-    requests: mpsc::UnboundedSender<CardRequest>,
+    requests: mpsc::Sender<CardRequest>,
 }
 
 impl CardView {
@@ -133,13 +139,14 @@ impl CardView {
             ended: None,
         }));
         let reader = tokio::spawn(read_frames(events, screen.clone(), redraw.clone()));
-        let (requests, queued) = mpsc::unbounded_channel();
+        let (requests, queued) = mpsc::channel(CARD_REQUESTS);
         tokio::spawn(write_requests(
             writer,
             queued,
             reader.abort_handle(),
             screen.clone(),
             redraw,
+            CARD_WRITE_TIMEOUT,
         ));
         Ok(Self {
             size,
@@ -148,16 +155,16 @@ impl CardView {
         })
     }
 
+    /// Asks for `size`; a size the full queue cannot take is asked for again by the next frame.
     pub(super) fn resize(&mut self, size: CardSize) {
-        if size != self.size {
+        if size != self.size && self.requests.try_send(CardRequest::Resize(size)).is_ok() {
             self.size = size;
-            let _ = self.requests.send(CardRequest::Resize(size));
         }
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            let _ = self.requests.send(CardRequest::Input(bytes));
+            let _ = self.requests.try_send(CardRequest::Input(bytes));
         }
     }
 }
@@ -210,13 +217,15 @@ async fn read_frames(
     redraw.notify_one();
 }
 
-/// Sends the card's input and resizes in order; once the card goes, detaches the view.
+/// Sends the card's input and resizes in order; once the card goes, detaches the view. A write
+/// the Tickhost takes nothing of within `write_timeout` ends the view and closes its connection.
 async fn write_requests(
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut queued: mpsc::UnboundedReceiver<CardRequest>,
+    mut queued: mpsc::Receiver<CardRequest>,
     reader: tokio::task::AbortHandle,
     screen: Arc<Mutex<CardScreen>>,
     redraw: Arc<Notify>,
+    write_timeout: Duration,
 ) {
     while let Some(request) = queued.recv().await {
         let sent = match request {
@@ -226,6 +235,7 @@ async fn write_requests(
                     sent = send(
                         &mut writer,
                         json!({"method":"input","params":{"data":chunk}}),
+                        write_timeout,
                     )
                     .await;
                     if sent.is_err() {
@@ -238,6 +248,7 @@ async fn write_requests(
                 send(
                     &mut writer,
                     json!({"method":"resize","params":{"size":size.requested()}}),
+                    write_timeout,
                 )
                 .await
             }
@@ -251,15 +262,26 @@ async fn write_requests(
             return;
         }
     }
-    let _ = send(&mut writer, json!({"method":"detach"})).await;
+    let _ = send(&mut writer, json!({"method":"detach"}), write_timeout).await;
     reader.abort();
 }
 
 async fn send(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     request: Value,
+    write_timeout: Duration,
 ) -> Result<(), HostError> {
-    hosted::write_frame(writer, &request, ATTACH_REQUEST_FRAME_BYTES).await
+    tokio::time::timeout(
+        write_timeout,
+        hosted::write_frame(writer, &request, ATTACH_REQUEST_FRAME_BYTES),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(HostError::after(
+            "Timeout",
+            "the Tickhost stopped taking this view's input",
+        ))
+    })
 }
 
 /// Where an open card's view stands.

@@ -456,3 +456,46 @@ fn input_typed_before_the_view_attaches_is_held_for_it() {
         "input beyond the limit is dropped, and everything after it"
     );
 }
+
+#[tokio::test]
+async fn a_view_whose_tickhost_stops_reading_ends_and_closes_its_connection() {
+    use tokio::io::AsyncReadExt;
+    let (local, mut remote) = tokio::net::UnixStream::pair().unwrap();
+    let (_unread, writer) = local.into_split();
+    let screen = Arc::new(Mutex::new(CardScreen {
+        parser: vt100::Parser::new(6, 30, 0),
+        ended: None,
+    }));
+    let (requests, queued) = mpsc::channel(CARD_REQUESTS);
+    let reader = tokio::spawn(std::future::pending::<()>());
+    let writing = tokio::spawn(write_requests(
+        writer,
+        queued,
+        reader.abort_handle(),
+        screen.clone(),
+        Arc::new(Notify::new()),
+        Duration::from_millis(200),
+    ));
+    for _ in 0..CARD_REQUESTS {
+        requests
+            .try_send(CardRequest::Input(vec![b'x'; ATTACH_INPUT_BYTES]))
+            .unwrap();
+    }
+    assert!(
+        requests
+            .try_send(CardRequest::Input(b"more".to_vec()))
+            .is_err(),
+        "the queue is bounded"
+    );
+    tokio::time::timeout(Duration::from_secs(10), writing)
+        .await
+        .expect("a write the Tickhost never takes times out")
+        .unwrap();
+    assert!(screen.lock().unwrap().ended.is_some());
+    assert!(reader.await.unwrap_err().is_cancelled());
+    let mut written = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), remote.read_to_end(&mut written))
+        .await
+        .expect("the view's connection closes, which detaches it")
+        .unwrap();
+}
