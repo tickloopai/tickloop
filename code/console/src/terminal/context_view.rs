@@ -449,15 +449,17 @@ impl ContextView<'_> {
             ToolSearchMode::Native => "native",
             ToolSearchMode::SearchTools => "SearchTools",
         };
+        let cost = if self.breakdown.tool_search_index.is_empty() {
+            "loaded on demand, not in context"
+        } else {
+            "names and descriptions are in context; full definitions load on search"
+        };
         let servers = pool.servers.len();
         let mut lines = vec![
             Vec::new(),
             vec![
                 ("Tool search pool".into(), Some(Role::ContextToolSearch)),
-                (
-                    format!(" · {mode} (loaded on demand, not in context)"),
-                    Some(Role::MutedText),
-                ),
+                (format!(" · {mode} ({cost})"), Some(Role::MutedText)),
             ],
             tree_line(
                 "",
@@ -532,11 +534,6 @@ impl ContextView<'_> {
         if pool.mode == ToolSearchMode::SearchTools {
             lines.push(muted(
                 "SearchTools, DescribeTools and ExecuteTools count under System tools.".into(),
-            ));
-        }
-        if !self.breakdown.tool_search_index.is_empty() {
-            lines.push(muted(
-                "Their names and descriptions count under Tool search index.".into(),
             ));
         }
         lines
