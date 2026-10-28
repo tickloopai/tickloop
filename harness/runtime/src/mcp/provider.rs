@@ -143,7 +143,7 @@ impl HostToolProvider for McpToolProvider {
             .into_iter()
             .map(|(entry, tool)| crate::tool_exposure::ExposureTool {
                 exposure: tool.exposure,
-                server: entry.config.name.clone(),
+                server: Some(entry.config.name.clone()),
                 original_name: tool.original.clone(),
                 definition: tool.definition.clone(),
                 original_schema: tool.original_schema.clone(),

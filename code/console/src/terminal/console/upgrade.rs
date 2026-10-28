@@ -721,6 +721,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Permission".into(),
             context: vec![],
+            markdown: None,
             options: vec![],
             selected: 0,
             confirmation: true,

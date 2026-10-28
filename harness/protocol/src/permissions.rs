@@ -41,6 +41,16 @@ impl ExecutionMode {
             .map(|offset| Self::CYCLE_ORDER[(start + offset) % Self::CYCLE_ORDER.len()])
             .find(|mode| *mode != self && enabled.contains(mode))
     }
+
+    /// Whether Auto's admission and review decide what this mode would otherwise ask about: in
+    /// Auto, and in Plan with Claude Code's `useAutoModeDuringPlan`, which is on by default.
+    pub const fn uses_auto_admission(self, use_auto_mode_during_plan: bool) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::Plan => use_auto_mode_during_plan,
+            Self::AcceptEdits | Self::FullAccess => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ExecutionMode {
@@ -109,5 +119,16 @@ pub struct PermissionPolicy {
     /// is built or loaded and never recorded, so no record can carry or forge one.
     #[serde(skip)]
     pub host_rules: Vec<PermissionRule>,
+    /// The user's `useAutoModeDuringPlan: false`: Plan asks a person where Auto would admit or
+    /// review. Filled in from settings like [`Self::host_rules`] and never recorded.
+    #[serde(skip)]
+    pub plan_without_auto: bool,
     pub revision: u64,
+}
+
+impl PermissionPolicy {
+    /// [`ExecutionMode::uses_auto_admission`] with the user's `useAutoModeDuringPlan`.
+    pub fn uses_auto_admission(&self) -> bool {
+        self.mode.uses_auto_admission(!self.plan_without_auto)
+    }
 }

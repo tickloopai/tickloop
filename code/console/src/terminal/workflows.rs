@@ -275,12 +275,11 @@ impl Workflow {
         if let Some(mode) = plan.approved_execution_mode {
             context.push(format!("Already approved with mode: {mode}"));
         }
-        context.extend(safe_text(&plan.markdown).split('\n').map(str::to_owned));
+        let markdown = Some(safe_text(&plan.markdown));
         if !plan.approval_pending {
-            return Ok((
-                menu("Saved plan", context, vec!["Close".into()]),
-                Self::PlanView { chat },
-            ));
+            let mut menu = menu("Saved plan", context, vec!["Close".into()]);
+            menu.markdown = markdown;
+            return Ok((menu, Self::PlanView { chat }));
         }
         let request = status
             .permissions
@@ -298,6 +297,7 @@ impl Workflow {
                 .map(|choice| choice.label().into())
                 .collect(),
         );
+        menu.markdown = markdown;
         menu.confirmation = true;
         Ok((
             menu,
@@ -683,6 +683,7 @@ fn menu(title: &str, context: Vec<String>, options: Vec<String>) -> Menu {
         id: tickloop_ids::generate(),
         title: title.into(),
         context,
+        markdown: None,
         options,
         selected: 0,
         confirmation: false,
@@ -2825,11 +2826,7 @@ mod tests {
             "{:?}",
             menu.context
         );
-        assert!(
-            menu.context
-                .iter()
-                .any(|line| line == "Then summarize them.")
-        );
+        assert_eq!(menu.markdown.as_deref(), Some(edited));
         assert!(matches!(edited_review, Workflow::Plan { version: 2, .. }));
 
         let ask = PLAN_APPROVAL_CHOICES

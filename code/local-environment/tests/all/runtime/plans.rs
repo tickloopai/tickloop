@@ -190,7 +190,10 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"EnterPlanMode"), "{tool_names:?}");
+    assert!(
+        !tool_names.contains(&"EnterPlanMode"),
+        "EnterPlanMode waits behind tool search: {tool_names:?}"
+    );
     assert!(
         tool_names.contains(&EXIT_PLAN_MODE_TOOL_NAME),
         "{tool_names:?}"

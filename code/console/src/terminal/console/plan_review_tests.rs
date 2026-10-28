@@ -20,6 +20,7 @@ fn plan_review(selected: usize) -> (Console, Uuid, Arc<Mutex<Vec<String>>>) {
                 ],
                 selected,
                 confirmation: true,
+                markdown: None,
             },
             true,
         )
@@ -64,7 +65,8 @@ fn hint_row(state: &mut State) -> String {
 fn ctrl_g_in_plan_review_opens_the_plan_in_the_external_editor() {
     let (console, id, opened) = plan_review(0);
     let mut state = console.state.lock().unwrap();
-    assert!(hint_row(&mut state).contains("ctrl+g edit plan"));
+    let hint = hint_row(&mut state);
+    assert!(hint.contains("ctrl+g edit plan"), "{hint}");
 
     let event = state.key(control('g'));
     assert!(

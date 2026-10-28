@@ -149,7 +149,6 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
             "CronDelete",
             "CronList",
             "CronUpdate",
-            "EnterPlanMode",
             "ExitPlanMode",
             "GetGoal",
             "ListSubagents",
@@ -159,13 +158,26 @@ async fn a_local_agent_keeps_every_tool_of_a_chat_with_a_folder() {
             "StopSubagent",
             "Subagent",
             "UpdateGoal",
+            "DescribeTools",
+            "ExecuteTools",
+            "SearchTools",
         ]
+    );
+    assert_eq!(
+        requests[0]
+            .deferred_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "SearchTools reaches the deferred EnterPlanMode"
     );
     let prompt = system_prompt(&requests[0]);
     for section in [
         "# Doing tasks",
         "# Executing actions with care",
         "# Using your tools",
+        "# Deferred tools\nThe following deferred tools are available via tool search. Their schemas are NOT loaded: search for them by name to load their schemas before calling them:\nEnterPlanMode",
         "# Subagent communication",
     ] {
         assert!(prompt.contains(section), "{section}");

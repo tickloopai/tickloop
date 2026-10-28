@@ -179,9 +179,9 @@ impl State {
         ))
     }
 
-    /// Key hints the plan approval dialog adds while its options have focus.
+    /// The key hint the plan approval dialog adds while its options have focus.
     pub(super) fn plan_review_hints(&self) -> Option<(String, u8)> {
         self.offered_plan_review()
-            .map(|_| ("ctrl+g edit plan".into(), 11))
+            .map(|_| ("ctrl+g edit plan".into(), 10))
     }
 }

@@ -793,6 +793,7 @@ async fn connect_daemon_at_startup(
         id: menu_id,
         title: "Stop the running daemon and continue?".into(),
         context,
+        markdown: None,
         options,
         selected: cancel_index,
         confirmation: true,
@@ -4831,7 +4832,7 @@ async fn interact_with_herdr(
                         },
                         EventKind::QuestionAsked {request} => print_question(console, &request)?,
                         EventKind::PlanUpdated {plan} => {
-                            outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id.public(),plan.version,safe_text(&plan.markdown));
+                            console.write_plan(&format!("Plan: {} · version {}",plan.loop_id.public(),plan.version),&safe_text(&plan.markdown))?;
 
                         },
                         EventKind::ProgressUpdated {progress} => {
@@ -6163,12 +6164,10 @@ fn render_restored_observation(
                     },
                     safe_text(&result.content)
                 ),
-                EventKind::PlanUpdated { plan } => outln!(
-                    console,
-                    "\nPlan version {}:\n{}",
-                    plan.version,
-                    safe_text(&plan.markdown)
-                ),
+                EventKind::PlanUpdated { plan } => console.write_plan(
+                    &format!("Plan version {}:", plan.version),
+                    &safe_text(&plan.markdown),
+                )?,
                 // The Todo list shows progress; only plain output writes it out.
                 EventKind::ProgressUpdated { progress } if !console.is_interactive() => {
                     outln!(console, "\nProgress:");

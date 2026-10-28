@@ -450,14 +450,14 @@ fn view_from_snapshot(
                 .unwrap_or_else(|| folder.to_path_buf())
         },
         folder,
-        snapshot.policy.mode,
+        snapshot.policy.uses_auto_admission(),
         &snapshot.policy.project_constraints,
         &snapshot.policy.managed_constraints,
         &snapshot.policy.host_rules,
     );
     rules.extend(launch_rule_views(
         &snapshot.policy.launch_rules,
-        snapshot.policy.mode,
+        snapshot.policy.uses_auto_admission(),
     ));
     PermissionsView {
         chat_id: snapshot.id,

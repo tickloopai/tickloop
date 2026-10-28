@@ -218,22 +218,22 @@ pub(super) struct PlanCheckpoint {
 /// Like Claude Code's `ALL_AGENT_DISALLOWED_TOOLS`, a delegated child gets neither
 /// `EnterPlanMode` nor `ExitPlanMode`: its mode is frozen, and in Plan it reports its findings or
 /// plan in its final reply for the parent to submit.
-pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
+pub(super) fn definitions(is_delegated: bool, offers_subagent: bool) -> Vec<ToolDefinition> {
     let mut definitions = Vec::new();
     if !is_delegated {
         definitions.push(ToolDefinition {
             name: ENTER_PLAN_MODE_TOOL_NAME.into(),
-            description: prompts::enter_plan_mode_description(),
+            description: prompts::enter_plan_mode_description(offers_subagent),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         });
-        // Following Claude Code's `.passthrough()`: additionalProperties is not declared, so other
-        // fields are accepted and ignored.
+        // Claude Code 2.1.302's schema. Following its `.passthrough()`: additionalProperties is not
+        // declared, so other fields are accepted and ignored.
         definitions.push(ToolDefinition {
             name: EXIT_PLAN_MODE_TOOL_NAME.into(),
             description: prompts::exit_plan_mode_description(),
             input_schema: json!({"type":"object","properties":{"allowedPrompts":{
                 "type":"array",
-                "description":"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
+                "description":"Deprecated: no longer used.",
                 "items":{"type":"object","properties":{
                     "tool":{"type":"string","enum":["Bash"],"description":"The tool this prompt applies to"},
                     "prompt":{"type":"string","description":"Semantic description of the action, e.g. \"run tests\", \"install dependencies\""}

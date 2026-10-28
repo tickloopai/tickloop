@@ -12,6 +12,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const ENTER_PLAN_MODE_BATCH_MESSAGE: &str = "EnterPlanMode must be the only call in its ExecuteTools batch: it changes the mode the other calls are decided under. No call in this batch was executed.";
+
 const MAX_BATCH_CALLS: usize = 10;
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -133,7 +135,6 @@ impl NestedCalls {
             name.as_str(),
             "ExecuteTools"
                 | "AskUserQuestion"
-                | "EnterPlanMode"
                 | "ExitPlanMode"
                 | "Subagent"
                 | "Skill"
@@ -448,6 +449,16 @@ impl Agent {
                 ));
             }
         };
+        // The calls run concurrently, and entering Plan changes how the others are decided.
+        if calls.len() > 1
+            && calls
+                .iter()
+                .any(|call| call["name"] == tickloop_harness_tools::ENTER_PLAN_MODE_TOOL_NAME)
+        {
+            return Ok(ToolCallOutcome::not_admitted(
+                ENTER_PLAN_MODE_BATCH_MESSAGE.into(),
+            ));
+        }
         let operation = OperationRecord {
             parent_call_id: None,
             parent_call_index: None,

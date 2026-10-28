@@ -54,7 +54,7 @@ fn input_dialog_pty_fixture() {
                     let trigger = std::fs::read_to_string(directory.join("trigger")).unwrap_or_default();
                     if trigger == "request" && !requested {
                         console.set_request_layout(Some(REQUEST)).unwrap();
-                        console.show_focused_menu(Menu { id: REQUEST, title: "Permission fixture".into(), context: vec!["Isolated Console request".into()], options: vec!["Allow fixture".into(), "Deny fixture".into()], selected: 0, confirmation: true }).unwrap();
+                        console.show_focused_menu(Menu { id: REQUEST, title: "Permission fixture".into(), context: vec!["Isolated Console request".into()], markdown: None, options: vec!["Allow fixture".into(), "Deny fixture".into()], selected: 0, confirmation: true }).unwrap();
                         std::fs::write(directory.join("phase"), "request").unwrap();
                         requested = true;
                     } else if trigger == "finish" && chosen { break; }
@@ -100,7 +100,7 @@ fn input_dialog_tick_paste_pty_fixture() {
                     let trigger = std::fs::read_to_string(directory.join("trigger")).unwrap_or_default();
                     if trigger == "request" && !requested {
                         console.set_request_layout(Some(REQUEST)).unwrap();
-                        console.show_question_menu(Menu { id: REQUEST, title: "Question fixture".into(), context: vec!["Isolated Tick focus".into()], options: vec!["Other".into()], selected: 0, confirmation: false }, QuestionMenu { entry_option: Some(0), entry_text: String::new(), multi_select: false, navigable: false }).unwrap();
+                        console.show_question_menu(Menu { id: REQUEST, title: "Question fixture".into(), context: vec!["Isolated Tick focus".into()], markdown: None, options: vec!["Other".into()], selected: 0, confirmation: false }, QuestionMenu { entry_option: Some(0), entry_text: String::new(), multi_select: false, navigable: false }).unwrap();
                         requested = true;
                     } else if trigger == "finish" && answered { break; }
                 }

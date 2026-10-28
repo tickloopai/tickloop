@@ -222,6 +222,7 @@ mod tests {
                     id,
                     title: "Sign out fixture".into(),
                     context: Vec::new(),
+                    markdown: None,
                     options: vec!["Cancel".into(), "Sign out".into()],
                     selected: 1,
                     confirmation: false,
@@ -304,6 +305,7 @@ mod tests {
                         id: request,
                         title: "Plan approval".into(),
                         context: Vec::new(),
+                        markdown: None,
                         options: vec!["Approve".into(), "Cancel".into()],
                         selected: 1,
                         confirmation: true,
@@ -451,6 +453,7 @@ mod tests {
                 id: request,
                 title: "Question".into(),
                 context: Vec::new(),
+                markdown: None,
                 options: vec!["Answer".into()],
                 selected: 0,
                 confirmation: false,
@@ -1820,6 +1823,7 @@ impl Menus {
             id,
             title: format!("Choose Provider · {filter}"),
             context,
+            markdown: None,
             options,
             selected,
             confirmation: false,
@@ -1998,6 +2002,7 @@ impl Menus {
                 id,
                 title: safe_text(&format!("Connection · {}", provider.model_page_name())),
                 context,
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -2912,6 +2917,7 @@ impl Menus {
                 id,
                 title: safe_text(&title),
                 context,
+                markdown: None,
                 options,
                 selected,
                 confirmation: false,
@@ -3091,7 +3097,7 @@ impl Menus {
         target: ConfigTarget,
         provider: ProviderModels,
     ) -> Result<(), String> {
-        self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Sign in · {}", provider.model_page_name()), context: vec!["Authorize this connection. Existing login is kept until authorization succeeds.".into()], options: vec!["Device code".into(), "Browser + callback".into()], selected: 0, confirmation: false }, Selection::LoginMethods { target, provider })
+        self.show(console, Menu { id: tickloop_ids::generate(), title: format!("Sign in · {}", provider.model_page_name()), context: vec!["Authorize this connection. Existing login is kept until authorization succeeds.".into()], markdown: None, options: vec!["Device code".into(), "Browser + callback".into()], selected: 0, confirmation: false }, Selection::LoginMethods { target, provider })
     }
 
     pub(super) fn provider_auth(
@@ -3173,6 +3179,7 @@ impl Menus {
                 "The project comes from the file unless overridden. Location defaults to global."
                     .into(),
             ],
+            markdown: None,
             options: vec!["Save service account".into(), "Cancel".into()],
             selected: 0,
             confirmation: false,
@@ -3210,6 +3217,7 @@ impl Menus {
             context: provider.api_key_page_context(
                 self.provider.provider_nav.credential_intent == Some(CredentialIntent::Replace),
             ),
+            markdown: None,
             options: vec!["Save API key".into(), "Cancel".into()],
             selected: 0,
             confirmation: false,

@@ -65,6 +65,8 @@ mod model_dialog_pty;
 mod monitor_tests;
 #[cfg(test)]
 mod plan_flow_pty;
+#[cfg(test)]
+mod plan_markdown_tests;
 mod plan_review;
 pub(super) use plan_review::{PlanReview, RequestedPlanEdit};
 #[cfg(test)]
@@ -179,6 +181,8 @@ pub(super) const UNCHECKED_OPTION: &str = "[ ] ";
 /// takes at most this fraction of the border, as `width / N`.
 const IDENTITY_LABEL_WIDTH_DIVISOR: usize = 3;
 const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
+/// A body laid out as Markdown sits two columns in, as a block's body rows do.
+const MARKDOWN_BODY_INDENT: &str = "  ";
 
 /// A foreground Bash command of the model, the call that started it, and when it was first seen.
 struct ForegroundCommand {
@@ -658,6 +662,9 @@ pub(super) struct Menu {
     pub id: Uuid,
     pub title: String,
     pub context: Vec<String>,
+    /// Markdown shown after `context`, such as a plan: laid out again for the width of each
+    /// frame, while plain output receives its source.
+    pub markdown: Option<String>,
     pub options: Vec<String>,
     pub selected: usize,
     pub confirmation: bool,
@@ -3576,6 +3583,22 @@ impl Console {
         }])
     }
 
+    /// Writes a plan as a block under `heading`. The conversation lays its Markdown out as it
+    /// does a reply's; plain output receives the source.
+    pub(super) fn write_plan(&self, heading: &str, markdown: &str) -> Result<(), String> {
+        if !self.is_interactive() {
+            return self.write_line(&format!("\n{heading}\n{markdown}"));
+        }
+        let mut pieces = vec![
+            ConversationPiece::Block,
+            ConversationPiece::Styled(format!("{heading}\n"), None),
+        ];
+        if !markdown.is_empty() {
+            pieces.push(ConversationPiece::BodyMarkdown(markdown.to_owned()));
+        }
+        self.write_pieces(&pieces)
+    }
+
     /// Writes a run's completion notice as a block of its own; in the conversation it replaces
     /// the previous completion notice.
     pub(super) fn write_completion_notice(
@@ -5377,6 +5400,9 @@ pub(super) enum ConversationPiece {
         text: String,
         starts_message: bool,
     },
+    /// A Markdown document laid out on the rows under the line above it, indented as a block's
+    /// body is, such as a plan under its heading.
+    BodyMarkdown(String),
     ToolCall {
         run_id: Uuid,
         text: String,
@@ -5483,6 +5509,10 @@ impl ConversationPiece {
                 let lead = format!("{} ", display.glyph(Glyph::Assistant));
                 scrollback.append_markdown(text, &lead, *starts_message);
             }
+            Self::BodyMarkdown(text) => {
+                scrollback.begin_markdown(MARKDOWN_BODY_INDENT);
+                scrollback.append_markdown(text, MARKDOWN_BODY_INDENT, false);
+            }
         }
     }
 
@@ -5494,6 +5524,7 @@ impl ConversationPiece {
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
+            | Self::BodyMarkdown(text)
             | Self::ToolCall { text, .. } => text.as_str().into(),
             Self::Response(runs)
             | Self::Body(runs)
@@ -7918,7 +7949,9 @@ impl State {
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
         let context_rows = if self.input_dialog_has_fixed_height() {
-            2 * usize::from(!picker_context.is_empty() || self.menu_review.is_some())
+            2 * usize::from(
+                !picker_context.is_empty() || menu.markdown.is_some() || self.menu_review.is_some(),
+            )
         } else {
             self.menu_context_rows(menu, capacity).min(2)
         };
@@ -8060,19 +8093,8 @@ impl State {
                     }
                 }));
             } else {
-                let context = picker_context
-                    .iter()
-                    .flat_map(|line| {
-                        let link = self
-                            .menu_link
-                            .as_ref()
-                            .filter(|(id, address)| *id == menu.id && address == line)
-                            .map(|(_, address)| address.clone());
-                        wrap_text(&display_text(line), self.width.saturating_sub(2).max(1))
-                            .into_iter()
-                            .map(move |line| (line, link.clone()))
-                    })
-                    .collect::<Vec<_>>();
+                let context =
+                    self.menu_context_lines(menu, &picker_context, self.width.saturating_sub(2));
                 self.context_offset = self
                     .context_offset
                     .min(context.len().saturating_sub(context_capacity));
@@ -8081,13 +8103,11 @@ impl State {
                         .into_iter()
                         .skip(self.context_offset)
                         .take(context_capacity)
-                        .map(|(line, link)| {
-                            let text = format!("  {line}");
-                            if let Some(address) = link {
-                                RoleLine::linked(text, Role::Accent, &address)
-                            } else {
-                                RoleLine::role(text, Role::MutedText)
-                            }
+                        .map(|line| {
+                            let mut indented = RoleLine::plain("  ");
+                            indented.spans.extend(line.spans);
+                            indented.link = line.link;
+                            indented
                         }),
                 );
             }
@@ -8217,23 +8237,20 @@ impl State {
             if self.menu_plan {
                 hints.push(("v full plan".into(), 12));
                 if !editing {
-                    hints.extend(self.plan_review_hints());
                     hints.push(("pgup/pgdn plan".into(), 10));
                     self.dialog_scrolls_own_content = true;
+                    // The feedback row's own hint names tab, so a narrow dialog drops this first.
                     if self.menu_comment.is_some() {
-                        hints.push(("tab feedback".into(), 10));
+                        hints.push(("tab feedback".into(), 9));
                     }
+                    hints.extend(self.plan_review_hints());
                 }
             } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
                 hints.push(("shift+tab review".into(), 7));
-            } else if menu
-                .context
-                .iter()
-                .flat_map(|line| {
-                    wrap_text(&display_text(line), self.width.saturating_sub(2).max(1))
-                })
-                .count()
+            } else if self
+                .menu_context_lines(menu, &menu.context, self.width.saturating_sub(2))
+                .len()
                 > context_capacity
             {
                 hints.push(("pgup/pgdn details".into(), 6));
@@ -14256,6 +14273,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Run this command?".into(),
             context: vec!["find crates docs .scratch -maxdepth 4 | head -100".into()],
+            markdown: None,
             options: vec![
                 "Allow once".into(),
                 "Allow for this session".into(),
@@ -14439,6 +14457,7 @@ mod tests {
             id,
             title: "Codex login".into(),
             context: vec!["Open this link:".into(), address.into()],
+            markdown: None,
             options: vec!["Cancel".into()],
             selected: 0,
             confirmation: false,
@@ -16815,6 +16834,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "Which report?".into(),
             context: vec!["☐ Report".into()],
+            markdown: None,
             options: options.iter().map(|option| (*option).into()).collect(),
             selected: 0,
             confirmation: false,
@@ -17325,8 +17345,9 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// Entering Plan asks only when an Ask rule matches, as in Claude Code.
     #[tokio::test]
-    async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
+    async fn an_ask_rules_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
         use tickloop_harness::tools::ENTER_PLAN_MODE_TOOL_NAME;
 
@@ -17347,6 +17368,21 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                vec![tickloop_harness::protocol::PermissionRule {
+                    id: Uuid::new_v4(),
+                    decision: tickloop_harness::protocol::Decision::Ask,
+                    tool: ENTER_PLAN_MODE_TOOL_NAME.into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
             .await
             .unwrap();
         let console = InteractiveConsoleFixture::new(State::new(true, 100, 30));
@@ -23427,6 +23463,7 @@ mod tests {
                 id: secret_id,
                 title: "API key".into(),
                 context: vec![],
+                markdown: None,
                 options: vec!["Save".into()],
                 selected: 0,
                 confirmation: false,
