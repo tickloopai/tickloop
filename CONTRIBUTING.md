@@ -16,7 +16,7 @@ Thanks for helping improve Tickloop. This guide covers the development setup, th
 - [cargo-nextest](https://nexte.st/): `cargo install --locked cargo-nextest`.
 - Node.js 22 for the script tests.
 - For public API checks: `rustup toolchain install nightly-2026-10-19 --profile minimal` and `cargo install --locked cargo-public-api --version 0.52.0`.
-- Optional: [Herdr](https://github.com/herdrdev/herdr) to exercise Tick panes.
+- Optional: [Herdr](https://github.com/herdrdev/herdr) to exercise Agent Panes.
 
 ```sh
 make build     # build tickloop and tickhost

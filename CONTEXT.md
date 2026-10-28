@@ -43,7 +43,7 @@ The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Sh
 _Avoid_: Tick host, tick-host, tick_host
 
 **Tick Card**:
-The only view of a local Tick: a card in the Agent View's Monitor column, attached through Tickhost, with a Tickloop title above the Tick's own screen. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick.
+The only view of a local Tick: a card under the Tick's row in the Agent View's Monitor column, attached through Tickhost, showing the Tick's own screen below a rule. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick.
 _Avoid_: popup, view Pane
 
 **Tick Ownership**:
