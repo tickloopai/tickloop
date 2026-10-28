@@ -432,3 +432,56 @@ fn only_a_card_on_screen_has_its_frames_redraw_the_console() {
     state.draw_frame(&mut Vec::new()).unwrap();
     assert!(!state.card_in_view(), "the card is open but not on screen");
 }
+
+#[test]
+fn keys_decoded_before_the_raw_input_reach_the_tick_as_its_terminal_sends_them() {
+    let with = |code, modifiers| KeyEvent::new(code, modifiers);
+    let cases: [(KeyEvent, bool, &[u8]); 20] = [
+        (key(KeyCode::Char('é')), false, "é".as_bytes()),
+        (
+            with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            b"\x03",
+        ),
+        (with(KeyCode::Char('x'), KeyModifiers::ALT), false, b"\x1bx"),
+        (
+            with(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ),
+            false,
+            b"\x1b\x18",
+        ),
+        (
+            with(KeyCode::Backspace, KeyModifiers::ALT),
+            false,
+            b"\x1b\x7f",
+        ),
+        (key(KeyCode::Up), false, b"\x1b[A"),
+        (key(KeyCode::Up), true, b"\x1bOA"),
+        (key(KeyCode::Home), false, b"\x1b[H"),
+        (key(KeyCode::Home), true, b"\x1bOH"),
+        (key(KeyCode::End), false, b"\x1b[F"),
+        (key(KeyCode::Insert), false, b"\x1b[2~"),
+        (key(KeyCode::Delete), false, b"\x1b[3~"),
+        (key(KeyCode::PageUp), false, b"\x1b[5~"),
+        (key(KeyCode::PageDown), false, b"\x1b[6~"),
+        (key(KeyCode::BackTab), false, b"\x1b[Z"),
+        (key(KeyCode::F(1)), false, b"\x1bOP"),
+        (key(KeyCode::F(4)), false, b"\x1bOS"),
+        (key(KeyCode::F(5)), false, b"\x1b[15~"),
+        (key(KeyCode::F(11)), false, b"\x1b[23~"),
+        (key(KeyCode::F(12)), false, b"\x1b[24~"),
+    ];
+    for (pressed, application_cursor, expected) in cases {
+        assert_eq!(
+            super::cards::card_key_bytes(pressed, application_cursor).as_deref(),
+            Some(expected),
+            "{pressed:?}"
+        );
+    }
+    assert_eq!(
+        super::cards::card_key_bytes(key(KeyCode::CapsLock), false),
+        None
+    );
+}

@@ -231,35 +231,22 @@ impl State {
         }
     }
 
-    /// A key crossterm decoded before the input thread switched to the card's raw input. Only
-    /// plain keys are passed on; Esc leaves.
+    /// A key crossterm decoded before the input thread switched to the card's raw input: passed
+    /// on as the Tick's terminal would send it; Esc leaves.
     pub(super) fn card_key(&mut self, key: KeyEvent) -> Option<InputEvent> {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        let bytes: Vec<u8> = match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.leave_card();
-                return None;
-            }
-            (KeyCode::Char(character), KeyModifiers::CONTROL)
-                if character.is_ascii_alphabetic() =>
-            {
-                vec![(character.to_ascii_lowercase() as u8) & 0x1f]
-            }
-            (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                character.to_string().into_bytes()
-            }
-            (KeyCode::Enter, _) => b"\r".to_vec(),
-            (KeyCode::Backspace, _) => vec![0x7f],
-            (KeyCode::Tab, _) => b"\t".to_vec(),
-            (KeyCode::Up, _) => b"\x1b[A".to_vec(),
-            (KeyCode::Down, _) => b"\x1b[B".to_vec(),
-            (KeyCode::Right, _) => b"\x1b[C".to_vec(),
-            (KeyCode::Left, _) => b"\x1b[D".to_vec(),
-            _ => return None,
-        };
-        self.cards.input(bytes);
+        if key.code == KeyCode::Esc {
+            self.leave_card();
+            return None;
+        }
+        let application_cursor = self
+            .focused_card_screen(|screen| screen.application_cursor())
+            .unwrap_or(false);
+        if let Some(bytes) = card_key_bytes(key, application_cursor) {
+            self.cards.input(bytes);
+        }
         None
     }
 
@@ -448,6 +435,50 @@ impl State {
             None => format!("{space} · {hint}"),
         }
     }
+}
+
+/// The bytes a legacy terminal sends for `key`, Alt as an Esc prefix; arrows, Home and End in
+/// their SS3 form when the Tick asked for `application_cursor` keys. `None` for keys such a
+/// terminal cannot send.
+pub(super) fn card_key_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+    const ESCAPE: u8 = 0x1b;
+    /// F5 to F12 in the `CSI n ~` form; F1 to F4 are SS3 `P` to `S`.
+    const FUNCTION_KEY_CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+    let cursor = |final_byte: u8| {
+        let introducer = if application_cursor { b'O' } else { b'[' };
+        vec![ESCAPE, introducer, final_byte]
+    };
+    let tilde = |code: u8| format!("\x1b[{code}~").into_bytes();
+    let bytes = match (key.code, key.modifiers.difference(KeyModifiers::ALT)) {
+        (KeyCode::Char(character), KeyModifiers::CONTROL) if character.is_ascii_alphabetic() => {
+            vec![(character.to_ascii_lowercase() as u8) & 0x1f]
+        }
+        (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            character.to_string().into_bytes()
+        }
+        (KeyCode::Enter, _) => b"\r".to_vec(),
+        (KeyCode::Backspace, _) => vec![0x7f],
+        (KeyCode::Tab, _) => b"\t".to_vec(),
+        (KeyCode::BackTab, _) => b"\x1b[Z".to_vec(),
+        (KeyCode::Up, _) => cursor(b'A'),
+        (KeyCode::Down, _) => cursor(b'B'),
+        (KeyCode::Right, _) => cursor(b'C'),
+        (KeyCode::Left, _) => cursor(b'D'),
+        (KeyCode::Home, _) => cursor(b'H'),
+        (KeyCode::End, _) => cursor(b'F'),
+        (KeyCode::Insert, _) => tilde(2),
+        (KeyCode::Delete, _) => tilde(3),
+        (KeyCode::PageUp, _) => tilde(5),
+        (KeyCode::PageDown, _) => tilde(6),
+        (KeyCode::F(number @ 1..=4), _) => vec![ESCAPE, b'O', b'P' + number - 1],
+        (KeyCode::F(number @ 5..=12), _) => tilde(FUNCTION_KEY_CODES[usize::from(number - 5)]),
+        _ => return None,
+    };
+    Some(if key.modifiers.contains(KeyModifiers::ALT) {
+        [vec![ESCAPE], bytes].concat()
+    } else {
+        bytes
+    })
 }
 
 impl Console {
