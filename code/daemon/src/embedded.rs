@@ -2,6 +2,8 @@ use crate::access_error::agent_access_error;
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -42,6 +44,8 @@ pub struct EmbeddedAgentAccess {
 }
 
 type QueuedAction = (ExecutionRef, AfterTurnAction);
+type CommandFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CommandResult, AccessError>> + Send + 'a>>;
 
 struct Inner {
     agent: Agent,
@@ -612,9 +616,11 @@ impl EmbeddedAgentAccess {
         }
     }
 
-    async fn dispatch(&self, envelope: &CommandEnvelope) -> Result<CommandResult, AccessError> {
+    /// Each command is its own boxed future: in unoptimized builds, one future matching every
+    /// command polls with a stack frame as large as all the commands' awaits together.
+    fn dispatch<'a>(&'a self, envelope: &'a CommandEnvelope) -> CommandFuture<'a> {
         match envelope.command.clone() {
-            AgentCommand::AddArtifactTick { execution, tick } => {
+            AgentCommand::AddArtifactTick { execution, tick } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
                     self.inner
@@ -623,11 +629,11 @@ impl EmbeddedAgentAccess {
                         .await
                         .map_err(agent_access_error)?,
                 ))
-            }
+            }),
             AgentCommand::RemoveArtifactTick {
                 execution,
                 instance_id,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
                     self.inner
@@ -636,12 +642,12 @@ impl EmbeddedAgentAccess {
                         .await
                         .map_err(agent_access_error)?,
                 ))
-            }
+            }),
             AgentCommand::LinkArtifact {
                 execution,
                 tick,
                 history,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 self.inner
                     .agent
@@ -649,8 +655,8 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::ListArtifactTicks { execution } => {
+            }),
+            AgentCommand::ListArtifactTicks { execution } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
                     self.inner
@@ -659,8 +665,8 @@ impl EmbeddedAgentAccess {
                         .await
                         .map_err(agent_access_error)?,
                 ))
-            }
-            AgentCommand::ListHostedTicks { execution } => {
+            }),
+            AgentCommand::ListHostedTicks { execution } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 let members = self
                     .hosted_ticks()?
@@ -668,23 +674,23 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;
                 Ok(CommandResult::HostedTicks(members))
-            }
+            }),
             AgentCommand::CloseHostedTick {
                 execution,
                 instance,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 self.hosted_ticks()?
                     .close_for_user(chat.into(), &instance)
                     .await
                     .map_err(hosted_access_error)?;
                 Ok(CommandResult::Done)
-            }
+            }),
             AgentCommand::ReopenHostedTick {
                 execution,
                 instance,
                 restore_subscriptions,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 let reopened = self
                     .hosted_ticks()?
@@ -714,11 +720,11 @@ impl EmbeddedAgentAccess {
                     membership,
                     restore_error,
                 })
-            }
+            }),
             AgentCommand::AttachHostedTick {
                 execution,
                 instance,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 let grant = if instance.access() == tick_protocol::SHELL_ACCESS {
                     self.inner
@@ -741,11 +747,11 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::HostedTickView(
                     grant.map_err(hosted_access_error)?,
                 ))
-            }
+            }),
             AgentCommand::RemoveMonitorMember {
                 execution,
                 instance,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::MonitorMembership(
                     self.inner
@@ -754,11 +760,11 @@ impl EmbeddedAgentAccess {
                         .await
                         .map_err(agent_access_error)?,
                 ))
-            }
+            }),
             AgentCommand::MarkMonitorHandled {
                 execution,
                 instance,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::MonitorMembership(
                     self.inner
@@ -767,13 +773,13 @@ impl EmbeddedAgentAccess {
                         .await
                         .map_err(agent_access_error)?,
                 ))
-            }
+            }),
             AgentCommand::Create {
                 launch_rules,
                 launch,
                 initial,
                 origin,
-            } => {
+            } => Box::pin(async move {
                 if let Some(UserInput::Skill { name, arguments }) = &initial {
                     self.inner
                         .agent
@@ -877,12 +883,12 @@ impl EmbeddedAgentAccess {
                     submitted,
                     shell,
                 })
-            }
+            }),
             AgentCommand::LoadRecord {
                 record,
                 as_new,
                 launch,
-            } => {
+            } => Box::pin(async move {
                 let snapshot = if as_new {
                     self.inner
                         .agent
@@ -925,13 +931,13 @@ impl EmbeddedAgentAccess {
                     execution,
                     snapshot: Box::new(self.snapshot(execution).await?),
                 })
-            }
+            }),
             AgentCommand::SendFamilyInput {
                 source_execution,
                 target_execution,
                 origin,
                 input,
-            } => {
+            } => Box::pin(async move {
                 if !self.inner.verified_sources.load(Ordering::SeqCst) {
                     self.inner
                         .views
@@ -992,13 +998,13 @@ impl EmbeddedAgentAccess {
                     message_id,
                     target_handle,
                 })
-            }
+            }),
             AgentCommand::Submit {
                 execution,
                 input,
                 origin,
-            } => Box::pin(self.submit(execution, input, origin)).await,
-            AgentCommand::ContinueLoop { execution, .. } => {
+            } => Box::pin(self.submit(execution, input, origin)),
+            AgentCommand::ContinueLoop { execution, .. } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 self.inner
                     .agent
@@ -1006,14 +1012,14 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
+            }),
             AgentCommand::DecidePermission {
                 request,
                 allow,
                 scope,
                 comment,
                 rule,
-            } => {
+            } => Box::pin(async move {
                 self.claim_answer(request, PendingRequestKind::Permission, envelope.command_id)
                     .await?;
                 let chat = self.chat(request.execution).await?;
@@ -1039,8 +1045,8 @@ impl EmbeddedAgentAccess {
                     return Err(agent_access_error(error));
                 }
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::AnswerQuestion { request, answers } => {
+            }),
+            AgentCommand::AnswerQuestion { request, answers } => Box::pin(async move {
                 self.claim_answer(request, PendingRequestKind::Question, envelope.command_id)
                     .await?;
                 let chat = self.chat(request.execution).await?;
@@ -1057,8 +1063,8 @@ impl EmbeddedAgentAccess {
                     return Err(agent_access_error(error));
                 }
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::DeclineQuestion { request } => {
+            }),
+            AgentCommand::DeclineQuestion { request } => Box::pin(async move {
                 self.claim_answer(request, PendingRequestKind::Question, envelope.command_id)
                     .await?;
                 let chat = self.chat(request.execution).await?;
@@ -1075,29 +1081,29 @@ impl EmbeddedAgentAccess {
                     return Err(agent_access_error(error));
                 }
                 Ok(CommandResult::Done)
-            }
+            }),
             AgentCommand::Configure {
                 execution,
                 change,
                 provider,
-            } => {
+            } => Box::pin(async move {
                 if provider.is_some() {
                     return Err(AccessError::invalid(
                         "External Provider definitions are not supported; choose a built-in model",
                     ));
                 }
                 Box::pin(self.configure(execution, change)).await
-            }
+            }),
             AgentCommand::EditHistory { execution, action } => {
-                self.history(execution, action, envelope.command_id).await
+                Box::pin(self.history(execution, action, envelope.command_id))
             }
             AgentCommand::ManageLoop { execution, action } => {
-                Box::pin(self.manage_loop(execution, action)).await
+                Box::pin(self.manage_loop(execution, action))
             }
             AgentCommand::ManageTask { execution, action } => {
-                self.manage_task(execution, action).await
+                Box::pin(self.manage_task(execution, action))
             }
-            AgentCommand::ManageGoal { execution, action } => {
+            AgentCommand::ManageGoal { execution, action } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 self.inner
                     .agent
@@ -1105,12 +1111,12 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
+            }),
             AgentCommand::ClearCompletedTasks {
                 execution,
                 root_loop_id,
                 expected_revision,
-            } => {
+            } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 self.inner
                     .agent
@@ -1118,8 +1124,8 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::EnqueueAfterTurn { execution, action } => {
+            }),
+            AgentCommand::EnqueueAfterTurn { execution, action } => Box::pin(async move {
                 let chat = self.chat(execution).await?;
                 if let AfterTurnAction::Submit {
                     origin: Some(origin),
@@ -1142,8 +1148,8 @@ impl EmbeddedAgentAccess {
                     .await
                     .insert(command_id, (execution, action));
                 Ok(CommandResult::Queued { command_id })
-            }
-            AgentCommand::RefreshConfiguration { execution } => {
+            }),
+            AgentCommand::RefreshConfiguration { execution } => Box::pin(async move {
                 let snapshot = self.snapshot(execution).await?;
                 self.configure(
                     execution,
@@ -1153,8 +1159,8 @@ impl EmbeddedAgentAccess {
                     },
                 )
                 .await
-            }
-            AgentCommand::ReconnectMcpServer { execution, name } => {
+            }),
+            AgentCommand::ReconnectMcpServer { execution, name } => Box::pin(async move {
                 self.chat(execution).await?;
                 self.inner
                     .agent
@@ -1162,26 +1168,28 @@ impl EmbeddedAgentAccess {
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::TrustWorkingDirectory { folder } => {
+            }),
+            AgentCommand::TrustWorkingDirectory { folder } => Box::pin(async move {
                 self.inner
                     .agent
                     .trust_working_directory(folder)
                     .await
                     .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
-            }
-            AgentCommand::FlushTranscripts => {
+            }),
+            AgentCommand::FlushTranscripts => Box::pin(async move {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
+            }),
+            AgentCommand::UpgradeRuntime { .. } => {
+                Box::pin(std::future::ready(Err(AccessError::new(
+                    AccessErrorCode::Unsupported,
+                    "runtime upgrades are coordinated by the daemon",
+                ))))
             }
-            AgentCommand::UpgradeRuntime { .. } => Err(AccessError::new(
-                AccessErrorCode::Unsupported,
-                "runtime upgrades are coordinated by the daemon",
-            )),
-            AgentCommand::ReplaceTickhost => Err(AccessError::invalid(
-                "only the Agent daemon replaces its Tickhost",
-            )),
+            AgentCommand::ReplaceTickhost => Box::pin(std::future::ready(Err(
+                AccessError::invalid("only the Agent daemon replaces its Tickhost"),
+            ))),
         }
     }
 
@@ -2312,7 +2320,7 @@ impl AgentAccess for EmbeddedAgentAccess {
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
-        let result = Box::pin(self.dispatch(&envelope)).await;
+        let result = self.dispatch(&envelope).await;
         let persistence = if let Some(error) = self.inner.agent.transcript_write_error() {
             PersistenceState::WriteFailed(error)
         } else if matches!(envelope.command, AgentCommand::FlushTranscripts) {
