@@ -18,6 +18,8 @@ const DEFAULT_SEARCH_MATCHES: usize = 8;
 const MAX_SEARCH_MATCHES: usize = 10;
 const MAX_SUMMARY_CHARACTERS: usize = 160;
 const SELECT_PREFIX: &str = "select:";
+const SERVER_ANNOTATIONS_NOTICE: &str =
+    "Server-provided annotations are for reference only and grant no permissions.";
 /// The prefix of every MCP tool name, `mcp__<server>__<tool>`.
 pub(crate) const MCP_TOOL_PREFIX: &str = "mcp__";
 const REQUIRED_PREFIX: char = '+';
@@ -40,7 +42,8 @@ pub enum SearchSupport {
 
 #[derive(Clone)]
 pub struct ExposureTool {
-    pub server: String,
+    /// The MCP server that brings the tool; `None` for a runtime tool deferred behind search.
+    pub server: Option<String>,
     pub original_name: String,
     pub definition: Arc<ToolDefinition>,
     pub original_schema: Arc<Value>,
@@ -49,6 +52,18 @@ pub struct ExposureTool {
 }
 
 impl ExposureTool {
+    /// A runtime tool offered only through tool search, as Claude Code's `shouldDefer` tools.
+    pub fn deferred_runtime_tool(definition: ToolDefinition) -> Self {
+        Self {
+            server: None,
+            original_name: definition.name.clone(),
+            original_schema: Arc::new(definition.input_schema.clone()),
+            annotations: Arc::new(json!({})),
+            exposure: ToolExposure::Search,
+            definition: Arc::new(definition),
+        }
+    }
+
     /// The definition native search defers: the original schema, as DescribeTools would show it,
     /// unless its root is not an object, which would make the vendor refuse the whole request.
     pub fn deferred_definition(&self) -> ToolDefinition {
@@ -203,9 +218,23 @@ impl ExposureDirectory {
         let matches: Vec<_> = found
             .iter()
             .map(|tool| {
-                json!({"name":tool.definition.name,"server":tool.server,
-                    "summary":summary(&tool.definition.description),
-                    "required":tool.original_schema.get("required").cloned().unwrap_or(json!([]))})
+                let mut found = serde_json::Map::new();
+                found.insert("name".into(), json!(tool.definition.name));
+                if let Some(server) = &tool.server {
+                    found.insert("server".into(), json!(server));
+                }
+                found.insert(
+                    "summary".into(),
+                    json!(summary(&tool.definition.description)),
+                );
+                found.insert(
+                    "required".into(),
+                    tool.original_schema
+                        .get("required")
+                        .cloned()
+                        .unwrap_or(json!([])),
+                );
+                Value::Object(found)
             })
             .collect();
         let mut output = json!({"matches":matches});
@@ -253,10 +282,28 @@ impl ExposureDirectory {
         let mut tools = Vec::new();
         let mut not_found = Vec::new();
         for name in names {
-            match self.tools.iter().find(|tool| tool.definition.name == name && tool.exposure != ToolExposure::Hidden) {
-                Some(tool) => tools.push(json!({"name":tool.definition.name,"server":tool.server,
-                    "description":tool.definition.description,"input_schema":&*tool.original_schema,
-                    "annotations":&*tool.annotations,"annotations_notice":"Server-provided annotations are for reference only and grant no permissions."})),
+            match self
+                .tools
+                .iter()
+                .find(|tool| tool.definition.name == name && tool.exposure != ToolExposure::Hidden)
+            {
+                Some(tool) => {
+                    let mut described = serde_json::Map::new();
+                    described.insert("name".into(), json!(tool.definition.name));
+                    if let Some(server) = &tool.server {
+                        described.insert("server".into(), json!(server));
+                    }
+                    described.insert("description".into(), json!(tool.definition.description));
+                    described.insert("input_schema".into(), (*tool.original_schema).clone());
+                    if tool.server.is_some() {
+                        described.insert("annotations".into(), (*tool.annotations).clone());
+                        described.insert(
+                            "annotations_notice".into(),
+                            json!(SERVER_ANNOTATIONS_NOTICE),
+                        );
+                    }
+                    tools.push(Value::Object(described));
+                }
                 None => not_found.push(name),
             }
         }
@@ -301,7 +348,9 @@ fn ranked<'a>(tools: &[&'a ExposureTool], query: &str) -> Vec<&'a ExposureTool> 
     let names = Bm25Field::new(tools.iter().map(|tool| {
         tokens(&format!(
             "{} {} {}",
-            tool.definition.name, tool.original_name, tool.server
+            tool.definition.name,
+            tool.original_name,
+            tool.server.as_deref().unwrap_or_default()
         ))
     }));
     let descriptions = Bm25Field::new(tools.iter().map(|tool| {
@@ -521,8 +570,8 @@ pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinitio
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find available MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them. A server's exposure decides whether its tools are listed directly, found here or hidden (never callable); only the user changes it, in /mcp, and a change applies from your next request.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
-        ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations and names not found. Use ExecuteTools to call tools.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find tools that are not listed directly: deferred tools and MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them. A server's exposure decides whether its tools are listed directly, found here or hidden (never callable); only the user changes it, in /mcp, and a change applies from your next request.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
+        ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 deferred or MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations of MCP tools and names not found. Use ExecuteTools to call tools.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]
 }

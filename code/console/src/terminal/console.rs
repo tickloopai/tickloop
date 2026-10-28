@@ -17263,8 +17263,9 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// Entering Plan asks only when an Ask rule matches, as in Claude Code.
     #[tokio::test]
-    async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
+    async fn an_ask_rules_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
         use tickloop_harness::tools::ENTER_PLAN_MODE_TOOL_NAME;
 
@@ -17285,6 +17286,21 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                vec![tickloop_harness::protocol::PermissionRule {
+                    id: Uuid::new_v4(),
+                    decision: tickloop_harness::protocol::Decision::Ask,
+                    tool: ENTER_PLAN_MODE_TOOL_NAME.into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
             .await
             .unwrap();
         let console = InteractiveConsoleFixture::new(State::new(true, 100, 30));

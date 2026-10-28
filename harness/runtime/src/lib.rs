@@ -3226,6 +3226,7 @@ impl Agent {
                     &family_roster,
                     workspace_host.as_ref(),
                     plan_mode.as_deref(),
+                    &registry.searched_names(),
                 ),
             );
             request.history_sources.insert(1, None);
@@ -3250,6 +3251,7 @@ impl Agent {
             .iter()
             .chain(&request.deferred_tools)
             .map(|tool| tool.name.clone())
+            .chain(registry.searched_names())
             .collect::<HashSet<_>>();
         let mut recovered_text = String::new();
         let mut continuations = 0;
@@ -5566,7 +5568,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_harness_tools::Tools::definitions()
         .into_iter()
         .chain(tool_exposure::fold_definitions())
-        .chain(plan::definitions(false))
+        .chain(plan::definitions(false, false))
         .chain([interaction::definition(false)])
         .chain(tick_subscriptions::definitions())
         .chain(delegation::definitions())

@@ -55,12 +55,17 @@ pub(crate) async fn breakdown(
     let servers = settings
         .map(|settings| configured_servers(&settings, launch))
         .unwrap_or_default();
-    if breakdown.tool_search.is_none() && !servers.is_empty() {
-        breakdown.tool_search = Some(ToolSearchPool {
-            mode,
-            servers: Vec::new(),
-            unavailable_servers: servers,
-        });
+    if !servers.is_empty() {
+        // The runtime's own deferred tools may already have opened the pool.
+        breakdown
+            .tool_search
+            .get_or_insert_with(|| ToolSearchPool {
+                mode,
+                servers: Vec::new(),
+                unavailable_servers: Vec::new(),
+            })
+            .unavailable_servers
+            .extend(servers);
     }
     Ok(breakdown)
 }
@@ -133,7 +138,15 @@ mod tests {
         assert!(!breakdown.calibrated);
         assert!(breakdown.used_tokens > 0);
         let pool = breakdown.tool_search.unwrap();
-        assert_eq!(pool.tool_count(), 0);
+        assert_eq!(
+            pool.servers
+                .iter()
+                .flat_map(|server| &server.tools)
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["EnterPlanMode"],
+            "only the runtime's own deferred tool, before any server connects"
+        );
         assert_eq!(
             pool.unavailable_servers,
             [UnavailableToolServer {

@@ -115,6 +115,7 @@ Permission history uses the same prepared service identity for matching as admis
 | --- | --- | --- |
 | SearchTools / DescribeTools | ReadOnly; no review | Discovery respects exposure and the delegated tool ceiling; annotations are reference data only |
 | ExecuteTools | No wrapper approval | Each independent child call is prepared, approved and dispatched through the ordinary tool pipeline, with the same target permission and policy revalidation |
+| EnterPlanMode | Deferred behind tool search, like Claude Code 2.1.302's `shouldDefer`; callable directly, or inside ExecuteTools only as the batch's sole call (its calls run concurrently). No approval and no review in any mode, as in Claude Code, which gives it no permission check | Only an explicit Ask rule asks the user (the Enter plan mode dialog) and a Deny rule refuses it; it only switches the Chat to Plan, which narrows what later calls may do. Delegated children never get it |
 
 Nested calls record their parent call and their individual permission decisions. Human confirmation pauses only the waiting call. Auto receives the entire model-authored batch and observed earlier results as assistant evidence, not user authorization, under the existing history trimming rules. An effective Auto rejection stops calls not yet dispatched, including pending confirmations; dispatched calls settle normally. Rejections count toward the existing denial limits. Fold does not add policy rules or native admission paths: the 82-rule policy and nine inapplicable entries remain unchanged.
 

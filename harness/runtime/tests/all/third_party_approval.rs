@@ -1163,7 +1163,7 @@ async fn plan_decides_mcp_calls_as_the_mode_it_was_entered_from() {
 }
 
 #[tokio::test]
-async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
+async fn entering_plan_through_the_tool_asks_nothing_and_keeps_the_auto_review_for_mcp_calls() {
     let server = McpService::start().await;
     let (provider, tool) = provider(&server, "review").await;
     let agent = Agent::new_embedded(
@@ -1202,7 +1202,7 @@ async fn entering_plan_through_the_tool_keeps_the_auto_review_for_mcp_calls() {
             _ => {}
         }
     }
-    assert_eq!(prompts, ["EnterPlanMode"]);
+    assert!(prompts.is_empty(), "{prompts:?}");
     assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
     assert_eq!(server.calls().len(), 1);
     assert_eq!(
