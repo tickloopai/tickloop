@@ -496,7 +496,11 @@ async fn mcp_children_keep_frozen_denials_and_take_new_parent_restrictions() {
         let (provider, tool) = provider(&server, "review").await;
         let model = Arc::new(PausedChildModel {
             script: ScriptedModel::new(vec![
-                call("delegate", "Subagent", json!({"task":"Read the service"})),
+                call(
+                    "delegate",
+                    "Subagent",
+                    json!({"task":"Read the service","run_in_background":false}),
+                ),
                 call("read", &tool, json!({})),
                 text("child done"),
                 text("parent done"),
@@ -505,7 +509,13 @@ async fn mcp_children_keep_frozen_denials_and_take_new_parent_restrictions() {
             child_entered: Default::default(),
             release_child: Default::default(),
         });
-        let agent = Agent::new_embedded(config(), model.clone());
+        // The second request is the child's only while the parent waits for it, which only a
+        // non-interactive host offers.
+        let agent = Agent::new_embedded_with_subagent_launch(
+            config(),
+            model.clone(),
+            SubagentLaunch::BackgroundByDefault,
+        );
         agent.install_host_tools(provider).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let parent = agent.create_chat(dir.path().into()).await.unwrap();

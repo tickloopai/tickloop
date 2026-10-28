@@ -326,7 +326,9 @@ async fn overview_completed_families_rank_by_recent_finish() {
 #[tokio::test]
 async fn overview_prioritizes_a_waiting_child_family_before_an_independent_running_agent() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Agent::new_embedded(
+    // The scripted replies need the delegating Agent to wait for its child, which only a
+    // non-interactive host offers.
+    let runtime = Agent::new_embedded_with_subagent_launch(
         tickloop_harness::test_support::config(),
         Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
             tickloop_harness::test_support::call(
@@ -341,6 +343,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
                 "Subagent",
                 serde_json::json!({
                     "task":"Ask the user which bounded cadence to use.",
+                    "run_in_background": false,
                 }),
             ),
             tickloop_harness::test_support::call(
@@ -349,6 +352,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
                 tickloop_harness::test_support::single_question("Which cadence?"),
             ),
         ])),
+        tickloop_harness::runtime::SubagentLaunch::BackgroundByDefault,
     );
     runtime.install_own_tickhost();
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));

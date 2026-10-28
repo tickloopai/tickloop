@@ -19,6 +19,7 @@ mod mcp_startup_wait;
 mod monitor_width;
 mod nested_family;
 mod other_tickhost;
+mod piped_background;
 mod provider_errors;
 mod question_decline;
 mod reply_visibility;
