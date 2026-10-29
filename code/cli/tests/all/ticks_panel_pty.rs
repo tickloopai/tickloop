@@ -638,7 +638,13 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     install_from_path(&fixture, "plugin", &directory);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
-    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    // The plugin's hook waits for trust, so the New Agent offers its review first.
+    terminal.wait_for_frame(0, "the hooks review", |frame| {
+        frame.contains("Hooks need review")
+    });
+    terminal.press(ESCAPE, "the review skipped", |frame| {
+        !frame.contains("Hooks need review") && frame.contains("❯")
+    });
     let frame = terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
         row_shows(
             frame,
