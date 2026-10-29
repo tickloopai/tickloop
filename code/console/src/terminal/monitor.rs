@@ -2499,7 +2499,7 @@ mod registered_rows_tests {
                 running: true,
                 ended: None,
                 resources: None,
-                actions: [('o', "inspect"), ('z', "expand")]
+                actions: [('o', "inspect"), ('e', "expand")]
                     .into_iter()
                     .map(|(key, label)| MonitorAction {
                         key,
@@ -2537,7 +2537,7 @@ mod registered_rows_tests {
         assert!(!text.contains("enter"), "keys are on the hint row: {text}");
         assert_eq!(
             list.hint(),
-            "enter inspect · z expand · tab next · esc input"
+            "enter inspect · e expand · tab next · esc input"
         );
     }
 }

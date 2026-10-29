@@ -656,6 +656,24 @@ impl MonitorCards {
         true
     }
 
+    /// The user shows the cards of `instances`, given in the list's order, as the user's, each
+    /// leaving the hidden set; among them the higher rows stay shown first when not all fit.
+    /// Returns the ones that were not open, whose views attach.
+    pub(super) fn show_all(&mut self, chat: Uuid, instances: &[InstanceRef]) -> Vec<InstanceRef> {
+        let mut opened = Vec::new();
+        for instance in instances.iter().rev() {
+            if self.open_as(chat, instance.clone(), CardOrigin::User) {
+                opened.push(instance.clone());
+            }
+            let sequence = self.next_sequence;
+            if let Some(card) = self.card_mut(instance) {
+                card.sequence = sequence;
+            }
+        }
+        opened.reverse();
+        opened
+    }
+
     /// The user hides the card: it closes, and the Agent's use no longer shows it.
     pub(super) fn hide(&mut self, instance: &InstanceRef) {
         self.close(instance);

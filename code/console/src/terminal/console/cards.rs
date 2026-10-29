@@ -19,6 +19,7 @@ pub(super) struct CardSource {
 }
 
 const OPENING_NOTE: &str = "opening";
+const ALL_CARDS_HINT: &str = "z/Z hide/show all";
 /// How long the card of a row the Agent used waits for the row to be listed.
 const AGENT_CARD_WAIT: Duration = Duration::from_secs(30);
 /// The most such cards that wait at once.
@@ -90,6 +91,44 @@ impl State {
             return None;
         }
         self.open_card(instance, CardOrigin::User)
+    }
+
+    /// z on the list: hides every shown card, the user's, the Agent's and a Tab preview alike,
+    /// without hiding them from the Agent's use, which shows them again as usual. The focus and
+    /// selection stay on the list.
+    pub(super) fn hide_all_cards(&mut self) {
+        if self.cards.cards().is_empty() {
+            return;
+        }
+        self.cards.close_all();
+        self.card_sizes.clear();
+        self.rendered_region = None;
+    }
+
+    /// Z on the list: shows the card of every row that has one as the user's, as Space on each
+    /// would; the higher rows take the room first. The focus and selection stay on the list, and
+    /// the views attach with the next card settle.
+    pub(super) fn show_all_cards(&mut self) {
+        let Some(chat) = self.chat else {
+            return;
+        };
+        let rows: Vec<InstanceRef> = self
+            .monitor
+            .entries()
+            .iter()
+            .map(|entry| entry.instance.clone())
+            .filter(|instance| self.row_toggles_card(instance))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let opened = self.cards.show_all(chat, &rows);
+        self.queued_card_inputs
+            .extend(opened.into_iter().map(|instance| InputEvent::TickAction {
+                chat,
+                action: super::super::tick_actions::builtin::attach_card(instance),
+            }));
+        self.rendered_region = None;
     }
 
     /// Enter, or a click inside a card: shows the card if it is hidden, keeps it, and gives it
@@ -690,7 +729,8 @@ impl State {
         }
     }
 
-    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card.
+    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card, and
+    /// z/Z while any row has one.
     pub(super) fn monitor_list_hint(&self) -> String {
         if let Some(focused) = self.cards.focused() {
             return if focused.shell_task().is_some() {
@@ -706,17 +746,29 @@ impl State {
         let Some(entry) = self.monitor.selected() else {
             return hint;
         };
-        if !self.row_toggles_card(&entry.instance) {
+        let mut card_keys = Vec::new();
+        if self.row_toggles_card(&entry.instance) {
+            card_keys.push(if self.cards.is_open(&entry.instance) {
+                "space hide"
+            } else {
+                "space show"
+            });
+        }
+        if self
+            .monitor
+            .entries()
+            .iter()
+            .any(|entry| self.row_toggles_card(&entry.instance))
+        {
+            card_keys.push(ALL_CARDS_HINT);
+        }
+        if card_keys.is_empty() {
             return hint;
         }
-        let space = if self.cards.is_open(&entry.instance) {
-            "space hide"
-        } else {
-            "space show"
-        };
+        let card_keys = card_keys.join(" · ");
         match hint.rsplit_once(" · ") {
-            Some((keys, last)) => format!("{keys} · {space} · {last}"),
-            None => format!("{space} · {hint}"),
+            Some((keys, last)) => format!("{keys} · {card_keys} · {last}"),
+            None => format!("{card_keys} · {hint}"),
         }
     }
 }
