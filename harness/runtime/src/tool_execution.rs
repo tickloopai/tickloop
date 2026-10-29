@@ -1190,6 +1190,22 @@ impl Agent {
         } else {
             input
         };
+        let input = if name == "TaskUpdate"
+            && registration
+                .as_ref()
+                .is_some_and(|tool| matches!(tool.route, ToolRoute::SharedTask))
+        {
+            match shared_tasks::prepared_update_input(input) {
+                Ok(input) => input,
+                Err(error) => {
+                    return Ok(ToolCallOutcome::not_admitted(format!(
+                        "invalid TaskUpdate input: {error}"
+                    )));
+                }
+            }
+        } else {
+            input
+        };
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
         }
@@ -3021,6 +3037,14 @@ mod tests {
                 true,
             ))
             .chain(tick_subscriptions::definitions())
+            .chain(
+                [
+                    shared_tasks::TaskToolAccess::Enabled,
+                    shared_tasks::TaskToolAccess::Finishing,
+                ]
+                .into_iter()
+                .flat_map(shared_tasks::definitions),
+            )
             .chain(skills.tool_definition())
             .chain(crate::mcp_resources::definitions())
             .chain(crate::tick_tools::definitions())
@@ -3051,6 +3075,7 @@ mod tests {
             "ArtifactUpload",
             "CronCreate",
             "ScheduleWakeup",
+            "TaskUpdate",
         ] {
             assert!(
                 definitions.iter().any(|definition| definition.name == name),

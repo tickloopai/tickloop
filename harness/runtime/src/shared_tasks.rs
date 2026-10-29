@@ -107,6 +107,65 @@ enum UpdateAction {
     },
 }
 
+/// The TaskUpdate fields that belong to some actions only, in schema order.
+const UPDATE_ACTION_FIELDS: [&str; 5] = ["owner", "result", "title", "description", "dependencies"];
+
+fn update_action_fields(action: &str) -> Option<&'static [&'static str]> {
+    match action {
+        "claim" => Some(&[]),
+        "assign" => Some(&["owner"]),
+        "complete" | "release" | "cancel" => Some(&["result"]),
+        "edit" => Some(&["title", "description", "dependencies"]),
+        _ => None,
+    }
+}
+
+/// TaskUpdate `input` as it is prepared, approved, executed and recorded: models fill the flat
+/// schema's fields that the action does not take with empty values, which are dropped. Such a
+/// field with content fails, naming the fields the action takes. Input without a known action
+/// is left to the strict parse.
+pub(super) fn prepared_update_input(mut input: Value) -> Result<Value, String> {
+    let Some(action) = input
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(input);
+    };
+    let Some(accepted) = update_action_fields(&action) else {
+        return Ok(input);
+    };
+    let is_foreign =
+        |field: &str| UPDATE_ACTION_FIELDS.contains(&field) && !accepted.contains(&field);
+    let is_empty = |value: &Value| {
+        value.is_null()
+            || value.as_str().is_some_and(str::is_empty)
+            || value.as_array().is_some_and(Vec::is_empty)
+    };
+    let fields = input
+        .as_object_mut()
+        .expect("input with an action is an object");
+    // `retain` keeps the remaining fields in order, so input without dropped fields is unchanged
+    // byte for byte and matches mutation receipts recorded before this preparation existed.
+    fields.retain(|field, value| !(is_foreign(field) && is_empty(value)));
+    let unexpected = UPDATE_ACTION_FIELDS
+        .into_iter()
+        .filter(|field| is_foreign(field) && fields.contains_key(*field))
+        .collect::<Vec<_>>();
+    if unexpected.is_empty() {
+        return Ok(input);
+    }
+    let got = unexpected.join(", ");
+    Err(if accepted.is_empty() {
+        format!("action '{action}' accepts no action fields (got: {got})")
+    } else {
+        format!(
+            "action '{action}' accepts only: {} (got: {got})",
+            accepted.join(", ")
+        )
+    })
+}
+
 #[derive(Deserialize)]
 struct UpdateInput {
     mutation_id: Uuid,
@@ -161,7 +220,7 @@ pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
         ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task on your Agent family's task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
         ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task id, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
         ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":task},"required":["task_id"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. Each action takes only its own fields; omit the others: claim takes none; assign requires owner; complete, release and cancel require result; edit requires title, description and dependencies (the full list, [] for none). claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
     ];
     match access {
         TaskToolAccess::Disabled => tools.clear(),
@@ -171,7 +230,7 @@ pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
                 .iter_mut()
                 .find(|tool| tool.name == "TaskUpdate")
                 .unwrap();
-            update.description = "Task tools are disabled in Settings. Finish your existing claimed task: complete records completion; release returns unfinished work to pending and clears its owner and claim. Only the claiming Run may do this. Do not retry updates to terminal tasks; on revision conflict, reconsider the action using current_task. No new task work can be created, claimed or assigned.".into();
+            update.description = "Task tools are disabled in Settings. Finish your existing claimed task: complete records completion; release returns unfinished work to pending and clears its owner and claim. Both require result and take no other action fields. Only the claiming Run may do this. Do not retry updates to terminal tasks; on revision conflict, reconsider the action using current_task. No new task work can be created, claimed or assigned.".into();
             update.input_schema["properties"]["action"]["enum"] = json!(["complete", "release"]);
         }
         TaskToolAccess::Enabled => {}
