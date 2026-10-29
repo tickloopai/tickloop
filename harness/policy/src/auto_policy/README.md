@@ -192,6 +192,17 @@ Both verify admission and rejection, including normally safe commands. This is r
 not semantic acceptance by a real review model. The conditional escape hint is appended by Code
 using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.
 
+## PreToolUse hooks
+
+Claude Code–compatible `command` hooks are not model tools, so this mapping adds no rule. A call's `PreToolUse` hooks run before it is prepared, and their merged answer (deny over ask over allow) changes only how the call reaches the steps below; `harness/runtime/src/hooks/` holds the engine and `harness/runtime/tests/all/tool_hooks.rs` the routing tests with the reference Execution Environment and a reviewer double.
+
+- **deny** (a `permissionDecision: "deny"`, `decision: "block"` or exit status 2, from any source) refuses the call unprepared: no Permission Rule, review or prompt is consulted, and the model reads the hook's reason.
+- **ask** (from any source) sends the call to a person in every mode, Auto included, without the reviewer; the request carries the approval source `hook`, and like an explicit Ask the answer covers that one call and saves no rule. An explicit Deny rule or Plan's side-effect refusal still refuses first. An Unrestricted host still asks; a host that cannot ask refuses.
+- **allow** counts only from a hook in the user's own `settings.json`. It admits the call after the deterministic checks and before the reviewer, as a user Allow rule does and as Claude Code does: explicit Ask and Deny rules, sensitive-path safety checks, Plan's side-effect refusal, approval the Execution Environment requires, a host tool's required confirmation, the delegation ceiling and final admission all still apply. The reviewer and therefore the frozen rules, Hard deny included, are not consulted for that call. Its approval record is `Direct` with the optional reason `hook`. A plugin's or the repository's allow is recorded as ignored and the call is decided as if the hook had not answered, so such hooks can never widen what runs.
+- **updatedInput** replaces the call's input before its single preparation; approval, review and execution all see the final input, the conversation keeps the input as the model wrote it, and the hook run record keeps the rewrite.
+
+Unconfirmed or modified plugin and repository hooks never run, so they cannot affect any decision. Hooks that do not answer leave the ordinary routing unchanged. No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, eight inapplicable native entries, and policy and built-in group version **10** are unchanged.
+
 ## Sandboxed Bash
 
 Following Claude Code's `autoAllowBashIfSandboxed` (`checkSandboxAutoAllow` in `bashPermissions.ts`),

@@ -828,6 +828,56 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
     Ok(())
 }
 
+/// A call its `PreToolUse` hooks let through, as it is prepared.
+struct RegisteredCall {
+    id: String,
+    name: String,
+    input: Value,
+    registration: Option<RegisteredTool>,
+    ids: tickloop_ids::IdContext,
+    task_binding: Option<Option<tickloop_harness_protocol::TaskExecutionBinding>>,
+}
+
+/// What the call's `PreToolUse` hooks decided, beyond its input.
+#[derive(Default)]
+struct HookGate {
+    permission: Option<crate::hooks::HookPermission>,
+    reason: Option<String>,
+    feedback: crate::hooks::ToolHookFeedback,
+}
+
+impl HookGate {
+    fn asks(&self) -> bool {
+        self.permission == Some(crate::hooks::HookPermission::Ask)
+    }
+
+    fn allows(&self) -> bool {
+        self.permission == Some(crate::hooks::HookPermission::Allow)
+    }
+
+    fn ask_reason(&self, tool: &str) -> String {
+        self.reason
+            .clone()
+            .unwrap_or_else(|| format!("Hook PreToolUse:{tool} asked for confirmation"))
+    }
+}
+
+/// Checks a host or local tool's input against its schema; built-in tools check theirs as
+/// they are prepared.
+fn validate_registered_input(registered: &RegisteredTool, input: &Value) -> Result<(), String> {
+    if !registered.is_host_or_local() {
+        return Ok(());
+    }
+    match &registered.route {
+        ToolRoute::Host(provider) => provider.validate_input(
+            &registered.definition.name,
+            &registered.definition.input_schema,
+            input,
+        ),
+        _ => validate_tool_input(&registered.definition, input),
+    }
+}
+
 pub(super) struct ToolCallOutcome {
     pub(super) result: ToolResult,
     pub(super) sources: Option<Vec<tickloop_harness_protocol::CitationSource>>,
@@ -839,6 +889,8 @@ pub(super) struct ToolCallOutcome {
     pub(super) continue_after_denial: bool,
     pub(super) is_rejected_by_user: bool,
     pub(super) denial: Option<DenialRecord>,
+    /// What the call's hooks tell the model after its result.
+    pub(super) hook_feedback: crate::hooks::ToolHookFeedback,
 }
 
 impl ToolCallOutcome {
@@ -857,6 +909,7 @@ impl ToolCallOutcome {
             continue_after_denial: false,
             is_rejected_by_user: false,
             denial: None,
+            hook_feedback: Default::default(),
         }
     }
 }
@@ -1251,32 +1304,110 @@ impl Agent {
         };
 
         if let Some(registered) = &registration
-            && registered.is_host_or_local()
-            && let Err(error) = match &registered.route {
-                ToolRoute::Host(provider) => provider.validate_input(
-                    &registered.definition.name,
-                    &registered.definition.input_schema,
-                    &input,
-                ),
-                _ => validate_tool_input(&registered.definition, &input),
-            }
+            && let Err(error) = validate_registered_input(registered, &input)
         {
-            return Ok(ToolCallOutcome {
-                result: ToolResult {
-                    content: error,
-                    is_error: true,
-                    output_ref: None,
-                },
-                sources: None,
-                images: Vec::new(),
-                host_call_status: None,
-                host_effect: None,
-                permission_comment: None,
-                continue_after_denial: false,
-                is_rejected_by_user: false,
-                denial: None,
-            });
+            return Ok(ToolCallOutcome::not_admitted(error));
         }
+        let (input, hook_gate) = if registration.is_some() {
+            match self
+                .pre_tool_use(receipt, &id, &name, input.clone(), &cancel)
+                .await
+            {
+                crate::hooks::PreToolGate::Cancelled => {
+                    return Err("run interrupted while PreToolUse hooks ran".into());
+                }
+                crate::hooks::PreToolGate::Refused { message, feedback } => {
+                    return Ok(ToolCallOutcome {
+                        hook_feedback: feedback,
+                        ..ToolCallOutcome::not_admitted(message)
+                    });
+                }
+                crate::hooks::PreToolGate::Proceed {
+                    input: rewritten,
+                    permission,
+                    reason,
+                    feedback,
+                } => {
+                    let rewritten = if rewritten != input
+                        && registration
+                            .as_ref()
+                            .is_some_and(|tool| matches!(tool.route, ToolRoute::Delegation))
+                    {
+                        delegation::offered_input(self.inner.tool_policy.subagent_launch, rewritten)
+                    } else {
+                        rewritten
+                    };
+                    if let Some(registered) = &registration
+                        && let Err(error) = validate_registered_input(registered, &rewritten)
+                    {
+                        return Ok(ToolCallOutcome {
+                            hook_feedback: feedback,
+                            ..ToolCallOutcome::not_admitted(error)
+                        });
+                    }
+                    (
+                        rewritten,
+                        HookGate {
+                            permission,
+                            reason,
+                            feedback,
+                        },
+                    )
+                }
+            }
+        } else {
+            (input, HookGate::default())
+        };
+        let HookGate {
+            permission,
+            reason,
+            feedback,
+        } = hook_gate;
+        let mut outcome = self
+            .admit_and_run_call(
+                receipt,
+                assistant_message_id,
+                RegisteredCall {
+                    id,
+                    name,
+                    input,
+                    registration,
+                    ids,
+                    task_binding,
+                },
+                HookGate {
+                    permission,
+                    reason,
+                    feedback: Default::default(),
+                },
+                cancel,
+            )
+            .await?;
+        let mut hook_feedback = feedback;
+        hook_feedback.extend(std::mem::take(&mut outcome.hook_feedback));
+        outcome.hook_feedback = hook_feedback;
+        Ok(outcome)
+    }
+
+    /// Prepares, admits and runs a call its `PreToolUse` hooks let through, then runs its
+    /// `PostToolUse` or `PostToolUseFailure` hooks if it ran.
+    async fn admit_and_run_call(
+        &self,
+        receipt: &Receipt,
+        assistant_message_id: Uuid,
+        call: RegisteredCall,
+        hook_gate: HookGate,
+        cancel: CancellationToken,
+    ) -> Result<ToolCallOutcome, ToolCallError> {
+        let RegisteredCall {
+            id,
+            name,
+            input,
+            registration,
+            ids,
+            task_binding,
+        } = call;
+        let mut dispatched = false;
         self.refresh_project_rules(receipt.chat_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -1362,21 +1493,7 @@ impl Agent {
                     } else {
                         error
                     };
-                    return Ok(ToolCallOutcome {
-                        result: ToolResult {
-                            content: error,
-                            is_error: true,
-                            output_ref: None,
-                        },
-                        sources: None,
-                        images: Vec::new(),
-                        host_call_status: None,
-                        host_effect: None,
-                        permission_comment: None,
-                        continue_after_denial: false,
-                        is_rejected_by_user: false,
-                        denial: None,
-                    });
+                    return Ok(ToolCallOutcome::not_admitted(error));
                 }
             }
         } else if matches!(
@@ -1640,11 +1757,25 @@ impl Agent {
                 }
                 other => other,
             };
+            let hook_asks = hook_gate.asks() && decision != Decision::Deny;
+            let hook_admits = hook_gate.allows()
+                && !matches!(decision, Decision::Deny | Decision::Allow)
+                && !explicit_ask
+                && !local_read_asks
+                && host_permission != Some(crate::host_tools::HostToolPermission::Confirmation);
+            let decision = if hook_asks {
+                Decision::Ask
+            } else if hook_admits {
+                Decision::Allow
+            } else {
+                decision
+            };
             let prompts_unavailable = decision == Decision::Ask
                 && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
             let mut decision = self.apply_prompt_policy_keeping_required_approval(
                 decision,
                 explicit_ask
+                    || hook_asks
                     || matches!(
                         host_permission,
                         Some(
@@ -1662,20 +1793,26 @@ impl Agent {
             let mut assessment_details = None;
             let mut approval_source = if explicit_ask {
                 PermissionApprovalSource::ExplicitAsk
+            } else if hook_asks {
+                PermissionApprovalSource::Hook
             } else {
                 PermissionApprovalSource::PermissionPolicy
             };
-            let mut approval_reason = Some(format!(
-                "{}: {}",
-                if explicit_ask {
-                    "an explicit Ask rule requires human approval"
-                } else {
-                    "the permission policy requires human approval"
-                },
-                prepared_host_call
-                    .as_ref()
-                    .map_or("", |call| call.approval_summary()),
-            ));
+            let mut approval_reason = if hook_asks && !explicit_ask {
+                Some(hook_gate.ask_reason(&name))
+            } else {
+                Some(format!(
+                    "{}: {}",
+                    if explicit_ask {
+                        "an explicit Ask rule requires human approval"
+                    } else {
+                        "the permission policy requires human approval"
+                    },
+                    prepared_host_call
+                        .as_ref()
+                        .map_or("", |call| call.approval_summary()),
+                ))
+            };
             let mut auto_denial_message = None;
             if decision == Decision::Check {
                 let mut assessment = self
@@ -1954,6 +2091,8 @@ impl Agent {
                                         == Some(crate::host_tools::HostToolPermission::ReadOnly)
                                     {
                                         super::denials::DirectApprovalBasis::ReadOnly
+                                    } else if hook_admits {
+                                        super::denials::DirectApprovalBasis::Hook
                                     } else if policy.admission_mode() == ExecutionMode::FullAccess {
                                         super::denials::DirectApprovalBasis::FullAccess
                                     } else {
@@ -2004,6 +2143,7 @@ impl Agent {
                         if let (Some(provider), Some(prepared)) =
                             (host_tools.as_ref(), prepared_host_call)
                         {
+                            dispatched = true;
                             let host_result = provider
                                 .execute_prepared(receipt.chat_id, prepared, cancel.clone())
                                 .await;
@@ -2076,6 +2216,7 @@ impl Agent {
                                 input: input.clone(),
                                 ..operation.clone()
                             };
+                            dispatched = true;
                             self.dispatch_registered_tool(
                                 receipt,
                                 &dispatch_operation,
@@ -2208,18 +2349,33 @@ impl Agent {
                             "an authorization rule denied this operation".to_owned()
                         });
                     }
+                    let hook_asks = hook_gate.asks() && decision != Decision::Deny;
+                    let hook_admits = hook_gate.allows()
+                        && !matches!(decision, Decision::Deny | Decision::Allow)
+                        && !explicit_ask
+                        && prepared.safety_check().is_none()
+                        && !prepared.requires_environment_approval();
+                    if hook_asks {
+                        decision = Decision::Ask;
+                    } else if hook_admits {
+                        decision = Decision::Allow;
+                    }
                     let safety_check = (decision == Decision::Ask)
                         .then(|| prepared.safety_check())
                         .flatten();
                     let mut approval_source = if explicit_ask {
                         PermissionApprovalSource::ExplicitAsk
+                    } else if hook_asks {
+                        PermissionApprovalSource::Hook
                     } else if safety_check.is_some() {
                         PermissionApprovalSource::SafetyCheck
                     } else {
                         PermissionApprovalSource::PermissionPolicy
                     };
                     let mut approval_reason = (decision == Decision::Ask).then(|| {
-                        if explicit_ask {
+                        if hook_asks && !explicit_ask {
+                            hook_gate.ask_reason(&prepared.name)
+                        } else if explicit_ask {
                             "an explicit Ask rule requires human approval".to_owned()
                         } else {
                             safety_check.map_or_else(
@@ -2235,7 +2391,7 @@ impl Agent {
                             Some(auto_mode::prompts_unavailable_message(&prepared.name));
                     }
                     let approval_required =
-                        explicit_ask || prepared.requires_environment_approval();
+                        explicit_ask || hook_asks || prepared.requires_environment_approval();
                     let bypassed_by_unrestricted_host = !approval_required
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
@@ -2604,6 +2760,8 @@ impl Agent {
                                 path: approval_path,
                                 direct_basis: if prepared.is_read_only {
                                     super::denials::DirectApprovalBasis::ReadOnly
+                                } else if hook_admits {
+                                    super::denials::DirectApprovalBasis::Hook
                                 } else if chat.snapshot.policy.admission_mode()
                                     == ExecutionMode::FullAccess
                                 {
@@ -2650,6 +2808,7 @@ impl Agent {
                             self.track_file_edit(receipt.chat_id, &path, assistant_message_id)
                                 .await;
                         }
+                        dispatched = true;
                         let execution = tools
                             .execute_with_context(
                                 prepared,
@@ -2695,6 +2854,12 @@ impl Agent {
         {
             sources = Some(Vec::new());
         }
+        let hook_feedback = if dispatched && !cancel.is_cancelled() {
+            self.post_tool_use(receipt, &id, &name, &input, &result, &cancel)
+                .await
+        } else {
+            Default::default()
+        };
         Ok(ToolCallOutcome {
             result,
             sources,
@@ -2705,6 +2870,7 @@ impl Agent {
             continue_after_denial,
             is_rejected_by_user,
             denial,
+            hook_feedback,
         })
     }
 

@@ -396,6 +396,14 @@ pub enum EventKind {
         goal: Option<crate::GoalSnapshot>,
         notice: Option<crate::GoalNotice>,
     },
+    /// A hook ran; the Chat's activity history keeps the record.
+    HookRan {
+        record: Box<crate::hooks::HookRunRecord>,
+    },
+    /// Hooks an event matched did not run; shown once per hook and Chat in a process.
+    HooksSkipped {
+        notice: crate::hooks::HookSkipNotice,
+    },
 }
 
 impl EventKind {
@@ -549,6 +557,16 @@ pub enum PermissionApprovalSource {
     ExplicitAsk,
     SafetyCheck,
     AutoReviewer,
+    /// A `PreToolUse` hook asked for the user's confirmation.
+    Hook,
+}
+
+impl PermissionApprovalSource {
+    /// Whether an answer covers this one action only: an explicit Ask rule or a hook asked, and
+    /// a saved rule would not keep either from asking again.
+    pub fn is_single_use(self) -> bool {
+        matches!(self, Self::ExplicitAsk | Self::Hook)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

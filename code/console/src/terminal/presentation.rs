@@ -2286,6 +2286,9 @@ pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
                 "Enforced by: explicit Ask rule · approval applies once".into()
             }
             PermissionApprovalSource::PermissionPolicy => "Enforced by: permission policy".into(),
+            PermissionApprovalSource::Hook => {
+                "Enforced by: PreToolUse hook · approval applies once".into()
+            }
         });
     }
     if let Some(prepared) = request.file_change.as_deref() {

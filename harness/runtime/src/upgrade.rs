@@ -409,6 +409,7 @@ impl Agent {
                     loaded_from_history: false,
                     goal_clock_ms: saved.goal_clock_ms,
                     cache_prefix: Default::default(),
+                    hook_state: Default::default(),
                 },
             );
         }

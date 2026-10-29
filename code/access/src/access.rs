@@ -102,7 +102,9 @@ use tickloop_harness::protocol::{
 /// 36.0 adds an ended root Agent whose last turn had finished (`EndedOutcome::Completed`,
 /// `EndReason::Finished`), which older readers reject as unknown, and whether an Agent summary
 /// still has work pending while its Loop is idle.
-pub const PROTOCOL_MAJOR: u16 = 36;
+/// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
+/// reason, which older readers reject as unknown, and the hook runs of the approval history.
+pub const PROTOCOL_MAJOR: u16 = 37;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{ChatId, LoopId, RunId};
 
 /// The Claude Code hook events Tickloop runs; hooks for any other event are skipped with a warning.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -162,4 +165,84 @@ pub struct HookTrustChange {
     pub source: HookSource,
     pub key: String,
     pub action: HookTrustAction,
+}
+
+/// How one hook run ended.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunOutcome {
+    /// It exited 0 with output the host could read.
+    Success,
+    /// It exited 2, or its output blocked or denied.
+    Blocking,
+    /// It exited with another status, or its output could not be read: only the user is told.
+    NonBlockingError,
+    /// Its timeout passed and the environment ended it.
+    TimedOut,
+    /// The turn was interrupted or stopped while it ran.
+    Cancelled,
+    /// The environment could not start it.
+    NotRun,
+}
+
+/// What a hook's output decided.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecision {
+    Allow,
+    Ask,
+    Deny,
+    /// A `decision: "block"` outside `PreToolUse`, or an exit status 2.
+    Block,
+    /// An `allow` from a plugin or repository hook, which may not admit a tool call.
+    IgnoredAllow,
+}
+
+/// One hook run as the Chat's activity history keeps it. It never reaches the model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookRunRecord {
+    pub id: Uuid,
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+    pub run_id: RunId,
+    pub at_ms: u64,
+    pub event: HookEvent,
+    pub source: HookSource,
+    /// The command as declared, without a plugin's substituted values.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub duration_ms: u64,
+    pub outcome: HookRunOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<HookDecision>,
+    /// Why it decided, blocked or failed, shortened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The `systemMessage` it showed the user, shortened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    /// The `updatedInput` it gave a `PreToolUse` call, shortened; the call's own input stays in
+    /// the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<String>,
+    /// Its standard output and error, shortened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+}
+
+/// Hooks an event matched that did not run because they may not run yet.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookSkipNotice {
+    pub event: HookEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Plugin and repository hooks the user has not confirmed, or whose content changed since.
+    pub unconfirmed: usize,
+    /// Plugin hooks that refer to a user configuration value that is not set.
+    pub unconfigured: usize,
 }

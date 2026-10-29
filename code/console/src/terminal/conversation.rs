@@ -553,6 +553,8 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::ContextCompaction { .. }
         | EventKind::TaskBoardChanged { .. }
         | EventKind::GoalUpdated { .. }
+        | EventKind::HookRan { .. }
+        | EventKind::HooksSkipped { .. }
         | EventKind::ScheduledTasksChanged { .. }
         | EventKind::ProgressUpdated { .. } => return None,
     };

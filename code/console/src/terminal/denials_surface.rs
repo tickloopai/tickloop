@@ -1,5 +1,7 @@
+use super::hook_activity;
 use super::style::{Role, RoleLine};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tickloop_harness::protocol::hooks::{HookRunOutcome, HookRunRecord};
 use tickloop_harness::protocol::{
     ApprovalAttemptOutcome, ApprovalFailureKind, ApprovalFallbackReason, ApprovalHistoryView,
     ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, AutoReviewerPreference,
@@ -15,27 +17,73 @@ pub(super) enum DenialsEffect {
     Retry(Uuid),
 }
 
+/// One row of Recent activity: a permission decision or a hook run.
+#[derive(Clone)]
+enum Activity {
+    Approval(ApprovalRecord),
+    Hook(HookRunRecord),
+}
+
+impl Activity {
+    fn id(&self) -> Uuid {
+        match self {
+            Self::Approval(record) => record.id,
+            Self::Hook(record) => record.id,
+        }
+    }
+
+    fn at_ms(&self) -> u64 {
+        match self {
+            Self::Approval(record) => record.at_ms,
+            Self::Hook(record) => record.at_ms,
+        }
+    }
+
+    fn is_retryable_denial(&self) -> bool {
+        matches!(self, Self::Approval(record) if record.outcome == ApprovalResult::Deny)
+    }
+
+    fn detail_lines(&self, width: usize) -> Vec<RoleLine> {
+        match self {
+            Self::Approval(record) => styled_detail_lines(record, width),
+            Self::Hook(record) => hook_detail_lines(record, width),
+        }
+    }
+}
+
+/// The view's decisions and hook runs, newest first.
+fn activities(view: &ApprovalHistoryView) -> Vec<Activity> {
+    let mut activities = view
+        .records
+        .iter()
+        .cloned()
+        .map(Activity::Approval)
+        .chain(view.hook_runs.iter().cloned().map(Activity::Hook))
+        .collect::<Vec<_>>();
+    activities.sort_by_key(|activity| std::cmp::Reverse(activity.at_ms()));
+    activities
+}
+
 #[derive(Default)]
 pub(super) struct DenialsSurface {
     view: Option<ApprovalHistoryView>,
+    activities: Vec<Activity>,
     selected: usize,
     scroll: usize,
-    detail: Option<ApprovalRecord>,
+    detail: Option<Activity>,
     detail_scroll: usize,
     error: Option<String>,
 }
 
 impl DenialsSurface {
     pub(super) fn replace_view(&mut self, view: ApprovalHistoryView) {
-        let selected_id = self
-            .view
-            .as_ref()
-            .and_then(|view| view.records.get(self.selected))
-            .map(|record| record.id);
+        let selected_id = self.activities.get(self.selected).map(Activity::id);
+        let activities = activities(&view);
         self.selected = selected_id
-            .and_then(|id| view.records.iter().position(|record| record.id == id))
+            .and_then(|id| activities.iter().position(|activity| activity.id() == id))
             .unwrap_or(self.selected)
-            .min(view.records.len().saturating_sub(1));
+            .min(activities.len().saturating_sub(1));
+        self.activities = activities;
         self.view = Some(view);
         self.error = None;
     }
@@ -50,11 +98,11 @@ impl DenialsSurface {
 
     pub(super) fn handle(&mut self, key: KeyEvent) -> DenialsEffect {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if let Some(record) = &self.detail {
+        if let Some(activity) = &self.detail {
             match key.code {
                 KeyCode::Esc | KeyCode::Left => self.detail = None,
-                KeyCode::Char('r') if !control && record.outcome == ApprovalResult::Deny => {
-                    return DenialsEffect::Retry(record.id);
+                KeyCode::Char('r') if !control && activity.is_retryable_denial() => {
+                    return DenialsEffect::Retry(activity.id());
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.detail_scroll = self.detail_scroll.saturating_add(1)
@@ -76,7 +124,7 @@ impl DenialsSurface {
             }
             return DenialsEffect::None;
         }
-        let count = self.view.as_ref().map_or(0, |view| view.records.len());
+        let count = self.activities.len();
         match key.code {
             KeyCode::Esc => return DenialsEffect::Back,
             KeyCode::Char('r') if !control => return DenialsEffect::Refresh,
@@ -93,11 +141,7 @@ impl DenialsSurface {
             KeyCode::PageDown => self.selected = (self.selected + 10).min(count.saturating_sub(1)),
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
             KeyCode::Enter => {
-                self.detail = self
-                    .view
-                    .as_ref()
-                    .and_then(|view| view.records.get(self.selected))
-                    .cloned();
+                self.detail = self.activities.get(self.selected).cloned();
                 self.detail_scroll = 0;
             }
             _ => {}
@@ -106,16 +150,12 @@ impl DenialsSurface {
     }
 
     pub(super) fn content_rows(&self, width: usize) -> usize {
-        let body = if let Some(record) = &self.detail {
-            styled_detail_lines(record, width).len()
+        let body = if let Some(activity) = &self.detail {
+            activity.detail_lines(width).len()
         } else {
-            self.view.as_ref().map_or(1, |view| {
-                if view.records.is_empty() {
-                    2
-                } else {
-                    view.records.len()
-                }
-            })
+            self.view
+                .as_ref()
+                .map_or(1, |_| self.activities.len().max(2))
         };
         self.header_lines().len() + body + 1
     }
@@ -134,7 +174,7 @@ impl DenialsSurface {
                     if self
                         .detail
                         .as_ref()
-                        .is_some_and(|record| record.outcome == ApprovalResult::Deny)
+                        .is_some_and(Activity::is_retryable_denial)
                     {
                         "r retry · esc back"
                     } else {
@@ -160,8 +200,8 @@ impl DenialsSurface {
             }
         }
 
-        let body = if let Some(record) = &self.detail {
-            let lines = styled_detail_lines(record, width);
+        let body = if let Some(activity) = &self.detail {
+            let lines = activity.detail_lines(width);
             self.detail_scroll = self
                 .detail_scroll
                 .min(lines.len().saturating_sub(body_height));
@@ -170,11 +210,14 @@ impl DenialsSurface {
                 .skip(self.detail_scroll)
                 .take(body_height)
                 .collect::<Vec<_>>()
-        } else if let Some(view) = &self.view {
-            if view.records.is_empty() {
+        } else if self.view.is_some() {
+            if self.activities.is_empty() {
                 vec![
                     RoleLine::role("No permission decisions yet", Role::Strong),
-                    RoleLine::role("Tool permission results will appear here.", Role::MutedText),
+                    RoleLine::role(
+                        "Tool permission results and hook runs will appear here.",
+                        Role::MutedText,
+                    ),
                 ]
                 .into_iter()
                 .take(body_height)
@@ -185,12 +228,19 @@ impl DenialsSurface {
                     self.selected
                         .saturating_sub(visible_records.saturating_sub(1)),
                 );
-                view.records
+                self.activities
                     .iter()
                     .enumerate()
                     .skip(self.scroll)
                     .take(visible_records)
-                    .map(|(index, record)| list_line(index, record, index == self.selected))
+                    .map(|(index, activity)| match activity {
+                        Activity::Approval(record) => {
+                            list_line(index, record, index == self.selected)
+                        }
+                        Activity::Hook(record) => {
+                            hook_list_line(index, record, index == self.selected)
+                        }
+                    })
                     .collect()
             }
         } else {
@@ -231,7 +281,7 @@ impl DenialsSurface {
                 format!("unsaved · {}", super::safe_line(reason))
             }
         };
-        let mut status = RoleLine::role(format!("{} records", view.records.len()), Role::Strong);
+        let mut status = RoleLine::role(format!("{} records", self.activities.len()), Role::Strong);
         status.push(format!(" · {persistence}"), Some(Role::MutedText));
         let mut lines = vec![status];
         if let Some(warning) = &view.load_warning {
@@ -293,6 +343,77 @@ fn list_line(index: usize, record: &ApprovalRecord, selected: bool) -> RoleLine 
     }
 
     operation
+}
+
+fn hook_list_line(index: usize, record: &HookRunRecord, selected: bool) -> RoleLine {
+    let mut line = RoleLine::default();
+    line.push(
+        if selected { "❯ " } else { "  " },
+        Some(if selected {
+            Role::Accent
+        } else {
+            Role::MutedText
+        }),
+    );
+    line.push(format!("{} ", index + 1), Some(Role::MutedText));
+    let role = match record.outcome {
+        HookRunOutcome::Success => Role::Success,
+        HookRunOutcome::Blocking => Role::Error,
+        _ => Role::Warning,
+    };
+    line.push(
+        format!("Hook {}", hook_activity::outcome_label(record.outcome)),
+        Some(if selected { Role::Strong } else { role }),
+    );
+    line.push(" · ", Some(Role::MutedText));
+    line.push(
+        super::safe_line(&format!(
+            "{} · {}",
+            hook_activity::hook_label(record),
+            record.command
+        )),
+        Some(if selected { Role::Strong } else { Role::Text }),
+    );
+    line
+}
+
+fn hook_detail_lines(record: &HookRunRecord, width: usize) -> Vec<RoleLine> {
+    let mut entries = vec![
+        format!("Hook: {}", hook_activity::hook_label(record)),
+        format!(
+            "Hook outcome: {} · {} ms",
+            hook_activity::outcome_label(record.outcome),
+            record.duration_ms
+        ),
+        format!("Source: {}", hook_activity::source_label(&record.source)),
+        format!("Command: {}", record.command),
+    ];
+    if let Some(code) = record.exit_code {
+        entries.push(format!("Exit status: {code}"));
+    }
+    if let Some(decision) = record.decision {
+        entries.push(format!(
+            "Hook decision: {}",
+            hook_activity::decision_label(decision)
+        ));
+    }
+    for (label, value) in [
+        ("Reason", &record.reason),
+        ("System message", &record.system_message),
+        ("Updated input", &record.updated_input),
+    ] {
+        if let Some(value) = value {
+            entries.push(format!("{label}: {value}"));
+        }
+    }
+    if !record.output.is_empty() {
+        entries.push(format!("Output: {}", record.output));
+    }
+    entries.push(format!("Record: {}", record.id));
+    entries
+        .iter()
+        .flat_map(|entry| wrap_role_line(detail_line(&super::safe_line(entry)), width))
+        .collect()
 }
 
 fn display_operation_summary<'a>(tool: &str, summary: &'a str) -> &'a str {
@@ -426,6 +547,7 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
                     PermissionApprovalSource::ExplicitAsk => "explicit Ask rule",
                     PermissionApprovalSource::SafetyCheck => "host safety check",
                     PermissionApprovalSource::AutoReviewer => "Auto reviewer",
+                    PermissionApprovalSource::Hook => "PreToolUse hook",
                 }
             ),
         ));
@@ -853,7 +975,64 @@ mod tests {
             records,
             persistence: DenialPersistence::Saved,
             load_warning: None,
+            hook_runs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hook_runs_join_recent_activity_newest_first_with_their_details() {
+        use tickloop_harness::protocol::hooks::{
+            HookDecision, HookEvent, HookRunOutcome, HookRunRecord, HookSource,
+        };
+        let mut history = view(vec![record(ApprovalResult::Allow)]);
+        history.hook_runs.push(HookRunRecord {
+            id: Uuid::new_v4(),
+            chat_id: Uuid::new_v4().into(),
+            loop_id: Uuid::new_v4().into(),
+            run_id: Uuid::new_v4().into(),
+            at_ms: 2,
+            event: HookEvent::PreToolUse,
+            source: HookSource::Plugin {
+                id: "guard@market".into(),
+            },
+            command: "guard.sh".into(),
+            tool_name: Some("Bash".into()),
+            call_id: Some("call".into()),
+            duration_ms: 15,
+            outcome: HookRunOutcome::Blocking,
+            exit_code: Some(2),
+            decision: Some(HookDecision::Deny),
+            reason: Some("builds are frozen".into()),
+            system_message: Some("Guard said no".into()),
+            updated_input: None,
+            output: String::new(),
+        });
+        let mut surface = DenialsSurface::default();
+        surface.replace_view(history);
+        let lines = surface.styled_lines(80, 6);
+        assert!(
+            lines[1]
+                .text()
+                .starts_with("❯ 1 Hook blocked · PreToolUse:Bash · guard.sh")
+        );
+        assert!(lines[2].text().starts_with("  2 Allow"));
+        surface.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let detail = surface
+            .styled_lines(80, 20)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Source: plugin guard@market",
+            "Exit status: 2",
+            "Hook decision: deny",
+            "Reason: builds are frozen",
+            "System message: Guard said no",
+        ] {
+            assert!(detail.contains(expected), "{detail}");
+        }
+        assert!(detail.ends_with("esc back"), "a hook run cannot be retried");
     }
 
     #[test]

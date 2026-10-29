@@ -697,6 +697,7 @@ impl Agent {
             continue_after_denial,
             is_rejected_by_user,
             denial,
+            hook_feedback,
         } = outcome;
         if let Some(record) = denial {
             self.record_final_denial(record).await;
@@ -719,6 +720,7 @@ impl Agent {
             ),
             _ => result.content.clone(),
         };
+        let model_text = hook_feedback.appended_to(model_text);
         let content = if images.is_empty() {
             model_text.into()
         } else {
@@ -754,7 +756,8 @@ impl Agent {
             if matches!(
                 chat.snapshot.subagent_reports.get(&receipt.run_id),
                 Some(SubagentReport::Delivered { .. })
-            ) {
+            ) || chat.hook_state.take_stop(receipt.run_id)
+            {
                 return chat
                     .snapshot
                     .request_usage

@@ -32,6 +32,7 @@ pub use harness::{
     durable_chat_host_rules,
 };
 mod hook_transcript;
+mod hooks;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -548,6 +549,8 @@ struct Chat {
     goal_clock_ms: u64,
     /// What keeps this Chat's prompt cache prefix stable, kept only in this process.
     cache_prefix: cache_prefix::CachePrefixState,
+    /// What the hook engine keeps for the Chat in this process.
+    hook_state: hooks::ChatHookState,
 }
 
 enum RunAdmission {
@@ -5075,9 +5078,14 @@ impl Agent {
                 .iter()
                 .find(|request| request.id == request_id)
                 .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
-            if request.approval_source == PermissionApprovalSource::ExplicitAsk {
+            if request.approval_source.is_single_use() {
                 return Err(AgentError::Invalid(
-                    "explicit Ask requires approval for this action only".into(),
+                    if request.approval_source == PermissionApprovalSource::Hook {
+                        "a PreToolUse hook requires approval for this action only"
+                    } else {
+                        "explicit Ask requires approval for this action only"
+                    }
+                    .into(),
                 ));
             }
         }
@@ -5801,6 +5809,7 @@ impl NewChat {
             loaded_from_history: false,
             goal_clock_ms: 0,
             cache_prefix: Default::default(),
+            hook_state: Default::default(),
         }
     }
 }

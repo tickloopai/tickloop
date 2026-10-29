@@ -535,6 +535,7 @@ impl Agent {
             continue_after_denial: false,
             is_rejected_by_user: false,
             denial: None,
+            hook_feedback: Default::default(),
         })
     }
 }

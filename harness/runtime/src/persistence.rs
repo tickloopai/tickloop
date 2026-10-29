@@ -30,6 +30,7 @@ use crate::transcript::{
 };
 use tickloop_harness_base::private_fs::unix_time_milliseconds;
 use tickloop_harness_base::timestamp::format_timestamp;
+use tickloop_harness_protocol::hooks::HookRunRecord;
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
     AgentMessageSource, ApprovalRecord, BranchOrigin, ChatId, ChatSnapshot, CompactBoundary,
@@ -117,9 +118,13 @@ struct SavedApprovals {
     version: u32,
     chat_id: ChatId,
     records: Vec<ApprovalRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hook_runs: Vec<HookRunRecord>,
 }
 
-type DenialWrite = (ChatId, PathBuf, u64, Vec<ApprovalRecord>);
+/// What a Chat's activity history file holds.
+type SavedActivity = (Vec<ApprovalRecord>, Vec<HookRunRecord>);
+type DenialWrite = (ChatId, PathBuf, u64, SavedActivity);
 type DenialWriteResult = (ChatId, u64, Result<(), String>);
 
 fn write_denial_windows(
@@ -130,7 +135,7 @@ fn write_denial_windows(
     let _gate = gate.lock().unwrap();
     writes
         .into_iter()
-        .map(|(chat_id, path, revision, records)| {
+        .map(|(chat_id, path, revision, (records, hook_runs))| {
             if saved_revisions
                 .lock()
                 .unwrap()
@@ -143,6 +148,7 @@ fn write_denial_windows(
                 version: APPROVAL_FILE_VERSION,
                 chat_id,
                 records,
+                hook_runs,
             })
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
@@ -470,7 +476,15 @@ impl ChatRecorder {
                     && saved.records.len() <= MAX_RECENT_DENIALS
                     && saved.records.iter().all(|record| record.chat_id == chat_id) =>
             {
-                Some(saved.records)
+                Some((
+                    saved.records,
+                    saved
+                        .hook_runs
+                        .into_iter()
+                        .filter(|run| run.chat_id == chat_id)
+                        .take(crate::hooks::MAX_RECENT_HOOK_RUNS)
+                        .collect::<Vec<_>>(),
+                ))
             }
             _ => serde_json::from_slice::<SavedDenials>(&contents)
                 .ok()
@@ -481,16 +495,20 @@ impl ChatRecorder {
                         && saved.records.iter().all(|record| record.chat_id == chat_id)
                 })
                 .map(|saved| {
-                    saved
-                        .records
-                        .into_iter()
-                        .map(ApprovalRecord::from_denial)
-                        .collect()
+                    (
+                        saved
+                            .records
+                            .into_iter()
+                            .map(ApprovalRecord::from_denial)
+                            .collect(),
+                        Vec::new(),
+                    )
                 }),
         };
         match records {
-            Some(records) => DenialWindow {
+            Some((records, hook_runs)) => DenialWindow {
                 records: records.into(),
+                hook_runs: hook_runs.into(),
                 ..Default::default()
             },
             None => DenialWindow {
@@ -1409,7 +1427,7 @@ impl ChatRecorder {
                     *chat_id,
                     self.denial_path_for_chat(*chat_id)?,
                     window.revision,
-                    window.records.iter().cloned().collect(),
+                    window.saved_activity(),
                 ))
             })
             .collect();
@@ -3120,7 +3138,7 @@ impl Agent {
                         *chat_id,
                         recorder.denial_path_for_chat(*chat_id)?,
                         window.revision,
-                        window.records.iter().cloned().collect(),
+                        window.saved_activity(),
                     ))
                 })
                 .collect::<Vec<DenialWrite>>()
@@ -3823,6 +3841,7 @@ impl Agent {
                 loaded_from_history: waits == WaitHosting::Process,
                 goal_clock_ms: 0,
                 cache_prefix: Default::default(),
+                hook_state: Default::default(),
             },
         );
         if let Some(context) = snapshot

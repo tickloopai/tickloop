@@ -48,6 +48,7 @@ mod file_mentions;
 mod footer;
 mod goal_view;
 mod herdr_agent;
+mod hook_activity;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -5087,6 +5088,14 @@ async fn interact_with_herdr(
                         },
                         EventKind::GoalUpdated {goal, notice} => {
                             if let Some(notice) = notice { console.write_pieces(&goal_view::notice_pieces(&notice, goal.as_ref().map_or("", |goal| goal.objective.as_str())))?; }
+                        },
+                        EventKind::HookRan {record} => {
+                            for (notice, role) in hook_activity::run_notices(&record) {
+                                console.write_roles(&[("\n".into(), None), (safe_text(&notice), Some(role)), ("\n".into(), None)])?;
+                            }
+                        },
+                        EventKind::HooksSkipped {notice} => {
+                            console.write_roles(&[("\n".into(), None), (safe_text(&hook_activity::skip_notice(&notice)), Some(Role::MutedText)), ("\n".into(), None)])?;
                         },
                         EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
