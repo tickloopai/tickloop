@@ -5,11 +5,13 @@ use std::sync::Arc;
 use crate::host_tools::{HostCallResult, HostEffect, PreparedHostCall};
 use tokio_util::sync::CancellationToken;
 
+mod files;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 mod port;
 pub mod shell_host;
 pub mod tools;
+pub use files::*;
 pub use port::*;
 pub use tools::ExecutionTools;
 
@@ -83,7 +85,7 @@ impl EnvironmentPreparedCall {
     }
 }
 
-/// A Folder without Tick or Shell execution capabilities.
+/// A Folder without Tick, Shell or file execution capabilities.
 pub struct FolderEnvironment;
 impl FolderEnvironment {
     pub fn bare() -> Self {
@@ -114,6 +116,7 @@ impl ExecutionPort for FolderPort {
                     ticks: false,
                     shells: false,
                     shell_output: ShellOutputDelivery::CallerFile,
+                    files: FileCapabilities::default(),
                 }))
             }
             ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(Vec::new())),

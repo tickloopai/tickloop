@@ -23,6 +23,8 @@ tickloop-harness-policy = { path = "../policy" }
 tickloop-harness-protocol = { path = "../protocol" }
 # The in-memory Transcript store implements the runtime's TranscriptStore seam.
 tickloop-harness-runtime = { path = "../runtime", features = ["test-support"] }
+# The file contracts print search results as the Glob and Grep tools do.
+tickloop-harness-tools = { path = "../tools" }
 tickloop-harness-transcript = { path = "../transcript" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }

@@ -103,6 +103,7 @@ impl ExecutionEnvironment for LocalEnvironment {
                 ticks: self.hosted_ticks.is_some(),
                 shells: self.shells.is_some(),
                 shell_output: ShellOutputDelivery::CallerFile,
+                files: FileCapabilities::default(),
             },
         }))
     }
@@ -225,8 +226,12 @@ impl ExecutionPort for LocalPort {
                     self.authority.check(self.scope.chat)?;
                     Ok(ExecutionInspection::Description(description))
                 }
+                ExecutionQuery::File(_) => Err(ExecutionError::new(
+                    error_code::UNSUPPORTED,
+                    "this environment has no file operations",
+                )),
                 ExecutionQuery::Capabilities => {
-                    Ok(ExecutionInspection::Capabilities(self.capabilities))
+                    Ok(ExecutionInspection::Capabilities(self.capabilities.clone()))
                 }
                 ExecutionQuery::Instances => {
                     let members = match &self.tools {
@@ -360,6 +365,12 @@ impl ExecutionPort for LocalPort {
                     return Err(ExecutionError::new(
                         "Unsupported",
                         "Shell execution is unavailable",
+                    ));
+                }
+                ExecutionIntent::WriteFile { .. } | ExecutionIntent::DeleteFile { .. } => {
+                    return Err(ExecutionError::new(
+                        error_code::UNSUPPORTED,
+                        "this environment has no file operations",
                     ));
                 }
                 ExecutionIntent::Open(open) => {
@@ -514,6 +525,7 @@ impl ExecutionPort for LocalPort {
                         shell: None,
                         command: None,
                         handoff: None,
+                        file: None,
                     })
                 }
                 HostCallResult::CompletedWithEffect(result, effect) => {
@@ -539,6 +551,7 @@ impl ExecutionPort for LocalPort {
                         shell: None,
                         command: None,
                         handoff: None,
+                        file: None,
                     })
                 }
                 HostCallResult::NotDispatched(message) => {
@@ -582,12 +595,14 @@ pub(crate) async fn prepare_hosted_call(
         scope: ExecutionScope {
             chat,
             folder: context.map(|context| context.folder.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         },
         authority: authority.clone(),
         capabilities: ExecutionCapabilities {
             ticks: true,
             shells: false,
             shell_output: ShellOutputDelivery::CallerFile,
+            files: FileCapabilities::default(),
         },
         tools: Some(tools),
         shells: None,
@@ -621,12 +636,14 @@ fn shell_port(
             folder: staged
                 .as_ref()
                 .map(|launch| launch.cwd.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         },
         authority,
         capabilities: ExecutionCapabilities {
             ticks: false,
             shells: true,
             shell_output: ShellOutputDelivery::CallerFile,
+            files: FileCapabilities::default(),
         },
         tools: None,
         shells: Some(shells),

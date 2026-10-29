@@ -430,6 +430,7 @@ impl LocalShells {
                     shell: None,
                     command: None,
                     handoff: None,
+                    file: None,
                 })
             }
             _ => ExecutionOutcome::OutcomeUnknown {
@@ -607,6 +608,7 @@ impl LocalShells {
             shell: Some(Box::new(status)),
             command: None,
             handoff,
+            file: None,
         })
     }
 

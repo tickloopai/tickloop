@@ -31,6 +31,7 @@ async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         authority.clone(),
     );
@@ -42,6 +43,7 @@ async fn sandbox_blocks_outside_writes_and_reports_folder_isolation() {
             ExecutionScope {
                 chat,
                 folder: Some(folder.display().to_string()),
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )
@@ -562,6 +564,7 @@ async fn sandbox_and_reference_hosts_share_the_frozen_isolation_contract() {
                 .display()
                 .to_string(),
         ),
+        additional_directories: Vec::new(),
     };
     let spec = ShellSpec {
         folder: scope.folder.clone(),

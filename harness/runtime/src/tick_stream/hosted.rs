@@ -334,6 +334,7 @@ impl HostedFeed {
             ExecutionScope {
                 chat: self.chat.into(),
                 folder: None,
+                additional_directories: Vec::new(),
             },
             ExecutionAuthority::new(self.chat.into()),
         )
@@ -884,6 +885,7 @@ impl TickStreamPort for HostedTickStream {
                     ExecutionScope {
                         chat: chat.into(),
                         folder: None,
+                        additional_directories: Vec::new(),
                     },
                     ExecutionAuthority::new(chat.into()),
                 )
@@ -907,6 +909,7 @@ impl TickStreamPort for HostedTickStream {
                 ExecutionScope {
                     chat: chat.into(),
                     folder: None,
+                    additional_directories: Vec::new(),
                 },
                 ExecutionAuthority::new(chat.into()),
             )
@@ -987,6 +990,7 @@ impl super::TickWatchValidator for EnvironmentWatchValidator {
                 ExecutionScope {
                     chat: chat.into(),
                     folder: None,
+                    additional_directories: Vec::new(),
                 },
                 ExecutionAuthority::with_cancellation(chat.into(), cancel),
             )

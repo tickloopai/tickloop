@@ -7,6 +7,7 @@
 pub mod event_stream;
 pub mod execution_contracts;
 pub mod execution_environment;
+pub mod file_contracts;
 pub mod harness;
 pub mod input_dialog;
 pub mod kitty_keyboard;

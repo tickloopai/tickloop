@@ -37,6 +37,7 @@ async fn a_prepared_open_refuses_an_in_place_program_change_with_preserved_mtime
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         OpenSpec {
             command: vec![program.to_string_lossy().into_owned()],
@@ -205,6 +206,7 @@ async fn native_environment_shell_output_and_state_have_one_owner() {
             ExecutionScope {
                 chat,
                 folder: Some(directory.path().to_string_lossy().into_owned()),
+                additional_directories: Vec::new(),
             },
             ExecutionAuthority::new(chat),
         )
@@ -286,6 +288,7 @@ async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() 
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some("/".into()),
+            additional_directories: Vec::new(),
         },
         first.clone(),
         second.clone(),
@@ -317,6 +320,7 @@ async fn preparations_with_one_operation_keep_distinct_facts_on_both_adapters() 
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some(root.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         },
         first,
         second,
@@ -349,6 +353,7 @@ async fn ended_shell_releases_its_output_fd_and_refuses_fifo_replacement_without
             ExecutionScope {
                 chat,
                 folder: Some(root.to_string_lossy().into_owned()),
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )
@@ -533,6 +538,7 @@ async fn local_and_memory_shells_share_the_stop_contract() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some("/".into()),
+            additional_directories: Vec::new(),
         },
         ShellSpec {
             folder: None,
@@ -560,6 +566,7 @@ async fn local_and_memory_shells_share_the_stop_contract() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some(cwd.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         },
         ShellSpec {
             folder: None,
@@ -590,6 +597,7 @@ async fn local_and_memory_shells_share_the_exit_contract() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some("/".into()),
+            additional_directories: Vec::new(),
         },
         ShellSpec {
             folder: None,
@@ -629,6 +637,7 @@ async fn local_and_memory_shells_share_the_exit_contract() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: Some(cwd.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         },
         ShellSpec {
             folder: None,
@@ -664,6 +673,7 @@ async fn shell_observation_reports_one_exit_and_late_observers_only_get_a_baseli
             ExecutionScope {
                 chat,
                 folder: Some("/".into()),
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )
@@ -754,7 +764,14 @@ async fn a_host_restart_ends_the_old_observation_until_an_explicit_reopen() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
     let port = environment
-        .bind(ExecutionScope { chat, folder: None }, authority.clone())
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: None,
+                additional_directories: Vec::new(),
+            },
+            authority.clone(),
+        )
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::Open(OpenSpec {
@@ -957,6 +974,7 @@ async fn terminal_sampling_ignores_a_screen_that_changed_back_to_its_baseline() 
             ExecutionScope {
                 chat: chat.into(),
                 folder: None,
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )
@@ -1043,6 +1061,7 @@ async fn the_harness_stream_consumes_memory_environment_facts_without_tickhost()
             ExecutionScope {
                 chat: chat.into(),
                 folder: None,
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )
@@ -1115,7 +1134,14 @@ async fn observation_registers_its_own_baseline_and_continues_from_a_cursor() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
     let port = environment
-        .bind(ExecutionScope { chat, folder: None }, authority.clone())
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: None,
+                additional_directories: Vec::new(),
+            },
+            authority.clone(),
+        )
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::Open(OpenSpec {
@@ -1190,7 +1216,14 @@ async fn a_tick_checks_the_prepared_revision_before_running_the_call() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
     let port = environment
-        .bind(ExecutionScope { chat, folder: None }, authority.clone())
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: None,
+                additional_directories: Vec::new(),
+            },
+            authority.clone(),
+        )
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::Open(OpenSpec {
@@ -1278,7 +1311,14 @@ async fn revoking_authority_invalidates_even_reads_on_an_existing_port() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
     let port = FolderEnvironment::bare()
-        .bind(ExecutionScope { chat, folder: None }, authority.clone())
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: None,
+                additional_directories: Vec::new(),
+            },
+            authority.clone(),
+        )
         .unwrap();
     assert!(port.inspect(ExecutionQuery::Capabilities).await.is_ok());
     authority.revoke();
@@ -1300,7 +1340,14 @@ async fn a_lost_open_reply_can_only_be_queried_and_does_not_open_again() {
     let chat = tickloop_ids::generate().into();
     let authority = ExecutionAuthority::new(chat);
     let port = environment
-        .bind(ExecutionScope { chat, folder: None }, authority.clone())
+        .bind(
+            ExecutionScope {
+                chat,
+                folder: None,
+                additional_directories: Vec::new(),
+            },
+            authority.clone(),
+        )
         .unwrap();
     let prepared = port
         .prepare(ExecutionIntent::Open(OpenSpec {
@@ -1336,6 +1383,7 @@ async fn a_lost_open_reply_can_only_be_queried_and_does_not_open_again() {
             ExecutionScope {
                 chat: foreign_chat,
                 folder: None,
+                additional_directories: Vec::new(),
             },
             ExecutionAuthority::new(foreign_chat),
         )
@@ -1371,6 +1419,7 @@ async fn a_prepared_open_refuses_a_replaced_program_before_contacting_the_host()
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         OpenSpec {
             command: vec![program.to_string_lossy().into_owned()],
@@ -1396,6 +1445,7 @@ async fn the_memory_environment_refuses_the_same_program_replacement() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         OpenSpec {
             command: vec!["/program".into()],
@@ -1415,6 +1465,7 @@ async fn local_and_reference_hosts_report_isolation_at_preparation() {
     let scope = ExecutionScope {
         chat: tickloop_ids::generate().into(),
         folder: Some(directory.path().display().to_string()),
+        additional_directories: Vec::new(),
     };
     let spec = ShellSpec {
         folder: None,
@@ -1484,6 +1535,7 @@ async fn a_prepared_open_refuses_a_link_pointed_at_another_program() {
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         OpenSpec {
             command: vec![link.to_string_lossy().into_owned()],
@@ -1510,6 +1562,7 @@ async fn a_prepared_open_through_a_link_refuses_a_change_to_the_program_it_names
         ExecutionScope {
             chat: tickloop_ids::generate().into(),
             folder: None,
+            additional_directories: Vec::new(),
         },
         OpenSpec {
             command: vec![link.to_string_lossy().into_owned()],
@@ -1544,6 +1597,7 @@ async fn a_shell_reached_through_a_link_runs_by_the_links_path() {
             ExecutionScope {
                 chat,
                 folder: Some(root.to_string_lossy().into_owned()),
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )

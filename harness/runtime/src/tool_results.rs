@@ -111,6 +111,7 @@ impl Agent {
                             .folder
                             .as_ref()
                             .map(|folder| folder.to_string_lossy().into_owned()),
+                        additional_directories: Vec::new(),
                     },
                     authority.clone(),
                 )

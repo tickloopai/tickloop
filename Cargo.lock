@@ -4524,6 +4524,7 @@ dependencies = [
  "tickloop-harness-policy",
  "tickloop-harness-protocol",
  "tickloop-harness-runtime",
+ "tickloop-harness-tools",
  "tickloop-harness-transcript",
  "tickloop-ids",
  "tickloop-tick-protocol",

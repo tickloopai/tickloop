@@ -100,6 +100,7 @@ impl HostToolProvider for ExecutionTools {
                     folder: scope
                         .context
                         .map(|context| context.folder.to_string_lossy().into_owned()),
+                    additional_directories: Vec::new(),
                 },
                 authority.clone(),
             )

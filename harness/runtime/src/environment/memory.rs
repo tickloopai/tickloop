@@ -1,8 +1,9 @@
-//! An execution environment whose programs and instances live in memory.
+//! An execution environment whose programs, instances and files live in memory.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, Weak},
+    time::{Duration, SystemTime},
 };
 
 use crate::{environment::*, host_tools::HostToolPermission};
@@ -10,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::{InstanceRef, TickDescriptor, TickState};
 use tickloop_harness_protocol::{ChatId, ToolResult};
+use tickloop_harness_tools::file_search::{SearchedFile, glob_files, grep_files};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -39,6 +41,248 @@ struct MemoryState {
     lose_reply: bool,
     call_reply_gate: Option<CancellationToken>,
     commands: HashMap<String, Arc<CommandScript>>,
+    file_roots: BTreeMap<RootName, MemoryRoot>,
+    outside_roots: MemoryTree,
+    outside_root_access: FileAccess,
+    file_read_gate: Option<CancellationToken>,
+    file_versions: u64,
+    last_modified: Option<SystemTime>,
+}
+
+struct MemoryRoot {
+    display_path: String,
+    access: FileAccess,
+    tree: MemoryTree,
+}
+
+/// Files by their path below the root; directories are the ones their paths imply.
+#[derive(Default)]
+struct MemoryTree {
+    files: BTreeMap<String, MemoryFile>,
+}
+
+struct MemoryFile {
+    content: Vec<u8>,
+    version: FileVersion,
+    modified: SystemTime,
+}
+
+impl MemoryFile {
+    fn metadata(&self) -> FileMetadata {
+        FileMetadata {
+            version: self.version.clone(),
+            len: self.content.len() as u64,
+            modified: Some(self.modified),
+        }
+    }
+}
+
+impl MemoryTree {
+    fn is_directory(&self, path: &str) -> bool {
+        path.is_empty() || self.below(path).next().is_some()
+    }
+
+    fn below<'t>(
+        &'t self,
+        directory: &str,
+    ) -> impl Iterator<Item = (&'t String, &'t MemoryFile)> + 't {
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        self.files
+            .range(prefix.clone()..)
+            .take_while(move |(path, _)| path.starts_with(&prefix))
+    }
+
+    fn stat(&self, path: &str) -> Result<FileStat, ExecutionError> {
+        if let Some(file) = self.files.get(path) {
+            Ok(FileStat::File(file.metadata()))
+        } else if self.is_directory(path) {
+            Ok(FileStat::Directory { modified: None })
+        } else {
+            Err(not_found(path))
+        }
+    }
+
+    fn file(&self, path: &str) -> Result<&MemoryFile, ExecutionError> {
+        self.files.get(path).ok_or_else(|| {
+            if self.is_directory(path) {
+                ExecutionError::new(error_code::IS_DIRECTORY, format!("{path} is a directory"))
+            } else {
+                not_found(path)
+            }
+        })
+    }
+
+    fn list(&self, path: &str, limit: usize) -> Result<DirectoryListing, ExecutionError> {
+        if self.files.contains_key(path) {
+            return Err(ExecutionError::new(
+                error_code::NOT_A_DIRECTORY,
+                format!("{path} is not a directory"),
+            ));
+        }
+        if !self.is_directory(path) {
+            return Err(not_found(path));
+        }
+        let skipped = if path.is_empty() { 0 } else { path.len() + 1 };
+        let mut entries = BTreeMap::new();
+        for (below, _) in self.below(path) {
+            let rest = &below[skipped..];
+            match rest.split_once('/') {
+                Some((name, _)) => entries.insert(name.to_owned(), FileKind::Directory),
+                None => entries.insert(rest.to_owned(), FileKind::File),
+            };
+        }
+        let truncated = entries.len() > limit;
+        Ok(DirectoryListing {
+            entries: entries
+                .into_iter()
+                .take(limit)
+                .map(|(name, kind)| DirectoryEntry { name, kind })
+                .collect(),
+            truncated,
+        })
+    }
+
+    fn searched(&self) -> impl Iterator<Item = SearchedFile<'_>> {
+        self.files.iter().map(|(path, file)| SearchedFile {
+            path,
+            content: &file.content,
+            modified: Some(file.modified),
+        })
+    }
+
+    /// Refuses a path that is a directory or has a file where one of its parent directories must
+    /// be.
+    fn check_writable(&self, path: &str) -> Result<(), ExecutionError> {
+        if !self.files.contains_key(path) && self.is_directory(path) {
+            return Err(ExecutionError::new(
+                error_code::IS_DIRECTORY,
+                format!("{path} is a directory"),
+            ));
+        }
+        let mut below = path;
+        while let Some((parent, _)) = below.rsplit_once('/') {
+            if self.files.contains_key(parent) {
+                return Err(ExecutionError::new(
+                    error_code::NOT_A_DIRECTORY,
+                    format!("{parent} is not a directory"),
+                ));
+            }
+            below = parent;
+        }
+        Ok(())
+    }
+}
+
+fn not_found(path: &str) -> ExecutionError {
+    ExecutionError::new(error_code::NOT_FOUND, format!("{path} does not exist"))
+}
+
+/// Where `path` is in its tree: below its root, or below `/` outside every root.
+fn tree_path(path: &FilePath) -> &str {
+    match path.root() {
+        Some(_) => path.path(),
+        None => path.path().trim_start_matches('/'),
+    }
+}
+
+fn check_expected(
+    current: Option<&MemoryFile>,
+    expected: Option<&FileVersion>,
+    shown: &str,
+) -> Result<(), ExecutionError> {
+    match (current, expected) {
+        (None, None) => Ok(()),
+        (Some(file), Some(expected)) if &file.version == expected => Ok(()),
+        (Some(_), None) => Err(ExecutionError::new(
+            error_code::CONFLICT,
+            format!("{shown} already exists"),
+        )),
+        _ => Err(ExecutionError::new(
+            error_code::CONFLICT,
+            format!("{shown} changed since it was read"),
+        )),
+    }
+}
+
+fn new_file(state: &mut MemoryState, content: Vec<u8>) -> MemoryFile {
+    state.file_versions += 1;
+    let now = SystemTime::now();
+    let modified = match state.last_modified {
+        Some(last) if last >= now => last + Duration::from_millis(1),
+        _ => now,
+    };
+    state.last_modified = Some(modified);
+    MemoryFile {
+        content,
+        version: FileVersion::new(format!("memory-{}", state.file_versions)),
+        modified,
+    }
+}
+
+/// The tree of a root the Port has, or of the paths outside every root.
+fn tree<'s>(state: &'s MemoryState, path: &FilePath) -> &'s MemoryTree {
+    match path.root() {
+        Some(name) => &state.file_roots[name].tree,
+        None => &state.outside_roots,
+    }
+}
+
+/// Refuses a root the Port does not have with `OutsideRoot`, and one whose capability falls short
+/// of `needed` with `AccessDenied`.
+fn check_access(
+    capabilities: &FileCapabilities,
+    path: &FilePath,
+    needed: FileAccess,
+) -> Result<(), ExecutionError> {
+    let is_bound = match path.root() {
+        Some(name) => capabilities.root(name).is_some(),
+        None => capabilities.outside_roots() != FileAccess::None,
+    };
+    if !is_bound {
+        return Err(ExecutionError::new(
+            error_code::OUTSIDE_ROOT,
+            format!("{} is outside this Chat's directories", path.path()),
+        ));
+    }
+    let access = capabilities.access(path);
+    let allowed = if needed.can_write() {
+        access.can_write()
+    } else {
+        access.can_read()
+    };
+    if !allowed {
+        return Err(ExecutionError::new(
+            error_code::ACCESS_DENIED,
+            format!("{} does not allow this", capabilities.display(path)),
+        ));
+    }
+    Ok(())
+}
+
+fn file_result(content: Value, file: Option<Box<FileMetadata>>) -> ExecutionResult {
+    ExecutionResult {
+        result: ToolResult {
+            content: content.to_string(),
+            is_error: false,
+            output_ref: None,
+        },
+        opened: None,
+        shell: None,
+        command: None,
+        handoff: None,
+        file,
+    }
+}
+
+fn tree_mut<'s>(state: &'s mut MemoryState, path: &FilePath) -> Option<&'s mut MemoryTree> {
+    match path.root() {
+        Some(name) => state.file_roots.get_mut(name).map(|root| &mut root.tree),
+        None => Some(&mut state.outside_roots),
+    }
 }
 
 /// How one run of a scripted one-shot command behaves.
@@ -338,6 +582,78 @@ impl MemoryEnvironment {
     pub fn lose_next_reply(&self) {
         self.state.lock().unwrap().lose_reply = true;
     }
+
+    /// Defines a file root; a Port has it when its scope names `display_path` as the Folder or an
+    /// Additional Directory.
+    pub fn define_root(&self, name: &str, display_path: &str, access: FileAccess) {
+        let name = RootName::new(name).expect("a valid root name");
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state
+                .file_roots
+                .iter()
+                .all(|(defined, root)| defined != &name && root.display_path != display_path),
+            "root {name} or {display_path} is already defined"
+        );
+        state.file_roots.insert(
+            name,
+            MemoryRoot {
+                display_path: display_path.into(),
+                access,
+                tree: MemoryTree::default(),
+            },
+        );
+    }
+
+    /// What every Port allows on absolute paths below no root; nothing by default.
+    pub fn set_outside_root_access(&self, access: FileAccess) {
+        self.state.lock().unwrap().outside_root_access = access;
+    }
+
+    /// Stores a file below a defined root, or at an absolute path outside every root when `root`
+    /// is `None`, as a change from outside the Agent: it gets a new version and modification time.
+    pub fn put_file(&self, root: Option<&str>, path: &str, content: impl Into<Vec<u8>>) {
+        let path = Self::file_path(root, path);
+        let mut state = self.state.lock().unwrap();
+        let file = new_file(&mut state, content.into());
+        tree_mut(&mut state, &path)
+            .expect("a defined root")
+            .files
+            .insert(tree_path(&path).into(), file);
+    }
+
+    pub fn set_modified(&self, root: Option<&str>, path: &str, modified: SystemTime) {
+        let path = Self::file_path(root, path);
+        let mut state = self.state.lock().unwrap();
+        tree_mut(&mut state, &path)
+            .and_then(|tree| tree.files.get_mut(tree_path(&path)))
+            .expect("an existing file")
+            .modified = modified;
+    }
+
+    pub fn file(&self, root: Option<&str>, path: &str) -> Option<Vec<u8>> {
+        let path = Self::file_path(root, path);
+        let mut state = self.state.lock().unwrap();
+        tree_mut(&mut state, &path)?
+            .files
+            .get(tree_path(&path))
+            .map(|file| file.content.clone())
+    }
+
+    /// Makes file reads wait until the returned token is cancelled.
+    pub fn hold_file_reads(&self) -> CancellationToken {
+        let release = CancellationToken::new();
+        self.state.lock().unwrap().file_read_gate = Some(release.clone());
+        release
+    }
+
+    fn file_path(root: Option<&str>, path: &str) -> FilePath {
+        match root {
+            Some(root) => FilePath::in_root(RootName::new(root).expect("a valid root name"), path),
+            None => FilePath::outside_roots(path),
+        }
+        .expect("a valid path")
+    }
 }
 
 impl ExecutionEnvironment for MemoryEnvironment {
@@ -393,10 +709,8 @@ impl MemoryPort {
             &self.authority,
             ExecutionFacts::for_command(spec),
         );
-        let mut plans = self.plans.lock().unwrap();
-        plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
-        plans.insert(
-            prepared.preparation(),
+        self.remember_plan(
+            &prepared,
             MemoryPlan {
                 lifetime: prepared.lifetime(),
                 program_generation: 0,
@@ -406,6 +720,141 @@ impl MemoryPort {
             },
         );
         Ok(prepared)
+    }
+
+    fn remember_plan(&self, prepared: &PreparedExecution, plan: MemoryPlan) {
+        let mut plans = self.plans.lock().unwrap();
+        plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
+        plans.insert(prepared.preparation(), plan);
+    }
+
+    /// The roots the scope names as its Folder and Additional Directories.
+    fn file_capabilities(&self, state: &MemoryState) -> FileCapabilities {
+        let roots = state
+            .file_roots
+            .iter()
+            .filter_map(|(name, root)| {
+                let is_folder = self.scope.folder.as_deref() == Some(root.display_path.as_str());
+                (is_folder
+                    || self
+                        .scope
+                        .additional_directories
+                        .contains(&root.display_path))
+                .then(|| FileRoot {
+                    name: name.clone(),
+                    display_path: root.display_path.clone(),
+                    access: root.access,
+                    is_folder,
+                    local_path: None,
+                })
+            })
+            .collect();
+        FileCapabilities::new(roots, state.outside_root_access)
+            .expect("memory roots have distinct names and display paths")
+    }
+
+    async fn inspect_file(&self, query: FileQuery) -> Result<ExecutionInspection, ExecutionError> {
+        let gate = self.state.lock().unwrap().file_read_gate.clone();
+        if let Some(release) = gate {
+            tokio::select! {
+                biased;
+                _ = self.authority.revoked() => {}
+                _ = release.cancelled() => {}
+            }
+            self.authority.check(self.scope.chat)?;
+        }
+        let state = self.state.lock().unwrap();
+        let path = query.path().clone();
+        check_access(&self.file_capabilities(&state), &path, FileAccess::Read)?;
+        let tree = tree(&state, &path);
+        let below = tree_path(&path);
+        let inspection = match query {
+            FileQuery::Stat(_) => FileInspection::Stat(tree.stat(below)?),
+            FileQuery::Read { offset, limit, .. } => {
+                let file = tree.file(below)?;
+                let begin = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(file.content.len());
+                let end = begin.saturating_add(limit).min(file.content.len());
+                FileInspection::Read(FileContent {
+                    metadata: file.metadata(),
+                    data: file.content[begin..end].to_vec(),
+                })
+            }
+            FileQuery::List { limit, .. } => FileInspection::List(tree.list(below, limit)?),
+            FileQuery::Glob { query, .. } => {
+                FileInspection::Glob(glob_files(tree.searched(), below, &query)?)
+            }
+            FileQuery::Grep { query, .. } => {
+                FileInspection::Grep(grep_files(tree.searched(), below, &query)?)
+            }
+        };
+        Ok(ExecutionInspection::File(inspection))
+    }
+
+    fn prepare_file(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
+        let path = intent.file_path().expect("a file change");
+        let capabilities = self.file_capabilities(&self.state.lock().unwrap());
+        check_access(&capabilities, path, FileAccess::ReadWrite)?;
+        let facts =
+            ExecutionFacts::for_file(&intent, &capabilities.display(path)).expect("a file change");
+        let prepared = PreparedExecution::new(self.identity, &self.authority, facts);
+        self.remember_plan(
+            &prepared,
+            MemoryPlan {
+                lifetime: prepared.lifetime(),
+                program_generation: 0,
+                open: None,
+                shell_program: None,
+                command: None,
+            },
+        );
+        Ok(prepared)
+    }
+
+    fn write_file(
+        &self,
+        state: &mut MemoryState,
+        path: &FilePath,
+        content: &[u8],
+        expected: Option<&FileVersion>,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let capabilities = self.file_capabilities(state);
+        check_access(&capabilities, path, FileAccess::ReadWrite)?;
+        let shown = capabilities.display(path);
+        let below = tree_path(path);
+        let current = tree(state, path);
+        current.check_writable(below)?;
+        check_expected(current.files.get(below), expected, &shown)?;
+        let file = new_file(state, content.to_vec());
+        let metadata = file.metadata();
+        tree_mut(state, path)
+            .expect("a bound root")
+            .files
+            .insert(below.into(), file);
+        Ok(file_result(
+            json!({"status":"written", "path":shown, "bytes":content.len()}),
+            Some(Box::new(metadata)),
+        ))
+    }
+
+    fn delete_file(
+        &self,
+        state: &mut MemoryState,
+        path: &FilePath,
+        expected: &FileVersion,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let capabilities = self.file_capabilities(state);
+        check_access(&capabilities, path, FileAccess::ReadWrite)?;
+        let shown = capabilities.display(path);
+        let below = tree_path(path);
+        let current = tree(state, path).file(below)?;
+        check_expected(Some(current), Some(expected), &shown)?;
+        tree_mut(state, path)
+            .expect("a bound root")
+            .files
+            .remove(below);
+        Ok(file_result(json!({"status":"deleted", "path":shown}), None))
     }
 
     async fn run_command(
@@ -559,12 +1008,15 @@ impl ExecutionPort for MemoryPort {
         let describes = matches!(&query, ExecutionQuery::Describe(_));
         match query {
             ExecutionQuery::Capabilities => {
+                let files = self.file_capabilities(&self.state.lock().unwrap());
                 Ok(ExecutionInspection::Capabilities(ExecutionCapabilities {
                     ticks: true,
                     shells: true,
                     shell_output: ShellOutputDelivery::Environment,
+                    files,
                 }))
             }
+            ExecutionQuery::File(query) => self.inspect_file(query).await,
             ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(
                 self.state
                     .lock()
@@ -667,10 +1119,15 @@ impl ExecutionPort for MemoryPort {
         if let ExecutionIntent::RunCommand(spec) = intent {
             return self.prepare_command(spec);
         }
+        if intent.file_path().is_some() {
+            return self.prepare_file(intent);
+        }
         let state = self.state.lock().unwrap();
         let (generation, normalized_input, summary, permission, catalog) = match &intent {
-            ExecutionIntent::RunCommand(_) => {
-                unreachable!("one-shot commands prepare on their own")
+            ExecutionIntent::RunCommand(_)
+            | ExecutionIntent::WriteFile { .. }
+            | ExecutionIntent::DeleteFile { .. } => {
+                unreachable!("one-shot commands and file changes prepare on their own")
             }
             ExecutionIntent::StopShell { instance, .. } => {
                 if state
@@ -863,10 +1320,8 @@ impl ExecutionPort for MemoryPort {
                 matches!(intent, ExecutionIntent::SpawnShell(_))
                     && state.shell_approval_skipped_when_isolated,
             );
-        let mut plans = self.plans.lock().unwrap();
-        plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
-        plans.insert(
-            prepared.preparation(),
+        self.remember_plan(
+            &prepared,
             MemoryPlan {
                 lifetime: prepared.lifetime(),
                 program_generation: generation,
@@ -921,6 +1376,20 @@ impl ExecutionPort for MemoryPort {
                 ExecutionIntent::RunCommand(_) => {
                     unreachable!("one-shot commands run on their own")
                 }
+                ExecutionIntent::WriteFile {
+                    path,
+                    content,
+                    expected,
+                } => match self.write_file(&mut state, path, content, expected.as_ref()) {
+                    Ok(result) => result,
+                    Err(error) => return ExecutionOutcome::NotDispatched(error),
+                },
+                ExecutionIntent::DeleteFile { path, expected } => {
+                    match self.delete_file(&mut state, path, expected) {
+                        Ok(result) => result,
+                        Err(error) => return ExecutionOutcome::NotDispatched(error),
+                    }
+                }
                 ExecutionIntent::StopShell { instance, reason } => {
                     let Some(shell) = state
                         .shells
@@ -958,6 +1427,7 @@ impl ExecutionPort for MemoryPort {
                         shell: None,
                         command: None,
                         handoff: None,
+                        file: None,
                     }
                 }
                 ExecutionIntent::SpawnShell(spec) => {
@@ -1021,6 +1491,7 @@ impl ExecutionPort for MemoryPort {
                         shell: Some(Box::new(status)),
                         command: None,
                         handoff: None,
+                        file: None,
                     }
                 }
                 ExecutionIntent::Open(_) | ExecutionIntent::Reopen { .. } => {
@@ -1087,6 +1558,7 @@ impl ExecutionPort for MemoryPort {
                         shell: None,
                         command: None,
                         handoff: None,
+                        file: None,
                     }
                 }
                 ExecutionIntent::SendInput { instance, data } => {
@@ -1115,7 +1587,7 @@ impl ExecutionPort for MemoryPort {
                             exited: false,
                         }),
                     });
-                    ExecutionResult { result: ToolResult { content: json!({"status":"completed", "tick_instance_id":instance, "written":data.len()}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None }
+                    ExecutionResult { result: ToolResult { content: json!({"status":"completed", "tick_instance_id":instance, "written":data.len()}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None, file: None }
                 }
                 ExecutionIntent::Close { instance } => {
                     if state
@@ -1132,7 +1604,7 @@ impl ExecutionPort for MemoryPort {
                     removed
                         .updates
                         .send_modify(|update| update.state = ExecutionLinkState::Gone);
-                    ExecutionResult { result: ToolResult { content: json!({"status":"closed", "host":"tickhost", "tick_instance_id":instance}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None }
+                    ExecutionResult { result: ToolResult { content: json!({"status":"closed", "host":"tickhost", "tick_instance_id":instance}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None, file: None }
                 }
                 ExecutionIntent::Call {
                     instance,
@@ -1191,6 +1663,7 @@ impl ExecutionPort for MemoryPort {
                         shell: None,
                         command: None,
                         handoff: None,
+                        file: None,
                     }
                 }
             };
@@ -1198,7 +1671,12 @@ impl ExecutionPort for MemoryPort {
                 (self.scope.chat, prepared.operation()),
                 ExecutionReceipt::Completed(result.clone()),
             );
-            let gate = if matches!(prepared.facts().intent, ExecutionIntent::Call { .. }) {
+            let gate = if matches!(
+                prepared.facts().intent,
+                ExecutionIntent::Call { .. }
+                    | ExecutionIntent::WriteFile { .. }
+                    | ExecutionIntent::DeleteFile { .. }
+            ) {
                 state.call_reply_gate.clone()
             } else {
                 None

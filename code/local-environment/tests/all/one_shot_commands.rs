@@ -41,6 +41,7 @@ fn scope(directory: &std::path::Path) -> ExecutionScope {
     ExecutionScope {
         chat: tickloop_ids::generate().into(),
         folder: Some(directory.display().to_string()),
+        additional_directories: Vec::new(),
     }
 }
 
@@ -75,6 +76,7 @@ async fn run(
             ExecutionScope {
                 chat,
                 folder: Some(spec.cwd.clone()),
+                additional_directories: Vec::new(),
             },
             authority.clone(),
         )

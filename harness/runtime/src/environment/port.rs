@@ -8,6 +8,9 @@ use tickloop_harness_protocol::{ChatId, PreparedApprovalFacts, ToolResult};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::files::{
+    FileCapabilities, FileInspection, FileMetadata, FilePath, FileQuery, FileVersion, error_code,
+};
 use crate::host_tools::HostToolPermission;
 
 pub const TERMINAL_INPUT_BYTES: usize = 4 * 1024;
@@ -20,6 +23,9 @@ pub struct ExecutionScope {
     pub chat: ChatId,
     /// A path in the execution environment, never resolved by the Harness.
     pub folder: Option<String>,
+    /// Paths in the execution environment, never resolved by the Harness. A change binds a new
+    /// Port.
+    pub additional_directories: Vec<String>,
 }
 
 /// Issued by the embedding host. Revocation also invalidates already bound Ports.
@@ -83,7 +89,7 @@ impl ExecutionAuthority {
         }
         if self.revoked.is_cancelled() {
             return Err(ExecutionError::new(
-                "AuthorityRevoked",
+                error_code::AUTHORITY_REVOKED,
                 "execution authority is no longer valid",
             ));
         }
@@ -107,11 +113,12 @@ impl ExecutionError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionCapabilities {
     pub ticks: bool,
     pub shells: bool,
     pub shell_output: ShellOutputDelivery,
+    pub files: FileCapabilities,
 }
 
 pub enum ExecutionQuery {
@@ -129,6 +136,7 @@ pub enum ExecutionQuery {
         offset: u64,
         limit: usize,
     },
+    File(FileQuery),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +164,17 @@ pub enum ExecutionIntent {
         revision: String,
     },
     RunCommand(CommandSpec),
+    /// Replaces the file, creating its parent directories as needed. `expected` is the version
+    /// it must still have, or `None` when it must not exist.
+    WriteFile {
+        path: FilePath,
+        content: Vec<u8>,
+        expected: Option<FileVersion>,
+    },
+    DeleteFile {
+        path: FilePath,
+        expected: FileVersion,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +359,7 @@ impl CommandOutput {
             shell: None,
             command: Some(Box::new(self)),
             handoff: None,
+            file: None,
         }
     }
 }
@@ -615,6 +635,8 @@ pub struct ExecutionResult {
     pub shell: Option<Box<ShellStatus>>,
     pub command: Option<Box<CommandOutput>>,
     pub handoff: Option<ExecutionHandoff>,
+    /// The file a `WriteFile` left.
+    pub file: Option<Box<FileMetadata>>,
 }
 
 #[derive(Debug)]
@@ -642,8 +664,27 @@ pub enum ExecutionInspection {
     Description(Value),
     Shell(ShellStatus),
     Output(OutputPage),
+    File(FileInspection),
 }
 
+/// One Chat's bound access to its Execution Environment.
+///
+/// File operations are designed for files that live elsewhere: every operation may be a network
+/// call, and the Harness assumes nothing about inodes, symbolic links or atomic renames.
+///
+/// - Reads ([`FileQuery`]) go through `inspect` and are idempotent. A failure or timeout is
+///   returned as an error; cancelling one drops its future, which the environment must tolerate.
+/// - Writes (`WriteFile`, `DeleteFile`) go through `prepare` and `execute` with the approval facts
+///   and admission of any other intent; a root whose capability does not allow writing refuses
+///   them at `prepare` with [`error_code::ACCESS_DENIED`]. A failure before dispatch is
+///   `NotDispatched`; a timeout or cancellation after dispatch is `OutcomeUnknown`, and the
+///   Harness never sends the write again. A later read sees a write either whole or not at all.
+/// - A [`FileVersion`] is compared only for equality; a write whose expected version does not
+///   match fails with [`error_code::CONFLICT`] and changes nothing.
+/// - The Harness maps a path to a root and refuses `..` that leaves it, and the environment
+///   enforces its roots again (locally including symbolic links) with
+///   [`error_code::OUTSIDE_ROOT`]. A root's capability is fixed when the Port is bound; whether a
+///   directory is reachable is not a capability, so an unreachable one fails each operation.
 #[async_trait::async_trait]
 pub trait ExecutionPort: Send + Sync {
     async fn inspect(&self, query: ExecutionQuery) -> Result<ExecutionInspection, ExecutionError>;

@@ -292,6 +292,7 @@ impl HostedTickTools {
             shell: None,
             command: None,
             handoff: None,
+            file: None,
         })
     }
 
@@ -1392,6 +1393,7 @@ impl OpenedTick {
                 shell: None,
                 command: None,
                 handoff: None,
+                file: None,
             });
         }
     }

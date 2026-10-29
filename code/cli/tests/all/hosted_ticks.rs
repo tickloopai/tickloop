@@ -351,6 +351,7 @@ for line in sys.stdin:
             ExecutionScope {
                 chat: tickloop_ids::generate().into(),
                 folder: Some("/".into()),
+                additional_directories: Vec::new(),
             },
             OpenSpec {
                 command: vec!["/counter".into()],
@@ -371,6 +372,7 @@ for line in sys.stdin:
             ExecutionScope {
                 chat: daemon.chats[0].into(),
                 folder: Some(daemon.root.to_string_lossy().into_owned()),
+                additional_directories: Vec::new(),
             },
             OpenSpec {
                 command: python_program(&script, &[]),
@@ -388,6 +390,7 @@ for line in sys.stdin:
         tickloop_harness::runtime::environment::ExecutionScope {
             chat: chat.into(),
             folder: Some(folder.to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
         }
     }
 

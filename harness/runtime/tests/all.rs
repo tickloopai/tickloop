@@ -113,3 +113,6 @@ mod plan_reminders;
 
 #[path = "all/sandbox_auto_approval.rs"]
 mod sandbox_auto_approval;
+
+#[path = "all/file_environment.rs"]
+mod file_environment;
