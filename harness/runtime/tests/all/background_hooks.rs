@@ -14,7 +14,7 @@ use tickloop_harness_protocol::hooks::{
     HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId,
+    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId, TaskNotification,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
 use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
@@ -205,6 +205,12 @@ fn texts(request: &ModelRequest) -> Vec<String> {
         .collect()
 }
 
+/// The notifications the Chat's views were shown live so far, once those in flight arrived.
+async fn shown_live(live: &mut Receiver<TaskNotification>) -> Vec<TaskNotification> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::iter::from_fn(|| live.try_recv().ok()).collect()
+}
+
 fn assert_prefix_kept(earlier: &ModelRequest, later: &ModelRequest) {
     assert!(
         later.messages.len() > earlier.messages.len()
@@ -241,6 +247,7 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
         exits(0, &answer.to_string(), "", SLOW_HOOK)
     });
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
     let started = Instant::now();
 
     let turn = bench.turn(&mut events, "Build it.").await;
@@ -275,6 +282,15 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
     );
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     assert_eq!(history.hook_runs, [end.clone(), start.clone()]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show the hook's notification once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(
+        shown.summary,
+        "PreToolUse:Bash hook finished in the background"
+    );
 
     bench.turn(&mut events, "Anything else?").await;
     let requests = bench.requests();
@@ -316,6 +332,7 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
         .environment
         .define_command(broken, |_| exits(1, "", "crashed", Duration::ZERO));
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
 
     let started = Instant::now();
     let first = bench
@@ -349,6 +366,12 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
     );
     assert!(!notification.contains("crashed"));
     assert_prefix_kept(&requests[1], &requests[2]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show only the rewake, once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(shown.summary, "Security review found issues");
 
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     let ended = |command: &str| {

@@ -5485,16 +5485,17 @@ async fn interact_with_herdr(
             },
             notification = task_notifications.recv() => match notification {
                 Ok(notification) if !overview_active && Some(notification.chat_id)==selected_chat => {
-                    console.write_shell_notification(&notification)?;
+                    console.write_task_notification(&notification)?;
                     status_dirty=true;
                 },
                 Ok(notification) => {
                     let notice=format!("{} · {}",background_label(agent,console,notification.chat_id),safe_line(&notification.summary));
                     if !interactive {outln!(console,"Background {notice}");}
-                    let (message, necessary) = match notification.status {
-                        TaskNotificationStatus::Completed => ("Shell task completed", false),
-                        TaskNotificationStatus::Failed => ("Shell task failed", true),
-                        TaskNotificationStatus::Killed => ("Shell task killed", false),
+                    let (message, necessary) = match notification.status() {
+                        Some(TaskNotificationStatus::Completed) => ("Shell task completed", false),
+                        Some(TaskNotificationStatus::Failed) => ("Shell task failed", true),
+                        Some(TaskNotificationStatus::Killed) => ("Shell task killed", false),
+                        None => ("Background hook finished", false),
                     };
                     background_notice=Some((notification.chat_id,BackgroundRunNotice { message: message.into(), compact_message: None, necessary }));
                     status_dirty=true;
@@ -5656,21 +5657,13 @@ async fn check_shell_prompt_watchdog(
     Ok(())
 }
 
-/// Following Claude Code's task notification style: a status-colored dot plus a summary.
+/// The line a background task's end adds to the conversation as it happens, the one a replay of
+/// its task notification shows.
 fn task_notification_line(
     notification: &TaskNotification,
     display: DisplayProfile,
 ) -> Vec<(String, Option<Role>)> {
-    let role = match notification.status {
-        TaskNotificationStatus::Completed => Role::Success,
-        TaskNotificationStatus::Failed => Role::Error,
-        TaskNotificationStatus::Killed => Role::Warning,
-    };
-    vec![
-        ("\n".into(), None),
-        (display.glyph(Glyph::ToolCall).into(), Some(role)),
-        (format!(" {}\n", safe_text(&notification.summary)), None),
-    ]
+    presentation::task_notification_runs(notification.status(), &notification.summary, display)
 }
 
 /// What the view has read of a `!` command: where reading resumes and its latest lines.
@@ -10038,6 +10031,42 @@ mod tests {
                 .matches("TickUpdate: Stock watcher")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_background_hook_summary_shows_once_live_as_its_replay_shows_it() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        use tickloop_harness::protocol::{TaskNotification, local_messages};
+        const SUMMARY: &str = "Background check found something";
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let message = local_messages::background_hook_notification(
+            SUMMARY,
+            "Stop hook blocking error from command \"PostToolUse:Bash\": REWAKE-DEMO",
+        );
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":chat,"folder":"/work","messages":[message],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
+        })).unwrap();
+        snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
+        snapshot.message_runs.insert(0, run.into());
+
+        let live = Console::test_interactive_for_chat(chat);
+        live.write_task_notification(&TaskNotification::for_background_hook(chat.into(), SUMMARY))
+            .unwrap();
+        live.defer_input_echo(chat, run).unwrap();
+        consume_input_echo_from_snapshot(&live, &snapshot, run).unwrap();
+        let replay = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&replay, &snapshot).unwrap();
+
+        assert_eq!(
+            live.test_conversation_text(),
+            format!("\n⏺ {SUMMARY}\n"),
+            "the line shows as the hook ends, and the run it wakes does not repeat it"
+        );
+        assert_eq!(
+            replay.test_conversation_text(),
+            live.test_conversation_text()
         );
     }
 

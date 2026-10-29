@@ -13,7 +13,7 @@ use tickloop_code_access::ExecutionRef;
 use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness::protocol::{
     Content, Decision, Event, LocalMessage, ModelIdentity, ModelProvider, PermissionRule,
-    PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ToolResult, Usage,
+    PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ShellTaskEnd, ToolResult, Usage,
 };
 
 use tickloop_harness::tools::ASK_USER_QUESTION_TOOL_NAME;
@@ -1002,10 +1002,12 @@ async fn a_finished_user_shell_shows_the_result_the_agent_records() {
 fn notification(status: TaskNotificationStatus, summary: &str) -> TaskNotification {
     TaskNotification {
         chat_id: Uuid::new_v4().into(),
-        task_id: Uuid::new_v4().into(),
-        tool_use_id: None,
-        output_file: "/tmp/task.log".into(),
-        status,
+        shell: Some(ShellTaskEnd {
+            task_id: Uuid::new_v4().into(),
+            tool_use_id: None,
+            output_file: "/tmp/task.log".into(),
+            status,
+        }),
         summary: summary.into(),
     }
 }

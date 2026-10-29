@@ -7,9 +7,10 @@
 //! An `async` hook's `systemMessage` and `additionalContext` join the end of the conversation
 //! for the model's next request without starting a turn. An `asyncRewake` hook that exits 2
 //! notifies the Loop with its output the way a finished background command does: a running turn
-//! reads it after its current tool results, and an idle Loop starts a turn for it. Any other
-//! ending only shows the user. A background hook keeps its timeout; Esc leaves it running, while
-//! `/stop` and shutdown end it.
+//! reads it after its current tool results, and an idle Loop starts a turn for it. Either
+//! notification shows the Chat's views its summary line as the hook ends, as a finished
+//! background command's does. Any other ending only shows the user. A background hook keeps its
+//! timeout; Esc leaves it running, while `/stop` and shutdown end it.
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -17,7 +18,7 @@ use std::time::Instant;
 use tickloop_harness_protocol::hooks::{
     HookBackground, HookBackgroundPhase, HookDecision, HookEvent, HookRunOutcome,
 };
-use tickloop_harness_protocol::{Message, Receipt, local_messages};
+use tickloop_harness_protocol::{Message, Receipt, TaskNotification, local_messages};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -63,9 +64,21 @@ fn decision_name(decision: HookDecision) -> &'static str {
     }
 }
 
+/// What a background hook's end tells the model, under the summary the user sees for it.
+struct HookNotice {
+    summary: String,
+    result: String,
+}
+
+impl HookNotice {
+    fn message(&self) -> Message {
+        local_messages::background_hook_notification(&self.summary, &self.result)
+    }
+}
+
 /// What an `async` hook gives the model's next request: its `systemMessage` and
 /// `additionalContext`, as Claude Code attaches them; `None` when it gave neither.
-fn async_notification(label: &str, response: &HookResponse) -> Option<Message> {
+fn async_notification(label: &str, response: &HookResponse) -> Option<HookNotice> {
     let lines = [
         ("system message", &response.system_message),
         ("additional context", &response.additional_context),
@@ -76,30 +89,28 @@ fn async_notification(label: &str, response: &HookResponse) -> Option<Message> {
             .map(|text| format!("{label} hook {kind}: {text}"))
     })
     .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| {
-        local_messages::background_hook_notification(
-            &format!("{label} hook finished in the background"),
-            &lines.join("\n"),
-        )
+    (!lines.is_empty()).then(|| HookNotice {
+        summary: format!("{label} hook finished in the background"),
+        result: lines.join("\n"),
     })
 }
 
 /// What an `asyncRewake` hook that exited 2 tells the model: its `rewakeMessage`, or Claude
-/// Code's default, then its standard error, else its standard output.
+/// Code's default, then its standard error, else its standard output, under its `rewakeSummary`.
 fn rewake_notification(
     label: &str,
     message: Option<&str>,
     summary: Option<&str>,
     output: &str,
-) -> Message {
+) -> HookNotice {
     let lead = message.map_or_else(
         || format!("Stop hook blocking error from command \"{label}\":"),
         str::to_owned,
     );
-    local_messages::background_hook_notification(
-        summary.unwrap_or(DEFAULT_REWAKE_SUMMARY),
-        &format!("{lead} {output}"),
-    )
+    HookNotice {
+        summary: summary.unwrap_or(DEFAULT_REWAKE_SUMMARY).to_owned(),
+        result: format!("{lead} {output}"),
+    }
 }
 
 impl Agent {
@@ -241,7 +252,7 @@ impl Agent {
                 _ => HookRunOutcome::NonBlockingError,
             };
         }
-        let notification = match background {
+        let notice = match background {
             HookBackground::Async => async_notification(&label, response),
             HookBackground::AsyncRewake { message, summary } if rewakes => {
                 Some(rewake_notification(
@@ -260,11 +271,13 @@ impl Agent {
             };
             record_hook_run(self, chat, receipt, record);
             let mut wakes = false;
-            if let Some(notification) = notification {
+            if let Some(notice) = notice {
+                let message = notice.message();
                 if rewakes {
-                    chat.hook_state.session.note_rewake(notification.clone());
+                    chat.hook_state.session.note_rewake(message.clone());
                 }
-                match self.append_local_messages(chat, [notification]) {
+                let shown = TaskNotification::for_background_hook(receipt.chat_id, &notice.summary);
+                match self.show_task_notification(chat, shown, message) {
                     Ok(()) => {
                         wakes = rewakes && self.queue_task_continuation(chat, Some(receipt.loop_id))
                     }
@@ -284,8 +297,8 @@ impl Agent {
 mod tests {
     use super::*;
 
-    fn text(message: &Message) -> String {
-        match &message.content[0] {
+    fn text(notice: &HookNotice) -> String {
+        match &notice.message().content[0] {
             tickloop_harness_protocol::Content::Text { text } => text.clone(),
             other => panic!("{other:?}"),
         }
