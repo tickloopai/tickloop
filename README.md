@@ -57,6 +57,7 @@ Then select the Counter in the Monitor and press Enter to step into its card, ty
 | `/permissions`, `/settings` | Choose how much the agent may do on its own; other preferences |
 | `/ticks`, `/plugins` | Install and log in to Ticks; manage other plugins |
 | `/mcp` | Inspect MCP servers, manage their login, change their exposure and turn them on or off here |
+| `/hooks` | See this folder's hooks; trust, disable or restore them |
 | `/context` | See what fills the context, by category, and how many MCP tools tool search can reach; `/context all` lists every item |
 | `/artifacts` | Sign in to Artifacts and add artifacts to the Chat |
 | `/exit` | Leave the interface (the agent keeps running) |
@@ -210,7 +211,7 @@ vim.keymap.set('n', '<Esc>', function() io.stdout:write('\27]7777;tickloop;key=e
 
 ## Plugins
 
-Plugins add Skills and MCP servers to the agent. Open `/plugins` to browse the installed and available plugins without a Tick program, or use the command line:
+Plugins add Skills, MCP servers and [hooks](#hooks) to the agent. Open `/plugins` to browse the installed and available plugins without a Tick program, or use the command line:
 
 ```sh
 tickloop plugin list --available
@@ -251,7 +252,7 @@ The third page of `/plugins`, **Marketplaces**, does what `tickloop plugin marke
 
 Type `/` to discover user-invocable Skills for the current folder, including built-in, user, project and enabled plugin and Tick Skills. The Skills group shows each name, description and source; use `Ctrl+N` / `Ctrl+P` to select, then `Enter` or `Tab` to complete. Completion refreshes when Skills or plugins change. Invoke `/plugin:skill [ARGUMENTS]`, or `/skill [ARGUMENTS]` when that short name is unique. Ambiguous short names list the full names to use; exact names win, and built-in commands always take precedence. Each invocation displays a `Skill · name · source` row, preserved when reopening history.
 
-Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills; reinstalling or updating preserves the disabled state. Installation places files; enabled MCP servers start with the Agent or on its next request. Plugin Skill and MCP tool calls still require the usual approval. Skills, Tick programs, MCP servers and plugin user configuration are supported; for hooks, installation and `tickloop plugin list` show how many need confirming and warn about the events, types and fields Tickloop skips; other components are listed as unsupported. Uninstalling a plugin also removes the trust records of its hooks. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
+Enabled plugin Skills appear as `plugin:skill` from the next model request, without restarting. Disabling hides its Skills; reinstalling or updating preserves the disabled state. Installation places files; enabled MCP servers start with the Agent or on its next request. Plugin Skill and MCP tool calls still require the usual approval. Skills, Tick programs, MCP servers, hooks and plugin user configuration are supported; for hooks, installation and `tickloop plugin list` show how many need confirming and warn about the events, types and fields Tickloop skips (see [Hooks](#hooks)); other components are listed as unsupported. Uninstalling a plugin also removes the trust records of its hooks. npm and pip plugin sources are listed but cannot be installed. Installation, updates, removal and login are user actions, not actions the model initiates.
 
 ### MCP servers
 
@@ -306,6 +307,77 @@ Plugins may declare `userConfig` fields (string, number, boolean, directory or f
 User-configured servers take priority over plugin servers with the same command and arguments or URL. Between plugins, the first plugin by name wins; skipped duplicates produce a warning. Plugin root and data placeholders (`${TICKLOOP_PLUGIN_ROOT}`, `${TICKLOOP_PLUGIN_DATA}` and their `CLAUDE_` aliases), plus startup environment variables `${VAR}` and `${VAR:-default}`, are expanded when connecting. Services referencing missing `${user_config.*}` values show "needs configuration" and do not start. HTTP authentication is discovered on connection; validation alone cannot tell whether login is required.
 
 Existing Tick packages migrate automatically on first use, keeping saved login. Broken packages are reported for reinstallation; the old directory is preserved.
+
+## Hooks
+
+Hooks run shell commands at fixed points of the agent's work: before and after a tool call, when you send a prompt, when a conversation starts or ends, when a turn is about to stop and before the conversation is compacted. Tickloop reads Claude Code's hook format, input and output, so a `hooks` section copied from Claude Code, or a plugin's hooks, run unchanged. Hooks come from three places:
+
+- **Your settings**: `hooks` at the top level of your `settings.json`, for every folder, and in `projects["/absolute/project/path"]`, for that working directory only. Both apply.
+- **Enabled plugins**: the plugin's `hooks/hooks.json`, or the `hooks` field of its manifest (a path or an inline object).
+- **The repository**: the working directory's `.claude/settings.json` and `.claude/settings.local.json`. Only their `hooks` are read; every other setting in these files is ignored.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/bin/check-command.sh", "timeout": 30}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/format.sh"}]}
+    ]
+  }
+}
+```
+
+### Trust and `/hooks`
+
+Your own hooks run without asking. A plugin's or a repository's hook runs only after you trust it, and the trust is bound to its content:
+
+- A plugin hook's trust covers its declaration and the whole plugin: updating or reinstalling the plugin, or a change to any file it shipped, asks again.
+- A repository hook's trust covers its declaration and the folder's `.claude/hooks/` directory: a `git pull` that changes either asks again. Files the command runs from anywhere else are not covered, and changing them does not ask again.
+
+Until you trust them, such hooks do not run, and the conversation says so, for example `PreToolUse:Bash hooks not run: 1 hook not confirmed yet · review in /hooks`. Only you can trust a hook: the agent has no way to do it. A turn never stops to ask: unconfirmed hooks are skipped in every conversation, Subagents and unattended ones included.
+
+`/hooks` lists the hooks of the current folder under **Your settings**, **This folder** and **Plugin NAME@MARKETPLACE**. Each row shows the event, the matcher, the command and its state: `trusted`, `pending` (never trusted), `modified` (changed since you trusted it) or `disabled`. Use `ctrl+n`/`ctrl+p` or the arrow keys to select, `enter` for the details (the full command, the file it comes from, its timeout, `if` condition and background mode, and what its trust covers), `space` or `t` to trust it, `x` twice within three seconds to disable it or restore a disabled one, `r` to refresh and `esc` to close. Your own hooks can be disabled too; disabling one turns it off in every folder. The panel does not edit hooks: change them in their file. Trust records live in your `settings.json` under `hookTrust` (a repository's in its folder's `projects` entry), and uninstalling a plugin removes its records.
+
+When a new conversation starts in a folder whose hooks are pending or modified, a **Hooks need review** menu offers to review them one by one in `/hooks`, to trust them all and continue, or to continue without trusting them (they do not run). It appears once per folder each time you open Tickloop.
+
+### What hooks can do
+
+Tickloop runs `command` hooks for ten events, with the input on stdin, exit codes and JSON output of Claude Code:
+
+| Event | When it runs | What it can do |
+| --- | --- | --- |
+| `PreToolUse` | Before a tool call is prepared | Deny it, ask you, allow it (your own hooks only), rewrite its input (`updatedInput`), add context |
+| `PostToolUse` | After a tool call succeeds | Give the model a reason (`decision: "block"`) or context after the result |
+| `PostToolUseFailure` | After a tool call fails | Add context after the result |
+| `UserPromptSubmit` | Before the model reads a prompt you sent | Block the prompt (it stays out of the conversation and you see why), add context |
+| `SessionStart` | New conversation (`startup`), continuing one (`resume`), `/clear` (`clear`), after compaction (`compact`) | Add context |
+| `SessionEnd` | When the agent ends: stopped in the Agents overview, or its process exits, as with `tickloop daemon stop` | Notification only |
+| `Stop`, `SubagentStop` | When the agent, or a Subagent before it reports back, would end its turn | Block, to keep the turn going with the reason; the next input carries `stop_hook_active: true` |
+| `StopFailure` | When a turn ends on a model error | Notification only |
+| `PreCompact` | Before `/compact` (`manual`) or automatic compaction (`auto`) | Block, to cancel the compaction |
+
+- Matchers take exact names, `|` lists or a regular expression; empty or `*` matches everything. They apply to the tool events, `SessionStart` (its source) and `PreCompact` (its trigger). Tool names are Tickloop's: `Read`, `Write`, `Edit`, `Bash` and `mcp__*` are the same as in Claude Code, and `Agent` or `Task` also matches `Subagent`.
+- Fields: `command`, `timeout` in seconds (600 by default), `if`, `async`, and `asyncRewake` with `rewakeMessage` and `rewakeSummary`. `if` takes a permission rule, such as `Bash(git push*)`, and runs the hook only for calls that rule could match; when it cannot tell, the hook runs.
+- The input has `session_id` (the Chat's ID), `transcript_path` (a Claude Code–format copy of the conversation, so scripts that read the transcript work), `cwd`, `permission_mode` and `hook_event_name`, plus each event's own fields. Commands run in the working directory with `CLAUDE_PROJECT_DIR` set; plugin hooks also get `TICKLOOP_PLUGIN_ROOT`, `TICKLOOP_PLUGIN_DATA` and their `CLAUDE_` aliases, and `${CLAUDE_PLUGIN_ROOT}` or `${user_config.KEY}` in the command are replaced. A plugin hook whose `user_config` value is missing does not run and waits for configuration.
+- Exit code 0 succeeds; its stdout is parsed as JSON when it is JSON, and otherwise becomes context for `UserPromptSubmit` and `SessionStart`. Exit code 2 blocks, and stderr goes to the model (or rejects the prompt, or keeps the turn going). Other exit codes and timeouts only warn you.
+- Matching hooks run in parallel. When they disagree, deny beats ask, and ask beats allow. `ask` asks you even in Auto mode. Your own hook's `allow` skips the approval prompt and the Auto reviewer, while explicit Ask and Deny rules, sensitive-path checks and Plan mode still apply. After `updatedInput`, the approval shows the input that will run.
+- `async: true` runs the hook in the background without holding up the agent; when it ends you see its result, and its `systemMessage` and `additionalContext` reach the model with the next request. `asyncRewake: true` also runs in the background, and exit code 2 wakes the agent with the hook's output, like a background command that finished. Decisions from background hooks are ignored.
+- `esc` and `/stop` cancel the hooks the current step is waiting for; a `PreToolUse` hook cancelled this way also cancels its tool call. Background hooks keep running after `esc`; `/stop` and stopping the agent end them. A `Stop` hook that keeps blocking has no limit: `esc` or `/stop` ends the loop.
+- A hook's `systemMessage`, the reason it blocked and its failures show as a line in the conversation. Every run, with its source, event, duration, exit code, decision and shortened output, is listed in `/permissions` → Recent activity (the last 100 per conversation).
+
+Hooks run as you, outside the sandbox, like hooks in Claude Code.
+
+**Plugin and repository hooks cannot allow anything.** Their `allow` is recorded as ignored and the call is decided as if they had not answered; they can still deny, ask you, rewrite input and add context. When a plugin or repository hook rewrites a call's input, an `allow` from your own hooks no longer counts for that call.
+
+Not supported yet, each reported with a warning while the other hooks keep working: the `prompt`, `agent`, `http` and `mcp_tool` types; the fields `args`, `shell`, `once` and `onFailure`; other events such as `Notification`, `PermissionRequest`, `UserPromptExpansion` or `FileChanged`; `CLAUDE_ENV_FILE`; `disableAllHooks`; hooks in Skill or agent frontmatter; and Codex's `.codex/hooks.json`. Known limits:
+
+- `UserPromptSubmit` runs for a prompt that starts a turn, not for one merged into a turn already running, nor for scheduled tasks, Tick updates and other automatic input.
+- When a `Stop` hook blocks and the turn goes on, messages you queued meanwhile are not picked up; they wait until the loop ends or you press `esc`.
+- `tool_response` is the tool's result text (parsed when it is JSON), not Claude Code's per-tool structure, and the transcript copy keeps tool results as text.
+- An `asyncRewake` hook that exits 2 after `esc` or `/stop` leaves its notification for the next turn instead of waking the agent.
+- A hook that moves itself to the background by printing `{"async": true}` as its first line of output, as Claude Code allows, is not moved: it runs to the end, and its output is reported as not valid JSON.
 
 ## Requirements
 
