@@ -3,7 +3,9 @@
 //!
 //! Exit status 0 is success: standard output starting with `{` is its JSON answer, anything else
 //! is plain text. Status 2 blocks with standard error as the reason, after any JSON answer it
-//! also printed. Any other status, a timeout or an answer that cannot be read only tells the user.
+//! also printed. Any other status only tells the user, though a JSON answer it printed still
+//! decides, as in Claude Code 2.1.302; a timeout or an answer that cannot be read only tells
+//! the user.
 
 use serde_json::{Map, Value};
 use tickloop_harness_protocol::hooks::{HookDecision, HookEvent, HookRunOutcome, HookSource};
@@ -242,17 +244,29 @@ pub(crate) fn interpret(event: HookEvent, command: &str, exit: HookExit<'_>) -> 
             }
             response
         }
-        code => HookResponse::failed(
-            HookRunOutcome::NonBlockingError,
-            format!(
+        code => {
+            let error = format!(
                 "Failed with non-blocking status code: {}",
                 if stderr.is_empty() {
                     code.map_or_else(|| "no status".to_owned(), |code| code.to_string())
                 } else {
                     stderr.to_owned()
                 }
-            ),
-        ),
+            );
+            let mut response = HookResponse::success();
+            match read_answer(exit.stdout) {
+                Answer::Json(answer) if apply_answer(&mut response, event, &answer).is_ok() => {
+                    response.outcome = if response.blocking_error.is_some() {
+                        HookRunOutcome::Blocking
+                    } else {
+                        HookRunOutcome::NonBlockingError
+                    };
+                    response.error = Some(error);
+                    response
+                }
+                _ => HookResponse::failed(HookRunOutcome::NonBlockingError, error),
+            }
+        }
     }
 }
 
@@ -280,6 +294,7 @@ impl HookVerdict {
     ) -> (Self, Option<String>) {
         let mut verdict = Self::default();
         let mut rewrites = 0;
+        let mut rewritten_by_user = true;
         for (source, response) in responses {
             verdict.cancelled |= response.outcome == HookRunOutcome::Cancelled;
             let permission = response.permission.filter(|permission| {
@@ -301,6 +316,7 @@ impl HookVerdict {
                 && response.permission != Some(HookPermission::Deny)
             {
                 rewrites += 1;
+                rewritten_by_user = *source == HookSource::User;
                 verdict.updated_input = Some(input.clone());
             }
             verdict
@@ -311,6 +327,12 @@ impl HookVerdict {
                 verdict.prevent_continuation = true;
                 verdict.stop_reason = verdict.stop_reason.take().or(response.stop_reason.clone());
             }
+        }
+        // A user's allow covers the input the user's hooks saw or wrote, never another
+        // source's rewrite of it.
+        if verdict.permission == Some(HookPermission::Allow) && !rewritten_by_user {
+            verdict.permission = None;
+            verdict.permission_reason = None;
         }
         let warning = (rewrites > 1).then(|| {
             format!(
@@ -360,14 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn other_statuses_and_timeouts_only_tell_the_user() {
-        let failed = pre(1, "{\"decision\":\"block\"}", "boom");
+    fn other_statuses_only_tell_the_user_unless_their_json_answer_decides() {
+        let failed = pre(1, "not json", "boom");
         assert_eq!(failed.outcome, HookRunOutcome::NonBlockingError);
         assert_eq!(failed.permission, None);
         assert_eq!(
             failed.error.as_deref(),
             Some("Failed with non-blocking status code: boom")
         );
+        let answered = pre(1, r#"{"decision":"block","reason":"no"}"#, "boom");
+        assert_eq!(answered.outcome, HookRunOutcome::Blocking);
+        assert_eq!(answered.permission, Some(HookPermission::Deny));
+        assert_eq!(answered.blocking_error.as_deref(), Some("no"));
+        let quiet = pre(1, r#"{"systemMessage":"careful"}"#, "boom");
+        assert_eq!(quiet.outcome, HookRunOutcome::NonBlockingError);
+        assert_eq!(quiet.system_message.as_deref(), Some("careful"));
         let timed_out = interpret(
             HookEvent::PostToolUse,
             "slow",
@@ -469,6 +498,23 @@ mod tests {
         assert_eq!(verdict.permission, None);
         assert_eq!(allow.decision(&plugin), Some(HookDecision::IgnoredAllow));
         let (verdict, _) = HookVerdict::merge([(&user, &allow)]);
+        assert_eq!(verdict.permission, Some(HookPermission::Allow));
+    }
+
+    #[test]
+    fn a_users_allow_does_not_admit_input_another_source_rewrote() {
+        let user = HookSource::User;
+        let repository = HookSource::Repository;
+        let allow = pre(0, r#"{"decision":"approve"}"#, "");
+        let rewrite = pre(
+            0,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"b"}}}"#,
+            "",
+        );
+        let (verdict, _) = HookVerdict::merge([(&user, &allow), (&repository, &rewrite)]);
+        assert_eq!(verdict.permission, None);
+        assert_eq!(verdict.updated_input, Some(json!({"command":"b"})));
+        let (verdict, _) = HookVerdict::merge([(&user, &allow), (&user, &rewrite)]);
         assert_eq!(verdict.permission, Some(HookPermission::Allow));
     }
 

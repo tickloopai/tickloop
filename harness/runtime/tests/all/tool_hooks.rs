@@ -18,7 +18,11 @@ use tickloop_harness_protocol::{
     DirectApprovalReason, EventKind, ExecutionMode, PermissionApprovalSource, PermissionRequest,
     PermissionRule, PromptPolicy, Role, ToolResult,
 };
-use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
+use tickloop_harness_protocol::{HostEndpointIdentity, HostToolAuthority};
+use tickloop_harness_runtime::environment::ExecutionTools;
+use tickloop_harness_runtime::environment::memory::{
+    MemoryCommandRun, MemoryEnvironment, counter_environment,
+};
 use tickloop_harness_runtime::transcript::{JsonlTranscriptStore, TranscriptStore};
 use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
 use tickloop_harness_test_support::harness::ChosenModels;
@@ -93,6 +97,9 @@ fn pre_tool_answer(fields: Value) -> MemoryCommandRun {
     answer(json!({ "hookSpecificOutput": specific }))
 }
 
+/// A hook command's name, the input it read and the variables it got.
+type RecordedInput = (String, Value, std::collections::BTreeMap<String, String>);
+
 /// One Agent with a Folder, the reference environment and hooks from the Settings Store.
 struct Bench {
     agent: Agent,
@@ -100,7 +107,7 @@ struct Bench {
     environment: Arc<MemoryEnvironment>,
     model: Arc<ScriptedModel>,
     reviewer: Arc<ScriptedModel>,
-    hook_inputs: Arc<Mutex<Vec<(String, Value, std::collections::BTreeMap<String, String>)>>>,
+    hook_inputs: Arc<Mutex<Vec<RecordedInput>>>,
     folder: std::path::PathBuf,
     _directory: tempfile::TempDir,
 }
@@ -113,6 +120,8 @@ struct Options {
     routed: Option<Arc<RoutedModel>>,
     /// Keeps the Chat in a local Transcript store, so hooks get a transcript path.
     keeps_transcripts: bool,
+    /// Offers the environment's Tick tools, with the counter Tick installed.
+    offers_ticks: bool,
 }
 
 impl Options {
@@ -123,6 +132,7 @@ impl Options {
             replies,
             routed: None,
             keeps_transcripts: false,
+            offers_ticks: false,
         }
     }
 }
@@ -132,7 +142,11 @@ impl Bench {
         let directory = tempfile::tempdir().unwrap();
         let folder = directory.path().canonicalize().unwrap();
         std::fs::write(folder.join("notes.txt"), "hello").unwrap();
-        let environment = Arc::new(MemoryEnvironment::new());
+        let environment = Arc::new(if options.offers_ticks {
+            counter_environment()
+        } else {
+            MemoryEnvironment::new()
+        });
         environment.define_shell(BUILD, Duration::ZERO, b"built".to_vec(), 0);
         environment.define_shell(SAFE_BUILD, Duration::ZERO, b"checked".to_vec(), 0);
         environment.define_shell("false", Duration::ZERO, b"failed".to_vec(), 1);
@@ -174,6 +188,18 @@ impl Bench {
         )
         .unwrap();
         agent.set_auto_reviewer(reviewer.clone()).await;
+        if options.offers_ticks {
+            agent
+                .install_host_tools(Arc::new(ExecutionTools::new(
+                    environment.clone(),
+                    HostToolAuthority::Native {
+                        endpoint: HostEndpointIdentity::TrustedAdapter {
+                            scope: tickloop_ids::generate(),
+                        },
+                    },
+                )))
+                .unwrap();
+        }
         let chat = agent.create_chat(folder.clone()).await.unwrap();
         agent.set_execution_mode(chat, options.mode).await.unwrap();
         Self {
@@ -205,6 +231,11 @@ impl Bench {
                 .push((name.clone(), input.clone(), spec.env.clone()));
             run(&input)
         });
+    }
+
+    /// The variables the first hook that ran got.
+    fn first_environment(&self) -> std::collections::BTreeMap<String, String> {
+        self.hook_inputs.lock().unwrap()[0].2.clone()
     }
 
     fn inputs_of(&self, command: &str) -> Vec<Value> {
@@ -319,7 +350,7 @@ async fn pre_tool_use_reads_claude_code_input_and_its_exit_two_refuses_the_call_
     assert_eq!(input["permission_mode"], "acceptEdits");
     assert_eq!(input["transcript_path"], "");
     assert!(input.get("agent_id").is_none());
-    let (_, _, env) = &bench.hook_inputs.lock().unwrap()[0];
+    let env = bench.first_environment();
     assert_eq!(
         env.keys().collect::<Vec<_>>(),
         ["CLAUDE_PROJECT_DIR"],
@@ -350,7 +381,7 @@ async fn a_plugin_hook_may_deny_and_gets_its_directories_but_its_allow_admits_no
         observed.hook_runs[0].decision,
         Some(HookDecision::IgnoredAllow)
     );
-    let (_, _, env) = &bench.hook_inputs.lock().unwrap()[0];
+    let env = bench.first_environment();
     for (name, value) in [
         ("TICKLOOP_PLUGIN_ROOT", "/plugins/guard"),
         ("CLAUDE_PLUGIN_ROOT", "/plugins/guard"),
@@ -951,5 +982,134 @@ async fn an_if_condition_runs_the_hook_only_for_calls_its_permission_rule_matche
     let inputs = bench.inputs_of(GUARD);
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0]["tool_input"]["command"], PUBLISH);
+    bench.agent.shutdown().await;
+}
+
+fn open_counter(id: &str) -> Vec<Content> {
+    call(
+        id,
+        "TickManage",
+        json!({"action": "open", "command": ["/counter"], "cwd": "/", "protocol": true}),
+    )
+}
+
+#[tokio::test]
+async fn host_tool_calls_go_through_the_same_hook_gate() {
+    let ticks = |mode| Options {
+        offers_ticks: true,
+        ..Options::new(mode, vec![open_counter("tick"), text("done")])
+    };
+
+    let bench = Bench::start(
+        ticks(ExecutionMode::Auto),
+        vec![user_hook(HookEvent::PreToolUse, Some("TickManage"), GUARD)],
+    )
+    .await;
+    bench.define(GUARD, |_| {
+        pre_tool_answer(json!({"permissionDecision": "ask"}))
+    });
+    let observed = bench.run("Open the counter.", true).await;
+    assert_eq!(observed.requests.len(), 1);
+    assert_eq!(
+        observed.requests[0].approval_source,
+        PermissionApprovalSource::Hook
+    );
+    assert!(!bench.reviewed());
+    assert!(!observed.results[0].is_error, "{:?}", observed.results[0]);
+    bench.agent.shutdown().await;
+
+    let bench = Bench::start(
+        ticks(ExecutionMode::Auto),
+        vec![user_hook(HookEvent::PreToolUse, Some("TickManage"), GUARD)],
+    )
+    .await;
+    bench.define(GUARD, |_| {
+        pre_tool_answer(json!({"permissionDecision": "allow"}))
+    });
+    let observed = bench.run("Open the counter.", false).await;
+    assert!(observed.requests.is_empty());
+    assert!(!bench.reviewed(), "a user's allow admits before review");
+    assert!(!observed.results[0].is_error, "{:?}", observed.results[0]);
+    assert_eq!(
+        observed.approvals[0].direct_reason,
+        Some(DirectApprovalReason::Hook)
+    );
+    bench.agent.shutdown().await;
+
+    let bench = Bench::start(
+        ticks(ExecutionMode::Auto),
+        vec![
+            user_hook(HookEvent::PreToolUse, Some("TickManage"), GUARD),
+            plugin_hook(HookEvent::PreToolUse, Some("TickManage"), "rewrite.sh"),
+        ],
+    )
+    .await;
+    bench.define(GUARD, |_| {
+        pre_tool_answer(json!({"permissionDecision": "allow"}))
+    });
+    bench.define("rewrite.sh", |input| {
+        let mut rewritten = input["tool_input"].clone();
+        rewritten["cwd"] = json!("/tmp");
+        pre_tool_answer(json!({"updatedInput": rewritten}))
+    });
+    let observed = bench.run("Open the counter.", false).await;
+    assert!(
+        bench.reviewed(),
+        "a user's allow never covers input a plugin rewrote"
+    );
+    assert_ne!(
+        observed.approvals[0].direct_reason,
+        Some(DirectApprovalReason::Hook)
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rewrite_may_not_change_a_tick_calls_action() {
+    let bench = Bench::start(
+        Options {
+            offers_ticks: true,
+            ..Options::new(
+                ExecutionMode::FullAccess,
+                vec![open_counter("tick"), text("done")],
+            )
+        },
+        vec![plugin_hook(
+            HookEvent::PreToolUse,
+            Some("TickManage"),
+            "rewrite.sh",
+        )],
+    )
+    .await;
+    bench.define("rewrite.sh", |_| {
+        pre_tool_answer(
+            json!({"updatedInput": {"action": "subscribe", "tick_instance_id": "hosted:x"}}),
+        )
+    });
+    let observed = bench.run("Open the counter.", true).await;
+    assert_eq!(
+        observed.results[0].content,
+        "A PreToolUse hook's updatedInput changed the action of TickManage; the call was not run."
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unrestricted_host_still_asks_when_a_hook_asks() {
+    let bench = Bench::start(
+        Options {
+            prompt_policy: PromptPolicy::Unrestricted,
+            ..Options::new(ExecutionMode::AcceptEdits, vec![build_call(), text("done")])
+        },
+        vec![plugin_hook(HookEvent::PreToolUse, Some("Bash"), GUARD)],
+    )
+    .await;
+    bench.define(GUARD, |_| {
+        pre_tool_answer(json!({"permissionDecision": "ask"}))
+    });
+    let observed = bench.run("Build it.", false).await;
+    assert_eq!(observed.requests.len(), 1);
+    assert!(observed.started.is_empty());
+    assert!(observed.results[0].is_error);
     bench.agent.shutdown().await;
 }

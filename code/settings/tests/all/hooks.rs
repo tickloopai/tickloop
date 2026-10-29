@@ -160,6 +160,9 @@ fn an_if_condition_is_read_and_names_a_hook_apart_from_the_same_command_without_
             {"type": "command", "command": "guard", "if": "Bash(git push*)"},
             {"type": "command", "command": "blank-if", "if": "  "},
             {"type": "command", "command": "numeric-if", "if": 3},
+            {"type": "command", "command": "path-if", "if": "Edit(src/**)"},
+        ]}], "Stop": [{"hooks": [
+            {"type": "command", "command": "stop-if", "if": "Bash"},
         ]}]}}),
     );
     let first = setup.hooks();
@@ -173,16 +176,25 @@ fn an_if_condition_is_read_and_names_a_hook_apart_from_the_same_command_without_
         [
             ("guard", None),
             ("guard", Some("Bash(git push*)")),
-            ("blank-if", None)
+            ("blank-if", None),
+            ("path-if", Some("Edit(src/**)")),
+            ("stop-if", Some("Bash")),
         ]
     );
     assert_ne!(first.hooks[0].key, first.hooks[1].key);
     let settings = setup.settings_path().display().to_string();
     assert_eq!(
         first.warnings,
-        [format!(
-            "{settings}: PreToolUse hook if must be text such as Bash(git push*); it is skipped"
-        )]
+        [
+            format!(
+                "{settings}: PreToolUse hook if must be text such as Bash(git push*); it is skipped"
+            ),
+            format!(
+                "{settings}: PreToolUse hook if Edit(src/**) cannot be matched; the hook runs for \
+                 every matching call"
+            ),
+            format!("{settings}: Stop hook if applies only to tool events; the hook never runs"),
+        ]
     );
 
     setup.write_user_settings(

@@ -838,12 +838,11 @@ struct RegisteredCall {
     task_binding: Option<Option<tickloop_harness_protocol::TaskExecutionBinding>>,
 }
 
-/// What the call's `PreToolUse` hooks decided, beyond its input.
+/// What the call's `PreToolUse` hooks decided about its admission.
 #[derive(Default)]
 struct HookGate {
     permission: Option<crate::hooks::HookPermission>,
     reason: Option<String>,
-    feedback: crate::hooks::ToolHookFeedback,
 }
 
 impl HookGate {
@@ -1308,7 +1307,7 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(error));
         }
-        let (input, hook_gate) = if registration.is_some() {
+        let (input, hook_gate, pre_tool_feedback) = if registration.is_some() {
             match self
                 .pre_tool_use(receipt, &id, &name, input.clone(), &cancel)
                 .await
@@ -1328,15 +1327,28 @@ impl Agent {
                     reason,
                     feedback,
                 } => {
-                    let rewritten = if rewritten != input
-                        && registration
-                            .as_ref()
-                            .is_some_and(|tool| matches!(tool.route, ToolRoute::Delegation))
-                    {
+                    let route = registration.as_ref().map(|tool| &tool.route);
+                    let rewritten = if rewritten == input {
+                        rewritten
+                    } else if matches!(route, Some(ToolRoute::Delegation)) {
                         delegation::offered_input(self.inner.tool_policy.subagent_launch, rewritten)
+                    } else if crate::tick_tools::is_tick_tool(&name) {
+                        crate::tick_tools::stored_instance_input(&ids, &name, rewritten)
                     } else {
                         rewritten
                     };
+                    // A Tick call's route was chosen by its action; a rewrite may not choose
+                    // another.
+                    if crate::tick_tools::is_tick_tool(&name)
+                        && rewritten.get("action") != input.get("action")
+                    {
+                        return Ok(ToolCallOutcome {
+                            hook_feedback: feedback,
+                            ..ToolCallOutcome::not_admitted(format!(
+                                "A PreToolUse hook's updatedInput changed the action of {name}; the call was not run."
+                            ))
+                        });
+                    }
                     if let Some(registered) = &registration
                         && let Err(error) = validate_registered_input(registered, &rewritten)
                     {
@@ -1345,24 +1357,12 @@ impl Agent {
                             ..ToolCallOutcome::not_admitted(error)
                         });
                     }
-                    (
-                        rewritten,
-                        HookGate {
-                            permission,
-                            reason,
-                            feedback,
-                        },
-                    )
+                    (rewritten, HookGate { permission, reason }, feedback)
                 }
             }
         } else {
-            (input, HookGate::default())
+            (input, HookGate::default(), Default::default())
         };
-        let HookGate {
-            permission,
-            reason,
-            feedback,
-        } = hook_gate;
         let mut outcome = self
             .admit_and_run_call(
                 receipt,
@@ -1375,15 +1375,11 @@ impl Agent {
                     ids,
                     task_binding,
                 },
-                HookGate {
-                    permission,
-                    reason,
-                    feedback: Default::default(),
-                },
+                hook_gate,
                 cancel,
             )
             .await?;
-        let mut hook_feedback = feedback;
+        let mut hook_feedback = pre_tool_feedback;
         hook_feedback.extend(std::mem::take(&mut outcome.hook_feedback));
         outcome.hook_feedback = hook_feedback;
         Ok(outcome)
@@ -1762,7 +1758,15 @@ impl Agent {
                 && !matches!(decision, Decision::Deny | Decision::Allow)
                 && !explicit_ask
                 && !local_read_asks
-                && host_permission != Some(crate::host_tools::HostToolPermission::Confirmation);
+                && !matches!(
+                    host_permission,
+                    Some(
+                        crate::host_tools::HostToolPermission::Confirmation
+                            | crate::host_tools::HostToolPermission::Classified {
+                                allow_rule_bypasses_review: false
+                            }
+                    )
+                );
             let decision = if hook_asks {
                 Decision::Ask
             } else if hook_admits {

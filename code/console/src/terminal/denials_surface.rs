@@ -20,8 +20,8 @@ pub(super) enum DenialsEffect {
 /// One row of Recent activity: a permission decision or a hook run.
 #[derive(Clone)]
 enum Activity {
-    Approval(ApprovalRecord),
-    Hook(HookRunRecord),
+    Approval(Box<ApprovalRecord>),
+    Hook(Box<HookRunRecord>),
 }
 
 impl Activity {
@@ -57,8 +57,13 @@ fn activities(view: &ApprovalHistoryView) -> Vec<Activity> {
         .records
         .iter()
         .cloned()
-        .map(Activity::Approval)
-        .chain(view.hook_runs.iter().cloned().map(Activity::Hook))
+        .map(|record| Activity::Approval(Box::new(record)))
+        .chain(
+            view.hook_runs
+                .iter()
+                .cloned()
+                .map(|record| Activity::Hook(Box::new(record))),
+        )
         .collect::<Vec<_>>();
     activities.sort_by_key(|activity| std::cmp::Reverse(activity.at_ms()));
     activities

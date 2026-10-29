@@ -56,6 +56,14 @@ impl HookEvent {
         Self::ALL.into_iter().find(|event| event.name() == name)
     }
 
+    /// Whether the event is about one tool call, which a hook's `if` can then narrow.
+    pub fn is_tool_event(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse | Self::PostToolUse | Self::PostToolUseFailure
+        )
+    }
+
     /// Whether a matcher selects this event's hooks: the tool name for tool events, the source for
     /// `SessionStart` and the trigger for `PreCompact`. Other events ignore any matcher.
     pub fn uses_matcher(self) -> bool {
@@ -234,7 +242,7 @@ pub struct HookRunRecord {
     /// the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_input: Option<String>,
-    /// Its standard output and error, shortened.
+    /// Its standard output and error, shortened; empty when it asked to suppress its output.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
 }

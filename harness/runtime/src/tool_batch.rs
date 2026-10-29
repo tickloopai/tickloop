@@ -753,10 +753,12 @@ impl Agent {
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
                 .map_err(|error| error.to_string())?;
-            if matches!(
-                chat.snapshot.subagent_reports.get(&receipt.run_id),
-                Some(SubagentReport::Delivered { .. })
-            ) || chat.hook_state.take_stop(receipt.run_id)
+            let stopped_by_hook = chat.hook_state.take_stop(receipt.run_id);
+            if stopped_by_hook
+                || matches!(
+                    chat.snapshot.subagent_reports.get(&receipt.run_id),
+                    Some(SubagentReport::Delivered { .. })
+                )
             {
                 return chat
                     .snapshot

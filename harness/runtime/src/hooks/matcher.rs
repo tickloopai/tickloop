@@ -4,11 +4,13 @@
 //! `Task` select the Subagent tool.
 //!
 //! A hook's `if` then narrows a tool event to calls a Permission Rule such as `Bash(git push*)`
-//! matches, judged as Tickloop's own Permission Rules judge calls.
+//! may match, judged as Tickloop's own Deny and Ask rules judge calls and failing closed.
 
 use serde_json::Value;
 use tickloop_harness_protocol::{Decision, PermissionRule, SUBAGENT_TOOL_NAME, hooks::HookEvent};
-use tickloop_harness_tools::permissions::rule_matches_call;
+use tickloop_harness_tools::permissions::{
+    is_supported_rule_text, parse_rule_text, restriction_may_match_call,
+};
 
 /// The names Claude Code users write for a Tickloop tool, besides its own.
 fn aliases(name: &str) -> &'static [&'static str] {
@@ -29,20 +31,13 @@ fn is_name_list(matcher: &str, allows_commas: bool) -> bool {
         })
 }
 
-pub(crate) fn is_tool_event(event: HookEvent) -> bool {
-    matches!(
-        event,
-        HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
-    )
-}
-
 /// Whether `matcher` selects `query` for `event`; an invalid regular expression selects nothing.
 pub(crate) fn matches(event: HookEvent, matcher: Option<&str>, query: &str) -> bool {
     let Some(matcher) = matcher.filter(|matcher| !matcher.is_empty() && *matcher != "*") else {
         return true;
     };
     let names = std::iter::once(query).chain(aliases(query).iter().copied());
-    let allows_commas = is_tool_event(event);
+    let allows_commas = event.is_tool_event();
     if is_name_list(matcher, allows_commas) {
         let listed = matcher
             .split(|character| character == '|' || (allows_commas && character == ','))
@@ -60,48 +55,31 @@ pub(crate) fn matches(event: HookEvent, matcher: Option<&str>, query: &str) -> b
     }
 }
 
-/// The tool and content of a Permission Rule written as `Tool` or `Tool(content)`, with `\(` and
-/// `\)` standing for parentheses in the content; `Tool()` and `Tool(*)` name the whole tool.
-fn parse_rule(rule: &str) -> Option<(&str, Option<String>)> {
-    let rule = rule.trim();
-    let Some(open) = rule.find('(') else {
-        return (!rule.is_empty()).then_some((rule, None));
-    };
-    let content = rule[open + 1..].strip_suffix(')')?;
-    let tool = rule[..open].trim();
-    if tool.is_empty() {
-        return None;
-    }
-    let content = content.replace("\\(", "(").replace("\\)", ")");
-    let content = content.trim();
-    Some((
-        tool,
-        (!content.is_empty() && content != "*").then(|| content.to_owned()),
-    ))
-}
-
-/// Whether the call of `tool` with `input` matches a hook's `if`; an `if` that is not a
-/// Permission Rule matches nothing.
+/// Whether the call of `tool` with `input` may match a hook's `if`, failing closed so a guard
+/// never misses a call: a compound command matches when any of its commands does, one that
+/// cannot be told apart matches, and an `if` Tickloop cannot match, such as a file path pattern,
+/// matches every call.
 pub(crate) fn condition_matches(condition: &str, tool: &str, input: &Value) -> bool {
-    let Some((rule_tool, specifier)) = parse_rule(condition) else {
-        tracing::warn!("hook if condition {condition:?} is not a Permission Rule");
-        return false;
-    };
-    let rule_tool = if aliases(tool).contains(&rule_tool) {
-        tool
-    } else {
-        rule_tool
+    if !is_supported_rule_text(condition) {
+        return true;
+    }
+    let Some((rule_tool, specifier)) = parse_rule_text(condition) else {
+        return true;
     };
     let rule = PermissionRule {
         id: uuid::Uuid::nil(),
-        decision: Decision::Allow,
-        tool: rule_tool.to_owned(),
+        decision: Decision::Deny,
+        tool: if aliases(tool).contains(&rule_tool.as_str()) {
+            tool.to_owned()
+        } else {
+            rule_tool
+        },
         specifier,
         input: None,
         loop_id: None,
         persistent: false,
     };
-    rule_matches_call(&rule, tool, input, uuid::Uuid::nil())
+    restriction_may_match_call(&rule, tool, input, uuid::Uuid::nil())
 }
 
 #[cfg(test)]
@@ -134,8 +112,43 @@ mod tests {
             "Subagent",
             &json!({"task": "Look"})
         ));
-        assert!(!condition_matches("Bash(git push*", "Bash", &push));
-        assert!(!condition_matches("(git push)", "Bash", &push));
+        assert!(!condition_matches(
+            "Bash(git push*)",
+            "Bash",
+            &json!({"command": "ls > out"})
+        ));
+    }
+
+    #[test]
+    fn an_if_that_cannot_be_judged_lets_the_hook_run() {
+        let push = json!({"command": "git push origin main"});
+        for uncertain in [
+            "cd repo && git push > push.log",
+            "echo $(git push)",
+            "echo 'unclosed",
+        ] {
+            assert!(
+                condition_matches("Bash(git push*)", "Bash", &json!({"command": uncertain})),
+                "{uncertain}"
+            );
+        }
+        assert!(condition_matches("Bash(git push*", "Bash", &push));
+        assert!(condition_matches("(git push)", "Bash", &push));
+        assert!(condition_matches(
+            "Edit(src/**)",
+            "Edit",
+            &json!({"file_path": "/elsewhere/a.rs"})
+        ));
+        assert!(condition_matches(
+            "mcp__github",
+            "mcp__github__create_issue",
+            &json!({})
+        ));
+        assert!(!condition_matches(
+            "mcp__github",
+            "mcp__slack__post",
+            &json!({})
+        ));
     }
 
     #[test]

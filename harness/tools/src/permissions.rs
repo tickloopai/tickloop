@@ -710,6 +710,102 @@ pub fn mcp_rule_matches_call(
     rule_matches_call(&resolved, name, input, loop_id)
 }
 
+/// The tool and content of a Permission Rule written as Claude Code writes one, `Tool` or
+/// `Tool(content)`, with `\(` and `\)` standing for parentheses in the content; `Tool()` and
+/// `Tool(*)` name the whole tool. `None` when the text is not a rule.
+pub fn parse_rule_text(text: &str) -> Option<(String, Option<String>)> {
+    let text = text.trim();
+    let Some(open) = text.find('(') else {
+        return (!text.is_empty() && !text.contains(')')).then(|| (text.to_owned(), None));
+    };
+    let tool = text[..open].trim();
+    let content = text[open + 1..].strip_suffix(')')?;
+    if tool.is_empty() || tool.contains(char::is_whitespace) {
+        return None;
+    }
+    let content = content.replace(r"\(", "(").replace(r"\)", ")");
+    let content = content.trim();
+    Some((
+        tool.to_owned(),
+        (!content.is_empty() && content != "*").then(|| content.to_owned()),
+    ))
+}
+
+/// Whether `text` is a rule whose content Tickloop can match: a Bash command pattern, a `WebFetch`
+/// domain or a whole tool. Path patterns of the file tools are not matched by any rule.
+pub fn is_supported_rule_text(text: &str) -> bool {
+    parse_rule_text(text).is_some_and(|(tool, content)| {
+        content.is_none_or(|content| is_supported_rule_content(&tool, &content))
+    })
+}
+
+/// Whether a restriction written as `rule` may apply to the call, failing closed: as Deny and Ask
+/// rules match, a compound command matches when any of its commands does, here with its
+/// redirections set aside, and a command whose commands cannot be told apart matches whatever
+/// the pattern. An MCP rule names its service by the call's own name, and a call whose service
+/// that name does not show matches too.
+pub fn restriction_may_match_call(
+    rule: &PermissionRule,
+    name: &str,
+    input: &Value,
+    loop_id: Uuid,
+) -> bool {
+    if rule.tool.starts_with("mcp__") && name.starts_with("mcp__") {
+        let Some(server) = name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+            .map(|(server, _)| server)
+            .filter(|server| !server.is_empty())
+        else {
+            return true;
+        };
+        return mcp_rule_matches_call(rule, name, server, input, loop_id);
+    }
+    if name != BASH_TOOL_NAME || !rule_applies_to_tool_and_goal(rule, name, loop_id) {
+        return rule_matches_any(rule, rule.decision, name, input, loop_id);
+    }
+    let Some(pattern) = rule.specifier.as_deref() else {
+        return rule_matches_any(rule, rule.decision, name, input, loop_id);
+    };
+    let Some(command) = input.get("command").and_then(Value::as_str) else {
+        return true;
+    };
+    if shell_rule_matches_any(pattern, input) {
+        return true;
+    }
+    if split_shell_commands(command).is_some() {
+        return false;
+    }
+    let Some(parts) = split_shell_parts(command, true) else {
+        return true;
+    };
+    parts.iter().any(|part| {
+        let part = without_redirections(part);
+        part.contains(['`', '(', ')', '{', '}', '<', '>']) || bash_pattern_matches(pattern, &part)
+    })
+}
+
+/// A simple command with its redirections, such as `> out.txt` or `2>&1`, left out.
+fn without_redirections(command: &str) -> String {
+    let is_redirection = |token: &str| {
+        let operator = token.trim_start_matches(|character: char| character.is_ascii_digit());
+        operator.starts_with(['<', '>']) || operator.starts_with("&>")
+    };
+    let mut kept = Vec::new();
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if !is_redirection(token) {
+            kept.push(token);
+            continue;
+        }
+        let operator = token.trim_start_matches(|character: char| character.is_ascii_digit());
+        if operator.trim_end_matches(['<', '>', '&', '|']).is_empty() {
+            tokens.next();
+        }
+    }
+    kept.join(" ")
+}
+
 fn allow_rules_cover_call(
     rules: &[&PermissionRule],
     name: &str,
@@ -937,6 +1033,98 @@ fn shell_token_ends(command: &str) -> Option<Vec<usize>> {
         ends.push(command.len());
     }
     (!ends.is_empty()).then_some(ends)
+}
+
+#[cfg(test)]
+mod restriction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn deny(tool: &str, specifier: Option<&str>) -> PermissionRule {
+        PermissionRule {
+            id: Uuid::nil(),
+            decision: Decision::Deny,
+            tool: tool.into(),
+            specifier: specifier.map(Into::into),
+            input: None,
+            loop_id: None,
+            persistent: false,
+        }
+    }
+
+    fn bash_matches(pattern: &str, command: &str) -> bool {
+        restriction_may_match_call(
+            &deny(BASH_TOOL_NAME, Some(pattern)),
+            BASH_TOOL_NAME,
+            &json!({ "command": command }),
+            Uuid::nil(),
+        )
+    }
+
+    #[test]
+    fn rule_text_names_a_tool_and_its_content() {
+        assert_eq!(
+            parse_rule_text("Bash(git push*)"),
+            Some(("Bash".into(), Some("git push*".into())))
+        );
+        assert_eq!(parse_rule_text("Bash"), Some(("Bash".into(), None)));
+        assert_eq!(parse_rule_text("Bash(*)"), Some(("Bash".into(), None)));
+        assert_eq!(
+            parse_rule_text(r"Bash(echo \(x\))"),
+            Some(("Bash".into(), Some("echo (x)".into())))
+        );
+        assert_eq!(parse_rule_text("Bash(git push*"), None);
+        assert_eq!(parse_rule_text("(git push)"), None);
+        assert_eq!(parse_rule_text(""), None);
+        assert!(is_supported_rule_text("Bash(git push*)"));
+        assert!(is_supported_rule_text("WebFetch(domain:example.com)"));
+        assert!(is_supported_rule_text("Edit"));
+        assert!(!is_supported_rule_text("Edit(src/**)"));
+        assert!(!is_supported_rule_text("WebFetch(https://example.com)"));
+        assert!(!is_supported_rule_text("Bash(git push*"));
+    }
+
+    #[test]
+    fn a_compound_command_matches_when_any_of_its_commands_does() {
+        assert!(bash_matches("git push*", "git push origin main"));
+        assert!(bash_matches("git push*", "cd repo && git push"));
+        assert!(bash_matches("git push*", "cargo test; git push --force"));
+        assert!(!bash_matches(
+            "git push*",
+            "git commit -m done && cargo test"
+        ));
+    }
+
+    #[test]
+    fn redirections_are_set_aside_and_what_cannot_be_told_apart_matches() {
+        assert!(bash_matches(
+            "git push*",
+            "git push origin main > push.log 2>&1"
+        ));
+        assert!(bash_matches(
+            "git push*",
+            "cargo build > build.log && git push"
+        ));
+        assert!(!bash_matches("git push*", "cargo build > build.log"));
+        assert!(bash_matches("git push*", "echo $(git push)"));
+        assert!(bash_matches("git push*", "(cd repo && git push)"));
+        assert!(bash_matches("git push*", "echo 'unclosed"));
+    }
+
+    #[test]
+    fn mcp_restrictions_name_the_service_from_the_call() {
+        let call = |rule: &str, name: &str| {
+            restriction_may_match_call(&deny(rule, None), name, &json!({}), Uuid::nil())
+        };
+        assert!(call("mcp__github", "mcp__github__create_issue"));
+        assert!(call("mcp__github__*", "mcp__github__create_issue"));
+        assert!(call(
+            "mcp__github__create_issue",
+            "mcp__github__create_issue"
+        ));
+        assert!(!call("mcp__github", "mcp__slack__post"));
+        assert!(call("mcp__github", "mcp__hashedname"));
+    }
 }
 
 #[cfg(test)]

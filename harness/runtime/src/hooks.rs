@@ -86,6 +86,8 @@ struct FinishedRun {
     response: HookResponse,
     duration: Duration,
     exit_code: Option<i32>,
+    /// Its standard output, then its standard error.
+    output: String,
 }
 
 /// One matched hook that may run.
@@ -214,7 +216,7 @@ impl Agent {
                 && (!call.event.uses_matcher()
                     || matcher::matches(call.event, hook.matcher.as_deref(), query))
                 && hook.condition.as_deref().is_none_or(|condition| {
-                    matcher::is_tool_event(call.event)
+                    call.event.is_tool_event()
                         && matcher::condition_matches(
                             condition,
                             query,
@@ -310,32 +312,45 @@ impl Agent {
             cwd: context.folder.to_string_lossy().into_owned(),
             timeout,
         };
-        let (response, exit_code) = match self
+        let (response, exit_code, output) = match self
             .execute_hook_command(receipt, context, spec, cancel)
             .await
         {
-            Err(error) if cancel.is_cancelled() => {
-                (HookResponse::failed(HookRunOutcome::Cancelled, error), None)
-            }
-            Err(error) => (HookResponse::failed(HookRunOutcome::NotRun, error), None),
-            Ok(output) => (
-                output::interpret(
+            Err(error) if cancel.is_cancelled() => (
+                HookResponse::failed(HookRunOutcome::Cancelled, error),
+                None,
+                String::new(),
+            ),
+            Err(error) => (
+                HookResponse::failed(HookRunOutcome::NotRun, error),
+                None,
+                String::new(),
+            ),
+            Ok(command) => {
+                let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
+                let response = output::interpret(
                     call.event,
                     &runnable.hook.command,
                     HookExit {
-                        code: output.exit.code,
-                        timed_out: output.timed_out,
-                        stdout: &output.stdout.text(),
-                        stderr: &output.stderr.text(),
+                        code: command.exit.code,
+                        timed_out: command.timed_out,
+                        stdout: &stdout,
+                        stderr: &stderr,
                     },
-                ),
-                output.exit.code,
-            ),
+                );
+                let output = [stdout.trim(), stderr.trim()]
+                    .into_iter()
+                    .filter(|stream| !stream.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (response, command.exit.code, output)
+            }
         };
         FinishedRun {
             response,
             duration: started.elapsed(),
             exit_code,
+            output,
         }
     }
 
@@ -434,7 +449,7 @@ impl Agent {
                 output: if response.suppress_output {
                     String::new()
                 } else {
-                    shortened(response.plain_text.as_deref().unwrap_or_default())
+                    shortened(&run.output)
                 },
             };
             record_hook_run(self, chat, receipt, record);

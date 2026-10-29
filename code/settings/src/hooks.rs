@@ -24,6 +24,7 @@ use tickloop_harness::protocol::hooks::{
     ConfiguredHook, HookEvent, HookList, HookPluginDirectories, HookSource, HookTrust,
     HookTrustAction, HookTrustChange,
 };
+use tickloop_harness::tools::permissions::is_supported_rule_text;
 
 use crate::{
     InvalidEntry, PROJECTS_KEY, SettingsError, UserSettings, object_entry,
@@ -447,14 +448,29 @@ fn declared_hooks(
             };
             for handler in handlers {
                 match command_hook(handler) {
-                    Ok((command, timeout_secs, condition)) => hooks.push(DeclaredHook {
-                        file: file.to_path_buf(),
-                        event,
-                        matcher: matcher.clone(),
-                        command,
-                        timeout_secs,
-                        condition,
-                    }),
+                    Ok((command, timeout_secs, condition)) => {
+                        if let Some(condition) = &condition {
+                            if !event.is_tool_event() {
+                                warnings.push(format!(
+                                    "{location}: {name} hook if applies only to tool events; \
+                                     the hook never runs"
+                                ));
+                            } else if !is_supported_rule_text(condition) {
+                                warnings.push(format!(
+                                    "{location}: {name} hook if {condition} cannot be matched; \
+                                     the hook runs for every matching call"
+                                ));
+                            }
+                        }
+                        hooks.push(DeclaredHook {
+                            file: file.to_path_buf(),
+                            event,
+                            matcher: matcher.clone(),
+                            command,
+                            timeout_secs,
+                            condition,
+                        })
+                    }
                     Err(problem) => warnings.push(format!("{location}: {name} hook {problem}")),
                 }
             }
