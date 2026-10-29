@@ -360,8 +360,7 @@ Hook 以你的身份在沙箱之外运行，与 Claude Code 中相同。
 
 暂不支持，各自给出警告、其余 Hook 照常运行：`prompt`、`agent`、`http`、`mcp_tool` 类型；`args`、`shell`、`once`、`onFailure` 字段；`Notification`、`PermissionRequest`、`UserPromptExpansion`、`FileChanged` 等其他事件；`CLAUDE_ENV_FILE`；`disableAllHooks`；Skill 或 agent frontmatter 中的 Hook；Codex 的 `.codex/hooks.json`。已知限制：
 
-- `UserPromptSubmit` 只对开始一轮的提示运行，不对并入进行中一轮的提示运行，也不对定时任务、Tick 更新等自动输入运行。
-- `Stop` Hook 拦下、本轮继续时，不会并入期间排队的消息；它们要等循环结束或你按 `esc` 后才处理。
+- `UserPromptSubmit` 对你发送的提示运行，包括 Agent 工作时排队、在本轮中被读入的提示，但不对定时任务、Tick 更新等自动输入运行。
 - `tool_response` 是工具的结果文本（是 JSON 时按 JSON 解析），不是 Claude Code 按工具区分的结构；转录副本中的工具结果也只保留文本。
 - `asyncRewake` Hook 在 `esc` 或 `/stop` 之后才以退出码 2 结束时，通知留到下一轮，不唤醒 Agent。
 - 像 Claude Code 允许的那样以第一行输出 `{"async": true}` 把自己转入后台的 Hook 不会转入后台：它照常运行到结束，输出被报告为无效 JSON。

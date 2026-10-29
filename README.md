@@ -373,8 +373,7 @@ Hooks run as you, outside the sandbox, like hooks in Claude Code.
 
 Not supported yet, each reported with a warning while the other hooks keep working: the `prompt`, `agent`, `http` and `mcp_tool` types; the fields `args`, `shell`, `once` and `onFailure`; other events such as `Notification`, `PermissionRequest`, `UserPromptExpansion` or `FileChanged`; `CLAUDE_ENV_FILE`; `disableAllHooks`; hooks in Skill or agent frontmatter; and Codex's `.codex/hooks.json`. Known limits:
 
-- `UserPromptSubmit` runs for a prompt that starts a turn, not for one merged into a turn already running, nor for scheduled tasks, Tick updates and other automatic input.
-- When a `Stop` hook blocks and the turn goes on, messages you queued meanwhile are not picked up; they wait until the loop ends or you press `esc`.
+- `UserPromptSubmit` runs for the prompts you send, including one queued while the agent works (when the turn takes it in), but not for scheduled tasks, Tick updates and other automatic input.
 - `tool_response` is the tool's result text (parsed when it is JSON), not Claude Code's per-tool structure, and the transcript copy keeps tool results as text.
 - An `asyncRewake` hook that exits 2 after `esc` or `/stop` leaves its notification for the next turn instead of waking the agent.
 - A hook that moves itself to the background by printing `{"async": true}` as its first line of output, as Claude Code allows, is not moved: it runs to the end, and its output is reported as not valid JSON.
