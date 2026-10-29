@@ -34,7 +34,7 @@ struct Factory {
     model: Arc<ScriptedModel>,
     runtimes: Mutex<Vec<Agent>>,
     launches: Mutex<Vec<LaunchSpec>>,
-    cleanups: Mutex<Vec<(Uuid, Uuid)>>,
+    cleanups: Mutex<Vec<Uuid>>,
     retired: AtomicUsize,
     exited: AtomicBool,
     block_directory: Arc<AtomicBool>,
@@ -124,13 +124,8 @@ impl WorkerFactory for Factory {
         self.retired.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn end_managed(
-        &self,
-        _: &LaunchSpec,
-        chat: Uuid,
-        operation: Uuid,
-    ) -> Result<(), AccessError> {
-        self.cleanups.lock().unwrap().push((chat, operation));
+    async fn end_managed(&self, _: &LaunchSpec, chat: Uuid) -> Result<(), AccessError> {
+        self.cleanups.lock().unwrap().push(chat);
         Ok(())
     }
 }
@@ -647,15 +642,7 @@ async fn acp_chat_reuses_identity_after_settle_and_cancel_then_release_revokes_c
     {
         let cleanups = factory.cleanups.lock().unwrap();
         assert_eq!(cleanups.len(), 3);
-        assert!(cleanups.iter().all(|(cleaned, _)| *cleaned == chat));
-        assert_eq!(
-            cleanups[0].1, cleanups[1].1,
-            "retry cleanup must preserve operation identity"
-        );
-        assert_ne!(
-            cleanups[0].1, cleanups[2].1,
-            "a new prompt needs new cleanup ownership"
-        );
+        assert!(cleanups.iter().all(|cleaned| *cleaned == chat));
     }
     execute(
         &daemon,
@@ -957,7 +944,7 @@ async fn hosted_cleanup_runs_even_when_worker_settlement_fails() {
     .unwrap_err();
     assert!(error.message.contains("injected Worker settlement failure"));
     assert_eq!(factory.cleanups.lock().unwrap().len(), 1);
-    assert_eq!(factory.cleanups.lock().unwrap()[0].0, chat);
+    assert_eq!(factory.cleanups.lock().unwrap()[0], chat);
     execute(
         &daemon,
         daemon.daemon_epoch(),
@@ -1191,7 +1178,7 @@ async fn unresponsive_worker_directory_does_not_prevent_managed_lease_cleanup() 
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(owner, _)| *owner == chat)
+                .any(|owner| *owner == chat)
             {
                 break;
             }
@@ -1257,7 +1244,7 @@ async fn reloading_after_a_worker_exit_ends_the_old_invocation_first() {
     // was forgotten.
     let cleanups = factory.cleanups.lock().unwrap().clone();
     assert_eq!(cleanups.len(), 1);
-    assert_eq!(cleanups[0].0, chat);
+    assert_eq!(cleanups[0], chat);
     assert_eq!(factory.retired.load(Ordering::SeqCst), 1);
     // Its proof is gone, so its late release can never end the new invocation's Ticks.
     for command in [

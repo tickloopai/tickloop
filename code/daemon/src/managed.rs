@@ -33,7 +33,6 @@ pub(crate) struct ManagedEntry {
     state: Mutex<State>,
 }
 struct State {
-    operation: Uuid,
     expires: Instant,
     released: bool,
     submitted: bool,
@@ -51,7 +50,6 @@ pub(crate) struct SavedManaged {
     chat: Uuid,
     launch: LaunchSpec,
     token: ManagedToken,
-    operation: Uuid,
     expires_at: SystemTime,
     released: bool,
     submitted: bool,
@@ -120,7 +118,6 @@ impl ManagedRegistry {
                 gate: Arc::new(Mutex::new(())),
                 history: Mutex::new(None),
                 state: Mutex::new(State {
-                    operation: tickloop_harness::ids::generate(),
                     expires: Instant::now() + Duration::from_secs(MANAGED_LEASE_SECONDS),
                     released: false,
                     submitted: false,
@@ -256,7 +253,6 @@ impl ManagedRegistry {
                 chat: entry.chat,
                 launch: entry.launch.clone(),
                 token: entry.token.clone(),
-                operation: state.operation,
                 expires_at: SystemTime::now()
                     + state.expires.saturating_duration_since(Instant::now()),
                 released: state.released,
@@ -281,7 +277,6 @@ impl ManagedRegistry {
                     gate: Arc::new(Mutex::new(())),
                     history: Mutex::new(None),
                     state: Mutex::new(State {
-                        operation: saved.operation,
                         expires: Instant::now()
                             + saved
                                 .expires_at
@@ -432,9 +427,6 @@ impl ManagedEntry {
                 "prior managed cleanup has not succeeded",
             ));
         }
-        if state.settled {
-            state.operation = tickloop_harness::ids::generate();
-        }
         state.submitted = true;
         state.settled = false;
         state.worker_settled = false;
@@ -443,9 +435,6 @@ impl ManagedEntry {
     }
     pub async fn settle(&self) {
         self.state.lock().await.settled = true;
-    }
-    pub async fn operation(&self) -> Uuid {
-        self.state.lock().await.operation
     }
     pub async fn worker_settled(&self) -> bool {
         self.state.lock().await.worker_settled
@@ -517,7 +506,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let operation = entry.operation().await;
         entry.state.lock().await.expires = Instant::now() - Duration::from_secs(1);
         assert_eq!(
             registry
@@ -534,7 +522,6 @@ mod tests {
             entry
                 .cleanup_finished(true, Some("host cleanup unavailable".into()))
                 .await;
-            assert_eq!(entry.operation().await, operation);
             assert!(
                 registry
                     .warning(execution)

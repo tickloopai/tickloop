@@ -157,14 +157,9 @@ impl ProcessWorkerFactory {
 
 #[async_trait]
 impl WorkerFactory for ProcessWorkerFactory {
-    async fn end_managed(
-        &self,
-        launch: &LaunchSpec,
-        chat: Uuid,
-        operation: Uuid,
-    ) -> Result<(), AccessError> {
+    async fn end_managed(&self, launch: &LaunchSpec, chat: Uuid) -> Result<(), AccessError> {
         self.control
-            .end_managed(launch.config_root.as_deref(), chat, operation)
+            .end_managed(launch.config_root.as_deref(), chat)
             .await
     }
     async fn request_upgrade(&self, executable: &Path) -> Result<(), AccessError> {

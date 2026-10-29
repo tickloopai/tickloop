@@ -705,6 +705,74 @@ async fn acp_cancel_running_shell_stops_the_process_and_returns_prompt_response(
         .unwrap();
 }
 
+/// Settling one prompt ends its hosted Ticks without fencing the Chat: the next prompt of the
+/// same session opens Ticks again.
+#[tokio::test]
+async fn acp_each_prompt_opens_hosted_ticks_and_settlement_ends_only_its_own() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(
+        listener.local_addr().unwrap(),
+        json!([{"id":tickloop_harness::ids::generate(), "decision":"allow", "tool":"TickManage"}]),
+    );
+    let markers = ["first.pid", "second.pid"].map(|name| fixture.folder().join(name));
+    let opens = markers.clone().map(|marker| {
+        let command = format!("printf '%s' $$ > '{}'; exec sleep 300", marker.display());
+        tool_stream(
+            "TickManage",
+            json!({"action":"open","command":["/bin/sh","-c",command]}),
+        )
+    });
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for body in [
+            opens[0].clone(),
+            text_stream("first opened"),
+            opens[1].clone(),
+            text_stream("second opened"),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            respond(&mut socket, &body).await;
+        }
+        requests
+    });
+    let mut wire = fixture.spawn();
+    wire.initialize().await;
+    let session = wire.session(2, &fixture).await;
+    let mut pids = Vec::new();
+    for (id, marker) in [(3, &markers[0]), (4, &markers[1])] {
+        wire.prompt(id, &session, "Open the controlled Tick.").await;
+        let response = wire.response(id).await;
+        assert_eq!(
+            response["result"]["stopReason"],
+            "end_turn",
+            "{response}; runtime failures: {:?}",
+            fixture.failures().await
+        );
+        let pid: u32 = std::fs::read_to_string(marker)
+            .unwrap_or_else(|error| panic!("prompt {id} opened no Tick: {error}"))
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !support::has_exited(pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("settlement left the prompt's hosted Tick running");
+        pids.push(pid);
+    }
+    assert_ne!(pids[0], pids[1]);
+    let requests = tokio::time::timeout(TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_result = requests[3]["messages"].to_string();
+    assert!(second_result.contains("hosted:"), "{second_result}");
+    assert!(!second_result.contains("OwnerEnded"), "{second_result}");
+    wire.finish().await;
+}
+
 #[tokio::test]
 async fn acp_process_crash_expires_lease_and_stops_its_shell() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

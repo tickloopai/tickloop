@@ -53,12 +53,7 @@ pub trait WorkerFactory: Send + Sync {
         }
     }
     /// Ends only this managed invocation's hosted ownership; never stops the daemon.
-    async fn end_managed(
-        &self,
-        _launch: &LaunchSpec,
-        _chat: Uuid,
-        _operation: Uuid,
-    ) -> Result<(), AccessError> {
+    async fn end_managed(&self, _launch: &LaunchSpec, _chat: Uuid) -> Result<(), AccessError> {
         Ok(())
     }
     async fn start(
@@ -870,9 +865,7 @@ impl DaemonServer {
     ) -> Result<(), AccessError> {
         tokio::time::timeout(
             Duration::from_secs(10),
-            self.inner
-                .factory
-                .end_managed(&entry.launch, entry.chat, entry.operation().await),
+            self.inner.factory.end_managed(&entry.launch, entry.chat),
         )
         .await
         .map_err(|_| {
