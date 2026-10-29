@@ -43,8 +43,12 @@ const REPOSITORY_SETTINGS_FILES: [&str; 2] =
 const REPOSITORY_HOOKS_DIRECTORY: &str = ".claude/hooks";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 const FINGERPRINT_BUFFER_BYTES: usize = 64 * 1024;
+/// Changes with the fingerprint's encoding, so trust confirmed under an earlier one lapses.
+const FINGERPRINT_VERSION: &[u8] = b"tickloop-hook-content-v3";
 /// Bounds a fingerprint, such as of a symbolic link to a large directory elsewhere.
 const MAX_FINGERPRINT_ENTRIES: usize = 100_000;
+/// What a symbolic link counts as while its target cannot be reached or opened.
+const UNREACHABLE_TARGET: &[u8] = b"unreachable";
 const MAX_FOLLOWED_LINKS: usize = 40;
 
 /// A hook as declared, before its source decides its hash and trust.
@@ -811,11 +815,10 @@ fn plugin_fingerprint(plugin: &InstalledPlugin) -> io::Result<String> {
         Some(shipped) => {
             let record = PathBuf::from(SHIPPED_FILES_RECORD);
             for relative in shipped.iter().chain([&record]) {
-                fingerprint.named(relative);
-                fingerprint.entry(&plugin.root.join(relative), &mut Vec::new(), 0)?;
+                fingerprint.entry(&plugin.root.join(relative), relative, &mut Vec::new(), 0)?;
             }
         }
-        None => fingerprint.entry(&plugin.root, &mut Vec::new(), 0)?,
+        None => fingerprint.entry(&plugin.root, Path::new(""), &mut Vec::new(), 0)?,
     }
     Ok(fingerprint.finish())
 }
@@ -823,27 +826,48 @@ fn plugin_fingerprint(plugin: &InstalledPlugin) -> io::Result<String> {
 /// The fingerprint of everything under `directory`; a missing one counts as empty.
 fn directory_fingerprint(directory: &Path) -> io::Result<String> {
     let mut fingerprint = Fingerprint::new();
-    fingerprint.entry(directory, &mut Vec::new(), 0)?;
+    fingerprint.entry(directory, Path::new(""), &mut Vec::new(), 0)?;
     Ok(fingerprint.finish())
 }
 
-/// A digest of files by their relative paths and bytes. Symbolic links count with their target
-/// and the content behind it; a link that leads nowhere readable, too far or back into a
-/// directory being read counts as a fixed marker, so it changes once it leads somewhere.
+/// A digest of files by their full relative paths and bytes, each directory with its number of
+/// entries, so no two trees encode alike. Symbolic links count with their target and the content
+/// behind it. A link whose target cannot be reached or opened, that leads too far or back into a
+/// directory being read counts as a fixed marker, so it changes once it leads somewhere; any
+/// other failure behind a link fails the fingerprint, as it does in a directory of its own.
 struct Fingerprint {
     hash: Sha256,
     buffer: Vec<u8>,
     entries: usize,
+    entry_limit: usize,
+}
+
+/// A directory opened for reading, by its canonical path.
+struct OpenDirectory {
+    canonical: PathBuf,
+    listing: fs::ReadDir,
+}
+
+fn open_directory(path: &Path) -> io::Result<OpenDirectory> {
+    Ok(OpenDirectory {
+        canonical: fs::canonicalize(path)?,
+        listing: fs::read_dir(path)?,
+    })
 }
 
 impl Fingerprint {
     fn new() -> Self {
+        Self::with_entry_limit(MAX_FINGERPRINT_ENTRIES)
+    }
+
+    fn with_entry_limit(entry_limit: usize) -> Self {
         let mut hash = Sha256::new();
-        hash.update(b"tickloop-hook-content-v2");
+        hash.update(FINGERPRINT_VERSION);
         Self {
             hash,
             buffer: vec![0; FINGERPRINT_BUFFER_BYTES],
             entries: 0,
+            entry_limit,
         }
     }
 
@@ -860,49 +884,38 @@ impl Fingerprint {
         self.hash.update(bytes);
     }
 
-    /// `ancestors` holds the directories being read, canonical; `links` counts the symbolic
-    /// links followed to reach `path`.
-    fn entry(&mut self, path: &Path, ancestors: &mut Vec<PathBuf>, links: usize) -> io::Result<()> {
+    /// Hashes `path`, named `relative` from where the fingerprint starts. `ancestors` holds the
+    /// directories being read, canonical; `links` counts the symbolic links followed to reach
+    /// `path`.
+    fn entry(
+        &mut self,
+        path: &Path,
+        relative: &Path,
+        ancestors: &mut Vec<PathBuf>,
+        links: usize,
+    ) -> io::Result<()> {
         self.entries += 1;
-        if self.entries > MAX_FINGERPRINT_ENTRIES {
+        if self.entries > self.entry_limit {
             return Err(io::Error::other(format!(
-                "more than {MAX_FINGERPRINT_ENTRIES} entries to read"
+                "more than {} entries to read",
+                self.entry_limit
             )));
         }
+        self.named(relative);
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.hash.update(b"missing");
+                self.bytes(b"missing");
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
         if metadata.is_symlink() {
-            self.hash.update(b"symlink");
-            self.named(&fs::read_link(path)?);
-            if links >= MAX_FOLLOWED_LINKS {
-                self.hash.update(b"too many links");
-                return Ok(());
-            }
-            match fs::metadata(path) {
-                Ok(target) if target.is_dir() => {
-                    if self.directory(path, ancestors, links + 1).is_err() {
-                        self.hash.update(b"unreadable");
-                    }
-                }
-                Ok(target) if target.is_file() => {
-                    if self.file(path, target.len()).is_err() {
-                        self.hash.update(b"unreadable");
-                    }
-                }
-                Ok(_) => self.hash.update(b"special"),
-                Err(_) => self.hash.update(b"unreadable"),
-            }
-            Ok(())
+            self.link(path, relative, ancestors, links)
         } else if metadata.is_dir() {
-            self.directory(path, ancestors, links)
+            self.directory(open_directory(path)?, relative, ancestors, links)
         } else if metadata.is_file() {
-            self.file(path, metadata.len())
+            self.file(fs::File::open(path)?, path, metadata.len())
         } else {
             Err(io::Error::other(format!(
                 "{} is not a file, directory or symlink",
@@ -911,38 +924,78 @@ impl Fingerprint {
         }
     }
 
-    fn directory(
+    fn link(
         &mut self,
         path: &Path,
+        relative: &Path,
         ancestors: &mut Vec<PathBuf>,
         links: usize,
     ) -> io::Result<()> {
-        let canonical = fs::canonicalize(path)?;
-        if ancestors.contains(&canonical) {
-            self.hash.update(b"cycle");
+        self.bytes(b"symlink");
+        self.named(&fs::read_link(path)?);
+        if links >= MAX_FOLLOWED_LINKS {
+            self.bytes(b"too many links");
             return Ok(());
         }
-        let mut entries = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
-        entries.sort_by_key(fs::DirEntry::file_name);
-        self.hash.update(b"directory");
-        ancestors.push(canonical);
-        for entry in entries {
-            self.named(Path::new(&entry.file_name()));
-            let result = self.entry(&entry.path(), ancestors, links);
-            if result.is_err() {
-                ancestors.pop();
-                return result;
+        match fs::metadata(path) {
+            Ok(target) if target.is_dir() => match open_directory(path) {
+                Ok(directory) => self.directory(directory, relative, ancestors, links + 1),
+                Err(_) => {
+                    self.bytes(UNREACHABLE_TARGET);
+                    Ok(())
+                }
+            },
+            Ok(target) if target.is_file() => match fs::File::open(path) {
+                Ok(file) => self.file(file, path, target.len()),
+                Err(_) => {
+                    self.bytes(UNREACHABLE_TARGET);
+                    Ok(())
+                }
+            },
+            Ok(_) => {
+                self.bytes(b"special");
+                Ok(())
+            }
+            Err(_) => {
+                self.bytes(UNREACHABLE_TARGET);
+                Ok(())
             }
         }
-        ancestors.pop();
-        Ok(())
     }
 
-    fn file(&mut self, path: &Path, length: u64) -> io::Result<()> {
+    fn directory(
+        &mut self,
+        directory: OpenDirectory,
+        relative: &Path,
+        ancestors: &mut Vec<PathBuf>,
+        links: usize,
+    ) -> io::Result<()> {
+        if ancestors.contains(&directory.canonical) {
+            self.bytes(b"cycle");
+            return Ok(());
+        }
+        let mut entries = directory.listing.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        self.bytes(b"directory");
+        self.hash.update((entries.len() as u64).to_le_bytes());
+        ancestors.push(directory.canonical);
+        let result = entries.iter().try_for_each(|entry| {
+            self.entry(
+                &entry.path(),
+                &relative.join(entry.file_name()),
+                ancestors,
+                links,
+            )
+        });
+        ancestors.pop();
+        result
+    }
+
+    fn file(&mut self, file: fs::File, path: &Path, length: u64) -> io::Result<()> {
         // Reads at most one byte past the observed size, to tell a file that changes while it is
         // read from a fingerprint of part of it.
-        let mut file = fs::File::open(path)?.take(length.saturating_add(1));
-        self.hash.update(b"file");
+        let mut file = file.take(length.saturating_add(1));
+        self.bytes(b"file");
         self.hash.update(length.to_le_bytes());
         let mut read = 0_u64;
         loop {
@@ -965,4 +1018,28 @@ impl Fingerprint {
 
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_entry_limit_reached_behind_a_link_fails_the_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let scripts = directory.path().join("hooks");
+        let elsewhere = directory.path().join("elsewhere");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fs::write(elsewhere.join(name), name).unwrap();
+        }
+        std::os::unix::fs::symlink(&elsewhere, scripts.join("z")).unwrap();
+
+        let mut fingerprint = Fingerprint::with_entry_limit(4);
+        let error = fingerprint
+            .entry(&scripts, Path::new(""), &mut Vec::new(), 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("more than 4 entries"), "{error}");
+    }
 }
