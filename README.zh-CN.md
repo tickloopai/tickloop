@@ -67,7 +67,7 @@ curl -fsSL https://tickloop.ai/install.sh | sh
 - `esc` 打断 Agent。输入为空时连按两次，可撤回到之前的某条消息。
 - `shift+tab` 在 Auto 与 Plan 模式之间切换。
 - `ctrl+j` 换行；`ctrl+g` 用外部编辑器编辑消息。
-- 列表和菜单中用 `j`／`k` 或方向键移动，`enter` 选择，`esc` 返回。
+- 列表和菜单中用 `ctrl+n`／`ctrl+p` 或方向键移动，`enter` 选择，`esc` 返回。
 - Tick 以卡片显示在 Monitor 列中，在 Herdr 内外都一样。在 Monitor 列表中按 `space`（或点击该行）显示或隐藏 Tick 的卡片；按 `enter`（或点击已打开的卡片）进入 Tick，之后按键都交给它，`ctrl+c` 也一样。可以同时打开多张卡片。
 - 在 Monitor 列表中，`tab` 和 `shift+tab` 依次经过每一行，并预览经过的 Tick 的卡片；移到下一行时预览关闭，除非进入了它（按 `space` 与其他卡片一样隐藏它）。`n` 跳到下一个有未看更新的行；这样的行滚出视野时，边缘会显示 `↑ 2 updated` 或 `↓ 1 updated`，点击它也会跳过去。各行保持加入时的顺序，更新不会让它们移动。
 - 在卡片中单按 `esc` 交给 Tick；连按 `esc esc` 离开，卡片保持打开。支持的 Tick 会把自己不用的按键交还：这时单按 `esc` 即离开，上下方向键离开到列表并选中上一张或下一张卡片的行，`tab` 和 `shift+tab` 离开到列表并像在列表中一样移动，左方向键回到输入框。进入另一张卡片仍需按 `enter` 或点击。点击卡片以外的地方也会离开。Shell 卡片只读，按 `esc` 离开。隐藏卡片或离开都不会结束程序。
@@ -111,13 +111,13 @@ Plan 模式仍拒绝文件编辑和会改变状态的命令，只有 Agent 写�
 
 ### 从 Claude Code 导入 Auto 规则
 
-在 `/permissions` → Auto mode 中选择 **Import from Claude Code**，可把 Claude Code 用户设置（`~/.claude/settings.json`；设置了 `CLAUDE_CONFIG_DIR` 时为该目录中的 `settings.json`）里 `autoMode` 的规则一次性复制过来。不读取任何项目文件，也不修改 Claude Code 的文件。`allow` 条目成为 Soft allow 规则，`soft_deny`（或旧名 `deny`）成为 Soft deny 规则，`environment` 成为标明“导入”来源的全局 Environment 条目。预览按“将添加 / 将跳过”列出每条及原因：与已有自定义规则文字相同的、与 Tickloop 内置规则同名的默认跳过，可以手动勾回；空的、超过 4096 字节的，或会让某组超过 256 条的条目不能保存。Soft allow 条目标有 **Will relax review**（会放宽审查）。`j`/`k` 移动，空格勾选，`enter` 保存，`esc` 取消且不改动。内置规则会保留；导入后的规则就是普通的自定义规则，不能覆盖显式 Ask 或 Deny。只有你能发起导入，Agent 没有对应的工具。
+在 `/permissions` → Auto mode 中选择 **Import from Claude Code**，可把 Claude Code 用户设置（`~/.claude/settings.json`；设置了 `CLAUDE_CONFIG_DIR` 时为该目录中的 `settings.json`）里 `autoMode` 的规则一次性复制过来。不读取任何项目文件，也不修改 Claude Code 的文件。`allow` 条目成为 Soft allow 规则，`soft_deny`（或旧名 `deny`）成为 Soft deny 规则，`environment` 成为标明“导入”来源的全局 Environment 条目。预览按“将添加 / 将跳过”列出每条及原因：与已有自定义规则文字相同的、与 Tickloop 内置规则同名的默认跳过，可以手动勾回；空的、超过 4096 字节的，或会让某组超过 256 条的条目不能保存。Soft allow 条目标有 **Will relax review**（会放宽审查）。`Ctrl+N`/`Ctrl+P` 移动，空格勾选，`enter` 保存，`esc` 取消且不改动。内置规则会保留；导入后的规则就是普通的自定义规则，不能覆盖显式 Ask 或 Deny。只有你能发起导入，Agent 没有对应的工具。
 
 ### 沙箱（macOS）
 
 在 macOS 上，Bash、后台 Shell 和 `!` Shell 可以在操作系统沙箱中运行。沙箱默认关闭，只读取你自己的 `settings.json`；仓库内容不能打开、关闭或放宽它。例如：
 
-用 `/sandbox` 打开 **Mode**（沙箱且免审、沙箱但正常审批、关闭）、**Overrides**（允许申请越出或严格模式）与只读的 **Config** 页。左右键切页，`j`/`k` 或 `Ctrl+N`/`Ctrl+P` 移动或滚动，Enter 保存，Esc 关闭。`/sandbox exclude "docker:*"` 为本 Folder 添加排除命令；排除命令仍走正常审批。非 macOS 平台可以查看设置，但不能通过此命令开启沙箱。
+用 `/sandbox` 打开 **Mode**（沙箱且免审、沙箱但正常审批、关闭）、**Overrides**（允许申请越出或严格模式）与只读的 **Config** 页。左右键切页，`Ctrl+N`/`Ctrl+P` 或上下键移动或滚动，Enter 保存，Esc 关闭。`/sandbox exclude "docker:*"` 为本 Folder 添加排除命令；排除命令仍走正常审批。非 macOS 平台可以查看设置，但不能通过此命令开启沙箱。
 
 改动只保存到用户自己的 `settings.json` 的 `projects["<规范化 Folder 路径>"].sandbox`，下一条命令起生效，无需重启。目录标量覆盖全局 `sandbox`；`excludedCommands`、`filesystem.allowWrite`/`denyWrite`、`network.allowedDomains` 合并两层并去重。Config 标出每项来源，并展示可写范围、受保护路径、网络规则与本机支持情况。其他窗口同时修改沙箱设置时，页面刷新并要求重新确认，不覆盖别人的改动。`/permissions` 提示可用 `/sandbox` 修改。
 
@@ -180,7 +180,7 @@ tickloop tick install --path ./my-tick    # 本地 Tick 目录或 .tar.gz 压缩
 
 官方 Tick 来自内置的 `tickloop` marketplace，源码在 [tickloopai/ticks](https://github.com/tickloopai/ticks)。带 Tick 程序的插件就是 Tick，即使它也带 Skill：装好后只出现在 `/ticks` 和 `tickloop tick` 中，不出现在 `/plugins`。安装前就能看出种类时（Tick marketplace 的包或本地目录），`tickloop plugin` 拒绝 Tick 并给出应改用的 `tickloop tick` 命令，反之亦然。
 
-在 `/ticks` 中，用 `Tab` 或左右键切换 **Installed**（已安装）和 **Available**（可安装），`j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择。已安装页按 `Enter` 打开 Tick 的操作：登录/退出登录、更新、启用/禁用；每行显示 marketplace、启用状态、版本和登录状态。登录在面板内完成：OAuth 的 Tick 显示链接和验证码，在任意设备的浏览器中确认；密钥以遮掩方式输入。可安装页按 `Enter` 安装或更新所选 Tick，按 `/` 开始过滤名字、说明和 marketplace，不区分大小写；过滤时 `j`/`k` 是文字，`Ctrl+N`/`Ctrl+P` 选择，`Ctrl+G` 打开外部编辑器。`Esc` 退出过滤并保留查询，再按一次关闭面板。
+在 `/ticks` 中，用 `Tab` 或左右键切换 **Installed**（已安装）和 **Available**（可安装），`Ctrl+N`/`Ctrl+P` 或上下键选择。已安装页按 `Enter` 打开 Tick 的操作：登录/退出登录、更新、启用/禁用；每行显示 marketplace、启用状态、版本和登录状态。登录在面板内完成：OAuth 的 Tick 显示链接和验证码，在任意设备的浏览器中确认；密钥以遮掩方式输入。可安装页按 `Enter` 安装或更新所选 Tick，按 `/` 开始过滤名字、说明和 marketplace，不区分大小写；过滤时字母是文字，`Ctrl+N`/`Ctrl+P` 选择，`Ctrl+G` 打开外部编辑器。`Esc` 退出过滤并保留查询，再按一次关闭面板。
 
 在已安装页同一行三秒内按两次 `x` 卸载：删除该 Tick 的数据，保留登录，不停止运行中的 Tick。移动选择、按其他键、离开或超时都会取消确认。登录保留在配置目录的 `credentials/NAME/`；要删除保存的登录，先退出登录再卸载。
 
@@ -278,7 +278,7 @@ MCP 工具默认采用 `exposure: "search"`。模型卡支持原生 Tool Search 
 
 ### 管理服务与登录
 
-`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连、在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`），以及修改暴露方式。登录或重连后服务立即连接，行内先显示 `connecting`，列出工具后显示 `connected · N tools`，失败则显示 `failed`，原因写在操作菜单里。Agent 启动前，打开面板会连接远程服务以列出工具，随后关闭这些连接；本地（stdio）服务显示 `starts with the Agent`，只有选 Connect 或按 `r` 才连接。在服务上按 `e`，暴露方式按 `search` → `direct` → `hidden` → `search` 循环切换，每次立即保存。用户服务的 `exposure` 写回该条目所在的那一层（全局与当前目录同名时写到当前目录），改为 `search` 时删除该字段；插件服务的选择按完整服务名记在全局设置的 `pluginMcpServerExposure` 对象中（例如 `"pluginMcpServerExposure": {"plugin_docs_search": "direct"}`），覆盖插件自带的 `exposure`，插件更新后仍然有效。运行中的 Agent 从下一次请求起按新暴露方式提供工具，一轮进行中也是如此。用 `j`/`k` 或 `Ctrl+N`/`Ctrl+P` 选择，`Enter` 打开操作，`e` 切换暴露方式，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目；`toolExposure` 在 `settings.json` 中编辑。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
+`/mcp` 按全局、当前目录和各插件分组显示 Agent 的服务，每行有连接方式、状态（已连接、连接中、失败、需要登录、需要配置、已停用、暂不支持）、工具数和暴露方式。在服务上按 Enter 可以查看工具、登录或重新登录、退出登录、重连、在当前目录停用或启用（插件服务同样适用，记在 `projects[<目录>].disabledMcpServers`），以及修改暴露方式。登录或重连后服务立即连接，行内先显示 `connecting`，列出工具后显示 `connected · N tools`，失败则显示 `failed`，原因写在操作菜单里。Agent 启动前，打开面板会连接远程服务以列出工具，随后关闭这些连接；本地（stdio）服务显示 `starts with the Agent`，只有选 Connect 或按 `r` 才连接。在服务上按 `e`，暴露方式按 `search` → `direct` → `hidden` → `search` 循环切换，每次立即保存。用户服务的 `exposure` 写回该条目所在的那一层（全局与当前目录同名时写到当前目录），改为 `search` 时删除该字段；插件服务的选择按完整服务名记在全局设置的 `pluginMcpServerExposure` 对象中（例如 `"pluginMcpServerExposure": {"plugin_docs_search": "direct"}`），覆盖插件自带的 `exposure`，插件更新后仍然有效。运行中的 Agent 从下一次请求起按新暴露方式提供工具，一轮进行中也是如此。用 `Ctrl+N`/`Ctrl+P` 或上下键选择，`Enter` 打开操作，`e` 切换暴露方式，`r` 刷新，`Esc` 返回。添加和删除服务使用 `tickloop mcp add` 和 `remove`，面板只管理已有条目；`toolExposure` 在 `settings.json` 中编辑。登录页显示链接，本机可以打开浏览器；远程使用时在自己的电脑上打开链接，把完整回调地址粘贴回面板；`Esc` 或 `Ctrl+C` 取消。`/plugins` 的已安装行显示插件带几个 MCP 服务以及是否需要登录。
 
 远程 MCP 服务需要 OAuth 时，运行 `tickloop mcp login <服务>`，在浏览器打开终端打印的链接。Tickloop 可以自动接收本机回调；通过 SSH 使用时，也可以把浏览器跳转后的完整地址粘贴回终端。Ctrl+C 取消，不覆盖已有登录；终端回调输入支持 Ctrl+G 打开外部编辑器。插件服务支持 `plugin:<插件>:<服务>` 和 `plugin_<插件>_<服务>` 两种写法。
 

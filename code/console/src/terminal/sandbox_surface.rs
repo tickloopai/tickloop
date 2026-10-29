@@ -383,7 +383,7 @@ impl SandboxSurface {
         }
         lines.push(RoleLine::role(
             if self.page == Page::Config {
-                "←/→ page · j/k ctrl+n/p scroll · home/end · esc close"
+                "←/→ page · ctrl+n/p scroll · home/end · esc close"
             } else {
                 "enter save · esc close"
             },

@@ -310,7 +310,7 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
         (
             MonitorTarget::Goal,
             "",
-            "enter Goal details · j/k select · esc return to input",
+            "enter Goal details · ctrl+n/p select · esc return to input",
         ),
     ];
     let mut goal_row = None;
@@ -593,7 +593,7 @@ fn monitor_hint_omits_basic_navigation() {
             .monitor
             .lines(140, 25, state.display, 0)
             .iter()
-            .any(|line| line.text().contains("j/k move"))
+            .any(|line| line.text().contains("ctrl+n/p move"))
     );
 }
 
@@ -752,7 +752,7 @@ fn focused_monitor_does_not_paste_into_composer_or_show_basic_navigation_hints()
         !state
             .rendered_screen
             .iter()
-            .any(|row| row.contains("j/k move"))
+            .any(|row| row.contains("ctrl+n/p move"))
     );
 }
 

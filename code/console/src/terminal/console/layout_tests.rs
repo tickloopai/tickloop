@@ -5385,3 +5385,17 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
         );
     }
 }
+
+#[test]
+fn agent_layout_help_lists_ctrl_n_p_navigation_instead_of_j_k() {
+    let text = |lines: Vec<RoleLine>| {
+        lines
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let help = text(agent_layout::help_lines(200, 200, None));
+    assert!(help.contains("ctrl+n/p list navigation"), "{help}");
+    assert!(!help.contains("j/k"), "{help}");
+}

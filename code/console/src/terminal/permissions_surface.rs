@@ -1452,10 +1452,18 @@ impl PermissionsSurface {
             Focus::Detail => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Enter) {
                     self.focus = Focus::List;
-                } else if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                } else if matches!(
+                    (key.code, key.modifiers),
+                    (KeyCode::Down | KeyCode::Char('j'), _)
+                        | (KeyCode::Char('n'), KeyModifiers::CONTROL)
+                ) {
                     self.detail_scroll = self.detail_scroll.saturating_add(1);
                     self.focus = Focus::Detail;
-                } else if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                } else if matches!(
+                    (key.code, key.modifiers),
+                    (KeyCode::Up | KeyCode::Char('k'), _)
+                        | (KeyCode::Char('p'), KeyModifiers::CONTROL)
+                ) {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                     self.focus = Focus::Detail;
                 } else if key.code == KeyCode::PageDown {
@@ -1653,11 +1661,13 @@ impl PermissionsSurface {
                     (KeyCode::Esc | KeyCode::Left | KeyCode::Enter, _) => {
                         self.focus = Focus::AutoGroup(group)
                     }
-                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                    | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                         scroll = scroll.saturating_sub(1);
                         self.focus = Focus::AutoRuleDetail { group, id, scroll };
                     }
-                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         scroll += 1;
                         self.focus = Focus::AutoRuleDetail { group, id, scroll };
                     }
@@ -1700,10 +1710,12 @@ impl PermissionsSurface {
             } => {
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc | KeyCode::Left, _) => return PermissionsEffect::None,
-                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                    | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                         selected = selected.saturating_sub(1)
                     }
-                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                    | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         selected = (selected + 1)
                             .min(3 + self.view.auto_rule_settings.environment_entries.len())
                     }
@@ -1849,7 +1861,7 @@ impl PermissionsSurface {
                 removed,
                 mut scroll,
             } => match (key.code, key.modifiers) {
-                (KeyCode::Enter | KeyCode::Char('y'), _) => {
+                (KeyCode::Enter, _) | (KeyCode::Char('y'), KeyModifiers::NONE) => {
                     self.focus = Focus::AutoPreview {
                         change: change.clone(),
                         title,
@@ -1858,7 +1870,7 @@ impl PermissionsSurface {
                     };
                     PermissionsEffect::Apply(change)
                 }
-                (KeyCode::Esc | KeyCode::Char('n'), _) => {
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     self.message = Some("No change".into());
                     self.focus = match &change {
                         PermissionChange::ChangeAutoRules {
@@ -1892,7 +1904,8 @@ impl PermissionsSurface {
                     };
                     PermissionsEffect::None
                 }
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                     scroll = scroll.saturating_sub(1);
                     self.focus = Focus::AutoPreview {
                         change,
@@ -1902,7 +1915,8 @@ impl PermissionsSurface {
                     };
                     PermissionsEffect::None
                 }
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                     scroll += 1;
                     self.focus = Focus::AutoPreview {
                         change,
@@ -2200,7 +2214,7 @@ impl PermissionsSurface {
         match &self.focus {
             Focus::AutoImport(draft) => {
                 body.extend(draft.lines());
-                "j/k select · space toggle · enter save · pgup/pgdn scroll · esc cancel"
+                "ctrl+n/p select · space toggle · enter save · pgup/pgdn scroll · esc cancel"
             }
             Focus::AutoSetup(setup) => {
                 body.push(plain_row(format!(
@@ -2208,7 +2222,7 @@ impl PermissionsSurface {
                     self.view.working_directory.display()
                 )));
                 body.extend(setup.lines(width));
-                "j/k select · enter toggle/continue · e edit · s scope · r descendants · ctrl+g editor · esc back"
+                "ctrl+n/p select · enter toggle/continue · e edit · s scope · r descendants · ctrl+g editor · esc back"
             }
             Focus::Detail => {
                 if self.page == Page::Directories {
@@ -3155,6 +3169,79 @@ mod tests {
             });
         }
         PermissionsSurface::open(view, PermissionsReturn::ModePicker { settings: false })
+    }
+
+    #[tokio::test]
+    async fn ctrl_n_p_move_every_auto_page_like_j_k_and_never_answer_the_preview() {
+        let control = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        let mut surface = zebra_surface().await;
+        surface.open_auto();
+        surface.focus = Focus::AutoGroup(AutoGroupState::new(AutoRuleKind::SoftDeny));
+        let group_selection = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::AutoGroup(group) => group.selected,
+            _ => panic!("the Auto group closed"),
+        };
+        surface.key(control('n'));
+        assert_eq!(group_selection(&surface), 1);
+        surface.key(control('p'));
+        assert_eq!(group_selection(&surface), 0);
+        press(&mut surface, KeyCode::Char('j'));
+        assert_eq!(group_selection(&surface), 1);
+
+        surface.focus = Focus::AutoEnvironment {
+            selected: 0,
+            scroll: 0,
+        };
+        let environment_selection = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::AutoEnvironment { selected, .. } => *selected,
+            _ => panic!("the Environment page closed"),
+        };
+        surface.key(control('n'));
+        assert_eq!(environment_selection(&surface), 1);
+        surface.key(control('p'));
+        assert_eq!(environment_selection(&surface), 0);
+
+        surface.focus = Focus::AutoRuleDetail {
+            group: AutoGroupState::new(AutoRuleKind::SoftDeny),
+            id: "missing".into(),
+            scroll: 0,
+        };
+        let detail_scroll = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::AutoRuleDetail { scroll, .. } => *scroll,
+            _ => panic!("the rule detail closed"),
+        };
+        surface.key(control('n'));
+        assert_eq!(detail_scroll(&surface), 1);
+        surface.key(control('p'));
+        assert_eq!(detail_scroll(&surface), 0);
+
+        surface.preview(
+            PermissionChange::ChangeAutoRules {
+                change: AutoRuleChange::RestoreGroup {
+                    kind: AutoRuleKind::SoftDeny,
+                },
+            },
+            "Restore group".into(),
+        );
+        let preview_scroll = |surface: &PermissionsSurface| match &surface.focus {
+            Focus::AutoPreview { scroll, .. } => *scroll,
+            _ => panic!("ctrl+n or ctrl+p answered the preview"),
+        };
+        surface.key(control('n'));
+        assert_eq!(preview_scroll(&surface), 1);
+        surface.key(control('p'));
+        assert_eq!(preview_scroll(&surface), 0);
+        surface.key(control('y'));
+        assert_eq!(preview_scroll(&surface), 0);
+
+        surface.focus = Focus::Detail;
+        surface.detail_scroll = 0;
+        surface.key(control('n'));
+        assert_eq!(surface.detail_scroll, 1);
+        surface.key(control('p'));
+        assert_eq!(surface.detail_scroll, 0);
+        press(&mut surface, KeyCode::Char('j'));
+        assert_eq!(surface.detail_scroll, 1);
     }
 
     #[tokio::test]
