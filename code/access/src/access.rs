@@ -107,7 +107,9 @@ use tickloop_harness::protocol::{
 /// and changing their trust records.
 /// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
 /// reason, which older readers reject as unknown, and the hook runs of the approval history.
-pub const PROTOCOL_MAJOR: u16 = 37;
+/// 38.0 adds the host note carrying what a hook gave the model, which older readers reject as
+/// unknown in the Chat snapshot's host notes, and a launch that starts its Agent after `/clear`.
+pub const PROTOCOL_MAJOR: u16 = 38;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -255,6 +257,9 @@ pub struct LaunchSpec {
     pub exact_chat: Option<Uuid>,
     pub environment: Vec<EnvironmentValue>,
     pub host_work_context: Option<HostWorkContext>,
+    /// The Agent starts the session `/clear` began: its `SessionStart` hooks read `clear`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_clear: bool,
 }
 
 impl LaunchSpec {
@@ -269,6 +274,7 @@ impl LaunchSpec {
             exact_chat: None,
             environment: Vec::new(),
             host_work_context: None,
+            after_clear: false,
         }
     }
 }

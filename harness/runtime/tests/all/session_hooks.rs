@@ -1,0 +1,1008 @@
+//! Claude Code–compatible `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `Stop`,
+//! `SubagentStop`, `StopFailure` and `PreCompact` hooks on the Loop's lifecycle, run through the
+//! reference Execution Environment's one-shot commands.
+
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tickloop_harness_model::ModelRequest;
+use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
+use tickloop_harness_protocol::hooks::{
+    ConfiguredHook, HookEvent, HookList, HookRunOutcome, HookRunRecord, HookSource, HookTrust,
+};
+use tickloop_harness_protocol::{
+    AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalStatus, Message,
+    Receipt, Role,
+};
+use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
+use tickloop_harness_runtime::transcript::{JsonlTranscriptStore, TranscriptStore};
+use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
+use tickloop_harness_test_support::harness::ChosenModels;
+use tickloop_harness_test_support::routed::RoutedModel;
+use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
+
+/// Requests start with the system prompt and the user context.
+const FIRST_CONVERSATION_MESSAGE: usize = 2;
+const RALPH_PROMPT: &str = "Keep improving the README until it is perfect.";
+
+fn user_hook(event: HookEvent, matcher: Option<&str>, command: &str) -> ConfiguredHook {
+    ConfiguredHook {
+        key: format!("{}:{}:{command}", event.name(), matcher.unwrap_or_default()),
+        hash: None,
+        source: HookSource::User,
+        file: "/settings.json".into(),
+        event,
+        matcher: matcher.map(Into::into),
+        command: command.into(),
+        resolved_command: Some(command.into()),
+        condition: None,
+        timeout_secs: 600,
+        plugin: None,
+        trust: HookTrust::Trusted,
+    }
+}
+
+fn exits(code: i32, stdout: &str, stderr: &str) -> MemoryCommandRun {
+    MemoryCommandRun {
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+        exit_code: code,
+        duration: Duration::ZERO,
+    }
+}
+
+fn answer(stdout: Value) -> MemoryCommandRun {
+    exits(0, &stdout.to_string(), "")
+}
+
+fn context_answer(event: HookEvent, context: &str) -> MemoryCommandRun {
+    answer(json!({
+        "hookSpecificOutput": {"hookEventName": event.name(), "additionalContext": context}
+    }))
+}
+
+/// One Agent with a Folder, the reference environment and hooks from the Settings Store.
+struct Bench {
+    agent: Agent,
+    chat: ChatId,
+    environment: Arc<MemoryEnvironment>,
+    settings: Arc<MemorySettingsStore>,
+    model: Arc<ScriptedModel>,
+    routed: Option<Arc<RoutedModel>>,
+    hook_inputs: Arc<Mutex<Vec<(String, Value)>>>,
+    directory: tempfile::TempDir,
+}
+
+impl Bench {
+    async fn start(replies: Vec<Vec<Content>>, hooks: Vec<ConfiguredHook>) -> Self {
+        Self::start_with(replies, None, hooks, false).await
+    }
+
+    async fn start_with(
+        replies: Vec<Vec<Content>>,
+        routed: Option<Arc<RoutedModel>>,
+        hooks: Vec<ConfiguredHook>,
+        keeps_transcripts: bool,
+    ) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().canonicalize().unwrap();
+        let environment = Arc::new(MemoryEnvironment::new());
+        let settings = Arc::new(MemorySettingsStore::default());
+        settings
+            .write(SettingsUpdate::TrustDirectory(folder.clone()))
+            .unwrap();
+        settings.set_hooks(HookList {
+            hooks,
+            ..Default::default()
+        });
+        let model = Arc::new(ScriptedModel::new(replies));
+        let agent = build_agent(
+            &directory,
+            &environment,
+            &settings,
+            &model,
+            routed.clone(),
+            keeps_transcripts,
+        );
+        let chat = agent.create_chat(folder).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        Self {
+            agent,
+            chat,
+            environment,
+            settings,
+            model,
+            routed,
+            hook_inputs: Arc::default(),
+            directory,
+        }
+    }
+
+    /// Scripts `command` and remembers each input it reads.
+    fn define(
+        &self,
+        command: &str,
+        run: impl Fn(&Value) -> MemoryCommandRun + Send + Sync + 'static,
+    ) {
+        let inputs = self.hook_inputs.clone();
+        let name = command.to_owned();
+        self.environment.define_command(command, move |spec| {
+            let input: Value = serde_json::from_slice(&spec.stdin).unwrap();
+            inputs.lock().unwrap().push((name.clone(), input.clone()));
+            run(&input)
+        });
+    }
+
+    fn inputs_of(&self, command: &str) -> Vec<Value> {
+        self.hook_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == command)
+            .map(|(_, input)| input.clone())
+            .collect()
+    }
+
+    fn requests(&self) -> Vec<ModelRequest> {
+        match &self.routed {
+            Some(routed) => routed.requests.lock().unwrap().clone(),
+            None => self.model.requests.lock().unwrap().clone(),
+        }
+    }
+
+    async fn run(&self, prompt: &str) -> Observed {
+        let mut events = self.agent.subscribe();
+        let receipt = self.agent.submit(self.chat, prompt.into()).await.unwrap();
+        observe(&mut events, &receipt).await
+    }
+}
+
+fn build_agent(
+    directory: &tempfile::TempDir,
+    environment: &Arc<MemoryEnvironment>,
+    settings: &Arc<MemorySettingsStore>,
+    model: &Arc<ScriptedModel>,
+    routed: Option<Arc<RoutedModel>>,
+    keeps_transcripts: bool,
+) -> Agent {
+    Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: keeps_transcripts.then(|| {
+                Arc::new(JsonlTranscriptStore::open(directory.path().join("transcripts")).unwrap())
+                    as Arc<dyn TranscriptStore>
+            }),
+            environment: Some(environment.clone()),
+            models: match routed {
+                Some(routed) => ChosenModels::new(routed),
+                None => ChosenModels::new(model.clone()),
+            },
+        },
+        HarnessOptions {
+            settings: Some(settings.clone()),
+            host: AgentHostOptions::embedded_defaults(),
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap()
+}
+
+#[derive(Default)]
+struct Observed {
+    hook_runs: Vec<HookRunRecord>,
+    interrupted: bool,
+    failed: Option<String>,
+}
+
+async fn observe(
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_harness_protocol::Event>,
+    receipt: &Receipt,
+) -> Observed {
+    let mut observed = Observed::default();
+    loop {
+        let event = next_event(events).await;
+        if event.chat_id != receipt.chat_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::HookRan { record } => observed.hook_runs.push(*record),
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+            EventKind::Interrupted if event.run_id == receipt.run_id => {
+                observed.interrupted = true;
+                break;
+            }
+            EventKind::Failed(error) if event.run_id == receipt.run_id => {
+                observed.failed = Some(error);
+                break;
+            }
+            _ => {}
+        }
+    }
+    observed
+}
+
+/// The host notes a request's conversation ends with, after its last assistant message.
+fn trailing_texts(request: &ModelRequest) -> Vec<String> {
+    let start = request
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+        .map_or(FIRST_CONVERSATION_MESSAGE, |index| index + 1);
+    request.messages[start..]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every request repeats the one before it byte for byte, so hook notes never break the
+/// prompt cache, and no request recorded a cache break.
+async fn assert_prefix_stable(bench: &Bench) {
+    let requests = bench.requests();
+    for pair in requests.windows(2) {
+        let (earlier, later) = (&pair[0].messages, &pair[1].messages);
+        assert!(
+            later.len() > earlier.len() && later[..earlier.len()] == earlier[..],
+            "a later request changed the conversation an earlier one sent"
+        );
+    }
+    let ledger = bench
+        .agent
+        .snapshot(bench.chat)
+        .await
+        .unwrap()
+        .request_usage;
+    assert!(
+        ledger
+            .entries()
+            .iter()
+            .all(|record| record.cache_break.is_none()),
+        "{ledger:?}"
+    );
+}
+
+fn conversation_texts(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn user_prompt_submit_context_and_plain_output_join_the_prompt_at_the_end() {
+    let bench = Bench::start(
+        vec![text("first"), text("second")],
+        vec![
+            user_hook(HookEvent::UserPromptSubmit, None, "context.sh"),
+            user_hook(HookEvent::UserPromptSubmit, None, "plain.sh"),
+        ],
+    )
+    .await;
+    bench.define("context.sh", |input| {
+        context_answer(
+            HookEvent::UserPromptSubmit,
+            &format!("prompt length {}", input["prompt"].as_str().unwrap().len()),
+        )
+    });
+    bench.define("plain.sh", |_| exits(0, "branch main\n", ""));
+    bench.run("Explain the code.").await;
+    bench.run("And the tests.").await;
+
+    let input = &bench.inputs_of("context.sh")[0];
+    assert_eq!(input["hook_event_name"], "UserPromptSubmit");
+    assert_eq!(input["prompt"], "Explain the code.");
+    assert_eq!(input["session_id"], bench.chat.uuid().to_string());
+    let first = &bench.requests()[0];
+    let trailing = trailing_texts(first);
+    assert_eq!(trailing[0], "Explain the code.");
+    let context = trailing
+        .iter()
+        .position(|text| {
+            text.contains("UserPromptSubmit hook additional context: prompt length 17")
+        })
+        .expect("the context follows the prompt");
+    assert!(trailing[context].starts_with("<system-reminder>\n"));
+    assert!(
+        trailing[context + 1].contains("UserPromptSubmit hook success: branch main"),
+        "{trailing:?}"
+    );
+    assert_prefix_stable(&bench).await;
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    let notes = snapshot
+        .host_notes
+        .values()
+        .filter(|note| {
+            **note == tickloop_harness_protocol::HostNote::Hook(HookEvent::UserPromptSubmit)
+        })
+        .count();
+    assert_eq!(notes, 4, "the notes are hidden as host notes");
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_blocked_prompt_never_enters_the_conversation_and_the_user_sees_why() {
+    let bench = Bench::start_with(
+        vec![text("answered")],
+        None,
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "secrets.sh")],
+        true,
+    )
+    .await;
+    bench.define("secrets.sh", |input| {
+        if input["prompt"].as_str().unwrap().contains("password") {
+            exits(2, "", "prompts must not carry passwords\n")
+        } else {
+            exits(0, "", "")
+        }
+    });
+    let observed = bench.run("My password is hunter2.").await;
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert!(bench.requests().is_empty(), "the model never reads it");
+    let run = &observed.hook_runs[0];
+    assert_eq!(run.outcome, HookRunOutcome::Blocking);
+    assert_eq!(
+        run.reason.as_deref(),
+        Some("[secrets.sh]: prompts must not carry passwords")
+    );
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert!(
+        !conversation_texts(&snapshot.messages)
+            .iter()
+            .any(|text| text.contains("hunter2")),
+        "{:?}",
+        snapshot.messages
+    );
+
+    bench.run("Say hello.").await;
+    let request = &bench.requests()[0];
+    assert!(
+        !conversation_texts(&request.messages)
+            .iter()
+            .any(|text| text.contains("hunter2"))
+    );
+    assert_eq!(trailing_texts(request)[0], "Say hello.");
+    let title = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+            if let Some(title) = snapshot.generated_title {
+                return title;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the prompt that passed its hooks names the Chat");
+    assert!(
+        format!("{title:?}").contains("Say hello") && !format!("{title:?}").contains("hunter2"),
+        "the title model never reads a blocked prompt: {title:?}"
+    );
+    bench.agent.shutdown().await;
+
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let reloaded = build_agent(
+        &bench.directory,
+        &bench.environment,
+        &bench.settings,
+        &model,
+        None,
+        true,
+    );
+    let texts = conversation_texts(&reloaded.resume_chat(bench.chat).await.unwrap().messages);
+    assert!(
+        !texts.iter().any(|text| text.contains("hunter2")),
+        "a load keeps it out too: {texts:?}"
+    );
+    assert!(texts.iter().any(|text| text == "Say hello."));
+    reloaded.shutdown().await;
+}
+
+#[tokio::test]
+async fn continue_false_keeps_the_prompt_and_ends_the_turn_unanswered() {
+    let bench = Bench::start(
+        vec![text("never asked")],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "pause.sh")],
+    )
+    .await;
+    bench.define("pause.sh", |_| {
+        answer(json!({"continue": false, "stopReason": "Paused for review"}))
+    });
+    let observed = bench.run("Deploy it.").await;
+    assert!(observed.failed.is_none());
+    assert!(bench.requests().is_empty());
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    let texts = conversation_texts(&snapshot.messages);
+    assert_eq!(texts[0], "Deploy it.");
+    assert!(texts[1].contains("Paused for review"), "{texts:?}");
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_start_runs_once_for_a_new_chat_and_its_context_follows_the_prompt() {
+    let bench = Bench::start(
+        vec![text("one"), text("two")],
+        vec![
+            user_hook(HookEvent::SessionStart, Some("startup"), "style.sh"),
+            user_hook(HookEvent::SessionStart, Some("resume|compact"), "other.sh"),
+            user_hook(HookEvent::SessionStart, None, "broken.sh"),
+        ],
+    )
+    .await;
+    bench.define("style.sh", |_| {
+        context_answer(HookEvent::SessionStart, "Explain your choices as you work.")
+    });
+    bench.define("other.sh", |_| exits(0, "must not run", ""));
+    bench.define("broken.sh", |_| exits(2, "", "no such style\n"));
+    let observed = bench.run("Refactor it.").await;
+    bench.run("Again.").await;
+
+    assert_eq!(bench.inputs_of("style.sh").len(), 1, "once per session");
+    assert!(bench.inputs_of("other.sh").is_empty());
+    let input = &bench.inputs_of("style.sh")[0];
+    assert_eq!(input["hook_event_name"], "SessionStart");
+    assert_eq!(input["source"], "startup");
+    assert_eq!(input["model"], config().model);
+    let trailing = trailing_texts(&bench.requests()[0]);
+    assert_eq!(trailing[0], "Refactor it.");
+    assert!(
+        trailing.iter().any(|text| text.contains(
+            "SessionStart:startup hook additional context: Explain your choices as you work."
+        )),
+        "{trailing:?}"
+    );
+    assert!(
+        !trailing.iter().any(|text| text.contains("no such style")),
+        "a SessionStart block only tells the user"
+    );
+    assert!(
+        observed
+            .hook_runs
+            .iter()
+            .any(|run| run.outcome == HookRunOutcome::Blocking)
+    );
+    assert_prefix_stable(&bench).await;
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_start_tells_hooks_a_chat_was_cleared() {
+    let bench = Bench::start(
+        vec![text("fresh")],
+        vec![user_hook(
+            HookEvent::SessionStart,
+            Some("clear"),
+            "clear.sh",
+        )],
+    )
+    .await;
+    bench.define("clear.sh", |_| exits(0, "cleared context\n", ""));
+    bench
+        .agent
+        .start_session_after_clear(bench.chat)
+        .await
+        .unwrap();
+    bench.run("Start over.").await;
+    assert_eq!(bench.inputs_of("clear.sh")[0]["source"], "clear");
+    assert!(
+        trailing_texts(&bench.requests()[0])
+            .iter()
+            .any(|text| text.contains("SessionStart:clear hook success: cleared context"))
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_compact_reads_its_trigger_adds_instructions_and_compaction_runs_session_start() {
+    let bench = Bench::start(
+        vec![text("one"), text("Summary of the work."), text("two")],
+        vec![
+            user_hook(HookEvent::PreCompact, Some("manual"), "keep.sh"),
+            user_hook(HookEvent::PreCompact, Some("auto"), "auto-only.sh"),
+            user_hook(HookEvent::SessionStart, Some("compact"), "after.sh"),
+        ],
+    )
+    .await;
+    bench.define("keep.sh", |_| exits(0, "Keep every file path.\n", ""));
+    bench.define("auto-only.sh", |_| exits(2, "", "must not run"));
+    bench.define("after.sh", |_| {
+        context_answer(HookEvent::SessionStart, "Re-read CONTRIBUTING.md.")
+    });
+    bench.run("Do the work.").await;
+    bench
+        .agent
+        .compact_with_instructions(bench.chat, Some("Focus on tests.".into()))
+        .await
+        .unwrap();
+    let input = &bench.inputs_of("keep.sh")[0];
+    assert_eq!(input["hook_event_name"], "PreCompact");
+    assert_eq!(input["trigger"], "manual");
+    assert_eq!(input["custom_instructions"], "Focus on tests.");
+    assert!(bench.inputs_of("auto-only.sh").is_empty());
+    let summary_request = &bench.requests()[1];
+    let instructions = trailing_texts(summary_request).join("\n");
+    assert!(
+        instructions.contains("Focus on tests.\n\nKeep every file path."),
+        "{instructions}"
+    );
+
+    bench.run("Continue.").await;
+    assert_eq!(bench.inputs_of("after.sh")[0]["source"], "compact");
+    assert!(trailing_texts(&bench.requests()[2]).iter().any(|text| {
+        text.contains("SessionStart:compact hook additional context: Re-read CONTRIBUTING.md.")
+    }));
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pre_compact_block_cancels_the_compaction() {
+    let bench = Bench::start(
+        vec![text("one")],
+        vec![user_hook(HookEvent::PreCompact, None, "hold.sh")],
+    )
+    .await;
+    bench.define("hold.sh", |_| exits(2, "", "a review is in progress\n"));
+    bench.run("Do the work.").await;
+    let before = bench.agent.snapshot(bench.chat).await.unwrap().messages;
+    let error = bench.agent.compact(bench.chat).await.unwrap_err();
+    assert!(
+        error.to_string().contains("a review is in progress"),
+        "{error}"
+    );
+    assert_eq!(bench.requests().len(), 1, "no summary was asked for");
+    assert_eq!(
+        bench.agent.snapshot(bench.chat).await.unwrap().messages,
+        before
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stop_block_goes_on_with_its_reason_and_the_next_input_says_it_is_active() {
+    let bench = Bench::start(
+        vec![text("first"), text("second")],
+        vec![user_hook(HookEvent::Stop, None, "check.sh")],
+    )
+    .await;
+    bench.define("check.sh", |input| {
+        if input["stop_hook_active"] == json!(true) {
+            exits(0, "", "")
+        } else {
+            answer(json!({"decision": "block", "reason": "Run the tests first."}))
+        }
+    });
+    let observed = bench.run("Fix the bug.").await;
+    assert!(observed.failed.is_none());
+    let inputs = bench.inputs_of("check.sh");
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["hook_event_name"], "Stop");
+    assert_eq!(inputs[0]["stop_hook_active"], false);
+    assert_eq!(inputs[0]["last_assistant_message"], "first");
+    assert_eq!(inputs[1]["stop_hook_active"], true);
+    assert_eq!(inputs[1]["last_assistant_message"], "second");
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        trailing_texts(&requests[1])
+            .iter()
+            .any(|text| text.contains("Stop hook feedback:\nRun the tests first.")),
+        "{:?}",
+        trailing_texts(&requests[1])
+    );
+    assert_prefix_stable(&bench).await;
+
+    bench.model.enqueue(text("third"));
+    bench.run("Next.").await;
+    assert_eq!(
+        bench.inputs_of("check.sh")[2]["stop_hook_active"],
+        false,
+        "a new turn starts afresh"
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_hook_errors_and_continue_false_end_the_turn() {
+    for (code, stdout) in [(1, ""), (0, r#"{"continue":false,"stopReason":"Done"}"#)] {
+        let bench = Bench::start(
+            vec![text("only")],
+            vec![user_hook(HookEvent::Stop, None, "stop.sh")],
+        )
+        .await;
+        bench.define("stop.sh", move |_| exits(code, stdout, "oops"));
+        let observed = bench.run("Go.").await;
+        assert!(observed.failed.is_none());
+        assert_eq!(bench.requests().len(), 1);
+        bench.agent.shutdown().await;
+    }
+}
+
+/// ralph-loop's Stop hook: every turn's end feeds the same prompt back until the model says
+/// its completion promise, which this model never does.
+#[tokio::test]
+async fn a_ralph_loop_stop_hook_keeps_going_until_esc_or_stop_ends_it() {
+    for stops in [false, true] {
+        let routed = Arc::new(RoutedModel::new(|_| text("Still improving the README.")));
+        let bench = Bench::start_with(
+            Vec::new(),
+            Some(routed),
+            vec![user_hook(HookEvent::Stop, None, "ralph.sh")],
+            false,
+        )
+        .await;
+        let iterations = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let counter = iterations.clone();
+        let notify = reached.clone();
+        bench.define("ralph.sh", move |_| {
+            if counter.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                notify.notify_one();
+            }
+            answer(json!({
+                "decision": "block",
+                "reason": RALPH_PROMPT,
+                "systemMessage": "Ralph iteration"
+            }))
+        });
+        let mut events = bench.agent.subscribe();
+        let receipt = bench
+            .agent
+            .submit(bench.chat, RALPH_PROMPT.into())
+            .await
+            .unwrap();
+        let agent = bench.agent.clone();
+        let chat = bench.chat;
+        let interrupter = tokio::spawn(async move {
+            reached.notified().await;
+            agent
+                .manage_goal(
+                    chat,
+                    GoalAction::Set {
+                        objective: "The README is perfect.".into(),
+                        token_budget: None,
+                        replace: false,
+                    },
+                )
+                .await
+                .unwrap();
+            if stops {
+                agent.stop(chat).await.unwrap();
+            } else {
+                agent.interrupt(chat).await.unwrap();
+            }
+        });
+        let observed =
+            tokio::time::timeout(Duration::from_secs(20), observe(&mut events, &receipt))
+                .await
+                .expect("the loop ends when interrupted");
+        interrupter.await.unwrap();
+        assert!(observed.interrupted, "stop={stops}");
+        let ran = iterations.load(Ordering::SeqCst);
+        assert!(ran >= 5, "no cap on blocks: {ran}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            iterations.load(Ordering::SeqCst),
+            ran,
+            "nothing goes on after the interruption"
+        );
+        let goal = bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .goal
+            .unwrap();
+        assert!(
+            matches!(goal.status, GoalStatus::Paused { .. }),
+            "Esc and /stop pause the goal the loop works on: {:?}",
+            goal.status
+        );
+        let inputs = bench.inputs_of("ralph.sh");
+        assert_eq!(inputs[0]["stop_hook_active"], false);
+        assert!(
+            inputs[1..]
+                .iter()
+                .all(|input| input["stop_hook_active"] == true)
+        );
+        assert!(
+            observed
+                .hook_runs
+                .iter()
+                .filter(|run| run.outcome != HookRunOutcome::Cancelled)
+                .all(|run| run.system_message.as_deref() == Some("Ralph iteration"))
+        );
+        bench.agent.shutdown().await;
+    }
+}
+
+fn is_child_request(request: &ModelRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .find(|message| tickloop_harness_test_support::is_conversation(message))
+        .and_then(|message| message.content.first())
+        .is_some_and(|content| {
+            matches!(content, Content::Text { text } if text.starts_with("<agent-message>"))
+        })
+}
+
+#[tokio::test]
+async fn subagent_stop_blocks_a_subagents_turn_end_before_its_result_reaches_the_parent() {
+    let child_turns = Arc::new(AtomicUsize::new(0));
+    let turns = child_turns.clone();
+    let routed = Arc::new(RoutedModel::new(move |request| {
+        if is_child_request(request) {
+            let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+            text(&format!("child report {turn}"))
+        } else if tickloop_harness_test_support::routed::has_tool_result(request, "delegate") {
+            text("parent done")
+        } else {
+            call("delegate", "Subagent", json!({"task": "Check the build"}))
+        }
+    }));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::SubagentStop, None, "verify.sh")],
+        false,
+    )
+    .await;
+    bench.define("verify.sh", |input| {
+        if input["stop_hook_active"] == json!(true) {
+            exits(0, "", "")
+        } else {
+            exits(2, "", "Include the build log.")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Delegate the check.".into())
+        .await
+        .unwrap();
+    let reaches_parent = |request: &ModelRequest| {
+        !is_child_request(request)
+            && conversation_texts(&request.messages)
+                .iter()
+                .any(|text| text.contains("child report 2"))
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !bench.requests().iter().any(reaches_parent) {
+            let _ = next_event(&mut events).await;
+        }
+    })
+    .await
+    .expect("the parent reads the report written after the block");
+    let inputs = bench.inputs_of("verify.sh");
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["hook_event_name"], "SubagentStop");
+    assert_eq!(inputs[0]["stop_hook_active"], false);
+    assert_eq!(inputs[0]["last_assistant_message"], "child report 1");
+    assert_eq!(inputs[0]["agent_type"], "general-purpose");
+    assert!(inputs[0].get("agent_transcript_path").is_some());
+    assert_ne!(inputs[0]["agent_id"], bench.chat.uuid().to_string());
+    assert_eq!(inputs[1]["stop_hook_active"], true);
+    assert_eq!(child_turns.load(Ordering::SeqCst), 2);
+    let child_feedback = bench
+        .requests()
+        .into_iter()
+        .rfind(is_child_request)
+        .map(|request| trailing_texts(&request))
+        .unwrap();
+    assert!(
+        child_feedback.iter().any(|text| {
+            text.contains("SubagentStop hook feedback:\n[verify.sh]: Include the build log.")
+        }),
+        "{child_feedback:?}"
+    );
+    assert!(
+        !bench
+            .requests()
+            .iter()
+            .filter(|request| !is_child_request(request))
+            .any(|request| conversation_texts(&request.messages)
+                .iter()
+                .any(|text| text.contains("child report 1"))),
+        "the blocked report never reaches the parent"
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_failure_tells_hooks_of_a_model_error_and_stop_does_not_run() {
+    let bench = Bench::start(
+        Vec::new(),
+        vec![
+            user_hook(HookEvent::StopFailure, None, "alert.sh"),
+            user_hook(HookEvent::Stop, None, "stop.sh"),
+        ],
+    )
+    .await;
+    let alerted = Arc::new(tokio::sync::Notify::new());
+    let notify = alerted.clone();
+    bench.define("alert.sh", move |_| {
+        notify.notify_one();
+        exits(0, "", "")
+    });
+    bench.define("stop.sh", |_| exits(0, "", ""));
+    let observed = bench.run("Go.").await;
+    assert!(observed.failed.is_some());
+    tokio::time::timeout(Duration::from_secs(5), alerted.notified())
+        .await
+        .expect("StopFailure runs");
+    let input = &bench.inputs_of("alert.sh")[0];
+    assert_eq!(input["hook_event_name"], "StopFailure");
+    assert_eq!(input["error"], "invalid_request");
+    assert!(
+        input["error_details"]
+            .as_str()
+            .unwrap()
+            .contains("script exhausted")
+    );
+    assert!(bench.inputs_of("stop.sh").is_empty());
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_end_runs_when_the_worker_ends_and_a_loaded_chat_resumes_its_session() {
+    let bench = Bench::start_with(
+        vec![text("before")],
+        None,
+        vec![
+            user_hook(HookEvent::SessionEnd, None, "end.sh"),
+            user_hook(HookEvent::SessionStart, None, "start.sh"),
+        ],
+        true,
+    )
+    .await;
+    bench.define("end.sh", |_| exits(1, "", "cleanup failed"));
+    bench.define("start.sh", |_| exits(0, "", ""));
+    bench.run("Remember this.").await;
+    assert!(bench.inputs_of("end.sh").is_empty(), "the session goes on");
+    bench.agent.shutdown().await;
+    let ended = bench.inputs_of("end.sh");
+    assert_eq!(
+        ended.len(),
+        1,
+        "a failing SessionEnd hook only tells the user"
+    );
+    assert_eq!(ended[0]["hook_event_name"], "SessionEnd");
+    assert_eq!(ended[0]["reason"], "other");
+    assert_eq!(ended[0]["session_id"], bench.chat.uuid().to_string());
+
+    let model = Arc::new(ScriptedModel::new(vec![text("after")]));
+    let resumed = build_agent(
+        &bench.directory,
+        &bench.environment,
+        &bench.settings,
+        &model,
+        None,
+        true,
+    );
+    resumed.resume_chat(bench.chat).await.unwrap();
+    let mut events = resumed.subscribe();
+    let receipt = resumed
+        .submit(bench.chat, "What did I ask?".into())
+        .await
+        .unwrap();
+    observe(&mut events, &receipt).await;
+    let sources = bench
+        .inputs_of("start.sh")
+        .iter()
+        .map(|input| input["source"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(sources, [json!("startup"), json!("resume")]);
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_stop_runs_before_an_auto_subagent_hands_its_report_back() {
+    use tickloop_harness_test_support::auto_classification;
+    use tickloop_harness_test_support::routed::{has_tool_result, state};
+    let routed = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            if has_tool_result(request, "first-report") {
+                call(
+                    "second-report",
+                    "SubagentHandback",
+                    json!({"message": "report with the build log"}),
+                )
+            } else {
+                call(
+                    "first-report",
+                    "SubagentHandback",
+                    json!({"message": "report without the log"}),
+                )
+            }
+        } else if has_tool_result(request, "delegate") {
+            text("parent done")
+        } else {
+            call("delegate", "Subagent", json!({"task": "Check the build"}))
+        }
+    }));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::SubagentStop, None, "verify.sh")],
+        false,
+    )
+    .await;
+    bench
+        .agent
+        .set_auto_reviewer(Arc::new(RoutedModel::new(|_| {
+            text(&auto_classification(false).to_string())
+        })))
+        .await;
+    bench
+        .agent
+        .set_execution_mode(bench.chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    bench.define("verify.sh", |input| {
+        if input["stop_hook_active"] == json!(true) {
+            exits(0, "", "")
+        } else {
+            answer(json!({"decision": "block", "reason": "Attach the build log."}))
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Delegate the check.".into())
+        .await
+        .unwrap();
+    let reaches_parent = |request: &ModelRequest| {
+        state(request)["delegation"].is_null()
+            && format!("{:?}", request.messages).contains("report with the build log")
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !bench.requests().iter().any(reaches_parent) {
+            let _ = next_event(&mut events).await;
+        }
+    })
+    .await
+    .expect("the parent reads the report sent after the block");
+    let inputs = bench.inputs_of("verify.sh");
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["hook_event_name"], "SubagentStop");
+    assert_eq!(inputs[1]["stop_hook_active"], true);
+    let first_result = bench
+        .requests()
+        .into_iter()
+        .filter(|request| !state(request)["delegation"].is_null())
+        .flat_map(|request| request.messages)
+        .flat_map(|message| message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == "first-report" => Some(content.text().into_owned()),
+            _ => None,
+        });
+    assert_eq!(
+        first_result.as_deref(),
+        Some("SubagentStop hook feedback:\nAttach the build log.")
+    );
+    assert!(
+        !bench
+            .requests()
+            .iter()
+            .filter(|request| state(request)["delegation"].is_null())
+            .any(|request| format!("{:?}", request.messages).contains("report without the log")),
+        "the blocked report never reaches the parent"
+    );
+    bench.agent.shutdown().await;
+}

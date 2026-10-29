@@ -2448,6 +2448,7 @@ impl Agent {
             self.record_delegation(id, metadata.clone(), snapshot.search_config.clone());
         }
         self.save(&snapshot);
+        let is_root = snapshot.delegation.is_none();
         chats.insert(
             id,
             NewChat {
@@ -2464,7 +2465,27 @@ impl Agent {
             }
             .into_chat(),
         );
+        if let Some(chat) = chats.get_mut(&id) {
+            chat.hook_state =
+                hooks::ChatHookState::starting_session(is_root, hooks::SessionSource::Startup);
+        }
         Ok(id)
+    }
+
+    /// Marks the new root Chat `chat_id` as started by `/clear`: its first model request runs
+    /// the `SessionStart` hooks for `clear` instead of `startup`.
+    pub async fn start_session_after_clear(&self, chat_id: ChatId) -> Result<(), AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if chat.snapshot.delegation.is_some() {
+            return Err(AgentError::Invalid(
+                "only a root Chat starts a session".into(),
+            ));
+        }
+        chat.hook_state
+            .session
+            .start_session(hooks::SessionSource::Clear);
+        Ok(())
     }
 
     pub async fn submit(&self, chat_id: ChatId, input: String) -> Result<Receipt, AgentError> {
@@ -3233,6 +3254,9 @@ impl Agent {
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
         drop(timing);
+        let timing = timing::Phase::new("announce_session_start");
+        Box::pin(self.announce_session_start(receipt, &cancel)).await?;
+        drop(timing);
         let prefix = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -3655,7 +3679,16 @@ impl Agent {
         self.complete_file_history_snapshots(receipt.chat_id).await;
         let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
-            RunStart::Request(request) => request,
+            RunStart::Request(request) => {
+                if let hooks::PromptGate::End = self
+                    .user_prompt_submit(&receipt, &cancel)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(Usage::default());
+                }
+                request
+            }
             RunStart::Resume { at, result } => {
                 *is_awaiting_model = false;
                 match self.reenter_batch(&receipt, at, result, &cancel).await? {
@@ -3697,7 +3730,12 @@ impl Agent {
                 {
                     return Err(Box::pin(self.leave_before_model_request(&receipt)).await);
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    if let AgentError::Model(model_error) = &error {
+                        self.notify_stop_failure(&receipt, model_error);
+                    }
+                    return Err(error.to_string());
+                }
             };
             *is_awaiting_model = false;
             let assistant_message_id = tickloop_ids::generate();
@@ -3745,6 +3783,10 @@ impl Agent {
             }
             if calls.is_empty() {
                 if let Some(continuation) = self.after_complete_response(&receipt, &cancel).await? {
+                    request = continuation;
+                    continue;
+                }
+                if let Some(continuation) = self.stop_turn_hooks(&receipt, &cancel).await? {
                     request = continuation;
                     continue;
                 }
@@ -3878,6 +3920,9 @@ impl Agent {
         );
         self.save(&chat.snapshot);
         self.emit(chat, &receipt, event);
+        if let Some(prompt) = chat.hook_state.session.take_blocked_prompt(receipt.run_id) {
+            self.take_back_blocked_prompt(chat, receipt.run_id, prompt);
+        }
         self.inner
             .host_contexts
             .lock()
@@ -4583,6 +4628,15 @@ impl Agent {
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
             self.mark_run_inputs_handled(&mut candidate, &pending);
+            if pending.trigger_source.is_none()
+                && pending.agent_message.is_none()
+                && !pending.task_continuation
+            {
+                candidate
+                    .hook_state
+                    .session
+                    .await_prompt_hooks(pending.receipt.run_id);
+            }
             candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
             self.append_input_message(&mut candidate, pending);
             let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
@@ -5557,6 +5611,7 @@ impl Agent {
                 cancel.cancel();
             }
         }
+        self.end_sessions().await;
         self.stop_transcript_flushing();
         self.discard_hook_transcripts();
         self.inner.tasks.close();

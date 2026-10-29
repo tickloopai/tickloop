@@ -640,6 +640,7 @@ mod tests {
             loop_state_note: false,
             task_reminder: false,
             date_change: None,
+            hook_note: None,
             guidance: None,
             execution_mode: None,
             is_inherited_prompt: false,

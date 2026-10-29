@@ -786,12 +786,20 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?;
                     chat
                 } else {
-                    self.inner
+                    let chat = self
+                        .inner
                         .agent
                         .create_chat_with_launch_rules(launch.folder.clone(), launch_rules)
                         .await
-                        .map_err(agent_access_error)?
-                        .uuid()
+                        .map_err(agent_access_error)?;
+                    if launch.after_clear {
+                        self.inner
+                            .agent
+                            .start_session_after_clear(chat)
+                            .await
+                            .map_err(agent_access_error)?;
+                    }
+                    chat.uuid()
                 };
                 if !launch.additional_directories.is_empty() {
                     self.inner

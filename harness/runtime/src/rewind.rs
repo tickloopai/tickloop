@@ -152,6 +152,31 @@ impl Agent {
         }))
     }
 
+    /// Takes the prompt at message `index` that a `UserPromptSubmit` hook blocked, with the
+    /// prompts the ended `run_id` started with after it, back out of the conversation, as
+    /// [`Agent::take_back_interrupted_prompt`] does: the model never reads it, and the
+    /// Transcript keeps it as an abandoned branch.
+    pub(super) fn take_back_blocked_prompt(&self, chat: &mut Chat, run_id: RunId, index: usize) {
+        if chat.snapshot.message_runs.get(&index) != Some(&run_id) {
+            return;
+        }
+        let Some(point) = chat.snapshot.rewind_point_at(index) else {
+            return;
+        };
+        match conversation_before(
+            &chat.snapshot,
+            &chat.bookkeeping,
+            point.message_index,
+            Some(point.execution_mode),
+        ) {
+            Ok(candidate) => {
+                self.replace_conversation(chat, point.message_index, point.message_id, candidate);
+                self.save(&chat.snapshot);
+            }
+            Err(error) => tracing::warn!("cannot take back a prompt a hook blocked: {error}"),
+        }
+    }
+
     /// Third stage of rewind: truncates the conversation according to the file restore result and
     /// the mode. The conversation is recomputed from the snapshot at the end of the occupation,
     /// keeping changes such as input queued during it.

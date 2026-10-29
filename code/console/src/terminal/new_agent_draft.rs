@@ -157,6 +157,10 @@ pub(super) struct NewAgentDraft {
     changes: Vec<ConfigurationChange>,
     additional_directories: Option<Vec<PathBuf>>,
     rules: Vec<PermissionRule>,
+    /// `/clear` left an Agent for this draft: the Agent it creates starts the session `/clear`
+    /// began.
+    #[serde(default)]
+    after_clear: bool,
 }
 
 impl NewAgentDraft {
@@ -278,9 +282,15 @@ impl NewAgentDraft {
     /// Splits the draft into what the first Create sends, starting from the View's launch.
     /// A staged model is replayed rather than launched, so the runtime clears the previous
     /// model's saved context window exactly as it does for a visible Agent.
+    /// The Agent this draft creates starts the session `/clear` began.
+    pub(super) fn follow_clear(&mut self) {
+        self.after_clear = true;
+    }
+
     pub(super) fn into_first_create(self, mut launch: LaunchSpec, workdir: PathBuf) -> FirstCreate {
         launch.folder = workdir;
         launch.exact_chat = None;
+        launch.after_clear = self.after_clear;
         let mut execution_mode = None;
         let mut changes = Vec::new();
         for change in self.changes {
@@ -418,6 +428,17 @@ mod tests {
                 .is_err()
         );
         assert_eq!(draft.configuration(base()), base());
+    }
+
+    #[test]
+    fn only_a_draft_clear_left_creates_its_agent_after_clear() {
+        let launch = || LaunchSpec::embedded(PathBuf::from("/"));
+        let fresh = NewAgentDraft::default().into_first_create(launch(), PathBuf::from("/work"));
+        assert!(!fresh.launch.after_clear);
+        let mut cleared = NewAgentDraft::default();
+        cleared.follow_clear();
+        let first = cleared.into_first_create(launch(), PathBuf::from("/work"));
+        assert!(first.launch.after_clear);
     }
 
     #[test]

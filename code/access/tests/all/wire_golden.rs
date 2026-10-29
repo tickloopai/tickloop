@@ -469,6 +469,7 @@ fn hook_list() -> HookList {
 
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
+        after_clear: false,
         additional_directories: Vec::new(),
         folder: "/work/project".into(),
         config_root: Some("/home/user/.tickloop".into()),

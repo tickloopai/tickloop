@@ -13,6 +13,7 @@
 
 mod matcher;
 mod output;
+mod session_events;
 mod tool_events;
 
 use std::collections::{BTreeMap, HashSet};
@@ -34,6 +35,7 @@ use crate::environment::{
 use crate::{Agent, Chat};
 use output::{HookExit, HookResponse};
 pub(crate) use output::{HookPermission, HookVerdict};
+pub(crate) use session_events::{PromptGate, SessionSource};
 pub(crate) use tool_events::{PreToolGate, ToolHookFeedback};
 
 /// Claude Code's default hook timeout, used when a hook declares none.
@@ -64,9 +66,21 @@ pub(crate) struct ChatHookState {
     announced_skips: HashSet<(HookSource, String)>,
     /// Runs a hook's `continue: false` ends once their current batch of calls is done.
     stopped_runs: HashSet<tickloop_harness_protocol::RunId>,
+    /// What the session and turn hooks keep.
+    pub(crate) session: session_events::SessionHookState,
 }
 
 impl ChatHookState {
+    /// The state of a Chat entering this process, which runs the `SessionStart` hooks for
+    /// `source` first when it is a root Chat.
+    pub(crate) fn starting_session(is_root: bool, source: SessionSource) -> Self {
+        let mut state = Self::default();
+        if is_root {
+            state.session.start_session(source);
+        }
+        state
+    }
+
     /// Whether a hook asked to end `run`, forgetting it.
     pub(crate) fn take_stop(&mut self, run: tickloop_harness_protocol::RunId) -> bool {
         self.stopped_runs.remove(&run)

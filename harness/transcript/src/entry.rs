@@ -315,6 +315,10 @@ pub struct ChainEntry {
     /// Code's `date_change` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_change: Option<String>,
+    /// Tickloop extension: marks a host note carrying what a hook of this event (its Claude Code
+    /// name) gave the model, Claude Code's hook attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_note: Option<String>,
     /// Tickloop extension: marks a host note carrying guidance, like Claude Code's Skill messages
     /// and `mcp_instructions_delta` attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]

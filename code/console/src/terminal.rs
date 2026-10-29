@@ -1369,6 +1369,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         session_persistence,
         exact_chat: None,
         host_work_context,
+        after_clear: false,
         environment: std::env::vars_os()
             .map(|(name, value)| EnvironmentValue {
                 name: name.as_os_str().as_bytes().to_vec(),
@@ -4175,6 +4176,7 @@ async fn interact_with_herdr(
                                     }
                                 }
                                 if shell_stop_failed {continue;}
+                                agent.follow_clear_in_draft();
                             }
                             global.interpret(crate::agent_console::Intent::NewDraft).map_err(|error|error.to_string())?;
                             console.clear_visible_agent()?;

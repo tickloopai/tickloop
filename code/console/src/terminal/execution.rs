@@ -784,6 +784,10 @@ impl ConsoleExecution {
     pub(super) fn launch_spec(&self) -> LaunchSpec {
         self.effective_launch()
     }
+    /// `/clear` left the shown Agent: the New Agent the draft creates starts the session it began.
+    pub(super) fn follow_clear_in_draft(&self) {
+        self.inner.draft.lock().unwrap().follow_clear();
+    }
     pub(super) fn access(&self) -> Arc<dyn AgentAccess> {
         self.inner.access.clone()
     }

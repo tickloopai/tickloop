@@ -445,6 +445,10 @@ pub enum HostNote {
     /// Claude Code's `date_change` attachment: the user's date moved on to this `YYYY-MM-DD`
     /// after the user context told the model an earlier one.
     DateChange(String),
+    /// Claude Code's hook attachments: what a hook of this event gave the model, such as a
+    /// `SessionStart` or `UserPromptSubmit` hook's additional context or a `Stop` hook's reason
+    /// to go on.
+    Hook(crate::hooks::HookEvent),
 }
 
 /// What an execution mode note told the model.
@@ -465,7 +469,8 @@ impl HostNote {
             | Self::LoopState
             | Self::TaskReminder
             | Self::Guidance(_)
-            | Self::DateChange(_) => None,
+            | Self::DateChange(_)
+            | Self::Hook(_) => None,
         }
     }
 }

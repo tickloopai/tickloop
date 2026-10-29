@@ -1524,6 +1524,10 @@ fn chain_entry(
             Some(HostNote::DateChange(date)) => Some(date.clone()),
             _ => None,
         },
+        hook_note: match snapshot.host_notes.get(&index) {
+            Some(HostNote::Hook(event)) => Some(event.name().to_owned()),
+            _ => None,
+        },
         guidance: match snapshot.host_notes.get(&index) {
             Some(HostNote::Guidance(note)) => Some(note.clone()),
             _ => None,
@@ -1688,6 +1692,7 @@ fn record_loop(
         loop_state_note: false,
         task_reminder: false,
         date_change: None,
+        hook_note: None,
         guidance: None,
         execution_mode: None,
         is_inherited_prompt: false,
@@ -1999,6 +2004,12 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored
                 .host_notes
                 .insert(index, HostNote::DateChange(date.clone()));
+        } else if let Some(event) = entry
+            .hook_note
+            .as_deref()
+            .and_then(tickloop_harness_protocol::hooks::HookEvent::from_name)
+        {
+            restored.host_notes.insert(index, HostNote::Hook(event));
         } else if let Some(note) = &entry.guidance {
             restored
                 .host_notes
@@ -3841,7 +3852,10 @@ impl Agent {
                 loaded_from_history: waits == WaitHosting::Process,
                 goal_clock_ms: 0,
                 cache_prefix: Default::default(),
-                hook_state: Default::default(),
+                hook_state: crate::hooks::ChatHookState::starting_session(
+                    snapshot.delegation.is_none(),
+                    crate::hooks::SessionSource::Resume,
+                ),
             },
         );
         if let Some(context) = snapshot

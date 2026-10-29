@@ -1579,6 +1579,9 @@ impl Agent {
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::Handback)
         ) {
+            if let Some(feedback) = self.subagent_stop_before_handback(receipt, &cancel).await? {
+                return Ok(ToolCallOutcome::not_admitted(feedback));
+            }
             match self.prepare_handback(receipt, &id, &input).await {
                 Ok(prepared) => Some(PreparedLocalCall::Handback(prepared)),
                 Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),

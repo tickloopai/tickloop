@@ -116,3 +116,6 @@ mod sandbox_auto_approval;
 
 #[path = "all/tool_hooks.rs"]
 mod tool_hooks;
+
+#[path = "all/session_hooks.rs"]
+mod session_hooks;
