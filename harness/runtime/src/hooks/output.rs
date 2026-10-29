@@ -5,13 +5,16 @@
 //! is plain text. Status 2 blocks with standard error as the reason, after any JSON answer it
 //! also printed. Any other status only tells the user, though a JSON answer it printed still
 //! decides, as in Claude Code 2.1.302; a timeout or an answer that cannot be read only tells
-//! the user.
+//! the user. A first line `{"async": true}` asks to go on in the background, and what follows
+//! it is the answer.
 
 use serde_json::{Map, Value};
 use tickloop_harness_protocol::hooks::{HookDecision, HookEvent, HookRunOutcome, HookSource};
 
 const BLOCKED_BY_HOOK: &str = "Blocked by hook";
 const NO_STDERR: &str = "No stderr output";
+/// The longest first line of output read as a request to go on in the background.
+const BACKGROUND_REQUEST_BYTES: usize = 4 * 1024;
 
 /// A permission a `PreToolUse` hook gave the call, strongest last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -205,6 +208,44 @@ fn apply_answer(
         Some(_) => return Err("updatedInput must be an object".into()),
     }
     Ok(())
+}
+
+/// Whether `line` is a JSON object with `"async": true`, with which Claude Code 2.1.302 lets a
+/// running command hook go on in the background; any other field, such as `asyncTimeout`, is
+/// ignored.
+fn asks_for_background(line: &str) -> bool {
+    serde_json::from_str::<Value>(line.trim())
+        .is_ok_and(|answer| answer.get("async") == Some(&Value::Bool(true)))
+}
+
+/// What a hook printed after a first line asking to go on in the background; `None` when its
+/// first line asked nothing of the kind.
+pub(super) fn after_background_request(stdout: &str) -> Option<&str> {
+    let stdout = stdout.trim_start();
+    let (first, rest) = stdout.split_once('\n').unwrap_or((stdout, ""));
+    asks_for_background(first).then_some(rest)
+}
+
+/// Whether the first line of a hook's standard output, read from `stdout` as it arrives, asks
+/// to go on in the background. Like Claude Code, a request ending in `}` counts before its line
+/// ends; a longer first line asks nothing.
+pub(super) async fn first_line_asks_for_background(
+    mut stdout: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) -> bool {
+    let mut received = Vec::new();
+    while let Some(chunk) = stdout.recv().await {
+        received.extend_from_slice(&chunk);
+        if let Some(end) = received.iter().position(|byte| *byte == b'\n') {
+            return asks_for_background(&String::from_utf8_lossy(&received[..end]));
+        }
+        if received.len() > BACKGROUND_REQUEST_BYTES {
+            return false;
+        }
+        if chunk.contains(&b'}') && asks_for_background(&String::from_utf8_lossy(&received)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Reads what the run of `command` for `event` said.
@@ -473,6 +514,69 @@ mod tests {
         let plain = pre(0, "formatted 3 files\n", "");
         assert_eq!(plain.outcome, HookRunOutcome::Success);
         assert_eq!(plain.plain_text.as_deref(), Some("formatted 3 files"));
+    }
+
+    #[test]
+    fn a_first_line_with_async_true_asks_for_the_background_and_the_rest_answers() {
+        let answer = "{\"systemMessage\":\"ready\"}\n";
+        assert_eq!(
+            after_background_request(&format!(
+                "\n{{\"async\": true, \"asyncTimeout\": 180000}}\n{answer}"
+            )),
+            Some(answer)
+        );
+        assert_eq!(after_background_request("{\"async\":true}"), Some(""));
+        for stdout in [
+            "{\"async\": false}\n{}",
+            "{\"systemMessage\":\"async\"}",
+            "[true]\n",
+            "async\n",
+            "",
+        ] {
+            assert_eq!(after_background_request(stdout), None, "{stdout}");
+        }
+    }
+
+    async fn asks_as_it_arrives(chunks: &[&[u8]], ends: bool) -> Option<bool> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        for chunk in chunks {
+            sender.send(chunk.to_vec()).unwrap();
+        }
+        if ends {
+            drop(sender);
+            return Some(first_line_asks_for_background(receiver).await);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            first_line_asks_for_background(receiver),
+        )
+        .await
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn the_first_line_is_read_as_it_arrives() {
+        assert_eq!(
+            asks_as_it_arrives(&[b"{\"as", b"ync\": true}\n"], false).await,
+            Some(true)
+        );
+        assert_eq!(
+            asks_as_it_arrives(&[b"{\"async\": true}"], false).await,
+            Some(true),
+            "a complete request counts before its line ends"
+        );
+        assert_eq!(
+            asks_as_it_arrives(&[b"{\"decision\": \"block\"}\n{\"async\": true}\n"], false).await,
+            Some(false)
+        );
+        assert_eq!(
+            asks_as_it_arrives(&[b"working"], false).await,
+            None,
+            "an unfinished line waits"
+        );
+        assert_eq!(asks_as_it_arrives(&[b"working"], true).await, Some(false));
+        let long = vec![b' '; BACKGROUND_REQUEST_BYTES + 1];
+        assert_eq!(asks_as_it_arrives(&[&long], false).await, Some(false));
     }
 
     #[test]

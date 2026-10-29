@@ -262,9 +262,13 @@ fn interrupted_nested_calls(
     })
 }
 
+/// What the model reads for a call an interruption stopped before it was admitted.
+pub(crate) const NOT_ADMITTED_AFTER_INTERRUPTION: &str =
+    "Interrupted before tool admission; the operation was not executed.";
+
 fn interrupted_before_admission() -> ToolResult {
     ToolResult {
-        content: "Interrupted before tool admission; the operation was not executed.".into(),
+        content: NOT_ADMITTED_AFTER_INTERRUPTION.into(),
         is_error: true,
         output_ref: None,
     }
