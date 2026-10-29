@@ -129,6 +129,8 @@ impl AgentRow {
         match self.agent_state {
             AgentState::Failed => Role::Error,
             AgentState::Completed if self.state == LoopState::Interrupted => Role::Warning,
+            // A finished Agent whose execution ended reads as done, not as an alert.
+            AgentState::Completed if self.ended.is_some() => Role::MutedText,
             _ if self.group != AttentionGroup::Completed => group_role(self.group),
             AgentState::Completed => Role::Success,
             _ => Role::MutedText,
@@ -1880,7 +1882,7 @@ pub(super) fn help_lines(
             "x twice closes/removes/unlinks",
             "enter reopen restores subscriptions",
             "f/h Artifact new/all feedback",
-            "j/k list navigation",
+            "ctrl+n/p list navigation",
             "pgup/pgdn conversation",
             "ctrl+end latest",
         ]

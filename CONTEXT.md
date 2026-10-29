@@ -222,7 +222,7 @@ Host environment information the Agent uses to understand the scope of its work,
 An overview, machine-wide, of all Agents and their parent-child relationships, from which the user can enter a selected Agent's view.
 
 **Agent State**:
-How the Agents Overview names a root Agent, after Claude Code's agent view: Needs input, Working, Idle, Completed (its last turn finished), Failed (its run failed, its execution was lost, or it ended when the daemon stopped) or Stopped (the user stopped it, or it ended while the daemon was off). The Overview groups them under Needs input, Working and Completed, which holds the last four.
+How the Agents Overview names a root Agent, after Claude Code's agent view: Needs input, Working, Idle, Completed (its last turn finished, with nothing pending even after its execution ended), Failed (its run failed, its execution was lost, or it was working or had pending work when the daemon stopped) or Stopped (the user stopped it, or it ended while the daemon was off). The Overview groups them under Needs input, Working and Completed, which holds the last four.
 _Avoid_: Done, Errors, Empty, Unknown
 
 **Ended Agent**:

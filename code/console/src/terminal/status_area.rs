@@ -955,7 +955,7 @@ impl StatusArea {
         }
         if focused {
             lines.push(RoleLine::role(
-                "  j/k move · enter details · esc back",
+                "  ctrl+n/p move · enter details · esc back",
                 Role::MutedText,
             ));
         }

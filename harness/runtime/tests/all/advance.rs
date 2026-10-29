@@ -1662,3 +1662,33 @@ async fn a_branch_switch_keeps_the_chats_scheduled_tasks() {
     );
     agent.shutdown().await;
 }
+
+/// An idle Chat with a scheduled task still has work coming, as Claude Code's idle job waiting on
+/// something; the Agents overview reaps such an Agent as work, not as a finished turn.
+#[tokio::test]
+async fn a_scheduled_task_leaves_an_idle_chat_with_pending_work() {
+    let fixture = fixture();
+    let agent = agent(
+        Arc::new(InMemoryTranscriptStore::new()),
+        Script::replies(&[]),
+    );
+    let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
+    assert!(!agent.summary(chat).await.unwrap().pending_work);
+
+    agent
+        .schedule_task(
+            chat,
+            tickloop_harness_runtime::NewScheduledTask::new(
+                "*/10 * * * *",
+                "check the build",
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let summary = agent.summary(chat).await.unwrap();
+    assert_eq!(summary.chat_loop.state, LoopState::Idle);
+    assert!(summary.pending_work);
+    agent.shutdown().await;
+}

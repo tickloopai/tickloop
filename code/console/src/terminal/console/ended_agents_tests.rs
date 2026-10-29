@@ -40,6 +40,7 @@ fn ended_row(index: u128, reason: EndReason, resumable: bool) -> AgentRow {
     let agent_state = match reason {
         EndReason::DaemonStopped | EndReason::WorkerLost => AgentState::Failed,
         EndReason::DaemonOff | EndReason::UserStopped => AgentState::Stopped,
+        EndReason::Finished => AgentState::Completed,
     };
     AgentRow {
         agent_id: ended_chat(index),
@@ -55,6 +56,7 @@ fn ended_row(index: u128, reason: EndReason, resumable: bool) -> AgentRow {
         group: AttentionGroup::Completed,
         glyph: match agent_state {
             AgentState::Failed => Glyph::AgentFailed,
+            AgentState::Completed => Glyph::AgentCompleted,
             _ => Glyph::AgentStopped,
         },
         preview: None,
@@ -377,4 +379,29 @@ fn another_key_or_another_row_between_the_presses_of_x_cancels() {
     // A first press on one row and a second on another stops nothing.
     select(&mut state, running.agent_id);
     assert!(state.key(key(KeyCode::Char('x'))).is_none());
+}
+
+#[test]
+fn a_finished_agent_reads_as_completed_without_alarm_and_resumes_on_one_enter() {
+    let mut finished = ended_row(0, EndReason::Finished, true);
+    finished.status = "Completed".into();
+    assert_eq!(finished.status_role(), Role::MutedText);
+    assert_eq!(finished.glyph_role(), Role::MutedText);
+    let console = overview_console(100, 30, vec![finished]);
+    let mut state = console.state.lock().unwrap();
+    let frame = drawn(&mut state);
+    let line = frame
+        .iter()
+        .find(|line| line.contains("Ended task 00"))
+        .unwrap_or_else(|| panic!("{frame:#?}"));
+    assert!(line.contains("✔") && line.contains("Completed"), "{line}");
+    assert!(!line.contains("Failed") && !line.contains("✖"), "{line}");
+    select(&mut state, ended_chat(0));
+
+    let event = state.key(key(KeyCode::Enter));
+
+    assert!(
+        matches!(event, Some(InputEvent::ResumeEndedAgent(chat)) if chat == ended_chat(0)),
+        "{event:?}"
+    );
 }

@@ -1013,8 +1013,8 @@ pub(super) struct State {
     shown_cards: Vec<tick_protocol::InstanceRef>,
     /// The open cards the last frame collapsed for lack of room.
     collapsed_cards: Vec<tick_protocol::InstanceRef>,
-    /// Where the selection rests while the Monitor list has the keys; its card shows once it
-    /// rested long enough.
+    /// Where the selection rests on a row with an open card while the Monitor list has the keys;
+    /// the card shows once it rested long enough.
     selection_rest: Option<cards::SelectionRest>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
     /// Agent's use showed; the input loop sends it.
@@ -11065,10 +11065,10 @@ impl State {
         let action = match (key.code, key.modifiers) {
             (KeyCode::Left, _) => Some(DiffDialogAction::Left),
             (KeyCode::Right, _) => Some(DiffDialogAction::Right),
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Some(DiffDialogAction::Up),
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                Some(DiffDialogAction::Down)
-            }
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(DiffDialogAction::Up),
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(DiffDialogAction::Down),
             (KeyCode::PageUp, _) => Some(DiffDialogAction::PageUp),
             (KeyCode::PageDown, _) => Some(DiffDialogAction::PageDown),
             (KeyCode::Home, _) => Some(DiffDialogAction::Home),
@@ -13346,20 +13346,9 @@ impl State {
             return Some(InputEvent::Cancel { menu_id });
         }
         if self.review_focused {
-            let action = match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
-                    Some(DiffNavigationAction::Up)
-                }
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                    Some(DiffNavigationAction::Down)
-                }
-                (KeyCode::PageUp, _) => Some(DiffNavigationAction::PageUp),
-                (KeyCode::PageDown, _) => Some(DiffNavigationAction::PageDown),
-                (KeyCode::Home, _) => Some(DiffNavigationAction::Home),
-                (KeyCode::End, _) => Some(DiffNavigationAction::End),
-                _ => None,
-            };
-            if let Some(action) = action.filter(|_| self.menu_is_visible()) {
+            if let Some(action) =
+                Self::review_navigation_key(key).filter(|_| self.menu_is_visible())
+            {
                 self.navigate_menu_review(action);
                 return None;
             }
@@ -14281,11 +14270,11 @@ fn read_keys(
         if !settle_background_work(state, stop, sender, input_was_idle, &mut deferred_frame)? {
             break;
         }
-        // The selected row's card shows on time even while nothing is typed.
+        // The selected row's open card shows on time even while nothing is typed.
         let wait = state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?
-            .selection_preview_deadline()
+            .selection_reveal_deadline()
             .map_or(INPUT_POLL_INTERVAL, |deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -14340,8 +14329,7 @@ fn read_keys(
                 None
             }
         };
-        let (previewed, preview_attach) = state.settle_selection_preview(Instant::now());
-        redraw |= previewed;
+        redraw |= state.settle_selection_reveal(Instant::now());
         if (redraw || submission_released) && in_burst && event::poll(Duration::ZERO)? {
             deferred_frame = true;
         } else if redraw || submission_released || std::mem::take(&mut deferred_frame) {
@@ -14355,11 +14343,6 @@ fn read_keys(
             if !send_input(sender, stop, input) || ended {
                 break;
             }
-        }
-        if let Some(attach) = preview_attach
-            && !send_input(sender, stop, attach)
-        {
-            break;
         }
     }
     Ok(())
@@ -16755,10 +16738,19 @@ mod tests {
         let before = state.menu_review.as_ref().unwrap().navigation.clone();
 
         assert!(state.key(key(KeyCode::Char('j'))).is_none());
+        let scrolled = state.menu_review.as_ref().unwrap().navigation.clone();
+        assert_ne!(scrolled, before, "j should scroll the focused diff");
+        assert!(state.key(control(KeyCode::Char('n'))).is_none());
         assert_ne!(
             state.menu_review.as_ref().unwrap().navigation,
-            before,
-            "j should scroll the focused diff"
+            scrolled,
+            "ctrl+n should scroll the focused diff too"
+        );
+        assert!(state.key(control(KeyCode::Char('p'))).is_none());
+        assert_eq!(
+            state.menu_review.as_ref().unwrap().navigation,
+            scrolled,
+            "ctrl+p should scroll the focused diff back"
         );
         assert!(state.key(key(KeyCode::Enter)).is_none());
         assert!(state.key(key(KeyCode::Char('y'))).is_none());
@@ -16849,6 +16841,33 @@ mod tests {
         assert!(state.key(key(KeyCode::Char('y'))).is_none());
         assert!(state.menu.is_some());
         assert!(state.frame().0.iter().any(|line| line.contains("Resize")));
+    }
+
+    #[test]
+    fn diff_screen_moves_with_ctrl_n_p_exactly_as_with_j_k() {
+        let opened = |keys: &[KeyEvent]| {
+            let mut state = State::new(true, 60, 12);
+            state.prompt_enabled = true;
+            state.diff_screen = Some(DiffScreen {
+                chat_id: Uuid::new_v4(),
+                catalog: diff_catalog(80),
+                dialog: DiffDialog::new(),
+            });
+            state.key(key(KeyCode::Enter));
+            for pressed in keys {
+                state.key(*pressed);
+            }
+            state.draw(&mut Vec::new()).unwrap();
+            state.rendered_screen.clone()
+        };
+        let start = opened(&[]);
+        let by_letter = opened(&[key(KeyCode::Char('j'))]);
+        assert_ne!(by_letter, start, "j scrolls the opened file");
+        assert_eq!(opened(&[control(KeyCode::Char('n'))]), by_letter);
+        assert_eq!(
+            opened(&[control(KeyCode::Char('n')), control(KeyCode::Char('p'))]),
+            opened(&[key(KeyCode::Char('j')), key(KeyCode::Char('k'))])
+        );
     }
 
     #[test]

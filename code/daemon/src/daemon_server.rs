@@ -656,6 +656,8 @@ impl DaemonServer {
                         &snapshot.user_shells,
                         snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
                     )),
+                    // The Worker's own directory reports it at the next read.
+                    pending_work: None,
                     updated_at: super::summary::updated_at(
                         &snapshot.conversation.chat_loop,
                         &snapshot.user_shells,
