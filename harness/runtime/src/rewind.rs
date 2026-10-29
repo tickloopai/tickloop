@@ -152,11 +152,18 @@ impl Agent {
         }))
     }
 
-    /// Takes the prompt at message `index` that a `UserPromptSubmit` hook blocked, with the
-    /// prompts the ended `run_id` started with after it, back out of the conversation, as
-    /// [`Agent::take_back_interrupted_prompt`] does: the model never reads it, and the
-    /// Transcript keeps it as an abandoned branch.
-    pub(super) fn take_back_blocked_prompt(&self, chat: &mut Chat, run_id: RunId, index: usize) {
+    /// Takes the prompt at message `index` that a `UserPromptSubmit` hook blocked, with what
+    /// follows it, back out of the conversation, as [`Agent::take_back_interrupted_prompt`]
+    /// does: the model never reads it, and the Transcript keeps it as an abandoned branch.
+    /// `run_id` is the Run the prompt started or the queued input it came as. Views redraw the
+    /// conversation only when `is_shown`; a queued prompt taken back as it joins never was.
+    pub(super) fn take_back_blocked_prompt(
+        &self,
+        chat: &mut Chat,
+        run_id: RunId,
+        index: usize,
+        is_shown: bool,
+    ) {
         if chat.snapshot.message_runs.get(&index) != Some(&run_id) {
             return;
         }
@@ -170,7 +177,16 @@ impl Agent {
             Some(point.execution_mode),
         ) {
             Ok(candidate) => {
-                self.replace_conversation(chat, point.message_index, point.message_id, candidate);
+                if is_shown {
+                    self.replace_conversation(
+                        chat,
+                        point.message_index,
+                        point.message_id,
+                        candidate,
+                    );
+                } else {
+                    self.swap_conversation(chat, point.message_index, candidate);
+                }
                 self.save(&chat.snapshot);
             }
             Err(error) => tracing::warn!("cannot take back a prompt a hook blocked: {error}"),
@@ -261,6 +277,18 @@ impl Agent {
         chat: &mut Chat,
         index: usize,
         message_id: Uuid,
+        candidate: (ChatSnapshot, ChatBookkeeping),
+    ) {
+        self.swap_conversation(chat, index, candidate);
+        self.emit_conversation_rewound(chat, message_id);
+    }
+
+    /// Switches to the conversation truncated before message `index` without telling views,
+    /// for a tail none of them was shown.
+    fn swap_conversation(
+        &self,
+        chat: &mut Chat,
+        index: usize,
         (candidate, mut candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
     ) {
         if let Some(recorder) = &self.inner.recorder {
@@ -270,7 +298,6 @@ impl Agent {
         chat.replace_snapshot(candidate);
         chat.bookkeeping = candidate_bookkeeping;
         self.inner.ledger_changes.send_replace(());
-        self.emit_conversation_rewound(chat, message_id);
     }
 
     pub(super) fn emit_conversation_rewound(&self, chat: &mut Chat, message_id: Uuid) {
