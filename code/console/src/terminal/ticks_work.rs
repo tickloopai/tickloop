@@ -244,7 +244,19 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.spawn(async move {
                 let result = blocking({
                     let name = name.clone();
-                    move || tickloop_tick_installer::uninstall(&store, &name)
+                    move || {
+                        let uninstalled = tickloop_tick_installer::uninstall(&store, &name)?;
+                        let id = format!("{}@{}", uninstalled.name, uninstalled.marketplace);
+                        tickloop_code_settings::UserSettings::in_root(store.config_root())
+                            .forget_plugin_hooks(&id)
+                            .map_err(|error| {
+                                format!(
+                                    "{name} was uninstalled, but its hook trust records were not \
+                                     removed: {error}"
+                                )
+                            })?;
+                        Ok(uninstalled)
+                    }
                 })
                 .await;
                 (panel, TickPackageResult::Uninstallation { name, result })

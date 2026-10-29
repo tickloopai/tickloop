@@ -7,6 +7,7 @@ use tickloop_harness::policy::settings::{
     PermissionChanges, ProjectSettings, SettingsSnapshot, SettingsStore, SettingsStoreError,
     SettingsUpdate,
 };
+use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
 
 impl From<SettingsError> for SettingsStoreError {
     fn from(error: SettingsError) -> Self {
@@ -163,5 +164,18 @@ impl SettingsStore for UserSettings {
         folder: Option<&Path>,
     ) -> Vec<tickloop_harness::policy::instructions::InstructionFile> {
         crate::instructions::instruction_files(folder, self.root(), self.home_directory())
+    }
+
+    fn hooks(&self, folder: Option<&Path>) -> HookList {
+        crate::hooks::configured_hooks(self, folder)
+    }
+
+    fn write_hook_trust(
+        &self,
+        folder: Option<&Path>,
+        changes: &[HookTrustChange],
+        expected_revision: Option<&str>,
+    ) -> Result<(), SettingsStoreError> {
+        crate::hooks::write_trust(self, folder, changes, expected_revision)
     }
 }
