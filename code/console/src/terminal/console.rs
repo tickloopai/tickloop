@@ -13032,9 +13032,14 @@ impl State {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
                 }
-                // Space is the list's card key; on a Tick row without a card, such as a lost
-                // Tick's, it does nothing rather than leave the list and type into the input.
-                (KeyCode::Char(' '), KeyModifiers::NONE) if self.monitor.selected().is_some() => {}
+                // Space is the card key of hosted Tick and Shell rows; on one without a card, such
+                // as a lost Tick's, it does nothing rather than leave the list and type into the
+                // input. An Artifact row never has a card, so there Space types into the input.
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| entry.group != TickGroup::Artifacts) => {}
                 (KeyCode::Enter, KeyModifiers::NONE)
                     if self
                         .monitor
