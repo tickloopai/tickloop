@@ -1037,6 +1037,80 @@ async fn acp_empty_session_survives_eof_and_is_listed_and_loaded_without_a_model
 }
 
 #[tokio::test]
+async fn acp_load_replays_no_empty_user_chunk_for_saved_empty_prompt_text() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(listener.local_addr().unwrap(), json!([]));
+    let mut first = fixture.spawn();
+    first.initialize().await;
+    let session = first.session(2, &fixture).await;
+    first
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId":session,"prompt":[
+                {"type":"text","text":"before"},
+                {"type":"resource_link","uri":"custom://material","name":"material"},
+                {"type":"text","text":"after"}
+            ]}),
+        )
+        .await;
+    let (mut socket, _) = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    read_request(&mut socket).await;
+    respond(&mut socket, &text_stream("Read it.")).await;
+    assert_eq!(first.response(3).await["result"]["stopReason"], "end_turn");
+    first.finish().await;
+
+    // Earlier versions saved an empty text block between attachments; restore that shape.
+    let saved_after = r#"{"kind":"prompt_text","text":"after"}"#;
+    let transcript = std::fs::read_dir(fixture.folder().join("config/projects"))
+        .unwrap()
+        .map(|project| project.unwrap().path().join(format!("{session}.jsonl")))
+        .find(|path| path.is_file())
+        .unwrap();
+    let saved = std::fs::read_to_string(&transcript).unwrap();
+    assert!(saved.contains(saved_after), "{saved}");
+    std::fs::write(
+        &transcript,
+        saved.replace(
+            saved_after,
+            &format!(r#"{{"kind":"prompt_text","text":""}},{saved_after}"#),
+        ),
+    )
+    .unwrap();
+
+    let mut next = fixture.spawn();
+    next.initialize().await;
+    let loaded = next.load(4, &session, &fixture.folder()).await;
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let user_chunks: Vec<&Value> = next
+        .frames
+        .iter()
+        .filter(|frame| {
+            frame["method"] == "session/update"
+                && frame["params"]["sessionId"] == session
+                && frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        })
+        .map(|frame| &frame["params"]["update"]["content"])
+        .collect();
+    let texts: Vec<&str> = user_chunks
+        .iter()
+        .filter_map(|content| content["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["before", "after"], "{user_chunks:?}");
+    assert!(
+        user_chunks
+            .iter()
+            .any(|content| content["uri"] == "custom://material"),
+        "{user_chunks:?}"
+    );
+    next.finish().await;
+    assert_no_model(&listener).await;
+}
+
+#[tokio::test]
 async fn acp_load_defers_configured_mcp_until_the_next_prompt() {
     use tickloop_harness::test_support::mcp_service::McpService;
 

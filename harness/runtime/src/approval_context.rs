@@ -1057,9 +1057,8 @@ mod tests {
         snapshot
             .prompt_execution_modes
             .insert(0, tickloop_harness_protocol::ExecutionMode::Auto);
-        let prompt_text = |text: &str| tickloop_harness_protocol::InputContext::PromptText {
-            text: text.into(),
-        };
+        let prompt_text =
+            |text: &str| tickloop_harness_protocol::InputContext::PromptText { text: text.into() };
         snapshot.message_contexts.insert(
             0,
             vec![
