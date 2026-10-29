@@ -25,15 +25,8 @@ pub const HOOK_EVENTS: [&str; 10] = [
 pub const COMMAND_HOOK_TYPE: &str = "command";
 /// `command` fields newer than Tickloop's support; a hook using one is skipped rather than run
 /// without it.
-pub const UNSUPPORTED_COMMAND_FIELDS: [&str; 7] = [
-    "args",
-    "shell",
-    "async",
-    "asyncRewake",
-    "once",
-    "if",
-    "onFailure",
-];
+pub const UNSUPPORTED_COMMAND_FIELDS: [&str; 6] =
+    ["args", "shell", "async", "asyncRewake", "once", "onFailure"];
 const HOOKS_KEY: &str = "hooks";
 const TYPE_FIELD: &str = "type";
 

@@ -4,8 +4,9 @@
 //! The Settings Store lists a Folder's hooks with their trust. Only those that may run do: a
 //! plugin or repository hook the user has not confirmed, or whose content changed, is skipped
 //! with a notice shown once per hook and Chat in this process, in a Subagent and on a host that
-//! cannot ask as well; nothing ever waits for a confirmation. Matching hooks run in parallel,
-//! the same command once per source, each a one-shot command in the Chat's Folder with the
+//! cannot ask as well; nothing ever waits for a confirmation. A hook's `if` further narrows a
+//! tool event to the calls its Permission Rule matches. Matching hooks run in parallel, the same
+//! command and `if` once per source, each a one-shot command in the Chat's Folder with the
 //! event's input on standard input and only `CLAUDE_PROJECT_DIR` and a plugin's directories
 //! added to its environment. Each run is kept in the Chat's activity history, never in what the
 //! model reads, and announced as it ends.
@@ -207,14 +208,19 @@ impl Agent {
         call: &HookCall,
         hooks: Vec<ConfiguredHook>,
     ) -> Vec<Runnable> {
+        let query = call.match_query.as_deref().unwrap_or_default();
         let matched = hooks.into_iter().filter(|hook| {
             hook.event == call.event
                 && (!call.event.uses_matcher()
-                    || matcher::matches(
-                        call.event,
-                        hook.matcher.as_deref(),
-                        call.match_query.as_deref().unwrap_or_default(),
-                    ))
+                    || matcher::matches(call.event, hook.matcher.as_deref(), query))
+                && hook.condition.as_deref().is_none_or(|condition| {
+                    matcher::is_tool_event(call.event)
+                        && matcher::condition_matches(
+                            condition,
+                            query,
+                            call.fields.get("tool_input").unwrap_or(&Value::Null),
+                        )
+                })
         });
         let mut runnable = Vec::new();
         let mut commands = HashSet::new();
@@ -225,7 +231,11 @@ impl Agent {
             }
             match hook.resolved_command.clone() {
                 Some(command) if hook.may_run() => {
-                    if commands.insert((hook.source.clone(), command.clone())) {
+                    if commands.insert((
+                        hook.source.clone(),
+                        command.clone(),
+                        hook.condition.clone(),
+                    )) {
                         runnable.push(Runnable { hook, command });
                     }
                 }

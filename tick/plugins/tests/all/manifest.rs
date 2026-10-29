@@ -589,7 +589,7 @@ fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings(
         &root.join("hooks/hooks.json"),
         &json!({"description": "Guards", "hooks": {
             "PreToolUse": [{"matcher": "Bash|Edit", "hooks": [
-                {"type": "command", "command": "guard", "timeout": 10},
+                {"type": "command", "command": "guard", "timeout": 10, "if": "Bash(rm *)"},
                 {"type": "prompt", "prompt": "Is this safe?"},
                 {"type": "command", "command": "later", "async": true, "once": true},
             ]}],
@@ -607,7 +607,7 @@ fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings(
     assert_eq!(support.runnable, 2);
     assert_eq!(support.events, names(&["PreToolUse", "Stop"]));
     assert_eq!(support.types, names(&["command"]));
-    assert_eq!(support.fields, names(&["command", "timeout"]));
+    assert_eq!(support.fields, names(&["command", "if", "timeout"]));
     assert_eq!(
         support.unsupported_events,
         names(&["Notification", "PermissionRequest"])

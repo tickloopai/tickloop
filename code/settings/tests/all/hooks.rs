@@ -152,6 +152,52 @@ fn plugin_source(name: &str) -> HookSource {
 }
 
 #[test]
+fn an_if_condition_is_read_and_names_a_hook_apart_from_the_same_command_without_it() {
+    let setup = Setup::new();
+    setup.write_user_settings(
+        json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "guard"},
+            {"type": "command", "command": "guard", "if": "Bash(git push*)"},
+            {"type": "command", "command": "blank-if", "if": "  "},
+            {"type": "command", "command": "numeric-if", "if": 3},
+        ]}]}}),
+    );
+    let first = setup.hooks();
+    let conditions = first
+        .hooks
+        .iter()
+        .map(|hook| (hook.command.as_str(), hook.condition.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        conditions,
+        [
+            ("guard", None),
+            ("guard", Some("Bash(git push*)")),
+            ("blank-if", None)
+        ]
+    );
+    assert_ne!(first.hooks[0].key, first.hooks[1].key);
+    let settings = setup.settings_path().display().to_string();
+    assert_eq!(
+        first.warnings,
+        [format!(
+            "{settings}: PreToolUse hook if must be text such as Bash(git push*); it is skipped"
+        )]
+    );
+
+    setup.write_user_settings(
+        json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "guard"},
+        ]}]}}),
+    );
+    assert_eq!(
+        setup.hooks().hooks[0].key,
+        first.hooks[0].key,
+        "a hook without if keeps its identity"
+    );
+}
+
+#[test]
 fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
     let setup = Setup::new();
     let other = setup.directory.path().join("other");
@@ -179,6 +225,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: Some("Bash".into()),
                 command: "check-bash".into(),
                 resolved_command: Some("check-bash".into()),
+                condition: None,
                 timeout_secs: 30,
                 plugin: None,
                 hash: None,
@@ -192,6 +239,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: None,
                 command: "finish".into(),
                 resolved_command: Some("finish".into()),
+                condition: None,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
                 plugin: None,
                 hash: None,

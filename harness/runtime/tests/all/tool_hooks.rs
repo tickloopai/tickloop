@@ -51,6 +51,7 @@ fn hook(
         matcher: matcher.map(Into::into),
         command: command.into(),
         resolved_command: Some(command.into()),
+        condition: None,
         timeout_secs: 600,
         plugin,
         trust: HookTrust::Trusted,
@@ -917,5 +918,38 @@ async fn a_subagent_runs_trusted_hooks_as_an_agent_and_skips_unconfirmed_ones_wi
     assert_ne!(input["agent_id"], bench.chat.uuid().to_string());
     assert_eq!(input["session_id"], input["agent_id"]);
     assert!(bench.inputs_of(GUARD).is_empty());
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_if_condition_runs_the_hook_only_for_calls_its_permission_rule_matches() {
+    const PUBLISH: &str = "git push origin main";
+    let mut guarded = user_hook(HookEvent::PreToolUse, Some("Bash"), GUARD);
+    guarded.condition = Some("Bash(git push*)".into());
+    let bench = Bench::start(
+        Options::new(
+            ExecutionMode::FullAccess,
+            vec![
+                build_call(),
+                call("publish", "Bash", json!({"command": PUBLISH})),
+                text("done"),
+            ],
+        ),
+        vec![guarded],
+    )
+    .await;
+    bench
+        .environment
+        .define_shell(PUBLISH, Duration::ZERO, b"published".to_vec(), 0);
+    bench.define(GUARD, |_| exits(2, "", "not on Fridays"));
+    let observed = bench.run("Build and publish.", true).await;
+    assert_eq!(observed.results[0].content, "built");
+    assert_eq!(
+        observed.results[1].content,
+        "PreToolUse:Bash hook error: [guard.sh]: not on Fridays"
+    );
+    let inputs = bench.inputs_of(GUARD);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["tool_input"]["command"], PUBLISH);
     bench.agent.shutdown().await;
 }

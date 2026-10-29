@@ -119,6 +119,10 @@ pub struct ConfiguredHook {
     /// The command to run, with a plugin's placeholders substituted; `None` while it refers to a
     /// plugin user configuration value that is not set.
     pub resolved_command: Option<String>,
+    /// Claude Code's `if`: a Permission Rule such as `Bash(git push*)` the tool call must also
+    /// match, after the matcher. A hook of an event without tool calls that has one never runs.
+    #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
     pub timeout_secs: u64,
     pub plugin: Option<HookPluginDirectories>,
     /// What a trust record must match: the declaration with the plugin's whole content, or with

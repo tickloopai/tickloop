@@ -53,38 +53,46 @@ struct DeclaredHook {
     matcher: Option<String>,
     command: String,
     timeout_secs: u64,
+    condition: Option<String>,
 }
 
 impl DeclaredHook {
-    /// The hook's identity within its source, from its normalized declaration.
+    /// The hook's identity within its source, from its normalized declaration. A hook without
+    /// `if` keeps the identity it had before `if` was read.
     fn key(&self) -> String {
-        let declaration = serde_json::to_vec(&(
+        let common = (
             self.event.name(),
             &self.matcher,
             COMMAND_HOOK_TYPE,
             &self.command,
             self.timeout_secs,
-        ))
+        );
+        let declaration = match &self.condition {
+            None => serde_json::to_vec(&common),
+            Some(condition) => serde_json::to_vec(&(common, condition)),
+        }
         .expect("hook declarations serialize");
         hex_digest(&declaration)
     }
 }
 
-/// The hooks of one source in declaration order, without repeating a command for the same event
-/// and matcher.
+/// The hooks of one source in declaration order, without repeating a command for the same event,
+/// matcher and `if`.
 #[derive(Default)]
 struct SourceHooks {
     hooks: Vec<DeclaredHook>,
-    seen: HashSet<(HookEvent, Option<String>, String)>,
+    seen: HashSet<(HookEvent, Option<String>, String, Option<String>)>,
 }
 
 impl SourceHooks {
     fn read(&mut self, declaration: &Value, file: &Path, warnings: &mut Vec<String>) {
         for hook in declared_hooks(declaration, file, warnings) {
-            if self
-                .seen
-                .insert((hook.event, hook.matcher.clone(), hook.command.clone()))
-            {
+            if self.seen.insert((
+                hook.event,
+                hook.matcher.clone(),
+                hook.command.clone(),
+                hook.condition.clone(),
+            )) {
                 self.hooks.push(hook);
             }
         }
@@ -384,6 +392,7 @@ fn configured(
         matcher: hook.matcher,
         resolved_command: Some(hook.command.clone()),
         command: hook.command,
+        condition: hook.condition,
         timeout_secs: hook.timeout_secs,
         plugin,
         hash,
@@ -438,12 +447,13 @@ fn declared_hooks(
             };
             for handler in handlers {
                 match command_hook(handler) {
-                    Ok((command, timeout_secs)) => hooks.push(DeclaredHook {
+                    Ok((command, timeout_secs, condition)) => hooks.push(DeclaredHook {
                         file: file.to_path_buf(),
                         event,
                         matcher: matcher.clone(),
                         command,
                         timeout_secs,
+                        condition,
                     }),
                     Err(problem) => warnings.push(format!("{location}: {name} hook {problem}")),
                 }
@@ -453,8 +463,8 @@ fn declared_hooks(
     hooks
 }
 
-/// The command and timeout of a supported `command` hook, or why it is skipped.
-fn command_hook(handler: &Value) -> Result<(String, u64), String> {
+/// The command, timeout and `if` of a supported `command` hook, or why it is skipped.
+fn command_hook(handler: &Value) -> Result<(String, u64, Option<String>), String> {
     let kind = handler.get("type").and_then(Value::as_str);
     match kind {
         Some(COMMAND_HOOK_TYPE) => {}
@@ -482,7 +492,14 @@ fn command_hook(handler: &Value) -> Result<(String, u64), String> {
             .map(|seconds| seconds.ceil() as u64)
             .ok_or("timeout must be a positive number of seconds; it is skipped")?,
     };
-    Ok((command.to_owned(), timeout_secs))
+    let condition = match handler.get("if") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(condition)) => {
+            Some(condition.trim().to_owned()).filter(|condition| !condition.is_empty())
+        }
+        Some(_) => return Err("if must be text such as Bash(git push*); it is skipped".into()),
+    };
+    Ok((command.to_owned(), timeout_secs, condition))
 }
 
 fn trust_state(record: Option<&Map<String, Value>>, hash: Option<&str>) -> HookTrust {
