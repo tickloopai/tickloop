@@ -563,13 +563,13 @@ fn cards_close_with_their_chat_and_their_rows_and_lose_the_focus_with_them() {
 }
 
 #[test]
-fn the_previewed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it() {
+fn the_revealed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it() {
     let chat = Uuid::from_u128(1);
-    let [focused, user, agent, other]: [InstanceRef; 4] = [
+    let [focused, user, agent, closed]: [InstanceRef; 4] = [
         "hosted:focused",
         "hosted:user",
         "hosted:agent",
-        "hosted:other",
+        "hosted:closed",
     ]
     .map(|instance| instance.parse().unwrap());
     let mut cards = MonitorCards::default();
@@ -582,52 +582,35 @@ fn the_previewed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it(
     };
     assert!(priority(&cards, &user) > priority(&cards, &agent));
 
-    assert!(
-        !cards.preview(chat, agent.clone()),
-        "an open card is only raised"
-    );
-    assert_eq!(cards.previewed(), Some(&agent));
+    assert!(cards.reveal(&agent));
+    assert_eq!(cards.revealed(), Some(&agent));
     assert_eq!(cards.card(&agent).unwrap().origin, CardOrigin::Agent);
     assert!(priority(&cards, &agent) > priority(&cards, &user));
     assert!(priority(&cards, &agent) < priority(&cards, &focused));
-    assert!(cards.end_preview());
-    assert!(cards.is_open(&agent), "a raised card stays open");
+    assert!(cards.end_reveal());
+    assert!(cards.is_open(&agent), "a revealed card stays open");
+    assert_eq!(cards.card(&agent).unwrap().origin, CardOrigin::Agent);
     assert!(priority(&cards, &user) > priority(&cards, &agent));
-    assert!(!cards.end_preview(), "nothing is previewed any more");
+    assert!(!cards.end_reveal(), "nothing is revealed any more");
 
-    assert!(cards.preview(chat, other.clone()), "a closed card opens");
-    assert_eq!(cards.card(&other).unwrap().origin, CardOrigin::Preview);
-    assert!(priority(&cards, &other) > priority(&cards, &user));
-    assert!(cards.end_preview());
-    assert!(
-        !cards.is_open(&other),
-        "a card open only as a preview closes"
-    );
+    assert!(!cards.reveal(&closed), "a card not open is not opened");
+    assert!(!cards.is_open(&closed) && cards.revealed().is_none());
 
-    cards.preview(chat, other.clone());
-    cards.open(chat, other.clone());
-    assert!(cards.end_preview());
-    assert_eq!(
-        cards.card(&other).unwrap().origin,
-        CardOrigin::User,
-        "a preview the user kept stays"
-    );
-    cards.preview(chat, user.clone());
+    cards.reveal(&user);
     cards.close(&user);
     assert_eq!(
-        cards.previewed(),
+        cards.revealed(),
         None,
-        "closing the previewed card ends the preview"
+        "closing the revealed card ends the reveal"
     );
 }
 
 #[test]
-fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_chat() {
+fn a_chats_cards_are_remembered_until_the_console_forgets_the_chat() {
     let chat = Uuid::from_u128(1);
     let shown: InstanceRef = "hosted:shown".parse().unwrap();
     let used: InstanceRef = "hosted:used".parse().unwrap();
     let hidden: InstanceRef = "hosted:hidden".parse().unwrap();
-    let previewed: InstanceRef = "hosted:previewed".parse().unwrap();
     let gone: InstanceRef = "hosted:gone".parse().unwrap();
     let mut cards = MonitorCards::default();
     cards.open(chat, shown.clone());
@@ -635,7 +618,7 @@ fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_
     cards.open(chat, gone.clone());
     cards.open(chat, hidden.clone());
     cards.hide(&hidden);
-    cards.preview(chat, previewed.clone());
+    cards.reveal(&used);
     cards.focus(shown.clone());
     let sequences: Vec<u64> = [&shown, &used]
         .iter()
@@ -644,7 +627,7 @@ fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_
 
     cards.remember();
     assert!(cards.cards().is_empty() && cards.focused().is_none());
-    assert_eq!(cards.previewed(), None);
+    assert_eq!(cards.revealed(), None, "the reveal is not remembered");
     assert!(cards.agent_may_show(&hidden), "no Chat is shown");
     let restored = cards.restore(chat, |_| true, |instance| instance != &gone);
     assert_eq!(restored, [shown.clone(), used.clone()]);

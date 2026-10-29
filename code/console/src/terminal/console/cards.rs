@@ -18,19 +18,17 @@ pub(super) struct CardSource {
     pub(super) note: Option<CardNote>,
 }
 
-/// Where the selection rests while the Monitor list has the keys, with since when.
+/// The row with an open card the selection rests on while the Monitor list has the keys, with
+/// since when.
 pub(super) struct SelectionRest {
     instance: InstanceRef,
     since: Instant,
-    /// The user hid the row's card while the selection rested on it, so it shows no preview until
-    /// the selection comes back.
-    declined: bool,
 }
 
 const OPENING_NOTE: &str = "opening";
-/// How long the selection rests on a row before its card shows; rows passed over sooner never
-/// attach a view.
-pub(super) const SELECTION_PREVIEW_DELAY: Duration = Duration::from_millis(150);
+/// How long the selection rests on the row of an open card before the card shows, should other
+/// cards have taken its room.
+pub(super) const SELECTION_REVEAL_DELAY: Duration = Duration::from_millis(150);
 const ALL_CARDS_HINT: &str = "z/Z hide/show all";
 /// How long the card of a row the Agent used waits for the row to be listed.
 const AGENT_CARD_WAIT: Duration = Duration::from_secs(30);
@@ -93,10 +91,9 @@ impl State {
         })
     }
 
-    /// Space, or a click on the row: shows the card, or hides it, previewed or not, which
-    /// detaches its view; a hidden card shows no preview while the selection stays on its row. A
-    /// card collapsed for lack of room shows as the user's most recent instead. The focus stays
-    /// on the list.
+    /// Space, or a click on the row: shows the card, or hides it, revealed or not, which detaches
+    /// its view. A card collapsed for lack of room shows as the user's most recent instead. The
+    /// focus stays on the list.
     pub(super) fn toggle_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
         self.rendered_region = None;
         if self.cards.is_open(&instance) {
@@ -108,88 +105,61 @@ impl State {
             }
             self.cards.hide(&instance);
             self.card_sizes.remove(&instance);
-            if self
-                .monitor
-                .selected()
-                .is_some_and(|entry| entry.instance == instance)
-            {
-                self.selection_rest = Some(SelectionRest {
-                    instance,
-                    since: Instant::now(),
-                    declined: true,
-                });
-            }
             return None;
         }
         self.open_card(instance, CardOrigin::User)
     }
 
-    /// The row whose card the selection previews: the selected Tick's while the Monitor list has
-    /// the keys, when its row has a card.
-    fn preview_subject(&self) -> Option<InstanceRef> {
+    /// The open card the selection reveals: the selected Tick's while the Monitor list has the
+    /// keys. A row whose card is not open is only selected.
+    fn reveal_subject(&self) -> Option<InstanceRef> {
         if !self.monitor_owns_keys() || self.card_focused() || self.monitor.detail.is_some() {
             return None;
         }
         self.monitor
             .selected()
             .map(|entry| entry.instance.clone())
-            .filter(|instance| self.row_toggles_card(instance))
+            .filter(|instance| self.cards.is_open(instance))
     }
 
-    /// Follows the selection at `now`: moving it, or the list losing the keys, ends the preview
-    /// of the row left, and once the selection rested on a row with a card for
-    /// [`SELECTION_PREVIEW_DELAY`] its card shows ahead of all but the focused one. Returns
-    /// whether the screen changed, and the attach of a card that opened.
-    pub(super) fn settle_selection_preview(&mut self, now: Instant) -> (bool, Option<InputEvent>) {
-        let subject = self.preview_subject();
+    /// Follows the selection at `now`: moving it, or the list losing the keys, puts the card of
+    /// the row left back in its own place, and once the selection rested on a row with an open
+    /// card for [`SELECTION_REVEAL_DELAY`] that card shows ahead of all but the focused one, the
+    /// cards it squeezes out returning when it goes back. Returns whether the screen changed.
+    pub(super) fn settle_selection_reveal(&mut self, now: Instant) -> bool {
+        let subject = self.reveal_subject();
         let mut changed = false;
         if self.selection_rest.as_ref().map(|rest| &rest.instance) != subject.as_ref() {
-            changed = self.cards.end_preview();
+            changed = self.cards.end_reveal();
             self.selection_rest = subject.map(|instance| SelectionRest {
                 instance,
                 since: now,
-                declined: false,
             });
         }
         if self
-            .selection_preview_deadline()
-            .is_none_or(|deadline| now < deadline)
+            .selection_reveal_deadline()
+            .is_some_and(|deadline| now >= deadline)
+            && let Some(rest) = &self.selection_rest
         {
-            if changed {
-                self.rendered_region = None;
-            }
-            return (changed, None);
+            changed |= self.cards.reveal(&rest.instance);
         }
-        let (Some(chat), Some(rest)) = (self.chat, &self.selection_rest) else {
-            return (changed, None);
-        };
-        let instance = rest.instance.clone();
-        self.rendered_region = None;
-        let attach = self
-            .cards
-            .preview(chat, instance.clone())
-            .then(|| InputEvent::TickAction {
-                chat,
-                action: super::super::tick_actions::builtin::attach_card(instance),
-            });
-        (true, attach)
+        if changed {
+            self.rendered_region = None;
+        }
+        changed
     }
 
-    /// When the card of the row the selection rests on is due to show.
-    pub(super) fn selection_preview_deadline(&self) -> Option<Instant> {
+    /// When the open card of the row the selection rests on is due to show.
+    pub(super) fn selection_reveal_deadline(&self) -> Option<Instant> {
         let rest = self.selection_rest.as_ref()?;
-        (!rest.declined && self.cards.previewed() != Some(&rest.instance))
-            .then_some(rest.since + SELECTION_PREVIEW_DELAY)
+        (self.cards.is_open(&rest.instance) && self.cards.revealed() != Some(&rest.instance))
+            .then_some(rest.since + SELECTION_REVEAL_DELAY)
     }
 
-    /// z on the list: hides every shown card, the user's, the Agent's and the selection's
-    /// preview alike, without hiding them from the Agent's use, which shows them again as usual;
-    /// the selected row previews again only once the selection comes back to it. The focus and
-    /// selection stay on the list.
+    /// z on the list: hides every shown card, the user's and the Agent's alike, without hiding
+    /// them from the Agent's use, which shows them again as usual. The focus and selection stay
+    /// on the list.
     pub(super) fn hide_all_cards(&mut self) {
-        if let Some(rest) = &mut self.selection_rest {
-            rest.declined = true;
-        }
         if self.cards.cards().is_empty() {
             return;
         }
@@ -446,16 +416,17 @@ impl State {
     }
 
     /// What cards settle apart from the user's own input: keys a focused card's Tick bubbled,
-    /// cards the Agent's use shows and the selected row's preview once due. Returns whether the
+    /// cards the Agent's use shows and the selected row's open card once due. Returns whether the
     /// screen changed, and what to send.
     pub(super) fn settle_card_signals(&mut self, now: Instant) -> (bool, Vec<InputEvent>) {
         self.cards.announce_focus();
         let bubbled = self.settle_bubbled_keys();
         let shown = self.show_agent_cards();
-        let (previewed, attach) = self.settle_selection_preview(now);
-        let mut inputs = std::mem::take(&mut self.queued_card_inputs);
-        inputs.extend(attach);
-        (bubbled || shown || previewed, inputs)
+        let revealed = self.settle_selection_reveal(now);
+        (
+            bubbled || shown || revealed,
+            std::mem::take(&mut self.queued_card_inputs),
+        )
     }
 
     /// Whether the last frame showed a card, so that a frame of its Tick changes the screen.

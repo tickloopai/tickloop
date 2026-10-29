@@ -1013,8 +1013,8 @@ pub(super) struct State {
     shown_cards: Vec<tick_protocol::InstanceRef>,
     /// The open cards the last frame collapsed for lack of room.
     collapsed_cards: Vec<tick_protocol::InstanceRef>,
-    /// Where the selection rests while the Monitor list has the keys; its card shows once it
-    /// rested long enough.
+    /// Where the selection rests on a row with an open card while the Monitor list has the keys;
+    /// the card shows once it rested long enough.
     selection_rest: Option<cards::SelectionRest>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
     /// Agent's use showed; the input loop sends it.
@@ -14264,11 +14264,11 @@ fn read_keys(
         if !settle_background_work(state, stop, sender, input_was_idle, &mut deferred_frame)? {
             break;
         }
-        // The selected row's card shows on time even while nothing is typed.
+        // The selected row's open card shows on time even while nothing is typed.
         let wait = state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?
-            .selection_preview_deadline()
+            .selection_reveal_deadline()
             .map_or(INPUT_POLL_INTERVAL, |deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -14323,8 +14323,7 @@ fn read_keys(
                 None
             }
         };
-        let (previewed, preview_attach) = state.settle_selection_preview(Instant::now());
-        redraw |= previewed;
+        redraw |= state.settle_selection_reveal(Instant::now());
         if (redraw || submission_released) && in_burst && event::poll(Duration::ZERO)? {
             deferred_frame = true;
         } else if redraw || submission_released || std::mem::take(&mut deferred_frame) {
@@ -14338,11 +14337,6 @@ fn read_keys(
             if !send_input(sender, stop, input) || ended {
                 break;
             }
-        }
-        if let Some(attach) = preview_attach
-            && !send_input(sender, stop, attach)
-        {
-            break;
         }
     }
     Ok(())

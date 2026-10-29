@@ -70,6 +70,8 @@ async fn view_with_keys_ticks_progress(
 const CLOSE: &[u8] = b"\x1b";
 /// Leaves an entered Tick's card: the first Esc reaches the Tick, the second leaves.
 const LEAVE_CARD: &[u8] = b"\x1b\x1b";
+/// Well past how long the selection rests on a row before an open card there is revealed.
+const SELECTION_REST: Duration = Duration::from_millis(400);
 
 /// How many Monitor cards show a keys Tick's screen; each card is 40 columns wide.
 fn keys_cards(frame: &str) -> usize {
@@ -107,32 +109,38 @@ fn monitor_position(frame: &str, needle: &str) -> (usize, usize) {
         .unwrap_or_else(|| panic!("no Monitor text {needle:?}: {frame}"))
 }
 
-/// Live Tick screens open as cards under their Monitor rows. The selected row's card shows as a
-/// preview once the selection rests there; Space hides it, and shows it again as the user's.
-/// Space shows and hides a card with the focus on the list, and several stay open; Enter enters one, so typed keys, Ctrl+C included,
-/// reach that Tick alone; a lone Esc reaches the Tick too, and Esc Esc leaves with the card still
-/// shown, the second Esc never reaching the Tick. A click on a row toggles its card, a click in a
-/// card enters it and a click outside leaves it.
+/// Live Tick screens open as cards under their Monitor rows. Selecting a row opens no card;
+/// Space shows and hides a card with the focus on the list, and several stay open; Enter enters
+/// one, so typed keys, Ctrl+C included, reach that Tick alone; a lone Esc reaches the Tick too,
+/// and Esc Esc leaves with the card still shown, the second Esc never reaching the Tick. A click
+/// on a row toggles its card, a click in a card enters it and a click outside leaves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
         view.send(b"\x1b[C");
-        view.wait_for("the selected row's card previews", |frame| {
-            keys_cards(frame) == 1 && frame.contains("space hide")
-        })
-        .await;
-        view.send(b" ");
-        view.wait_for("Space hides the preview, which stays hidden", |frame| {
-            keys_cards(frame) == 0 && frame.contains("space show")
-        })
-        .await;
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        tokio::time::sleep(SELECTION_REST).await;
+        let rested = view.frame();
+        assert_eq!(
+            keys_cards(&rested),
+            0,
+            "the selection resting on a row opens no card: {rested}"
+        );
         view.send(b" ");
         view.wait_for("one card shows its Tick", |frame| keys_cards(frame) == 1)
             .await;
-        // Space right after the move shows the card as the user's before any preview.
-        view.send(b"j ");
+        view.send(b"j");
+        view.wait_for("the other row selected", |frame| {
+            frame.contains("space show")
+        })
+        .await;
+        tokio::time::sleep(SELECTION_REST).await;
+        let rested = view.frame();
+        assert_eq!(keys_cards(&rested), 1, "{rested}");
+        view.send(b" ");
         let both = view
             .wait_for("both cards show", |frame| keys_cards(frame) == 2)
             .await;
@@ -275,11 +283,18 @@ async fn actual_cli_bubbled_keys_go_back_to_the_list_with_another_tick_selected(
             None,
         )
         .await;
-        // Space right after each move shows the card as the user's before any preview.
-        view.send(b"\x1b[C ");
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        view.send(b" ");
         view.wait_for("one card shows", |frame| keys_cards(frame) == 1)
             .await;
-        view.send(b"j ");
+        view.send(b"j");
+        view.wait_for("the other row selected", |frame| {
+            frame.contains("space show")
+        })
+        .await;
+        view.send(b" ");
         let both = view
             .wait_for("both cards grow to their maximum", |frame| {
                 keys_card_rows(frame) == [9, 9]
@@ -356,7 +371,10 @@ async fn actual_cli_a_tick_that_wants_focus_reports_hears_its_card_gain_and_lose
     let result = AssertUnwindSafe(async {
         let mut view =
             view_with_keys_ticks_progress(&fixture, &[], 1, &["--focus-reports"], None, None).await;
-        view.send(b"\x1b[C ");
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        view.send(b" ");
         view.wait_for("the Tick starts out of focus", |frame| {
             card_shows(frame, "keys 1b 5b 4f") && !card_focused(frame)
         })
@@ -597,14 +615,11 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             later.contains("Monitor 2") && selected_row_is_gone(&later),
             "both gone rows stay: {later}"
         );
-        let selected = selected_line(&later).expect("a selected row");
         let other = hosted_rows(&later)
             .into_iter()
-            .find(|row| *row != selected)
+            .find(|row| Some(*row) != selected_line(&later))
             .expect("the other hosted row");
-        // The two rows are next to each other; lines alone could not tell, as the selected row's
-        // card moves the rows below it.
-        view.send(if other > selected { b"j" } else { b"k" });
+        select_line(&mut view, other).await;
         view.wait_for("the other row is gone too", selected_row_is_gone)
             .await;
         assert_eq!(
@@ -901,17 +916,11 @@ fn selected_line(frame: &str) -> Option<usize> {
         .position(|line| monitor_part(line).is_some_and(|part| part.contains(SELECTED_MARK)))
 }
 
-/// Moves the Monitor selection to the row that names `needle` one key at a time, sending each
+/// Moves the Monitor selection to the row on screen line `target` one key at a time, sending each
 /// only once the last one moved the selection, so no key is still on its way when it returns.
-/// Each step finds the row again: the selected row's card shows under it once the selection
-/// rests there, moving the rows below.
-async fn select_row(view: &mut PtyView, needle: &str) {
+async fn select_line(view: &mut PtyView, target: usize) {
     loop {
         let frame = view.frame();
-        let target = frame
-            .lines()
-            .position(|line| monitor_part(line).is_some_and(|part| part.contains(needle)))
-            .unwrap_or_else(|| panic!("no Monitor row names {needle:?}: {frame}"));
         let selected =
             selected_line(&frame).unwrap_or_else(|| panic!("no Monitor row is selected: {frame}"));
         if selected == target {
@@ -923,6 +932,16 @@ async fn select_row(view: &mut PtyView, needle: &str) {
         })
         .await;
     }
+}
+
+/// Moves the Monitor selection to the row that names `needle`.
+async fn select_row(view: &mut PtyView, needle: &str) {
+    let frame = view.frame();
+    let target = frame
+        .lines()
+        .position(|line| monitor_part(line).is_some_and(|part| part.contains(needle)))
+        .unwrap_or_else(|| panic!("no Monitor row names {needle:?}: {frame}"));
+    select_line(view, target).await;
 }
 
 /// Whether a Monitor line shows `text`, such as a card's screen line.
@@ -1378,7 +1397,10 @@ async fn actual_cli_a_card_shown_before_visiting_a_subagent_comes_back_on_return
                     .any(|line| line.contains(REMEMBERING_CHILD))
         })
         .await;
-        view.send(b"\x1b[C ");
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("space show"))
+            .await;
+        view.send(b" ");
         view.wait_for("the card shows its Tick", |frame| keys_cards(frame) == 1)
             .await;
         view.send(b"\r");
