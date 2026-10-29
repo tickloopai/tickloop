@@ -10,16 +10,20 @@ use std::{
 };
 
 use grep_printer::{StandardBuilder, SummaryBuilder, SummaryKind};
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
-use ignore::{WalkBuilder, overrides::OverrideBuilder, types::TypesBuilder};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Operation, READ_TOOL_NAME, ToolDefinition, ToolError, io_error, is_sensitive_path,
-    open_existing,
+    Operation, READ_TOOL_NAME, ToolDefinition, ToolError,
+    file_search::{
+        CONTEXT_SEPARATOR, FileSearchError, GLOB_RESULT_LIMIT, GLOB_SKIPPED_NAMES,
+        GREP_SKIPPED_NAMES, GrepOutputMode, GrepQuery, MAX_COLUMNS, MAX_SEARCH_FILE_BYTES,
+        MAX_SEARCH_OUTPUT_BYTES, RIPGREP_IGNORE_FILE, apply_head_limit, binary_detection,
+        content_text, count_text, file_types, files_text, glob_listing, override_matcher,
+    },
+    io_error, is_sensitive_path, open_existing,
     read::semantic_integer,
     shell::BASH_TOOL_NAME,
     write::{FILE_NOT_FOUND_CWD_NOTE, semantic_boolean},
@@ -29,26 +33,7 @@ use tickloop_harness_protocol::ToolResult;
 pub const GLOB_TOOL_NAME: &str = "Glob";
 pub const GREP_TOOL_NAME: &str = "Grep";
 
-/// Claude Code's `globLimits.maxResults` default.
-const MAX_GLOB_RESULTS: usize = 100;
-const GLOB_TRUNCATED_NOTE: &str =
-    "(Results are truncated. Consider using a more specific path or pattern.)";
-/// Claude Code `DEFAULT_HEAD_LIMIT`: the entries Grep returns when `head_limit` is unspecified.
-const DEFAULT_HEAD_LIMIT: usize = 250;
-/// Claude Code passes `--max-columns 500` so minified or base64 lines do not flood the output.
-const MAX_COLUMNS: u64 = 500;
-const MAX_SEARCH_FILE_BYTES: u64 = 8 * 1024 * 1024;
-/// Output collected from the files searched so far; like ripgrep's output buffer in Claude Code,
-/// reaching it ends the search with the lines already found.
-const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const CURRENT_DIRECTORY: &str = ".";
-const CONTEXT_SEPARATOR: &[u8] = b"--";
-const RIPGREP_IGNORE_FILE: &str = ".rgignore";
-/// Glob lists ignored and hidden files like `rg --files --no-ignore --hidden`, but never this
-/// project's private data or Git's object store.
-const GLOB_SKIPPED_NAMES: &[&str] = &[".git", ".tickloop"];
-/// Claude Code `VCS_DIRECTORIES_TO_EXCLUDE`, plus this project's private data.
-const GREP_SKIPPED_NAMES: &[&str] = &[".git", ".svn", ".hg", ".bzr", ".jj", ".sl", ".tickloop"];
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -169,32 +154,11 @@ enum SearchKind {
     Glob {
         pattern: String,
     },
-    Grep(Box<GrepRequest>),
+    Grep(Box<GrepQuery>),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum OutputMode {
-    Content,
-    #[default]
-    FilesWithMatches,
-    Count,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct GrepRequest {
-    pattern: String,
-    globs: Vec<String>,
-    file_type: Option<String>,
-    output_mode: OutputMode,
-    lines_before: usize,
-    lines_after: usize,
-    line_numbers: bool,
-    case_insensitive: bool,
-    multiline: bool,
-    /// `None` applies the default limit; `Some(0)` lists everything.
-    head_limit: Option<usize>,
-    offset: usize,
+fn invalid_input(error: FileSearchError) -> ToolError {
+    ToolError::InvalidInput(error.to_string())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -206,7 +170,7 @@ struct GrepInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     glob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_mode: Option<OutputMode>,
+    output_mode: Option<GrepOutputMode>,
     #[serde(
         rename = "-B",
         default,
@@ -329,6 +293,16 @@ fn split_absolute_glob(pattern: &str) -> Option<(String, String)> {
 }
 
 fn prepare_grep(input: &Value) -> Result<(String, Operation, Value), ToolError> {
+    let (path, request, normalized_input) = grep_query(input)?;
+    Ok((
+        path,
+        Operation::Search(SearchRequest::new(SearchKind::Grep(Box::new(request)))),
+        normalized_input,
+    ))
+}
+
+/// The searched path, the checked query and the normalized input of a `Grep` call.
+pub(crate) fn grep_query(input: &Value) -> Result<(String, GrepQuery, Value), ToolError> {
     let parsed: GrepInput = serde_json::from_value(input.clone())
         .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
     let (lines_before, lines_after) = match parsed.context.or(parsed.context_alias) {
@@ -338,7 +312,7 @@ fn prepare_grep(input: &Value) -> Result<(String, Operation, Value), ToolError> 
             parsed.lines_after.unwrap_or(0),
         ),
     };
-    let request = GrepRequest {
+    let request = GrepQuery {
         pattern: parsed.pattern.clone(),
         globs: parsed.glob.as_deref().map(split_globs).unwrap_or_default(),
         file_type: parsed.file_type.clone(),
@@ -351,21 +325,16 @@ fn prepare_grep(input: &Value) -> Result<(String, Operation, Value), ToolError> 
         head_limit: parsed.head_limit,
         offset: parsed.offset.unwrap_or(0),
     };
-    request.matcher()?;
-    let mut overrides = OverrideBuilder::new(CURRENT_DIRECTORY);
-    for glob in &request.globs {
-        overrides
-            .add(glob)
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-    }
+    request.matcher().map_err(invalid_input)?;
+    override_matcher(Path::new(CURRENT_DIRECTORY), &request.globs).map_err(invalid_input)?;
     if let Some(file_type) = &request.file_type {
-        file_types(file_type)?;
+        file_types(file_type).map_err(invalid_input)?;
     }
     let normalized_input = serde_json::to_value(&parsed)
         .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
     Ok((
         parsed.path.unwrap_or_else(|| CURRENT_DIRECTORY.into()),
-        Operation::Search(SearchRequest::new(SearchKind::Grep(Box::new(request)))),
+        request,
         normalized_input,
     ))
 }
@@ -382,14 +351,6 @@ fn split_globs(glob: &str) -> Vec<String> {
         })
         .map(String::from)
         .collect()
-}
-
-fn file_types(name: &str) -> Result<ignore::types::Types, ToolError> {
-    TypesBuilder::new()
-        .add_defaults()
-        .select(name)
-        .build()
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))
 }
 
 impl SearchRequest {
@@ -439,48 +400,6 @@ fn display_path(path: &Path, workdir: &Path) -> PathBuf {
     path.strip_prefix(workdir).unwrap_or(path).to_path_buf()
 }
 
-impl GrepRequest {
-    /// The matcher ripgrep builds for these flags: `^` and `$` match at line boundaries, and only
-    /// multiline mode lets a match cross a line terminator, with `.` matching newlines there.
-    fn matcher(&self) -> Result<RegexMatcher, ToolError> {
-        let mut builder = RegexMatcherBuilder::new();
-        builder
-            .multi_line(true)
-            .case_insensitive(self.case_insensitive)
-            .ban_byte(Some(b'\0'));
-        if self.multiline {
-            builder.dot_matches_new_line(true);
-        } else {
-            builder.line_terminator(Some(b'\n'));
-        }
-        builder
-            .build(&self.pattern)
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))
-    }
-
-    fn searcher(&self) -> Searcher {
-        let is_content = self.output_mode == OutputMode::Content;
-        let mut builder = SearcherBuilder::new();
-        builder
-            .multi_line(self.multiline)
-            .line_number(is_content && self.line_numbers);
-        if is_content {
-            builder
-                .before_context(self.lines_before)
-                .after_context(self.lines_after);
-        }
-        builder.build()
-    }
-
-    /// How many output entries decide the page, or `None` when every entry is needed.
-    fn entries_needed(&self) -> Option<usize> {
-        match self.head_limit {
-            Some(0) => None,
-            limit => Some(self.offset + limit.unwrap_or(DEFAULT_HEAD_LIMIT) + 1),
-        }
-    }
-}
-
 pub(super) fn execute(
     root: &Path,
     request: &SearchRequest,
@@ -521,21 +440,6 @@ fn walker(
     builder
 }
 
-fn overrides(
-    root: &Path,
-    globs: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<ignore::overrides::Override, ToolError> {
-    let mut builder = OverrideBuilder::new(root);
-    for glob in globs {
-        builder
-            .add(glob.as_ref())
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-    }
-    builder
-        .build()
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))
-}
-
 /// `rg --files --glob <pattern> --sort=modified --no-ignore --hidden`: oldest first, the first
 /// hundred.
 fn list_files(
@@ -545,7 +449,7 @@ fn list_files(
     cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
     let mut walk = walker(root, GLOB_SKIPPED_NAMES, false);
-    walk.overrides(overrides(root, [pattern])?);
+    walk.overrides(override_matcher(root, [pattern]).map_err(invalid_input)?);
     let mut files = Vec::new();
     for entry in walk.build() {
         if cancel.is_cancelled() {
@@ -563,42 +467,39 @@ fn list_files(
             files.push((modified, entry.into_path()));
         }
     }
-    if files.is_empty() {
-        return Ok("No files found".into());
-    }
     files.sort_by_key(|(modified, _)| *modified);
-    let mut lines = files
+    let paths = files
         .iter()
-        .take(MAX_GLOB_RESULTS)
+        .take(GLOB_RESULT_LIMIT)
         .map(|(_, path)| display_path(path, workdir).to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    if files.len() > MAX_GLOB_RESULTS {
-        lines.push(GLOB_TRUNCATED_NOTE.into());
-    }
-    Ok(lines.join("\n"))
+        .collect();
+    Ok(glob_listing(paths, files.len() > GLOB_RESULT_LIMIT))
 }
 
 fn search_contents(
     root: &Path,
-    request: &GrepRequest,
+    request: &GrepQuery,
     workdir: &Path,
     cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
-    let matcher = request.matcher()?;
+    let matcher = request.matcher().map_err(invalid_input)?;
     let mut searcher = request.searcher();
     let mut walk = walker(root, GREP_SKIPPED_NAMES, true);
-    walk.overrides(overrides(root, &request.globs)?);
+    walk.overrides(override_matcher(root, &request.globs).map_err(invalid_input)?);
     if let Some(file_type) = &request.file_type {
-        walk.types(file_types(file_type)?);
+        walk.types(file_types(file_type).map_err(invalid_input)?);
     }
     let root_is_directory = std::fs::metadata(root)
         .map_err(|error| io_error(root, error))?
         .is_dir();
-    let has_context = request.lines_before > 0 || request.lines_after > 0;
     let mut content_printer = StandardBuilder::new()
         .path(root_is_directory)
         .max_columns(Some(MAX_COLUMNS))
-        .separator_search(has_context.then(|| CONTEXT_SEPARATOR.to_vec()))
+        .separator_search(
+            request
+                .has_context()
+                .then(|| CONTEXT_SEPARATOR.as_bytes().to_vec()),
+        )
         .build_no_color(Vec::new());
     let mut count_printer = SummaryBuilder::new()
         .kind(SummaryKind::Count)
@@ -634,17 +535,11 @@ fn search_contents(
             }
             continue;
         }
-        // Like ripgrep, a file named explicitly reports binary matches while one found by the
-        // walk stops at the first NUL byte.
-        searcher.set_binary_detection(if is_explicit {
-            BinaryDetection::convert(b'\0')
-        } else {
-            BinaryDetection::quit(b'\0')
-        });
+        searcher.set_binary_detection(binary_detection(is_explicit));
         let reader = file.take(MAX_SEARCH_FILE_BYTES);
         let shown_path = display_path(path, workdir);
         let printed = match request.output_mode {
-            OutputMode::FilesWithMatches => {
+            GrepOutputMode::FilesWithMatches => {
                 let mut printer = SummaryBuilder::new()
                     .kind(SummaryKind::PathWithMatch)
                     .build_no_color(std::io::sink());
@@ -654,12 +549,12 @@ fn search_contents(
                 }
                 continue;
             }
-            OutputMode::Content => {
+            GrepOutputMode::Content => {
                 let sink = content_printer.sink_with_path(&matcher, &shown_path);
                 let _ = searcher.search_reader(&matcher, reader, sink);
                 content_printer.get_mut().get_mut()
             }
-            OutputMode::Count => {
+            GrepOutputMode::Count => {
                 let sink = count_printer.sink_with_path(&matcher, &shown_path);
                 let _ = searcher.search_reader(&matcher, reader, sink);
                 count_printer.get_mut().get_mut()
@@ -682,82 +577,22 @@ fn search_contents(
         }
     }
     Ok(match request.output_mode {
-        OutputMode::Content => content_result(lines, request),
-        OutputMode::Count => count_result(lines, request),
-        OutputMode::FilesWithMatches => files_result(matched_files, request, workdir),
+        GrepOutputMode::Content => {
+            let (lines, applied_limit) = apply_head_limit(lines, request);
+            content_text(lines, applied_limit, request.offset)
+        }
+        GrepOutputMode::Count => {
+            let (lines, applied_limit) = apply_head_limit(lines, request);
+            count_text(lines, applied_limit, request.offset)
+        }
+        GrepOutputMode::FilesWithMatches => files_result(matched_files, request, workdir),
     })
-}
-
-/// Claude Code `applyHeadLimit`: skips `offset` entries, then keeps `head_limit` of them (250 when
-/// unspecified, everything when 0). The limit is returned only when it dropped entries.
-fn apply_head_limit<T>(items: Vec<T>, request: &GrepRequest) -> (Vec<T>, Option<usize>) {
-    let mut kept = items.into_iter().skip(request.offset).collect::<Vec<_>>();
-    if request.head_limit == Some(0) {
-        return (kept, None);
-    }
-    let limit = request.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
-    let applied_limit = (kept.len() > limit).then_some(limit);
-    kept.truncate(limit);
-    (kept, applied_limit)
-}
-
-/// Claude Code `formatLimitInfo`.
-fn pagination(applied_limit: Option<usize>, offset: usize) -> String {
-    let mut parts = Vec::new();
-    if let Some(limit) = applied_limit {
-        parts.push(format!("limit: {limit}"));
-    }
-    if offset > 0 {
-        parts.push(format!("offset: {offset}"));
-    }
-    parts.join(", ")
-}
-
-fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
-}
-
-fn content_result(lines: Vec<String>, request: &GrepRequest) -> String {
-    let (lines, applied_limit) = apply_head_limit(lines, request);
-    let content = if lines.is_empty() {
-        "No matches found".into()
-    } else {
-        lines.join("\n")
-    };
-    match pagination(applied_limit, request.offset) {
-        pagination if pagination.is_empty() => content,
-        pagination => format!("{content}\n\n[Showing results with pagination = {pagination}]"),
-    }
-}
-
-fn count_result(lines: Vec<String>, request: &GrepRequest) -> String {
-    let (lines, applied_limit) = apply_head_limit(lines, request);
-    let counts = lines
-        .iter()
-        .filter_map(|line| line.rsplit_once(':')?.1.parse::<usize>().ok())
-        .collect::<Vec<_>>();
-    let content = if lines.is_empty() {
-        "No matches found".into()
-    } else {
-        lines.join("\n")
-    };
-    let pagination = match pagination(applied_limit, request.offset) {
-        pagination if pagination.is_empty() => String::new(),
-        pagination => format!(" with pagination = {pagination}"),
-    };
-    let occurrences: usize = counts.iter().sum();
-    let files = counts.len();
-    format!(
-        "{content}\n\nFound {occurrences} total {} across {files} {}.{pagination}",
-        plural(occurrences, "occurrence", "occurrences"),
-        plural(files, "file", "files"),
-    )
 }
 
 /// Newest first like Claude Code, with the path breaking ties.
 fn files_result(
     mut matched_files: Vec<(Option<SystemTime>, PathBuf)>,
-    request: &GrepRequest,
+    request: &GrepQuery,
     workdir: &Path,
 ) -> String {
     matched_files.sort_by(|(left_time, left_path), (right_time, right_path)| {
@@ -766,21 +601,9 @@ fn files_result(
             .then_with(|| left_path.cmp(right_path))
     });
     let (matched_files, applied_limit) = apply_head_limit(matched_files, request);
-    if matched_files.is_empty() {
-        return "No files found".into();
-    }
-    let pagination = match pagination(applied_limit, request.offset) {
-        pagination if pagination.is_empty() => String::new(),
-        pagination => format!(" {pagination}"),
-    };
     let paths = matched_files
         .iter()
         .map(|(_, path)| display_path(path, workdir).to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    format!(
-        "Found {} {}{pagination}\n{}",
-        paths.len(),
-        plural(paths.len(), "file", "files"),
-        paths.join("\n")
-    )
+        .collect();
+    files_text(paths, applied_limit, request.offset)
 }

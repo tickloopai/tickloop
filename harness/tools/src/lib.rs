@@ -21,6 +21,7 @@ use tickloop_harness_protocol::{
 };
 
 pub mod file_change;
+pub mod file_search;
 pub mod permissions;
 mod persisted_output;
 pub use persisted_output::{
@@ -49,6 +50,8 @@ pub use write::{EDIT_TOOL_NAME, WRITE_TOOL_NAME};
 
 #[cfg(test)]
 mod file_change_review_tests;
+#[cfg(test)]
+mod file_search_tests;
 #[cfg(test)]
 mod file_write_publication_tests;
 #[cfg(test)]
