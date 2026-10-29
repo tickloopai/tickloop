@@ -164,6 +164,10 @@ pub(super) struct Monitor {
     tick_viewport: Cell<(usize, usize)>,
     next_page: Option<PageCursor>,
     selected: Option<MonitorTarget>,
+    /// Every row in the list's order, scheduled tasks past the pinned ones included, as the last
+    /// reconciliation left it; a selected row that leaves hands the selection to the row taking
+    /// its place.
+    reconciled_order: Vec<MonitorTarget>,
     pub(super) action_error: Option<String>,
     tick_anchor: Option<InstanceRef>,
     expanded_tasks: bool,
@@ -1089,6 +1093,7 @@ impl Monitor {
             && self.selected_task().is_none()
             && !self.is_more_selected()
             && !self.is_goal_selected()
+            && !self.select_in_place_of_left_row()
         {
             self.selected = if self.expanded_tasks {
                 None
@@ -1107,6 +1112,50 @@ impl Monitor {
                 self.selected = Some(MonitorTarget::Goal);
             }
         }
+        self.reconciled_order = self.targets_in_order(self.listed_ticks(), self.tasks().len());
+    }
+    /// Selects the row now in the place of the selected row that left: the one after the nearest
+    /// row above it that stayed, else the first, else the last when nothing follows. Says whether
+    /// it selected one.
+    fn select_in_place_of_left_row(&mut self) -> bool {
+        let Some(left) = self.selected.as_ref().and_then(|selected| {
+            self.reconciled_order
+                .iter()
+                .position(|target| target == selected)
+        }) else {
+            return false;
+        };
+        let order = if self.expanded_tasks {
+            self.tasks()
+                .iter()
+                .map(|task| MonitorTarget::ScheduledTask(task.id))
+                .collect()
+        } else {
+            self.targets_in_order(self.listed_ticks(), self.preview_count())
+        };
+        let place = self.reconciled_order[..left]
+            .iter()
+            .rev()
+            .find_map(|stayed| order.iter().position(|target| target == stayed))
+            .map_or(0, |above| above + 1);
+        let Some(target) = order.get(place).or(order.last()).cloned() else {
+            return false;
+        };
+        match target {
+            MonitorTarget::Tick(instance) => self.select_listed(&instance),
+            target => self.selected = Some(target),
+        }
+        true
+    }
+    /// Every Tick row in the list's order, the ones on pages not loaded yet included; the loaded
+    /// rows are the listing's first pages.
+    fn listed_ticks(&self) -> impl Iterator<Item = &InstanceRef> {
+        self.entries.iter().map(|entry| &entry.instance).chain(
+            self.listing
+                .iter()
+                .skip(self.entries.len())
+                .map(|row| &row.instance),
+        )
     }
     /// Closes the open detail; an empty Monitor then releases focus back to the input. A finished
     /// Shell the detail kept listed leaves on the next clock tick.
@@ -1233,15 +1282,25 @@ impl Monitor {
     /// Every row the keys can select, in the list's order: the loaded rows, the shown scheduled
     /// tasks and their `+N more`, then the Goal.
     fn selectable_targets(&self) -> Vec<MonitorTarget> {
-        let mut targets = self
-            .entries
-            .iter()
-            .map(|entry| MonitorTarget::Tick(entry.instance.clone()))
+        self.targets_in_order(
+            self.entries.iter().map(|entry| &entry.instance),
+            self.preview_count(),
+        )
+    }
+
+    /// `ticks`, the first `task_count` scheduled tasks and their `+N more`, then the Goal.
+    fn targets_in_order<'a>(
+        &self,
+        ticks: impl Iterator<Item = &'a InstanceRef>,
+        task_count: usize,
+    ) -> Vec<MonitorTarget> {
+        let mut targets = ticks
+            .map(|instance| MonitorTarget::Tick(instance.clone()))
             .collect::<Vec<_>>();
         targets.extend(
             self.tasks()
                 .iter()
-                .take(self.preview_count())
+                .take(task_count)
                 .map(|task| MonitorTarget::ScheduledTask(task.id)),
         );
         if self.tasks().len() > MAX_PINNED_TASKS {
@@ -3914,6 +3973,78 @@ mod scrolling_tests {
             status.monitor.mark_observed(calendar(*row), at_ms);
         }
         monitor.set_chat_status(Arc::new(status));
+    }
+
+    fn remove_rows(monitor: &mut Monitor, rows: &[usize]) {
+        let mut status = (**monitor.chat_status.as_ref().unwrap()).clone();
+        status
+            .monitor
+            .members
+            .retain(|member| !rows.iter().any(|row| member.instance == calendar(*row)));
+        monitor.set_chat_status(Arc::new(status));
+    }
+
+    fn selected_instance(monitor: &Monitor) -> InstanceRef {
+        monitor.selected().unwrap().instance.clone()
+    }
+
+    #[test]
+    fn removing_the_selected_row_selects_the_row_that_takes_its_place() {
+        let mut monitor = monitor(5);
+        monitor.select(&calendar(2));
+        remove_rows(&mut monitor, &[2]);
+        assert_eq!(selected_instance(&monitor), calendar(3));
+        remove_rows(&mut monitor, &[3, 4]);
+        assert_eq!(
+            selected_instance(&monitor),
+            calendar(1),
+            "the last row leaving hands the selection to the new last row"
+        );
+        remove_rows(&mut monitor, &[0, 1]);
+        assert!(monitor.selected.is_none());
+    }
+
+    #[test]
+    fn rows_leaving_or_joining_elsewhere_keep_the_selected_row() {
+        let mut monitor = monitor(6);
+        monitor.select(&calendar(3));
+        remove_rows(&mut monitor, &[1, 5]);
+        assert_eq!(selected_instance(&monitor), calendar(3));
+        let mut status = (**monitor.chat_status.as_ref().unwrap()).clone();
+        status
+            .monitor
+            .members
+            .push(tickloop_harness::protocol::MonitorMember {
+                instance: calendar(1),
+                title: Some("Tick 001".into()),
+                is_terminal: false,
+                min_rows: None,
+                max_rows: None,
+            });
+        monitor.set_chat_status(Arc::new(status));
+        assert_eq!(selected_instance(&monitor), calendar(3));
+    }
+
+    #[test]
+    fn removing_the_selected_row_of_a_scrolled_list_keeps_its_place_in_view() {
+        let mut monitor = monitor(270);
+        for _ in 0..250 {
+            monitor.move_selection(1);
+        }
+        assert_eq!(selected_instance(&monitor), calendar(250));
+        monitor.frame(24, 12, DisplayProfile::default(), 0);
+        let offset = monitor.tick_offset.get();
+        assert!(offset > 0);
+        remove_rows(&mut monitor, &[250]);
+        assert_eq!(selected_instance(&monitor), calendar(251));
+        let frame = monitor.frame(24, 12, DisplayProfile::default(), 0);
+        assert_eq!(monitor.tick_offset.get(), offset);
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text().contains("Tick 251"))
+        );
     }
 
     fn texts(frame: &MonitorFrame) -> Vec<String> {

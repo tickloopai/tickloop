@@ -4255,16 +4255,72 @@ fn returning_from_the_full_task_list_keeps_selection_when_removal_eliminates_ove
     assert!(state.monitor.task_list_is_open());
     assert_eq!(
         state.monitor.selected_task().unwrap().id,
-        Uuid::from_u128(0)
+        Uuid::from_u128(2)
     );
     state.monitor.close_task_list();
     assert!(!state.monitor.task_list_is_open());
     assert_eq!(
         state.monitor.selected_task().unwrap().id,
-        Uuid::from_u128(0)
+        Uuid::from_u128(2)
     );
     let frame = state.monitor.frame(48, 16, state.display, 0);
     assert!(!frame.lines.iter().any(|line| line.text().contains("more")));
+}
+
+#[test]
+fn a_selected_row_leaving_selects_the_next_row_across_sections() {
+    let mut state = docked_monitor_fixture(2, 2);
+    let first_tick = state.monitor.entries()[0].clone();
+    state
+        .monitor
+        .select(&state.monitor.entries()[1].instance.clone());
+    state.monitor.replace(TickGroup::Ticks, vec![first_tick]);
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(0)
+    );
+    state.monitor.remove_task(&Uuid::from_u128(0));
+    assert_eq!(
+        state.monitor.selected_task().unwrap().id,
+        Uuid::from_u128(1)
+    );
+    state.monitor.remove_task(&Uuid::from_u128(1));
+    assert!(state.monitor.is_goal_selected());
+}
+
+#[test]
+fn closing_the_selected_row_with_x_x_selects_the_row_that_takes_its_place() {
+    let mut state = State::new(true, 140, 25);
+    let chat = Uuid::new_v4();
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let rows: Vec<tick_protocol::InstanceRef> = (0..3)
+        .map(|index| format!("calendar:{index:03}").parse().unwrap())
+        .collect();
+    let mut status = chat_status(chat);
+    status.monitor.members = rows
+        .iter()
+        .map(|instance| MonitorMember {
+            instance: instance.clone(),
+            title: Some(instance.to_string()),
+            is_terminal: false,
+            min_rows: None,
+            max_rows: None,
+        })
+        .collect();
+    state.monitor.set_chat_status(Arc::new(status));
+    state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    state.monitor.select(&rows[1]);
+    let Some(InputEvent::TickAction { action, .. }) = confirm_removal(&mut state) else {
+        panic!("x twice must ask the Agent to remove the row");
+    };
+    assert_eq!(action.instance, rows[1].to_string());
+    let mut membership = state.monitor.chat_status.as_ref().unwrap().monitor.clone();
+    membership
+        .members
+        .retain(|member| member.instance != rows[1]);
+    state.monitor.set_membership(membership);
+    assert_eq!(state.monitor.selected().unwrap().instance, rows[2]);
 }
 
 fn removal_fixture(intent: crate::monitor_rows::TickIntent) -> State {
