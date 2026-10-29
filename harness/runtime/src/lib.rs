@@ -162,8 +162,9 @@ use tickloop_harness_protocol::{
     OperationState, PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution,
     PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PromptPolicy,
     QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
-    ResponseRejection, Role, RunId, SubagentRegistration, TaskNotification, TriggerSource, Usage,
-    UserShellRecord, UserShellState, VerdictEvidence, projection,
+    ResponseRejection, Role, RunId, SUBAGENT_HANDBACK_TOOL_NAME, SubagentRegistration,
+    TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence,
+    projection,
 };
 use tickloop_harness_tools::permissions::SessionPermissionDecision;
 use tickloop_harness_tools::{
@@ -3848,6 +3849,12 @@ impl Agent {
                     content: output.content,
                 });
                 chat.snapshot.last_model_run = Some(receipt.run_id);
+                if calls
+                    .iter()
+                    .any(|call| call.name != SUBAGENT_HANDBACK_TOOL_NAME)
+                {
+                    chat.hook_state.session.note_tool_calls(receipt.run_id);
+                }
                 self.emit(
                     chat,
                     &receipt,

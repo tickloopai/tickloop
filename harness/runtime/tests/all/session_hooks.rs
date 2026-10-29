@@ -732,8 +732,12 @@ async fn a_ralph_loop_stop_hook_keeps_going_until_esc_or_stop_ends_it() {
         let reached = Arc::new(tokio::sync::Notify::new());
         let counter = iterations.clone();
         let notify = reached.clone();
+        let gate = bench.gate.clone();
         bench.define("ralph.sh", move |_| {
             if counter.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                // The request the fifth block goes on with waits for the interruption, so the
+                // loop stays under the cap on consecutive blocks.
+                gate.holds_next.store(true, Ordering::SeqCst);
                 notify.notify_one();
             }
             answer(json!({
@@ -776,7 +780,7 @@ async fn a_ralph_loop_stop_hook_keeps_going_until_esc_or_stop_ends_it() {
         interrupter.await.unwrap();
         assert!(observed.interrupted, "stop={stops}");
         let ran = iterations.load(Ordering::SeqCst);
-        assert!(ran >= 5, "no cap on blocks: {ran}");
+        assert_eq!(ran, 5);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             iterations.load(Ordering::SeqCst),
@@ -824,6 +828,153 @@ fn ralph_until_active(input: &Value) -> MemoryCommandRun {
 
 fn texts_of(request: &ModelRequest) -> Vec<String> {
     conversation_texts(&request.messages)
+}
+
+/// Claude Code 2.1.302's most consecutive blocks of a turn's end before the model calls a tool.
+const STOP_BLOCK_CAP: usize = 8;
+
+fn always_block(_: &Value) -> MemoryCommandRun {
+    answer(json!({"decision": "block", "reason": RALPH_PROMPT}))
+}
+
+fn cap_warning(blocks: usize) -> String {
+    format!(
+        "A hook blocked the turn from ending {blocks} consecutive times — overriding and ending \
+         turn. For Stop/SubagentStop hooks, check stop_hook_active in the input and return \
+         success while it's true."
+    )
+}
+
+/// The reasons the runs' records give, in order.
+fn run_reasons(observed: &Observed) -> Vec<String> {
+    observed
+        .hook_runs
+        .iter()
+        .map(|run| run.reason.clone().unwrap_or_default())
+        .collect()
+}
+
+/// Only the last record warns, after its own reason, that its block was overridden.
+fn assert_only_last_block_overridden(reasons: &[String], blocks: usize) {
+    let (last, earlier) = reasons.split_last().unwrap();
+    assert_eq!(*last, format!("{RALPH_PROMPT}\n{}", cap_warning(blocks)));
+    assert!(
+        earlier.iter().all(|reason| reason == RALPH_PROMPT),
+        "{earlier:?}"
+    );
+}
+
+/// As in Claude Code 2.1.302, Stop hooks may block a turn's end 8 consecutive times: the ninth
+/// block is overridden with a warning and the turn ends; the next turn counts afresh.
+#[tokio::test]
+async fn the_ninth_consecutive_stop_block_is_overridden_and_ends_the_turn() {
+    let routed = Arc::new(RoutedModel::new(|_| text("Still improving the README.")));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::Stop, None, "ralph.sh")],
+        false,
+    )
+    .await;
+    bench.define("ralph.sh", always_block);
+    let observed = tokio::time::timeout(Duration::from_secs(20), bench.run(RALPH_PROMPT))
+        .await
+        .expect("the cap ends the turn");
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert_eq!(bench.inputs_of("ralph.sh").len(), STOP_BLOCK_CAP + 1);
+    assert_eq!(
+        bench.requests().len(),
+        STOP_BLOCK_CAP + 1,
+        "the overridden block's reason is never sent"
+    );
+    assert_only_last_block_overridden(&run_reasons(&observed), STOP_BLOCK_CAP + 1);
+    assert_prefix_stable(&bench).await;
+
+    let next = tokio::time::timeout(Duration::from_secs(20), bench.run("Next."))
+        .await
+        .expect("the cap ends the next turn too");
+    assert_eq!(
+        bench.inputs_of("ralph.sh").len(),
+        2 * (STOP_BLOCK_CAP + 1),
+        "a new turn counts afresh"
+    );
+    assert_only_last_block_overridden(&run_reasons(&next), STOP_BLOCK_CAP + 1);
+    bench.agent.shutdown().await;
+}
+
+/// Claude Code counts only blocks with no tool call between them: a tool call starts the count
+/// again.
+#[tokio::test]
+async fn a_tool_call_starts_the_count_of_consecutive_stop_blocks_again() {
+    const BLOCKS_BEFORE_TOOL: usize = 5;
+    let mut replies = vec![text("Still improving the README."); BLOCKS_BEFORE_TOOL];
+    replies.push(call("build", "Bash", json!({"command": "cargo build"})));
+    replies.extend(vec![
+        text("Still improving the README.");
+        STOP_BLOCK_CAP + 1
+    ]);
+    let bench = Bench::start(replies, vec![user_hook(HookEvent::Stop, None, "ralph.sh")]).await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    bench.define("ralph.sh", always_block);
+    let observed = tokio::time::timeout(Duration::from_secs(20), bench.run(RALPH_PROMPT))
+        .await
+        .expect("the cap ends the turn");
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert_eq!(
+        bench.inputs_of("ralph.sh").len(),
+        BLOCKS_BEFORE_TOOL + STOP_BLOCK_CAP + 1
+    );
+    assert_eq!(
+        bench.requests().len(),
+        BLOCKS_BEFORE_TOOL + 1 + STOP_BLOCK_CAP + 1
+    );
+    assert_only_last_block_overridden(&run_reasons(&observed), STOP_BLOCK_CAP + 1);
+    bench.agent.shutdown().await;
+}
+
+/// A ralph-style loop whose every turn calls a tool never reaches the cap, however often its
+/// Stop hook blocks.
+#[tokio::test]
+async fn a_loop_calling_a_tool_every_turn_is_never_capped() {
+    const ITERATIONS: usize = 2 * STOP_BLOCK_CAP;
+    let mut replies = Vec::new();
+    for iteration in 0..ITERATIONS {
+        replies.push(call(
+            &format!("build-{iteration}"),
+            "Bash",
+            json!({"command": "cargo build"}),
+        ));
+        replies.push(text("Still improving the README."));
+    }
+    let bench = Bench::start(replies, vec![user_hook(HookEvent::Stop, None, "ralph.sh")]).await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counter = runs.clone();
+    bench.define("ralph.sh", move |input| {
+        if counter.fetch_add(1, Ordering::SeqCst) + 1 == ITERATIONS {
+            exits(0, "", "")
+        } else {
+            always_block(input)
+        }
+    });
+    let observed = tokio::time::timeout(Duration::from_secs(20), bench.run(RALPH_PROMPT))
+        .await
+        .expect("the loop ends when its hook lets it");
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert_eq!(runs.load(Ordering::SeqCst), ITERATIONS);
+    assert_eq!(bench.requests().len(), 2 * ITERATIONS);
+    assert!(
+        run_reasons(&observed)
+            .iter()
+            .all(|reason| !reason.contains("overriding")),
+        "{:?}",
+        run_reasons(&observed)
+    );
+    bench.agent.shutdown().await;
 }
 
 #[tokio::test]
@@ -1364,6 +1515,75 @@ async fn subagent_stop_runs_before_an_auto_subagent_hands_its_report_back() {
             .any(|request| format!("{:?}", request.messages).contains("report without the log")),
         "the blocked report never reaches the parent"
     );
+    bench.agent.shutdown().await;
+}
+
+/// An Auto Subagent's hand-back is no tool call that starts the count again: SubagentStop may
+/// block it 8 consecutive times, and the ninth block is overridden so the report goes back.
+#[tokio::test]
+async fn the_ninth_consecutive_subagent_stop_block_lets_the_report_go_back() {
+    use tickloop_harness_test_support::auto_classification;
+    use tickloop_harness_test_support::routed::{has_tool_result, state};
+    let routed = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            call(
+                &format!("report-{}", request.messages.len()),
+                "SubagentHandback",
+                json!({"message": "the build report"}),
+            )
+        } else if has_tool_result(request, "delegate") {
+            text("parent done")
+        } else {
+            call("delegate", "Subagent", json!({"task": "Check the build"}))
+        }
+    }));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::SubagentStop, None, "verify.sh")],
+        false,
+    )
+    .await;
+    bench
+        .agent
+        .set_auto_reviewer(Arc::new(RoutedModel::new(|_| {
+            text(&auto_classification(false).to_string())
+        })))
+        .await;
+    bench
+        .agent
+        .set_execution_mode(bench.chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    bench.define("verify.sh", |_| {
+        answer(json!({"decision": "block", "reason": RALPH_PROMPT}))
+    });
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Delegate the check.".into())
+        .await
+        .unwrap();
+    let reaches_parent = |request: &ModelRequest| {
+        state(request)["delegation"].is_null()
+            && format!("{:?}", request.messages).contains("the build report")
+    };
+    let mut records = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !bench.requests().iter().any(reaches_parent) {
+            if let EventKind::HookRan { record } = next_event(&mut events).await.kind {
+                records.push(*record);
+            }
+        }
+    })
+    .await
+    .expect("the parent reads the report once the block is overridden");
+    assert_eq!(bench.inputs_of("verify.sh").len(), STOP_BLOCK_CAP + 1);
+    let reasons = records
+        .iter()
+        .map(|record| record.reason.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_only_last_block_overridden(&reasons, STOP_BLOCK_CAP + 1);
     bench.agent.shutdown().await;
 }
 
