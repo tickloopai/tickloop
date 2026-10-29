@@ -489,7 +489,10 @@ const SENSITIVE_PATH_SIGNALS: &[&str] = &[
 ];
 const SENSITIVE_PATH_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
 
-fn is_sensitive_path(path: &Path) -> bool {
+/// Whether any component of `path` names a credential file or directory the file tools refuse,
+/// such as `.ssh`, `.env.local` or `deploy.pem`; hosts reuse it to keep the same paths away from
+/// what they route or list.
+pub fn is_sensitive_path(path: &Path) -> bool {
     path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return false;

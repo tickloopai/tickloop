@@ -10,6 +10,10 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[[test]]
+name = "all"
+required-features = ["tools"]
+
 [features]
 default = []
 base = ["dep:tickloop-harness-base"]
