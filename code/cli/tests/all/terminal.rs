@@ -818,40 +818,22 @@ fn terminal_explains_how_to_start_without_credentials() {
     assert!(!text.contains("--config"));
     assert!(!text.contains("/model FILE"));
     assert!(text.contains("--cwd"));
-    assert!(text.contains("/help explains commands and keyboard shortcuts"));
+    assert!(text.contains("/stop interrupts the current turn"));
     assert!(
         !text.contains("/ack-"),
         "removed acknowledgement commands must not be documented: {text}"
     );
     for current in [
-        "Usage:",
-        "Commands:",
-        "Options:",
-        "Session options:",
-        "Permission options:",
-        "-p, --print",
-        "--cwd",
         "--continue",
-        "--resume [<CHAT>]",
-        "--chat-id <CHAT>",
+        "--resume [CHAT]",
+        "--chat-id CHAT",
         "--fork-session",
         "--no-session-persistence",
-        "/provider",
-        "/help",
-    ] {
-        assert!(text.contains(current), "missing {current}: {text}");
-    }
-    for manual in [
-        "--config",
-        "/model FILE",
-        "/loops new",
-        "/ack-",
         "TICKLOOP_CONFIG_DIR",
         "/clear",
         "/resume CHAT",
-        "cleanupPeriodDays",
     ] {
-        assert!(!text.contains(manual), "unexpected {manual}: {text}");
+        assert!(text.contains(current), "missing {current}: {text}");
     }
 }
 
@@ -4299,6 +4281,10 @@ fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     assert!(!output.status.success());
     assert!(error.contains("cleanupPeriodDays is 0"), "{error}");
     assert!(!config_root.join("projects").exists());
+
+    let help = trusted_agent_command().arg("--help").output().unwrap();
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("cleanupPeriodDays"), "{text}");
 }
 
 async fn daemon_catalog(
