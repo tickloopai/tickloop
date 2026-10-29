@@ -351,7 +351,7 @@ Tickloop 为以下十个事件运行 `command` 类型的 Hook，stdin 输入、�
 - 退出码 0 表示成功：stdout 是 JSON 时按 JSON 解析，否则在 `UserPromptSubmit` 与 `SessionStart` 中作为上下文。退出码 2 表示拦下，stderr 交给模型（或拒绝该提示、让本轮继续）。其他退出码和超时只提醒你。
 - 匹配到的 Hook 并行运行；决定不一致时 deny 优先于 ask，ask 优先于 allow。`ask` 在 Auto 下也会问你。你自己的 Hook 返回 `allow` 时跳过审批提示与 Auto 审查，显式的 Ask、Deny 规则、敏感路径检查与 Plan 照常生效。`updatedInput` 之后，审批界面显示实际将运行的参数。
 - `async: true` 让 Hook 在后台运行、不阻塞 Agent；结束后显示结果，其 `systemMessage` 与 `additionalContext` 随下一次请求交给模型。`asyncRewake: true` 同样在后台运行，退出码 2 时以 Hook 的输出唤醒 Agent，就像后台命令完成时一样。运行中的 Hook 以第一行输出 `{"async": true}` 时同样转入后台（与 Claude Code 一致），之后按 `async` Hook 处理，超时仍从开始运行时算起。后台 Hook 的决定类输出一律忽略。
-- `esc` 和 `/stop` 取消当前步骤正在等待的 Hook；这样被取消的 `PreToolUse` Hook 也会取消对应的工具调用，模型读到该调用未执行。后台 Hook 不随 `esc` 取消，`/stop` 与停止 Agent 时结束。持续拦下的 `Stop` Hook 没有次数上限，用 `esc` 或 `/stop` 结束循环。
+- `esc` 和 `/stop` 取消当前步骤正在等待的 Hook；这样被取消的 `PreToolUse` Hook 也会取消对应的工具调用，模型读到该调用未执行。后台 Hook 不随 `esc` 取消，`/stop` 与停止 Agent 时结束。持续拦下的 `Stop` Hook 可用 `esc` 或 `/stop` 结束循环。与 Claude Code 一致，`Stop`、`SubagentStop` Hook 在中间没有工具调用时最多连续拦下 8 次，第 9 次拦截被忽略并给出警告，本轮结束；调用工具后重新计数，因此每轮都调用工具的循环不受影响。
 - Hook 的 `systemMessage`、拦下的原因和失败会在对话中显示一行。每次运行（来源、事件、耗时、退出码、决定与截断后的输出）都列在 `/permissions` → Recent activity 中（每个对话最近 100 条）。
 
 Hook 以你的身份在沙箱之外运行，与 Claude Code 中相同。

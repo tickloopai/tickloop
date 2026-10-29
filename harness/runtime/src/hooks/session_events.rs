@@ -17,10 +17,12 @@
 //!   (`compact`).
 //! - `Stop` runs when a root Chat's model ends its turn without calling tools, `SubagentStop`
 //!   when a Subagent's does or before its report is handed back: a block goes on with the
-//!   hooks' reasons, the hooks then reading `stop_hook_active: true`, as often as they block;
-//!   Esc and `/stop` end the Run as always. Input queued meanwhile joins after the reasons, so a
-//!   loop that never calls tools still reads it. A Run that read an `asyncRewake` hook's
-//!   notification reads `stop_hook_active: true` too, as Claude Code queues that notification.
+//!   hooks' reasons, the hooks then reading `stop_hook_active: true`; Esc and `/stop` end the Run
+//!   as always. As in Claude Code, they may block 8 consecutive times with no tool call between
+//!   (a hand-back is none): the ninth block is overridden with a warning and the turn ends.
+//!   Input queued meanwhile joins after the reasons, so a loop that never calls tools still
+//!   reads it. A Run that read an `asyncRewake` hook's notification reads
+//!   `stop_hook_active: true` too, as Claude Code queues that notification.
 //! - `StopFailure` tells the hooks a turn ended on a model error, `SessionEnd` that a root Chat
 //!   ends with its Worker; neither changes anything.
 //! - `PreCompact` runs before a compaction: a block cancels it, and plain output from the others
@@ -45,6 +47,9 @@ const DEFAULT_STOP_REASON: &str = "Operation stopped by hook";
 const SESSION_END_REASON: &str = "other";
 /// Claude Code's longest wait for `SessionEnd` hooks as its process ends.
 const SESSION_END_BUDGET: Duration = Duration::from_secs(60);
+/// Claude Code's most consecutive blocks of a turn's end by `Stop` or `SubagentStop` hooks with
+/// no tool call between them; the next one is overridden.
+const STOP_BLOCK_CAP: u32 = 8;
 
 /// Why a session starts, Claude Code's `SessionStart` source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +78,9 @@ pub(crate) struct SessionHookState {
     session_start: Option<SessionSource>,
     /// Runs a `Stop` or `SubagentStop` hook kept going: their hooks read `stop_hook_active`.
     continued_by_stop: HashSet<RunId>,
+    /// How many consecutive times `Stop` or `SubagentStop` hooks blocked each Run's end since its
+    /// model last called a tool other than the hand-back.
+    stop_blocks: HashMap<RunId, u32>,
     /// Runs whose prompt a `UserPromptSubmit` hook blocked, with the prompt's message index:
     /// the prompt is taken back once the Run ends.
     blocked_prompts: HashMap<RunId, usize>,
@@ -124,9 +132,16 @@ impl SessionHookState {
         !self.unchecked_prompts.is_empty()
     }
 
+    /// The model of `run` called a tool other than the hand-back: blocks of its turn's end count
+    /// from zero again.
+    pub(crate) fn note_tool_calls(&mut self, run: RunId) {
+        self.stop_blocks.remove(&run);
+    }
+
     /// Forgets what the hooks kept for `run`, which ended.
     pub(crate) fn forget_run(&mut self, run: RunId) {
         self.continued_by_stop.remove(&run);
+        self.stop_blocks.remove(&run);
         self.unchecked_prompts.remove(&run);
     }
 
@@ -518,15 +533,21 @@ impl Agent {
     }
 
     /// The `Stop` or `SubagentStop` hooks' feedback when they block the turn's end, after which
-    /// they read `stop_hook_active`.
+    /// they read `stop_hook_active`; none when the block is one more than the cap allows.
     async fn run_stop_hooks(
         &self,
         receipt: &Receipt,
         cancel: &CancellationToken,
     ) -> Result<Option<Vec<String>>, String> {
-        let (event, mut fields) = {
+        let (event, mut fields, blocks) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("Agent is unavailable")?;
+            let blocks = chat
+                .hook_state
+                .session
+                .stop_blocks
+                .get(&receipt.run_id)
+                .map_or(1, |blocks| blocks + 1);
             let mut fields = Map::new();
             fields.insert(
                 "stop_hook_active".into(),
@@ -541,7 +562,7 @@ impl Agent {
                 "last_assistant_message".into(),
                 last_assistant_message(chat).map_or(Value::Null, Value::String),
             );
-            (stop_event(chat), fields)
+            (stop_event(chat), fields, blocks)
         };
         if event == HookEvent::SubagentStop {
             let transcript = match self.hook_transcript_path(receipt.chat_id).await {
@@ -550,8 +571,9 @@ impl Agent {
             };
             fields.insert("agent_transcript_path".into(), json!(transcript));
         }
+        let is_over_cap = blocks > STOP_BLOCK_CAP;
         let verdict = self
-            .run_hooks(
+            .run_hooks_overriding_block(
                 receipt,
                 HookCall {
                     event,
@@ -560,20 +582,21 @@ impl Agent {
                     tool: None,
                 },
                 cancel,
+                is_over_cap.then(|| stop_block_cap_warning(blocks)),
             )
             .await;
         if verdict.cancelled
             || cancel.is_cancelled()
             || verdict.prevent_continuation
             || verdict.blocking_errors.is_empty()
+            || is_over_cap
         {
             return Ok(None);
         }
         if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
-            chat.hook_state
-                .session
-                .continued_by_stop
-                .insert(receipt.run_id);
+            let session = &mut chat.hook_state.session;
+            session.continued_by_stop.insert(receipt.run_id);
+            session.stop_blocks.insert(receipt.run_id, blocks);
         }
         Ok(Some(
             verdict
@@ -704,6 +727,16 @@ impl Agent {
             }
         }
     }
+}
+
+/// Claude Code's warning as it overrides the `blocks`th consecutive block of a turn's end,
+/// without its advice to raise the cap, which Tickloop fixes.
+fn stop_block_cap_warning(blocks: u32) -> String {
+    format!(
+        "A hook blocked the turn from ending {blocks} consecutive times — overriding and ending \
+         turn. For Stop/SubagentStop hooks, check stop_hook_active in the input and return \
+         success while it's true."
+    )
 }
 
 fn stop_event(chat: &Chat) -> HookEvent {

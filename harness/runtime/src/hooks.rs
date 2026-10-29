@@ -199,6 +199,14 @@ impl FinishedRun {
 /// A hook command's run as the execution environment reports it.
 type CommandRun = Pin<Box<dyn Future<Output = Result<CommandOutput, String>> + Send>>;
 
+/// What the records of an event's runs add after their own reasons.
+struct RecordNotes {
+    /// For the last run: the hooks together did something only one of them may do.
+    warning: Option<String>,
+    /// For the last run that blocked: why the block does not hold.
+    block_override: Option<String>,
+}
+
 /// One matched hook that may run.
 #[derive(Clone)]
 struct Runnable {
@@ -266,6 +274,19 @@ impl Agent {
         call: HookCall,
         cancel: &CancellationToken,
     ) -> HookVerdict {
+        self.run_hooks_overriding_block(receipt, call, cancel, None)
+            .await
+    }
+
+    /// Runs the hooks `call` matches as [`Self::run_hooks`] does; when they block, the record of
+    /// the last run that blocked adds `block_override`, which says why the block does not hold.
+    pub(crate) async fn run_hooks_overriding_block(
+        &self,
+        receipt: &Receipt,
+        call: HookCall,
+        cancel: &CancellationToken,
+        block_override: Option<String>,
+    ) -> HookVerdict {
         let Some((context, settings)) = self.hook_context(receipt).await else {
             return HookVerdict::default();
         };
@@ -308,8 +329,22 @@ impl Agent {
         if let Some(warning) = &warning {
             tracing::warn!("{} hooks: {warning}", call.event.name());
         }
-        self.record_hook_runs(receipt, &call, &runnable, finished, warning)
-            .await;
+        let block_override = block_override.filter(|_| {
+            !verdict.blocking_errors.is_empty()
+                && !verdict.prevent_continuation
+                && !verdict.cancelled
+        });
+        self.record_hook_runs(
+            receipt,
+            &call,
+            &runnable,
+            finished,
+            RecordNotes {
+                warning,
+                block_override,
+            },
+        )
+        .await;
         verdict
     }
 
@@ -552,7 +587,7 @@ impl Agent {
         call: &HookCall,
         runnable: &[Runnable],
         finished: Vec<FinishedRun>,
-        warning: Option<String>,
+        notes: RecordNotes,
     ) {
         let mut chats = self.inner.chats.lock().await;
         let Some(chat) = chats.get_mut(&receipt.chat_id) else {
@@ -564,28 +599,39 @@ impl Agent {
             .filter(|(_, run)| !run.backgrounded)
             .collect::<Vec<_>>();
         let count = ended.len();
+        let last_block = ended
+            .iter()
+            .rposition(|(_, run)| run.response.blocking_error.is_some());
         for (index, (runnable, run)) in ended.into_iter().enumerate() {
-            let mut reason = run.response.reason();
-            if index + 1 == count
-                && let Some(warning) = &warning
-            {
-                reason = Some(match reason {
-                    Some(reason) => format!("{reason}\n{warning}"),
-                    None => warning.clone(),
-                });
-            }
-            let record = run_record(
+            let mut record = run_record(
                 receipt,
                 call.event,
                 call.tool.as_ref(),
                 &runnable.hook,
                 &run,
-                reason,
+                run.response.reason(),
             );
+            if index + 1 == count
+                && let Some(warning) = &notes.warning
+            {
+                add_to_reason(&mut record, warning);
+            }
+            if Some(index) == last_block
+                && let Some(block_override) = &notes.block_override
+            {
+                add_to_reason(&mut record, block_override);
+            }
             record_hook_run(self, chat, receipt, record);
         }
         self.save(&chat.snapshot);
     }
+}
+
+fn add_to_reason(record: &mut HookRunRecord, note: &str) {
+    record.reason = Some(match record.reason.take() {
+        Some(reason) => format!("{reason}\n{note}"),
+        None => note.to_owned(),
+    });
 }
 
 /// The record of `hook`'s `run` for `event`, giving `reason` as why it decided, blocked or
