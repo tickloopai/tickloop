@@ -290,6 +290,8 @@ fn plugin_hooks(
         } in declared
         {
             let resolved = resolve_plugin_command(&hook.command, &environment);
+            let sensitive_values =
+                user_config.secret_texts_for(&Value::String(hook.command.clone()));
             let mut hook = configured(
                 hook,
                 key,
@@ -299,6 +301,7 @@ fn plugin_hooks(
                 trust,
             );
             hook.resolved_command = resolved;
+            hook.sensitive_values = sensitive_values;
             hooks.push(hook);
         }
     }
@@ -416,6 +419,7 @@ fn configured(
         event: hook.event,
         matcher: hook.matcher,
         resolved_command: Some(hook.command.clone()),
+        sensitive_values: Vec::new(),
         command: hook.command,
         condition: hook.condition,
         timeout_secs: hook.timeout_secs,

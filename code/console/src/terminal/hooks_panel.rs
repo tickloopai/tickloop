@@ -866,6 +866,7 @@ mod tests {
             matcher: Some("Bash".into()),
             command: format!("./{key}.sh"),
             resolved_command: Some(format!("./{key}.sh")),
+            sensitive_values: Vec::new(),
             condition: None,
             timeout_secs: 30,
             background: None,

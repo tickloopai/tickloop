@@ -453,6 +453,7 @@ fn hook_list() -> HookList {
             matcher: Some("Bash".into()),
             command: "${CLAUDE_PLUGIN_ROOT}/check.sh".into(),
             resolved_command: Some("/home/user/.tickloop/plugins/cache/guard/check.sh".into()),
+            sensitive_values: Vec::new(),
             condition: Some("Bash(rm *)".into()),
             timeout_secs: 30,
             background: Some(HookBackground::AsyncRewake {

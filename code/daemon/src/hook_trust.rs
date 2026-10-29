@@ -1,14 +1,14 @@
 //! `/hooks` and the review a New Agent offers: the hooks configured for the Folder a launch starts
 //! in, read and trusted through the Settings Store of the configuration root it names. Hooks
 //! belong to the Folder, not to one Agent, so the same request serves before and after an Agent
-//! starts there.
+//! starts there. Views get each hook without a plugin's sensitive configuration values.
 
 use std::path::PathBuf;
 
 use tickloop_code_access::{AccessError, AccessErrorCode, LaunchSpec};
 use tickloop_code_settings::UserSettings;
 use tickloop_harness::policy::settings::{SettingsStore, SettingsStoreError};
-use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
+use tickloop_harness::protocol::hooks::{ConfiguredHook, HookList, HookTrustChange};
 
 fn settings_store(launch: &LaunchSpec) -> Result<(UserSettings, PathBuf), AccessError> {
     let root = launch
@@ -19,11 +19,20 @@ fn settings_store(launch: &LaunchSpec) -> Result<(UserSettings, PathBuf), Access
     Ok((settings, launch.folder.clone()))
 }
 
+fn list_for_views(mut list: HookList) -> HookList {
+    list.hooks = list
+        .hooks
+        .into_iter()
+        .map(ConfiguredHook::for_views)
+        .collect();
+    list
+}
+
 pub(crate) async fn hooks(launch: &LaunchSpec) -> Result<HookList, AccessError> {
     let (settings, folder) = settings_store(launch)?;
     tokio::task::spawn_blocking(move || {
         let store: &dyn SettingsStore = &settings;
-        store.hooks(Some(&folder))
+        list_for_views(store.hooks(Some(&folder)))
     })
     .await
     .map_err(|error| AccessError::unavailable(error.to_string()))
@@ -47,7 +56,7 @@ pub(crate) async fn write_trust(
                 ),
                 SettingsStoreError::Storage(message) => AccessError::storage(message),
             })?;
-        Ok(store.hooks(Some(&folder)))
+        Ok(list_for_views(store.hooks(Some(&folder))))
     })
     .await
     .map_err(|error| AccessError::unavailable(error.to_string()))?

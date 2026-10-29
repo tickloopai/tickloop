@@ -50,6 +50,7 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
+mod secret_redaction;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod tick_adapter;

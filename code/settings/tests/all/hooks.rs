@@ -299,6 +299,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: Some("Bash".into()),
                 command: "check-bash".into(),
                 resolved_command: Some("check-bash".into()),
+                sensitive_values: Vec::new(),
                 condition: None,
                 timeout_secs: 30,
                 background: None,
@@ -314,6 +315,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: None,
                 command: "finish".into(),
                 resolved_command: Some("finish".into()),
+                sensitive_values: Vec::new(),
                 condition: None,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
                 background: None,
@@ -908,6 +910,60 @@ fn content_behind_symlinks_counts_for_the_fingerprint() {
         HookTrust::Trusted,
         "cycles hash the same each time"
     );
+}
+
+const HOOK_SECRET_SENTINEL: &str = "HOOK_SECRET_SENTINEL";
+
+#[test]
+fn a_plugin_hook_carries_its_sensitive_values_and_views_get_it_without_them() {
+    use tickloop_code_settings::plugin_config::PluginUserConfig;
+    let setup = Setup::new();
+    let command = "check ${user_config.token} ${user_config.level}";
+    let plugin = setup.install_plugin(
+        "guard",
+        json!({
+            "name": "guard",
+            "userConfig": {
+                "token": {"type": "string", "title": "Token", "sensitive": true},
+                "unused": {"type": "string", "title": "Unused", "sensitive": true},
+                "level": {"type": "string", "title": "Level"},
+            },
+        }),
+        &[(
+            "hooks/hooks.json",
+            &hooks_json(hooks_of("PreToolUse", None, &[command])),
+        )],
+    );
+    PluginUserConfig::load(&setup.config_root, &plugin.manifest)
+        .unwrap()
+        .save(
+            &setup.config_root,
+            &plugin.manifest,
+            &serde_json::from_value(json!({
+                "token": HOOK_SECRET_SENTINEL,
+                "unused": "other-secret",
+                "level": "high",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    let hook = only(&setup.hooks(), command);
+    assert_eq!(
+        hook.resolved_command.as_deref(),
+        Some("check HOOK_SECRET_SENTINEL high"),
+        "the hook runs with the value"
+    );
+    assert_eq!(hook.sensitive_values, [HOOK_SECRET_SENTINEL]);
+
+    let shown = hook.for_views();
+    assert_eq!(
+        shown.resolved_command.as_deref(),
+        Some("check [redacted] high")
+    );
+    assert!(shown.sensitive_values.is_empty());
+    let wire = serde_json::to_string(&shown).unwrap();
+    assert!(!wire.contains(HOOK_SECRET_SENTINEL), "{wire}");
 }
 
 const MOVED_PAYLOAD_COMMAND: &str =

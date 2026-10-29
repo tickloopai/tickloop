@@ -44,6 +44,7 @@ fn background_hook(
         matcher: matcher.map(Into::into),
         command: command.into(),
         resolved_command: Some(command.into()),
+        sensitive_values: Vec::new(),
         condition: None,
         timeout_secs: 600,
         background,
@@ -500,5 +501,91 @@ async fn the_same_command_runs_both_in_the_foreground_and_in_the_background() {
         turn.hook_runs.iter().any(|run| run.background.is_none()),
         "the foreground run is not merged into the background one"
     );
+    bench.agent.shutdown().await;
+}
+
+const HOOK_SECRET_SENTINEL: &str = "HOOK_SECRET_SENTINEL";
+
+/// A background plugin hook whose command was given the sensitive [`HOOK_SECRET_SENTINEL`].
+fn secret_background_hook(script: &str, background: Option<HookBackground>) -> ConfiguredHook {
+    ConfiguredHook {
+        source: HookSource::Plugin {
+            id: "guard@market".into(),
+        },
+        command: format!("{script} ${{user_config.token}}"),
+        resolved_command: Some(format!("{script} {HOOK_SECRET_SENTINEL}")),
+        sensitive_values: vec![HOOK_SECRET_SENTINEL.into()],
+        hash: Some("hash".into()),
+        ..background_hook(HookEvent::PostToolUse, Some("Bash"), script, background)
+    }
+}
+
+#[tokio::test]
+async fn a_sensitive_plugin_value_a_background_hook_prints_never_reaches_the_model_or_records() {
+    let bench = Bench::start(
+        vec![build_call(), text("done"), text("I will rotate it.")],
+        vec![
+            secret_background_hook(AUDIT, Some(HookBackground::Async)),
+            secret_background_hook(REVIEW, rewake(None, None)),
+        ],
+    )
+    .await;
+    bench
+        .environment
+        .define_command(&format!("{AUDIT} {HOOK_SECRET_SENTINEL}"), |_| {
+            let answer = json!({
+                "systemMessage": format!("audit saw {HOOK_SECRET_SENTINEL}"),
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": format!("audit context {HOOK_SECRET_SENTINEL}"),
+                },
+            });
+            exits(0, &answer.to_string(), "", Duration::ZERO)
+        });
+    bench
+        .environment
+        .define_command(&format!("{REVIEW} {HOOK_SECRET_SENTINEL}"), |_| {
+            exits(
+                2,
+                "",
+                &format!("review found {HOOK_SECRET_SENTINEL}\n"),
+                SLOW_HOOK,
+            )
+        });
+    let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
+
+    let first = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+    follow_turn(&mut events, first.run_id).await;
+    tokio::time::timeout(HOOK_END_WAIT, woken_turn(&mut events, first.run_id))
+        .await
+        .expect("exit status 2 wakes the idle Loop");
+
+    let requests = format!("{:?}", bench.requests());
+    assert!(requests.contains("audit context [redacted]"), "{requests}");
+    assert!(requests.contains("review found [redacted]"), "{requests}");
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    assert_eq!(
+        history
+            .hook_runs
+            .iter()
+            .filter(|run| run.background == Some(HookBackgroundPhase::Ended))
+            .count(),
+        2
+    );
+    let snapshot = format!("{:?}", bench.agent.snapshot(bench.chat).await.unwrap());
+    let shown = format!("{:?}", shown_live(&mut live).await);
+    for (what, text) in [
+        ("model requests", requests),
+        ("activity history", format!("{history:?}")),
+        ("snapshot", snapshot),
+        ("notifications", shown),
+    ] {
+        assert!(!text.contains(HOOK_SECRET_SENTINEL), "{what}: {text}");
+    }
     bench.agent.shutdown().await;
 }

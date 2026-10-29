@@ -41,6 +41,7 @@ fn user_hook(event: HookEvent, matcher: Option<&str>, command: &str) -> Configur
         matcher: matcher.map(Into::into),
         command: command.into(),
         resolved_command: Some(command.into()),
+        sensitive_values: Vec::new(),
         condition: None,
         timeout_secs: 600,
         background: None,

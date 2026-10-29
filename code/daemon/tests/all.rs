@@ -16,6 +16,8 @@ mod builtin_catalog;
 mod busy_inputs;
 #[path = "all/family_records.rs"]
 mod family_records;
+#[path = "all/hook_views.rs"]
+mod hook_views;
 #[path = "all/live_context.rs"]
 mod live_context;
 #[path = "all/permission_claims.rs"]

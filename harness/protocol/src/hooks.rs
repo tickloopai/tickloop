@@ -130,6 +130,9 @@ pub enum HookBackground {
     },
 }
 
+/// What stands in for a sensitive value a view must not show.
+const REDACTED_VALUE: &str = "[redacted]";
+
 /// One `command` hook as configured for a Folder.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfiguredHook {
@@ -146,6 +149,11 @@ pub struct ConfiguredHook {
     /// The command to run, with a plugin's placeholders substituted; `None` while it refers to a
     /// plugin user configuration value that is not set.
     pub resolved_command: Option<String>,
+    /// The plugin's sensitive user configuration values `resolved_command` contains. The host
+    /// removes them from what the hook prints before the model, a view or a record sees it, and
+    /// views get the hook [`ConfiguredHook::for_views`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_values: Vec<String>,
     /// Claude Code's `if`: a Permission Rule such as `Bash(git push*)` the tool call must also
     /// match, after the matcher. A hook of an event without tool calls that has one never runs.
     #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
@@ -162,6 +170,20 @@ pub struct ConfiguredHook {
 }
 
 impl ConfiguredHook {
+    /// The hook as a view may show it: each sensitive value in the command it runs replaced
+    /// with `[redacted]`, and the values themselves left out.
+    pub fn for_views(mut self) -> Self {
+        let mut secrets = std::mem::take(&mut self.sensitive_values);
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        if let Some(command) = &mut self.resolved_command {
+            for secret in &secrets {
+                *command = command.replace(secret.as_str(), REDACTED_VALUE);
+            }
+        }
+        self
+    }
+
     pub fn needs_configuration(&self) -> bool {
         self.resolved_command.is_none()
     }

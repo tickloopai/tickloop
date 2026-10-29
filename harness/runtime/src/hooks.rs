@@ -8,9 +8,11 @@
 //! tool event to the calls its Permission Rule matches. Matching hooks run in parallel, the same
 //! command and `if` once per source, each a one-shot command in the Chat's Folder with the
 //! event's input on standard input and only `CLAUDE_PROJECT_DIR` and a plugin's directories
-//! added to its environment. Each run is kept in the Chat's activity history, never in what the
-//! model reads, and announced as it ends. A hook declared `async` or `asyncRewake` runs in the
-//! background instead; see [`background`].
+//! added to its environment. The plugin's sensitive configuration values a command was given are
+//! removed from everything it prints and every error it gets before anything reads them. Each
+//! run is kept in the Chat's activity history, never in what the model reads, and announced as
+//! it ends. A hook declared `async` or `asyncRewake` runs in the background instead; see
+//! [`background`].
 
 mod background;
 mod matcher;
@@ -34,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::environment::{
     CommandSpec, ExecutionAuthority, ExecutionIntent, ExecutionOutcome, ExecutionScope,
 };
+use crate::secret_redaction::SecretRedactor;
 use crate::{Agent, Chat};
 use output::{HookExit, HookResponse};
 pub(crate) use output::{HookPermission, HookVerdict};
@@ -344,6 +347,12 @@ impl Agent {
             cwd: context.folder.to_string_lossy().into_owned(),
             timeout,
         };
+        let redactor = (!runnable.hook.sensitive_values.is_empty())
+            .then(|| SecretRedactor::new(&runnable.hook.sensitive_values));
+        let redacted = |text: String| match &redactor {
+            Some(redactor) => redactor.redact(text),
+            None => text,
+        };
         let not_finished = |response| FinishedRun {
             response,
             duration: started.elapsed(),
@@ -355,12 +364,17 @@ impl Agent {
             .execute_hook_command(receipt, context, spec, cancel)
             .await
         {
-            Err(error) if cancel.is_cancelled() => {
-                not_finished(HookResponse::failed(HookRunOutcome::Cancelled, error))
-            }
-            Err(error) => not_finished(HookResponse::failed(HookRunOutcome::NotRun, error)),
+            Err(error) if cancel.is_cancelled() => not_finished(HookResponse::failed(
+                HookRunOutcome::Cancelled,
+                redacted(error),
+            )),
+            Err(error) => not_finished(HookResponse::failed(
+                HookRunOutcome::NotRun,
+                redacted(error),
+            )),
             Ok(command) => {
-                let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
+                let stdout = redacted(command.stdout.text());
+                let stderr = redacted(command.stderr.text());
                 let response = output::interpret(
                     event,
                     &runnable.hook.command,
