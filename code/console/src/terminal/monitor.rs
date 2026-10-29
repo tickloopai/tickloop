@@ -95,6 +95,18 @@ pub(super) struct MonitorEntry {
 }
 
 impl MonitorEntry {
+    /// The ended Tick whose row reopens it in its place, when the row offers that.
+    pub(super) fn reopens(&self) -> Option<&InstanceRef> {
+        self.actions.iter().find_map(|action| match &action.intent {
+            crate::monitor_rows::TickIntent::ReopenHosted(instance)
+                if action.key == crate::monitor_rows::MONITOR_ENTER_KEY =>
+            {
+                Some(instance)
+            }
+            _ => None,
+        })
+    }
+
     fn state_label(&self) -> &str {
         match (self.status.is_empty(), self.tone) {
             (true, StatusTone::Running { .. }) => "running",
@@ -3956,6 +3968,7 @@ mod scrolling_tests {
                     is_terminal: false,
                     min_rows: None,
                     max_rows: None,
+                    joined_at_ms: None,
                 });
         }
         monitor.set_chat_status(Arc::new(status));
@@ -4020,6 +4033,7 @@ mod scrolling_tests {
                 is_terminal: false,
                 min_rows: None,
                 max_rows: None,
+                joined_at_ms: None,
             });
         monitor.set_chat_status(Arc::new(status));
         assert_eq!(selected_instance(&monitor), calendar(3));

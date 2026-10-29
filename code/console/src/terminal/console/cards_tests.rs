@@ -393,6 +393,7 @@ fn a_card_stays_open_while_its_row_is_on_a_page_the_monitor_has_not_loaded() {
                 is_terminal: false,
                 min_rows: None,
                 max_rows: None,
+                joined_at_ms: None,
             });
     }
     state.monitor.set_chat_status(Arc::new(status));
@@ -674,8 +675,11 @@ fn a_view_that_saw_its_tick_end_says_so_before_the_row_does() {
         "Space still hides the card of a Tick that no longer opens a view"
     );
     assert!(
-        state.key(key(KeyCode::Char(' '))).is_none() && !state.cards.is_open(&instance),
-        "and never shows it again"
+        matches!(
+            state.key(key(KeyCode::Char(' '))),
+            Some(InputEvent::TickAction { action, .. }) if action.instance == instance.to_string()
+        ) && !state.cards.is_open(&instance),
+        "and then reopens the Tick rather than showing the ended card again"
     );
 }
 
@@ -2093,14 +2097,15 @@ fn space_keeps_the_keys_on_a_tick_row_without_a_card_and_types_on_an_artifact_ro
     let (instance, _requests) = attached_hosted_card(&mut state);
     state.key(key(KeyCode::Enter));
     assert!(state.card_focused());
+    // Another Chat opened it, so its row offers no reopen.
     change_row(&mut state, &instance, |entry| {
         entry.status = "lost".into();
         entry.tone = crate::monitor_rows::StatusTone::Gone;
         entry.ended = Some("lost".into());
         entry.actions = vec![crate::monitor_rows::MonitorAction {
             key: crate::monitor_rows::MONITOR_ENTER_KEY,
-            label: "reopen",
-            intent: crate::monitor_rows::TickIntent::ReopenHosted(instance.clone()),
+            label: "details",
+            intent: crate::monitor_rows::TickIntent::ShowDetails(instance.clone()),
         }];
     });
     state.draw_frame(&mut Vec::new()).unwrap();
@@ -2115,6 +2120,7 @@ fn space_keeps_the_keys_on_a_tick_row_without_a_card_and_types_on_an_artifact_ro
             state.monitor_owns_keys(),
             "Space never leaves the list for the input"
         );
+        assert!(!state.monitor_list_hint().contains("space"));
         assert!(
             state.editor.draft().is_empty(),
             "{:?}",

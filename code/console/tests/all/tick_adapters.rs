@@ -525,6 +525,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         is_terminal: false,
         instance: member.clone(),
         title: None,
+        joined_at_ms: None,
     });
     assert_eq!(
         member_row.actions,

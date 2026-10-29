@@ -17,6 +17,10 @@ pub struct MonitorMember {
     /// The most terminal rows the Tick declared, when it opened, that it can use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rows: Option<u16>,
+    /// When its row joined the Monitor, in Unix milliseconds, when that is not when the instance
+    /// was created: an instance reopened in place of another keeps the row it took over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at_ms: Option<u64>,
 }
 
 /// The most handled marks a Chat keeps, and the most used marks; the oldest go first, since an
@@ -195,6 +199,7 @@ impl MonitorMembership {
                     is_terminal: false,
                     min_rows: None,
                     max_rows: None,
+                    joined_at_ms: None,
                 });
                 self.members.len() - 1
             }

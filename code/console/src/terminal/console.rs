@@ -13036,9 +13036,26 @@ impl State {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
                 }
+                // Space on the row of an ended Tick this Chat opened reopens it in the row's place
+                // and shows the new instance's card; the list keeps the keys.
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| entry.reopens().is_some()) =>
+                {
+                    let instance = self.monitor.selected()?.reopens()?.clone();
+                    let chat = self.chat?;
+                    let executor = super::tick_actions::builtin::reopen_showing_card(instance);
+                    match executor.prepare(&mut super::tick_actions::TickActionUi { state: self }) {
+                        Ok(action) => return Some(InputEvent::TickAction { chat, action }),
+                        Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
+                    }
+                }
                 // Space is the card key of hosted Tick and Shell rows; on one without a card, such
-                // as a lost Tick's, it does nothing rather than leave the list and type into the
-                // input. An Artifact row never has a card, so there Space types into the input.
+                // as a Tick another Chat opened that ended, it does nothing rather than leave the
+                // list and type into the input. An Artifact row never has a card, so there Space
+                // types into the input.
                 (KeyCode::Char(' '), KeyModifiers::NONE)
                     if self
                         .monitor

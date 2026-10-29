@@ -1563,6 +1563,7 @@ fn each_access_probes_its_own_members_beside_the_others() {
             is_terminal: false,
             instance,
             title: Some(title.into()),
+            joined_at_ms: None,
         });
     }
     console.update_monitor_chat(snapshot.clone()).unwrap();
@@ -1620,6 +1621,7 @@ fn monitor_scrolls_continuously_across_pages_and_caches_earlier_rows() {
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: Some(format!("Tick {index:03}")),
+                joined_at_ms: None,
             });
     }
     state.monitor.rebuild();
@@ -1683,6 +1685,7 @@ fn probed_members_report_their_host_state_and_owner() {
             is_terminal: false,
             instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
+            joined_at_ms: None,
         });
     }
     console.update_monitor_chat(snapshot.clone()).unwrap();
@@ -1741,6 +1744,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
         is_terminal: false,
         instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
+        joined_at_ms: None,
     });
     state.monitor.chat_status = Some(Arc::new(snapshot));
     state.monitor.rebuild();
@@ -3461,6 +3465,219 @@ async fn closing_and_reopening_a_hosted_tick_execute_directly_and_silently() {
     core.shutdown().await;
 }
 
+/// Space on the row of an ended Tick this Chat opened reopens it in the row's place and shows the
+/// new instance's card while the list keeps the keys; Enter reopens and enters the card.
+#[tokio::test]
+async fn space_reopens_an_ended_tick_in_its_place_showing_its_card_and_enter_enters_it() {
+    use crate::monitor_rows::{MemberFindings, MemberState};
+    use crate::terminal::execution::ConsoleExecution;
+    use crate::terminal::monitor_cards::CardOrigin;
+    use crate::terminal::tick_actions::{TickActionContext, execute};
+    use tickloop_code_access::{
+        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
+        DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
+    };
+    use tickloop_code_daemon::EmbeddedAgentAccess;
+
+    /// Reopens each Tick as the next new instance; the Agent records it as the daemon does. A
+    /// card's attach finds no view, and notes which card had the keys when it was asked for.
+    struct ReopeningRemote {
+        inner: EmbeddedAgentAccess,
+        core: tickloop_harness::runtime::Agent,
+        chat: std::sync::OnceLock<Uuid>,
+        reopened: Mutex<Vec<tick_protocol::InstanceRef>>,
+        console: std::sync::OnceLock<Arc<Mutex<State>>>,
+        focused_at_attach: Mutex<Vec<Option<tick_protocol::InstanceRef>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentAccess for ReopeningRemote {
+        async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
+            self.inner.observe(request).await
+        }
+        async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            if matches!(envelope.command, AgentCommand::AttachHostedTick { .. }) {
+                let state = self.console.get().unwrap().lock().unwrap();
+                self.focused_at_attach
+                    .lock()
+                    .unwrap()
+                    .push(state.cards.focused().cloned());
+            }
+            let AgentCommand::ReopenHostedTick { instance, .. } = &envelope.command else {
+                return self.inner.execute(envelope).await;
+            };
+            let reopened = self.reopened.lock().unwrap().remove(0);
+            let membership = self
+                .core
+                .record_reopened_tick(
+                    (*self.chat.get().unwrap()).into(),
+                    instance,
+                    reopened.clone(),
+                )
+                .await
+                .unwrap();
+            let mut receipt = self
+                .inner
+                .execute(CommandEnvelope {
+                    command: AgentCommand::FlushTranscripts,
+                    ..envelope
+                })
+                .await?;
+            receipt.result = Some(CommandResult::HostedTickReopened {
+                instance: reopened,
+                membership,
+                restore_error: None,
+            });
+            Ok(receipt)
+        }
+        async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            self.inner.show_view(update).await
+        }
+    }
+    let created_at = |created_ms: u64| {
+        let mut bytes = *Uuid::now_v7().as_bytes();
+        bytes[..6].copy_from_slice(&created_ms.to_be_bytes()[2..]);
+        tick_protocol::InstanceRef::hosted(Uuid::from_bytes(bytes))
+    };
+    let (first, lost, last) = (created_at(1_000), created_at(2_000), created_at(3_000));
+    let (reopened, reopened_again) = (created_at(9_000), created_at(9_500));
+
+    let directory = tempfile::tempdir().unwrap();
+    let core = tickloop_harness::runtime::Agent::new_embedded(
+        tickloop_harness::test_support::config(),
+        Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
+    );
+    let remote = Arc::new(ReopeningRemote {
+        inner: EmbeddedAgentAccess::new(core.clone()),
+        core: core.clone(),
+        chat: std::sync::OnceLock::new(),
+        reopened: Mutex::new(vec![reopened.clone(), reopened_again.clone()]),
+        console: std::sync::OnceLock::new(),
+        focused_at_attach: Mutex::new(Vec::new()),
+    });
+    let agent = ConsoleExecution::from_access_for_test(
+        remote.clone(),
+        remote.inner.daemon_epoch(),
+        ViewRef {
+            session_id: Uuid::new_v4(),
+            view_id: Uuid::new_v4(),
+        },
+        LaunchSpec::embedded(directory.path().into()),
+        None,
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    remote.chat.set(chat).unwrap();
+    for (seed, member) in [("first", &first), ("lost", &lost), ("last", &last)] {
+        let placeholder = tick_protocol::InstanceRef::new("hosted", seed).unwrap();
+        core.record_reopened_tick(chat.into(), &placeholder, member.clone())
+            .await
+            .unwrap();
+    }
+    let mut state = State::new(true, 140, 40);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    assert!(remote.console.set(console.state.clone()).is_ok());
+    console
+        .update_monitor_chat(agent.status(chat).await.unwrap())
+        .unwrap();
+    let ends = |instance: &tick_protocol::InstanceRef| {
+        console
+            .update_member_findings(
+                chat,
+                vec![(
+                    tick_protocol::HOSTED_ACCESS,
+                    Some(MemberFindings {
+                        states: [(instance.clone(), MemberState::Gone)].into(),
+                        ..Default::default()
+                    }),
+                )],
+            )
+            .unwrap();
+    };
+    ends(&lost);
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let rows = |state: &State| -> Vec<tick_protocol::InstanceRef> {
+        state
+            .monitor
+            .entries()
+            .iter()
+            .map(|entry| entry.instance.clone())
+            .collect()
+    };
+
+    let action = {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        state.monitor.select(&lost);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert!(
+            state.monitor_list_hint().contains("space reopen"),
+            "{}",
+            state.monitor_list_hint()
+        );
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        else {
+            panic!("Space did not reopen the ended Tick");
+        };
+        assert!(state.monitor_owns_keys() && state.editor.draft().is_empty());
+        action
+    };
+    execute(action, context).await.unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(
+            rows(&state),
+            [first.clone(), reopened.clone(), last.clone()],
+            "the reopened Tick keeps the row's place"
+        );
+        assert_eq!(state.monitor.selected().unwrap().instance, reopened);
+        assert_eq!(
+            state.cards.card(&reopened).map(|card| card.origin),
+            Some(CardOrigin::User),
+            "its card shows as the user's"
+        );
+        assert!(!state.card_focused() && state.monitor_owns_keys());
+    }
+    assert_eq!(
+        remote.focused_at_attach.lock().unwrap().as_slice(),
+        [None],
+        "its view attaches at once, and the list keeps the keys"
+    );
+
+    ends(&reopened);
+    let action = {
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter did not reopen the ended Tick");
+        };
+        action
+    };
+    execute(action, context).await.unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(rows(&state), [first, reopened_again.clone(), last]);
+        assert_eq!(
+            state.cards.card(&reopened_again).map(|card| card.origin),
+            Some(CardOrigin::User)
+        );
+    }
+    assert_eq!(
+        remote.focused_at_attach.lock().unwrap().last(),
+        Some(&Some(reopened_again)),
+        "Enter enters its card"
+    );
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn scheduled_task_details_and_confirmed_delete_use_the_live_agent() {
     use crate::terminal::{
@@ -4059,6 +4276,7 @@ fn scheduled_and_goal_stay_docked_while_ticks_scroll_and_shrink_at_narrow_height
                 is_terminal: false,
                 instance: format!("calendar:member-{index:03}").parse().unwrap(),
                 title: None,
+                joined_at_ms: None,
             });
         }
     }
@@ -4306,6 +4524,7 @@ fn closing_the_selected_row_with_x_x_selects_the_row_that_takes_its_place() {
             is_terminal: false,
             min_rows: None,
             max_rows: None,
+            joined_at_ms: None,
         })
         .collect();
     state.monitor.set_chat_status(Arc::new(status));
@@ -4590,6 +4809,7 @@ fn auto_reveal_sources(chat: Uuid, content: &str) -> crate::terminal::monitor::M
             instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
             is_terminal: content == "terminal",
             title: Some("New Tick".into()),
+            joined_at_ms: None,
         }),
         "artifact" => snapshot
             .artifact_ticks
@@ -4763,6 +4983,7 @@ fn existing_monitor_content_is_a_baseline_and_later_additions_can_reveal_it() {
                 instance: tick_protocol::InstanceRef::hosted(Uuid::new_v4()),
                 is_terminal: false,
                 title: Some("Later Tick".into()),
+                joined_at_ms: None,
             });
         console.refresh_monitor(sources).unwrap();
         assert!(
@@ -4841,6 +5062,7 @@ fn subscribing_to_existing_member_and_updating_existing_goal_do_not_reveal_monit
             instance: row.instance.clone(),
             is_terminal: false,
             title: None,
+            joined_at_ms: None,
         });
     console.refresh_monitor(sources).unwrap();
     console.update_subscribed_ticks(chat, &[row]).unwrap();
@@ -5601,6 +5823,7 @@ fn live_tick_and_artifact_content_flash_the_monitor_once_even_before_status_deli
                 instance: instance.clone(),
                 is_terminal: false,
                 title: Some("Stream Tick".into()),
+                joined_at_ms: None,
             });
             instance
         };

@@ -86,6 +86,17 @@ impl UseTarget {
     }
 }
 
+/// When a hosted Tick was created, from the UUID v7 of its identity: when its row joined the
+/// Monitor of the Chat that opened it.
+fn identity_time_ms(instance: &InstanceRef) -> Option<u64> {
+    let uuid = instance.hosted_run()?.uuid();
+    (uuid.get_version_num() == 7).then(|| {
+        uuid.as_bytes()[..6]
+            .iter()
+            .fold(0_u64, |time, byte| time << 8 | u64::from(*byte))
+    })
+}
+
 /// The Shell whose output file is `path`: an Agent command or a user Shell of the Chat.
 fn shell_with_output(chat: &Chat, path: &Path) -> Option<InstanceRef> {
     chat.snapshot
@@ -127,7 +138,8 @@ impl Agent {
     }
 
     /// Joins the instance reopened in place of `lost` to the Chat's Monitor as one it opened,
-    /// under the lost one's title, and takes the lost row out: one row stays.
+    /// under the lost one's title and in its place in the order, and takes the lost row out: one
+    /// row stays.
     pub async fn record_reopened_tick(
         &self,
         chat_id: ChatId,
@@ -136,22 +148,25 @@ impl Agent {
     ) -> Result<MonitorMembership, AgentError> {
         let membership = self
             .update_monitor(chat_id, |membership| {
-                let title = membership
+                let lost_member = membership
                     .members
                     .iter()
                     .find(|member| &member.instance == lost)
-                    .and_then(|member| member.title.clone());
-                let (is_terminal, min_rows, max_rows) = membership
-                    .members
-                    .iter()
-                    .find(|member| &member.instance == lost)
-                    .map_or((false, None, None), |member| {
-                        (member.is_terminal, member.min_rows, member.max_rows)
-                    });
-                let member = membership.record_opened(reopened.clone(), title);
-                member.is_terminal = is_terminal;
-                member.min_rows = min_rows;
-                member.max_rows = max_rows;
+                    .cloned();
+                let joined_at_ms = lost_member
+                    .as_ref()
+                    .and_then(|member| member.joined_at_ms)
+                    .or_else(|| identity_time_ms(lost));
+                let member = membership.record_opened(
+                    reopened.clone(),
+                    lost_member.as_ref().and_then(|member| member.title.clone()),
+                );
+                if let Some(lost_member) = lost_member {
+                    member.is_terminal = lost_member.is_terminal;
+                    member.min_rows = lost_member.min_rows;
+                    member.max_rows = lost_member.max_rows;
+                }
+                member.joined_at_ms = joined_at_ms;
                 membership.mark_handled(reopened, now_ms());
                 membership.remove(lost.clone());
             })
