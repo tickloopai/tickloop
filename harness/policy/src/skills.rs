@@ -488,7 +488,7 @@ Available Skills:
             format!("{}\n\nArguments:\n{arguments}", skill.body)
         };
         let mut shell_commands = if skill.command.is_some() {
-            commands::shell_commands(&content)
+            commands::shell_commands(&content)?
         } else {
             Vec::new()
         };

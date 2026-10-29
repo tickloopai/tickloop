@@ -444,7 +444,7 @@ fn parameter<'a>(
     ))
 }
 
-pub(super) fn shell_commands(content: &str) -> Vec<SkillShellCommand> {
+pub(super) fn shell_commands(content: &str) -> Result<Vec<SkillShellCommand>, SkillError> {
     let mut commands = FENCED_SHELL
         .captures_iter(content)
         .filter_map(|captures| {
@@ -478,5 +478,13 @@ pub(super) fn shell_commands(content: &str) -> Vec<SkillShellCommand> {
         }
     }
     commands.sort_by_key(|shell| shell.range.start);
-    commands
+    if commands
+        .windows(2)
+        .any(|pair| pair[0].range.end > pair[1].range.start)
+    {
+        return Err(SkillError::Invalid(
+            "overlapping Shell blocks cannot be prepared".into(),
+        ));
+    }
+    Ok(commands)
 }

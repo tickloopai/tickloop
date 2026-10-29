@@ -371,3 +371,10 @@ fn positional_argument_boundaries_follow_ascii_rules_beside_chinese_text() {
             .ends_with("处理 demo文件; $1_unchanged; $١")
     );
 }
+
+#[test]
+fn overlapping_shell_markers_are_rejected_before_any_execution_plan_is_returned() {
+    let registry = command_registry("!`printf first ```!\nprintf second\n``` tail`");
+    let expanded = registry.expand("demo:check", "", SkillCaller::User);
+    assert!(expanded.is_err(), "{expanded:?}");
+}
