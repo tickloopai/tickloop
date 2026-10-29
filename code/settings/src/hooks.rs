@@ -21,8 +21,8 @@ use tick_plugins::{
 use tickloop_harness::policy::settings::SettingsStoreError;
 use tickloop_harness::policy::skills::{PLUGIN_DATA_VARIABLES, PLUGIN_ROOT_VARIABLES};
 use tickloop_harness::protocol::hooks::{
-    ConfiguredHook, HookEvent, HookList, HookPluginDirectories, HookSource, HookTrust,
-    HookTrustAction, HookTrustChange,
+    ConfiguredHook, HookBackground, HookEvent, HookList, HookPluginDirectories, HookSource,
+    HookTrust, HookTrustAction, HookTrustChange,
 };
 use tickloop_harness::tools::permissions::is_supported_rule_text;
 
@@ -55,11 +55,12 @@ struct DeclaredHook {
     command: String,
     timeout_secs: u64,
     condition: Option<String>,
+    background: Option<HookBackground>,
 }
 
 impl DeclaredHook {
     /// The hook's identity within its source, from its normalized declaration. A hook without
-    /// `if` keeps the identity it had before `if` was read.
+    /// `if`, `async` or `asyncRewake` keeps the identity it had before they were read.
     fn key(&self) -> String {
         let common = (
             self.event.name(),
@@ -68,21 +69,39 @@ impl DeclaredHook {
             &self.command,
             self.timeout_secs,
         );
-        let declaration = match &self.condition {
-            None => serde_json::to_vec(&common),
-            Some(condition) => serde_json::to_vec(&(common, condition)),
+        let declaration = match (&self.condition, &self.background) {
+            (None, None) => serde_json::to_vec(&common),
+            (Some(condition), None) => serde_json::to_vec(&(common, condition)),
+            (condition, Some(background)) => serde_json::to_vec(&(common, condition, background)),
         }
         .expect("hook declarations serialize");
         hex_digest(&declaration)
     }
 }
 
-/// The hooks of one source in declaration order, without repeating a command for the same event,
-/// matcher and `if`.
+/// A supported `command` hook's own fields.
+struct CommandHandler {
+    command: String,
+    timeout_secs: u64,
+    condition: Option<String>,
+    background: Option<HookBackground>,
+}
+
+/// What makes two hooks of one source the same: the event, matcher, command, `if` and way of
+/// running.
+type SameHook = (
+    HookEvent,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<HookBackground>,
+);
+
+/// The hooks of one source in declaration order, each [`SameHook`] once.
 #[derive(Default)]
 struct SourceHooks {
     hooks: Vec<DeclaredHook>,
-    seen: HashSet<(HookEvent, Option<String>, String, Option<String>)>,
+    seen: HashSet<SameHook>,
 }
 
 impl SourceHooks {
@@ -93,6 +112,7 @@ impl SourceHooks {
                 hook.matcher.clone(),
                 hook.command.clone(),
                 hook.condition.clone(),
+                hook.background.clone(),
             )) {
                 self.hooks.push(hook);
             }
@@ -395,6 +415,7 @@ fn configured(
         command: hook.command,
         condition: hook.condition,
         timeout_secs: hook.timeout_secs,
+        background: hook.background,
         plugin,
         hash,
         trust,
@@ -448,7 +469,12 @@ fn declared_hooks(
             };
             for handler in handlers {
                 match command_hook(handler) {
-                    Ok((command, timeout_secs, condition)) => {
+                    Ok(CommandHandler {
+                        command,
+                        timeout_secs,
+                        condition,
+                        background,
+                    }) => {
                         if let Some(condition) = &condition {
                             if !event.is_tool_event() {
                                 warnings.push(format!(
@@ -469,6 +495,7 @@ fn declared_hooks(
                             command,
                             timeout_secs,
                             condition,
+                            background,
                         })
                     }
                     Err(problem) => warnings.push(format!("{location}: {name} hook {problem}")),
@@ -479,8 +506,8 @@ fn declared_hooks(
     hooks
 }
 
-/// The command, timeout and `if` of a supported `command` hook, or why it is skipped.
-fn command_hook(handler: &Value) -> Result<(String, u64, Option<String>), String> {
+/// The fields of a supported `command` hook, or why it is skipped.
+fn command_hook(handler: &Value) -> Result<CommandHandler, String> {
     let kind = handler.get("type").and_then(Value::as_str);
     match kind {
         Some(COMMAND_HOOK_TYPE) => {}
@@ -515,7 +542,33 @@ fn command_hook(handler: &Value) -> Result<(String, u64, Option<String>), String
         }
         Some(_) => return Err("if must be text such as Bash(git push*); it is skipped".into()),
     };
-    Ok((command.to_owned(), timeout_secs, condition))
+    Ok(CommandHandler {
+        command: command.to_owned(),
+        timeout_secs,
+        condition,
+        background: background(handler)?,
+    })
+}
+
+/// How Claude Code's `async` and `asyncRewake` run a hook; `asyncRewake` implies `async`.
+fn background(handler: &Value) -> Result<Option<HookBackground>, String> {
+    let flag = |field: &str| match handler.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(set)) => Ok(*set),
+        Some(_) => Err(format!("{field} must be true or false; it is skipped")),
+    };
+    let rewake_text = |field: &str| match handler.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if !text.trim().is_empty() => Ok(Some(text.clone())),
+        Some(_) => Err(format!("{field} must be non-empty text; it is skipped")),
+    };
+    if flag("asyncRewake")? {
+        return Ok(Some(HookBackground::AsyncRewake {
+            message: rewake_text("rewakeMessage")?,
+            summary: rewake_text("rewakeSummary")?,
+        }));
+    }
+    Ok(flag("async")?.then_some(HookBackground::Async))
 }
 
 fn trust_state(record: Option<&Map<String, Value>>, hash: Option<&str>) -> HookTrust {

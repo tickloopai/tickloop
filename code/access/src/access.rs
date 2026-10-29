@@ -107,8 +107,10 @@ use tickloop_harness::protocol::{
 /// and changing their trust records.
 /// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
 /// reason, which older readers reject as unknown, and the hook runs of the approval history.
+/// 37.1 adds how a configured hook runs in the background (`async`, `asyncRewake`) and which end
+/// of a background run a hook run record is.
 pub const PROTOCOL_MAJOR: u16 = 37;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

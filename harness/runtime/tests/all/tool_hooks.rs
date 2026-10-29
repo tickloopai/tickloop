@@ -57,6 +57,7 @@ fn hook(
         resolved_command: Some(command.into()),
         condition: None,
         timeout_secs: 600,
+        background: None,
         plugin,
         trust: HookTrust::Trusted,
     }

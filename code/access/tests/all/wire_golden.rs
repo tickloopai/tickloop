@@ -22,8 +22,8 @@ use tickloop_code_access::{
     ViewRef,
 };
 use tickloop_harness::protocol::hooks::{
-    ConfiguredHook, HookEvent, HookList, HookPluginDirectories, HookSource, HookTrust,
-    HookTrustAction, HookTrustChange,
+    ConfiguredHook, HookBackground, HookEvent, HookList, HookPluginDirectories, HookSource,
+    HookTrust, HookTrustAction, HookTrustChange,
 };
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
@@ -455,6 +455,10 @@ fn hook_list() -> HookList {
             resolved_command: Some("/home/user/.tickloop/plugins/cache/guard/check.sh".into()),
             condition: Some("Bash(rm *)".into()),
             timeout_secs: 30,
+            background: Some(HookBackground::AsyncRewake {
+                message: Some("Review:".into()),
+                summary: None,
+            }),
             plugin: Some(HookPluginDirectories {
                 root: "/home/user/.tickloop/plugins/cache/guard".into(),
                 data: "/home/user/.tickloop/plugins/data/guard".into(),

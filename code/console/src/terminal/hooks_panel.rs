@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_harness::protocol::hooks::{
-    ConfiguredHook, HookList, HookSource, HookTrust, HookTrustAction, HookTrustChange,
+    ConfiguredHook, HookBackground, HookList, HookSource, HookTrust, HookTrustAction,
+    HookTrustChange,
 };
 use uuid::Uuid;
 
@@ -563,6 +564,19 @@ impl HooksPanel {
             &format!("{} seconds", hook.timeout_secs),
             Role::MutedText,
         );
+        match &hook.background {
+            None => {}
+            Some(HookBackground::Async) => field(
+                "Background",
+                "async: runs without holding up the event",
+                Role::Text,
+            ),
+            Some(HookBackground::AsyncRewake { .. }) => field(
+                "Background",
+                "asyncRewake: runs without holding up the event and wakes the agent on exit 2",
+                Role::Text,
+            ),
+        }
         field("State", trust_label(hook.trust), trust_role(hook.trust));
         let coverage = match hook.source {
             HookSource::User => USER_COVERAGE,
@@ -854,6 +868,7 @@ mod tests {
             resolved_command: Some(format!("./{key}.sh")),
             condition: None,
             timeout_secs: 30,
+            background: None,
             plugin: None,
             trust,
         }
@@ -1070,6 +1085,10 @@ mod tests {
         repository.resolved_command = Some("./format.sh --all".into());
         let mut configured = hook(plugin(), "lint", HookTrust::Pending);
         configured.resolved_command = None;
+        configured.background = Some(HookBackground::AsyncRewake {
+            message: None,
+            summary: None,
+        });
         let mut panel = loaded(vec![repository, configured]);
         press(&mut panel, KeyCode::Enter);
         let shown = text(&mut panel);
@@ -1090,6 +1109,7 @@ mod tests {
         assert!(shown.contains("Source: Plugin guard@market"), "{shown}");
         assert!(shown.contains("plugin's whole content"), "{shown}");
         assert!(shown.contains("Needs configuration"), "{shown}");
+        assert!(shown.contains("Background: asyncRewake"), "{shown}");
         press(&mut panel, KeyCode::Esc);
         assert!(text(&mut panel).contains("enter details"));
         assert!(matches!(

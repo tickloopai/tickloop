@@ -59,7 +59,7 @@ impl HookResponse {
         }
     }
 
-    fn success() -> Self {
+    pub(super) fn success() -> Self {
         Self {
             outcome: HookRunOutcome::Success,
             permission: None,
@@ -85,6 +85,15 @@ impl HookResponse {
             Some(HookPermission::Allow) => Some(HookDecision::IgnoredAllow),
             None => self.blocking_error.as_ref().map(|_| HookDecision::Block),
         }
+    }
+
+    /// Why it decided, blocked or failed, as its record says.
+    pub(super) fn reason(&self) -> Option<String> {
+        self.blocking_error
+            .clone()
+            .or(self.permission_reason.clone())
+            .or(self.error.clone())
+            .or(self.stop_reason.clone())
     }
 }
 

@@ -434,6 +434,16 @@ pub fn task_notification(ids: &IdContext, notification: &TaskNotification) -> Me
     user_text(&notification.text(ids))
 }
 
+/// What a hook that ran in the background tells the model when it ends: a line the user sees and
+/// the text the model reads, as Claude Code notifies of a finished background task.
+pub fn background_hook_notification(summary: &str, result: &str) -> Message {
+    user_text(&format!(
+        "<{TASK_NOTIFICATION_TAG}>\n<{SUMMARY_TAG}>{}</{SUMMARY_TAG}>\n<{RESULT_TAG}>{}</{RESULT_TAG}>\n</{TASK_NOTIFICATION_TAG}>",
+        escape_xml(summary),
+        escape_xml(result)
+    ))
+}
+
 fn user_text(text: &str) -> Message {
     Message {
         role: Role::User,

@@ -367,7 +367,7 @@ fn hook_list_line(index: usize, record: &HookRunRecord, selected: bool) -> RoleL
         _ => Role::Warning,
     };
     line.push(
-        format!("Hook {}", hook_activity::outcome_label(record.outcome)),
+        format!("Hook {}", hook_activity::run_label(record)),
         Some(if selected { Role::Strong } else { role }),
     );
     line.push(" · ", Some(Role::MutedText));
@@ -387,7 +387,7 @@ fn hook_detail_lines(record: &HookRunRecord, width: usize) -> Vec<RoleLine> {
         format!("Hook: {}", hook_activity::hook_label(record)),
         format!(
             "Hook outcome: {} · {} ms",
-            hook_activity::outcome_label(record.outcome),
+            hook_activity::run_label(record),
             record.duration_ms
         ),
         format!("Source: {}", hook_activity::source_label(&record.source)),
@@ -1011,6 +1011,7 @@ mod tests {
             system_message: Some("Guard said no".into()),
             updated_input: None,
             output: String::new(),
+            background: None,
         });
         let mut surface = DenialsSurface::default();
         surface.replace_view(history);
