@@ -13032,6 +13032,9 @@ impl State {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
                 }
+                // Space is the list's card key; on a Tick row without a card, such as a lost
+                // Tick's, it does nothing rather than leave the list and type into the input.
+                (KeyCode::Char(' '), KeyModifiers::NONE) if self.monitor.selected().is_some() => {}
                 (KeyCode::Enter, KeyModifiers::NONE)
                     if self
                         .monitor

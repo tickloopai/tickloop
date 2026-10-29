@@ -1744,3 +1744,45 @@ fn space_or_a_click_on_a_collapsed_cards_row_shows_it_in_one_press() {
     state.draw_frame(&mut Vec::new()).unwrap();
     assert!(!collapsed(&state, four), "{}", screen(&state));
 }
+
+#[test]
+fn space_on_a_row_without_a_card_keeps_the_keys_on_the_list() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    state.key(key(KeyCode::Enter));
+    assert!(state.card_focused());
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "lost".into();
+        entry.tone = crate::monitor_rows::StatusTone::Gone;
+        entry.ended = Some("lost".into());
+        entry.actions = vec![crate::monitor_rows::MonitorAction {
+            key: crate::monitor_rows::MONITOR_ENTER_KEY,
+            label: "reopen",
+            intent: crate::monitor_rows::TickIntent::ReopenHosted(instance.clone()),
+        }];
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(!state.card_focused(), "a lost Tick takes no keys");
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(!state.cards.is_open(&instance), "Space hides its card");
+
+    for _ in 0..2 {
+        assert!(state.key(key(KeyCode::Char(' '))).is_none());
+        assert!(!state.cards.is_open(&instance), "a lost Tick shows no card");
+        assert!(
+            state.monitor_owns_keys(),
+            "Space never leaves the list for the input"
+        );
+        assert!(
+            state.editor.draft().is_empty(),
+            "{:?}",
+            state.editor.draft()
+        );
+    }
+
+    let (mut state, rows) = tab_fixture();
+    assert_eq!(selected(&state), rows[0], "a row that can have no card");
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(state.monitor_owns_keys() && state.editor.draft().is_empty());
+    assert!(state.cards.cards().is_empty());
+}
