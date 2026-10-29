@@ -82,13 +82,12 @@ impl GitClient {
         let root = directory.path();
         let target = if let Some(sha) = &source.sha {
             let sha = sha.to_ascii_lowercase();
-            let available = if sha.len() == 40 {
+            let initial_result = if sha.len() == 40 {
                 self.run(
                     root,
                     &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
                 )
                 .await
-                .is_ok()
             } else {
                 self.run(
                     root,
@@ -100,9 +99,8 @@ impl GitClient {
                     ],
                 )
                 .await
-                .is_ok()
             };
-            if !available {
+            if let Err(initial_error) = initial_result {
                 // Some servers refuse object-id fetches; abbreviated ids also need local history.
                 let mut arguments = vec![
                     "fetch",
@@ -116,7 +114,13 @@ impl GitClient {
                 } else {
                     arguments.extend([REMOTE_BRANCHES, REMOTE_TAGS]);
                 }
-                self.run(root, &arguments).await?;
+                self.run(root, &arguments).await.map_err(|fallback_error| {
+                    PluginError::Invalid(format!(
+                        "cannot fetch Git commit {sha}: initial attempt: {}; history fallback: {}",
+                        redacted_git_failure(&initial_error, &source.url),
+                        redacted_git_failure(&fallback_error, &source.url),
+                    ))
+                })?;
             }
             sha
         } else if let Some(reference) = source.reference.as_deref() {
@@ -244,6 +248,24 @@ impl GitClient {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
+}
+
+fn redacted_git_failure(error: &PluginError, source_url: &str) -> String {
+    const REDACTED_URL: &str = "[redacted Git URL]";
+    error
+        .to_string()
+        .replace(source_url, REDACTED_URL)
+        .split_whitespace()
+        .map(|word| {
+            // Git can normalize credentials or report a redirected URL instead of the source URL.
+            if word.contains("://") || word.contains("git@") {
+                REDACTED_URL
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn valid_sha(sha: &str) -> bool {
