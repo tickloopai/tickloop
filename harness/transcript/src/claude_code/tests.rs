@@ -68,7 +68,7 @@ fn ralph_loop_last_assistant_text(file: &str) -> String {
         })
         .filter(|block| block["type"] == "text")
         .filter_map(|block| block["text"].as_str().map(str::to_owned))
-        .last()
+        .next_back()
         .unwrap_or_default()
 }
 
@@ -197,8 +197,6 @@ fn only_what_the_conversation_shows_the_model_is_projected() {
         vec![text("Conversation compacted")],
     );
     boundary.subtype = Some(crate::COMPACT_BOUNDARY_SUBTYPE.into());
-    let mut transcript_only = entry(Some(boundary.uuid), Role::User, vec![text("shown only")]);
-    transcript_only.is_visible_in_transcript_only = true;
     let image = Content::ToolResult {
         tool_use_id: "call-1".into(),
         content: tickloop_harness_protocol::ToolResultContent::Blocks(vec![
@@ -217,7 +215,7 @@ fn only_what_the_conversation_shows_the_model_is_projected() {
         is_error: true,
     };
     let answer = entry(
-        Some(transcript_only.uuid),
+        Some(boundary.uuid),
         Role::Assistant,
         vec![
             thinking("private reasoning"),
@@ -237,7 +235,6 @@ fn only_what_the_conversation_shows_the_model_is_projected() {
         Line::User(prompt.clone()),
         Line::User(note),
         Line::System(boundary),
-        Line::User(transcript_only),
         Line::Assistant(answer),
         Line::User(result),
         Line::Unknown(UnknownLine {
@@ -324,6 +321,7 @@ fn a_compaction_adds_its_summary_but_not_the_copies_of_kept_messages() {
         )],
     );
     summary.is_compact_summary = true;
+    summary.is_visible_in_transcript_only = true;
     let mut kept = entry(
         Some(summary.uuid),
         Role::Assistant,

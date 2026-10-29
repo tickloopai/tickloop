@@ -154,9 +154,10 @@ pub fn project(lines: &[Line]) -> Vec<ClaudeCodeLine> {
         .collect()
 }
 
-/// Host notes and entries kept for the user's view alone are not conversation the model sees.
+/// Host notes are not conversation; a compaction summary is, though shown in the transcript
+/// view alone.
 fn shows_the_model(entry: &ChainEntry) -> bool {
-    !entry.is_meta && !entry.is_visible_in_transcript_only && entry.loop_record.is_none()
+    !entry.is_meta && entry.loop_record.is_none()
 }
 
 fn conversation_blocks(entry: &ChainEntry) -> Vec<ClaudeCodeBlock> {
