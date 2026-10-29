@@ -474,6 +474,8 @@ async fn managed_cancellation_keeps_the_chat_reusable_and_other_chats_running() 
         .submit(chat, "start a foreground sleep".into())
         .await
         .unwrap();
+    // The command is listed as Running before the Tickhost answers its start; cancelling while
+    // that start is in flight leaves its outcome unknown, so wait for the started process.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if agent
@@ -481,7 +483,7 @@ async fn managed_cancellation_keeps_the_chat_reusable_and_other_chats_running() 
                 .await
                 .unwrap()
                 .iter()
-                .any(|command| command.state == CommandState::Running)
+                .any(|command| command.state == CommandState::Running && command.pid.is_some())
             {
                 break;
             }

@@ -110,6 +110,7 @@ pub fn render_input_context(context: &InputContext) -> Vec<Content> {
     let (kind, text) = match context {
         InputContext::File(text) => ("file", text),
         InputContext::Directory(text) => ("directory", text),
+        InputContext::PromptText { text } if text.is_empty() => return Vec::new(),
         InputContext::PromptText { text } => return vec![Content::Text { text: text.clone() }],
         InputContext::Resource(resource) => {
             let value = serde_json::json!({

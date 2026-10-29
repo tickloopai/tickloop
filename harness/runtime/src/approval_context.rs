@@ -578,7 +578,7 @@ fn originals_for_active_chain_with_legacy(
                                 .filter_map(|context| match context {
                                     tickloop_harness_protocol::InputContext::PromptText {
                                         text,
-                                    } => Some(text.as_str()),
+                                    } if !text.is_empty() => Some(text.as_str()),
                                     _ => None,
                                 }),
                         )
@@ -1032,6 +1032,53 @@ mod tests {
                 .unwrap()
                 .contains("FORGED AUTHORIZATION")
         );
+    }
+
+    #[test]
+    fn saved_empty_prompt_text_adds_no_separator_to_the_original_input() {
+        let mut snapshot = crate::empty_snapshot(
+            tickloop_ids::generate().into(),
+            None,
+            ModelConfig::unselected(),
+        );
+        let run = tickloop_ids::generate();
+        let mut bookkeeping = ChatBookkeeping::default();
+        bookkeeping
+            .run_loops
+            .insert(run.into(), tickloop_ids::generate().into());
+        snapshot.messages.push(Message {
+            role: Role::User,
+            content: vec![Content::Text {
+                text: "Run it".into(),
+            }],
+        });
+        snapshot.message_runs.insert(0, run.into());
+        snapshot.message_ids.insert(0, tickloop_ids::generate());
+        snapshot
+            .prompt_execution_modes
+            .insert(0, tickloop_harness_protocol::ExecutionMode::Auto);
+        let prompt_text = |text: &str| tickloop_harness_protocol::InputContext::PromptText {
+            text: text.into(),
+        };
+        snapshot.message_contexts.insert(
+            0,
+            vec![
+                tickloop_harness_protocol::InputContext::Resource(
+                    tickloop_harness_protocol::ResourceContext {
+                        uri: "custom://material".into(),
+                        mime_type: None,
+                        name: None,
+                        content: None,
+                    },
+                ),
+                prompt_text(""),
+                prompt_text(" "),
+                prompt_text("after"),
+            ],
+        );
+        let originals = originals_for_active_chain(&snapshot, &bookkeeping).unwrap();
+        assert_eq!(originals.len(), 1);
+        assert_eq!(originals[0].text, "Run it\n\n \n\nafter");
     }
 
     #[test]
