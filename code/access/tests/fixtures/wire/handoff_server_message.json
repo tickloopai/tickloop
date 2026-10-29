@@ -2,8 +2,8 @@
   {
     "Hello": {
       "process_id": 4242,
-      "major": 35,
-      "minor": 1,
+      "major": 36,
+      "minor": 0,
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "session_id": "00000000-0000-0000-0000-000000000051",
       "capabilities": [

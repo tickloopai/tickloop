@@ -41,6 +41,8 @@ const DAY_MILLISECONDS: u64 = 24 * 60 * 60 * 1000;
 pub enum RecordStatus {
     /// Running in the daemon that last wrote the record.
     Live,
+    /// Its last turn had finished with nothing pending when its execution ended.
+    Completed,
     Failed,
     Stopped,
 }
@@ -67,6 +69,11 @@ pub struct AgentRecord {
     pub ended_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<EndReason>,
+    /// Whether work was still coming while its Loop was idle, at the last state written: queued
+    /// input, an active Goal, a scheduled task, a received Tick Subscription, a running Shell or
+    /// a working Subagent. Records written before it was kept read as nothing pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_work: Option<bool>,
 }
 
 impl AgentRecord {
@@ -84,32 +91,64 @@ impl AgentRecord {
     fn outcome(&self) -> Option<EndedOutcome> {
         match self.status {
             RecordStatus::Live => None,
+            RecordStatus::Completed => Some(EndedOutcome::Completed),
             RecordStatus::Failed => Some(EndedOutcome::Failed),
             RecordStatus::Stopped => Some(EndedOutcome::Stopped),
         }
     }
 
+    /// Claude Code's done job: the turn ended and nothing was pending. A turn that ended in a
+    /// failure is as terminal; its record keeps that it failed.
+    fn finished_its_turn(&self) -> bool {
+        matches!(
+            self.last_state,
+            LoopState::Idle | LoopState::Interrupted | LoopState::Failed
+        ) && !self.pending_work.unwrap_or(false)
+    }
+
+    /// Claude Code's blocked job, which no reaper ends: a question or plan left for the user.
+    /// A permission prompt is mid-turn work in Claude Code and is reaped like it.
     fn awaited_the_user(&self) -> bool {
         matches!(
             self.last_state,
-            LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan
+            LoopState::WaitingQuestion | LoopState::WaitingPlan
         )
     }
 
-    /// Ends a record whose execution is gone, as Claude Code's restart reaper does: recent activity
-    /// failed now, activity older than [`STALE_AFTER_MILLISECONDS`] stopped back then. An Agent that
-    /// was waiting for the user still waits for them, however long ago that was.
-    fn end_without_execution(&mut self, now: u64) {
+    /// Ends a record whose execution is gone, as Claude Code's restart reaper does. A finished
+    /// turn stays finished and a question stays for the user; other work, an idle Agent with
+    /// pending work included, failed now when it was active within
+    /// [`STALE_AFTER_MILLISECONDS`] and stopped back then when it was not. `gone` says how the
+    /// execution went: [`EndReason::WorkerLost`] is Claude Code's display fallback, which fails
+    /// work without the 48-hour rule.
+    fn end_without_execution(&mut self, now: u64, gone: EndReason) {
         let stale = now.saturating_sub(self.updated_at) > STALE_AFTER_MILLISECONDS;
-        if stale && !self.awaited_the_user() {
-            self.status = RecordStatus::Stopped;
-            self.end_reason = Some(EndReason::DaemonOff);
-            self.ended_at = Some(self.updated_at);
+        let (status, reason, ended_at) = if self.finished_its_turn() {
+            let status = if self.last_state == LoopState::Failed {
+                RecordStatus::Failed
+            } else {
+                RecordStatus::Completed
+            };
+            (status, EndReason::Finished, self.updated_at)
+        } else if stale && !self.awaited_the_user() && gone == EndReason::DaemonStopped {
+            (RecordStatus::Stopped, EndReason::DaemonOff, self.updated_at)
         } else {
-            self.status = RecordStatus::Failed;
-            self.end_reason = Some(EndReason::DaemonStopped);
-            self.ended_at = Some(now);
-        }
+            (RecordStatus::Failed, gone, now)
+        };
+        self.status = status;
+        self.end_reason = Some(reason);
+        self.ended_at = Some(ended_at);
+    }
+
+    /// An earlier reaper ended a finished turn as failed or stopped before records kept whether
+    /// work was pending; such a record reads as finished, as it would now.
+    fn reaped_before_pending_work_was_kept(&self) -> bool {
+        self.pending_work.is_none()
+            && matches!(
+                self.end_reason,
+                Some(EndReason::DaemonStopped | EndReason::DaemonOff)
+            )
+            && self.finished_its_turn()
     }
 }
 
@@ -132,7 +171,35 @@ fn record_of(summary: &AgentSummary, existing: Option<&AgentRecord>, now: u64) -
         status: RecordStatus::Live,
         ended_at: None,
         end_reason: None,
+        pending_work: summary.pending_work,
     }
+}
+
+/// Whether a Subagent of the root `root` still works: its turn runs or waits on the user.
+fn family_works(directory: &[AgentSummary], root: &AgentSummary) -> bool {
+    let parents = directory
+        .iter()
+        .map(|summary| (summary.execution, summary.parent))
+        .collect::<HashMap<_, _>>();
+    let descends = |summary: &AgentSummary| {
+        let mut visited = HashSet::new();
+        let mut current = summary.parent;
+        while let Some(parent) = current.filter(|parent| visited.insert(*parent)) {
+            if parent == root.execution {
+                return true;
+            }
+            current = parents.get(&parent).copied().flatten();
+        }
+        false
+    };
+    directory.iter().any(|summary| {
+        summary.availability == ExecutionAvailability::Live
+            && !matches!(
+                summary.state,
+                LoopState::Idle | LoopState::Interrupted | LoopState::Failed
+            )
+            && descends(summary)
+    })
 }
 
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -235,8 +302,9 @@ impl AgentRegistry {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut records = HashMap::new();
         for mut record in self.read_all() {
-            if !running.contains(&record.chat_id) && !record.is_ended() {
-                record.end_without_execution(now);
+            let unexecuted = !running.contains(&record.chat_id);
+            if unexecuted && (!record.is_ended() || record.reaped_before_pending_work_was_kept()) {
+                record.end_without_execution(now, EndReason::DaemonStopped);
                 self.write_logged(&record);
             }
             let expired = record.is_ended()
@@ -267,16 +335,18 @@ impl AgentRegistry {
         };
         for summary in directory.iter().filter(|summary| self.is_own_root(summary)) {
             let existing = records.get(&summary.chat_id);
-            let record = if summary.availability == ExecutionAvailability::Lost {
-                let ended_at = existing.and_then(|record| record.ended_at).unwrap_or(now);
-                record_of(summary, existing, now).ended(
-                    RecordStatus::Failed,
-                    EndReason::WorkerLost,
-                    ended_at,
-                )
-            } else {
-                record_of(summary, existing, now)
-            };
+            let mut summary = summary.clone();
+            if family_works(directory, &summary) {
+                summary.pending_work = Some(true);
+            }
+            let summary = &summary;
+            let mut record = record_of(summary, existing, now);
+            if summary.availability == ExecutionAvailability::Lost {
+                record.end_without_execution(now, EndReason::WorkerLost);
+                if let Some(ended_at) = existing.and_then(|record| record.ended_at) {
+                    record.ended_at = Some(ended_at);
+                }
+            }
             if existing != Some(&record) {
                 self.write_logged(&record);
                 records.insert(record.chat_id, record);
@@ -309,24 +379,29 @@ impl AgentRegistry {
             .iter()
             .map(|summary| summary.chat_id)
             .collect::<HashSet<_>>();
-        let records = {
-            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            match &state.records {
-                Some(records) => records.values().cloned().collect::<Vec<_>>(),
-                None => Vec::new(),
-            }
-        };
         let now = (self.clock)();
+        let records = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(records) = state.records.as_mut() else {
+                return Vec::new();
+            };
+            // Claude Code's display fallback: a record still saying running whose execution this
+            // daemon does not list ends once past the grace, and the record says so too.
+            for record in records.values_mut() {
+                if !record.is_ended()
+                    && !listed.contains(&record.chat_id)
+                    && now.saturating_sub(record.created_at) >= UNLISTED_GRACE_MILLISECONDS
+                {
+                    record.end_without_execution(now, EndReason::WorkerLost);
+                    self.write_logged(record);
+                }
+            }
+            records.values().cloned().collect::<Vec<_>>()
+        };
         let mut ended = Vec::new();
-        for mut record in records {
+        for record in records {
             if listed.contains(&record.chat_id) {
                 continue;
-            }
-            if !record.is_ended() {
-                if now.saturating_sub(record.created_at) < UNLISTED_GRACE_MILLISECONDS {
-                    continue;
-                }
-                record = record.ended(RecordStatus::Failed, EndReason::WorkerLost, now);
             }
             let Some(outcome) = record.outcome() else {
                 continue;
@@ -523,6 +598,7 @@ mod tests {
             self.now.load(Ordering::SeqCst)
         }
 
+        /// A root Agent in the middle of a turn.
         fn root_summary(&self, chat_id: Uuid) -> AgentSummary {
             AgentSummary {
                 availability: ExecutionAvailability::Live,
@@ -533,12 +609,13 @@ mod tests {
                 },
                 chat_id,
                 folder: Some("/work".into()),
-                state: LoopState::Idle,
+                state: LoopState::Running,
                 run_id: None,
                 run_started_at: None,
                 title: "Fix the parser".into(),
                 subagent: None,
                 has_work: Some(true),
+                pending_work: None,
                 updated_at: Some(self.now()),
                 preview: None,
                 waiting_permissions: 0,
@@ -770,8 +847,11 @@ mod tests {
         assert_eq!(ended.len(), 1);
         assert_eq!(ended[0].outcome, EndedOutcome::Failed);
         assert_eq!(ended[0].reason, EndReason::WorkerLost);
-        // Reading never rewrites the record; only the daemon's own observations do.
-        assert_eq!(statuses(&registry), [(chat, RecordStatus::Live, None)]);
+        // The record says what the overview shows.
+        assert_eq!(
+            statuses(&registry),
+            [(chat, RecordStatus::Failed, Some(EndReason::WorkerLost))]
+        );
     }
 
     #[tokio::test]
@@ -791,5 +871,323 @@ mod tests {
         let ended = registry.ended(&[]).await;
         assert_eq!(ended[0].outcome, EndedOutcome::Stopped);
         assert_eq!(ended[0].ended_at, fixture.now());
+    }
+
+    /// A root Agent whose turn ended with nothing pending.
+    fn finished(fixture: &Fixture, chat: Uuid) -> AgentSummary {
+        AgentSummary {
+            state: LoopState::Idle,
+            pending_work: Some(false),
+            ..fixture.root_summary(chat)
+        }
+    }
+
+    /// Records `summaries` in one daemon, then reconciles them in the next one `elapsed` later.
+    fn restart_after(fixture: &Fixture, summaries: &[AgentSummary], elapsed: u64) -> AgentRegistry {
+        let before = fixture.registry(None);
+        before.reconcile(&[]);
+        before.observe(summaries);
+        fixture.advance(elapsed);
+        let after = fixture.registry(None);
+        after.reconcile(&[]);
+        after
+    }
+
+    fn record(registry: &AgentRegistry, chat: Uuid) -> AgentRecord {
+        registry
+            .read_all()
+            .into_iter()
+            .find(|record| record.chat_id == chat)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_finished_turn_with_nothing_pending_stays_completed_at_any_age() {
+        let idle = Uuid::from_u128(10);
+        let interrupted = Uuid::from_u128(20);
+        for elapsed in [HOUR, STALE_AFTER_MILLISECONDS + HOUR] {
+            let fixture = Fixture::new();
+            let finished_at = fixture.now();
+            let interrupted_summary = AgentSummary {
+                state: LoopState::Interrupted,
+                ..finished(&fixture, interrupted)
+            };
+            let after = restart_after(
+                &fixture,
+                &[finished(&fixture, idle), interrupted_summary],
+                elapsed,
+            );
+            assert_eq!(
+                statuses(&after),
+                [
+                    (idle, RecordStatus::Completed, Some(EndReason::Finished)),
+                    (
+                        interrupted,
+                        RecordStatus::Completed,
+                        Some(EndReason::Finished)
+                    ),
+                ],
+                "{elapsed}"
+            );
+            assert_eq!(record(&after, idle).ended_at, Some(finished_at));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_lists_as_completed_without_failure() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let after = restart_after(&fixture, &[finished(&fixture, chat)], HOUR);
+
+        let ended = after.ended(&[]).await;
+
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].outcome, EndedOutcome::Completed);
+        assert_eq!(ended[0].reason, EndReason::Finished);
+    }
+
+    #[test]
+    fn a_turn_that_failed_stays_failed_without_the_48_hour_rule() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let failed = AgentSummary {
+            state: LoopState::Failed,
+            ..finished(&fixture, chat)
+        };
+
+        let after = restart_after(&fixture, &[failed], STALE_AFTER_MILLISECONDS + HOUR);
+
+        assert_eq!(
+            statuses(&after),
+            [(chat, RecordStatus::Failed, Some(EndReason::Finished))]
+        );
+    }
+
+    #[test]
+    fn an_idle_agent_with_pending_work_fails_within_48_hours_and_stops_after_them() {
+        for (elapsed, expected) in [
+            (HOUR, (RecordStatus::Failed, EndReason::DaemonStopped)),
+            (
+                STALE_AFTER_MILLISECONDS + HOUR,
+                (RecordStatus::Stopped, EndReason::DaemonOff),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let chat = Uuid::from_u128(10);
+            let waiting_on_work = AgentSummary {
+                pending_work: Some(true),
+                ..finished(&fixture, chat)
+            };
+
+            let after = restart_after(&fixture, &[waiting_on_work], elapsed);
+
+            assert_eq!(
+                statuses(&after),
+                [(chat, expected.0, Some(expected.1))],
+                "{elapsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_working_subagent_keeps_its_idle_root_pending() {
+        let fixture = Fixture::new();
+        let root = finished(&fixture, Uuid::from_u128(10));
+        let mut child = fixture.root_summary(Uuid::from_u128(20));
+        child.parent = Some(root.execution);
+        child.subagent = Some(tickloop_harness::protocol::SubagentRegistration {
+            child_chat_id: child.chat_id.into(),
+            handle: "audit".into(),
+            description: "Audit".into(),
+            created_at: 0,
+            color: None,
+        });
+        let mut grandchild = fixture.root_summary(Uuid::from_u128(30));
+        grandchild.parent = Some(child.execution);
+        child.state = LoopState::Idle;
+
+        let after = restart_after(&fixture, &[root.clone(), child, grandchild], HOUR);
+
+        assert_eq!(record(&after, root.chat_id).pending_work, Some(true));
+        assert_eq!(
+            statuses(&after),
+            [(
+                root.chat_id,
+                RecordStatus::Failed,
+                Some(EndReason::DaemonStopped)
+            )]
+        );
+    }
+
+    #[test]
+    fn mid_turn_work_and_a_permission_prompt_fail_within_48_hours_and_stop_after_them() {
+        for state in [
+            LoopState::Running,
+            LoopState::Queued,
+            LoopState::WaitingPermission,
+        ] {
+            for (elapsed, expected) in [
+                (HOUR, (RecordStatus::Failed, EndReason::DaemonStopped)),
+                (
+                    STALE_AFTER_MILLISECONDS + HOUR,
+                    (RecordStatus::Stopped, EndReason::DaemonOff),
+                ),
+            ] {
+                let fixture = Fixture::new();
+                let chat = Uuid::from_u128(10);
+                let working = AgentSummary {
+                    state: state.clone(),
+                    ..fixture.root_summary(chat)
+                };
+
+                let after = restart_after(&fixture, &[working], elapsed);
+
+                assert_eq!(
+                    statuses(&after),
+                    [(chat, expected.0, Some(expected.1))],
+                    "{state:?} {elapsed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_question_or_plan_left_for_the_user_is_never_stopped() {
+        for state in [LoopState::WaitingQuestion, LoopState::WaitingPlan] {
+            let fixture = Fixture::new();
+            let chat = Uuid::from_u128(10);
+            let asking = AgentSummary {
+                state: state.clone(),
+                ..fixture.root_summary(chat)
+            };
+
+            let after = restart_after(&fixture, &[asking], STALE_AFTER_MILLISECONDS + HOUR);
+
+            assert_eq!(
+                statuses(&after),
+                [(chat, RecordStatus::Failed, Some(EndReason::DaemonStopped))],
+                "{state:?}"
+            );
+            assert_eq!(record(&after, chat).last_state, state);
+        }
+    }
+
+    #[test]
+    fn records_without_the_pending_fact_read_as_finished_when_their_turn_ended() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let unknown = AgentSummary {
+            pending_work: None,
+            ..finished(&fixture, chat)
+        };
+
+        let after = restart_after(&fixture, &[unknown], HOUR);
+
+        assert_eq!(
+            statuses(&after),
+            [(chat, RecordStatus::Completed, Some(EndReason::Finished))]
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_an_earlier_reaper_failed_reads_as_completed_again() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry(None);
+        let chat = Uuid::from_u128(10);
+        let updated_at = fixture.now() - HOUR;
+        create_private_directory(&registry.directory).unwrap();
+        let old_reap = serde_json::json!({
+            "version": 1,
+            "agentId": Uuid::from_u128(11),
+            "chatId": chat,
+            "folder": "/work",
+            "title": "问候与交流",
+            "createdAt": updated_at - HOUR,
+            "updatedAt": updated_at,
+            "lastState": "Idle",
+            "status": "failed",
+            "endedAt": fixture.now(),
+            "endReason": "daemon_stopped"
+        });
+        std::fs::write(
+            registry.record_path(chat),
+            serde_json::to_vec(&old_reap).unwrap(),
+        )
+        .unwrap();
+        let working = Uuid::from_u128(20);
+        let mut old_working = old_reap.clone();
+        old_working["chatId"] = serde_json::json!(working);
+        old_working["lastState"] = serde_json::json!("Running");
+        std::fs::write(
+            registry.record_path(working),
+            serde_json::to_vec(&old_working).unwrap(),
+        )
+        .unwrap();
+
+        registry.reconcile(&[]);
+
+        assert_eq!(
+            statuses(&registry),
+            [
+                (chat, RecordStatus::Completed, Some(EndReason::Finished)),
+                (
+                    working,
+                    RecordStatus::Failed,
+                    Some(EndReason::DaemonStopped)
+                ),
+            ]
+        );
+        assert_eq!(record(&registry, chat).ended_at, Some(updated_at));
+    }
+
+    #[tokio::test]
+    async fn the_display_fallback_keeps_a_finished_turn_completed_and_writes_what_it_shows() {
+        let fixture = Fixture::new();
+        let done = Uuid::from_u128(10);
+        let working = Uuid::from_u128(20);
+        let registry = fixture.registry(None);
+        registry.reconcile(&[finished(&fixture, done), fixture.root_summary(working)]);
+        fixture.advance(UNLISTED_GRACE_MILLISECONDS);
+
+        let ended = registry.ended(&[]).await;
+
+        let outcome = |chat| {
+            ended
+                .iter()
+                .find(|agent| agent.record.chat_id == chat)
+                .map(|agent| (agent.outcome, agent.reason))
+        };
+        assert_eq!(
+            outcome(done),
+            Some((EndedOutcome::Completed, EndReason::Finished))
+        );
+        assert_eq!(
+            outcome(working),
+            Some((EndedOutcome::Failed, EndReason::WorkerLost))
+        );
+        assert_eq!(
+            statuses(&registry),
+            [
+                (done, RecordStatus::Completed, Some(EndReason::Finished)),
+                (working, RecordStatus::Failed, Some(EndReason::WorkerLost)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lost_worker_keeps_a_finished_turn_completed() {
+        let fixture = Fixture::new();
+        let chat = Uuid::from_u128(10);
+        let registry = fixture.registry(None);
+        registry.reconcile(&[finished(&fixture, chat)]);
+        let mut lost = finished(&fixture, chat);
+        lost.availability = ExecutionAvailability::Lost;
+
+        registry.observe(&[lost]);
+
+        assert_eq!(
+            statuses(&registry),
+            [(chat, RecordStatus::Completed, Some(EndReason::Finished))]
+        );
     }
 }

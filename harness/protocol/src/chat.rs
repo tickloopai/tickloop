@@ -857,6 +857,52 @@ pub fn chat_has_work(
     !conversation.messages.is_empty() || !user_shells.is_empty() || queued > 0
 }
 
+/// Whether the Chat still has work coming while its Loop is idle, as Claude Code tells a job that
+/// waits on something from one that is done: queued input, an active Goal, a scheduled task that
+/// can fire, a Tick Subscription it receives, or a Shell or background command still running.
+/// The caller passes the process-local parts the snapshot may not carry.
+pub fn chat_has_pending_work(
+    conversation: &ChatSnapshot,
+    commands: &[crate::CommandSnapshot],
+    user_shells: &[UserShellRecord],
+    queued: usize,
+) -> bool {
+    let receiving = conversation.chat_loop.receiving.is_receiving();
+    queued > 0
+        || conversation
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == crate::GoalStatus::Active)
+        || conversation
+            .scheduled_tasks
+            .iter()
+            .any(|task| task.paused_at_ms.is_none())
+        || receiving
+            && conversation
+                .chat_loop
+                .subscriptions
+                .iter()
+                .any(|subscription| !subscription.paused)
+        || commands.iter().any(|command| {
+            matches!(
+                command.state,
+                crate::CommandState::Running
+                    | crate::CommandState::Background
+                    | crate::CommandState::Cancelling
+            )
+        })
+        || user_shells.iter().any(|shell| {
+            matches!(
+                shell.state,
+                UserShellState::Queued
+                    | UserShellState::WaitingPermission
+                    | UserShellState::Running
+                    | UserShellState::Background
+                    | UserShellState::Cancelling
+            )
+        })
+}
+
 const PREVIEW_MAX_CHARACTERS: usize = 160;
 
 /// The latest conversation content as one bounded line: the newest reply, or the newest typed

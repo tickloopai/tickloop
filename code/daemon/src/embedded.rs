@@ -2190,6 +2190,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         title: summary.title,
                         subagent: registration,
                         has_work: Some(summary.has_work),
+                        pending_work: Some(summary.pending_work),
                         waiting_permissions: summary.waiting_permissions,
                         waiting_questions: summary.waiting_questions,
                         parent: match summary.parent_chat {

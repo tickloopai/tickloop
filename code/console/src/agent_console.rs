@@ -843,13 +843,12 @@ impl AgentState {
         }
     }
 
-    /// An ended root still waits for the user when it ended waiting for them.
+    /// An ended root still waits for the user when it ended on a question or plan for them, as
+    /// Claude Code keeps a blocked job; a permission prompt was work and ended with it.
     pub fn of_ended(agent: &EndedAgent) -> Self {
         match (agent.outcome, &agent.last_state) {
-            (
-                _,
-                LoopState::WaitingPermission | LoopState::WaitingQuestion | LoopState::WaitingPlan,
-            ) => Self::NeedsInput,
+            (_, LoopState::WaitingQuestion | LoopState::WaitingPlan) => Self::NeedsInput,
+            (EndedOutcome::Completed, _) => Self::Completed,
             (EndedOutcome::Failed, _) => Self::Failed,
             (EndedOutcome::Stopped, _) => Self::Stopped,
         }
