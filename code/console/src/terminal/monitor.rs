@@ -1101,6 +1101,22 @@ impl Monitor {
             self.focused = false;
             self.overlay = false;
         }
+        // The Tick row the Ticks section scrolls by while the selection is elsewhere hands that
+        // to the row taking its place, so the section stays where it was.
+        if let Some(anchor) = self.tick_anchor.take() {
+            self.tick_anchor = if self.lists(&anchor) {
+                Some(anchor)
+            } else {
+                let ticks = self
+                    .listed_ticks()
+                    .map(|instance| MonitorTarget::Tick(instance.clone()))
+                    .collect::<Vec<_>>();
+                match self.row_in_place_of(&MonitorTarget::Tick(anchor), &ticks) {
+                    Some(MonitorTarget::Tick(instance)) => Some(instance),
+                    _ => None,
+                }
+            };
+        }
         if self.selected().is_none()
             && self.selected_task().is_none()
             && !self.is_more_selected()
@@ -1130,11 +1146,7 @@ impl Monitor {
     /// row above it that stayed, else the first, else the last when nothing follows. Says whether
     /// it selected one.
     fn select_in_place_of_left_row(&mut self) -> bool {
-        let Some(left) = self.selected.as_ref().and_then(|selected| {
-            self.reconciled_order
-                .iter()
-                .position(|target| target == selected)
-        }) else {
+        let Some(selected) = self.selected.clone() else {
             return false;
         };
         let order = if self.expanded_tasks {
@@ -1145,12 +1157,7 @@ impl Monitor {
         } else {
             self.targets_in_order(self.listed_ticks(), self.preview_count())
         };
-        let place = self.reconciled_order[..left]
-            .iter()
-            .rev()
-            .find_map(|stayed| order.iter().position(|target| target == stayed))
-            .map_or(0, |above| above + 1);
-        let Some(target) = order.get(place).or(order.last()).cloned() else {
+        let Some(target) = self.row_in_place_of(&selected, &order) else {
             return false;
         };
         match target {
@@ -1158,6 +1165,25 @@ impl Monitor {
             target => self.selected = Some(target),
         }
         true
+    }
+    /// The row of `order` now in the place of `left`, a row of the last reconciliation that left
+    /// since: the one after the nearest row above it that stayed, else the first, else the last
+    /// when nothing follows.
+    fn row_in_place_of(
+        &self,
+        left: &MonitorTarget,
+        order: &[MonitorTarget],
+    ) -> Option<MonitorTarget> {
+        let left = self
+            .reconciled_order
+            .iter()
+            .position(|target| target == left)?;
+        let place = self.reconciled_order[..left]
+            .iter()
+            .rev()
+            .find_map(|stayed| order.iter().position(|target| target == stayed))
+            .map_or(0, |above| above + 1);
+        order.get(place).or(order.last()).cloned()
     }
     /// Every Tick row in the list's order, the ones on pages not loaded yet included; the loaded
     /// rows are the listing's first pages.
@@ -4053,6 +4079,46 @@ mod scrolling_tests {
         assert_eq!(selected_instance(&monitor), calendar(251));
         let frame = monitor.frame(24, 12, DisplayProfile::default(), 0);
         assert_eq!(monitor.tick_offset.get(), offset);
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text().contains("Tick 251"))
+        );
+    }
+
+    #[test]
+    fn the_ticks_section_keeps_its_scroll_when_the_row_it_follows_leaves_under_a_task() {
+        let mut monitor = monitor(270);
+        for _ in 0..250 {
+            monitor.move_selection(1);
+        }
+        let task: tickloop_harness::protocol::ScheduledTask =
+            serde_json::from_value(serde_json::json!({
+                "id":"00000000-0000-0000-0000-00000123abcd",
+                "kind":{"type":"recurring", "cron":"* * * * *"},
+                "prompt":"check weather", "creator":"user", "time_zone":"Asia/Shanghai",
+                "created_at_ms":0, "next_fire_at_ms":60000, "scheduled_for_ms":60000,
+                "jitter_ms":0, "skipped":0
+            }))
+            .unwrap();
+        let mut status = (**monitor.chat_status.as_ref().unwrap()).clone();
+        status.scheduled_tasks.push(task.clone());
+        monitor.set_chat_status(Arc::new(status));
+        monitor.select_target(&MonitorTarget::ScheduledTask(task.id));
+        assert!(monitor.selected_task().is_some());
+        monitor.frame(24, 16, DisplayProfile::default(), 0);
+        let offset = monitor.tick_offset.get();
+        assert!(offset > 0, "the Ticks section follows Tick 250");
+
+        remove_rows(&mut monitor, &[250]);
+        let frame = monitor.frame(24, 16, DisplayProfile::default(), 0);
+        assert!(monitor.selected_task().is_some(), "the task stays selected");
+        assert_eq!(
+            monitor.tick_offset.get(),
+            offset,
+            "the row taking its place keeps the section where it was"
+        );
         assert!(
             frame
                 .lines
