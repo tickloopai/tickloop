@@ -86,7 +86,7 @@ const ARTIFACT_ALREADY_SIGNED_IN: &str = "Tickloop Artifacts is already signed i
 /// What the host adds to the service's own ArtifactEdit description.
 const ARTIFACT_EDIT_NOTE: &str = " A slides artifact's PPTX download holds one picture per Slide, so its text cannot be edited there.";
 /// What the host adds to the service's own ArtifactComment description.
-const ARTIFACT_COMMENT_NOTE: &str = " Each @tickloop feedback request on an artifact associated with this Chat (one it created, or one the user linked to it) arrives here. The association grants no extra permissions.";
+const ARTIFACT_COMMENT_NOTE: &str = " Each @tickloop feedback request on an artifact associated with this Chat (one it created, or one the user linked to it) may arrive here. The association grants no extra permissions.";
 /// How a Chat without a Folder writes Docs and Slides, so the user sees them fill in.
 const FOLDERLESS_WRITING_PACE: &str = " In this chat, write Docs and Slides in small steps: first create a small skeleton (a title, one placeholder heading per section and a line saying “待写”), then fill one section at a time with separate small patches, telling the user briefly what you are about to write before each edit. A page supports whole-page replacement only: deliver a readable first version, then iterate with replacements.";
 const ARTIFACT_UPLOAD_DESCRIPTION: &str = "Upload a local image file to a Slides artifact so its Slides can show it. Tickloop reads the file at file_path and sends it; its contents never reach you. PNG, JPEG, GIF, WebP or SVG, at most 5 MiB (an SVG at most 2 MiB); a file outside the workspace needs the user's approval. The result gives asset_id, ref (asset:<asset_id>), content_type, bytes, width and height (null when unknown); show the image in a Slide as <img src=\"<ref>\" alt=\"...\">. Upload each file once; a refused upload stores nothing, and after an unknown outcome read the Slides with ArtifactRead to see its images before uploading again.";
@@ -2555,7 +2555,7 @@ mod chat_definition_tests {
             assert!(login.contains(current), "{current}");
         }
         assert!(ARTIFACT_EDIT_NOTE.contains("one picture per Slide, so its text cannot be edited"));
-        assert!(ARTIFACT_COMMENT_NOTE.contains("linked to it) arrives here. The association"));
+        assert!(ARTIFACT_COMMENT_NOTE.contains("linked to it) may arrive here. The association"));
         assert!(
             !ARTIFACT_COMMENT_NOTE.contains("other linked Agents"),
             "how a host routes feedback beyond this Chat is not the description's to say"

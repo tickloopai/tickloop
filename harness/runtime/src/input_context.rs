@@ -32,6 +32,7 @@ pub(super) fn restored_contexts_are_valid(contexts: &[InputContext]) -> bool {
                 text.content.len() <= MAX_RESTORED_CONTEXT_BYTES
             }
             InputContext::Image(image) => image.image.data.len() <= MAX_BASE64_BYTES,
+            InputContext::Later(_) => false,
         };
         let is_unique = match context {
             InputContext::Image(ImageContext {

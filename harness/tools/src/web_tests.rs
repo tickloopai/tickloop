@@ -707,7 +707,14 @@ async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
         crate::Tools::folderless(Reach::PublicAddresses).with_search_configuration(None, None);
     assert!(matches!(
         disabled.prepare(&tickloop_ids::IdContext::new(), &workspace, WEB_SEARCH_TOOL_NAME, &input).await,
-        Err(ToolError::Network(message)) if message == web_search::DISABLED_MESSAGE
+        Err(ToolError::Network(message)) if message == web_search::disabled_message(Some("/websearch"))
+    ));
+    let elsewhere = crate::Tools::folderless(Reach::PublicAddresses)
+        .with_search_configuration(None, None)
+        .with_search_settings(None);
+    assert!(matches!(
+        elsewhere.prepare(&tickloop_ids::IdContext::new(), &workspace, WEB_SEARCH_TOOL_NAME, &input).await,
+        Err(ToolError::Network(message)) if message == web_search::disabled_message(None)
     ));
 }
 

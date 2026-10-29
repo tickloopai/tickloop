@@ -31,6 +31,14 @@ pub enum SubagentReport {
         report: String,
         review: Box<crate::ApprovalAssessmentDetails>,
     },
+    /// A status a later version knows: neither waiting for a report nor holding one here.
+    #[serde(untagged)]
+    Later(crate::LaterVariant<SubagentReport>),
+}
+
+impl crate::TaggedRecord for SubagentReport {
+    const TAG: &'static str = "status";
+    const KNOWN: &'static [&'static str] = &["pending", "delivered"];
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

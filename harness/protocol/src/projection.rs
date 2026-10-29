@@ -119,7 +119,7 @@ impl ChatSnapshot {
                         .mcp_servers
                         .retain(|server, _| !mcp_servers.contains(server));
                 }
-                HostNote::Guidance(GuidanceNote::Unknown(_))
+                HostNote::Guidance(GuidanceNote::Later(_))
                 | HostNote::HostTools(_)
                 | HostNote::PlanModeExit
                 | HostNote::ExecutionMode(_)
@@ -320,7 +320,7 @@ pub fn full_summary_message(
 ) -> Message {
     let continuation = match trigger {
         CompactTrigger::Auto => CONTINUE_WITHOUT_QUESTIONS,
-        CompactTrigger::Manual => "",
+        CompactTrigger::Manual | CompactTrigger::Later(_) => "",
     };
     user_text(format!(
         "{FULL_SUMMARY_PREFIX}{}{FULL_SUMMARY_PINNED_STATE}{pinned_state}{continuation}",
@@ -484,6 +484,8 @@ pub fn history_calls_in(
     let mut calls: Vec<HistoryCall> = Vec::new();
     let mut pending: HashMap<String, Vec<usize>> = HashMap::new();
     let mut seen = HashSet::new();
+    // A model request shows the result of a later version's call as text, as it shows the call.
+    let mut later_calls = HashSet::new();
     for (message_index, message) in snapshot
         .messages
         .iter()
@@ -520,6 +522,10 @@ pub fn history_calls_in(
                         result: None,
                     });
                 }
+                Content::Later(_) => {
+                    later_calls.extend(content.later_call_id().map(str::to_owned));
+                }
+                Content::ToolResult { tool_use_id, .. } if later_calls.contains(tool_use_id) => {}
                 Content::ToolResult { tool_use_id, .. } => {
                     if message.role != Role::User {
                         return Err(InvalidConversation(

@@ -208,6 +208,41 @@ pub enum Content {
         width: u32,
         height: u32,
     },
+    /// A block a later version wrote, kept in the Transcript; a request or a view shows
+    /// [`LATER_CONTENT_TEXT`] in its place.
+    #[serde(untagged)]
+    Later(crate::LaterVariant<Content>),
+}
+
+/// What a model request or a view shows in place of content a later version wrote.
+pub const LATER_CONTENT_TEXT: &str = "[Content from a later Tickloop version was omitted here.]";
+
+impl crate::TaggedRecord for Content {
+    const TAG: &'static str = "type";
+    const KNOWN: &'static [&'static str] = &[
+        "text",
+        "tool_use",
+        "tool_result",
+        "thinking",
+        "protocol_data",
+        "image",
+    ];
+
+    /// Protocol data of a protocol only a later version speaks.
+    fn holds_later_value(value: &Value) -> bool {
+        value["type"] == "protocol_data"
+            && crate::names_later_variant::<Protocol>(&value["protocol"])
+    }
+}
+
+impl Content {
+    /// The id a later version's block gives the call it makes, if it makes one.
+    pub fn later_call_id(&self) -> Option<&str> {
+        match self {
+            Self::Later(later) => later.value()["id"].as_str(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -217,6 +252,14 @@ pub enum ImageSource {
         media_type: ImageMediaType,
         data: String,
     },
+    /// A source a later version knows; the image is shown as [`LATER_CONTENT_TEXT`].
+    #[serde(untagged)]
+    Later(crate::LaterVariant<ImageSource>),
+}
+
+impl crate::TaggedRecord for ImageSource {
+    const TAG: &'static str = "type";
+    const KNOWN: &'static [&'static str] = &["base64"];
 }
 
 impl From<Image> for Content {
@@ -233,12 +276,14 @@ impl From<Image> for Content {
 }
 
 impl ImageSource {
-    /// The inline `data:` URL form OpenAI-style protocols take for images.
-    pub fn data_url(&self) -> String {
+    /// The inline `data:` URL form OpenAI-style protocols take for images; none for a source
+    /// only a later version reads.
+    pub fn data_url(&self) -> Option<String> {
         match self {
             Self::Base64 { media_type, data } => {
-                format!("data:{};base64,{data}", media_type.mime_type())
+                Some(format!("data:{};base64,{data}", media_type.mime_type()))
             }
+            Self::Later(_) => None,
         }
     }
 }
@@ -265,6 +310,14 @@ pub enum ToolResultBlock {
         width: u32,
         height: u32,
     },
+    /// A block a later version wrote; a request or a view shows [`LATER_CONTENT_TEXT`].
+    #[serde(untagged)]
+    Later(crate::LaterVariant<ToolResultBlock>),
+}
+
+impl crate::TaggedRecord for ToolResultBlock {
+    const TAG: &'static str = "type";
+    const KNOWN: &'static [&'static str] = &["text", "image"];
 }
 
 impl From<Image> for ToolResultBlock {
@@ -291,6 +344,7 @@ impl ToolResultContent {
                     .iter()
                     .filter_map(|block| match block {
                         ToolResultBlock::Text { text } => Some(text.as_str()),
+                        ToolResultBlock::Later(_) => Some(LATER_CONTENT_TEXT),
                         ToolResultBlock::Image { .. } => None,
                     })
                     .collect::<Vec<_>>()
@@ -320,6 +374,53 @@ impl From<&str> for ToolResultContent {
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
+}
+
+/// `messages` as a model reads them: each block a later version wrote, and each image whose
+/// source only a later version reads, becomes [`LATER_CONTENT_TEXT`], and so does the result of a
+/// call a later block made, so every call still pairs with its result.
+pub fn without_later_content(messages: &mut [Message]) {
+    let later_calls = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(Content::later_call_id)
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+    let placeholder = || Content::Text {
+        text: LATER_CONTENT_TEXT.into(),
+    };
+    for block in messages.iter_mut().flat_map(|message| &mut message.content) {
+        match block {
+            Content::Later(_)
+            | Content::Image {
+                source: ImageSource::Later(_),
+                ..
+            } => *block = placeholder(),
+            Content::ToolResult { tool_use_id, .. } if later_calls.contains(tool_use_id) => {
+                *block = placeholder();
+            }
+            Content::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } => {
+                for result_block in blocks {
+                    if matches!(
+                        result_block,
+                        ToolResultBlock::Later(_)
+                            | ToolResultBlock::Image {
+                                source: ImageSource::Later(_),
+                                ..
+                            }
+                    ) {
+                        *result_block = ToolResultBlock::Text {
+                            text: LATER_CONTENT_TEXT.into(),
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

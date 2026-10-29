@@ -245,7 +245,7 @@ fn change_text(
     let artifact_lines = linked.chain(unlinked).collect::<Vec<_>>();
     if !artifact_lines.is_empty() {
         lines.push(format!(
-            "Host notice: {ARTIFACTS_HEADING} changed; each @tickloop feedback request on a linked artifact arrives here:"
+            "Host notice: {ARTIFACTS_HEADING} changed; each @tickloop feedback request on a linked artifact may arrive here:"
         ));
         lines.extend(artifact_lines);
     }
@@ -373,7 +373,7 @@ mod tests {
         let after = with(&[("artifact:a", "Plan"), ("artifact:c", "Deck")]);
         assert_eq!(
             change_text(&before, &after, &ids).unwrap(),
-            "Host notice: Artifacts linked to this Chat changed; each @tickloop feedback request on a linked artifact arrives here:\n- Linked: \"Deck\" (https://docs.example/a), artifact:c\n- Unlinked: \"Notes\" (https://docs.example/a), artifact:b"
+            "Host notice: Artifacts linked to this Chat changed; each @tickloop feedback request on a linked artifact may arrive here:\n- Linked: \"Deck\" (https://docs.example/a), artifact:c\n- Unlinked: \"Notes\" (https://docs.example/a), artifact:b"
         );
     }
 

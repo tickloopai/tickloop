@@ -67,9 +67,13 @@ pub(super) fn remind(chat: &mut Chat, receipt: &Receipt) -> bool {
     true
 }
 
+/// What the caller learns of a finished child's run. A run that owed a report, in any status,
+/// never hands over its unreviewed text.
 pub(super) fn completion_text(snapshot: &ChatSnapshot, run: Uuid) -> String {
     match snapshot.subagent_reports.get(&tickloop_ids::Id::from(run)) {
-        Some(SubagentReport::Pending { .. }) => SUBAGENT_MISSING_REPORT.into(),
+        Some(SubagentReport::Pending { .. } | SubagentReport::Later(_)) => {
+            SUBAGENT_MISSING_REPORT.into()
+        }
         Some(SubagentReport::Delivered { .. }) => SUBAGENT_REPORT_RECEIPT.into(),
         None => snapshot.run_response_text(run.into()).unwrap_or_default(),
     }
@@ -220,5 +224,30 @@ impl Agent {
         self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
             .await?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report status only a later version knows still owes a report: the caller never gets the
+    /// run's unreviewed text.
+    #[test]
+    fn a_later_report_status_never_hands_over_unreviewed_text() {
+        let run = Uuid::from_u128(7);
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(1),
+            "chat_loop": {"id": Uuid::from_u128(2), "state": "Idle"},
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "PRIVATE-UNSENT-TEXT"}]}],
+            "message_runs": {"0": run},
+        }))
+        .unwrap();
+        assert_eq!(completion_text(&snapshot, run), "PRIVATE-UNSENT-TEXT");
+        snapshot.subagent_reports.insert(
+            run.into(),
+            serde_json::from_value(serde_json::json!({"status": "later_status"})).unwrap(),
+        );
+        assert_eq!(completion_text(&snapshot, run), SUBAGENT_MISSING_REPORT);
     }
 }

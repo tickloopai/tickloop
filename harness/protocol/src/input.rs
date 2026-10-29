@@ -11,6 +11,14 @@ pub enum InputContext {
     File(TextContext),
     Directory(TextContext),
     Image(ImageContext),
+    /// Context a later version attached; the model is told it was left out.
+    #[serde(untagged)]
+    Later(crate::LaterVariant<InputContext>),
+}
+
+impl crate::TaggedRecord for InputContext {
+    const TAG: &'static str = "kind";
+    const KNOWN: &'static [&'static str] = &["file", "directory", "image"];
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -29,8 +37,20 @@ pub struct ImageContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageOrigin {
-    Pasted { id: u32 },
-    Mentioned { path: PathBuf },
+    Pasted {
+        id: u32,
+    },
+    Mentioned {
+        path: PathBuf,
+    },
+    /// An origin a later version knows.
+    #[serde(untagged)]
+    Later(crate::LaterVariant<ImageOrigin>),
+}
+
+impl crate::TaggedRecord for ImageOrigin {
+    const TAG: &'static str = "type";
+    const KNOWN: &'static [&'static str] = &["pasted", "mentioned"];
 }
 
 impl InputContext {
@@ -39,8 +59,9 @@ impl InputContext {
             Self::File(context) | Self::Directory(context) => Some(&context.path),
             Self::Image(context) => match &context.origin {
                 ImageOrigin::Mentioned { path } => Some(path),
-                ImageOrigin::Pasted { .. } => None,
+                ImageOrigin::Pasted { .. } | ImageOrigin::Later(_) => None,
             },
+            Self::Later(_) => None,
         }
     }
 }
@@ -50,6 +71,7 @@ impl ImageOrigin {
         match self {
             Self::Pasted { id } => format!("[Image #{id}]"),
             Self::Mentioned { path } => path.display().to_string(),
+            Self::Later(_) => "[Image]".into(),
         }
     }
 }
@@ -65,6 +87,11 @@ pub fn render_input_context(context: &InputContext) -> Vec<Content> {
                 },
                 image.image.clone().into(),
             ];
+        }
+        InputContext::Later(_) => {
+            return vec![Content::Text {
+                text: crate::LATER_CONTENT_TEXT.into(),
+            }];
         }
     };
     let value = serde_json::json!({

@@ -819,6 +819,7 @@ fn message_text(content: &[Content]) -> String {
         .iter()
         .filter_map(|content| match content {
             Content::Text { text } => Some(text.as_str()),
+            Content::Later(_) => Some(tickloop_harness_protocol::LATER_CONTENT_TEXT),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -881,6 +882,9 @@ fn add_answer_content(node: &mut DisplayNode, entry: &ChainEntry) {
             Content::Text { text } if is_model_output => {
                 node.blocks.push(DisplayBlock::Text { text: text.clone() });
             }
+            Content::Later(_) if is_model_output => node.blocks.push(DisplayBlock::Text {
+                text: tickloop_harness_protocol::LATER_CONTENT_TEXT.into(),
+            }),
             Content::Thinking { thinking, .. } if is_model_output => add_thinking(node, thinking),
             Content::ProtocolData {
                 protocol: Protocol::Responses,
@@ -1092,6 +1096,51 @@ mod tests {
             ]
         );
         assert!(!serde_json::to_string(&node).unwrap().contains("opaque"));
+    }
+
+    /// Content a later version wrote shows as a placeholder in an answer and in a prompt.
+    #[test]
+    fn later_content_shows_as_a_placeholder() {
+        let later: Content =
+            serde_json::from_value(serde_json::json!({"type": "later_block", "x": 1})).unwrap();
+        let mut node = DisplayNode {
+            id: Uuid::new_v4(),
+            parent: None,
+            kind: DisplayKind::Answer {
+                input_id: None,
+                attempt: 1,
+            },
+            blocks: Vec::new(),
+            status: DisplayStatus::Streaming,
+            timestamp: String::new(),
+        };
+        let reply = entry(
+            Uuid::new_v4(),
+            None,
+            Role::Assistant,
+            vec![
+                Content::Text {
+                    text: "Done.".into(),
+                },
+                later.clone(),
+            ],
+        );
+        add_answer_content(&mut node, &reply);
+        assert_eq!(
+            node.blocks[1],
+            DisplayBlock::Text {
+                text: tickloop_harness_protocol::LATER_CONTENT_TEXT.into()
+            }
+        );
+        assert_eq!(
+            message_text(&[
+                Content::Text {
+                    text: "Look".into()
+                },
+                later
+            ]),
+            format!("Look\n{}", tickloop_harness_protocol::LATER_CONTENT_TEXT)
+        );
     }
 
     /// A compaction's copy of an answer entry only aliases it, while a fragment appended to the

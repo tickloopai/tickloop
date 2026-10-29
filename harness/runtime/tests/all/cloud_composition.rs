@@ -1103,45 +1103,60 @@ async fn a_search_results_urls_may_be_fetched() {
     agent.shutdown().await;
 }
 
-/// WebSearch stays listed while search is off, and a call is told what the host says of turning
-/// it on rather than a command the host may not have.
+/// WebSearch stays listed while search is off, and a call names where this host's user turns it
+/// on, or no place on a host that has none, rather than the terminal's command.
 #[tokio::test]
-async fn a_search_call_while_search_is_off_hears_the_hosts_own_words() {
-    const HOST_WORDS: &str = "Web search is off for this workspace; an administrator can turn it on. Do not work around it.";
-    let model = Arc::new(RoutedModel::new(|request| {
-        if request.tools.is_empty() {
-            return text("Read.");
-        }
-        if !has_tool_result(request, "fetch-0") {
-            return call("fetch-0", "WebSearch", json!({"query": "delivery"}));
-        }
-        text("Done.")
-    }));
-    let agent = cloud_harness(
-        Arc::new(InMemoryTranscriptStore::new()),
-        model.clone(),
-        HarnessOptions {
-            tools: ToolPolicy {
-                web_search: true,
-                ..ToolPolicy::durable_chat()
+async fn a_search_call_while_search_is_off_names_only_the_hosts_own_settings() {
+    for (settings, expected) in [
+        (
+            Some("the workspace search settings"),
+            "explain that it is off and that they can turn it on with the workspace search settings. Do not",
+        ),
+        (None, "explain that it is off. Do not"),
+    ] {
+        let model = Arc::new(RoutedModel::new(|request| {
+            if request.tools.is_empty() {
+                return text("Read.");
+            }
+            if !has_tool_result(request, "fetch-0") {
+                return call("fetch-0", "WebSearch", json!({"query": "delivery"}));
+            }
+            text("Done.")
+        }));
+        let agent = cloud_harness(
+            Arc::new(InMemoryTranscriptStore::new()),
+            model.clone(),
+            HarnessOptions {
+                tools: ToolPolicy {
+                    web_search: true,
+                    ..ToolPolicy::durable_chat()
+                },
+                web_search_settings: settings.map(str::to_owned),
+                ..cloud_options(durable_chat_host_rules())
             },
-            web_search_disabled_message: HOST_WORDS.into(),
-            ..cloud_options(durable_chat_host_rules())
-        },
-    );
-    let chat = agent.create_chat_without_folder().await.unwrap();
-    agent.set_search(chat, None).await.unwrap();
-    let results = run_fetches(&agent, chat, "Search for the delivery page.", 1).await;
-    assert_eq!(results, [(HOST_WORDS.to_owned(), true)]);
-    let requests = model.requests.lock().unwrap().clone();
-    assert!(
-        requests[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "WebSearch"),
-        "WebSearch stays listed"
-    );
-    agent.shutdown().await;
+        );
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        agent.set_search(chat, None).await.unwrap();
+        let results = run_fetches(&agent, chat, "Search for the delivery page.", 1).await;
+        assert_eq!(
+            results,
+            [(
+                tickloop_harness_tools::web_search::disabled_message(settings),
+                true
+            )]
+        );
+        assert!(results[0].0.contains(expected), "{}", results[0].0);
+        let requests = model.requests.lock().unwrap().clone();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "WebSearch"),
+            "WebSearch stays listed"
+        );
+        assert!(!format!("{requests:?}").contains("/websearch"));
+        agent.shutdown().await;
+    }
 }
 
 /// Nobody is asked to approve a call on a host that denies whatever would prompt, and its system
@@ -1733,7 +1748,7 @@ async fn a_chat_with_a_later_versions_guidance_kind_still_loads_and_continues() 
         .collect::<Vec<_>>();
     assert!(later_version.iter().any(|line| matches!(
         line.chain_entry().and_then(|entry| entry.guidance.as_ref()),
-        Some(tickloop_harness_protocol::GuidanceNote::Unknown(unknown)) if unknown.kind == "later_kind"
+        Some(tickloop_harness_protocol::GuidanceNote::Later(later)) if later.tag() == "later_kind"
     )));
     let store_of_later_version = Arc::new(InMemoryTranscriptStore::new());
     store_of_later_version.seed(chat, later_version, store.position(chat).unwrap());
@@ -1748,7 +1763,7 @@ async fn a_chat_with_a_later_versions_guidance_kind_still_loads_and_continues() 
     assert!(reloaded.host_notes.values().any(|note| matches!(
         note,
         tickloop_harness_protocol::HostNote::Guidance(
-            tickloop_harness_protocol::GuidanceNote::Unknown(_)
+            tickloop_harness_protocol::GuidanceNote::Later(_)
         )
     )));
     assert!(reloaded.visible_guidance().mcp_servers.is_empty());
@@ -1769,4 +1784,156 @@ async fn a_chat_with_a_later_versions_guidance_kind_still_loads_and_continues() 
                     == json!({"kind": "later_kind", "servers": {"docs": "sha256:01"}})
             })
     }));
+}
+
+/// The Chat's Lines with `change` applied to the JSON of each chain entry, as a later version
+/// might have written them.
+fn as_written_later(
+    store: &InMemoryTranscriptStore,
+    chat: ChatId,
+    mut change: impl FnMut(&mut serde_json::Map<String, Value>),
+) -> Arc<InMemoryTranscriptStore> {
+    let lines = store
+        .lines(chat)
+        .into_iter()
+        .map(|line| {
+            let mut value = serde_json::to_value(&line).unwrap();
+            if line.chain_entry().is_some() {
+                change(value.as_object_mut().unwrap());
+            }
+            serde_json::from_value::<Line>(value).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let later = Arc::new(InMemoryTranscriptStore::new());
+    later.seed(chat, lines, store.position(chat).unwrap());
+    later
+}
+
+/// Content a later version wrote stays in the Transcript as written, and a request shows a
+/// placeholder in its place, keeping each call paired with its result.
+#[tokio::test]
+async fn later_content_reaches_the_model_as_a_placeholder_and_stays_in_the_transcript() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+    let later_block = json!({"type": "later_block", "detail": {"x": 1}});
+    let later_result = json!({"type": "later_result_block"});
+    let later = as_written_later(&store, chat, |entry| {
+        let role = entry["message"]["role"].as_str().unwrap().to_owned();
+        let content = entry["message"]["content"].as_array_mut().unwrap();
+        if role == "user" && content.iter().any(|block| block["text"] == "One.") {
+            content.push(later_block.clone());
+        }
+        if role == "assistant" && content.iter().any(|block| block["text"] == "Done.") {
+            content.push(later_result.clone());
+        }
+    });
+    let (_, reloaded) =
+        turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+    assert!(reloaded.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::Later(_)))
+    }));
+    let last = model.requests.lock().unwrap().last().cloned().unwrap();
+    let history = format!("{:?}", last.messages);
+    assert_eq!(
+        history
+            .matches(tickloop_harness_protocol::LATER_CONTENT_TEXT)
+            .count(),
+        2,
+        "{history}"
+    );
+    assert!(!history.contains("later_block") && !history.contains("later_result_block"));
+    let written = later
+        .lines(chat)
+        .iter()
+        .map(|line| serde_json::to_value(line).unwrap().to_string())
+        .collect::<String>();
+    assert!(written.contains(&later_block.to_string()));
+    assert!(written.contains(&later_result.to_string()));
+}
+
+/// A Skill from a source only a later version knows stays recorded but never guides again, while
+/// one from a known source is restored as before.
+#[tokio::test]
+async fn a_skill_from_a_later_source_is_never_invoked_again() {
+    for (source, guides) in [
+        (
+            json!({"kind": "user", "path": "/skills/deploy/SKILL.md"}),
+            true,
+        ),
+        (
+            json!({"kind": "later_source", "registry": "skills.example"}),
+            false,
+        ),
+    ] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+        let (chat, _) =
+            turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+        let skill = json!([{"name": "deploy", "content": "DEPLOY SKILL STEPS", "source": source}]);
+        let later = as_written_later(&store, chat, |entry| {
+            entry.insert("invokedSkills".into(), skill.clone());
+        });
+        let (_, reloaded) =
+            turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+        assert_eq!(reloaded.invoked_skills.len(), 1, "the record stays");
+        let last = model.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            format!("{:?}", last.messages).contains("DEPLOY SKILL STEPS"),
+            guides,
+            "{source}"
+        );
+        let last_entry = later
+            .lines(chat)
+            .into_iter()
+            .rev()
+            .find_map(|line| line.chain_entry().cloned())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&last_entry.invoked_skills).unwrap(),
+            skill,
+            "written back as recorded"
+        );
+    }
+}
+
+/// An answer whose model or private history source a later version recorded with values this
+/// version does not know loads and continues, and its entry keeps them as written.
+#[tokio::test]
+async fn an_answer_with_a_later_model_provenance_loads_and_keeps_it() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+    let later_model = json!({
+        "profile": "later", "protocol": "later_protocol", "requested_model": "m", "provider": "api",
+    });
+    let later_source = json!({
+        "provider_id": "p", "endpoint_fingerprint": "f", "adapter": "later_adapter",
+        "service_model_id": "m", "auth_source": "api_key_env", "credential_reference": "",
+    });
+    let later = as_written_later(&store, chat, |entry| {
+        if entry["message"]["role"] == "assistant" {
+            entry.insert("model".into(), later_model.clone());
+            entry.insert("privateSource".into(), later_source.clone());
+        }
+    });
+    let (_, reloaded) =
+        turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+    let first_answer = reloaded
+        .messages
+        .iter()
+        .position(|message| message.role == Role::Assistant)
+        .unwrap();
+    assert!(!reloaded.message_models.contains_key(&first_answer));
+    assert!(!reloaded.message_sources.contains_key(&first_answer));
+    let written = later
+        .lines(chat)
+        .iter()
+        .map(|line| serde_json::to_value(line).unwrap())
+        .filter(|line| line["model"] == later_model && line["privateSource"] == later_source)
+        .count();
+    assert!(written >= 1);
 }

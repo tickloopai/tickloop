@@ -489,8 +489,9 @@ pub(super) fn announce_guidance_notes(
 }
 
 /// The invoked Skills whose guidance applies to the active run. A remote Skill guides only while
-/// its source stays current, and a built-in Skill only the user invokes, such as /slides, guides
-/// only the run its invocation started.
+/// its source stays current, a built-in Skill only the user invokes, such as /slides, guides
+/// only the run its invocation started, and a Skill from a source only a later version knows
+/// guides no longer.
 fn guiding_skills(chat: &Chat) -> Vec<InvokedSkill> {
     chat.snapshot
         .invoked_skills
@@ -499,6 +500,7 @@ fn guiding_skills(chat: &Chat) -> Vec<InvokedSkill> {
             SkillSource::Remote { .. } => invoked.run_id == chat.active_run,
             SkillSource::BuiltIn if invoked.name == "artifact-draft" => false,
             SkillSource::BuiltIn => invoked.run_id.is_none() || invoked.run_id == chat.active_run,
+            SkillSource::Later(_) => false,
             _ => true,
         })
         .cloned()

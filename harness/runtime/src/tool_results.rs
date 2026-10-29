@@ -71,7 +71,8 @@ impl Agent {
                     snapshot.search_config.clone(),
                     self.inner.config_root.clone(),
                 )
-                .with_search_provider_factory(self.inner.search_provider_factory.clone()),
+                .with_search_provider_factory(self.inner.search_provider_factory.clone())
+                .with_search_settings(self.inner.web_search_settings.clone()),
         )
     }
 
@@ -135,7 +136,8 @@ impl Agent {
                 snapshot.search_config.clone(),
                 self.inner.config_root.clone(),
             )
-            .with_search_provider_factory(self.inner.search_provider_factory.clone()),
+            .with_search_provider_factory(self.inner.search_provider_factory.clone())
+            .with_search_settings(self.inner.web_search_settings.clone()),
         )
     }
 

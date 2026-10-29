@@ -103,7 +103,7 @@ fn mentioned_image_path(context: &InputContext) -> Option<&Path> {
     match context {
         InputContext::Image(image) => match &image.origin {
             ImageOrigin::Mentioned { path } => Some(path),
-            ImageOrigin::Pasted { .. } => None,
+            ImageOrigin::Pasted { .. } | ImageOrigin::Later(_) => None,
         },
         _ => None,
     }

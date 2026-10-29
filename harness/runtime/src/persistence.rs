@@ -45,8 +45,8 @@ use tickloop_harness_transcript::{
     CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
     CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
     FileHistorySnapshotEntry, ForkedFrom, LOOP_SUBTYPE, LastPromptEntry, Line, LoopRecord,
-    MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, SentAgentMessagesEntry,
-    SubagentsEntry, SummarizeMetadataEntry,
+    MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, Recorded,
+    SentAgentMessagesEntry, SubagentsEntry, SummarizeMetadataEntry,
 };
 
 /// Following Claude Code's `NO_RESPONSE_REQUESTED`: the assistant sentinel appended when the
@@ -1446,6 +1446,7 @@ fn chain_entry(
 ) -> ChainEntry {
     let is_assistant = message.role == Role::Assistant;
     let is_user = message.role == Role::User;
+    let later_provenance = bookkeeping.later_provenance.get(&index);
     let run_id = snapshot.message_runs.get(&index).copied();
     let tool_call_recoveries = snapshot
         .tool_call_recoveries
@@ -1551,9 +1552,21 @@ fn chain_entry(
         is_visible_in_transcript_only: summarize_metadata.is_some_and(Option::is_none),
         usage: snapshot.message_usage.get(&index).cloned(),
         model: is_assistant
-            .then(|| snapshot.message_models.get(&index).cloned())
+            .then(|| {
+                snapshot
+                    .message_models
+                    .get(&index)
+                    .cloned()
+                    .map(Recorded::Known)
+                    .or_else(|| later_provenance.and_then(|later| later.model.clone()))
+            })
             .flatten(),
-        private_source: snapshot.message_sources.get(&index).cloned(),
+        private_source: snapshot
+            .message_sources
+            .get(&index)
+            .cloned()
+            .map(Recorded::Known)
+            .or_else(|| later_provenance.and_then(|later| later.private_source.clone())),
         loop_id: snapshot
             .message_runs
             .contains_key(&index)
@@ -1712,9 +1725,10 @@ fn compact_metadata_entry(
 ) -> CompactMetadata {
     CompactMetadata {
         display_leaf,
-        trigger: match boundary.trigger {
+        trigger: match &boundary.trigger {
             CompactTrigger::Manual => CompactTriggerEntry::Manual,
             CompactTrigger::Auto => CompactTriggerEntry::Auto,
+            CompactTrigger::Later(trigger) => CompactTriggerEntry::Later(trigger.clone()),
         },
         pre_tokens: boundary.pre_tokens,
         user_context: boundary.user_context.clone(),
@@ -1731,9 +1745,10 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
         .filter(|_| entry.is_compact_boundary())
     {
         return Some(CompactionMarker::Boundary(CompactBoundary {
-            trigger: match metadata.trigger {
+            trigger: match &metadata.trigger {
                 CompactTriggerEntry::Manual => CompactTrigger::Manual,
                 CompactTriggerEntry::Auto => CompactTrigger::Auto,
+                CompactTriggerEntry::Later(trigger) => CompactTrigger::Later(trigger.clone()),
             },
             pre_tokens: metadata.pre_tokens,
             user_context: metadata.user_context.clone(),
@@ -1746,18 +1761,19 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
             model: None,
         }));
     }
+    // A summary whose direction only a later version knows reads as one that kept nothing.
     entry.is_compact_summary.then(|| CompactionMarker::Summary {
-        summarize_metadata: entry
-            .summarize_metadata
-            .as_ref()
-            .map(|metadata| SummarizeMetadata {
+        summarize_metadata: entry.summarize_metadata.as_ref().and_then(|metadata| {
+            Some(SummarizeMetadata {
                 messages_summarized: metadata.messages_summarized,
                 user_context: metadata.user_context.clone(),
                 direction: match metadata.direction {
                     PartialCompactDirection::From => SummaryDirection::FromHere,
                     PartialCompactDirection::UpTo => SummaryDirection::UpToHere,
+                    PartialCompactDirection::Later(_) => return None,
                 },
-            }),
+            })
+        }),
     })
 }
 
@@ -1821,6 +1837,7 @@ struct RestoredChain {
     inherited_prompts: HashSet<usize>,
     host_notes: BTreeMap<usize, HostNote>,
     loop_state_views: BTreeMap<usize, serde_json::Value>,
+    later_provenance: BTreeMap<usize, LaterProvenance>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
@@ -1838,6 +1855,16 @@ struct RestoredChain {
     /// it (a new slug switched to on resume is written on later entries); when none is valid, keep
     /// the first one, and rebuilding the plan warns and switches to a new slug.
     plan_slug: Option<String>,
+}
+
+/// The model and private history source a later version recorded for an assistant message with
+/// values this version does not know.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LaterProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<Recorded<tickloop_harness_protocol::ModelIdentity>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_source: Option<Recorded<PrivateHistorySource>>,
 }
 
 /// Restores chain entries into messages and preserves user prompts with execution modes as rewind
@@ -1859,6 +1886,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         inherited_prompts: HashSet::new(),
         host_notes: BTreeMap::new(),
         loop_state_views: BTreeMap::new(),
+        later_provenance: BTreeMap::new(),
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
@@ -1937,12 +1965,16 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         }
         let index = restored.messages.len();
         restored.message_ids.insert(index, entry.uuid);
-        if let Some(model) = entry
+        let mut later = LaterProvenance::default();
+        match entry
             .model
             .clone()
             .filter(|_| entry.message.role == Role::Assistant)
         {
-            restored.message_models.insert(index, model);
+            Some(Recorded::Known(model)) => {
+                restored.message_models.insert(index, model);
+            }
+            later_model => later.model = later_model,
         }
         if let Some(run_id) = entry.run_id {
             restored.message_runs.insert(index, run_id.into());
@@ -2016,12 +2048,19 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         {
             restored.message_usage.insert(index, usage);
         }
-        if let Some(source) = entry
+        // Private history whose source only a later version knows is never sent to a model.
+        match entry
             .private_source
             .clone()
             .filter(|_| entry.message.role == Role::Assistant)
         {
-            restored.message_sources.insert(index, source);
+            Some(Recorded::Known(source)) => {
+                restored.message_sources.insert(index, source);
+            }
+            later_source => later.private_source = later_source,
+        }
+        if later.model.is_some() || later.private_source.is_some() {
+            restored.later_provenance.insert(index, later);
         }
         let execution_mode = entry.execution_mode.as_ref().map(|value| {
             let (mode, warning) = restored_execution_mode(value);
@@ -2130,6 +2169,7 @@ impl RestoredChain {
             inherited_prompts: HashSet::new(),
             host_notes: BTreeMap::new(),
             loop_state_views: BTreeMap::new(),
+            later_provenance: BTreeMap::new(),
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
@@ -2199,6 +2239,9 @@ impl RestoredChain {
             }
             if let Some(source) = self.message_sources.get(&original) {
                 kept.message_sources.insert(index, source.clone());
+            }
+            if let Some(later) = self.later_provenance.get(&original) {
+                kept.later_provenance.insert(index, later.clone());
             }
             for uuid in &self.links[original].uuids {
                 kept.message_of_entry.insert(*uuid, index);
@@ -2501,6 +2544,7 @@ impl RestoredChain {
         snapshot.message_compactions = self.message_compactions.clone();
         snapshot.host_notes = self.host_notes.clone();
         bookkeeping.loop_state_views = self.loop_state_views.clone();
+        bookkeeping.later_provenance = self.later_provenance.clone();
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         bookkeeping.plan_slug = self.plan_slug.clone();
         self.replay_loop(snapshot);

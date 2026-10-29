@@ -167,6 +167,9 @@ pub(super) fn function_call_output(content: ToolResultContent) -> Value {
                 .into_iter()
                 .map(|block| match block {
                     ToolResultBlock::Text { text } => json!({"type":"input_text","text":text}),
+                    ToolResultBlock::Later(_) => {
+                        json!({"type":"input_text","text":tickloop_harness_protocol::LATER_CONTENT_TEXT})
+                    }
                     ToolResultBlock::Image { source, .. } => {
                         json!({"type":"input_image","image_url":source.data_url()})
                     }

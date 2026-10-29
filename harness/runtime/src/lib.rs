@@ -389,8 +389,8 @@ struct Inner {
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
-    /// What a WebSearch call is told while the Chat's search is off.
-    web_search_disabled_message: String,
+    /// Where the user changes web search settings, which WebSearch names when search cannot run.
+    web_search_settings: Option<String>,
     /// The permits each request to a model's vendor takes, in order.
     request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
@@ -439,6 +439,10 @@ struct ChatBookkeeping {
     /// records for a load to restore.
     #[serde(default)]
     loop_state_views: BTreeMap<usize, serde_json::Value>,
+    /// The model and private history source of each assistant message that a later version
+    /// recorded with values this version does not know, kept as written for its entry.
+    #[serde(default)]
+    later_provenance: BTreeMap<usize, persistence::LaterProvenance>,
     /// Project partition (normalized working directory) owning each persistent rule in the rule
     /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
@@ -2096,7 +2100,7 @@ impl Agent {
             scheduled_task_expiry,
             scheduled_task_min_interval,
             trust_model_scheduled_tasks,
-            web_search_disabled_message,
+            web_search_settings,
         } = options;
         let model = tickloop_harness_model::cards::model_for_persistent_selection(model);
         let config_root = local_state_root;
@@ -2161,7 +2165,7 @@ impl Agent {
                 citation_style,
                 host_rules,
                 system_prompt_addition,
-                web_search_disabled_message,
+                web_search_settings,
                 request_gates,
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(

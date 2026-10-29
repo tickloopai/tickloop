@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ChatSnapshot, Content, ImageSource, Message, ModelConfig, ModelRequestKind, Protocol,
-    RequestOutcome, RequestUsageLedger, Role, ToolDefinition, ToolResultBlock, ToolResultContent,
-    Usage,
+    ChatSnapshot, Content, ImageSource, LATER_CONTENT_TEXT, Message, ModelConfig, ModelRequestKind,
+    Protocol, RequestOutcome, RequestUsageLedger, Role, ToolDefinition, ToolResultBlock,
+    ToolResultContent, Usage,
 };
 
 pub const ESTIMATED_CONTEXT_BYTES_PER_TOKEN: usize = 2;
@@ -76,6 +76,7 @@ pub fn message_content_tokens<C: ContextTokenCounter + ?Sized>(
                         ToolResultBlock::Image { width, height, .. } => {
                             estimated_image_tokens(*width, *height)
                         }
+                        ToolResultBlock::Later(_) => counter.text_tokens(LATER_CONTENT_TEXT),
                     })
                     .sum(),
             },
@@ -84,6 +85,7 @@ pub fn message_content_tokens<C: ContextTokenCounter + ?Sized>(
                 counter.protocol_data_tokens(*protocol, value)
             }
             Content::Image { width, height, .. } => estimated_image_tokens(*width, *height),
+            Content::Later(_) => counter.text_tokens(LATER_CONTENT_TEXT),
         })
         .sum::<usize>();
     content + MESSAGE_FRAMING_TOKENS
@@ -363,7 +365,9 @@ pub fn serialized_context_bytes(messages: &[Message], tools: &[ToolDefinition]) 
                         width,
                         height,
                     } => Some((data.len(), *width, *height)),
-                    ToolResultBlock::Text { .. } => None,
+                    ToolResultBlock::Image { .. }
+                    | ToolResultBlock::Text { .. }
+                    | ToolResultBlock::Later(_) => None,
                 })
                 .collect(),
             _ => Vec::new(),

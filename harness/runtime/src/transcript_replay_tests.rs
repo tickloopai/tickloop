@@ -181,7 +181,12 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
         let (restored, warnings) = super::restore_chain(&loaded.chain);
         assert!(warnings.is_empty());
         assert_eq!(
-            entry.model.as_ref().unwrap().requested_model,
+            entry
+                .model
+                .as_ref()
+                .and_then(tickloop_harness_transcript::Recorded::known)
+                .unwrap()
+                .requested_model,
             llm_config.model
         );
         let mut snapshot =

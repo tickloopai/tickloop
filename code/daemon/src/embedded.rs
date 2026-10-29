@@ -1773,7 +1773,7 @@ impl EmbeddedAgentAccess {
             let result = tokio::select! {
                 biased;
                 () = sender.closed() => return,
-                result = tickloop_harness::tools::web_search::test_connection(&config, root.as_deref(), cancel.clone()) => result,
+                result = tickloop_harness::tools::web_search::test_connection(&config, root.as_deref(), Some(tickloop_harness::tools::web_search::DEFAULT_SEARCH_SETTINGS), cancel.clone()) => result,
             };
             let _ = sender
                 .send(ObservationUpdate {

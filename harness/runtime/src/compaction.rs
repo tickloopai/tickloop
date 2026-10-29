@@ -91,6 +91,7 @@ impl CompactionLayout {
         compacted.message_contexts = BTreeMap::new();
         compacted_bookkeeping.denial_references = BTreeMap::new();
         compacted_bookkeeping.loop_state_views = BTreeMap::new();
+        compacted_bookkeeping.later_provenance = BTreeMap::new();
         compacted_bookkeeping.message_responses = BTreeMap::new();
         compacted_bookkeeping
             .lifecycle
@@ -128,6 +129,11 @@ impl CompactionLayout {
                         compacted_bookkeeping
                             .loop_state_views
                             .insert(index, view.clone());
+                    }
+                    if let Some(later) = bookkeeping.later_provenance.get(&original) {
+                        compacted_bookkeeping
+                            .later_provenance
+                            .insert(index, later.clone());
                     }
                     if let Some(original_id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {

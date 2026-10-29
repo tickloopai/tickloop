@@ -6,6 +6,8 @@ mod access_round_trip;
 mod chat_status;
 #[path = "all/goal.rs"]
 mod goal;
+#[path = "all/later_content.rs"]
+mod later_content;
 #[path = "all/local_messages.rs"]
 mod local_messages;
 #[path = "all/plan_admission.rs"]

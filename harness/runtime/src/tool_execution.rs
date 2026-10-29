@@ -1213,7 +1213,9 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(
                 if self.inner.tool_policy.web_search {
-                    self.inner.web_search_disabled_message.clone()
+                    tickloop_harness_tools::web_search::disabled_message(
+                        self.inner.web_search_settings.as_deref(),
+                    )
                 } else {
                     UNOFFERED_WEB_SEARCH_MESSAGE.into()
                 },

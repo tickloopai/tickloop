@@ -827,7 +827,7 @@ async fn search_off_keeps_the_prefix_and_answers_a_call_with_how_to_enable_it() 
             }
         }
     }
-    let disabled = tickloop_harness::tools::web_search::DISABLED_MESSAGE;
+    let disabled = tickloop_harness::tools::web_search::disabled_message(Some("/websearch"));
     assert_eq!(results.len(), 1);
     assert!(results[0].is_error);
     assert_eq!(results[0].content, disabled);
@@ -981,7 +981,7 @@ async fn search_distinguishes_disabled_empty_rate_limited_and_invalid_responses(
     assert!(run.results[0].is_error);
     assert_eq!(
         run.results[0].content,
-        tickloop_harness::tools::web_search::DISABLED_MESSAGE
+        tickloop_harness::tools::web_search::disabled_message(Some("/websearch"))
     );
     assert!(run.permission_requests.is_empty());
     assert!(

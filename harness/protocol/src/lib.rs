@@ -22,6 +22,7 @@ mod ids;
 mod image;
 mod input;
 mod interaction;
+mod later;
 pub mod local_messages;
 mod loops;
 pub mod mcp;
@@ -72,8 +73,8 @@ pub use chat::{
     GuidanceNote, HostNote, InputId, LoopId, OperationRecord, OperationState, PendingCommand,
     PendingInput, PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
     ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
-    ToolCallRecovery, UnknownGuidance, UserShellReceipt, UserShellRecord, UserShellState,
-    chat_display_title, chat_has_pending_work, chat_has_work, chat_preview, short_chat_title,
+    ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
+    chat_has_pending_work, chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_breakdown::{
@@ -130,6 +131,7 @@ pub use ids::{
 pub use image::{Image, ImageMediaType};
 pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
+pub use later::{LaterVariant, TaggedRecord, names_later_variant};
 pub use local_messages::{
     FOLDED_TICK_REPLY_CHARACTERS, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE, LocalMessage,
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
@@ -140,9 +142,9 @@ pub use loops::{
     TriggerIdentity, TriggerKind, TriggerSource,
 };
 pub use model::{
-    ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
-    ModelIdentity, ModelProvider, PrivateHistorySource, Protocol, ReasoningEffort, Role,
-    ToolResultBlock, ToolResultContent, Usage,
+    ApiKeyStatus, Content, ImageSource, InputModality, LATER_CONTENT_TEXT, Message,
+    ModelAuthSource, ModelConfig, ModelIdentity, ModelProvider, PrivateHistorySource, Protocol,
+    ReasoningEffort, Role, ToolResultBlock, ToolResultContent, Usage, without_later_content,
 };
 pub use model_availability::{AccountModelDirectory, DirectorySemantics, ModelAvailability};
 pub use model_card::{

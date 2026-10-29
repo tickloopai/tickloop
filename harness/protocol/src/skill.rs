@@ -37,6 +37,21 @@ pub enum SkillSource {
         uri: String,
         resources: Vec<RemoteSkillResource>,
     },
+    /// A source a later version knows; its Skill is never loaded again from here.
+    #[serde(untagged)]
+    Later(crate::LaterVariant<SkillSource>),
+}
+
+impl crate::TaggedRecord for SkillSource {
+    const TAG: &'static str = "kind";
+    const KNOWN: &'static [&'static str] = &[
+        "built_in",
+        "user",
+        "project",
+        "tick_package",
+        "plugin",
+        "remote",
+    ];
 }
 
 impl SkillSource {
@@ -48,6 +63,7 @@ impl SkillSource {
             Self::TickPackage { package, .. } => format!("Tick package · {package}"),
             Self::Plugin { plugin, .. } => format!("Plugin · {plugin}"),
             Self::Remote { .. } => "Remote".into(),
+            Self::Later(_) => "Later version".into(),
         }
     }
 }

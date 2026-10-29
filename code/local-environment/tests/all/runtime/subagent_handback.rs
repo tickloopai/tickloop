@@ -733,7 +733,7 @@ async fn malformed_report_checkpoint_cannot_restore_as_unreviewed_plain_output()
         .map(|line| {
             let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
             if entry["loop"].get("subagentReport").is_some() {
-                entry["loop"]["subagentReport"] = json!({"status":"invalid"});
+                entry["loop"]["subagentReport"] = json!({"status":"delivered"});
                 changed = true;
             }
             entry.to_string()
