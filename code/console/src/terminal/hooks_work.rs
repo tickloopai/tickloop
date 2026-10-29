@@ -48,6 +48,7 @@ pub(super) struct HookTasks {
     contexts: HashMap<Uuid, PanelContext>,
     /// The Folders whose review this Console has shown.
     reviewed: HashSet<PathBuf>,
+    announced_warnings: HashSet<(PathBuf, String)>,
     /// The Folder of the New Agent shown, once its hooks have been asked for.
     checked: Option<PathBuf>,
     /// A review found for the New Agent's Folder, waiting for the screen to be free.
@@ -158,9 +159,18 @@ pub(super) fn finish(
         Done::ReviewRead { folder, listing } => {
             if tasks.checked.as_ref() == Some(&folder)
                 && let Ok(listing) = listing
-                && listing.hooks.iter().any(needs_review)
             {
-                tasks.waiting = Some((folder, listing));
+                for warning in &listing.warnings {
+                    if tasks
+                        .announced_warnings
+                        .insert((folder.clone(), warning.clone()))
+                    {
+                        console.write_line(&format!("Warning: {}", safe_line(warning)))?;
+                    }
+                }
+                if listing.hooks.iter().any(needs_review) {
+                    tasks.waiting = Some((folder, listing));
+                }
             }
             return Ok(());
         }

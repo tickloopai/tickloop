@@ -697,12 +697,12 @@ fn plugin_hooks_show_how_many_need_confirming_instead_of_being_unsupported() {
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "guard@local  1.0.0  enabled  no login needed  2 hooks need confirming\n"
+        "guard@local  1.0.0  enabled  no login needed  2 hooks need confirming; hook events not supported yet, so their hooks are not used: Notification; hook types not supported yet, so those hooks are not used: prompt; hook fields not supported yet, so the hooks using them are not used: once\n"
     );
     succeeded(&plugin(&fixture, &["disable", "guard"]));
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "guard@local  1.0.0  disabled  no login needed  2 hooks need confirming\n"
+        "guard@local  1.0.0  disabled  no login needed  2 hooks need confirming; hook events not supported yet, so their hooks are not used: Notification; hook types not supported yet, so those hooks are not used: prompt; hook fields not supported yet, so the hooks using them are not used: once\n"
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["uninstall", "guard"])),

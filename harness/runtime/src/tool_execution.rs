@@ -1390,8 +1390,26 @@ impl Agent {
         Ok(outcome)
     }
 
+    async fn failed_tool_preparation(
+        &self,
+        receipt: &Receipt,
+        call_id: &str,
+        name: &str,
+        input: &Value,
+        error: String,
+        cancel: &CancellationToken,
+    ) -> ToolCallOutcome {
+        let mut outcome = ToolCallOutcome::not_admitted(error);
+        if !cancel.is_cancelled() {
+            outcome.hook_feedback = self
+                .post_tool_use(receipt, call_id, name, input, &outcome.result, cancel)
+                .await;
+        }
+        outcome
+    }
+
     /// Prepares, admits and runs a call its `PreToolUse` hooks let through, then runs its
-    /// `PostToolUse` or `PostToolUseFailure` hooks if it ran.
+    /// `PostToolUse` after success or `PostToolUseFailure` after a preparation or execution error.
     async fn admit_and_run_call(
         &self,
         receipt: &Receipt,
@@ -1409,6 +1427,7 @@ impl Agent {
             task_binding,
         } = call;
         let mut dispatched = false;
+        let mut preparation_failed = false;
         self.refresh_project_rules(receipt.chat_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -1494,7 +1513,9 @@ impl Agent {
                     } else {
                         error
                     };
-                    return Ok(ToolCallOutcome::not_admitted(error));
+                    return Ok(self
+                        .failed_tool_preparation(receipt, &id, &name, &input, error, &cancel)
+                        .await);
                 }
             }
         } else if matches!(
@@ -1506,9 +1527,16 @@ impl Agent {
             let instance = match tick_subscriptions::subscription_request(&input) {
                 Ok((instance, _)) => instance,
                 Err(error) => {
-                    return Ok(ToolCallOutcome::not_admitted(
-                        crate::tick_tools::model_tick_text(&ids, &error),
-                    ));
+                    return Ok(self
+                        .failed_tool_preparation(
+                            receipt,
+                            &id,
+                            &name,
+                            &input,
+                            crate::tick_tools::model_tick_text(&ids, &error),
+                            &cancel,
+                        )
+                        .await);
                 }
             };
             let port = self.tick_deliveries().port.clone();
@@ -1532,7 +1560,11 @@ impl Agent {
                         Some(watch.into_admission(input.clone()))
                     }
                     Ok(None) => None,
-                    Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+                    Err(error) => {
+                        return Ok(self
+                            .failed_tool_preparation(receipt, &id, &name, &input, error, &cancel)
+                            .await);
+                    }
                 },
                 None => None,
             }
@@ -1551,7 +1583,11 @@ impl Agent {
                 &input,
             ) {
                 Ok(prepared) => Some(PreparedLocalCall::McpResource(prepared)),
-                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+                Err(error) => {
+                    return Ok(self
+                        .failed_tool_preparation(receipt, &id, &name, &input, error, &cancel)
+                        .await);
+                }
             }
         } else if matches!(
             name.as_str(),
@@ -1563,6 +1599,21 @@ impl Agent {
             match self.prepare_family_call(receipt, &name, &input).await {
                 Ok(prepared) => Some(PreparedLocalCall::Family(prepared)),
                 Err(rejection) => {
+                    if matches!(
+                        rejection.code,
+                        tickloop_harness_protocol::FamilyMessageRejectionCode::InvalidTarget
+                    ) {
+                        return Ok(self
+                            .failed_tool_preparation(
+                                receipt,
+                                &id,
+                                &name,
+                                &input,
+                                rejection.result().content,
+                                &cancel,
+                            )
+                            .await);
+                    }
                     return Ok(ToolCallOutcome {
                         result: rejection.result(),
                         ..ToolCallOutcome::not_admitted(String::new())
@@ -1578,7 +1629,11 @@ impl Agent {
                 self.inner.tool_policy.subagent_launch,
             ) {
                 Ok(prepared) => Some(PreparedLocalCall::Delegation(prepared)),
-                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+                Err(error) => {
+                    return Ok(self
+                        .failed_tool_preparation(receipt, &id, &name, &input, error, &cancel)
+                        .await);
+                }
             }
         } else if matches!(
             registration.as_ref().map(|registered| &registered.route),
@@ -2848,7 +2903,10 @@ impl Agent {
                         }
                     }
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    preparation_failed = registration.is_some();
+                    Err(error)
+                }
             }
         };
         let result = result.unwrap_or_else(|error| ToolResult {
@@ -2866,7 +2924,7 @@ impl Agent {
         {
             sources = Some(Vec::new());
         }
-        let hook_feedback = if dispatched && !cancel.is_cancelled() {
+        let hook_feedback = if (dispatched || preparation_failed) && !cancel.is_cancelled() {
             self.post_tool_use(receipt, &id, &name, &input, &result, &cancel)
                 .await
         } else {

@@ -3100,6 +3100,9 @@ impl Agent {
             is_skill_invocation,
             attached_file_reads,
         };
+        if hooks::is_user_prompt(&queued) {
+            hooks::resume_prompt_inputs(chat);
+        }
         chat.bookkeeping.lifecycle.accept(&ledger, &queued);
         chat.snapshot.pending_inputs.insert(index, queued);
         if let Some(feedback_input) = feedback_input {
@@ -3758,6 +3761,12 @@ impl Agent {
         let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
             RunStart::Request(request) => {
+                self.checkpoint_pending_prompt(&receipt)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.announce_session_start(&receipt, &cancel)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 if let hooks::PromptGate::End = self
                     .user_prompt_submit(&receipt, &cancel)
                     .await
@@ -3816,7 +3825,6 @@ impl Agent {
                     return Err(error.to_string());
                 }
             };
-            *is_awaiting_model = false;
             let assistant_message_id = tickloop_ids::generate();
             let calls = tool_batch::batch_calls(&output.content);
             {
@@ -3882,6 +3890,7 @@ impl Agent {
                     .run_conversation_usage(receipt.run_id)
                     .map_err(|error| error.to_string());
             }
+            *is_awaiting_model = false;
             match self
                 .run_batch_from(
                     &receipt,
@@ -3917,6 +3926,46 @@ impl Agent {
             receipt.loop_id, chat.snapshot.chat_loop.id,
             "every run belongs to its Chat's one Loop"
         );
+        if let Some(inputs) = chat
+            .hook_state
+            .session
+            .preparing_inputs
+            .remove(&receipt.run_id)
+        {
+            let interrupted_by_user = chat.user_cancelled_runs.remove(&receipt.run_id);
+            if interrupted_by_user
+                || internal_failure
+                || (!cancel.is_cancelled() && result.is_err())
+            {
+                for pending in &mut chat.snapshot.pending_inputs {
+                    if inputs.contains(&pending.receipt.run_id) && hooks::is_user_prompt(pending) {
+                        pending.armed = false;
+                        chat.bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
+                    }
+                }
+            }
+            run_supervision::clear_run_state(chat, receipt.run_id);
+            let event = if cancel.is_cancelled() && !internal_failure {
+                chat.snapshot.chat_loop.set_state(LoopState::Interrupted);
+                EventKind::Interrupted
+            } else if let Err(error) = result {
+                chat.snapshot.chat_loop.set_state(LoopState::Failed);
+                EventKind::Failed(error)
+            } else {
+                chat.snapshot.chat_loop.set_state(LoopState::Idle);
+                EventKind::Completed {
+                    usage: Usage::default(),
+                }
+            };
+            self.emit(chat, &receipt, event);
+            let snapshot = chat.snapshot.clone();
+            let bookkeeping = chat.bookkeeping.clone();
+            drop(chats);
+            let _ = self.checkpoint_transcript(&snapshot, &bookkeeping).await;
+            return self.next_run(receipt.chat_id).await.ok().flatten();
+        }
         chat.family_finishing.insert(receipt.run_id);
         chat.feedback_inputs.remove(&receipt.run_id);
         run_supervision::clear_run_state(chat, receipt.run_id);
@@ -4005,9 +4054,6 @@ impl Agent {
         );
         self.save(&chat.snapshot);
         self.emit(chat, &receipt, event);
-        if let Some(prompt) = chat.hook_state.session.take_blocked_prompt(receipt.run_id) {
-            self.take_back_blocked_prompt(chat, receipt.run_id, prompt, true);
-        }
         self.inner
             .host_contexts
             .lock()
@@ -4267,7 +4313,12 @@ impl Agent {
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
-                RunAdmission::Ready(receipt, request, cancel) => {
+                RunAdmission::Ready(receipt, mut request, cancel) => {
+                    if self.commit_unhooked_prompt(&receipt, &cancel).await? {
+                        let chats = self.inner.chats.lock().await;
+                        let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+                        (request.messages, request.history_sources) = context::model_history(chat)?;
+                    }
                     return Ok(Some((receipt, *request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
@@ -4660,6 +4711,7 @@ impl Agent {
                 pending.receipt.loop_id,
                 self.inner.config_root.as_deref(),
             )?;
+            let queued_before_hooks = candidate.snapshot.pending_inputs.clone();
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
             if pending.agent_message.is_none()
@@ -4712,42 +4764,17 @@ impl Agent {
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
-            self.mark_run_inputs_handled(&mut candidate, &pending);
             if hooks::is_user_prompt(&pending) {
-                candidate
-                    .hook_state
-                    .session
-                    .await_prompt_hooks(pending.receipt.run_id);
-            }
-            candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
-            self.append_input_message(&mut candidate, pending);
-            let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
-            for queued in merged_inputs {
-                let consumed = queued.receipt.clone();
-                if queued.agent_message.is_none() {
-                    self.merge_host_context(&receipt, &consumed);
-                }
-                self.append_input_message(&mut candidate, queued);
-                self.settle_input(
-                    &mut candidate,
-                    consumed.run_id,
-                    SettledOutcome::Merged {
-                        into: receipt.run_id.into(),
-                    },
+                candidate.hook_state.session.await_prompt_hooks(receipt.run_id);
+                candidate.hook_state.session.preparing_inputs.insert(
+                    receipt.run_id,
+                    std::iter::once(pending.receipt.run_id)
+                        .chain(merged_inputs.iter().map(|input| input.receipt.run_id))
+                        .collect(),
                 );
-                merged_receipts.push(consumed);
-            }
-            self.save(&candidate.snapshot);
-            self.start_response(&mut candidate, &receipt);
-            self.emit(&mut candidate, &receipt, EventKind::Started);
-            for consumed in merged_receipts {
-                self.emit(
-                    &mut candidate,
-                    &consumed,
-                    EventKind::InputMerged {
-                        into_run_id: receipt.run_id,
-                    },
-                );
+                candidate.snapshot.pending_inputs = queued_before_hooks;
+            } else {
+                self.commit_run_inputs(&mut candidate, pending, merged_inputs, Vec::new());
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
@@ -4780,6 +4807,53 @@ impl Agent {
         self.save(&candidate.snapshot);
         *chat = candidate;
         Ok(RunAdmission::Idle)
+    }
+
+    fn commit_run_inputs(
+        &self,
+        chat: &mut Chat,
+        pending: PendingInput,
+        merged_inputs: Vec<PendingInput>,
+        notes: Vec<String>,
+    ) {
+        let receipt = pending.receipt.clone();
+        self.mark_run_inputs_handled(chat, &pending);
+        chat.bookkeeping.lifecycle.start_input(receipt.run_id);
+        self.append_input_message(chat, pending);
+        let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
+        for queued in merged_inputs {
+            let consumed = queued.receipt.clone();
+            if queued.agent_message.is_none() {
+                self.merge_host_context(&receipt, &consumed);
+            }
+            self.append_input_message(chat, queued);
+            self.settle_input(
+                chat,
+                consumed.run_id,
+                SettledOutcome::Merged {
+                    into: receipt.run_id.into(),
+                },
+            );
+            merged_receipts.push(consumed);
+        }
+        hooks::append_hook_notes(
+            chat,
+            &receipt,
+            tickloop_harness_protocol::hooks::HookEvent::UserPromptSubmit,
+            notes,
+        );
+        self.save(&chat.snapshot);
+        self.start_response(chat, &receipt);
+        self.emit(chat, &receipt, EventKind::Started);
+        for consumed in merged_receipts {
+            self.emit(
+                chat,
+                &consumed,
+                EventKind::InputMerged {
+                    into_run_id: receipt.run_id,
+                },
+            );
+        }
     }
 
     async fn request_permission(

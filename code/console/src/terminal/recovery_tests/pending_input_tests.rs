@@ -124,7 +124,40 @@ fn pending_input_pty_fixture() {
                     calls: AtomicUsize::new(0),
                     requests: Mutex::new(Vec::new()),
                 });
-                let core = tickloop_harness::runtime::Agent::new_embedded(tickloop_harness::test_support::config(), model.clone());
+                let core = if std::env::var(QUEUE_ROUTE).as_deref() == Ok("hooks") {
+                    use tickloop_harness::protocol::hooks::{ConfiguredHook, HookEvent, HookList, HookSource, HookTrust};
+                    use tickloop_harness::runtime::{HarnessOptions, HarnessSeams};
+                    use tickloop_harness::runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
+                    let environment = Arc::new(MemoryEnvironment::new());
+                    environment.define_command("wait-for-prompt", |_| MemoryCommandRun {
+                        duration: if std::path::Path::new("release-hook").exists() { Duration::ZERO } else { Duration::from_secs(60) },
+                        stdout: b"session context".to_vec(),
+                        ..Default::default()
+                    });
+                    environment.define_command("session-context", |_| MemoryCommandRun {
+                        stdout: b"session context".to_vec(), ..Default::default()
+                    });
+                    let settings = Arc::new(tickloop_harness::policy::settings::MemorySettingsStore::default());
+                    let prompt_hook = ConfiguredHook {
+                            key: "startup".into(), hash: None, source: HookSource::User,
+                            file: "/settings.json".into(), event: HookEvent::UserPromptSubmit,
+                            matcher: None, command: "wait-for-prompt".into(),
+                            resolved_command: Some("wait-for-prompt".into()), sensitive_values: Vec::new(),
+                            condition: None, timeout_secs: 600, background: None, plugin: None, trust: HookTrust::Trusted,
+                        };
+                    let session_hook = ConfiguredHook {
+                        key: "session".into(), event: HookEvent::SessionStart,
+                        command: "session-context".into(), resolved_command: Some("session-context".into()),
+                        ..prompt_hook.clone()
+                    };
+                    settings.set_hooks(HookList { hooks: vec![session_hook, prompt_hook], ..Default::default() });
+                    tickloop_harness::runtime::Agent::with_seams(HarnessSeams {
+                        search: None, transcripts: None, environment: Some(environment),
+                        models: tickloop_harness::test_support::harness::ChosenModels::new(model.clone()),
+                    }, HarnessOptions { settings: Some(settings), ..HarnessOptions::local(tickloop_harness::test_support::config()) }).unwrap()
+                } else {
+                    tickloop_harness::runtime::Agent::new_embedded(tickloop_harness::test_support::config(), model.clone())
+                };
                 let access = Arc::new(QueueAccess {daemon:EmbeddedAgentAccess::new(core.clone())});
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -145,8 +178,13 @@ fn pending_input_pty_fixture() {
                 let proof_agent = agent.clone();
                 tokio::task::spawn_local(async move {
                     let mut submitted_elsewhere=false;
+                    let mut resumed_hook=false;
                     loop {
                         if let Some(snapshot) = proof_core.list_chats().await.into_iter().next() {
+                            if !resumed_hook && std::path::Path::new("release-hook").exists() && snapshot.pending_inputs.iter().any(|input| !input.armed) {
+                                resumed_hook=true;
+                                proof_core.continue_loop(snapshot.id).await.unwrap();
+                            }
                             if !submitted_elsewhere && std::path::Path::new(OTHER_VIEW_SUBMIT).exists() && !snapshot.messages.is_empty() {
                                 other_view.display_chat(Some(snapshot.id.into())).await.unwrap();
                                 for _ in 0..2 {
@@ -164,7 +202,7 @@ fn pending_input_pty_fixture() {
                                 "hello_messages": hello_messages,
                                 "request_hellos": request_hellos,
                                 "pending_receipts": snapshot.pending_inputs.iter().map(|pending| serde_json::json!({
-                                    "run":pending.receipt.run_id,"loop":pending.receipt.loop_id,
+                                    "run":pending.receipt.run_id,"loop":pending.receipt.loop_id,"armed":pending.armed,
                                 })).collect::<Vec<_>>(),
                                 "started": snapshot.events.iter().filter(|event| matches!(event.kind,EventKind::Started)).map(|event|event.run_id).collect::<Vec<_>>(),
                                 "completed": snapshot.events.iter().filter(|event| matches!(event.kind,EventKind::Completed {..})).map(|event|event.run_id).collect::<Vec<_>>(),
@@ -460,6 +498,57 @@ fn up_takes_back_pending_messages_without_creating_sent_body_echoes() {
         2,
         "{frame}"
     );
+}
+
+#[test]
+fn a_prompt_waiting_for_session_hooks_stays_queued_then_echoes_once() {
+    let (mut fixture, directory) = start_queue_fixture("hooks");
+    fixture.wait_for("Tickloop");
+    fixture.send(format!("{QUEUED_MESSAGE}\r").as_bytes());
+    wait_queue_proof(&fixture, directory.path(), 0, 1);
+    let queued = fixture
+        .repaint_after_recovery("an interruptible prompt waiting for hooks", |frame| {
+            screen::queued_inputs(frame).len() == 1 && frame.contains("esc to interrupt")
+        });
+    let (body, _) = screen::split_at_queue(&queued).unwrap();
+    assert_eq!(body.matches(QUEUED_MESSAGE).count(), 0, "{queued}");
+    assert!(
+        screen::queued_inputs(&queued)[0].contains(QUEUED_MESSAGE),
+        "{queued}"
+    );
+    fixture.send(b"\x1b");
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        let proof = wait_queue_proof(&fixture, directory.path(), 0, 1);
+        if proof["pending_receipts"][0]["armed"] == false {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hook was not interrupted: {proof}; {}",
+            screen::visible_screen(&fixture.raw_output(), 80, 24)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(directory.path().join("release-hook"), "").unwrap();
+    let proof = wait_queue_proof(&fixture, directory.path(), 1, 0);
+    assert_eq!(proof["hello_messages"], 1);
+    let consumed = fixture.repaint_after_recovery("the hook-checked prompt echoed once", |frame| {
+        frame
+            .lines()
+            .filter(|line| line.trim() == format!("❯ {QUEUED_MESSAGE}"))
+            .count()
+            == 1
+            && screen::queued_inputs(frame).is_empty()
+    });
+    assert_eq!(
+        consumed
+            .lines()
+            .filter(|line| line.trim() == format!("❯ {QUEUED_MESSAGE}"))
+            .count(),
+        1
+    );
+    std::fs::write(directory.path().join(QUEUE_STAGE), "release-1").unwrap();
 }
 
 #[test]

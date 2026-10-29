@@ -53,6 +53,8 @@ struct ChatCheckpoint {
     family_generation: u64,
     start_new_tool_result_message: bool,
     #[serde(default)]
+    pending_session_start: Option<crate::hooks::SessionSource>,
+    #[serde(default)]
     mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
     #[serde(default)]
     ceiling_mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
@@ -153,6 +155,7 @@ impl Agent {
                 bookkeeping: chat.bookkeeping.clone(),
                 family_generation: chat.family_generation,
                 start_new_tool_result_message: chat.start_new_tool_result_message,
+                pending_session_start: chat.hook_state.session.session_start,
                 mode_before_plan: chat.snapshot.policy.mode_before_plan,
                 ceiling_mode_before_plan: chat
                     .snapshot
@@ -409,7 +412,11 @@ impl Agent {
                     loaded_from_history: false,
                     goal_clock_ms: saved.goal_clock_ms,
                     cache_prefix: Default::default(),
-                    hook_state: Default::default(),
+                    hook_state: {
+                        let mut state = crate::hooks::ChatHookState::default();
+                        state.session.session_start = saved.pending_session_start;
+                        state
+                    },
                 },
             );
         }

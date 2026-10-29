@@ -419,6 +419,29 @@ async fn a_plugin_hook_may_deny_and_gets_its_directories_but_its_allow_admits_no
 }
 
 #[tokio::test]
+async fn a_deny_without_a_reason_names_the_hook_that_denied_the_tool() {
+    let bench = Bench::start(
+        Options::new(ExecutionMode::FullAccess, vec![build_call(), text("done")]),
+        vec![user_hook(HookEvent::PreToolUse, Some("Bash"), GUARD)],
+    )
+    .await;
+    bench.define(GUARD, |_| {
+        pre_tool_answer(json!({"permissionDecision": "deny"}))
+    });
+    let observed = bench.run("Build it.", true).await;
+    assert!(observed.started.is_empty());
+    assert_eq!(
+        observed.results[0].content,
+        "Hook PreToolUse:Bash denied this tool"
+    );
+    assert_eq!(
+        bench.model_tool_results(),
+        ["Hook PreToolUse:Bash denied this tool"]
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_ask_reaches_a_person_even_in_auto_and_a_host_that_cannot_ask_refuses() {
     let read = |bench: &Bench| {
         bench.model.enqueue(call(
@@ -497,7 +520,10 @@ async fn explicit_ask_and_deny_rules_win_over_a_users_allow() {
     for (decision, asks) in [(Decision::Ask, true), (Decision::Deny, false)] {
         let bench = Bench::start(
             Options::new(ExecutionMode::Auto, vec![build_call(), text("done")]),
-            vec![user_hook(HookEvent::PreToolUse, Some("Bash"), GUARD)],
+            vec![
+                user_hook(HookEvent::PreToolUse, Some("Bash"), GUARD),
+                user_hook(HookEvent::PostToolUseFailure, None, "failure.sh"),
+            ],
         )
         .await;
         bench
@@ -517,10 +543,15 @@ async fn explicit_ask_and_deny_rules_win_over_a_users_allow() {
             .await
             .unwrap();
         bench.define(GUARD, |_| answer(json!({"decision": "approve"})));
+        bench.define("failure.sh", |_| exits(0, "", ""));
         let observed = bench.run("Build it.", false).await;
         assert_eq!(observed.requests.len(), usize::from(asks), "{decision:?}");
         assert!(observed.started.is_empty(), "{decision:?}");
         assert!(observed.results[0].is_error, "{decision:?}");
+        assert!(
+            bench.inputs_of("failure.sh").is_empty(),
+            "an admission refusal is not a tool failure"
+        );
         bench.agent.shutdown().await;
     }
 }
@@ -625,6 +656,74 @@ async fn post_tool_use_feedback_follows_the_result_and_failure_hooks_only_add_co
     assert_eq!(
         observed.hook_runs[0].system_message.as_deref(),
         Some("Formatter complained")
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_read_after_pre_tool_use_runs_failure_hooks() {
+    let bench = Bench::start(
+        Options::new(
+            ExecutionMode::FullAccess,
+            vec![
+                call("missing", "Read", json!({"file_path": "missing.txt"})),
+                text("done"),
+            ],
+        ),
+        vec![
+            user_hook(HookEvent::PreToolUse, Some("Read"), "before.sh"),
+            user_hook(HookEvent::PostToolUseFailure, Some("Read"), "failure.sh"),
+            user_hook(HookEvent::PostToolUse, Some("Read"), "success.sh"),
+        ],
+    )
+    .await;
+    bench.define("before.sh", |_| exits(0, "", ""));
+    bench.define("failure.sh", |_| answer(json!({
+        "hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext": "check the path"}
+    })));
+    bench.define("success.sh", |_| exits(0, "", ""));
+    let observed = bench.run("Read the missing file.", true).await;
+    assert!(observed.results[0].is_error);
+    assert_eq!(bench.inputs_of("before.sh").len(), 1);
+    let failures = bench.inputs_of("failure.sh");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["tool_name"], "Read");
+    assert_eq!(failures[0]["tool_use_id"], "missing");
+    assert_eq!(failures[0]["error"], observed.results[0].content);
+    assert!(bench.inputs_of("success.sh").is_empty());
+    assert!(bench.model_tool_results()[0].contains("check the path"));
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_host_preparation_runs_failure_hooks_without_dispatching() {
+    let bench = Bench::start(
+        Options {
+            offers_ticks: true,
+            ..Options::new(ExecutionMode::FullAccess, vec![
+                call("missing-tick", "TickManage", json!({"action": "open", "command": ["/missing-program"], "cwd": "/", "protocol": true})),
+                call("empty-task", "Subagent", json!({"task": " "})),
+                call("unknown-peer", "SendMessage", json!({"to": "missing-agent", "message": "hello"})),
+                text("done"),
+            ])
+        },
+        vec![user_hook(HookEvent::PostToolUseFailure, None, "failure.sh")],
+    ).await;
+    bench.define("failure.sh", |_| answer(json!({"hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext": "check the input"}})));
+    let observed = bench.run("Open and delegate.", true).await;
+    assert!(observed.started.is_empty());
+    assert_eq!(observed.results.len(), 3);
+    assert!(observed.results.iter().all(|result| result.is_error));
+    let failures = bench.inputs_of("failure.sh");
+    assert_eq!(failures.len(), 3);
+    assert_eq!(failures[0]["tool_name"], "TickManage");
+    assert_eq!(failures[1]["tool_name"], "Subagent");
+    assert_eq!(failures[2]["tool_name"], "SendMessage");
+    assert!(
+        bench
+            .model_tool_results()
+            .iter()
+            .all(|result| result.contains("check the input"))
     );
     bench.agent.shutdown().await;
 }

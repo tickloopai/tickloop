@@ -1570,6 +1570,15 @@ impl TicksPanel {
                     {
                         lines.push(RoleLine::role(format!("  {warning}"), Role::Warning));
                     }
+                    if let InstalledEntry::Usable { package, .. } = entry {
+                        for warning in package.manifest.hook_support.warnings() {
+                            lines.extend(
+                                wrap_text(&safe_line(&warning), width.saturating_sub(2).max(1))
+                                    .into_iter()
+                                    .map(|line| RoleLine::role(format!("  {line}"), Role::Warning)),
+                            );
+                        }
+                    }
                     (index, lines)
                 })
                 .collect();
@@ -3304,6 +3313,33 @@ mod tests {
                 && !shown.contains("hook"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn installed_rows_show_skipped_hook_events_types_and_fields() {
+        let mut package = installed("alpha", "1.0.0", false);
+        package.manifest.hook_support.runnable = 1;
+        package
+            .manifest
+            .hook_support
+            .unsupported_events
+            .insert("Notification".into());
+        package
+            .manifest
+            .hook_support
+            .unsupported_types
+            .insert("prompt".into());
+        package
+            .manifest
+            .hook_support
+            .unsupported_fields
+            .insert("once".into());
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
+        panel.apply(installed_list(1, vec![(package, LoginState::NotRequired)]));
+        let shown = text(&mut panel);
+        for unsupported in ["Notification", "prompt", "once"] {
+            assert!(shown.contains(unsupported), "{shown}");
+        }
     }
 
     #[test]

@@ -127,7 +127,8 @@ impl HookSupport {
         Ok(())
     }
 
-    fn warnings(&self) -> Vec<String> {
+    /// Compatibility warnings for the hook events, types and fields this host skips.
+    pub fn warnings(&self) -> Vec<String> {
         [
             (
                 &self.unsupported_events,

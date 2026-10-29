@@ -799,7 +799,7 @@ fn bash_restriction_may_match(pattern: &str, command: &str, unclear: UnclearComm
     if shell_rule_matches_any(pattern, command) {
         return true;
     }
-    match distinct_commands(command) {
+    match distinct_commands(command, unclear) {
         Some(commands) => commands
             .iter()
             .any(|command| simple_command_may_match(pattern, command)),
@@ -818,7 +818,7 @@ fn bash_restriction_may_match(pattern: &str, command: &str, unclear: UnclearComm
 
 /// The simple commands of `command` with their redirections set aside, or `None` when they
 /// cannot be told apart: a substitution runs a command of its own, quoted or not.
-fn distinct_commands(command: &str) -> Option<Vec<String>> {
+fn distinct_commands(command: &str, unclear: UnclearCommands) -> Option<Vec<String>> {
     if command.contains("$(") || command.contains('`') {
         return None;
     }
@@ -829,9 +829,12 @@ fn distinct_commands(command: &str) -> Option<Vec<String>> {
         .iter()
         .map(|part| without_redirections(part))
         .collect::<Vec<_>>();
-    (!commands
-        .iter()
-        .any(|command| command.contains(['(', ')', '{', '}', '<', '>'])))
+    (!commands.iter().any(|command| match unclear {
+        UnclearCommands::Match => split_shell_commands(command).is_none(),
+        UnclearCommands::MatchWhereTheRuleCouldRun => {
+            command.contains(['(', ')', '{', '}', '<', '>'])
+        }
+    }))
     .then_some(commands)
 }
 
@@ -1363,6 +1366,46 @@ mod restriction_tests {
         assert!(bash_matches("git push*", "echo $(git push)"));
         assert!(bash_matches("git push*", "(cd repo && git push)"));
         assert!(bash_matches("git push*", "echo 'unclosed"));
+    }
+
+    #[test]
+    fn quoted_metacharacters_with_redirections_do_not_make_unrelated_hooks_match() {
+        let command = "echo 'eval(user)' > /dev/null && git status --short | head -1";
+        assert!(!bash_matches("git*commit*", command));
+        assert!(!bash_matches("git push*", command));
+        assert!(bash_matches("git status*", command));
+        for (decision, expected) in [
+            (Decision::Deny, ExplicitPermissionDecision::Deny),
+            (Decision::Ask, ExplicitPermissionDecision::Ask),
+        ] {
+            assert_eq!(
+                explicit_decision(
+                    bash_rule(decision, "git push*"),
+                    "echo 'eval(user)' > /dev/null && git push | head"
+                ),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            explicit_decision(
+                bash_rule(Decision::Allow, "git push*"),
+                "echo 'eval(user)' > /dev/null && git push | head"
+            ),
+            None
+        );
+        for (decision, expected) in [
+            (Decision::Deny, ExplicitPermissionDecision::Deny),
+            (Decision::Ask, ExplicitPermissionDecision::Ask),
+        ] {
+            assert_eq!(
+                explicit_decision(
+                    bash_rule(decision, "git push*"),
+                    "echo '(example); git push' > /dev/null"
+                ),
+                Some(expected),
+                "the existing conservative permission restriction stays unchanged"
+            );
+        }
     }
 
     #[test]

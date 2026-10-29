@@ -26,8 +26,8 @@ impl Agent {
     /// hosting, unconsumed family messages retain their delivery state, and Trigger inputs
     /// are queued again since their sources already moved past them; what the load makes of
     /// the Trigger records is its guess, never recorded, since another process may hold the
-    /// Chat's lease and go on with them. Other inputs the Agent queued for itself are lost with
-    /// the process.
+    /// Chat's lease and go on with them. Accepted human prompts are restored disarmed until an
+    /// explicit continuation; other inputs the Agent queued for itself are lost with the process.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -38,7 +38,9 @@ impl Agent {
                 let before = chat.bookkeeping.lifecycle.trigger_revisions();
                 chat.bookkeeping.lifecycle.reopen_started_ahead();
                 let survives_restart = |pending: &PendingInput| {
-                    is_trigger_input(pending) || pending.agent_message.is_some()
+                    is_trigger_input(pending)
+                        || pending.agent_message.is_some()
+                        || crate::hooks::is_user_prompt(pending)
                 };
                 let waiting = chat
                     .bookkeeping
@@ -52,6 +54,14 @@ impl Agent {
                     !waiting.contains(&tickloop_ids::Id::from(entry.run_id))
                 });
                 self.requeue_inputs(chat, survives_restart);
+                for pending in &mut chat.snapshot.pending_inputs {
+                    if crate::hooks::is_user_prompt(pending) {
+                        pending.armed = false;
+                        chat.bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
+                    }
+                }
                 chat.bookkeeping
                     .lifecycle
                     .leave_trigger_guesses_unrecorded(before);

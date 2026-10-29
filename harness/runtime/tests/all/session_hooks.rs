@@ -75,6 +75,7 @@ fn context_answer(event: HookEvent, context: &str) -> MemoryCommandRun {
 struct GatedModel {
     inner: Arc<dyn ModelClient>,
     holds_next: AtomicBool,
+    failure: Mutex<Option<ModelError>>,
     entered: Notify,
     release: Notify,
 }
@@ -106,6 +107,9 @@ impl ModelClient for GatedModel {
                 () = cancel.cancelled() => {}
                 () = self.release.notified() => {}
             }
+        }
+        if let Some(error) = self.failure.lock().unwrap().take() {
+            return Err(error);
         }
         self.inner.complete(request, deltas, cancel).await
     }
@@ -153,6 +157,7 @@ impl Bench {
                 None => model.clone(),
             },
             holds_next: AtomicBool::new(false),
+            failure: Mutex::new(None),
             entered: Notify::new(),
             release: Notify::new(),
         });
@@ -520,7 +525,7 @@ async fn continue_false_keeps_the_prompt_and_ends_the_turn_unanswered() {
 }
 
 #[tokio::test]
-async fn session_start_runs_once_for_a_new_chat_and_its_context_follows_the_prompt() {
+async fn session_start_runs_once_for_a_new_chat_and_its_context_precedes_the_prompt() {
     let bench = Bench::start(
         vec![text("one"), text("two")],
         vec![
@@ -545,7 +550,15 @@ async fn session_start_runs_once_for_a_new_chat_and_its_context_follows_the_prom
     assert_eq!(input["source"], "startup");
     assert_eq!(input["model"], config().model);
     let trailing = trailing_texts(&bench.requests()[0]);
-    assert_eq!(trailing[0], "Refactor it.");
+    let prompt = trailing
+        .iter()
+        .position(|text| text == "Refactor it.")
+        .unwrap();
+    let session = trailing
+        .iter()
+        .position(|text| text.contains("Explain your choices as you work."))
+        .unwrap();
+    assert!(session < prompt, "{trailing:?}");
     assert!(
         trailing.iter().any(|text| text.contains(
             "SessionStart:startup hook additional context: Explain your choices as you work."
@@ -567,6 +580,282 @@ async fn session_start_runs_once_for_a_new_chat_and_its_context_follows_the_prom
 }
 
 #[tokio::test]
+async fn session_start_keeps_the_prompt_queued_until_both_hooks_finish_and_esc_preserves_it() {
+    let bench = Bench::start_with(
+        vec![text("done")],
+        None,
+        vec![
+            user_hook(HookEvent::SessionStart, None, "start.sh"),
+            user_hook(HookEvent::UserPromptSubmit, None, "prompt.sh"),
+        ],
+        true,
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("start.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(60),
+            ..exits(0, "session context", "")
+        }
+    });
+    bench.define("prompt.sh", |_| {
+        context_answer(HookEvent::UserPromptSubmit, "prompt context")
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Keep this prompt.".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert_eq!(snapshot.pending_inputs.len(), 1);
+    assert_eq!(snapshot.pending_inputs[0].input, "Keep this prompt.");
+    assert!(
+        !conversation_texts(&snapshot.messages)
+            .iter()
+            .any(|text| text == "Keep this prompt.")
+    );
+    assert!(bench.inputs_of("prompt.sh").is_empty());
+    assert!(bench.requests().is_empty());
+    bench.agent.interrupt(bench.chat).await.unwrap();
+    assert!(observe(&mut events, &receipt).await.interrupted);
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert_eq!(snapshot.pending_inputs.len(), 1);
+    assert!(!snapshot.pending_inputs[0].armed);
+    bench.define("start.sh", |_| exits(0, "session context", ""));
+    bench.agent.continue_loop(bench.chat).await.unwrap();
+    observe(&mut events, &receipt).await;
+    let texts = trailing_texts(&bench.requests()[0]);
+    let session = texts
+        .iter()
+        .position(|text| text.contains("session context"))
+        .unwrap();
+    let prompt = texts
+        .iter()
+        .position(|text| text == "Keep this prompt.")
+        .unwrap();
+    let context = texts
+        .iter()
+        .position(|text| text.contains("prompt context"))
+        .unwrap();
+    assert!(session < prompt && prompt < context, "{texts:?}");
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|text| *text == "Keep this prompt.")
+            .count(),
+        1
+    );
+    assert!(
+        bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_prompt_waiting_for_session_start_survives_restart_and_planned_upgrade() {
+    for upgrade in [false, true] {
+        let bench = Bench::start_with(
+            Vec::new(),
+            None,
+            vec![user_hook(HookEvent::SessionStart, None, "start.sh")],
+            true,
+        )
+        .await;
+        let entered = Arc::new(Notify::new());
+        let notify = entered.clone();
+        bench.define("start.sh", move |_| {
+            notify.notify_one();
+            MemoryCommandRun {
+                duration: Duration::from_secs(60),
+                ..exits(0, "session context", "")
+            }
+        });
+        let mut events = bench.agent.subscribe();
+        let receipt = bench
+            .agent
+            .submit(bench.chat, "Survive the host.".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            bench.agent.prepare_upgrade().await.unwrap().is_none(),
+            "a running hook holds the upgrade boundary"
+        );
+        let checkpoint = if upgrade {
+            bench.agent.interrupt(bench.chat).await.unwrap();
+            assert!(observe(&mut events, &receipt).await.interrupted);
+            Some(
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(checkpoint) = bench.agent.prepare_upgrade().await.unwrap() {
+                            break serde_json::from_value::<
+                                tickloop_harness_runtime::upgrade::AgentUpgradeCheckpoint,
+                            >(
+                                serde_json::to_value(checkpoint).unwrap()
+                            )
+                            .unwrap();
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap(),
+            )
+        } else {
+            bench.agent.shutdown().await;
+            None
+        };
+        let model = Arc::new(ScriptedModel::new(vec![text("restored")]));
+        let successor = build_agent(
+            &bench.directory,
+            &bench.environment,
+            &bench.settings,
+            model.clone(),
+            true,
+        );
+        if let Some(checkpoint) = checkpoint {
+            successor.restore_upgrade(checkpoint).await.unwrap();
+            successor.activate_upgrade().await.unwrap();
+            bench.agent.shutdown_for_upgrade().await;
+            successor.release_upgrade().await.unwrap();
+        } else {
+            successor.resume_chat(bench.chat).await.unwrap();
+        }
+        let snapshot = successor.snapshot(bench.chat).await.unwrap();
+        assert_eq!(snapshot.pending_inputs.len(), 1, "upgrade={upgrade}");
+        assert_eq!(snapshot.pending_inputs[0].input, "Survive the host.");
+        assert!(!snapshot.pending_inputs[0].armed);
+        assert!(model.requests.lock().unwrap().is_empty());
+        bench.define("start.sh", |_| exits(0, "session context", ""));
+        let mut events = successor.subscribe();
+        successor.continue_loop(bench.chat).await.unwrap();
+        observe(&mut events, &receipt).await;
+        let request = model.requests.lock().unwrap()[0].clone();
+        let texts = conversation_texts(&request.messages);
+        let context = texts
+            .iter()
+            .position(|text| text.contains("session context"))
+            .unwrap();
+        let prompt = texts
+            .iter()
+            .position(|text| text == "Survive the host.")
+            .unwrap();
+        assert!(context < prompt, "upgrade={upgrade}: {texts:?}");
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Survive the host.")
+                .count(),
+            1
+        );
+        successor.shutdown().await;
+        let reloaded = build_agent(
+            &bench.directory,
+            &bench.environment,
+            &bench.settings,
+            Arc::new(ScriptedModel::new(Vec::new())),
+            true,
+        );
+        let snapshot = reloaded.resume_chat(bench.chat).await.unwrap();
+        let texts = conversation_texts(&snapshot.messages);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Survive the host.")
+                .count(),
+            1
+        );
+        assert!(
+            texts
+                .iter()
+                .position(|text| text.contains("session context"))
+                .unwrap()
+                < texts
+                    .iter()
+                    .position(|text| text == "Survive the host.")
+                    .unwrap()
+        );
+        reloaded.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_storage_failure_before_input_hooks_keeps_the_prompt_for_explicit_retry() {
+    use tickloop_harness_test_support::transcripts::{
+        FaultyTranscriptStore, InMemoryTranscriptStore,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(FaultyTranscriptStore::new(Arc::new(
+        InMemoryTranscriptStore::new(),
+    )));
+    let environment = Arc::new(MemoryEnvironment::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    environment.define_command("start.sh", move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        exits(0, "context", "")
+    });
+    let settings = Arc::new(MemorySettingsStore::default());
+    settings.set_hooks(HookList {
+        hooks: vec![user_hook(HookEvent::SessionStart, None, "start.sh")],
+        ..Default::default()
+    });
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(store.clone()),
+            environment: Some(environment),
+            models: ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("done")]))),
+        },
+        HarnessOptions {
+            settings: Some(settings),
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    store.fail_appends();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, "Keep me until storage works.".into())
+        .await
+        .unwrap();
+    let observed = observe(&mut events, &receipt).await;
+    assert!(observed.failed.is_some());
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.pending_inputs.len(), 1);
+    assert!(!snapshot.pending_inputs[0].armed);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    store.heal();
+    agent.continue_loop(chat).await.unwrap();
+    assert!(observe(&mut events, &receipt).await.failed.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn session_start_tells_hooks_a_chat_was_cleared() {
     let bench = Bench::start(
         vec![text("fresh")],
@@ -585,6 +874,14 @@ async fn session_start_tells_hooks_a_chat_was_cleared() {
         .unwrap();
     bench.run("Start over.").await;
     assert_eq!(bench.inputs_of("clear.sh")[0]["source"], "clear");
+    let texts = trailing_texts(&bench.requests()[0]);
+    assert!(
+        texts
+            .iter()
+            .position(|text| text.contains("cleared context"))
+            .unwrap()
+            < texts.iter().position(|text| text == "Start over.").unwrap()
+    );
     assert!(
         trailing_texts(&bench.requests()[0])
             .iter()
@@ -629,6 +926,14 @@ async fn pre_compact_reads_its_trigger_adds_instructions_and_compaction_runs_ses
 
     bench.run("Continue.").await;
     assert_eq!(bench.inputs_of("after.sh")[0]["source"], "compact");
+    let texts = trailing_texts(&bench.requests()[2]);
+    assert!(
+        texts
+            .iter()
+            .position(|text| text.contains("Re-read CONTRIBUTING.md."))
+            .unwrap()
+            < texts.iter().position(|text| text == "Continue.").unwrap()
+    );
     assert!(trailing_texts(&bench.requests()[2]).iter().any(|text| {
         text.contains("SessionStart:compact hook additional context: Re-read CONTRIBUTING.md.")
     }));
@@ -720,6 +1025,42 @@ async fn stop_hook_errors_and_continue_false_end_the_turn() {
 
 /// ralph-loop's Stop hook: every turn's end feeds the same prompt back until the model says
 /// its completion promise, which this model never does.
+#[tokio::test]
+async fn esc_while_waiting_for_a_stop_hook_records_an_ordinary_interruption() {
+    let bench = Bench::start(
+        vec![text("done")],
+        vec![user_hook(HookEvent::Stop, None, "wait.sh")],
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("wait.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(60),
+            ..exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Finish.".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    bench.agent.interrupt(bench.chat).await.unwrap();
+    assert!(observe(&mut events, &receipt).await.interrupted);
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert_eq!(
+        conversation_texts(&snapshot.messages).last().unwrap(),
+        "[Request interrupted by user]"
+    );
+    assert!(snapshot.operations.is_empty());
+    bench.agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_ralph_loop_stop_hook_keeps_going_until_esc_or_stop_ends_it() {
     for stops in [false, true] {
@@ -1368,6 +1709,50 @@ async fn stop_failure_tells_hooks_of_a_model_error_and_stop_does_not_run() {
     );
     assert!(bench.inputs_of("stop.sh").is_empty());
     bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_failure_classifies_unclassified_client_errors_separately_from_server_errors() {
+    for (status, expected) in [
+        (400, "unknown"),
+        (422, "unknown"),
+        (500, "server_error"),
+        (503, "server_error"),
+        (402, "billing_error"),
+        (403, "authentication_failed"),
+        (429, "rate_limit"),
+    ] {
+        let bench = Bench::start(
+            Vec::new(),
+            vec![user_hook(HookEvent::StopFailure, None, "alert.sh")],
+        )
+        .await;
+        *bench.gate.failure.lock().unwrap() = Some(
+            ModelError::HttpResponse {
+                status,
+                description: String::new(),
+                retry_after: None,
+                should_retry: Some(false),
+            }
+            .at_stage(tickloop_harness_model::ModelRequestStage::ResponseHeaders),
+        );
+        let alerted = Arc::new(Notify::new());
+        let notify = alerted.clone();
+        bench.define("alert.sh", move |_| {
+            notify.notify_one();
+            exits(0, "", "")
+        });
+        assert!(bench.run("Go.").await.failed.is_some());
+        tokio::time::timeout(Duration::from_secs(5), alerted.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            bench.inputs_of("alert.sh")[0]["error"],
+            expected,
+            "HTTP {status}"
+        );
+        bench.agent.shutdown().await;
+    }
 }
 
 #[tokio::test]

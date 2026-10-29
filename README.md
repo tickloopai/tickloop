@@ -340,6 +340,8 @@ Until you trust them, such hooks do not run, and the conversation says so, for e
 
 `/hooks` lists the hooks of the current folder under **Your settings**, **This folder** and **Plugin NAME@MARKETPLACE**. Each row shows the event, the matcher, the `if` condition, the command and its state: `trusted`, `pending` (never trusted), `modified` (changed since you trusted it) or `disabled`. Use `ctrl+n`/`ctrl+p` or the arrow keys to select, `enter` for the details (the full command, the file it comes from, its timeout, `if` condition and background mode, and what its trust covers; the arrow keys or `ctrl+n`/`ctrl+p` scroll them when they do not fit), `space` or `t` to trust it, `x` twice within three seconds to disable it or restore a disabled one, `r` to refresh and `esc` to close. Your own hooks can be disabled too; disabling one turns it off in every folder. The panel does not edit hooks: change them in their file. Trust records live in your `settings.json` under `hookTrust` (a repository's in its folder's `projects` entry), and uninstalling a plugin removes its records.
 
+Unsupported hook configuration is reported when the Console opens the folder and in `/hooks`, including `.claude/settings.local.json`. The list's navigation keys also reach warnings below the hook rows.
+
 When a new conversation starts in a folder whose hooks are pending or modified, a **Hooks need review** menu offers to review them one by one in `/hooks`, to trust them all and continue, or to continue without trusting them (they do not run). It appears once per folder each time you open Tickloop.
 
 ### What hooks can do
@@ -350,13 +352,15 @@ Tickloop runs `command` hooks for ten events, with the input on stdin, exit code
 | --- | --- | --- |
 | `PreToolUse` | Before a tool call is prepared | Deny it, ask you, allow it (your own hooks only), rewrite its input (`updatedInput`), add context |
 | `PostToolUse` | After a tool call succeeds | Give the model a reason (`decision: "block"`) or context after the result |
-| `PostToolUseFailure` | After a tool call fails | Add context after the result |
+| `PostToolUseFailure` | After a tool call fails, including a missing file during preparation | Add context after the result |
 | `UserPromptSubmit` | Before the model reads a prompt you sent | Block the prompt (it stays out of the conversation and you see why), add context |
 | `SessionStart` | New conversation (`startup`), continuing one (`resume`), `/clear` (`clear`), after compaction (`compact`) | Add context |
 | `SessionEnd` | When the agent ends: stopped in the Agents overview, or its process exits, as with `tickloop daemon stop` | Notification only |
 | `Stop`, `SubagentStop` | When the agent, or a Subagent before it reports back, would end its turn | Block, to keep the turn going with the reason and any `additionalContext`; the next input carries `stop_hook_active: true` |
 | `StopFailure` | When a turn ends on a model error | Notification only |
 | `PreCompact` | Before `/compact` (`manual`) or automatic compaction (`auto`) | Block, to cancel the compaction |
+
+`SessionStart` finishes before the first prompt's `UserPromptSubmit`. The prompt stays queued while these hooks run; its session context is recorded first, then the prompt and its prompt-hook context. A prompt still waiting for hooks survives a Worker restart or a planned upgrade. `esc` while waiting leaves it queued; Continue or another prompt resumes it, while `/stop` discards queued prompts.
 
 - Matchers take exact names, `|` lists or a regular expression; empty or `*` matches everything. They apply to the tool events, `SessionStart` (its source) and `PreCompact` (its trigger). Tool names are Tickloop's: `Read`, `Write`, `Edit`, `Bash` and `mcp__*` are the same as in Claude Code, and `Agent` or `Task` also matches `Subagent`.
 - Fields: `command`, `timeout` in seconds (600 by default), `if`, `async`, and `asyncRewake` with `rewakeMessage` and `rewakeSummary`. `if` takes a permission rule, such as `Bash(git push*)`, and runs the hook only for calls that rule could match; when it cannot tell, the hook runs.

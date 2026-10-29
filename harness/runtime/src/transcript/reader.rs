@@ -258,6 +258,15 @@ pub(crate) fn assemble(
                 .and_then(|parent| parent.entry.parent_uuid);
         }
     }
+    let mut seen_inputs = HashSet::new();
+    let has_queued_input = lifecycle.iter().rev().any(|line| {
+        let Line::Input(input) = line else {
+            return false;
+        };
+        seen_inputs.insert(input.input_id)
+            && input.state == tickloop_harness_transcript::InputState::Accepted
+            && input.queued.is_some()
+    });
     let leaf = match leaf {
         Some(uuid) => match entries.get(&uuid) {
             Some(indexed) => Some(indexed),
@@ -274,6 +283,17 @@ pub(crate) fn assemble(
                 left_time
                     .cmp(&right_time)
                     .then_with(|| right.file_index.cmp(&left.file_index))
+            })
+            .or_else(|| {
+                // A prompt waiting for input hooks has a ledger and Loop, but no message yet.
+                has_queued_input
+                    .then(|| {
+                        entries
+                            .values()
+                            .filter(|indexed| indexed.entry.is_loop_record())
+                            .max_by_key(|indexed| indexed.file_index)
+                    })
+                    .flatten()
             }),
     };
     let Some(leaf) = leaf else {

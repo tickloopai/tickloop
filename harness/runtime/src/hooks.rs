@@ -46,6 +46,7 @@ use output::{HookExit, HookResponse};
 pub(crate) use output::{HookPermission, HookVerdict};
 pub(crate) use session_events::{
     PromptGate, QueuedPrompt, SessionSource, append_hook_notes, is_user_prompt,
+    resume_prompt_inputs,
 };
 pub(crate) use tool_events::{PreToolGate, ToolHookFeedback};
 

@@ -4,15 +4,16 @@
 //! What a hook gives the model is a host note appended at the end of the conversation, so the
 //! request prefix an earlier request sent stays byte for byte the same.
 //!
-//! - `UserPromptSubmit` runs as a Run that a user's prompt started begins, before its first model
-//!   request: a block takes the prompt back out of the conversation, as an interrupted prompt
-//!   is, and ends the Run; `continue: false` keeps the prompt and ends the Run unanswered.
-//!   Triggers and Agent messages are not prompts and run no hook.
+//! - A new prompt stays in the recoverable input queue through `SessionStart` and
+//!   `UserPromptSubmit`. Only then do the prompt and its context enter the conversation.
+//!   A block withdraws the queued prompt; `continue: false` records it and ends the Run
+//!   unanswered. Triggers and Agent messages are not prompts and run no prompt hook.
 //! - It runs too for each prompt queued to a running turn as the turn takes queued input in, at
 //!   a tool boundary or as a `Stop` block goes on, as Claude Code's main thread does: a blocked
 //!   prompt is taken back the same way while the turn goes on, and a prompt whose hook ends its
 //!   turn waits, with the prompts queued after it, for a turn of its own.
-//! - `SessionStart` runs before the next model request of a root Chat after it was created
+//! - `SessionStart` runs before the next prompt's hooks, or the next model request when no
+//!   new prompt is waiting, after a root Chat was created
 //!   (`startup`), loaded from history (`resume`), started by `/clear` (`clear`) or compacted
 //!   (`compact`).
 //! - `Stop` runs when a root Chat's model ends its turn without calling tools, `SubagentStop`
@@ -54,7 +55,7 @@ const SESSION_END_BUDGET: Duration = Duration::from_secs(60);
 const STOP_BLOCK_CAP: u32 = 8;
 
 /// Why a session starts, Claude Code's `SessionStart` source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SessionSource {
     Startup,
     Resume,
@@ -77,15 +78,14 @@ impl SessionSource {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionHookState {
     /// The `SessionStart` the Chat's next model request runs first.
-    session_start: Option<SessionSource>,
+    pub(crate) session_start: Option<SessionSource>,
     /// Runs a `Stop` or `SubagentStop` hook kept going: their hooks read `stop_hook_active`.
     continued_by_stop: HashSet<RunId>,
     /// How many consecutive times `Stop` or `SubagentStop` hooks blocked each Run's end since its
     /// model last called a tool other than the hand-back.
     stop_blocks: HashMap<RunId, u32>,
-    /// Runs whose prompt a `UserPromptSubmit` hook blocked, with the prompt's message index:
-    /// the prompt is taken back once the Run ends.
-    blocked_prompts: HashMap<RunId, usize>,
+    /// Accepted inputs reserved for a Run whose prompt hooks have not finished.
+    pub(crate) preparing_inputs: HashMap<RunId, Vec<RunId>>,
     /// Runs a user's prompt started whose `UserPromptSubmit` hooks have not let it through yet.
     unchecked_prompts: HashSet<RunId>,
     /// `asyncRewake` notifications no model request has read yet.
@@ -145,11 +145,7 @@ impl SessionHookState {
         self.continued_by_stop.remove(&run);
         self.stop_blocks.remove(&run);
         self.unchecked_prompts.remove(&run);
-    }
-
-    /// The prompt index of `run` a `UserPromptSubmit` hook blocked, forgetting it.
-    pub(crate) fn take_blocked_prompt(&mut self, run: RunId) -> Option<usize> {
-        self.blocked_prompts.remove(&run)
+        self.preparing_inputs.remove(&run);
     }
 }
 
@@ -158,6 +154,17 @@ pub(crate) fn is_user_prompt(pending: &PendingInput) -> bool {
     pending.trigger_source.is_none()
         && pending.agent_message.is_none()
         && !pending.task_continuation
+}
+
+pub(crate) fn resume_prompt_inputs(chat: &mut Chat) {
+    for pending in &mut chat.snapshot.pending_inputs {
+        if is_user_prompt(pending) && !pending.armed {
+            pending.armed = true;
+            chat.bookkeeping
+                .lifecycle
+                .set_queued_armed(pending.receipt.run_id, true);
+        }
+    }
 }
 
 /// What a prompt queued to a running turn does as the turn takes it in, after its
@@ -230,24 +237,6 @@ fn last_assistant_message(chat: &Chat) -> Option<String> {
         .filter(|text| !text.trim().is_empty())
 }
 
-/// The prompts `run` started with: the messages it began with that a user typed.
-fn run_prompts(chat: &Chat, run: RunId) -> Vec<usize> {
-    let snapshot = &chat.snapshot;
-    let Some(start) = snapshot
-        .message_runs
-        .iter()
-        .find(|(_, owner)| **owner == run)
-        .map(|(index, _)| *index)
-    else {
-        return Vec::new();
-    };
-    snapshot
-        .prompt_execution_modes
-        .range(start..)
-        .map(|(index, _)| *index)
-        .collect()
-}
-
 /// Claude Code's `StopFailure` error kind for a model failure.
 fn failure_name(error: &ModelError) -> &'static str {
     match error.kind() {
@@ -259,6 +248,9 @@ fn failure_name(error: &ModelError) -> &'static str {
         ModelFailureKind::Configuration
         | ModelFailureKind::InvalidResponse
         | ModelFailureKind::ResponseRejected => "invalid_request",
+        ModelFailureKind::ProviderFailure if error.status().is_some_and(|status| status < 500) => {
+            "unknown"
+        }
         ModelFailureKind::Connection
         | ModelFailureKind::Timeout
         | ModelFailureKind::StreamInterrupted
@@ -306,6 +298,118 @@ impl Agent {
             .map_err(AgentError::Storage)
     }
 
+    pub(crate) async fn checkpoint_pending_prompt(
+        &self,
+        receipt: &Receipt,
+    ) -> Result<(), AgentError> {
+        let preparing = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+            chat.hook_state
+                .session
+                .preparing_inputs
+                .contains_key(&receipt.run_id)
+        };
+        if preparing {
+            self.commit_transcripts(&[receipt.chat_id])
+                .await
+                .map_err(AgentError::Storage)?;
+        }
+        Ok(())
+    }
+
+    fn commit_preparing_prompt(
+        &self,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        notes: Vec<String>,
+    ) -> bool {
+        let Some(inputs) = chat
+            .hook_state
+            .session
+            .preparing_inputs
+            .get(&receipt.run_id)
+        else {
+            return false;
+        };
+        let Some(first) = chat
+            .snapshot
+            .pending_inputs
+            .iter()
+            .find(|input| input.receipt.run_id == receipt.run_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let merged = inputs
+            .iter()
+            .filter(|run| **run != receipt.run_id)
+            .filter_map(|run| {
+                chat.snapshot
+                    .pending_inputs
+                    .iter()
+                    .find(|input| input.receipt.run_id == *run)
+                    .cloned()
+            })
+            .collect();
+        chat.snapshot
+            .pending_inputs
+            .retain(|input| !inputs.contains(&input.receipt.run_id));
+        chat.hook_state
+            .session
+            .preparing_inputs
+            .remove(&receipt.run_id);
+        self.commit_run_inputs(chat, first, merged, notes);
+        true
+    }
+
+    /// Keeps ordinary submissions atomic when neither input event has any configured hooks.
+    pub(crate) async fn commit_unhooked_prompt(
+        &self,
+        receipt: &Receipt,
+        cancel: &CancellationToken,
+    ) -> Result<bool, AgentError> {
+        let pending_session = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+            if !chat
+                .hook_state
+                .session
+                .preparing_inputs
+                .contains_key(&receipt.run_id)
+            {
+                return Ok(false);
+            }
+            chat.hook_state.session.session_start.is_some()
+        };
+        if let Some((context, settings)) = self.hook_context(receipt).await {
+            let folder = context.folder;
+            match tokio::task::spawn_blocking(move || settings.hooks(Some(&folder))).await {
+                Ok(list)
+                    if !list.hooks.iter().any(|hook| {
+                        hook.event == HookEvent::UserPromptSubmit
+                            || pending_session && hook.event == HookEvent::SessionStart
+                    }) => {}
+                _ => return Ok(false),
+            }
+        }
+        let committed = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            if cancel.is_cancelled() || chat.active_run != Some(receipt.run_id) {
+                return Ok(false);
+            }
+            chat.hook_state.session.session_start = None;
+            self.commit_preparing_prompt(chat, receipt, Vec::new())
+        };
+        if committed {
+            self.let_prompt_through(receipt).await;
+        }
+        Ok(committed)
+    }
+
     /// Runs `UserPromptSubmit` for the prompts the Run `receipt` started with, before its first
     /// model request.
     pub(crate) async fn user_prompt_submit(
@@ -313,28 +417,28 @@ impl Agent {
         receipt: &Receipt,
         cancel: &CancellationToken,
     ) -> Result<PromptGate, AgentError> {
-        let (prompts, prompt) = {
+        let (inputs, prompt) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-            if !chat
+            let Some(inputs) = chat
                 .hook_state
                 .session
-                .unchecked_prompts
-                .contains(&receipt.run_id)
-            {
+                .preparing_inputs
+                .get(&receipt.run_id)
+            else {
                 return Ok(PromptGate::Proceed);
-            }
-            let prompts = run_prompts(chat, receipt.run_id);
-            let prompt = prompts
+            };
+            let prompt = chat
+                .snapshot
+                .pending_inputs
                 .iter()
-                .map(|index| text_of(&chat.snapshot.messages[*index].content))
+                .filter(|pending| {
+                    inputs.contains(&pending.receipt.run_id) && is_user_prompt(pending)
+                })
+                .map(|pending| pending.input.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            (prompts, prompt)
-        };
-        let Some(&first_prompt) = prompts.first() else {
-            self.let_prompt_through(receipt).await;
-            return Ok(PromptGate::Proceed);
+            (inputs.clone(), prompt)
         };
         let mut fields = Map::new();
         fields.insert("prompt".into(), json!(prompt));
@@ -358,10 +462,41 @@ impl Agent {
             let chat = chats
                 .get_mut(&receipt.chat_id)
                 .ok_or(AgentError::NotFound)?;
+            let withdrawn = chat
+                .snapshot
+                .pending_inputs
+                .iter()
+                .filter(|pending| {
+                    inputs.contains(&pending.receipt.run_id) && is_user_prompt(pending)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            chat.snapshot.pending_inputs.retain(|pending| {
+                !withdrawn
+                    .iter()
+                    .any(|input| input.receipt.run_id == pending.receipt.run_id)
+            });
+            for pending in withdrawn {
+                self.settle_input(
+                    chat,
+                    pending.receipt.run_id,
+                    tickloop_harness_transcript::SettledOutcome::Withdrawn,
+                );
+                self.emit(
+                    chat,
+                    &pending.receipt,
+                    tickloop_harness_protocol::EventKind::InputTakenBack,
+                );
+            }
             chat.hook_state
                 .session
-                .blocked_prompts
-                .insert(receipt.run_id, first_prompt);
+                .preparing_inputs
+                .remove(&receipt.run_id);
+            chat.hook_state
+                .session
+                .unchecked_prompts
+                .remove(&receipt.run_id);
+            self.save(&chat.snapshot);
             return Ok(PromptGate::End);
         }
         let name = hook_name(HookEvent::UserPromptSubmit, None);
@@ -374,8 +509,18 @@ impl Agent {
                     .unwrap_or_else(|| DEFAULT_STOP_REASON.into()),
             );
         }
-        self.note_from_hooks(receipt, HookEvent::UserPromptSubmit, notes)
-            .await?;
+        {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            if cancel.is_cancelled()
+                || chat.active_run != Some(receipt.run_id)
+                || !self.commit_preparing_prompt(chat, receipt, notes)
+            {
+                return Ok(PromptGate::End);
+            }
+        }
         self.let_prompt_through(receipt).await;
         Ok(if verdict.prevent_continuation {
             PromptGate::End

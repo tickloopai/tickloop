@@ -132,6 +132,41 @@ fn wait_for_review(terminal: &Terminal) -> String {
 }
 
 #[test]
+fn unsupported_local_hooks_warn_in_the_console_and_hooks_panel() {
+    let fixture = Fixture::new();
+    let claude = fixture.root.join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.local.json"),
+        json!({"hooks": {
+            "Notification": [{"hooks": [{"type": "command", "command": "ignored"}]}],
+            "Stop": [{"hooks": [
+                {"type": "prompt", "prompt": "check"},
+                {"type": "command", "command": "ignored", "shell": "bash"}
+            ]}]
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let mut terminal = start(&fixture);
+    terminal.wait_for_frame(0, "local hook warnings", |frame| {
+        shows(frame, "event Notification")
+            && shows(frame, "type prompt")
+            && shows(frame, "field shell")
+    });
+    terminal.press(b"/hooks\r", "warnings in hooks panel", |frame| {
+        shows(frame, LIST_HINT)
+            && shows(frame, "event Notification")
+            && shows(frame, "type prompt")
+            && shows(frame, "field shell")
+    });
+    terminal.press(ESCAPE, "the hooks panel closed", |frame| {
+        !shows(frame, LIST_HINT)
+    });
+    terminal.exit();
+}
+
+#[test]
 fn reviewing_one_by_one_opens_the_list_where_hooks_are_trusted_disabled_and_restored() {
     let fixture = Fixture::new();
     install_plugin_with_hooks(&fixture);

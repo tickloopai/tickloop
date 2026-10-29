@@ -186,12 +186,7 @@ fn apply_answer(
         Some("ask") => response.permission = Some(HookPermission::Ask),
         Some("deny") => {
             response.permission = Some(HookPermission::Deny);
-            response.blocking_error = Some(
-                decision_reason
-                    .clone()
-                    .or(reason)
-                    .unwrap_or(BLOCKED_BY_HOOK.into()),
-            );
+            response.blocking_error = decision_reason.clone().or(reason);
         }
         Some(other) => {
             return Err(format!(
@@ -268,7 +263,9 @@ pub(crate) fn interpret(event: HookEvent, command: &str, exit: HookExit<'_>) -> 
                 }
                 Answer::Json(answer) => match apply_answer(&mut response, event, &answer) {
                     Ok(()) => {
-                        if response.blocking_error.is_some() {
+                        if response.blocking_error.is_some()
+                            || response.permission == Some(HookPermission::Deny)
+                        {
                             response.outcome = HookRunOutcome::Blocking;
                         }
                         response
@@ -306,7 +303,9 @@ pub(crate) fn interpret(event: HookEvent, command: &str, exit: HookExit<'_>) -> 
             let mut response = HookResponse::success();
             match read_answer(exit.stdout) {
                 Answer::Json(answer) if apply_answer(&mut response, event, &answer).is_ok() => {
-                    response.outcome = if response.blocking_error.is_some() {
+                    response.outcome = if response.blocking_error.is_some()
+                        || response.permission == Some(HookPermission::Deny)
+                    {
                         HookRunOutcome::Blocking
                     } else {
                         HookRunOutcome::NonBlockingError

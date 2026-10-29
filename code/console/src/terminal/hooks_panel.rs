@@ -248,7 +248,7 @@ impl HooksPanel {
                     .position(|hook| hook.source == source && hook.key == key)
             })
             .unwrap_or(self.selected)
-            .min(self.hooks().len().saturating_sub(1));
+            .min(self.row_count().saturating_sub(1));
         if self.view == View::Details && self.selected_hook().is_none() {
             self.view = View::List;
         }
@@ -279,6 +279,13 @@ impl HooksPanel {
         match &self.listing {
             Listing::Loaded(listing) => &listing.hooks,
             _ => &[],
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match &self.listing {
+            Listing::Loaded(listing) => listing.hooks.len() + listing.warnings.len(),
+            _ => 0,
         }
     }
 
@@ -326,7 +333,7 @@ impl HooksPanel {
                     self.details_top.saturating_sub(1)
                 };
             } else {
-                self.selected = step(self.selected, self.hooks().len(), down);
+                self.selected = step(self.selected, self.row_count(), down);
             }
             return HooksPanelEffect::None;
         }
@@ -669,8 +676,18 @@ impl HooksPanel {
             push_wrapped(&mut body, &text, INDENT, width, role);
         }
         if let Listing::Loaded(listing) = &self.listing {
-            for warning in &listing.warnings {
+            for (offset, warning) in listing.warnings.iter().enumerate() {
+                let index = listing.hooks.len() + offset;
+                let start = body.lines.len();
                 push_wrapped(&mut body, warning, "", width, Role::Warning);
+                let rows = start..body.lines.len();
+                if index == self.selected {
+                    body.focus = rows.clone();
+                    for line in &mut body.lines[rows.clone()] {
+                        line.fill = Some(Role::Selection);
+                    }
+                }
+                body.targets.push((rows, index));
             }
         }
         let mut hints = Vec::new();
@@ -940,6 +957,34 @@ mod tests {
             listing: Ok(listing(hooks)),
         });
         panel
+    }
+
+    #[test]
+    fn warnings_after_a_long_hook_list_are_reachable_with_navigation_keys() {
+        let mut hooks = Vec::new();
+        for index in 0..30 {
+            hooks.push(hook(plugin(), &format!("hook-{index}"), HookTrust::Trusted));
+        }
+        let mut panel = HooksPanel::new(None);
+        let mut configured = listing(hooks);
+        configured.warnings = vec![
+            "settings.local.json: hook event Notification is not supported".into(),
+            "settings.local.json: hook type prompt is not supported".into(),
+            "settings.local.json: hook field shell is not supported".into(),
+        ];
+        let warnings = configured.warnings.clone();
+        panel.apply(HooksResult::Listed {
+            read: 1,
+            listing: Ok(configured),
+        });
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&text(&mut panel));
+            panel.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        }
+        for warning in warnings {
+            assert!(seen.contains(&warning), "missing {warning}: {seen}");
+        }
     }
 
     fn press(panel: &mut HooksPanel, code: KeyCode) -> HooksPanelEffect {

@@ -480,6 +480,37 @@ fn unsupported_types_events_and_fields_skip_only_their_hook_with_a_warning() {
 }
 
 #[test]
+fn both_repository_settings_files_report_unsupported_hooks_and_keep_supported_ones() {
+    for name in ["settings.json", "settings.local.json"] {
+        let setup = Setup::new();
+        let path = setup.write_repository_file(
+            &setup.folder,
+            name,
+            json!({"hooks": {
+                "Notification": [{"hooks": [{"type": "command", "command": "ignored"}]}],
+                "Stop": [{"hooks": [
+                    {"type": "prompt", "prompt": "check"},
+                    {"type": "command", "command": "ignored", "shell": "bash"},
+                    {"type": "command", "command": "kept"}
+                ]}]
+            }}),
+        );
+        let list = setup.hooks();
+        assert_eq!(commands(&list), [(HookSource::Repository, "kept")]);
+        assert_eq!(list.hooks[0].file, path);
+        for unsupported in ["event Notification", "type prompt", "field shell"] {
+            assert!(
+                list.warnings
+                    .iter()
+                    .any(|warning| warning.contains(name) && warning.contains(unsupported)),
+                "{:?}",
+                list.warnings
+            );
+        }
+    }
+}
+
+#[test]
 fn identical_commands_collapse_within_a_source_but_not_across_plugins() {
     let setup = Setup::new();
     setup.write_user_settings(json!({

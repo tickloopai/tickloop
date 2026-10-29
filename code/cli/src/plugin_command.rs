@@ -626,6 +626,7 @@ fn list(store: &PluginStore, kind: PluginKind) -> Result<(), String> {
                         .then(|| format!("not supported yet: {}", component_labels(&unsupported))),
                 )
                 .chain(hooks_to_confirm(store, plugin))
+                .chain(plugin.manifest.hook_support.warnings())
                 .collect::<Vec<_>>();
             [
                 plugin.id(),

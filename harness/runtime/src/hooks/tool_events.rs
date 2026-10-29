@@ -129,6 +129,11 @@ impl Agent {
                 .map(|error| format!("PreToolUse:{tool} hook error: {error}"))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let message = if message.is_empty() {
+                format!("Hook PreToolUse:{tool} denied this tool")
+            } else {
+                message
+            };
             return PreToolGate::Refused { message, feedback };
         }
         PreToolGate::Proceed {

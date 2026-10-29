@@ -327,6 +327,8 @@ Hook 在 Agent 工作的固定时刻运行 Shell 命令：工具调用前后、�
 
 `/hooks` 按 **Your settings**、**This folder** 与 **Plugin NAME@MARKETPLACE** 分组列出当前目录的 Hook。每行显示事件、matcher、`if` 条件、命令和状态：`trusted`、`pending`（从未信任）、`modified`（信任后有改动）或 `disabled`。用 `ctrl+n`/`ctrl+p` 或方向键选择，`enter` 查看详情（完整命令、所在文件、超时、`if` 条件、后台方式，以及信任覆盖的范围；放不下时用方向键或 `ctrl+n`/`ctrl+p` 滚动），`space` 或 `t` 信任，三秒内按两次 `x` 停用或恢复已停用的 Hook，`r` 刷新，`esc` 关闭。你自己的 Hook 也可以停用，停用后在所有目录都不运行。面板不编辑 Hook，请到它所在的文件里修改。信任记录保存在你的 `settings.json` 的 `hookTrust` 中（仓库的记在该目录的 `projects` 条目里），卸载插件时一并删除。
 
+Console 打开目录时和 `/hooks` 中都会显示不支持的 Hook 配置警告，包括 `.claude/settings.local.json`。用列表的导航键也能到达 Hook 行下面的警告。
+
 新对话开始时，如果当前目录有待确认或已修改的 Hook，会显示 **Hooks need review** 菜单：逐个审查（打开 `/hooks`）、全部信任并继续，或不信任直接继续（这些 Hook 不运行）。每次打开 Tickloop，每个目录只提示一次。
 
 ### Hook 能做什么
@@ -337,13 +339,15 @@ Tickloop 为以下十个事件运行 `command` 类型的 Hook，stdin 输入、�
 | --- | --- | --- |
 | `PreToolUse` | 工具调用准备之前 | 拒绝、要求询问你、放行（仅限你自己的 Hook）、改写参数（`updatedInput`）、补充上下文 |
 | `PostToolUse` | 工具调用成功之后 | 在结果后给模型理由（`decision: "block"`）或补充上下文 |
-| `PostToolUseFailure` | 工具调用失败之后 | 在结果后补充上下文 |
+| `PostToolUseFailure` | 工具调用失败之后，包括准备时发现文件缺失 | 在结果后补充上下文 |
 | `UserPromptSubmit` | 模型读取你发送的提示之前 | 拦下该提示（不进入对话，并显示原因）、补充上下文 |
 | `SessionStart` | 新对话（`startup`）、继续对话（`resume`）、`/clear`（`clear`）、压缩之后（`compact`） | 补充上下文 |
 | `SessionEnd` | Agent 结束时：在 Agents 总览中停止，或其进程退出（如 `tickloop daemon stop`） | 只做通知 |
 | `Stop`、`SubagentStop` | Agent 或 Subagent（交回结果之前）即将结束本轮时 | 拦下，让本轮按给出的理由及 `additionalContext` 继续；下次输入带 `stop_hook_active: true` |
 | `StopFailure` | 一轮因模型错误结束时 | 只做通知 |
 | `PreCompact` | `/compact`（`manual`）或自动压缩（`auto`）之前 | 拦下，取消这次压缩 |
+
+`SessionStart` 完成后才运行首个提示的 `UserPromptSubmit`。等待这些 Hook 时，提示保留在队列；先记录会话上下文，再记录提示及其提示 Hook 上下文。仍在等待 Hook 的提示会跨 Worker 重启或计划升级保留。等待中按 `esc` 会将提示留在队列，Continue 或发送另一条提示后继续；`/stop` 会丢弃排队的提示。
 
 - matcher 接受精确名、`|` 分隔的列表或正则表达式，空或 `*` 匹配全部，用于工具类事件、`SessionStart`（来源）和 `PreCompact`（触发方式）。工具名用 Tickloop 的名字：`Read`、`Write`、`Edit`、`Bash` 与 `mcp__*` 与 Claude Code 相同，`Agent` 或 `Task` 也匹配 `Subagent`。
 - 字段：`command`、`timeout`（秒，默认 600）、`if`、`async`，以及带 `rewakeMessage`、`rewakeSummary` 的 `asyncRewake`。`if` 写一条权限规则，如 `Bash(git push*)`，只在该规则可能匹配的调用上运行；判断不了时照常运行。
