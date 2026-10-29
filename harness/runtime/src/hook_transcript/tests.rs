@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -132,19 +132,102 @@ fn assert_unique_lines(content: &str) {
     assert_eq!(ids.len(), count, "a line was written twice:\n{content}");
 }
 
+/// Beside the Chat's own Transcript in the store, as Claude Code keeps its session file.
+fn expected_path(fixture: &Fixture) -> PathBuf {
+    let stored = fixture.store.chat_path(fixture.chat).unwrap();
+    stored
+        .parent()
+        .unwrap()
+        .join(fixture.chat.uuid().to_string())
+        .join(HOOK_TRANSCRIPT_FILE)
+}
+
+/// A name swapped for a hard link to a file elsewhere is never written through: the transcript
+/// is written again as a new file of its own, and the other file stays as it was.
+#[tokio::test]
+async fn a_hard_link_put_in_its_place_is_never_written_through() {
+    let fixture = answered().await;
+    let (path, before) = fixture.transcript().await;
+    let outside = fixture.directory.path().join("outside.txt");
+    // As long as the transcript, so its length alone cannot tell them apart.
+    let outside_content = format!("{}\n", "o".repeat(before.len() - 1));
+    std::fs::write(&outside, &outside_content).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::hard_link(&outside, &path).unwrap();
+
+    fixture.ask("More", text("More done.")).await;
+    let (_, after) = fixture.transcript().await;
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), outside_content);
+    assert!(after.starts_with(&before), "{after}");
+    assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+    assert_eq!(ralph_loop_last_assistant_text(&path), "More done.");
+    fixture.agent.shutdown().await;
+    assert!(
+        outside.exists(),
+        "deleting the transcript leaves other files alone"
+    );
+}
+
+/// A second link to the transcript would see every later append; it keeps the old content and
+/// the transcript goes on as a new file.
+#[tokio::test]
+async fn a_second_link_to_the_transcript_gets_nothing_more() {
+    let fixture = answered().await;
+    let (path, before) = fixture.transcript().await;
+    let copy = fixture.directory.path().join("linked.jsonl");
+    std::fs::hard_link(&path, &copy).unwrap();
+
+    fixture.ask("More", text("More done.")).await;
+    let (_, after) = fixture.transcript().await;
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), before);
+    assert!(after.starts_with(&before) && after.len() > before.len());
+    assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+    fixture.agent.shutdown().await;
+}
+
+/// A rewrite that keeps the file's length is still caught: the next request writes the
+/// transcript again from the stored Lines.
+#[tokio::test]
+async fn a_same_length_rewrite_is_written_again() {
+    let fixture = answered().await;
+    let (path, before) = fixture.transcript().await;
+    let tampered = before.replace(ANSWER, &"x".repeat(ANSWER.len()));
+    assert_eq!(tampered.len(), before.len());
+    // File times may come from a coarse clock (Linux ticks); a rewrite is noticed once the
+    // clock moved on since the last write.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(tampered.as_bytes())
+        .unwrap();
+
+    let (_, after) = fixture.transcript().await;
+    assert_eq!(after, before);
+    fixture.agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_transcript_is_written_only_when_asked_for_and_reads_like_claude_codes() {
     let fixture = answered().await;
-    let expected = {
-        let chats = fixture.agent.inner.chats.lock().await;
-        chat_temp_directory(&chats[&fixture.chat].snapshot)
-            .path()
-            .join(HOOK_TRANSCRIPT_FILE)
-    };
+    let expected = expected_path(&fixture);
     assert!(!expected.exists(), "nothing is written before a hook asks");
 
     let (path, content) = fixture.transcript().await;
     assert_eq!(path, expected);
+    let family_temp = {
+        let chats = fixture.agent.inner.chats.lock().await;
+        chats[&fixture.chat]
+            .tools
+            .family_temp_directory()
+            .unwrap()
+            .to_path_buf()
+    };
+    assert!(
+        !path.starts_with(&family_temp),
+        "tools write the family temp directory; the transcript lives in the Transcript store"
+    );
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -285,13 +368,10 @@ async fn a_subagent_has_its_own_transcript() {
 
     let root_path = agent.hook_transcript_path(chat).await.unwrap().unwrap();
     let child_path = agent.hook_transcript_path(child).await.unwrap().unwrap();
+    assert_ne!(child_path, root_path);
     assert_eq!(
-        child_path,
-        root_path
-            .parent()
-            .unwrap()
-            .join(child.uuid().to_string())
-            .join(HOOK_TRANSCRIPT_FILE)
+        child_path.parent().unwrap().file_name().unwrap(),
+        child.uuid().to_string().as_str()
     );
     assert_eq!(ralph_loop_last_assistant_text(&root_path), "root done");
     assert_eq!(ralph_loop_last_assistant_text(&child_path), "child done");
@@ -305,7 +385,7 @@ async fn a_subagent_has_its_own_transcript() {
 }
 
 #[tokio::test]
-async fn a_chat_without_a_folder_has_none() {
+async fn a_chat_without_a_local_transcript_has_none() {
     let agent = Agent::with_seams(
         crate::HarnessSeams {
             search: None,

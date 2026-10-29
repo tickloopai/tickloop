@@ -246,7 +246,7 @@ fn family_root(snapshot: &ChatSnapshot) -> ChatId {
 
 /// The Chat's private temporary directory: its family's for the root, and a directory of its own
 /// inside it for a Subagent.
-pub(super) fn chat_temp_directory(snapshot: &ChatSnapshot) -> PrivateDirectory {
+fn chat_temp_directory(snapshot: &ChatSnapshot) -> PrivateDirectory {
     let root = family_root(snapshot);
     let family_temp = private_family_temp_directory(root.into());
     if root == snapshot.id {
