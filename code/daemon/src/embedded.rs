@@ -1168,6 +1168,15 @@ impl EmbeddedAgentAccess {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
             }),
+            AgentCommand::WriteHookTrust {
+                launch,
+                changes,
+                expected_revision,
+            } => Box::pin(async move {
+                crate::hook_trust::write_trust(&launch, changes, expected_revision)
+                    .await
+                    .map(|hooks| CommandResult::Hooks(Box::new(hooks)))
+            }),
             AgentCommand::UpgradeRuntime { .. } => {
                 Box::pin(std::future::ready(Err(AccessError::new(
                     AccessErrorCode::Unsupported,
@@ -2091,6 +2100,15 @@ impl AgentAccess for EmbeddedAgentAccess {
                 ObservationValue::McpServers(vec![
                     crate::draft_mcp::connect(&launch, &name).await?,
                 ]),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
+            ObservationRequest::Hooks { launch } => Ok(Observation::single(
+                ObservationValue::Hooks(Box::new(crate::hook_trust::hooks(&launch).await?)),
                 Cursor {
                     daemon_epoch: self.inner.epoch,
                     execution: None,

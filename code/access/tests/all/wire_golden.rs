@@ -21,6 +21,10 @@ use tickloop_code_access::{
     ReceiptState, RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput,
     ViewRef,
 };
+use tickloop_harness::protocol::hooks::{
+    ConfiguredHook, HookEvent, HookList, HookPluginDirectories, HookSource, HookTrust,
+    HookTrustAction, HookTrustChange,
+};
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
     Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content,
@@ -437,6 +441,31 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
     live
 }
 
+fn hook_list() -> HookList {
+    HookList {
+        hooks: vec![ConfiguredHook {
+            key: "k1".into(),
+            source: HookSource::Plugin {
+                id: "guard@market".into(),
+            },
+            file: "/home/user/.tickloop/plugins/cache/guard/hooks/hooks.json".into(),
+            event: HookEvent::PreToolUse,
+            matcher: Some("Bash".into()),
+            command: "${CLAUDE_PLUGIN_ROOT}/check.sh".into(),
+            resolved_command: Some("/home/user/.tickloop/plugins/cache/guard/check.sh".into()),
+            timeout_secs: 30,
+            plugin: Some(HookPluginDirectories {
+                root: "/home/user/.tickloop/plugins/cache/guard".into(),
+                data: "/home/user/.tickloop/plugins/data/guard".into(),
+            }),
+            hash: Some("h1".into()),
+            trust: HookTrust::Pending,
+        }],
+        warnings: vec!["Notification hooks are not supported yet; skipped".into()],
+        revision: "r1".into(),
+    }
+}
+
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
         additional_directories: Vec::new(),
@@ -662,6 +691,24 @@ fn agent_commands_keep_their_recorded_wire() {
                     chat_id: id(0x90),
                 },
             },
+            AgentCommand::WriteHookTrust {
+                launch: Box::new(launch_spec()),
+                changes: vec![
+                    HookTrustChange {
+                        source: HookSource::Plugin {
+                            id: "guard@market".into(),
+                        },
+                        key: "k1".into(),
+                        action: HookTrustAction::Trust { hash: "h1".into() },
+                    },
+                    HookTrustChange {
+                        source: HookSource::Repository,
+                        key: "k2".into(),
+                        action: HookTrustAction::Disable,
+                    },
+                ],
+                expected_revision: Some("r1".into()),
+            },
         ],
     );
 }
@@ -761,6 +808,9 @@ fn observation_requests_keep_their_recorded_wire() {
             },
             ObservationRequest::EndedAgents {
                 store_root: Some("/home/user/.tickloop".into()),
+            },
+            ObservationRequest::Hooks {
+                launch: Box::new(launch_spec()),
             },
         ],
     );
@@ -934,6 +984,7 @@ fn observation_values_keep_their_recorded_wire() {
                 error: None,
                 workers: Vec::new(),
             })),
+            ObservationValue::Hooks(Box::new(hook_list())),
             ObservationValue::EndedAgents(vec![
                 EndedAgent {
                     record: TranscriptRef {
@@ -1154,6 +1205,7 @@ fn command_results_keep_their_recorded_wire() {
             },
             CommandResult::Text("ok".into()),
             CommandResult::Done,
+            CommandResult::Hooks(Box::new(hook_list())),
             CommandResult::PromptTakenBack {
                 snapshot: Box::new(live_chat_snapshot()),
                 draft: TakenBackPrompt {
