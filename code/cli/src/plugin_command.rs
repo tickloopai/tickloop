@@ -740,7 +740,7 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
         }
     );
     for warning in commands.warnings.iter().chain(registry.warnings()) {
-        println!("Warning: {}", safe_line(&warning));
+        println!("Warning: {}", safe_line(warning));
     }
     if let Some(tick) = &manifest.tick {
         let protocol = if tick.protocol {
