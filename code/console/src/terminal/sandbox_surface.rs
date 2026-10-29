@@ -140,7 +140,7 @@ impl SandboxSurface {
                     && self.selected != MODE_DISABLED
                     && !cfg!(target_os = "macos")
                 {
-                    self.message = "Cannot enable sandbox: 本平台暂不支持".into();
+                    self.message = "Cannot enable sandbox: not supported on this platform".into();
                     return false;
                 }
                 let change = if self.page == Page::Mode {
@@ -283,7 +283,7 @@ impl SandboxSurface {
         lines.push(format!(
             "Host support [local]: {}",
             if !cfg!(target_os = "macos") {
-                "本平台暂不支持"
+                "not supported on this platform"
             } else {
                 match &self.availability {
                     Ok(()) => "available",
@@ -291,8 +291,8 @@ impl SandboxSurface {
                 }
             }
         ));
-        lines.push("Read restrictions (allowRead/denyRead): 暂不支持".into());
-        lines.push("Other network fields (local binding / Unix sockets): 暂不支持".into());
+        lines.push("Read restrictions (allowRead/denyRead): not supported yet".into());
+        lines.push("Other network fields (local binding / Unix sockets): not supported yet".into());
         lines
     }
 
@@ -314,7 +314,7 @@ impl SandboxSurface {
         );
         if !cfg!(target_os = "macos") {
             lines.extend(wrapped(
-                "本平台暂不支持，不能打开沙箱",
+                "Sandbox cannot be enabled on this platform",
                 width,
                 Role::Warning,
             ));

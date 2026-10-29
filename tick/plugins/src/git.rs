@@ -80,7 +80,46 @@ impl GitClient {
         )
         .await?;
         let root = directory.path();
-        let target = if let Some(reference) = source.reference.as_deref() {
+        let target = if let Some(sha) = &source.sha {
+            let sha = sha.to_ascii_lowercase();
+            let available = if sha.len() == 40 {
+                self.run(
+                    root,
+                    &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
+                )
+                .await
+                .is_ok()
+            } else {
+                self.run(
+                    root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{sha}^{{commit}}"),
+                    ],
+                )
+                .await
+                .is_ok()
+            };
+            if !available {
+                // Some servers refuse object-id fetches; abbreviated ids also need local history.
+                let mut arguments = vec![
+                    "fetch",
+                    "--unshallow",
+                    "--no-tags",
+                    "--end-of-options",
+                    "origin",
+                ];
+                if let Some(reference) = source.reference.as_deref() {
+                    arguments.push(reference);
+                } else {
+                    arguments.extend([REMOTE_BRANCHES, REMOTE_TAGS]);
+                }
+                self.run(root, &arguments).await?;
+            }
+            sha
+        } else if let Some(reference) = source.reference.as_deref() {
             self.run(
                 root,
                 &[
@@ -94,42 +133,6 @@ impl GitClient {
             )
             .await?;
             "FETCH_HEAD".to_owned()
-        } else if let Some(sha) = &source.sha {
-            let sha = sha.to_ascii_lowercase();
-            if sha.len() == 40 {
-                self.run(
-                    root,
-                    &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
-                )
-                .await?;
-                "FETCH_HEAD".to_owned()
-            } else {
-                let revision = format!("{sha}^{{commit}}");
-                if self
-                    .run(
-                        root,
-                        &["rev-parse", "--verify", "--end-of-options", &revision],
-                    )
-                    .await
-                    .is_err()
-                {
-                    // Servers cannot fetch an abbreviated object id; obtain history to resolve it locally.
-                    self.run(
-                        root,
-                        &[
-                            "fetch",
-                            "--unshallow",
-                            "--no-tags",
-                            "--end-of-options",
-                            "origin",
-                            REMOTE_BRANCHES,
-                            REMOTE_TAGS,
-                        ],
-                    )
-                    .await?;
-                }
-                sha
-            }
         } else {
             "HEAD".to_owned()
         };
@@ -143,7 +146,10 @@ impl GitClient {
                     &format!("{target}^{{commit}}"),
                 ],
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                PluginError::Invalid(format!("cannot resolve Git commit {target}: {error}"))
+            })?;
         if !valid_sha(&commit) {
             return Err(PluginError::Invalid(
                 "Git returned an invalid commit SHA".into(),

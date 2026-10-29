@@ -285,13 +285,12 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
     crate::support::write_skill(&root.join("plugins/review/skills/new"), "new");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "new"]);
-    let newest = git(&root, &["rev-parse", "HEAD"]);
     let market = fixture.source("sources-market");
     write_json(
         &market.join("marketplace.json"),
         &json!({"name": "sources", "plugins": [
-            {"name": "review", "source": {"source": "git-subdir", "url": format!("file://{}", root.display()), "path": "plugins/review", "ref": "v1", "sha": old}},
-            {"name": "whole", "source": {"source": "url", "url": format!("file://{}", root.display()), "sha": newest}},
+            {"name": "review", "source": {"source": "git-subdir", "url": format!("file://{}", root.display()), "path": "plugins/review", "ref": "main", "sha": old}},
+            {"name": "whole", "source": {"source": "url", "url": format!("file://{}", root.display()), "ref": "main", "sha": old}},
             {"name": "github", "source": {"source": "github", "repo": "owner/repo", "ref": "main", "sha": old}}
         ]}),
     );
@@ -317,11 +316,20 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
         .await
         .unwrap()
         .plugin;
-    assert_eq!(whole.revision, newest[..12]);
+    assert_eq!(whole.revision, old[..12]);
+    assert_eq!(whole.version, old[..12]);
+    assert!(
+        whole
+            .root
+            .join("plugins/review/skills/old/SKILL.md")
+            .is_file()
+    );
+    assert!(!whole.root.join("plugins/review/skills/new").exists());
     assert!(whole.root.join("outside").is_file());
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(market.join("marketplace.json")).unwrap()).unwrap();
-    document["plugins"][0]["source"]["sha"] = json!(newest);
+    document["plugins"][0]["source"]["sha"] = json!("0".repeat(40));
+    document["plugins"][1]["source"]["sha"] = json!("0".repeat(40));
     write_json(&market.join("marketplace.json"), &document);
     fixture
         .store
@@ -329,13 +337,17 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
         .await
         .unwrap();
     let before = fixture.registry();
-    let error = fixture
-        .store
-        .install_marketplace_plugin("sources", "review", &no_http)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("SHA"), "{error}");
-    assert_eq!(before, fixture.registry());
+    let files = fixture.plugin_files();
+    for name in ["review", "whole"] {
+        let error = fixture
+            .store
+            .install_marketplace_plugin("sources", name, &no_http)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&"0".repeat(40)), "{error}");
+        assert_eq!(before, fixture.registry());
+        assert_eq!(files, fixture.plugin_files());
+    }
     assert!(installed.root.join("skills/old/SKILL.md").exists());
 }
 
@@ -1047,7 +1059,7 @@ async fn git_short_sha_pins_resolve_older_commits_and_record_the_full_commit() {
     git(&root, &["commit", "-m", "new"]);
     let source = GitSource {
         url: format!("file://{}", root.display()),
-        reference: None,
+        reference: Some("main".into()),
         sha: Some(old[..8].to_uppercase()),
         subdirectory: None,
     };
@@ -1067,6 +1079,53 @@ async fn git_short_sha_pins_resolve_older_commits_and_record_the_full_commit() {
             .unwrap()
             .contains("name: old")
     );
+}
+
+#[tokio::test]
+async fn git_pins_fall_back_to_ref_history_when_object_fetches_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let root = fixture.source("fetch-fallback");
+    crate::support::write_skill(&root.join("skills/check"), "old");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "old"]);
+    let old = git(&root, &["rev-parse", "HEAD"]);
+    git(&root, &["tag", "v1"]);
+    crate::support::write_skill(&root.join("skills/check"), "new");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "new"]);
+    let executable = fixture.root().join("git-without-object-fetch");
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\ncase \"$*\" in *'origin {old}') exit 1;; esac\nexec git \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = tick_plugins::GitClient::new(executable, std::time::Duration::from_secs(10));
+    for reference in [None, Some("main"), Some("v1")] {
+        let source = GitSource {
+            url: format!("file://{}", root.display()),
+            reference: reference.map(str::to_owned),
+            sha: Some(old.clone()),
+            subdirectory: None,
+        };
+        let checkout = client.checkout(&source, &fixture.root()).await.unwrap();
+        assert_eq!(checkout.commit(), old);
+        assert!(
+            std::fs::read_to_string(checkout.root().join("skills/check/SKILL.md"))
+                .unwrap()
+                .contains("name: old")
+        );
+    }
+    let source = GitSource {
+        url: format!("file://{}", root.display()),
+        reference: Some("v1".into()),
+        sha: None,
+        subdirectory: None,
+    };
+    let checkout = client.checkout(&source, &fixture.root()).await.unwrap();
+    assert_eq!(checkout.commit(), old);
 }
 
 #[tokio::test]

@@ -235,7 +235,7 @@ tickloop plugin marketplace update MARKETPLACE  # omit the name to refresh all
 tickloop plugin marketplace remove MARKETPLACE
 ```
 
-`add` also accepts `OWNER/REPO#REF`, Git URLs (HTTPS, SSH or file), a local directory, or an HTTPS marketplace JSON URL. It uses the name declared by the marketplace. Removing a marketplace keeps its installed plugins. Browsing uses the last fetched Git catalog; refresh it with `marketplace update`. The `tickloop` catalog is read on every use. Plugin `update` refreshes its source and checks Git commits, so it can update content even when the displayed version stays the same. Update-all skips plugins from removed marketplaces.
+`add` also accepts `OWNER/REPO#REF`, Git URLs (HTTPS, SSH or file), a local directory, or an HTTPS marketplace JSON URL. It uses the name declared by the marketplace. Removing a marketplace keeps its installed plugins. Browsing uses the last fetched Git catalog; refresh it with `marketplace update`. The `tickloop` catalog is read on every use. Plugin `update` refreshes its source and checks Git commits, so it can update content even when the displayed version stays the same. Update-all skips plugins from removed marketplaces. A Git source with a `sha` installs that commit even if its `ref` has moved; the ref is only a fetch hint. A missing commit fails installation and leaves the existing plugin unchanged.
 
 For a local plugin directory or `.tar.gz` archive:
 
