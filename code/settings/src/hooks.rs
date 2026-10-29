@@ -15,7 +15,8 @@ use std::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tick_plugins::{
-    CLAUDE_MANIFEST, InstalledPlugin, ManifestFormat, PluginHooks, PluginStore, TICKLOOP_MANIFEST,
+    CLAUDE_MANIFEST, InstalledPlugin, ManifestFormat, PluginHooks, PluginStore,
+    SHIPPED_FILES_RECORD, TICKLOOP_MANIFEST,
 };
 use tickloop_harness::policy::settings::SettingsStoreError;
 use tickloop_harness::policy::skills::{PLUGIN_DATA_VARIABLES, PLUGIN_ROOT_VARIABLES};
@@ -51,10 +52,10 @@ const UNSUPPORTED_COMMAND_FIELDS: [&str; 7] = [
     "if",
     "onFailure",
 ];
-/// Files a run of Python hooks generates in a plugin, left out of its fingerprint.
-const GENERATED_ENTRY_NAMES: [&str; 2] = ["__pycache__", ".venv"];
-const GENERATED_ENTRY_SUFFIXES: [&str; 2] = [".pyc", ".egg-info"];
 const FINGERPRINT_BUFFER_BYTES: usize = 64 * 1024;
+/// Bounds a fingerprint, such as of a symbolic link to a large directory elsewhere.
+const MAX_FINGERPRINT_ENTRIES: usize = 100_000;
+const MAX_FOLLOWED_LINKS: usize = 40;
 
 /// A hook as declared, before its source decides its hash and trust.
 struct DeclaredHook {
@@ -180,7 +181,7 @@ fn repository_hooks(
         return Vec::new();
     }
     let scripts = folder.join(REPOSITORY_HOOKS_DIRECTORY);
-    let fingerprint = match content_fingerprint(&scripts) {
+    let fingerprint = match directory_fingerprint(&scripts) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
             warnings.push(format!(
@@ -234,7 +235,7 @@ fn plugin_hooks(
             continue;
         }
         let id = plugin.id();
-        let fingerprint = match content_fingerprint(&plugin.root) {
+        let fingerprint = match plugin_fingerprint(plugin) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 warnings.push(format!(
@@ -672,71 +673,165 @@ impl UserSettings {
     }
 }
 
-/// A digest of every entry under `root` by relative path: files by their bytes, symlinks by their
-/// target. Generated Python files are left out, as running hooks creates them. A missing `root`
-/// has the digest of an empty directory.
-fn content_fingerprint(root: &Path) -> io::Result<String> {
-    let mut hash = Sha256::new();
-    hash.update(b"tickloop-hook-content-v1");
-    if matches!(fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound) {
-        return Ok(format!("sha256:{:x}", hash.finalize()));
-    }
-    let mut pending = vec![root.to_path_buf()];
-    let mut buffer = vec![0_u8; FINGERPRINT_BUFFER_BYTES];
-    while let Some(path) = pending.pop() {
-        let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-        let name = relative.file_name().and_then(|name| name.to_str());
-        if name.is_some_and(|name| {
-            GENERATED_ENTRY_NAMES.contains(&name)
-                || GENERATED_ENTRY_SUFFIXES
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
-        }) {
-            continue;
+/// A plugin's fingerprint: what it shipped with, by the record its install kept, so files its
+/// programs create later (such as Python bytecode) leave it unchanged; a plugin without a
+/// readable record is covered whole.
+fn plugin_fingerprint(plugin: &InstalledPlugin) -> io::Result<String> {
+    let mut fingerprint = Fingerprint::new();
+    match plugin.shipped_files().ok().flatten() {
+        Some(shipped) => {
+            let record = PathBuf::from(SHIPPED_FILES_RECORD);
+            for relative in shipped.iter().chain([&record]) {
+                fingerprint.named(relative);
+                fingerprint.entry(&plugin.root.join(relative), &mut Vec::new(), 0)?;
+            }
         }
-        let relative = relative.as_os_str().as_encoded_bytes();
-        hash.update((relative.len() as u64).to_le_bytes());
-        hash.update(relative);
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            hash.update(b"directory");
-            let mut entries = fs::read_dir(&path)?.collect::<io::Result<Vec<_>>>()?;
-            entries.sort_by_key(fs::DirEntry::file_name);
-            pending.extend(entries.iter().rev().map(fs::DirEntry::path));
-        } else if metadata.is_symlink() {
-            let target = fs::read_link(&path)?;
-            let target = target.as_os_str().as_encoded_bytes();
-            hash.update(b"symlink");
-            hash.update((target.len() as u64).to_le_bytes());
-            hash.update(target);
-        } else if metadata.is_file() {
-            hash.update(b"file");
-            let length = metadata.len();
-            hash.update(length.to_le_bytes());
-            let mut file = fs::File::open(&path)?.take(length.saturating_add(1));
-            let mut read = 0_u64;
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                read += count as u64;
-                hash.update(&buffer[..count]);
-            }
-            if read != length {
-                return Err(io::Error::other(format!(
-                    "{} changed while it was read",
-                    path.display()
-                )));
-            }
-        } else {
+        None => fingerprint.entry(&plugin.root, &mut Vec::new(), 0)?,
+    }
+    Ok(fingerprint.finish())
+}
+
+/// The fingerprint of everything under `directory`; a missing one counts as empty.
+fn directory_fingerprint(directory: &Path) -> io::Result<String> {
+    let mut fingerprint = Fingerprint::new();
+    fingerprint.entry(directory, &mut Vec::new(), 0)?;
+    Ok(fingerprint.finish())
+}
+
+/// A digest of files by their relative paths and bytes. Symbolic links count with their target
+/// and the content behind it; a link that leads nowhere readable, too far or back into a
+/// directory being read counts as a fixed marker, so it changes once it leads somewhere.
+struct Fingerprint {
+    hash: Sha256,
+    buffer: Vec<u8>,
+    entries: usize,
+}
+
+impl Fingerprint {
+    fn new() -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"tickloop-hook-content-v2");
+        Self {
+            hash,
+            buffer: vec![0; FINGERPRINT_BUFFER_BYTES],
+            entries: 0,
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("sha256:{:x}", self.hash.finalize())
+    }
+
+    fn named(&mut self, name: &Path) {
+        self.bytes(name.as_os_str().as_encoded_bytes());
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.hash.update((bytes.len() as u64).to_le_bytes());
+        self.hash.update(bytes);
+    }
+
+    /// `ancestors` holds the directories being read, canonical; `links` counts the symbolic
+    /// links followed to reach `path`.
+    fn entry(&mut self, path: &Path, ancestors: &mut Vec<PathBuf>, links: usize) -> io::Result<()> {
+        self.entries += 1;
+        if self.entries > MAX_FINGERPRINT_ENTRIES {
             return Err(io::Error::other(format!(
+                "more than {MAX_FINGERPRINT_ENTRIES} entries to read"
+            )));
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.hash.update(b"missing");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.is_symlink() {
+            self.hash.update(b"symlink");
+            self.named(&fs::read_link(path)?);
+            if links >= MAX_FOLLOWED_LINKS {
+                self.hash.update(b"too many links");
+                return Ok(());
+            }
+            match fs::metadata(path) {
+                Ok(target) if target.is_dir() => {
+                    if self.directory(path, ancestors, links + 1).is_err() {
+                        self.hash.update(b"unreadable");
+                    }
+                }
+                Ok(target) if target.is_file() => {
+                    if self.file(path, target.len()).is_err() {
+                        self.hash.update(b"unreadable");
+                    }
+                }
+                Ok(_) => self.hash.update(b"special"),
+                Err(_) => self.hash.update(b"unreadable"),
+            }
+            Ok(())
+        } else if metadata.is_dir() {
+            self.directory(path, ancestors, links)
+        } else if metadata.is_file() {
+            self.file(path, metadata.len())
+        } else {
+            Err(io::Error::other(format!(
                 "{} is not a file, directory or symlink",
+                path.display()
+            )))
+        }
+    }
+
+    fn directory(
+        &mut self,
+        path: &Path,
+        ancestors: &mut Vec<PathBuf>,
+        links: usize,
+    ) -> io::Result<()> {
+        let canonical = fs::canonicalize(path)?;
+        if ancestors.contains(&canonical) {
+            self.hash.update(b"cycle");
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        self.hash.update(b"directory");
+        ancestors.push(canonical);
+        for entry in entries {
+            self.named(Path::new(&entry.file_name()));
+            let result = self.entry(&entry.path(), ancestors, links);
+            if result.is_err() {
+                ancestors.pop();
+                return result;
+            }
+        }
+        ancestors.pop();
+        Ok(())
+    }
+
+    fn file(&mut self, path: &Path, length: u64) -> io::Result<()> {
+        // Reads at most one byte past the observed size, to tell a file that changes while it is
+        // read from a fingerprint of part of it.
+        let mut file = fs::File::open(path)?.take(length.saturating_add(1));
+        self.hash.update(b"file");
+        self.hash.update(length.to_le_bytes());
+        let mut read = 0_u64;
+        loop {
+            let count = file.read(&mut self.buffer)?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            self.hash.update(&self.buffer[..count]);
+        }
+        if read != length {
+            return Err(io::Error::other(format!(
+                "{} changed while it was read",
                 path.display()
             )));
         }
+        Ok(())
     }
-    Ok(format!("sha256:{:x}", hash.finalize()))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

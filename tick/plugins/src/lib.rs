@@ -32,7 +32,7 @@ pub use registry::{PluginSource, REGISTRY_FILE_NAME};
 pub use source::{GitSource, MarketplaceSource};
 pub use store::{
     BrokenPlugin, DownloadFile, ExpectedArchive, InstallOutcome, Installation, InstalledPlugin,
-    InstalledPlugins, PluginStore, Uninstalled,
+    InstalledPlugins, PluginStore, SHIPPED_FILES_RECORD, Uninstalled,
 };
 
 /// The directory under the config root that holds the plugins and their registry.

@@ -36,6 +36,8 @@ const DATA_DIRECTORY: &str = "data";
 /// every install since a local build need not change its version.
 pub(crate) const LOCAL_REVISION: &str = "local";
 const MANIFEST_DIRECTORY_MODE: u32 = 0o755;
+/// In an installed plugin's root, the JSON list of the files and symbolic links it shipped with.
+pub const SHIPPED_FILES_RECORD: &str = ".tickloop-shipped-files.json";
 
 /// A plugin as installed: its manifest, where it is, and how it was installed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +79,28 @@ impl InstalledPlugin {
     /// The absolute directory of every Skill the plugin carries.
     pub fn skill_directories(&self) -> Vec<PathBuf> {
         skill_directories(&self.root, &self.manifest.skill_paths)
+    }
+
+    /// The files and symbolic links the plugin was installed with, relative to its root and
+    /// sorted, as recorded at install; `None` for a copy installed before records were kept or
+    /// with a name the record cannot hold. Files its programs create later are not among them.
+    pub fn shipped_files(&self) -> io::Result<Option<Vec<PathBuf>>> {
+        let bytes = match fs::read(self.root.join(SHIPPED_FILES_RECORD)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid shipped file record");
+        let paths = serde_json::from_slice::<Vec<PathBuf>>(&bytes).map_err(|_| invalid())?;
+        if paths.iter().any(|path| {
+            path.as_os_str().is_empty()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        }) {
+            return Err(invalid());
+        }
+        Ok(Some(paths))
     }
 }
 
@@ -488,6 +512,7 @@ impl PluginStore {
         if let Some(document) = manifest.written_manifest(request.entry) {
             write_manifest(&staged, &document)?;
         }
+        record_shipped_files(&staged)?;
         if let Some((name, version)) = request.expected {
             if manifest.name != name {
                 return Err(PluginError::Invalid(format!(
@@ -767,6 +792,44 @@ fn write_manifest(root: &Path, document: &Value) -> Result<(), PluginError> {
     let mut contents = serde_json::to_vec_pretty(document).expect("a manifest serializes");
     contents.push(b'\n');
     fs::write(&path, contents).map_err(PluginError::io(format!("cannot write {}", path.display())))
+}
+
+/// Records in the staged plugin at `root` the files and symbolic links it ships with, replacing
+/// anything the plugin itself put at the record's name. A plugin with a name JSON cannot hold
+/// gets no record, so everything under its root counts as shipped.
+fn record_shipped_files(root: &Path) -> Result<(), PluginError> {
+    let record = root.join(SHIPPED_FILES_RECORD);
+    let cannot =
+        |action: &str, path: &Path| PluginError::io(format!("cannot {action} {}", path.display()));
+    match fs::symlink_metadata(&record) {
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(&record).map_err(cannot("remove", &record))?
+        }
+        Ok(_) => fs::remove_file(&record).map_err(cannot("remove", &record))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(cannot("read", &record)(error)),
+    }
+    let mut shipped = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(cannot("read", &directory))? {
+            let entry = entry.map_err(cannot("read", &directory))?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(cannot("read", &path))?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).expect("entries lie under the root");
+                shipped.push(relative.to_path_buf());
+            }
+        }
+    }
+    shipped.sort();
+    let Ok(mut contents) = serde_json::to_vec_pretty(&shipped) else {
+        return Ok(());
+    };
+    contents.push(b'\n');
+    fs::write(&record, contents).map_err(cannot("write", &record))
 }
 
 /// Opens the archive and hashes it, refusing it when `expected_sha256` differs; returns it

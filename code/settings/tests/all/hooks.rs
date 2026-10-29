@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_plugins::{InstalledPlugin, PluginStore};
+use tick_plugins::{InstalledPlugin, PluginStore, SHIPPED_FILES_RECORD};
 use tickloop_code_settings::UserSettings;
 use tickloop_harness::policy::settings::{SettingsStore, SettingsStoreError};
 use tickloop_harness::protocol::hooks::{
@@ -602,4 +602,142 @@ fn unreadable_trust_records_leave_hooks_unconfirmed_with_a_warning() {
             .is_err()
     );
     assert_eq!(setup.user_settings(), saved);
+}
+
+fn trust_after(setup: &Setup, command: &str, change: impl FnOnce()) -> HookTrust {
+    setup.trust(&only(&setup.hooks(), command));
+    change();
+    only(&setup.hooks(), command).trust
+}
+
+#[test]
+fn a_plugin_fingerprint_covers_everything_it_shipped_but_not_files_made_after_install() {
+    let setup = Setup::new();
+    let plugin = setup.install_plugin(
+        "guard",
+        json!({"name": "guard"}),
+        &[
+            (
+                "hooks/hooks.json",
+                &hooks_json(hooks_of("Stop", None, &["guard"])),
+            ),
+            (".venv/lib/site.pth", "import shipped\n"),
+            (
+                "hooks/__pycache__/check.cpython-312.pyc",
+                "shipped bytecode",
+            ),
+            ("pkg.egg-info/PKG-INFO", "Name: guard\n"),
+        ],
+    );
+    let root = &plugin.root;
+
+    for shipped in [
+        ".venv/lib/site.pth",
+        "hooks/__pycache__/check.cpython-312.pyc",
+        "pkg.egg-info/PKG-INFO",
+    ] {
+        assert_eq!(
+            trust_after(&setup, "guard", || fs::write(root.join(shipped), "changed")
+                .unwrap()),
+            HookTrust::Modified,
+            "{shipped}"
+        );
+    }
+    assert_eq!(
+        trust_after(&setup, "guard", || fs::remove_file(
+            root.join(".venv/lib/site.pth")
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+    assert_eq!(
+        trust_after(&setup, "guard", || {
+            fs::create_dir_all(root.join("__pycache__")).unwrap();
+            fs::write(root.join("__pycache__/run.pyc"), "generated").unwrap();
+            fs::write(root.join("hooks/__pycache__/new.pyc"), "generated").unwrap();
+        }),
+        HookTrust::Trusted
+    );
+    assert_eq!(
+        trust_after(&setup, "guard", || fs::write(
+            root.join(SHIPPED_FILES_RECORD),
+            "[]"
+        )
+        .unwrap()),
+        HookTrust::Modified,
+        "a record that leaves out shipped files"
+    );
+}
+
+#[test]
+fn a_plugin_installed_without_a_record_of_its_files_covers_every_file() {
+    let setup = Setup::new();
+    let plugin = setup.install_plugin(
+        "guard",
+        json!({"name": "guard"}),
+        &[(
+            "hooks/hooks.json",
+            &hooks_json(hooks_of("Stop", None, &["guard"])),
+        )],
+    );
+    fs::remove_file(plugin.root.join(SHIPPED_FILES_RECORD)).unwrap();
+
+    assert_eq!(
+        trust_after(&setup, "guard", || {
+            fs::create_dir_all(plugin.root.join("__pycache__")).unwrap();
+            fs::write(plugin.root.join("__pycache__/run.pyc"), "generated").unwrap();
+        }),
+        HookTrust::Modified
+    );
+}
+
+#[test]
+fn content_behind_symlinks_counts_for_the_fingerprint() {
+    let setup = Setup::new();
+    setup.write_repository_file(
+        &setup.folder,
+        "settings.json",
+        json!({"hooks": hooks_of("Stop", None, &[".claude/hooks/check.sh"])}),
+    );
+    let hooks = setup.folder.join(".claude/hooks");
+    let scripts = setup.folder.join("scripts");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::create_dir_all(scripts.join("lib")).unwrap();
+    fs::write(scripts.join("check.sh"), "exit 0\n").unwrap();
+    std::os::unix::fs::symlink("../../scripts/check.sh", hooks.join("check.sh")).unwrap();
+    std::os::unix::fs::symlink("../../scripts/lib", hooks.join("lib")).unwrap();
+    std::os::unix::fs::symlink("../../scripts/missing.sh", hooks.join("later.sh")).unwrap();
+    std::os::unix::fs::symlink(".", hooks.join("loop")).unwrap();
+    std::os::unix::fs::symlink("../../scripts", scripts.join("lib/up")).unwrap();
+    let command = ".claude/hooks/check.sh";
+
+    assert_eq!(
+        trust_after(&setup, command, || fs::write(
+            scripts.join("check.sh"),
+            "exit 2\n"
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+    assert_eq!(
+        trust_after(&setup, command, || fs::write(
+            scripts.join("lib/util.sh"),
+            "x\n"
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+    assert_eq!(
+        trust_after(&setup, command, || fs::write(
+            scripts.join("missing.sh"),
+            "x\n"
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+    assert_eq!(
+        trust_after(&setup, command, || {}),
+        HookTrust::Trusted,
+        "cycles hash the same each time"
+    );
 }
