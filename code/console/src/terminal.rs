@@ -943,7 +943,7 @@ Subagents wear the colour they were given at creation; the input takes the colou
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
 space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card; a Shell's screen only shows it, and esc leaves it. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; n selects the next row with an unseen update. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, restoring its subscriptions at their frequencies; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
-The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; j/k and ctrl+n/p select, enter shows details, esc returns to the editor.
+The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 esc interrupts the current turn and pauses an active Goal; Tick Subscriptions and Artifact feedback keep arriving.
@@ -979,7 +979,7 @@ After a completed turn, a dim prompt suggestion may appear in empty input; /sett
 tab or right accepts the suggestion for editing; empty enter accepts and submits; esc dismisses after candidates or dialogs.
 ↑/↓ or ctrl+n/p selects a completion; enter fills a selected match or sends the draft.
 Typing @ and part of a local path offers files and directories; only an accepted candidate is attached.
-Focused lists also accept j/k and ctrl+n/p; enter confirms; esc cancels or denies.
+Focused lists also accept ctrl+n/p; enter confirms; esc cancels or denies.
 Input uses normal editing with Emacs keys: ctrl+a/e line start/end, ctrl+b/f and alt+b/f move by character and word.
 ctrl+h deletes backward; ctrl+k/u/w and alt+d/alt+backspace kill; ctrl+y yanks and alt+y cycles; ctrl+_ undoes; ctrl+s stashes the draft.
 ctrl+g edits the draft in $VISUAL or $EDITOR (which may be Vim); saving and quitting updates the draft.
@@ -995,7 +995,7 @@ esc twice clears a draft into history, or opens the rewind review when input is 
 /rewind opens the Rewind checkpoint selector.
 ctrl+o or /details opens the full conversation transcript; ctrl+o, esc or q returns.
 In transcript: / searches, enter accepts, n/N moves between matches; esc cancels search.
-j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
+ctrl+n/p or arrows scroll; g/G or home/end jumps.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
 /plan [open|DESCRIPTION] enters Plan mode, starting on DESCRIPTION when given; in Plan it shows the plan, and open edits it in your editor. A plan awaiting approval reopens its review: ctrl+g edits the plan, shift+tab on the feedback field approves with that feedback.
@@ -10432,6 +10432,14 @@ mod tests {
     #[test]
     fn tui_runs_immediately_rather_than_after_the_current_turn() {
         assert_eq!(command_timing("/tui fullscreen"), CommandTiming::Immediate);
+    }
+
+    #[test]
+    fn help_advertises_ctrl_n_p_for_lists_and_never_j_k() {
+        let help = help_text();
+        assert!(!help.contains("j/k"), "{help}");
+        assert!(help.contains("Focused lists also accept ctrl+n/p"));
+        assert!(help.contains("ctrl+n/p or arrows scroll"));
     }
 
     #[test]

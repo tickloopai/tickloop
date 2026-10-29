@@ -256,7 +256,7 @@ impl TickDetailView for TaskDetail {
         self
     }
     fn hint(&self) -> String {
-        "j/k scroll · x remove · esc back".into()
+        "ctrl+n/p scroll · x remove · esc back".into()
     }
     fn lines(&mut self, width: usize, height: usize, _now: u64) -> Vec<TickDetailLine> {
         let view = view(&self.task, false, None, false);
@@ -365,6 +365,27 @@ mod tests {
             "jitter_ms": 0, "skipped": 2
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn task_detail_hints_ctrl_n_p_and_scrolls_with_it_and_with_j_k() {
+        let mut detail = TaskDetail {
+            id: Uuid::nil(),
+            chat: Uuid::nil(),
+            task: task(),
+            top: 0,
+        };
+        assert_eq!(detail.hint(), "ctrl+n/p scroll · x remove · esc back");
+        let (width, height) = (20, 2);
+        for (code, modifiers, top) in [
+            (KeyCode::Char('n'), KeyModifiers::CONTROL, 1),
+            (KeyCode::Char('j'), KeyModifiers::NONE, 2),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL, 1),
+            (KeyCode::Char('k'), KeyModifiers::NONE, 0),
+        ] {
+            detail.key(KeyEvent::new(code, modifiers), width, height);
+            assert_eq!(detail.top, top, "{code:?} {modifiers:?}");
+        }
     }
 
     #[test]

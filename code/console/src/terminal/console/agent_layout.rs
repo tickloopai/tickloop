@@ -1880,7 +1880,7 @@ pub(super) fn help_lines(
             "x twice closes/removes/unlinks",
             "enter reopen restores subscriptions",
             "f/h Artifact new/all feedback",
-            "j/k list navigation",
+            "ctrl+n/p list navigation",
             "pgup/pgdn conversation",
             "ctrl+end latest",
         ]

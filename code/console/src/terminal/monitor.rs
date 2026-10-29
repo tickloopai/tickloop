@@ -1556,10 +1556,10 @@ impl Monitor {
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
         if self.is_more_selected() {
-            return "enter all scheduled · j/k select · esc input".into();
+            return "enter all scheduled · ctrl+n/p select · esc input".into();
         }
         if self.is_goal_selected() {
-            return "enter Goal details · j/k select · esc return to input".into();
+            return "enter Goal details · ctrl+n/p select · esc return to input".into();
         }
         if let Some(task) = self.selected_task() {
             let pause = if task.confirmation
@@ -1574,7 +1574,7 @@ impl Monitor {
             return format!(
                 "{pause}{}",
                 if self.expanded_tasks {
-                    "enter details · x remove · j/k select · esc back"
+                    "enter details · x remove · ctrl+n/p select · esc back"
                 } else {
                     "enter details · x remove · esc input"
                 }
