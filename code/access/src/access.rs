@@ -99,8 +99,11 @@ use tickloop_harness::protocol::{
 /// state belongs to the Agent), and adds the most rows a Tick can use to its Monitor member.
 /// 35.1 adds the ended root Agents the overview keeps after their execution ended, stopping a
 /// root Agent, and forgetting an ended one.
-pub const PROTOCOL_MAJOR: u16 = 35;
-pub const PROTOCOL_MINOR: u16 = 1;
+/// 36.0 adds an ended root Agent whose last turn had finished (`EndedOutcome::Completed`,
+/// `EndReason::Finished`), which older readers reject as unknown, and whether an Agent summary
+/// still has work pending while its Loop is idle.
+pub const PROTOCOL_MAJOR: u16 = 36;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -812,6 +815,11 @@ pub struct AgentSummary {
     /// older daemon or worker); it is neither worked nor empty and stays absent when re-sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_work: Option<bool>,
+    /// Whether work is still coming while its Loop is idle: queued input, an active Goal, a
+    /// scheduled task, a received Tick Subscription or a running Shell. `None` when the producer
+    /// did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_work: Option<bool>,
     /// Unix milliseconds when the Loop or a user Shell of this execution last entered its current
     /// state; for finished work, when it finished. `None` when no producer recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -833,6 +841,8 @@ pub struct AgentSummary {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EndedOutcome {
+    /// Its last turn had finished with nothing pending: Claude Code's done.
+    Completed,
     Failed,
     Stopped,
 }
@@ -848,6 +858,8 @@ pub enum EndReason {
     WorkerLost,
     /// The user stopped it.
     UserStopped,
+    /// Its last turn had already ended, with nothing pending, when its execution ended.
+    Finished,
 }
 
 /// A root Agent whose execution ended, as the overview lists it.
