@@ -35,6 +35,8 @@ const BUILD: &str = "cargo build";
 const SAFE_BUILD: &str = "cargo check";
 const GUARD: &str = "guard.sh";
 const PLUGIN: &str = "guard@market";
+/// What the model reads for a call an interruption stopped before it was admitted.
+const NOT_EXECUTED: &str = "Interrupted before tool admission; the operation was not executed.";
 
 fn hook(
     source: HookSource,
@@ -768,7 +770,10 @@ async fn timeouts_and_other_statuses_only_warn() {
 async fn esc_and_stop_end_a_running_pre_tool_use_hook_and_the_call_never_runs() {
     for stops in [false, true] {
         let bench = Bench::start(
-            Options::new(ExecutionMode::FullAccess, vec![build_call(), text("done")]),
+            Options::new(
+                ExecutionMode::FullAccess,
+                vec![build_call(), text("not built")],
+            ),
             vec![user_hook(HookEvent::PreToolUse, None, "hang")],
         )
         .await;
@@ -799,6 +804,18 @@ async fn esc_and_stop_end_a_running_pre_tool_use_hook_and_the_call_never_runs() 
         assert!(observed.interrupted, "stop={stops}");
         assert!(observed.started.is_empty(), "stop={stops}");
         assert_eq!(observed.hook_runs[0].outcome, HookRunOutcome::Cancelled);
+        assert_eq!(
+            observed
+                .results
+                .iter()
+                .map(|result| result.content.as_str())
+                .collect::<Vec<_>>(),
+            [NOT_EXECUTED],
+            "the interface shows the call as not run, stop={stops}"
+        );
+        bench.run("Did it build?", true).await;
+        let results = bench.model_tool_results();
+        assert_eq!(results, [NOT_EXECUTED], "stop={stops}");
         bench.agent.shutdown().await;
     }
 }
