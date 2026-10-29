@@ -1046,6 +1046,47 @@ fn the_selection_previews_wherever_it_lands_and_only_while_the_list_has_the_keys
 }
 
 #[test]
+fn a_row_leaving_moves_the_preview_to_the_row_taking_its_place_once_it_rested() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two] = [&rows[1], &rows[2]];
+    let start = Instant::now();
+    state.monitor.select(one);
+    rest_until(&mut state, start);
+    attaches(rest_until(&mut state, start + RESTED), chat, one);
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    let left = start + Duration::from_secs(1);
+    let entries: Vec<_> = state
+        .monitor
+        .entries()
+        .iter()
+        .filter(|entry| entry.group == TickGroup::Ticks && &entry.instance != one)
+        .cloned()
+        .collect();
+    state.update_tick_entries(chat, TickGroup::Ticks, entries);
+    assert_eq!(
+        selected(&state),
+        *two,
+        "the row taking its place is selected"
+    );
+    assert!(rest_until(&mut state, left).is_none());
+    assert!(
+        !state.cards.is_open(one) && state.cards.previewed().is_none(),
+        "the removed row's preview closes"
+    );
+    assert!(
+        rest_until(&mut state, left + QUICKLY).is_none(),
+        "not before the selection rested"
+    );
+    assert!(!state.cards.is_open(two));
+    attaches(rest_until(&mut state, left + RESTED), chat, two);
+    assert_eq!(origin(&state, two), Some(CardOrigin::Preview));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.shown_cards.contains(two), "{}", screen(&state));
+}
+
+#[test]
 fn tab_in_the_input_never_moves_the_monitor() {
     let (mut state, rows) = tab_fixture();
     state.monitor.focused = false;
