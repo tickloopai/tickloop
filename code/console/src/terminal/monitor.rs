@@ -1573,7 +1573,7 @@ impl Monitor {
             }
         }
         if entry.is_unread() {
-            parts.push("Unread".to_owned());
+            parts.push("Agent unread".to_owned());
         }
         parts.retain(|part| !part.is_empty());
         parts.join(" · ")
@@ -4248,12 +4248,15 @@ mod scrolling_tests {
         let mut monitor = monitor(2);
         observe(&mut monitor, &[0], 5_000);
         let status = |monitor: &Monitor| texts(&monitor.frame(30, 12, display, 6_000)).join("\n");
-        assert!(status(&monitor).contains("Unread"), "list focused");
+        assert!(status(&monitor).contains("Agent unread"), "list focused");
         monitor.card_focused = true;
-        assert!(!status(&monitor).contains("Unread"), "a card focused");
+        assert!(!status(&monitor).contains("Agent unread"), "a card focused");
         monitor.card_focused = false;
         monitor.focused = false;
-        assert!(!status(&monitor).contains("Unread"), "the input focused");
+        assert!(
+            !status(&monitor).contains("Agent unread"),
+            "the input focused"
+        );
         assert_eq!(
             monitor.side_content_height(30, 12, display, 6_000),
             12 - 1,
