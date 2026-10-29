@@ -698,16 +698,15 @@ fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat Pe
         {
             continue;
         }
-        if chat
-            .user_skill_preparations
-            .get(&pending.receipt.run_id)
-            .is_some_and(|preparation| match preparation {
-                command_skills::UserSkillPreparation::Pending(expansion) => {
+        if pending.is_skill_invocation
+            && match chat.user_skill_preparations.get(&pending.receipt.run_id) {
+                Some(command_skills::UserSkillPreparation::Pending(expansion)) => {
                     !expansion.shell_commands.is_empty()
                 }
-                command_skills::UserSkillPreparation::Started => true,
-                command_skills::UserSkillPreparation::Complete => false,
-            })
+                Some(command_skills::UserSkillPreparation::Started) => true,
+                Some(command_skills::UserSkillPreparation::Complete) => false,
+                None => !command_skills::ordinary_guidance_is_active(chat, pending.receipt.run_id),
+            }
         {
             is_behind_held_prompt = true;
         }

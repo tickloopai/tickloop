@@ -899,3 +899,104 @@ async fn plain_command_guidance_keeps_the_existing_active_turn_merge_behavior() 
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn durable_restore_rejects_a_queued_command_whose_plan_and_source_were_not_retained() {
+    use super::durable_queue::{Script, Step};
+    use tickloop_harness_runtime::SkillInvocation;
+    use tickloop_harness_runtime::{Delivery, ParentSelection, TurnOp, TurnRequest, WaitHosting};
+    use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
+    use tickloop_harness_transcript::SettledOutcome;
+    let folder = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let make = |store: Arc<InMemoryTranscriptStore>, model: Arc<Script>| {
+        let environment = MemoryEnvironment::new();
+        environment.define_shell("printf active", Duration::ZERO, b"active".to_vec(), 0);
+        environment.define_shell("touch must-not-run", Duration::ZERO, b"wrong".to_vec(), 0);
+        let mut options = HarnessOptions::local(config());
+        options.waits = WaitHosting::Durable;
+        options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DenyOnPrompt;
+        options.tools.tick_subscriptions = false;
+        options.tools.user_skills = true;
+        options.settings = Some(Arc::new(CommandSettings {
+            memory: Default::default(),
+            markdown: "---\ndescription: Check\n---\n!`touch must-not-run`".into(),
+        }));
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model),
+            },
+            options,
+        )
+        .unwrap()
+    };
+    let model = Script::new(vec![Step::Hang]);
+    let first = make(store.clone(), model.clone());
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    first.submit(chat, "Do ordinary work".into()).await.unwrap();
+    model.until_holding().await;
+    let input_id = tickloop_ids::generate().into();
+    first
+        .advance(
+            chat,
+            TurnRequest {
+                input_id,
+                op: TurnOp::Skill {
+                    after: ParentSelection::CurrentLeaf,
+                    skill: SkillInvocation {
+                        name: "demo:check".into(),
+                        arguments: String::new(),
+                    },
+                },
+                delivery: Delivery::Queue,
+                host_context: None,
+            },
+        )
+        .await
+        .unwrap();
+    first.sync().await.unwrap();
+    let image = Arc::new(InMemoryTranscriptStore::new());
+    image.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    first.shutdown().await;
+    let resumed_model = Script::new(vec![
+        Step::Reply(call("active", "Bash", json!({"command":"printf active"}))),
+        Step::Reply(text("done")),
+    ]);
+    let resumed = make(image, resumed_model.clone());
+    resumed.resume_chat(chat).await.unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        resumed.settled_input(chat, input_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(outcome, SettledOutcome::Failed { ref error } if error.contains("Skill preparation was interrupted or not retained")),
+        "{outcome:?}"
+    );
+    assert!(
+        resumed_model
+            .conversation_requests()
+            .iter()
+            .all(|request| !request.contains("/demo:check"))
+    );
+    assert!(
+        !resumed
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .iter()
+            .any(|operation| operation.name == "Bash"
+                && operation.input["command"] == "touch must-not-run")
+    );
+    resumed.shutdown().await;
+}

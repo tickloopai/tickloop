@@ -15,6 +15,20 @@ pub(super) fn shell_input(name: &str, command: &str) -> Value {
     serde_json::json!({"command": command, "description": format!("Prepare /{name}"), "run_in_background": false})
 }
 
+pub(super) fn ordinary_guidance_is_active(chat: &Chat, run: RunId) -> bool {
+    chat.snapshot
+        .user_skill_invocations
+        .get(&run)
+        .is_some_and(|invocation| {
+            chat.skills.is_plugin_command(&invocation.name) == Some(false)
+                && chat
+                    .snapshot
+                    .invoked_skills
+                    .iter()
+                    .any(|skill| skill.name == invocation.name && skill.source == invocation.source)
+        })
+}
+
 impl Agent {
     pub(super) async fn skill_shell_output(
         &self,
@@ -44,24 +58,23 @@ impl Agent {
             let chat = chats
                 .get_mut(&receipt.chat_id)
                 .ok_or("chat is unavailable")?;
-            if !chat
+            let is_skill_input = chat
                 .snapshot
                 .user_skill_invocations
                 .contains_key(&receipt.run_id)
-            {
+                || chat
+                    .bookkeeping
+                    .lifecycle
+                    .open_input(receipt.run_id)
+                    .and_then(|input| chat.bookkeeping.lifecycle.input(input))
+                    .is_some_and(|input| {
+                        matches!(input.op, tickloop_harness_transcript::InputOp::Skill)
+                    });
+            if !is_skill_input {
                 return Ok(false);
             }
             if !chat.user_skill_preparations.contains_key(&receipt.run_id)
-                && chat
-                    .snapshot
-                    .user_skill_invocations
-                    .get(&receipt.run_id)
-                    .is_some_and(|invocation| {
-                        chat.skills.is_plugin_command(&invocation.name) == Some(false)
-                            && chat.snapshot.invoked_skills.iter().any(|skill| {
-                                skill.name == invocation.name && skill.source == invocation.source
-                            })
-                    })
+                && ordinary_guidance_is_active(chat, receipt.run_id)
             {
                 return Ok(false);
             }
