@@ -361,6 +361,8 @@ impl Agent {
                     ));
                 }
             };
+            let announced_loop_state =
+                crate::loop_state_notes::restored(&snapshot, &saved.bookkeeping);
             self.inner.chats.lock().await.insert(
                 snapshot.id,
                 Chat {
@@ -372,7 +374,7 @@ impl Agent {
                     task_checkpoint_pending: false,
                     family_finishing: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
-                    announced_loop_state: None,
+                    announced_loop_state,
                     active: saved
                         .waiting
                         .as_ref()

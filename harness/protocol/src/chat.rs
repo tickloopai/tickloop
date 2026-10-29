@@ -491,6 +491,47 @@ pub enum GuidanceNote {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         mcp_servers: BTreeSet<String>,
     },
+    /// Guidance of a kind a later version wrote, kept as written so the Chat still loads; it
+    /// announces nothing this version knows of.
+    #[serde(untagged)]
+    Unknown(UnknownGuidance),
+}
+
+/// The `kind` of every guidance note this version knows.
+const KNOWN_GUIDANCE_KINDS: [&str; 5] = [
+    "skill",
+    "mcp_instructions",
+    "mcp_servers",
+    "mcp_warnings",
+    "withdrawn",
+];
+
+/// A guidance note of a kind this version does not know: its `kind` and its whole JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownGuidance {
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+impl Serialize for UnknownGuidance {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownGuidance {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kind = value["kind"]
+            .as_str()
+            .ok_or_else(|| serde::de::Error::custom("a guidance note has a kind"))?
+            .to_owned();
+        // A known kind that does not parse is a broken note, not an unknown one.
+        if KNOWN_GUIDANCE_KINDS.contains(&kind.as_str()) {
+            return Err(serde::de::Error::custom(format!("invalid {kind} guidance")));
+        }
+        Ok(Self { kind, value })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -1501,6 +1501,10 @@ fn chain_entry(
             _ => None,
         },
         loop_state_note: snapshot.host_notes.get(&index) == Some(&HostNote::LoopState),
+        loop_state_view: match snapshot.host_notes.get(&index) {
+            Some(HostNote::LoopState) => bookkeeping.loop_state_views.get(&index).cloned(),
+            _ => None,
+        },
         task_reminder: snapshot.host_notes.get(&index) == Some(&HostNote::TaskReminder),
         date_change: match snapshot.host_notes.get(&index) {
             Some(HostNote::DateChange(date)) => Some(date.clone()),
@@ -1668,6 +1672,7 @@ fn record_loop(
         plan_mode_exit: false,
         execution_mode_note: None,
         loop_state_note: false,
+        loop_state_view: None,
         task_reminder: false,
         date_change: None,
         guidance: None,
@@ -1815,6 +1820,7 @@ struct RestoredChain {
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
     host_notes: BTreeMap<usize, HostNote>,
+    loop_state_views: BTreeMap<usize, serde_json::Value>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
@@ -1852,6 +1858,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
         host_notes: BTreeMap::new(),
+        loop_state_views: BTreeMap::new(),
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
@@ -1975,6 +1982,9 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::ExecutionMode(note));
         } else if entry.loop_state_note {
             restored.host_notes.insert(index, HostNote::LoopState);
+            if let Some(view) = &entry.loop_state_view {
+                restored.loop_state_views.insert(index, view.clone());
+            }
         } else if entry.task_reminder {
             restored.host_notes.insert(index, HostNote::TaskReminder);
         } else if let Some(date) = &entry.date_change {
@@ -2119,6 +2129,7 @@ impl RestoredChain {
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
             host_notes: BTreeMap::new(),
+            loop_state_views: BTreeMap::new(),
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
@@ -2173,6 +2184,9 @@ impl RestoredChain {
             }
             if let Some(announced) = self.host_notes.get(&original) {
                 kept.host_notes.insert(index, announced.clone());
+            }
+            if let Some(view) = self.loop_state_views.get(&original) {
+                kept.loop_state_views.insert(index, view.clone());
             }
             if let Some(marker) = self.message_compactions.get(&original) {
                 kept.message_compactions.insert(index, marker.clone());
@@ -2486,6 +2500,7 @@ impl RestoredChain {
         snapshot.message_models = self.message_models.clone();
         snapshot.message_compactions = self.message_compactions.clone();
         snapshot.host_notes = self.host_notes.clone();
+        bookkeeping.loop_state_views = self.loop_state_views.clone();
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         bookkeeping.plan_slug = self.plan_slug.clone();
         self.replay_loop(snapshot);
@@ -3748,6 +3763,7 @@ impl Agent {
                 .stopped_runs
                 .insert(chat_id, stopped_runs.into_iter().map(Into::into).collect());
         }
+        let announced_loop_state = super::loop_state_notes::restored(&snapshot, &bookkeeping);
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {
@@ -3759,7 +3775,7 @@ impl Agent {
                 snapshot: snapshot.clone(),
                 bookkeeping,
                 start_new_tool_result_message: false,
-                announced_loop_state: None,
+                announced_loop_state,
                 active: None,
                 active_run: None,
                 upgrade_wait: None,

@@ -71,8 +71,8 @@ pub use chat::{
     GuidanceNote, HostNote, InputId, LoopId, OperationRecord, OperationState, PendingCommand,
     PendingInput, PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
     ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
-    ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
-    chat_has_pending_work, chat_has_work, chat_preview, short_chat_title,
+    ToolCallRecovery, UnknownGuidance, UserShellReceipt, UserShellRecord, UserShellState,
+    chat_display_title, chat_has_pending_work, chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::{ChatStatus, ChatStatusInput};
 pub use context_breakdown::{

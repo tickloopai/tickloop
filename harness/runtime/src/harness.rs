@@ -75,6 +75,9 @@ pub struct HarnessOptions {
     /// Whether tasks the Agent creates with CronCreate or ScheduleWakeup start timing at once
     /// on a host without permission requests, instead of waiting for the user's confirmation.
     pub trust_model_scheduled_tasks: bool,
+    /// The result of a WebSearch call while the Chat's search is off, which says how the user
+    /// turns it on in this host. The default names the terminal's `/websearch` command.
+    pub web_search_disabled_message: String,
 }
 
 impl HarnessOptions {
@@ -97,6 +100,8 @@ impl HarnessOptions {
             scheduled_task_expiry: Some(crate::scheduled_tasks::TASK_LIFETIME),
             scheduled_task_min_interval: None,
             trust_model_scheduled_tasks: false,
+            web_search_disabled_message: tickloop_harness_tools::web_search::DISABLED_MESSAGE
+                .into(),
         }
     }
 }

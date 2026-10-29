@@ -307,6 +307,11 @@ pub struct ChainEntry {
     /// Subagents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loop_state_note: bool,
+    /// Tickloop extension: on a Loop state note, the state of the Loop the model knows once it
+    /// reads the note, so a load tells only what changed since. Raw, so a later format cannot
+    /// invalidate the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_state_view: Option<serde_json::Value>,
     /// Tickloop extension: marks the host note reminding the model of the task tools, Claude
     /// Code's `task_reminder` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1145,6 +1150,67 @@ mod tests {
     #[test]
     fn a_broken_line_of_a_known_kind_is_not_unknown() {
         assert!(serde_json::from_str::<Line>(r#"{"type":"user","uuid":7}"#).is_err());
+    }
+
+    fn guidance_line(guidance: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "uuid": Uuid::from_u128(1),
+            "parentUuid": null,
+            "isSidechain": false,
+            "chatId": Uuid::nil(),
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "version": "later",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Host notice"}]},
+            "isMeta": true,
+            "guidance": guidance,
+            "humanFamilyOrigin": null,
+        })
+    }
+
+    /// A guidance kind a later version adds leaves the host note's Line readable here, and
+    /// writing it back keeps what that version wrote.
+    #[test]
+    fn a_host_note_with_a_later_guidance_kind_is_kept_as_written() {
+        let raw = guidance_line(serde_json::json!({
+            "kind": "later_kind",
+            "servers": {"docs": "sha256:01"},
+            "detail": [1, 2],
+        }));
+        let line: Line = serde_json::from_value(raw.clone()).unwrap();
+        let Line::User(entry) = &line else {
+            panic!("a user Line: {line:?}");
+        };
+        assert!(matches!(
+            &entry.guidance,
+            Some(tickloop_harness_protocol::GuidanceNote::Unknown(unknown)) if unknown.kind == "later_kind"
+        ));
+        assert_eq!(serde_json::to_value(&line).unwrap(), raw);
+    }
+
+    /// Only an unknown kind is kept as unknown: a known kind still reads as itself, and one that
+    /// does not parse breaks its Line as before.
+    #[test]
+    fn a_known_guidance_kind_is_never_read_as_unknown() {
+        let known: Line = serde_json::from_value(guidance_line(serde_json::json!({
+            "kind": "mcp_servers",
+            "servers": {"docs": "sha256:01"},
+        })))
+        .unwrap();
+        assert!(matches!(
+            known.chain_entry().and_then(|entry| entry.guidance.as_ref()),
+            Some(tickloop_harness_protocol::GuidanceNote::McpServers { servers }) if servers.len() == 1
+        ));
+        for broken in [
+            serde_json::json!({"kind": "mcp_servers"}),
+            serde_json::json!({"kind": "skill", "name": 7}),
+            serde_json::json!({"servers": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Line>(guidance_line(broken.clone())).is_err(),
+                "{broken}"
+            );
+        }
     }
 
     /// A store classifying a written Line by its header alone reads the kind the Line has.

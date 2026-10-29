@@ -30,8 +30,13 @@ const OUTPUT_STYLE_INTRO: &str = "Respond to the user according to your \"Output
 /// instruction files arrive in tags too, so tags are not said to be the host's alone.
 const SYSTEM_SECTION: &str = "# System
  - All text you output outside of tool use is displayed to the user. Output text to communicate with the user. You can use Github-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
- - Tools are executed in a user-selected execution mode. When you attempt to call a tool that is not automatically allowed by the user's execution mode or permission settings, the user will be prompted so that they can approve or deny the execution. If the user denies a tool you call, or the host blocks it, do not re-attempt the exact same tool call. Instead, think about why it was denied and adjust your approach.
+ - Tools are executed in a user-selected execution mode. {APPROVAL} Instead, think about why it was denied and adjust your approach.
  - Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.";
+
+const APPROVAL_PROMPTED: &str = "When you attempt to call a tool that is not automatically allowed by the user's execution mode or permission settings, the user will be prompted so that they can approve or deny the execution. If the user denies a tool you call, or the host blocks it, do not re-attempt the exact same tool call.";
+
+/// A host that denies whatever would prompt asks no one.
+const APPROVAL_DENIED: &str = "When you attempt to call a tool that is not automatically allowed by the user's execution mode or permission settings, the call is denied without asking the user. If a tool you call is denied or blocked, do not re-attempt the exact same tool call.";
 
 const COMPACTION_NOTE: &str = " - The host will automatically compress prior messages in your conversation as it approaches context limits. This means your conversation with the user is not limited by the context window.";
 
@@ -114,6 +119,7 @@ pub(super) struct PromptScope<'a> {
     pub has_folder: bool,
     pub tools: crate::ToolPolicy,
     pub waits: crate::WaitHosting,
+    pub prompt_policy: tickloop_harness_protocol::PromptPolicy,
     /// The host's own instructions, a section after the Output Style.
     pub host_section: Option<&'a str>,
     pub citation_style: crate::CitationStyle,
@@ -131,6 +137,7 @@ impl PromptScope<'_> {
         has_folder: true,
         tools: crate::ToolPolicy::local(),
         waits: crate::WaitHosting::Process,
+        prompt_policy: tickloop_harness_protocol::PromptPolicy::Interactive,
         host_section: None,
         citation_style: crate::CitationStyle::MarkdownLinks,
         compacts: false,
@@ -177,6 +184,7 @@ pub(super) fn conversation_system_prompt(
         has_folder,
         tools,
         waits,
+        prompt_policy,
         host_section,
         citation_style,
         compacts,
@@ -201,7 +209,14 @@ pub(super) fn conversation_system_prompt(
     if has_folder {
         intro = format!("{intro}\n{URL_POLICY}");
     }
-    let mut system = SYSTEM_SECTION.to_owned();
+    let mut system = SYSTEM_SECTION.replace(
+        "{APPROVAL}",
+        if prompt_policy == tickloop_harness_protocol::PromptPolicy::DenyOnPrompt {
+            APPROVAL_DENIED
+        } else {
+            APPROVAL_PROMPTED
+        },
+    );
     if compacts {
         system = format!("{system}\n{COMPACTION_NOTE}");
     }
@@ -258,6 +273,7 @@ impl crate::Agent {
             has_folder: chat.snapshot.folder.is_some(),
             tools: self.inner.tool_policy,
             waits: self.inner.waits,
+            prompt_policy: self.inner.host_options.prompt_policy,
             host_section: self.inner.system_prompt_addition.as_deref(),
             citation_style: self.inner.citation_style,
             compacts: crate::context::context_window(&chat.snapshot).is_some(),
@@ -605,6 +621,41 @@ mod tests {
             "Mode Active",
         ] {
             assert!(!prompt.contains(absent), "{absent}");
+        }
+    }
+
+    /// A host that denies whatever would prompt never tells the model someone will be asked;
+    /// every other policy keeps the sentence the local prompt has.
+    #[test]
+    fn calls_that_would_prompt_are_described_by_the_hosts_prompt_policy() {
+        use tickloop_harness_protocol::PromptPolicy;
+        let prompt = |prompt_policy, has_folder| {
+            conversation_system_prompt(
+                &serde_json::json!({}),
+                OutputStyle::Standard,
+                PromptScope {
+                    has_folder,
+                    prompt_policy,
+                    ..PromptScope::LOCAL
+                },
+            )
+        };
+        for has_folder in [true, false] {
+            let denying = prompt(PromptPolicy::DenyOnPrompt, has_folder);
+            assert!(denying.contains(&format!(
+                " - Tools are executed in a user-selected execution mode. {APPROVAL_DENIED} Instead, think about why it was denied and adjust your approach.\n"
+            )));
+            assert!(!denying.contains("will be prompted"), "{denying}");
+            assert!(!denying.contains("{APPROVAL}"));
+            for asking in [PromptPolicy::Interactive, PromptPolicy::Unrestricted] {
+                let asking = prompt(asking, has_folder);
+                assert!(asking.contains(APPROVAL_PROMPTED));
+                assert_eq!(
+                    asking.replace(APPROVAL_PROMPTED, APPROVAL_DENIED),
+                    denying,
+                    "only the sentence on approval differs"
+                );
+            }
         }
     }
 

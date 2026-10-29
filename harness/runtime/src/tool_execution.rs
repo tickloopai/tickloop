@@ -1213,11 +1213,10 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(
                 if self.inner.tool_policy.web_search {
-                    tickloop_harness_tools::web_search::DISABLED_MESSAGE
+                    self.inner.web_search_disabled_message.clone()
                 } else {
-                    UNOFFERED_WEB_SEARCH_MESSAGE
-                }
-                .into(),
+                    UNOFFERED_WEB_SEARCH_MESSAGE.into()
+                },
             ));
         }
         if registration.is_none() && shared_tasks::is_task_tool(&name) {

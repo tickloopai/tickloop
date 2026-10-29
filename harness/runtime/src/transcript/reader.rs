@@ -638,6 +638,7 @@ mod tests {
             plan_mode_exit: false,
             execution_mode_note: None,
             loop_state_note: false,
+            loop_state_view: None,
             task_reminder: false,
             date_change: None,
             guidance: None,

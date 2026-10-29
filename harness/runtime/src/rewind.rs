@@ -409,6 +409,7 @@ pub(super) fn conversation_before(
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
+    candidate_bookkeeping.loop_state_views.split_off(&index);
     candidate_bookkeeping.message_responses.split_off(&index);
     candidate_bookkeeping.lifecycle.restart_claims_at(index);
     candidate_bookkeeping.lifecycle.forget_tail_answer();
