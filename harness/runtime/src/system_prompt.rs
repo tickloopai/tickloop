@@ -263,12 +263,16 @@ impl crate::Agent {
         workspace_host: Option<&crate::host_tools::WorkspaceHostContext>,
         deferred_tools: &[String],
     ) -> tickloop_harness_protocol::Message {
-        let environment = chat
-            .snapshot
-            .folder
-            .as_deref()
-            .zip(chat.environment.get())
-            .map(|(folder, environment)| environment.section(folder, &chat.snapshot.model));
+        let directories = chat.snapshot.folder.as_deref().map(|folder| {
+            crate::environment_info::WorkingDirectories::new(folder, &chat.execution.files())
+        });
+        let environment =
+            directories
+                .as_ref()
+                .zip(chat.environment.get())
+                .map(|(directories, environment)| {
+                    environment.section(directories, &chat.snapshot.model)
+                });
         let scope = PromptScope {
             has_folder: chat.snapshot.folder.is_some(),
             tools: self.inner.tool_policy,
@@ -284,9 +288,9 @@ impl crate::Agent {
         let mut state = serde_json::json!({
             "delegation": chat.snapshot.delegation.as_ref().map(fixed_delegation),
         });
-        if let Some(folder) = &chat.snapshot.folder {
+        if let Some(directories) = &directories {
             state.as_object_mut().unwrap().extend(serde_json::json!({
-                "workdir": folder,
+                "workdir": directories.folder,
                 "family_temp_directory": family_temp,
                 "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_harness_tools::SCRATCHPAD_SUBDIRECTORY)),
                 "workspace_host": workspace_host.map(fixed_workspace_host),

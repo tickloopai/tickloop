@@ -66,6 +66,9 @@ impl Agent {
         }
         if changed {
             chat.snapshot.policy.revision += 1;
+            chat.execution
+                .follow(self.inner.environment.as_ref(), &chat.snapshot)
+                .await;
         }
         self.save(&chat.snapshot);
         Ok(())
@@ -248,6 +251,9 @@ impl Agent {
                     .insert(tickloop_harness_protocol::AdditionalDirectorySource::Session);
                 chat.snapshot.additional_directories.push(path);
                 chat.snapshot.policy.revision += 1;
+                chat.execution
+                    .follow(self.inner.environment.as_ref(), &chat.snapshot)
+                    .await;
                 self.save(&chat.snapshot);
             }
             PermissionChange::RemoveDirectory { path } => {
@@ -281,6 +287,9 @@ impl Agent {
                 }
                 chat.bookkeeping.additional_directory_sources.remove(&path);
                 chat.snapshot.policy.revision += 1;
+                chat.execution
+                    .follow(self.inner.environment.as_ref(), &chat.snapshot)
+                    .await;
                 self.save(&chat.snapshot);
             }
             PermissionChange::SelectReviewer { reviewer } => {

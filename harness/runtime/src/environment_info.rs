@@ -1,37 +1,46 @@
 //! Claude Code's `# Environment` section and its git status snapshot: what a Chat with a Folder
 //! learns about where it runs. The environment is read once per Chat, at its first conversation
 //! request, so the system prompt stays the same for the rest of the Chat; the git status joins the
-//! user context, read again only when that is.
+//! user context, read again only when that is. Only a Folder on this machine is read: for a Folder
+//! elsewhere no `uname` or `git` runs, and the section leaves out what they would tell.
 
 use std::{path::Path, process::Command};
+
+use crate::environment::{FileAccess, FileCapabilities};
 
 /// Claude Code's `MAX_STATUS_CHARS`.
 const MAX_STATUS_CHARS: usize = 2_000;
 const RECENT_COMMITS: &str = "5";
+const READ_ONLY_MARK: &str = " (read-only)";
+const NO_FILE_ACCESS_MARK: &str = " (no file access)";
 
 /// What a Chat read about its Folder and system when it first asked the model.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChatEnvironment {
-    is_git: bool,
+    /// `None` for a Folder that is not on this machine.
+    is_git: Option<bool>,
     os_version: Option<String>,
 }
 
 impl ChatEnvironment {
-    /// Reads the environment of `folder`; it runs `uname` and read-only `git` commands, so call it
-    /// on a blocking thread.
-    pub(crate) fn capture(folder: &Path) -> Self {
+    /// Reads the environment of the Folder at `local_folder` on this machine; it runs `uname` and
+    /// read-only `git` commands there, so call it on a blocking thread. A Folder elsewhere
+    /// (`None`) runs nothing.
+    pub(crate) fn capture(local_folder: Option<&Path>) -> Self {
+        let Some(folder) = local_folder else {
+            return Self::default();
+        };
         let os_version = output(Command::new("uname").arg("-sr"));
         Self {
-            is_git: is_git(folder),
+            is_git: Some(is_git(folder)),
             os_version,
         }
     }
 
-    /// The `# Environment` section for a Chat working in `folder` with `model`, followed by the
-    /// git status snapshot in a repository.
+    /// The `# Environment` section for a Chat working in `directories` with `model`.
     pub(crate) fn section(
         &self,
-        folder: &Path,
+        directories: &WorkingDirectories,
         model: &tickloop_harness_protocol::ModelConfig,
     ) -> String {
         let model_line = match &model.card {
@@ -41,11 +50,20 @@ impl ChatEnvironment {
             ),
             None => format!("You are powered by the model {}.", model.model),
         };
-        let mut lines = vec![
-            format!("Primary working directory: {}", folder.display()),
-            format!("Is a git repository: {}", self.is_git),
-            format!("Platform: {}", std::env::consts::OS),
-        ];
+        let mut lines = vec![format!(
+            "Primary working directory: {}{}",
+            directories.folder, directories.folder_mark
+        )];
+        if let Some(is_git) = self.is_git {
+            lines.push(format!("Is a git repository: {is_git}"));
+        }
+        if !directories.additional.is_empty() {
+            lines.push(format!(
+                "Additional working directories: {}",
+                directories.additional.join(", ")
+            ));
+        }
+        lines.push(format!("Platform: {}", std::env::consts::OS));
         if let Some(os_version) = &self.os_version {
             lines.push(format!("OS Version: {os_version}"));
         }
@@ -58,6 +76,49 @@ impl ChatEnvironment {
                 .collect::<Vec<_>>()
                 .join("\n")
         )
+    }
+}
+
+/// The Folder and Additional Directories as the system prompt names them: by the display paths
+/// their Port gives, marking those the file tools cannot write. An Additional Directory on this
+/// machine that the file tools can write is reached by its own path and goes unlisted, as it did
+/// before Ports offered files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkingDirectories {
+    pub(crate) folder: String,
+    folder_mark: &'static str,
+    additional: Vec<String>,
+}
+
+impl WorkingDirectories {
+    /// `folder` names the Folder when the Port offers no root for it.
+    pub(crate) fn new(folder: &Path, files: &FileCapabilities) -> Self {
+        let (folder, folder_mark) = match files.folder() {
+            Some(root) => (root.display_path.clone(), access_mark(root.access)),
+            None => (folder.display().to_string(), ""),
+        };
+        let additional = files
+            .roots()
+            .iter()
+            .filter(|root| {
+                !root.is_folder
+                    && (root.local_path.is_none() || root.access != FileAccess::ReadWrite)
+            })
+            .map(|root| format!("{}{}", root.display_path, access_mark(root.access)))
+            .collect();
+        Self {
+            folder,
+            folder_mark,
+            additional,
+        }
+    }
+}
+
+fn access_mark(access: FileAccess) -> &'static str {
+    match access {
+        FileAccess::ReadWrite => "",
+        FileAccess::Read => READ_ONLY_MARK,
+        FileAccess::None => NO_FILE_ACCESS_MARK,
     }
 }
 
@@ -127,14 +188,15 @@ pub(crate) fn git_status(folder: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::{FileRoot, RootName};
 
     #[test]
     fn a_folder_outside_git_reports_no_repository_and_no_status() {
         let directory = tempfile::tempdir().unwrap();
-        let environment = ChatEnvironment::capture(directory.path());
-        assert!(!environment.is_git);
+        let environment = ChatEnvironment::capture(Some(directory.path()));
+        assert_eq!(environment.is_git, Some(false));
         assert_eq!(git_status(directory.path()), None);
-        let section = environment.section(directory.path(), &fixture_model());
+        let section = environment.section(&local_directories(directory.path()), &fixture_model());
         assert!(section.starts_with("# Environment\n"));
         assert!(section.contains("Is a git repository: false"));
         assert!(section.contains("You are powered by the model fixture-model."));
@@ -167,15 +229,114 @@ mod tests {
             "first commit",
         ]);
         std::fs::write(directory.path().join("new.txt"), "x").unwrap();
-        let environment = ChatEnvironment::capture(directory.path());
-        assert!(environment.is_git);
+        let environment = ChatEnvironment::capture(Some(directory.path()));
+        assert_eq!(environment.is_git, Some(true));
         let status = git_status(directory.path()).unwrap();
         assert!(status.contains("Current branch: trunk"), "{status}");
         assert!(status.contains("Status:\n?? new.txt"), "{status}");
         assert!(status.contains("first commit"), "{status}");
-        let section = environment.section(directory.path(), &fixture_model());
+        let section = environment.section(&local_directories(directory.path()), &fixture_model());
         assert!(section.contains("Is a git repository: true"));
         assert!(status.starts_with("This is the git status at the start of the conversation."));
+    }
+
+    /// Local roots are writable and shown by their own paths, so a local Chat's section reads as
+    /// it did before Ports offered files, whether or not the Port reports its roots.
+    #[test]
+    fn a_local_folder_with_writable_directories_keeps_the_section_unchanged() {
+        let environment = ChatEnvironment {
+            is_git: Some(true),
+            os_version: Some("Darwin 25.0.0".into()),
+        };
+        let folder = Path::new("/work/project");
+        let expected = format!(
+            "# Environment\nYou have been invoked in the following environment:\n - Primary working directory: /work/project\n - Is a git repository: true\n - Platform: {}\n - OS Version: Darwin 25.0.0\n - You are powered by the model fixture-model.",
+            std::env::consts::OS
+        );
+        for files in [FileCapabilities::default(), local_files()] {
+            let directories = WorkingDirectories::new(folder, &files);
+            assert_eq!(directories.folder, "/work/project");
+            assert_eq!(
+                environment.section(&directories, &fixture_model()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_elsewhere_runs_nothing_and_lists_its_directories_with_their_access() {
+        let environment = ChatEnvironment::capture(None);
+        assert_eq!(environment, ChatEnvironment::default());
+        let files = FileCapabilities::new(
+            vec![
+                root("design", "/design", FileAccess::Read, true, None),
+                root("browser", "/browser", FileAccess::ReadWrite, false, None),
+                root("vault", "/vault", FileAccess::None, false, None),
+                root(
+                    "notes",
+                    "/work/notes",
+                    FileAccess::Read,
+                    false,
+                    Some("/work/notes"),
+                ),
+            ],
+            FileAccess::None,
+        )
+        .unwrap();
+        let section = environment.section(
+            &WorkingDirectories::new(Path::new("/srv/folder"), &files),
+            &fixture_model(),
+        );
+        assert_eq!(
+            section,
+            format!(
+                "# Environment\nYou have been invoked in the following environment:\n - Primary working directory: /design (read-only)\n - Additional working directories: /browser, /vault (no file access), /work/notes (read-only)\n - Platform: {}\n - You are powered by the model fixture-model.",
+                std::env::consts::OS
+            )
+        );
+    }
+
+    fn local_directories(folder: &Path) -> WorkingDirectories {
+        WorkingDirectories::new(folder, &FileCapabilities::default())
+    }
+
+    fn local_files() -> FileCapabilities {
+        FileCapabilities::new(
+            vec![
+                root(
+                    "project",
+                    "/work/project",
+                    FileAccess::ReadWrite,
+                    true,
+                    Some("/work/project"),
+                ),
+                root(
+                    "shared",
+                    "/work/shared",
+                    FileAccess::ReadWrite,
+                    false,
+                    Some("/work/shared"),
+                ),
+            ],
+            FileAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    fn root(
+        name: &str,
+        display_path: &str,
+        access: FileAccess,
+        is_folder: bool,
+        local_path: Option<&str>,
+    ) -> FileRoot {
+        FileRoot {
+            name: RootName::new(name).unwrap(),
+            display_path: display_path.into(),
+            access,
+            is_folder,
+            local_path: local_path.map(Into::into),
+        }
     }
 
     fn fixture_model() -> tickloop_harness_protocol::ModelConfig {

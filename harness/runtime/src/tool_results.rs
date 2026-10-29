@@ -30,6 +30,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{Agent, AgentError, Chat};
+use crate::chat_execution::ChatExecution;
 use crate::transcript::private_family_temp_directory;
 use tickloop_harness_base::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
 use tickloop_harness_protocol::projection;
@@ -77,10 +78,17 @@ impl Agent {
     }
 
     /// Each family owns one private temporary root; children share it without widening
-    /// access to other families in the same project. A Chat without a Folder has no directory.
-    pub(super) fn create_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
+    /// access to other families in the same project. A Chat without a Folder has no directory
+    /// and binds no Port. The Port bound here serves the Chat's tool listing and its shell host.
+    pub(super) async fn create_chat_tools(
+        &self,
+        snapshot: &ChatSnapshot,
+    ) -> (Arc<Tools>, ChatExecution) {
         if snapshot.folder.is_none() {
-            return self.folderless_chat_tools(snapshot);
+            return (
+                self.folderless_chat_tools(snapshot),
+                ChatExecution::unbound(snapshot.id),
+            );
         }
         let chat_id = snapshot.id;
         let family_temp = private_family_temp_directory(family_root(snapshot).into());
@@ -95,36 +103,15 @@ impl Agent {
             |project| PrivateDirectory::trusted(project).join(chat_id.uuid().to_string()),
         );
         let task_output = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
-        let authority = crate::environment::ExecutionAuthority::new(chat_id);
-        let port = self
-            .inner
-            .environment
-            .as_ref()
-            .ok_or_else(|| {
-                crate::environment::ExecutionError::new("Unsupported", "no execution environment")
-            })
-            .and_then(|environment| {
-                environment.bind(
-                    crate::environment::ExecutionScope {
-                        chat: chat_id,
-                        folder: snapshot
-                            .folder
-                            .as_ref()
-                            .map(|folder| folder.to_string_lossy().into_owned()),
-                        additional_directories: Vec::new(),
-                    },
-                    authority.clone(),
-                )
-            });
+        let execution = ChatExecution::bind(self.inner.environment.as_ref(), snapshot).await;
         let shells = Arc::new(crate::environment::shell_host::EnvironmentShellHost::new(
-            port,
-            authority,
+            execution.clone(),
             Arc::new(crate::environment::shell_host::CurrentLocalShellHost::new(
                 self.downgrade(),
                 chat_id.into(),
             )),
         ));
-        Arc::new(
+        let tools = Arc::new(
             Tools::for_chat(
                 ChatDirectory {
                     chat: chat_directory,
@@ -139,7 +126,8 @@ impl Agent {
             )
             .with_search_provider_factory(self.inner.search_provider_factory.clone())
             .with_search_settings(self.inner.web_search_settings.clone()),
-        )
+        );
+        (tools, execution)
     }
 
     /// Third-party MCP results over 20 KB keep both ends; the full text goes to the Family's

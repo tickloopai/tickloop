@@ -13,22 +13,16 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 pub(crate) struct EnvironmentShellHost {
-    port: Result<Arc<dyn ExecutionPort>, ExecutionError>,
-    authority: ExecutionAuthority,
+    execution: crate::chat_execution::ChatExecution,
     local: Arc<dyn ShellHost>,
 }
 
 impl EnvironmentShellHost {
     pub(crate) fn new(
-        port: Result<Arc<dyn ExecutionPort>, ExecutionError>,
-        authority: ExecutionAuthority,
+        execution: crate::chat_execution::ChatExecution,
         local: Arc<dyn ShellHost>,
     ) -> Self {
-        Self {
-            port,
-            authority,
-            local,
-        }
+        Self { execution, local }
     }
 }
 
@@ -39,19 +33,14 @@ impl ShellHost for EnvironmentShellHost {
         task: uuid::Uuid,
         reason: &str,
     ) -> Result<Option<ShellStopPreparation>, ToolError> {
-        let port = self
-            .port
-            .as_ref()
+        let bound = self
+            .execution
+            .port()
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
-        if matches!(
-            port.inspect(ExecutionQuery::Capabilities)
-                .await
-                .map_err(|error| ToolError::Rejected(error.to_string()))?,
-            ExecutionInspection::Capabilities(ExecutionCapabilities { shells: false, .. })
-        ) {
+        if !bound.capabilities.shells {
             return self.local.prepare_stop(task, reason).await;
         }
-        prepare_stop(port.clone(), self.authority.clone(), task, reason)
+        prepare_stop(bound.port, self.execution.authority().clone(), task, reason)
             .await
             .map(Some)
     }
@@ -59,53 +48,38 @@ impl ShellHost for EnvironmentShellHost {
         &self,
         request: ShellPreparationRequest,
     ) -> Result<Option<ShellPreparation>, ToolError> {
-        let port = self
-            .port
-            .as_ref()
+        let bound = self
+            .execution
+            .port()
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
-        let ExecutionInspection::Capabilities(capabilities) = port
-            .inspect(ExecutionQuery::Capabilities)
-            .await
-            .map_err(|error| ToolError::Rejected(error.to_string()))?
-        else {
-            return Err(ToolError::Rejected(
-                "execution environment returned no capabilities".into(),
-            ));
-        };
-        if !capabilities.shells {
+        if !bound.capabilities.shells {
             return self.local.prepare(request).await;
         }
         prepare_shell(
-            port.clone(),
-            self.authority.clone(),
+            bound.port,
+            self.execution.authority().clone(),
             request,
-            capabilities.shell_output,
+            bound.capabilities.shell_output,
         )
         .await
         .map(Some)
     }
     async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
-        let port = self
-            .port
-            .as_ref()
+        let bound = self
+            .execution
+            .port()
             .map_err(|error| ShellStartError::NotStarted(ToolError::Rejected(error.to_string())))?;
-        let capabilities = port
-            .inspect(ExecutionQuery::Capabilities)
-            .await
-            .map_err(|error| ShellStartError::NotStarted(ToolError::Rejected(error.to_string())))?;
-        if matches!(
-            capabilities,
-            ExecutionInspection::Capabilities(ExecutionCapabilities { shells: false, .. })
-        ) {
+        if !bound.capabilities.shells {
             return self.local.start(launch).await;
         }
+        let port = bound.port;
+        let authority = self.execution.authority();
         let spec = shell_spec(&launch);
         let prepared = port
             .prepare(ExecutionIntent::SpawnShell(spec))
             .await
             .map_err(|error| ShellStartError::NotStarted(ToolError::Rejected(error.to_string())))?;
-        let admission = self
-            .authority
+        let admission = authority
             .admit(&prepared)
             .map_err(|error| ShellStartError::NotStarted(ToolError::Rejected(error.to_string())))?;
         match port.execute(prepared, admission, launch.cancel).await {
@@ -116,8 +90,8 @@ impl ShellHost for EnvironmentShellHost {
                 let output = (status.output_delivery == ShellOutputDelivery::Environment)
                     .then_some(launch.output);
                 Ok(Box::new(PortShellProcess::new(
-                    port.clone(),
-                    self.authority.clone(),
+                    port,
+                    authority.clone(),
                     *status,
                     output,
                     result.handoff.map(ExecutionHandoff::into_value),

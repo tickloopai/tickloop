@@ -339,7 +339,7 @@ impl Agent {
             };
             self.adopt_upgrade_transcript(&snapshot, &saved.bookkeeping)
                 .await?;
-            let tools = self.create_chat_tools(&snapshot);
+            let (tools, execution) = self.create_chat_tools(&snapshot).await;
             for (path, read) in live_snapshot::restore_reads(saved.file_reads.clone())
                 .map_err(AgentError::Invalid)?
             {
@@ -388,6 +388,7 @@ impl Agent {
                     pending_client: None,
                     pending_model_thinking: None,
                     tools,
+                    execution,
                     skills,
                     content_replacements: saved.content_replacements.clone(),
                     file_history,

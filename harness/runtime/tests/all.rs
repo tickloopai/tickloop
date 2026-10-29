@@ -40,6 +40,9 @@ mod explicit_ask_scopes;
 #[path = "all/file_tools.rs"]
 mod file_tools;
 
+#[path = "all/folder_capabilities.rs"]
+mod folder_capabilities;
+
 #[path = "all/plan_auto.rs"]
 mod plan_auto;
 

@@ -57,7 +57,8 @@ impl Agent {
 
     /// What the first request of a New Agent working in `folder` would hold, before the Agent
     /// exists: the draft's model and settings, no messages. It creates no Chat, writes nothing
-    /// and connects nothing; the tools are those this Agent's host offers now.
+    /// and connects nothing; the tools are those this Agent's host offers now, with the file
+    /// tools its Execution Environment would offer for `folder`.
     pub async fn draft_context_breakdown(
         &self,
         folder: Option<PathBuf>,
@@ -66,7 +67,7 @@ impl Agent {
         let instruction_files = self.instruction_files_in(folder.clone()).await?;
         let current_date = self.current_date();
         let settings = self.load_user_settings(folder.clone()).await?;
-        let chat = self.draft_chat(folder, draft, settings);
+        let chat = self.draft_chat(folder, draft, settings).await;
         let parts = self.context_parts(&chat, &instruction_files, &current_date)?;
         tokio::task::spawn_blocking(move || {
             parts.count(&*tickloop_harness_model::context_tokens::TOKEN_COUNTER)
@@ -76,7 +77,7 @@ impl Agent {
     }
 
     /// A Chat value as creating one for `draft` would start it, registered nowhere.
-    fn draft_chat(
+    async fn draft_chat(
         &self,
         folder: Option<PathBuf>,
         draft: ContextDraft,
@@ -106,8 +107,12 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .client
             .clone();
+        let execution =
+            crate::chat_execution::ChatExecution::bind(self.inner.environment.as_ref(), &snapshot)
+                .await;
         crate::NewChat {
             tools: self.folderless_chat_tools(&snapshot),
+            execution,
             skills: self.discover_skills(snapshot.folder.as_deref()),
             output_style: settings
                 .map(|settings| settings.output_style)

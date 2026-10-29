@@ -276,8 +276,9 @@ pub(super) struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// The tools a request of `chat` offers: those `policy` admits, and the file tools, Bash and
-    /// TaskStop only when the Chat has a Folder.
+    /// The tools a request of `chat` offers: those `policy` admits; Read, Glob and Grep when one
+    /// of its Port's roots is readable, Write and Edit when one is writable; Bash and TaskStop
+    /// only when the Chat has a Folder.
     pub(super) fn for_chat(
         chat: &Chat,
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
@@ -289,11 +290,19 @@ impl ToolRegistry {
     ) -> Self {
         let is_delegated = chat.snapshot.delegation.is_some();
         let has_folder = chat.snapshot.folder.is_some();
+        let files = chat.execution.files();
+        let can_read = files.roots().iter().any(|root| root.access.can_read());
+        let can_write = files.roots().iter().any(|root| root.access.can_write());
         let mut tools = tickloop_harness_tools::Tools::definitions()
             .into_iter()
             .filter(|definition| match definition.name.as_str() {
                 tickloop_harness_tools::WEB_FETCH_TOOL_NAME => policy.web_fetch,
                 tickloop_harness_tools::WEB_SEARCH_TOOL_NAME => policy.web_search,
+                tickloop_harness_tools::READ_TOOL_NAME
+                | tickloop_harness_tools::GLOB_TOOL_NAME
+                | tickloop_harness_tools::GREP_TOOL_NAME => can_read,
+                tickloop_harness_tools::WRITE_TOOL_NAME
+                | tickloop_harness_tools::EDIT_TOOL_NAME => can_write,
                 _ => has_folder,
             })
             .map(|definition| RegisteredTool {

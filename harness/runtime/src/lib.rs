@@ -63,6 +63,7 @@ pub mod family_pauses;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
 mod cache_prefix;
+mod chat_execution;
 mod chat_reads;
 mod chat_settings;
 mod chat_title;
@@ -509,6 +510,9 @@ struct Chat {
     /// or under the project directory in the system temp directory when not, and externalized tool
     /// results and file change reviews are written there.
     tools: Arc<tickloop_harness_tools::Tools>,
+    /// The Port bound for the Chat's directories, shared with its shell host; the file roots it
+    /// offers decide which file tools the model sees.
+    execution: chat_execution::ChatExecution,
     /// Shared with the tool registry of each model request, whose Skill calls expand against the
     /// listing that request sent even when the Chat's Skills are read again meanwhile.
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
@@ -2434,7 +2438,7 @@ impl Agent {
             .await
             .entry(id)
             .or_default();
-        let tools = self.create_chat_tools(&snapshot);
+        let (tools, execution) = self.create_chat_tools(&snapshot).await;
         let skills = self.discover_skills(snapshot.folder.as_deref());
         let file_history = snapshot
             .folder
@@ -2469,6 +2473,7 @@ impl Agent {
                 environment,
                 announced_date,
                 tools,
+                execution,
                 skills,
                 file_history,
             }
@@ -5008,6 +5013,9 @@ impl Agent {
         chat.snapshot.additional_directories = additional;
         if directory_changed {
             chat.snapshot.policy.revision += 1;
+            chat.execution
+                .follow(self.inner.environment.as_ref(), &chat.snapshot)
+                .await;
         }
         self.save(&chat.snapshot);
         Ok(())
@@ -5753,6 +5761,7 @@ pub(crate) struct NewChat {
     environment: OnceLock<environment_info::ChatEnvironment>,
     announced_date: Option<String>,
     tools: Arc<tickloop_harness_tools::Tools>,
+    execution: chat_execution::ChatExecution,
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
     file_history: Option<FileHistory>,
 }
@@ -5768,6 +5777,7 @@ impl NewChat {
             environment,
             announced_date,
             tools,
+            execution,
             skills,
             file_history,
         } = self;
@@ -5791,6 +5801,7 @@ impl NewChat {
             pending_client: None,
             pending_model_thinking: None,
             tools,
+            execution,
             skills,
             content_replacements: Default::default(),
             file_history,

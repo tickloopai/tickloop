@@ -17,17 +17,14 @@ impl Agent {
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.user_context.get().cloned().map(|cached| {
                 let needs_environment = chat.environment.get().is_none();
-                (
-                    cached,
-                    chat.snapshot.folder.clone().filter(|_| needs_environment),
-                )
+                (cached, readable_folder(chat).filter(|_| needs_environment))
             })
         };
         if let Some((cached, folder)) = cached {
             // A Subagent takes its parent's user context, but reads its own environment.
-            if let Some(folder) = folder.filter(|folder| folder.is_dir()) {
+            if let Some(local_folder) = folder {
                 let environment = tokio::task::spawn_blocking(move || {
-                    crate::environment_info::ChatEnvironment::capture(&folder)
+                    crate::environment_info::ChatEnvironment::capture(local_folder.as_deref())
                 })
                 .await
                 .map_err(|error| {
@@ -44,13 +41,17 @@ impl Agent {
         let folder = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            chat.snapshot.folder.clone()
+            readable_folder(chat)
         };
-        let (environment, git_status) = match folder.filter(|folder| folder.is_dir()) {
-            Some(folder) => tokio::task::spawn_blocking(move || {
+        let (environment, git_status) = match folder {
+            Some(local_folder) => tokio::task::spawn_blocking(move || {
                 (
-                    Some(crate::environment_info::ChatEnvironment::capture(&folder)),
-                    crate::environment_info::git_status(&folder),
+                    Some(crate::environment_info::ChatEnvironment::capture(
+                        local_folder.as_deref(),
+                    )),
+                    local_folder
+                        .as_deref()
+                        .and_then(crate::environment_info::git_status),
                 )
             })
             .await
@@ -108,6 +109,17 @@ impl Agent {
             .with_timezone(&self.inner.schedule_clock.zone())
             .format(CURRENT_DATE_FORMAT)
             .to_string()
+    }
+}
+
+/// Whether the Chat's environment can be read, and where its Folder is on this machine: `None`
+/// without a Folder or when the Folder's local directory is gone, `Some(None)` for a Folder the
+/// Port places elsewhere, which runs nothing here.
+fn readable_folder(chat: &crate::Chat) -> Option<Option<std::path::PathBuf>> {
+    chat.snapshot.folder.as_ref()?;
+    match chat.execution.local_folder() {
+        Some(local_folder) => local_folder.is_dir().then_some(Some(local_folder)),
+        None => Some(None),
     }
 }
 

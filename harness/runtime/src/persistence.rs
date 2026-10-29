@@ -3822,7 +3822,7 @@ impl Agent {
         self.checkpoint_transcript(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
-        let tools = self.create_chat_tools(&snapshot);
+        let (tools, execution) = self.create_chat_tools(&snapshot).await;
         let skills = self.discover_skills(folder.as_deref());
         self.inner
             .subagent_registry
@@ -3860,6 +3860,7 @@ impl Agent {
                 pending_client: None,
                 pending_model_thinking: None,
                 tools,
+                execution,
                 skills,
                 content_replacements,
                 file_history,

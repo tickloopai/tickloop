@@ -239,7 +239,7 @@ impl Agent {
                 recorder.record_citation_sources(bookkeeping.citation_sources.clone());
             }
         }
-        let tools = self.create_chat_tools(&snapshot);
+        let (tools, execution) = self.create_chat_tools(&snapshot).await;
         let skills = self.discover_skills(Some(&folder));
         // Following Claude Code's `/branch`: re-records, under the child Chat's id, the source's
         // replacement decisions still in the copied conversation.
@@ -282,6 +282,7 @@ impl Agent {
                 pending_client: None,
                 pending_model_thinking: None,
                 tools,
+                execution,
                 skills,
                 content_replacements,
                 file_history: Some(file_history),
