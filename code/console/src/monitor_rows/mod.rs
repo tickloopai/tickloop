@@ -293,7 +293,8 @@ pub struct TickDescriptor {
     pub resources: Option<TickResources>,
     pub actions: Vec<MonitorAction>,
     /// When the row joined the Monitor, as far as its source tells: when an Artifact was linked
-    /// to the Chat. Listing fills it in from a time-ordered identity otherwise.
+    /// to the Chat, or the row's place a reopened Tick took over. Listing fills it in from a
+    /// time-ordered identity otherwise.
     pub joined_at_ms: Option<u64>,
 }
 #[derive(Default)]
@@ -545,7 +546,7 @@ fn resolve_unread(
 /// A member row with only the facts the Chat recorded: no invented status, time or resources.
 pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
     TickDescriptor {
-        joined_at_ms: None,
+        joined_at_ms: member.joined_at_ms,
         title: member
             .title
             .clone()
@@ -882,6 +883,7 @@ mod order_tests {
             is_terminal: false,
             min_rows: None,
             max_rows: None,
+            joined_at_ms: None,
         });
         row.group = group;
         row.updated_at_ms = Some(updated_at_ms);
@@ -962,5 +964,30 @@ mod order_tests {
             }
         }
         assert_eq!(paged, expected, "pages follow the display order");
+    }
+
+    #[test]
+    fn a_reopened_tick_keeps_the_place_of_the_row_it_took_over() {
+        let (oldest, middle) = (hosted_created_at(1_000), hosted_created_at(2_000));
+        let reopened = hosted_created_at(9_000);
+        let member = member_descriptor(&MonitorMember {
+            instance: reopened.clone(),
+            title: None,
+            is_terminal: false,
+            min_rows: None,
+            max_rows: None,
+            joined_at_ms: Some(1_500),
+        });
+        let subscribed = row(reopened.clone(), TickGroup::Ticks, 10);
+        assert_eq!(
+            listed(vec![
+                row(middle.clone(), TickGroup::Ticks, 1),
+                subscribed,
+                member,
+                row(oldest.clone(), TickGroup::Ticks, 2),
+            ]),
+            [oldest, reopened, middle],
+            "a subscription's row of it moves it nowhere either"
+        );
     }
 }

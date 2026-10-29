@@ -36,6 +36,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
             is_terminal: false,
             instance: instance.clone(),
             title: Some("Counter".into()),
+            joined_at_ms: None,
         });
         snapshot.family_completions.push(FamilyCompletion {
             notification,

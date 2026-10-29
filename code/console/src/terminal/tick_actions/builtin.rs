@@ -16,7 +16,10 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         // The Console shows and enters Monitor cards itself.
         TickIntent::OpenView(_) => return None,
         TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
-        TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted { instance }),
+        TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted {
+            instance,
+            card: ReopenedCard::Enter,
+        }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
         TickIntent::StopShell { task } => Arc::new(StopShell { task }),
@@ -371,9 +374,30 @@ impl TickActionBackend for CloseHosted {
     }
 }
 
-/// Starts a new instance with the recorded command and restores its Tick Subscriptions.
+/// What the user's reopen does with the card of the instance reopened in the row's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::terminal) enum ReopenedCard {
+    /// Space: shows it as the user's, and the list keeps the keys.
+    Show,
+    /// Enter: shows it and gives it the keys.
+    Enter,
+}
+
+/// Reopens a hosted Tick from its row with Space, which shows the new instance's card.
+pub(in crate::terminal) fn reopen_showing_card(
+    instance: tick_protocol::InstanceRef,
+) -> Arc<dyn TickActionExecutor> {
+    Arc::new(ReopenHosted {
+        instance,
+        card: ReopenedCard::Show,
+    })
+}
+
+/// Starts a new instance with the recorded command in the row's place, restores its Tick
+/// Subscriptions and shows its card.
 struct ReopenHosted {
     instance: tick_protocol::InstanceRef,
+    card: ReopenedCard,
 }
 impl TickActionExecutor for ReopenHosted {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -382,6 +406,7 @@ impl TickActionExecutor for ReopenHosted {
             crate::monitor_rows::MONITOR_ENTER_KEY,
             Arc::new(ReopenHosted {
                 instance: self.instance.clone(),
+                card: self.card,
             }),
         ))
     }
@@ -399,6 +424,12 @@ impl TickActionBackend for ReopenHosted {
         refresh_subscriptions(&ctx).await?;
         if let Some(error) = restore_error {
             ctx.notify(&format!("Reopened as {reopened}; {}", safe_text(&error)))?;
+        }
+        if ctx
+            .console
+            .show_reopened_card(ctx.chat, &reopened, self.card)?
+        {
+            AttachCard { instance: reopened }.execute(ctx).await?;
         }
         Ok(())
     }

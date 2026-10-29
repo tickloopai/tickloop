@@ -3038,6 +3038,7 @@ mod manual_admission_tests {
                 title: None,
                 min_rows: None,
                 max_rows: None,
+                joined_at_ms: None,
             });
         assert_eq!(
             manual_eligibility(&snapshot, &instance),

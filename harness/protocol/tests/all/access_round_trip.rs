@@ -164,6 +164,7 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
                 title: Some("Quotes".into()),
                 min_rows: Some(9),
                 max_rows: Some(30),
+                joined_at_ms: None,
             },
             MonitorMember {
                 is_terminal: false,
@@ -171,6 +172,7 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
                 title: None,
                 min_rows: None,
                 max_rows: None,
+                joined_at_ms: None,
             },
         ]
     );
@@ -178,7 +180,18 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     assert!(
         serde_json::to_string(&saved.members[1]).unwrap()
             == r#"{"is_terminal":false,"instance":"hosted:added"}"#,
-        "an undeclared minimum and maximum are left out"
+        "an undeclared minimum and maximum, and no join time of its own, are left out"
+    );
+    let reopened = MonitorMember {
+        joined_at_ms: Some(1_500),
+        ..saved.members[1].clone()
+    };
+    let wire = serde_json::to_value(&reopened).unwrap();
+    assert_eq!(wire["joined_at_ms"], 1_500);
+    assert_eq!(
+        serde_json::from_value::<MonitorMember>(wire).unwrap(),
+        reopened,
+        "a reopened member keeps the place it took over"
     );
     assert!(
         !serde_json::to_string(&saved).unwrap().contains("source"),

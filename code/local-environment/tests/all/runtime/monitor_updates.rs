@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::InstanceRef;
 use tickloop_harness::protocol::{
-    ChatId, ChatSnapshot, Content, Event, EventKind, ToolDefinition, ToolResult,
+    ChatId, ChatSnapshot, Content, Event, EventKind, MonitorMembership, ToolDefinition, ToolResult,
 };
 use tickloop_harness::runtime::{
     Agent,
@@ -316,5 +316,52 @@ async fn a_reopened_instance_starts_from_what_it_already_did() {
     assert!(
         membership.is_removed(&lost),
         "the reopened instance takes the lost row's place"
+    );
+}
+
+#[tokio::test]
+async fn a_reopened_instance_keeps_the_place_the_lost_row_had_in_the_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let lost = InstanceRef::hosted(uuid::Uuid::now_v7());
+    let (seconds, _) = lost
+        .hosted_run()
+        .unwrap()
+        .uuid()
+        .get_timestamp()
+        .unwrap()
+        .to_unix();
+    let created_ms = seconds * 1_000;
+    std::thread::sleep(Duration::from_millis(2));
+    let reopened = InstanceRef::hosted(uuid::Uuid::now_v7());
+    let membership = agent
+        .record_reopened_tick(chat, &lost, reopened.clone())
+        .await
+        .unwrap();
+    let joined_at_ms = |membership: &MonitorMembership, instance: &InstanceRef| {
+        membership
+            .members
+            .iter()
+            .find(|member| &member.instance == instance)
+            .unwrap()
+            .joined_at_ms
+    };
+    let joined = joined_at_ms(&membership, &reopened).expect("the lost row's join time");
+    assert!(
+        (created_ms..created_ms + 1_000).contains(&joined),
+        "the lost instance's creation, {joined} from {created_ms}"
+    );
+
+    std::thread::sleep(Duration::from_millis(2));
+    let again = InstanceRef::hosted(uuid::Uuid::now_v7());
+    let membership = agent
+        .record_reopened_tick(chat, &reopened, again.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        joined_at_ms(&membership, &again),
+        Some(joined),
+        "reopening a reopened Tick keeps the first row's place"
     );
 }

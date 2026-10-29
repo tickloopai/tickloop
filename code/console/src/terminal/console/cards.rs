@@ -7,6 +7,7 @@ use crate::terminal::monitor_cards::{
     CARD_FRAME_INTERVAL, CardDemand, CardInput, CardModes, CardNote, CardOrigin, CardScreen,
     CardSize, CardState, CardView, DEFAULT_CARD_ROWS, DOUBLE_ESCAPE_WINDOW, SgrMouse, ViewEnd,
 };
+use crate::terminal::tick_actions::builtin::ReopenedCard;
 use tick_protocol::{BubbledKey, InstanceRef};
 
 /// What the frame needs of one open card; its screen is locked only while the frame is drawn.
@@ -20,6 +21,7 @@ pub(super) struct CardSource {
 
 const OPENING_NOTE: &str = "opening";
 const ALL_CARDS_HINT: &str = "z/Z hide/show all";
+const REOPEN_HINT: &str = "space reopen";
 /// How long the card of a row the Agent used waits for the row to be listed.
 const AGENT_CARD_WAIT: Duration = Duration::from_secs(30);
 /// The most such cards that wait at once.
@@ -172,6 +174,32 @@ impl State {
         let attach = self.open_card(instance.clone(), CardOrigin::User);
         self.focus_card(instance);
         attach
+    }
+
+    /// After the user reopened a row's Tick: shows the card of `reopened`, which took the row's
+    /// place, as the user's, and with [`ReopenedCard::Enter`] gives it the keys while the
+    /// Monitor list still has them on its row. The row it took over hands it the selection.
+    /// Returns whether its view has to attach.
+    pub(super) fn show_reopened_card(&mut self, reopened: InstanceRef, card: ReopenedCard) -> bool {
+        if !self.has_card(&reopened) {
+            return false;
+        }
+        let attaches = self
+            .chat
+            .is_some_and(|chat| self.cards.open_as(chat, reopened.clone(), CardOrigin::User));
+        let is_selected = self
+            .monitor
+            .selected()
+            .is_some_and(|entry| entry.instance == reopened);
+        if card == ReopenedCard::Enter
+            && is_selected
+            && self.monitor_owns_keys()
+            && !self.card_focused()
+        {
+            self.focus_card(reopened);
+        }
+        self.rendered_region = None;
+        attaches
     }
 
     /// Gives an open card the focus, selecting its row so the list scrolls to it.
@@ -776,8 +804,8 @@ impl State {
         }
     }
 
-    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card, and
-    /// z/Z while any row has one.
+    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card or
+    /// reopens, and z/Z while any row has a card.
     pub(super) fn monitor_list_hint(&self) -> String {
         if let Some(focused) = self.cards.focused() {
             return if focused.shell_task().is_some() {
@@ -804,6 +832,8 @@ impl State {
                     "space show"
                 },
             );
+        } else if entry.reopens().is_some() {
+            card_keys.push(REOPEN_HINT);
         }
         if self
             .monitor
@@ -869,6 +899,25 @@ pub(super) fn card_key_bytes(key: KeyEvent, application_cursor: bool) -> Option<
 }
 
 impl Console {
+    /// [`State::show_reopened_card`] while the View still shows `chat`; returns whether the
+    /// card's view has to attach.
+    pub(in crate::terminal) fn show_reopened_card(
+        &self,
+        chat: Uuid,
+        reopened: &InstanceRef,
+        card: ReopenedCard,
+    ) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat != Some(chat) {
+            return Ok(false);
+        }
+        let attaches = state.show_reopened_card(reopened.clone(), card);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(attaches)
+    }
+
     /// Attaches `instance`'s card view with `grant` while the card still waits for it.
     pub(in crate::terminal) async fn attach_card(
         &self,
