@@ -153,11 +153,12 @@ test("the output of tickloop plugin validate is read line by line", () => {
     skills: ["skills/read", "skills/write"],
     tick: { executable: "bin/tick-notes", kind: "speaks the Tick protocol" },
     mcp: [],
+    hooks: null,
     unsupported: ["commands", "MCP servers"],
     warnings: ["skills path \"../outside\" is ignored: it must start with ./"],
   });
   assert.deepEqual(parseValidateOutput("Plugin bare-plugin, read from its directory.\nSkills: none\n"), {
-    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, mcp: [], unsupported: [], warnings: [],
+    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [],
   });
 });
 
@@ -222,6 +223,7 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
     manifestFormats: { ".claude-plugin/plugin.json": 2, "marketplace entry": 2 },
     supportedComponents: { skills: 4 },
     unsupportedComponents: { "MCP servers": 1, commands: 1 },
+    hooks: { plugins: 0, fully: 0, partly: 0, none: 0, supportedHooks: 0, unsupportedEvents: {}, unsupportedTypes: {}, unsupportedFields: {} },
   });
   assert.equal(git(fixture.monorepo, "status", "--porcelain"), "", "the plugin sources stay untouched");
   assert.ok(!existsSync(join(scratch, "claude-work", "git", "1", "other")), "a git subdirectory is checked out sparsely");
@@ -368,4 +370,59 @@ test("MCP validation contributes transports, OAuth discovery and configuration t
   const totals = summarize([{ status: STATUS.installable, sourceType: "path", supportedComponents: ["MCP servers"], unsupportedComponents: [], warnings: [], manifestFormat: "directory", mcp: parsed.mcp }]);
   assert.deepEqual(totals.mcp, { servers: 3, byTransport: { http: 1, sse: 1, stdio: 1 }, oauthConfigured: 0, oauthDiscovery: 1, needsUserConfig: 1, unsupported: 1 });
   assert.equal(totals.installableWithSkillsOrTick, 0);
+});
+
+test("hook support is read from validate and reported per plugin as fully, partly or not supported", () => {
+  const partly = parseValidateOutput([
+    "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.",
+    "Skills: none",
+    "Hooks: 2 supported | events: PreToolUse, Stop | types: command | fields: command, timeout",
+    "Hooks not supported yet: events: Notification | types: prompt | fields: async",
+    "Warning: hook events not supported yet, so their hooks are not used: Notification",
+  ].join("\n"));
+  assert.deepEqual(partly.hooks, {
+    support: "partly",
+    supported: 2,
+    events: ["PreToolUse", "Stop"],
+    types: ["command"],
+    fields: ["command", "timeout"],
+    unsupportedEvents: ["Notification"],
+    unsupportedTypes: ["prompt"],
+    unsupportedFields: ["async"],
+  });
+  const fully = parseValidateOutput("Hooks: 1 supported | events: Stop | types: command | fields: command\n").hooks;
+  assert.deepEqual(
+    { support: fully.support, unsupportedEvents: fully.unsupportedEvents, unsupportedTypes: fully.unsupportedTypes, unsupportedFields: fully.unsupportedFields },
+    { support: "fully", unsupportedEvents: [], unsupportedTypes: [], unsupportedFields: [] },
+  );
+  const none = parseValidateOutput([
+    "Not supported yet, so not used: hooks.",
+    "Hooks: 0 supported | events: none | types: none | fields: none",
+    "Hooks not supported yet: events: Notification | types: none | fields: none",
+  ].join("\n"));
+  assert.deepEqual({ support: none.hooks.support, events: none.hooks.events, unsupported: none.unsupported }, { support: "none", events: [], unsupported: ["hooks"] });
+
+  const plugin = (name, hooks, unsupportedComponents = []) => ({
+    name, status: STATUS.installable, sourceType: "path", source: `./${name}`, revision: "abc", manifestFormat: ".claude-plugin/plugin.json", version: "1.0.0",
+    supportedComponents: hooks?.supported ? ["hooks"] : [], unsupportedComponents, warnings: [], errors: [], mcp: [], hooks,
+  });
+  const report = {
+    generatedAt: "now", tickloop: { version: "tickloop test" }, target: "aarch64-apple-darwin",
+    marketplace: { name: "hooked", source: "hooked", format: "claude", file: "marketplace.json" },
+    plugins: [plugin("guard", partly.hooks), plugin("done", fully), plugin("notify", none.hooks, ["hooks"]), plugin("plain", null)],
+  };
+  report.totals = summarize(report.plugins);
+  assert.deepEqual(report.totals.hooks, {
+    plugins: 3, fully: 1, partly: 1, none: 1, supportedHooks: 3,
+    unsupportedEvents: { Notification: 2 }, unsupportedTypes: { prompt: 1 }, unsupportedFields: { async: 1 },
+  });
+  assert.deepEqual(report.totals.supportedComponents, { hooks: 2 });
+
+  const markdown = renderMarkdown(report);
+  assert.match(markdown, /^## Hooks$/m);
+  assert.match(markdown, /^\| Partly supported \| 1 \|$/m);
+  assert.match(markdown, /^\| guard \| partly \| 2 \| PreToolUse, Stop \| command \| command, timeout \| Notification \| prompt \| async \|$/m);
+  assert.match(markdown, /^\| Plugin \| Source \| Status \| Revision \| Manifest \| Version \| Used \| Not supported yet \| Hooks \| Warnings and errors \|$/m);
+  assert.match(markdown, /^\| guard \| path \.\/guard \| installable \| abc \| \S+ \| 1\.0\.0 \| hooks \|  \| partly: 2 supported \(PreToolUse, Stop\); not supported: events Notification; types prompt; fields async \|  \|$/m);
+  assert.match(markdown, /^\| plain \| path \.\/plain \| installable \| abc \| \S+ \| 1\.0\.0 \|  \|  \|  \|  \|$/m);
 });

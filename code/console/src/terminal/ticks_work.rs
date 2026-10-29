@@ -215,7 +215,28 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                         .map(Box::new)
                 }
                 .await;
-                (panel, TickPackageResult::Installation { name, result })
+                let hooks_to_confirm = match &result {
+                    Ok(installation) => {
+                        let plugin = installation.plugin.clone();
+                        blocking(move || {
+                            Ok(
+                                tickloop_code_settings::UserSettings::in_root(store.config_root())
+                                    .plugin_hooks_to_confirm(&plugin),
+                            )
+                        })
+                        .await
+                        .unwrap_or_default()
+                    }
+                    Err(_) => 0,
+                };
+                (
+                    panel,
+                    TickPackageResult::Installation {
+                        name,
+                        result,
+                        hooks_to_confirm,
+                    },
+                )
             });
         }
         TickPackageRequest::SetEnabled { name, enabled } => {
@@ -247,19 +268,31 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
                     move || {
                         let uninstalled = tickloop_tick_installer::uninstall(&store, &name)?;
                         let id = format!("{}@{}", uninstalled.name, uninstalled.marketplace);
-                        tickloop_code_settings::UserSettings::in_root(store.config_root())
-                            .forget_plugin_hooks(&id)
-                            .map_err(|error| {
-                                format!(
-                                    "{name} was uninstalled, but its hook trust records were not \
-                                     removed: {error}"
-                                )
-                            })?;
-                        Ok(uninstalled)
+                        let forgot_hook_trust =
+                            tickloop_code_settings::UserSettings::in_root(store.config_root())
+                                .forget_plugin_hooks(&id)
+                                .map_err(|error| {
+                                    format!(
+                                        "{name} was uninstalled, but its hook trust records were \
+                                         not removed: {error}"
+                                    )
+                                })?;
+                        Ok((uninstalled, forgot_hook_trust))
                     }
                 })
                 .await;
-                (panel, TickPackageResult::Uninstallation { name, result })
+                let (result, forgot_hook_trust) = match result {
+                    Ok((uninstalled, forgot_hook_trust)) => (Ok(uninstalled), forgot_hook_trust),
+                    Err(error) => (Err(error), false),
+                };
+                (
+                    panel,
+                    TickPackageResult::Uninstallation {
+                        name,
+                        result,
+                        forgot_hook_trust,
+                    },
+                )
             });
         }
         TickPackageRequest::LogIn {
@@ -536,10 +569,22 @@ fn read_installed_now(store: &PluginStore) -> Result<InstalledList, String> {
             (plugin.name().to_owned(), config)
         })
         .collect();
+    let settings = tickloop_code_settings::UserSettings::in_root(store.config_root());
+    let hooks_to_confirm = packages
+        .plugins
+        .iter()
+        .map(|plugin| {
+            (
+                plugin.name().to_owned(),
+                settings.plugin_hooks_to_confirm(plugin),
+            )
+        })
+        .collect();
     Ok(InstalledList {
         packages,
         logins,
         configurations,
+        hooks_to_confirm,
     })
 }
 
