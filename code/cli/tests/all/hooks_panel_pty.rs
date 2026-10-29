@@ -105,13 +105,14 @@ fn is_selected(frame: &str, text: &str) -> bool {
         .any(|line| line.contains(screen::SELECTED_MARK) && line.contains(text))
 }
 
-/// The row that shows `text`, without its selection mark.
-fn row(frame: &str, text: &str) -> String {
+/// Whether the row that shows `text` ends with the trust `state`; `false` while no row shows it,
+/// as before the list has loaded.
+fn row_state(frame: &str, text: &str, state: &str) -> bool {
     frame
         .lines()
         .map(|line| line.replace(screen::SELECTED_MARK, " "))
         .find(|line| line.contains(text))
-        .unwrap_or_else(|| panic!("no row with {text}:\n{frame}"))
+        .is_some_and(|line| line.trim_end().ends_with(state))
 }
 
 /// The key hints, or what replaces them: the dialog's last row.
@@ -165,12 +166,8 @@ fn reviewing_one_by_one_opens_the_list_where_hooks_are_trusted_disabled_and_rest
             .unwrap_or_else(|| panic!("{text} in {dialog}"))
     });
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{dialog}");
-    assert!(
-        row(&frame, "echo user-guard")
-            .trim_end()
-            .ends_with("trusted")
-    );
-    assert!(row(&frame, "format.sh").trim_end().ends_with("pending"));
+    assert!(row_state(&frame, "echo user-guard", "trusted"));
+    assert!(row_state(&frame, "format.sh", "pending"));
     assert!(
         is_selected(&frame, "format.sh"),
         "the first hook to review is selected:\n{frame}"
@@ -194,8 +191,7 @@ fn reviewing_one_by_one_opens_the_list_where_hooks_are_trusted_disabled_and_rest
     terminal.press(ESCAPE, "the list again", |frame| shows(frame, LIST_HINT));
 
     terminal.press(b" ", "the hook trusted", |frame| {
-        shows(frame, "Trusted PostToolUse Edit|Write")
-            && row(frame, "format.sh").trim_end().ends_with("trusted")
+        shows(frame, "Trusted PostToolUse Edit|Write") && row_state(frame, "format.sh", "trusted")
     });
     let trust = folder_trust(&fixture);
     assert_eq!(
@@ -207,7 +203,7 @@ fn reviewing_one_by_one_opens_the_list_where_hooks_are_trusted_disabled_and_rest
     let frame = terminal.press(b"x", "the confirmation", |frame| {
         hint_line(frame).contains("Press x again to disable PostToolUse Edit|Write")
     });
-    assert!(row(&frame, "format.sh").trim_end().ends_with("trusted"));
+    assert!(row_state(&frame, "format.sh", "trusted"));
     terminal.press(CONTROL_N, "the confirmation cancelled by moving", |frame| {
         is_selected(frame, "repo-stop") && hint_line(frame).contains(LIST_HINT)
     });
@@ -220,22 +216,17 @@ fn reviewing_one_by_one_opens_the_list_where_hooks_are_trusted_disabled_and_rest
     terminal.press(b"z", "the confirmation cancelled by another key", |frame| {
         hint_line(frame).contains(LIST_HINT)
     });
-    assert!(
-        row(&terminal.frame(), "format.sh")
-            .trim_end()
-            .ends_with("trusted")
-    );
+    assert!(row_state(&terminal.frame(), "format.sh", "trusted"));
 
     terminal.send(b"x");
     terminal.press(b"x", "the hook disabled", |frame| {
         shows(frame, "Disabled PostToolUse Edit|Write")
-            && row(frame, "format.sh").trim_end().ends_with("disabled")
+            && row_state(frame, "format.sh", "disabled")
             && hint_line(frame).contains("x restore")
     });
     terminal.send(b"x");
     terminal.press(b"x", "the hook restored", |frame| {
-        shows(frame, "Restored PostToolUse Edit|Write")
-            && row(frame, "format.sh").trim_end().ends_with("trusted")
+        shows(frame, "Restored PostToolUse Edit|Write") && row_state(frame, "format.sh", "trusted")
     });
     terminal.press(ESCAPE, "the panel closed", |frame| !shows(frame, LIST_HINT));
 
@@ -275,8 +266,8 @@ fn trusting_all_from_the_review_trusts_every_hook_to_review() {
     );
     terminal.press(b"/hooks\r", "every hook trusted", |frame| {
         shows(frame, LIST_HINT)
-            && row(frame, "format.sh").trim_end().ends_with("trusted")
-            && row(frame, "repo-stop").trim_end().ends_with("trusted")
+            && row_state(frame, "format.sh", "trusted")
+            && row_state(frame, "repo-stop", "trusted")
     });
     terminal.press(ESCAPE, "the panel closed", |frame| !shows(frame, LIST_HINT));
     terminal.exit();
@@ -298,8 +289,8 @@ fn continuing_without_trusting_leaves_the_hooks_pending() {
     assert!(folder_trust(&fixture).is_null(), "{}", settings(&fixture));
     terminal.press(b"/hooks\r", "the hooks still pending", |frame| {
         shows(frame, LIST_HINT)
-            && row(frame, "format.sh").trim_end().ends_with("pending")
-            && row(frame, "repo-stop").trim_end().ends_with("pending")
+            && row_state(frame, "format.sh", "pending")
+            && row_state(frame, "repo-stop", "pending")
     });
     terminal.press(ESCAPE, "the panel closed", |frame| !shows(frame, LIST_HINT));
     terminal.exit();
