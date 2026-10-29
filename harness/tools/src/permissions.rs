@@ -770,19 +770,72 @@ pub fn restriction_may_match_call(
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return true;
     };
-    if shell_rule_matches_any(pattern, input) {
+    // A substitution runs a command of its own, quoted or not.
+    if shell_rule_matches_any(pattern, input) || command.contains("$(") || command.contains('`') {
         return true;
     }
-    if split_shell_commands(command).is_some() {
-        return false;
-    }
-    let Some(parts) = split_shell_parts(command, true) else {
-        return true;
+    let commands = match split_shell_commands(command) {
+        Some(commands) => commands.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+        None => {
+            let Some(parts) = split_shell_parts(command, true) else {
+                return true;
+            };
+            let commands = parts
+                .iter()
+                .map(|part| without_redirections(part))
+                .collect::<Vec<_>>();
+            if commands
+                .iter()
+                .any(|command| command.contains(['(', ')', '{', '}', '<', '>']))
+            {
+                return true;
+            }
+            commands
+        }
     };
-    parts.iter().any(|part| {
-        let part = without_redirections(part);
-        part.contains(['`', '(', ')', '{', '}', '<', '>']) || bash_pattern_matches(pattern, &part)
+    commands.iter().any(|command| {
+        bash_pattern_matches(pattern, command)
+            || bash_pattern_matches(pattern, &without_wrappers(command))
     })
+}
+
+/// A simple command as the program it runs sees it: without leading variable assignments, the
+/// `env` and `command` wrappers and their options, and with the program named without its
+/// directory.
+fn without_wrappers(command: &str) -> String {
+    let is_assignment = |token: &str| {
+        token.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|character: char| character.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    };
+    let mut tokens = command.split_whitespace().peekable();
+    loop {
+        match tokens.peek().copied() {
+            Some(token) if is_assignment(token) => {}
+            Some("env" | "command") => {
+                tokens.next();
+                while tokens
+                    .peek()
+                    .is_some_and(|token| token.starts_with('-') || is_assignment(token))
+                {
+                    tokens.next();
+                }
+                continue;
+            }
+            _ => break,
+        }
+        tokens.next();
+    }
+    let mut words = Vec::new();
+    if let Some(program) = tokens.next() {
+        words.push(program.rsplit('/').next().unwrap_or(program));
+    }
+    words.extend(tokens);
+    words.join(" ")
 }
 
 /// A simple command with its redirections, such as `> out.txt` or `2>&1`, left out.
@@ -1109,6 +1162,52 @@ mod restriction_tests {
         assert!(bash_matches("git push*", "echo $(git push)"));
         assert!(bash_matches("git push*", "(cd repo && git push)"));
         assert!(bash_matches("git push*", "echo 'unclosed"));
+    }
+
+    #[test]
+    fn substitutions_anywhere_cannot_be_judged_and_match() {
+        assert!(bash_matches("git push*", r#"echo "$(git push)""#));
+        assert!(bash_matches("git push*", "echo \"`git push`\""));
+        assert!(bash_matches("git push*", "echo `date`"));
+    }
+
+    #[test]
+    fn wrappers_assignments_and_program_paths_do_not_hide_a_command() {
+        for command in [
+            "env X=1 git push",
+            "env -i PATH=/bin git push origin",
+            "command git push",
+            "command -p git push",
+            "/usr/bin/git push",
+            "X=1 Y=2 git push",
+            "cargo test && FOO=bar /opt/homebrew/bin/git push",
+        ] {
+            assert!(bash_matches("git push*", command), "{command}");
+        }
+        assert!(!bash_matches("git push*", "env X=1 git status"));
+        assert!(!bash_matches("git push*", "/usr/bin/git status"));
+    }
+
+    #[test]
+    fn the_same_commands_keep_their_existing_deny_rule_matching() {
+        let rule = deny(BASH_TOOL_NAME, Some("git push*"));
+        for (command, matches) in [
+            ("git push", true),
+            ("cargo test && git push", true),
+            ("env X=1 git push", false),
+            ("/usr/bin/git push", false),
+        ] {
+            assert_eq!(
+                rule_matches_call(
+                    &rule,
+                    BASH_TOOL_NAME,
+                    &json!({ "command": command }),
+                    Uuid::nil()
+                ),
+                matches,
+                "{command}"
+            );
+        }
     }
 
     #[test]
