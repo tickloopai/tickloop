@@ -1746,7 +1746,7 @@ fn space_or_a_click_on_a_collapsed_cards_row_shows_it_in_one_press() {
 }
 
 #[test]
-fn space_on_a_row_without_a_card_keeps_the_keys_on_the_list() {
+fn space_keeps_the_keys_on_a_tick_row_without_a_card_and_types_on_an_artifact_row() {
     let mut state = cards_fixture();
     let (instance, _requests) = attached_hosted_card(&mut state);
     state.key(key(KeyCode::Enter));
@@ -1781,8 +1781,13 @@ fn space_on_a_row_without_a_card_keeps_the_keys_on_the_list() {
     }
 
     let (mut state, rows) = tab_fixture();
-    assert_eq!(selected(&state), rows[0], "a row that can have no card");
+    assert_eq!(selected(&state), rows[0], "an Artifact row");
+    assert!(!state.monitor_list_hint().contains("space"));
     assert!(state.key(key(KeyCode::Char(' '))).is_none());
-    assert!(state.monitor_owns_keys() && state.editor.draft().is_empty());
+    assert!(
+        !state.monitor_owns_keys(),
+        "an Artifact row has no card, so Space leaves the list"
+    );
+    assert_eq!(state.editor.draft(), " ");
     assert!(state.cards.cards().is_empty());
 }
