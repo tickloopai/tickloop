@@ -70,7 +70,7 @@ async fn view_with_keys_ticks_progress(
 const CLOSE: &[u8] = b"\x1b";
 /// Leaves an entered Tick's card: the first Esc reaches the Tick, the second leaves.
 const LEAVE_CARD: &[u8] = b"\x1b\x1b";
-/// Well past how long the selection rests on a row before an open card there is revealed.
+/// Long enough for a card the selection wrongly opened to show.
 const SELECTION_REST: Duration = Duration::from_millis(400);
 
 /// How many Monitor cards show a keys Tick's screen; each card is 40 columns wide.
@@ -109,8 +109,8 @@ fn monitor_position(frame: &str, needle: &str) -> (usize, usize) {
         .unwrap_or_else(|| panic!("no Monitor text {needle:?}: {frame}"))
 }
 
-/// Live Tick screens open as cards under their Monitor rows. Selecting a row opens no card;
-/// Space shows and hides a card with the focus on the list, and several stay open; Enter enters
+/// Live Tick screens open as cards under their Monitor rows. Selecting a row opens no card,
+/// while Tab previews the next row's until the selection moves on; Space shows and hides a card with the focus on the list, and several stay open; Enter enters
 /// one, so typed keys, Ctrl+C included, reach that Tick alone; a lone Esc reaches the Tick too,
 /// and Esc Esc leaves with the card still shown, the second Esc never reaching the Tick. A click
 /// on a row toggles its card, a click in a card enters it and a click outside leaves it.
@@ -129,6 +129,16 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
             0,
             "the selection resting on a row opens no card: {rested}"
         );
+        view.send(b"\t");
+        view.wait_for("Tab previews the next row's card", |frame| {
+            keys_cards(frame) == 1 && frame.contains("space hide")
+        })
+        .await;
+        view.send(b"k");
+        view.wait_for("the preview closes as the selection moves on", |frame| {
+            keys_cards(frame) == 0 && frame.contains("space show")
+        })
+        .await;
         view.send(b" ");
         view.wait_for("one card shows its Tick", |frame| keys_cards(frame) == 1)
             .await;

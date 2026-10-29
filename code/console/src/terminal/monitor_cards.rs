@@ -530,11 +530,15 @@ pub(super) enum CardState {
     Failed(String),
 }
 
-/// Who showed a card, which decides which cards stay shown when not all fit.
+/// Who showed a card, which decides which cards stay shown when not all fit and which close by
+/// themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CardOrigin {
     /// The user showed or entered it: Space, Enter or a click.
     User,
+    /// Tab selected its row; it closes when the selection moves on or the list loses the keys,
+    /// unless the user keeps it.
+    Preview,
     /// The Agent used its Tick or took in its update; it stays until the user hides it.
     Agent,
 }
@@ -553,8 +557,8 @@ pub(super) struct OpenCard {
     early_input_overflowed: bool,
 }
 
-/// What a Chat's cards were while another Chat is shown: the cards shown and the ones the user
-/// hid.
+/// What a Chat's cards were while another Chat is shown: the cards shown, without a Tab preview,
+/// and the ones the user hid.
 #[derive(Default)]
 struct RememberedCards {
     shown: Vec<RememberedCard>,
@@ -575,7 +579,7 @@ pub(super) struct MonitorCards {
     open: Vec<OpenCard>,
     focused: Option<InstanceRef>,
     /// The selected row's open card, shown ahead of every card but the focused one while the
-    /// selection rests on its row.
+    /// selection is on its row; a Tab preview is always this card.
     revealed: Option<InstanceRef>,
     /// The cards the user hid in this Chat; the Agent's use shows them again only after the user
     /// does.
@@ -709,10 +713,27 @@ impl MonitorCards {
         self.revealed.as_ref()
     }
 
-    /// The selection left the revealed card's row, which goes back to its own priority. Returns
-    /// whether a card was revealed.
+    /// Shows `instance`'s card in `chat` as the row Tab selected: a card not open opens as a
+    /// preview, and either way it is revealed. Returns whether it opened.
+    pub(super) fn preview(&mut self, chat: Uuid, instance: InstanceRef) -> bool {
+        let opened = self.open_as(chat, instance.clone(), CardOrigin::Preview);
+        self.revealed = Some(instance);
+        opened
+    }
+
+    /// The selection left the revealed card's row: a card open only as a preview closes, and any
+    /// other goes back to its own priority. Returns whether a card was revealed.
     pub(super) fn end_reveal(&mut self) -> bool {
-        self.revealed.take().is_some()
+        let Some(instance) = self.revealed.take() else {
+            return false;
+        };
+        if self
+            .card(&instance)
+            .is_some_and(|card| card.origin == CardOrigin::Preview)
+        {
+            self.close(&instance);
+        }
+        true
     }
 
     /// Closes the card, which detaches its view; a focused card loses the focus.
@@ -733,8 +754,8 @@ impl MonitorCards {
     }
 
     /// Remembers the shown Chat's cards and the ones the user hid, then closes them, which
-    /// detaches their views; no Chat's cards are shown until [`MonitorCards::restore`]. The focus
-    /// and the selection's reveal are not remembered.
+    /// detaches their views; no Chat's cards are shown until [`MonitorCards::restore`]. The focus,
+    /// the selection's reveal and a Tab preview are not remembered.
     pub(super) fn remember(&mut self) {
         self.leave_focus();
         self.revealed = None;
@@ -745,6 +766,7 @@ impl MonitorCards {
         };
         let shown: Vec<RememberedCard> = open
             .into_iter()
+            .filter(|card| card.origin != CardOrigin::Preview)
             .map(|card| RememberedCard {
                 instance: card.instance,
                 origin: card.origin,

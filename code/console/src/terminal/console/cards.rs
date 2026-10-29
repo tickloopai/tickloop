@@ -19,17 +19,7 @@ pub(super) struct CardSource {
     pub(super) note: Option<CardNote>,
 }
 
-/// The row with an open card the selection rests on while the Monitor list has the keys, with
-/// since when.
-pub(super) struct SelectionRest {
-    instance: InstanceRef,
-    since: Instant,
-}
-
 const OPENING_NOTE: &str = "opening";
-/// How long the selection rests on the row of an open card before the card shows, should other
-/// cards have taken its room.
-pub(super) const SELECTION_REVEAL_DELAY: Duration = Duration::from_millis(150);
 const ALL_CARDS_HINT: &str = "z/Z hide/show all";
 const REOPEN_HINT: &str = "space reopen";
 /// How long the card of a row the Agent used waits for the row to be listed.
@@ -93,8 +83,8 @@ impl State {
         })
     }
 
-    /// Space, or a click on the row: shows the card, or hides it, revealed or not, which detaches
-    /// its view. A card collapsed for lack of room shows as the user's most recent instead. The
+    /// Space, or a click on the row: shows the card, or hides it, revealed or previewed or not,
+    /// which detaches its view. A card collapsed for lack of room shows as the user's most recent instead. The
     /// focus stays on the list.
     pub(super) fn toggle_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
         self.rendered_region = None;
@@ -113,7 +103,7 @@ impl State {
     }
 
     /// The open card the selection reveals: the selected Tick's while the Monitor list has the
-    /// keys. A row whose card is not open is only selected.
+    /// keys.
     fn reveal_subject(&self) -> Option<InstanceRef> {
         if !self.monitor_owns_keys() || self.card_focused() || self.monitor.detail.is_some() {
             return None;
@@ -124,43 +114,24 @@ impl State {
             .filter(|instance| self.cards.is_open(instance))
     }
 
-    /// Follows the selection at `now`: moving it, or the list losing the keys, puts the card of
-    /// the row left back in its own place, and once the selection rested on a row with an open
-    /// card for [`SELECTION_REVEAL_DELAY`] that card shows ahead of all but the focused one, the
-    /// cards it squeezes out returning when it goes back. Returns whether the screen changed.
-    pub(super) fn settle_selection_reveal(&mut self, now: Instant) -> bool {
+    /// Follows the selection before each frame: moving it by any means, or the list losing the
+    /// keys, closes a Tab preview and puts any other card of the row left back in its own place,
+    /// and the open card of the selected row shows ahead of all but the focused one, the cards it
+    /// squeezes out returning when it goes back. A row whose card is not open is only selected.
+    fn follow_selection(&mut self) {
         let subject = self.reveal_subject();
-        let mut changed = false;
-        if self.selection_rest.as_ref().map(|rest| &rest.instance) != subject.as_ref() {
-            changed = self.cards.end_reveal();
-            self.selection_rest = subject.map(|instance| SelectionRest {
-                instance,
-                since: now,
-            });
+        if self.cards.revealed() == subject.as_ref() {
+            return;
         }
-        if self
-            .selection_reveal_deadline()
-            .is_some_and(|deadline| now >= deadline)
-            && let Some(rest) = &self.selection_rest
-        {
-            changed |= self.cards.reveal(&rest.instance);
+        self.cards.end_reveal();
+        if let Some(instance) = subject {
+            self.cards.reveal(&instance);
         }
-        if changed {
-            self.rendered_region = None;
-        }
-        changed
     }
 
-    /// When the open card of the row the selection rests on is due to show.
-    pub(super) fn selection_reveal_deadline(&self) -> Option<Instant> {
-        let rest = self.selection_rest.as_ref()?;
-        (self.cards.is_open(&rest.instance) && self.cards.revealed() != Some(&rest.instance))
-            .then_some(rest.since + SELECTION_REVEAL_DELAY)
-    }
-
-    /// z on the list: hides every shown card, the user's and the Agent's alike, without hiding
-    /// them from the Agent's use, which shows them again as usual. The focus and selection stay
-    /// on the list.
+    /// z on the list: hides every shown card, the user's, the Agent's and a Tab preview alike,
+    /// without hiding them from the Agent's use, which shows them again as usual. The focus and
+    /// selection stay on the list.
     pub(super) fn hide_all_cards(&mut self) {
         if self.cards.cards().is_empty() {
             return;
@@ -311,10 +282,25 @@ impl State {
         self.rendered_region = None;
     }
 
-    /// Tab and Shift+Tab on the list: selects the next or previous row of any kind, wrapping.
-    pub(super) fn cycle_rows(&mut self, delta: isize) {
+    /// Tab and Shift+Tab on the list: selects the next or previous row of any kind, wrapping. A
+    /// row with a live screen shows its card at once ahead of all but the focused one: a card not
+    /// open opens as a preview, whose view the event attaches, and an open one is revealed.
+    pub(super) fn cycle_rows(&mut self, delta: isize) -> Option<InputEvent> {
         self.rendered_region = None;
+        self.cards.end_reveal();
         self.monitor.cycle_selection(delta);
+        let chat = self.chat?;
+        let row = self
+            .monitor
+            .selected()
+            .map(|entry| entry.instance.clone())
+            .filter(|instance| self.has_card(instance) || self.cards.is_open(instance))?;
+        self.cards
+            .preview(chat, row.clone())
+            .then(|| InputEvent::TickAction {
+                chat,
+                action: super::super::tick_actions::builtin::attach_card(row),
+            })
     }
 
     /// Leaves the focused card, which stays shown, for the Monitor list with its row selected.
@@ -325,7 +311,7 @@ impl State {
 
     /// Acts on the first key the focused card's Tick bubbled that moves the focus; the keys
     /// after it came from where the focus no longer is and go nowhere. Returns whether anything
-    /// changed.
+    /// changed; the attach of a card a bubbled Tab previews waits with the queued card inputs.
     pub(super) fn settle_bubbled_keys(&mut self) -> bool {
         for key in self.cards.take_bubbled() {
             if !self.card_focused() {
@@ -348,13 +334,11 @@ impl State {
                     self.monitor.focused = false;
                     self.monitor.overlay = false;
                 }
-                BubbledKey::Tab => {
+                BubbledKey::Tab | BubbledKey::Backtab => {
                     self.leave_card_for_list();
-                    self.cycle_rows(1);
-                }
-                BubbledKey::Backtab => {
-                    self.leave_card_for_list();
-                    self.cycle_rows(-1);
+                    let delta = if key == BubbledKey::Tab { 1 } else { -1 };
+                    let attach = self.cycle_rows(delta);
+                    self.queued_card_inputs.extend(attach);
                 }
             }
             return true;
@@ -444,15 +428,13 @@ impl State {
     }
 
     /// What cards settle apart from the user's own input: keys a focused card's Tick bubbled,
-    /// cards the Agent's use shows and the selected row's open card once due. Returns whether the
-    /// screen changed, and what to send.
-    pub(super) fn settle_card_signals(&mut self, now: Instant) -> (bool, Vec<InputEvent>) {
+    /// and cards the Agent's use shows. Returns whether the screen changed, and what to send.
+    pub(super) fn settle_card_signals(&mut self) -> (bool, Vec<InputEvent>) {
         self.cards.announce_focus();
         let bubbled = self.settle_bubbled_keys();
         let shown = self.show_agent_cards();
-        let revealed = self.settle_selection_reveal(now);
         (
-            bubbled || shown || revealed,
+            bubbled || shown,
             std::mem::take(&mut self.queued_card_inputs),
         )
     }
@@ -618,8 +600,8 @@ impl State {
         self.cards.input(bytes);
     }
 
-    /// The open cards of the shown Chat whose rows are still listed, for the next frame. A row
-    /// leaving the list closes its card; a row on a page not loaded yet is still listed. A card
+    /// The open cards of the shown Chat whose rows are still listed, for the next frame, with the
+    /// selected row's revealed. A row leaving the list closes its card; a row on a page not loaded yet is still listed. A card
     /// whose Tick ended, as its row or its view tells, keeps its last screen and says how on its
     /// rule.
     pub(super) fn card_sources(&mut self) -> Vec<CardSource> {
@@ -627,6 +609,7 @@ impl State {
         let monitor = &self.monitor;
         self.cards
             .retain(self.chat, |instance| monitor.lists(instance));
+        self.follow_selection();
         self.card_sizes
             .retain(|instance, _| self.cards.is_open(instance));
         let focused = self.cards.focused().cloned();
