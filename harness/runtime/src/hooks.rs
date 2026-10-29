@@ -217,8 +217,8 @@ impl Agent {
         ))
     }
 
-    /// The hooks `call` matches that may run, the same command once per source; announces the
-    /// ones it matches that may not run yet.
+    /// The hooks `call` matches that may run, the same command, `if` and way of running once per
+    /// source; announces the ones it matches that may not run yet.
     async fn select_hooks(
         &self,
         receipt: &Receipt,
@@ -252,6 +252,7 @@ impl Agent {
                         hook.source.clone(),
                         command.clone(),
                         hook.condition.clone(),
+                        hook.background.clone(),
                     )) {
                         runnable.push(Runnable { hook, command });
                     }

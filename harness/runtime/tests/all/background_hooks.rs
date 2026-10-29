@@ -3,6 +3,7 @@
 //! request, and an `asyncRewake` hook that exits 2 notifies the Loop, waking it when idle.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -163,16 +164,18 @@ async fn follow_turn(events: &mut Receiver<Event>, run_id: RunId) -> Turn {
     }
 }
 
-/// The record of `command`'s background run as it ended.
-async fn hook_end(events: &mut Receiver<Event>, command: &str) -> HookRunRecord {
+/// The record of `command`'s background run as it ended, from the Chat's activity history, so
+/// an end that came during the turn is found as well.
+async fn hook_end(bench: &Bench, command: &str) -> HookRunRecord {
     tokio::time::timeout(HOOK_END_WAIT, async {
         loop {
-            if let EventKind::HookRan { record } = next_event(events).await.kind
-                && record.command == command
-                && record.background == Some(HookBackgroundPhase::Ended)
-            {
-                return *record;
+            let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+            if let Some(record) = history.hook_runs.into_iter().find(|record| {
+                record.command == command && record.background == Some(HookBackgroundPhase::Ended)
+            }) {
+                return record;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -253,7 +256,7 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
     assert_eq!(start.outcome, HookRunOutcome::Success);
     assert_eq!(start.tool_name.as_deref(), Some("Bash"));
 
-    let end = hook_end(&mut events, AUDIT).await;
+    let end = hook_end(&bench, AUDIT).await;
     assert_eq!(end.outcome, HookRunOutcome::Success);
     assert_eq!(end.decision, None, "a background decision decides nothing");
     let reason = end.reason.clone().unwrap();
@@ -407,7 +410,7 @@ async fn esc_leaves_background_hooks_running_and_stop_cancels_them() {
         interrupter.await.unwrap();
         assert!(turn.interrupted, "stop={stops}");
 
-        let end = hook_end(&mut events, AUDIT).await;
+        let end = hook_end(&bench, AUDIT).await;
         if stops {
             assert_eq!(end.outcome, HookRunOutcome::Cancelled);
             assert!(started.elapsed() < SLOW_HOOK, "/stop ends it at once");
@@ -435,10 +438,44 @@ async fn a_background_hook_times_out_as_any_hook_does() {
     let mut events = bench.agent.subscribe();
 
     bench.turn(&mut events, "Build it.").await;
-    let end = hook_end(&mut events, REVIEW).await;
+    let end = hook_end(&bench, REVIEW).await;
 
     assert_eq!(end.outcome, HookRunOutcome::TimedOut);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(bench.requests().len(), 2, "a timed-out hook wakes nothing");
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_same_command_runs_both_in_the_foreground_and_in_the_background() {
+    let bench = Bench::start(
+        vec![build_call(), text("done")],
+        vec![
+            background_hook(HookEvent::PostToolUse, None, AUDIT, None),
+            background_hook(
+                HookEvent::PostToolUse,
+                None,
+                AUDIT,
+                Some(HookBackground::Async),
+            ),
+        ],
+    )
+    .await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    bench.environment.define_command(AUDIT, move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        exits(0, "", "", Duration::ZERO)
+    });
+    let mut events = bench.agent.subscribe();
+
+    let turn = bench.turn(&mut events, "Build it.").await;
+    hook_end(&bench, AUDIT).await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert!(
+        turn.hook_runs.iter().any(|run| run.background.is_none()),
+        "the foreground run is not merged into the background one"
+    );
     bench.agent.shutdown().await;
 }
