@@ -44,6 +44,8 @@ struct MemoryState {
 /// How one run of a scripted one-shot command behaves.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCommandRun {
+    /// Written to standard output as soon as the command starts; `stdout` follows as it ends.
+    pub early_stdout: Vec<u8>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
@@ -419,6 +421,11 @@ impl MemoryPort {
             return ExecutionOutcome::NotDispatched(error);
         }
         let run = script(spec);
+        if let Some(tap) = &spec.stdout_tap
+            && !run.early_stdout.is_empty()
+        {
+            tap.send(&run.early_stdout);
+        }
         let timed_out = run.duration > spec.timeout;
         tokio::select! {
             biased;
@@ -436,6 +443,8 @@ impl MemoryPort {
             }
             _ = tokio::time::sleep(run.duration.min(spec.timeout)) => {}
         }
+        let mut stdout = CapturedOutput::new(&run.early_stdout);
+        stdout.append(&run.stdout);
         let exit = if timed_out {
             ProgramExit {
                 code: None,
@@ -451,7 +460,7 @@ impl MemoryPort {
             CommandOutput {
                 exit,
                 timed_out,
-                stdout: CapturedOutput::new(&run.stdout),
+                stdout,
                 stderr: CapturedOutput::new(&run.stderr),
             }
             .into_result(),

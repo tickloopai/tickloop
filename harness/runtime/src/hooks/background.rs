@@ -1,6 +1,8 @@
 //! Hooks declared `async` or `asyncRewake`, run in the background as Claude Code 2.1.302 runs
 //! them: their event goes on at once, and nothing they print decides anything; a decision is
-//! recorded as ignored. Each run is recorded as it starts and as it ends.
+//! recorded as ignored. Each run is recorded as it starts and as it ends. A running hook whose
+//! first line of output is `{"async": true}` goes on from there as an `async` hook, still under
+//! its timeout from when it started.
 //!
 //! An `async` hook's `systemMessage` and `additionalContext` join the end of the conversation
 //! for the model's next request without starting a turn. An `asyncRewake` hook that exits 2
@@ -10,7 +12,7 @@
 //! `/stop` and shutdown end it.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::Instant;
 
 use tickloop_harness_protocol::hooks::{
     HookBackground, HookBackgroundPhase, HookDecision, HookEvent, HookRunOutcome,
@@ -19,8 +21,8 @@ use tickloop_harness_protocol::{Message, Receipt, local_messages};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ChatHookState, FinishedRun, HookCall, HookContext, HookResponse, Runnable, record_hook_run,
-    run_record,
+    ChatHookState, CommandRun, FinishedRun, HookCall, HookContext, HookResponse, Runnable,
+    record_hook_run, run_record,
 };
 use crate::Agent;
 
@@ -101,6 +103,31 @@ fn rewake_notification(
 }
 
 impl Agent {
+    /// Records that `runnable` goes on in the background for `call` and returns what ends it
+    /// there; `None` when the Chat is gone.
+    async fn record_background_start(
+        &self,
+        receipt: &Receipt,
+        call: &HookCall,
+        runnable: &Runnable,
+    ) -> Option<CancellationToken> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id)?;
+        let cancel = chat.hook_state.background_cancel(&self.inner.shutdown);
+        let mut record = run_record(
+            receipt,
+            call.event,
+            call.tool.as_ref(),
+            &runnable.hook,
+            &FinishedRun::unfinished(HookResponse::success(), Instant::now()),
+            None,
+        );
+        record.background = Some(HookBackgroundPhase::Started);
+        record_hook_run(self, chat, receipt, record);
+        self.save(&chat.snapshot);
+        Some(cancel)
+    }
+
     /// Starts `runnable` in the background for `call` and records its start; its event does not
     /// wait for it.
     pub(super) async fn start_background_hook(
@@ -111,31 +138,11 @@ impl Agent {
         runnable: Runnable,
         stdin: Vec<u8>,
     ) {
-        let cancel = {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&receipt.chat_id) else {
-                return;
-            };
-            let cancel = chat.hook_state.background_cancel(&self.inner.shutdown);
-            let started = FinishedRun {
-                response: HookResponse::success(),
-                duration: Duration::ZERO,
-                exit_code: None,
-                output: String::new(),
-                blocking_output: String::new(),
-            };
-            let mut record = run_record(
-                receipt,
-                call.event,
-                call.tool.as_ref(),
-                &runnable.hook,
-                &started,
-                None,
-            );
-            record.background = Some(HookBackgroundPhase::Started);
-            record_hook_run(self, chat, receipt, record);
-            self.save(&chat.snapshot);
-            cancel
+        let Some(background) = runnable.hook.background.clone() else {
+            return;
+        };
+        let Some(cancel) = self.record_background_start(receipt, call, &runnable).await else {
+            return;
         };
         let agent = self.clone();
         let receipt = receipt.clone();
@@ -147,7 +154,51 @@ impl Agent {
                 .run_one_hook(&receipt, &context, event, &runnable, &stdin, &cancel)
                 .await;
             agent
-                .finish_background_hook(&receipt, event, tool.as_ref(), &runnable, run)
+                .finish_background_hook(&receipt, event, tool.as_ref(), &runnable, &background, run)
+                .await;
+        });
+    }
+
+    /// Lets the rest of a hook run that asked for it go on in the background as an `async`
+    /// hook's run: records its start, and its end once `execution` ends; `/stop` and shutdown
+    /// end it through `execution_cancel`.
+    pub(super) async fn continue_in_background(
+        &self,
+        receipt: &Receipt,
+        call: &HookCall,
+        runnable: &Runnable,
+        started: Instant,
+        mut execution: CommandRun,
+        execution_cancel: CancellationToken,
+    ) {
+        let Some(cancel) = self.record_background_start(receipt, call, runnable).await else {
+            execution_cancel.cancel();
+            return;
+        };
+        let agent = self.clone();
+        let receipt = receipt.clone();
+        let runnable = runnable.clone();
+        let event = call.event;
+        let tool = call.tool.clone();
+        self.inner.tasks.spawn(async move {
+            let ending = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    execution_cancel.cancel();
+                    execution.await
+                }
+                ending = &mut execution => ending,
+            };
+            let run = FinishedRun::read(event, &runnable, started, ending, cancel.is_cancelled());
+            agent
+                .finish_background_hook(
+                    &receipt,
+                    event,
+                    tool.as_ref(),
+                    &runnable,
+                    &HookBackground::Async,
+                    run,
+                )
                 .await;
         });
     }
@@ -159,11 +210,9 @@ impl Agent {
         event: HookEvent,
         tool: Option<&(String, String)>,
         runnable: &Runnable,
+        background: &HookBackground,
         run: FinishedRun,
     ) {
-        let Some(background) = &runnable.hook.background else {
-            return;
-        };
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
