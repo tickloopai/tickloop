@@ -400,6 +400,7 @@ pub(super) enum InputEvent {
     /// Work `/plugins` asks for, or the login state to read again once a login program ended.
     TickPackages(super::ticks_panel::TickPackageWork),
     Mcp(super::mcp_panel::McpWork),
+    Hooks(super::hooks_panel::HooksWork),
     TickAction {
         chat: Uuid,
         action: super::tick_actions::PreparedTickAction,
@@ -465,6 +466,7 @@ impl fmt::Debug for InputEvent {
             Self::ArtifactSignOut => formatter.write_str("ArtifactSignOut"),
             Self::TickPackages(work) => formatter.debug_tuple("TickPackages").field(work).finish(),
             Self::Mcp(work) => formatter.debug_tuple("Mcp").field(work).finish(),
+            Self::Hooks(work) => formatter.debug_tuple("Hooks").field(work).finish(),
             Self::TickAction { chat, action } => formatter
                 .debug_struct("TickAction")
                 .field("chat", chat)
@@ -1985,6 +1987,54 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
         Ok(Some(taken))
+    }
+
+    /// Hands `result` to the `/hooks` panel `panel`, shown or waiting; `None` when it is closed,
+    /// otherwise whether it still has something to show.
+    pub(super) fn apply_hooks_result(
+        &self,
+        panel: Uuid,
+        result: super::hooks_panel::HooksResult,
+    ) -> Result<Option<bool>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(super::user_panel::UserPanel::Hooks(open)) = state.user_panel_mut(panel) else {
+            return Ok(None);
+        };
+        let keeps_showing = open.apply(result);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(keeps_showing))
+    }
+
+    /// Closes the panel `panel` when it is the one shown.
+    pub(super) fn close_user_panel(&self, panel: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state
+            .user_panel
+            .as_ref()
+            .is_none_or(|shown| shown.id() != panel)
+        {
+            return Ok(());
+        }
+        state.user_panel = None;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Whether the New Agent screen is shown with nothing over its input, so the review of its
+    /// Folder's hooks can show.
+    pub(super) fn can_offer_hook_review(&self) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.interactive
+            && state.chat.is_none()
+            && state.overview.projection.is_none()
+            && state.request_layout.is_none()
+            && state.transcript.is_none()
+            && state.diff_screen.is_none()
+            && !state.input_dialog_visible())
     }
 
     /// The `/mcp` panel shown while its servers are still connecting.
@@ -12909,6 +12959,12 @@ impl State {
                 ),
                 super::user_panel::UserPanelEffect::Mcp(request) => {
                     Some(InputEvent::Mcp(super::mcp_panel::McpWork {
+                        panel: panel.id(),
+                        request,
+                    }))
+                }
+                super::user_panel::UserPanelEffect::Hooks(request) => {
+                    Some(InputEvent::Hooks(super::hooks_panel::HooksWork {
                         panel: panel.id(),
                         request,
                     }))

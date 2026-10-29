@@ -14,6 +14,7 @@ mod builtin_catalog;
 mod codex_terminal;
 mod command_consolidation;
 mod graceful_upgrade;
+mod hooks_panel_pty;
 mod hosted_bounds;
 mod hosted_ticks;
 mod marketplace_commands;

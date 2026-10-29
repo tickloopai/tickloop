@@ -48,6 +48,8 @@ mod file_mentions;
 mod footer;
 mod goal_view;
 mod herdr_agent;
+mod hooks_panel;
+mod hooks_work;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -484,6 +486,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/plugins"
                 | "/ticks"
                 | "/mcp"
+                | "/hooks"
                 | "/settings"
                 | "/permissions"
                 | "/sandbox"
@@ -1997,6 +2000,7 @@ async fn interact_with_herdr(
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::new(agent.clone());
     let mut mcp_tasks = mcp_work::McpTasks::default();
+    let mut hook_tasks = hooks_work::HookTasks::default();
     // While `/mcp` shows servers that are still connecting, it reads them again this often.
     let mut mcp_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     mcp_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2204,6 +2208,15 @@ async fn interact_with_herdr(
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
         let dispatch_directory = global.projection().dispatch_directory;
+        if interactive && config_root.is_some() {
+            hooks_work::offer_review(
+                console,
+                agent,
+                selected_chat.is_none() && !overview_active,
+                &dispatch_directory,
+                &mut hook_tasks,
+            )?;
+        }
         menus.set_new_agent_directory(dispatch_directory.clone());
         agent.set_new_agent_directory(dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
@@ -3060,6 +3073,11 @@ async fn interact_with_herdr(
                     mcp_work::finish(console, root, agent, panel, done, &mut mcp_tasks)?;
                 }
             },
+            done = hook_tasks.join_next(), if !hook_tasks.is_empty() => {
+                if let Some(done) = done {
+                    hooks_work::finish(console, agent, done, &mut hook_tasks)?;
+                }
+            },
             _ = mcp_refresh.tick(), if console.mcp_panel_awaiting_connections()?.is_some() => {
                 if let Some(panel) = console.mcp_panel_awaiting_connections()? && let Some(root) = config_root.as_deref() {
                     mcp_work::refresh(root, agent, panel, &mut mcp_tasks);
@@ -3440,6 +3458,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::Mcp(work)) => {
                     if let Some(root) = config_root.as_deref() { mcp_work::start(console, root, agent, work, &mut mcp_tasks)?; }
                 },
+                Some(InputEvent::Hooks(work)) => hooks_work::start(agent, work, &mut hook_tasks),
                 Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
                     let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
@@ -4121,6 +4140,12 @@ async fn interact_with_herdr(
                             let Some(root) = config_root.as_deref() else { outln!(console, "/mcp needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
                             if !interactive { outln!(console, "/mcp needs an interactive terminal; run tickloop mcp list there instead."); continue; }
                             if let Err(error) = mcp_work::open(console, root, agent, selected_chat.map(Into::into), workdir.clone(), &mut mcp_tasks) { outln!(console, "Cannot open /mcp: {}", safe_text(&error)); }
+                        },
+                        command if command.split_whitespace().next() == Some("/hooks") => {
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use /hooks"); continue; }
+                            if config_root.is_none() { outln!(console, "/hooks needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; }
+                            if !interactive { outln!(console, "/hooks needs an interactive terminal."); continue; }
+                            if let Err(error) = hooks_work::open(console, agent, selected_chat.map(Into::into), global.projection().dispatch_directory, &mut hook_tasks) { outln!(console, "Cannot open /hooks: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
