@@ -158,7 +158,7 @@ pub(super) async fn install(
             install_from(HTTP, store, &marketplace, &plugin).await?
         }
     };
-    report(&installation, kind);
+    report(store, &installation, kind);
     super::plugin_config::configure(store, &installation.plugin, false)?;
     Ok(())
 }
@@ -330,7 +330,7 @@ pub(super) async fn update(
             Err(reason) => Err(format!("cannot update {name}@{marketplace}: {reason}")),
         };
         match result {
-            Ok(installation) => report_update(&installation),
+            Ok(installation) => report_update(store, &installation),
             Err(message) if is_single => return Err(message),
             Err(message) => {
                 failures += 1;
@@ -348,7 +348,7 @@ pub(super) async fn update(
     }
 }
 
-fn report_update(installation: &Installation) {
+fn report_update(store: &PluginStore, installation: &Installation) {
     let plugin = &installation.plugin;
     let id = plugin.id();
     let version = &plugin.version;
@@ -366,7 +366,7 @@ fn report_update(installation: &Installation) {
         }
         InstallOutcome::Reinstalled => println!("Reinstalled {noun} {id} {version} in {root}."),
     }
-    report_notes(plugin);
+    report_notes(store, plugin);
 }
 
 /// Lists what every marketplace offers of `kind`, merged by name, beside what is installed; a

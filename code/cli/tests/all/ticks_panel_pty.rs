@@ -632,7 +632,7 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
     fs::write(
         directory.join(".claude-plugin/plugin.json"),
-        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"hooks":{}}}"#,
+        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"check"}]}]},"commands":{"tidy":{"content":"Tidy"}}}"#,
     )
     .unwrap();
     install_from_path(&fixture, "plugin", &directory);
@@ -643,16 +643,19 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
         row_shows(
             frame,
             "notes",
-            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
-        ) && frame.contains("Not supported yet: hooks")
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
+        ) && frame.contains("Not supported yet: commands")
     });
-    assert!(!frame.contains("Not supported yet: MCP"), "{frame}");
+    assert!(
+        !frame.contains("Not supported yet: MCP") && !frame.contains("commands, hooks"),
+        "{frame}"
+    );
     terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
     terminal.press(b"\r", "disabled", |frame| {
         row_shows(
             frame,
             "notes",
-            "local · disabled · 1.0.0 · no login needed · 1 MCP server",
+            "local · disabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
         )
     });
     terminal.press(b"\r", "enable action", |frame| frame.contains("❯ Enable"));
@@ -660,7 +663,7 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
         row_shows(
             frame,
             "notes",
-            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
         )
     });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));

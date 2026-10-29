@@ -527,10 +527,56 @@ fn a_plugin_update_lapses_its_hook_trust_and_uninstalling_forgets_its_records() 
     setup.trust(&updated);
 
     setup.plugins().uninstall("guard", false).unwrap();
-    setup.settings().forget_plugin_hooks("guard@local").unwrap();
+    assert!(setup.settings().forget_plugin_hooks("guard@local").unwrap());
     assert_eq!(setup.user_settings()["hookTrust"]["plugins"], json!({}));
+    assert!(!setup.settings().forget_plugin_hooks("guard@local").unwrap());
     install("exit 2\n");
     assert_eq!(setup.hooks().hooks[0].trust, HookTrust::Pending);
+}
+
+#[test]
+fn a_plugin_counts_its_hooks_never_confirmed_or_changed_since_whether_or_not_enabled() {
+    let setup = Setup::new();
+    let hooks = hooks_json(json!({
+        "PreToolUse": [{"hooks": [
+            {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/check.sh\""},
+            {"type": "command", "command": "second"},
+            {"type": "command", "command": "third"},
+            {"type": "prompt", "prompt": "Is this safe?"},
+        ]}],
+        "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
+    }));
+    let install = |script: &str| {
+        setup.install_plugin(
+            "guard",
+            json!({"name": "guard"}),
+            &[("hooks/hooks.json", &hooks), ("check.sh", script)],
+        )
+    };
+    let plugin = install("exit 0\n");
+    assert_eq!(setup.settings().plugin_hooks_to_confirm(&plugin), 3);
+
+    setup.trust(&only(&setup.hooks(), "\"${CLAUDE_PLUGIN_ROOT}/check.sh\""));
+    setup
+        .change(&only(&setup.hooks(), "third"), HookTrustAction::Disable)
+        .unwrap();
+    assert_eq!(setup.settings().plugin_hooks_to_confirm(&plugin), 1);
+
+    let updated = install("exit 2\n");
+    assert_eq!(setup.settings().plugin_hooks_to_confirm(&updated), 2);
+
+    let disabled = setup.plugins().set_enabled("guard", false).unwrap();
+    assert_eq!(setup.settings().plugin_hooks_to_confirm(&disabled), 2);
+    let plain = setup.install_plugin("plain", json!({"name": "plain"}), &[]);
+    assert_eq!(setup.settings().plugin_hooks_to_confirm(&plain), 0);
+}
+
+#[test]
+fn the_plugin_manifest_names_exactly_the_hook_events_tickloop_runs() {
+    assert_eq!(
+        tick_plugins::HOOK_EVENTS.to_vec(),
+        HookEvent::ALL.map(HookEvent::name).to_vec()
+    );
 }
 
 #[test]

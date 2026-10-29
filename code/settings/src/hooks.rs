@@ -15,8 +15,8 @@ use std::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tick_plugins::{
-    CLAUDE_MANIFEST, InstalledPlugin, ManifestFormat, PluginHooks, PluginStore,
-    SHIPPED_FILES_RECORD, TICKLOOP_MANIFEST,
+    CLAUDE_MANIFEST, COMMAND_HOOK_TYPE, InstalledPlugin, ManifestFormat, PluginHooks, PluginStore,
+    SHIPPED_FILES_RECORD, TICKLOOP_MANIFEST, UNSUPPORTED_COMMAND_FIELDS,
 };
 use tickloop_harness::policy::settings::SettingsStoreError;
 use tickloop_harness::policy::skills::{PLUGIN_DATA_VARIABLES, PLUGIN_ROOT_VARIABLES};
@@ -40,18 +40,7 @@ const REPOSITORY_SETTINGS_FILES: [&str; 2] =
     [".claude/settings.json", ".claude/settings.local.json"];
 /// The scripts a repository's trust covers besides the hook declarations.
 const REPOSITORY_HOOKS_DIRECTORY: &str = ".claude/hooks";
-const COMMAND_TYPE: &str = "command";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
-/// `command` fields newer than this support; a hook using one is skipped rather than run without.
-const UNSUPPORTED_COMMAND_FIELDS: [&str; 7] = [
-    "args",
-    "shell",
-    "async",
-    "asyncRewake",
-    "once",
-    "if",
-    "onFailure",
-];
 const FINGERPRINT_BUFFER_BYTES: usize = 64 * 1024;
 /// Bounds a fingerprint, such as of a symbolic link to a large directory elsewhere.
 const MAX_FINGERPRINT_ENTRIES: usize = 100_000;
@@ -72,7 +61,7 @@ impl DeclaredHook {
         let declaration = serde_json::to_vec(&(
             self.event.name(),
             &self.matcher,
-            COMMAND_TYPE,
+            COMMAND_HOOK_TYPE,
             &self.command,
             self.timeout_secs,
         ))
@@ -227,23 +216,12 @@ fn plugin_hooks(
     }
     let mut hooks = Vec::new();
     for plugin in installed.plugins.iter().filter(|plugin| plugin.enabled) {
-        let mut declared = SourceHooks::default();
-        for declaration in &plugin.manifest.hooks {
-            read_plugin_hooks(plugin, declaration, &mut declared, warnings);
-        }
-        if declared.hooks.is_empty() {
+        let id = plugin.id();
+        let plugin_records = TrustRecords::record(records.plugins, &id);
+        let declared = plugin_hooks_with_trust(plugin, plugin_records, warnings);
+        if declared.is_empty() {
             continue;
         }
-        let id = plugin.id();
-        let fingerprint = match plugin_fingerprint(plugin) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                warnings.push(format!(
-                    "the hooks of plugin {id} are skipped: cannot read its files: {error}"
-                ));
-                continue;
-            }
-        };
         let user_config =
             PluginUserConfig::load(config_root, &plugin.manifest).unwrap_or_else(|error| {
                 warnings.push(format!("plugin {id}: {error}"));
@@ -271,11 +249,13 @@ fn plugin_hooks(
             root: plugin.root.clone(),
             data: data.clone(),
         };
-        let plugin_records = TrustRecords::record(records.plugins, &id);
-        for hook in declared.hooks {
-            let key = hook.key();
-            let hash = format!("{key}/{fingerprint}");
-            let trust = trust_state(TrustRecords::record(plugin_records, &key), Some(&hash));
+        for PluginHook {
+            hook,
+            key,
+            hash,
+            trust,
+        } in declared
+        {
             let resolved = resolve_plugin_command(&hook.command, &environment);
             let mut hook = configured(
                 hook,
@@ -290,6 +270,55 @@ fn plugin_hooks(
         }
     }
     hooks
+}
+
+/// A plugin's declared hook with what its trust is judged by.
+struct PluginHook {
+    hook: DeclaredHook,
+    key: String,
+    hash: String,
+    trust: HookTrust,
+}
+
+/// The hooks `plugin` declares with their trust by its `records`; none when its files cannot be
+/// fingerprinted.
+fn plugin_hooks_with_trust(
+    plugin: &InstalledPlugin,
+    records: Option<&Map<String, Value>>,
+    warnings: &mut Vec<String>,
+) -> Vec<PluginHook> {
+    let mut declared = SourceHooks::default();
+    for declaration in &plugin.manifest.hooks {
+        read_plugin_hooks(plugin, declaration, &mut declared, warnings);
+    }
+    if declared.hooks.is_empty() {
+        return Vec::new();
+    }
+    let fingerprint = match plugin_fingerprint(plugin) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            warnings.push(format!(
+                "the hooks of plugin {} are skipped: cannot read its files: {error}",
+                plugin.id()
+            ));
+            return Vec::new();
+        }
+    };
+    declared
+        .hooks
+        .into_iter()
+        .map(|hook| {
+            let key = hook.key();
+            let hash = format!("{key}/{fingerprint}");
+            let trust = trust_state(TrustRecords::record(records, &key), Some(&hash));
+            PluginHook {
+                hook,
+                key,
+                hash,
+                trust,
+            }
+        })
+        .collect()
 }
 
 fn read_plugin_hooks(
@@ -428,7 +457,7 @@ fn declared_hooks(
 fn command_hook(handler: &Value) -> Result<(String, u64), String> {
     let kind = handler.get("type").and_then(Value::as_str);
     match kind {
-        Some(COMMAND_TYPE) => {}
+        Some(COMMAND_HOOK_TYPE) => {}
         Some(kind) => return Err(format!("type {kind} is not supported; it is skipped")),
         None => return Err("needs a type; it is skipped".into()),
     }
@@ -441,7 +470,7 @@ fn command_hook(handler: &Value) -> Result<(String, u64), String> {
         ));
     }
     let command = handler
-        .get(COMMAND_TYPE)
+        .get(COMMAND_HOOK_TYPE)
         .and_then(Value::as_str)
         .filter(|command| !command.trim().is_empty())
         .ok_or("needs a command; it is skipped")?;
@@ -647,9 +676,22 @@ fn trust_partition<'a>(
 }
 
 impl UserSettings {
+    /// How many hooks of `plugin` wait for the user to confirm them: never confirmed, or changed
+    /// since. Hooks the user turned off do not count, and neither does whether the plugin is
+    /// enabled.
+    pub fn plugin_hooks_to_confirm(&self, plugin: &InstalledPlugin) -> usize {
+        let saved = self.read_object().unwrap_or_default();
+        let records = TrustRecords::read(&saved, None, self.file_path(), &mut Vec::new());
+        let plugin_records = TrustRecords::record(records.plugins, &plugin.id());
+        plugin_hooks_with_trust(plugin, plugin_records, &mut Vec::new())
+            .iter()
+            .filter(|hook| matches!(hook.trust, HookTrust::Pending | HookTrust::Modified))
+            .count()
+    }
+
     /// Removes the hook trust records of the plugin `id` (`<plugin>@<marketplace>`), as when it is
-    /// uninstalled; the file is left alone when it has none.
-    pub fn forget_plugin_hooks(&self, id: &str) -> Result<(), SettingsError> {
+    /// uninstalled, and tells whether it had any; the file is left alone when it has none.
+    pub fn forget_plugin_hooks(&self, id: &str) -> Result<bool, SettingsError> {
         let has_records = |saved: &Map<String, Value>| {
             saved
                 .get(HOOK_TRUST_KEY)
@@ -658,7 +700,7 @@ impl UserSettings {
                 .is_some()
         };
         if !has_records(&self.read_object()?) {
-            return Ok(());
+            return Ok(false);
         }
         self.update(|saved| {
             if let Some(plugins) = saved
@@ -669,7 +711,8 @@ impl UserSettings {
                 plugins.remove(id);
             }
             Ok(())
-        })
+        })?;
+        Ok(true)
     }
 }
 
