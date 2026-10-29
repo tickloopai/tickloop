@@ -725,7 +725,7 @@ fn ensure_execution_settled(
 
 /// Empties `board` in one revision: retries of its recorded mutations report the task cleared,
 /// and numbering continues after the removed tasks.
-fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
+pub(super) fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
     let offset = board
         .task_number_offset
         .checked_add(board.tasks.len() as u64)
@@ -744,24 +744,45 @@ fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
     Ok(())
 }
 
-/// Clears the task board of `chat`'s current Loop when a prompt is answered again, regenerated
-/// or edited: one answer plans and finishes its own tasks, so the replaced answer's tasks do
-/// not carry over. Tells whether a board was cleared.
-pub(super) fn clear_board_for_new_answer(chat: &mut Chat) -> Result<bool, String> {
-    if chat.snapshot.delegation.is_some() {
-        return Ok(false);
+/// The finished board of the root Chat's Loop, cleared: a new answer to a prompt starts over
+/// without the tasks of earlier answers, which keep them where they ended.
+pub(super) fn cleared_finished_board(snapshot: &ChatSnapshot) -> Result<Option<TaskBoard>, String> {
+    if snapshot.delegation.is_some() {
+        return Ok(None);
     }
-    let loop_id = chat.snapshot.chat_loop.id;
-    let Some(board) = chat
-        .snapshot
+    snapshot
         .task_boards
-        .get_mut(&loop_id)
-        .filter(|board| !board.tasks.is_empty())
-    else {
-        return Ok(false);
-    };
-    clear_board(board)?;
-    Ok(true)
+        .get(&snapshot.chat_loop.id)
+        .filter(|board| board.is_finished())
+        .map(|board| {
+            let mut board = board.clone();
+            clear_board(&mut board).map(|()| board)
+        })
+        .transpose()
+}
+
+/// The Runs of `chats` that run, wait to run, or continue for their task's commands.
+pub(super) fn live_runs<'a>(
+    chats: impl IntoIterator<Item = &'a Chat>,
+) -> crate::task_board_history::LiveRuns {
+    chats
+        .into_iter()
+        .flat_map(|chat| {
+            chat.ready_runs
+                .iter()
+                .chain(chat.parked.keys())
+                .copied()
+                .chain(chat.active_run)
+                .chain(
+                    chat.snapshot
+                        .pending_inputs
+                        .iter()
+                        .filter(|pending| pending.task_continuation)
+                        .map(|pending| pending.receipt.run_id),
+                )
+                .map(|run| ((chat.snapshot.id, run), chat.family_generation))
+        })
+        .collect()
 }
 
 impl Agent {
@@ -806,13 +827,7 @@ impl Agent {
         let Some(board) = root.snapshot.task_boards.get_mut(&root_loop_id) else {
             return Ok(());
         };
-        if board.revision != expected_revision
-            || board.tasks.is_empty()
-            || board
-                .tasks
-                .iter()
-                .any(|task| task.status != Status::Completed)
-        {
+        if board.revision != expected_revision || !board.is_finished() {
             return Ok(());
         }
         clear_board(board).map_err(AgentError::Invalid)?;
@@ -951,9 +966,19 @@ impl Agent {
         Ok(())
     }
 
+    /// Queues `root`'s boards as [`Self::queue_latest_task_boards`] does. A change while the
+    /// root runs no answer also stands where its conversation ends; a running answer's changes
+    /// stand where the answer ends.
+    pub(super) fn queue_task_boards(&self, root: &mut Chat) {
+        if root.active_run.is_none() && root.parked.is_empty() {
+            self.record_task_board_checkpoint(root);
+        }
+        self.queue_latest_task_boards(root);
+    }
+
     /// Records `root`'s boards for the next Transcript checkpoint; task work waits for that
     /// checkpoint before it changes them again.
-    pub(super) fn queue_task_boards(&self, root: &mut Chat) {
+    pub(super) fn queue_latest_task_boards(&self, root: &mut Chat) {
         self.record_chat_metadata(
             root.snapshot.id,
             Line::TaskBoards(TaskBoardsEntry {
@@ -1641,25 +1666,7 @@ impl Agent {
     /// before any Run starts. A claim whose execution did not come back needs reconciliation.
     pub(crate) async fn restore_task_claims(&self, members: &[ChatId]) {
         let mut chats = self.inner.chats.lock().await;
-        let live = members
-            .iter()
-            .filter_map(|id| chats.get(id))
-            .flat_map(|chat| {
-                chat.ready_runs
-                    .iter()
-                    .chain(chat.parked.keys())
-                    .copied()
-                    .chain(chat.active_run)
-                    .chain(
-                        chat.snapshot
-                            .pending_inputs
-                            .iter()
-                            .filter(|pending| pending.task_continuation)
-                            .map(|pending| pending.receipt.run_id),
-                    )
-                    .map(|run| ((chat.snapshot.id, run), chat.family_generation))
-            })
-            .collect::<HashMap<_, _>>();
+        let live = live_runs(members.iter().filter_map(|id| chats.get(id)));
         for id in members {
             let Some(root) = chats.get_mut(id) else {
                 continue;

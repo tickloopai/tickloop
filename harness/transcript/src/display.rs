@@ -251,15 +251,21 @@ pub fn task_boards(lines: &[Line], enabled: bool) -> Vec<DisplayTaskBoard> {
     boards
         .into_iter()
         .filter(|board: &TaskBoard| !board.tasks.is_empty())
-        .map(|board| DisplayTaskBoard {
+        .map(DisplayTaskBoard::from)
+        .collect()
+}
+
+impl From<TaskBoard> for DisplayTaskBoard {
+    fn from(board: TaskBoard) -> Self {
+        Self {
             root_chat_id: board.root_chat_id,
             root_loop_id: board.root_loop_id,
             revision: board.revision,
             is_team: board.is_team,
             task_number_offset: board.task_number_offset,
             tasks: board.tasks,
-        })
-        .collect()
+        }
+    }
 }
 
 /// The Chat's scheduled tasks as its latest record keeps them.

@@ -93,6 +93,7 @@ impl CompactionLayout {
         compacted_bookkeeping.loop_state_views = BTreeMap::new();
         compacted_bookkeeping.later_provenance = BTreeMap::new();
         compacted_bookkeeping.message_responses = BTreeMap::new();
+        compacted_bookkeeping.task_board_checkpoints = BTreeMap::new();
         compacted_bookkeeping
             .lifecycle
             .restart_claims_at(self.sources.len());
@@ -134,6 +135,11 @@ impl CompactionLayout {
                         compacted_bookkeeping
                             .later_provenance
                             .insert(index, later.clone());
+                    }
+                    if let Some(boards) = bookkeeping.task_board_checkpoints.get(&original) {
+                        compacted_bookkeeping
+                            .task_board_checkpoints
+                            .insert(index, boards.clone());
                     }
                     if let Some(original_id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {
@@ -203,6 +209,18 @@ impl CompactionLayout {
                     compacted
                         .message_compactions
                         .insert(index, CompactionMarker::Boundary(self.boundary.clone()));
+                    // The chain restarts at the boundary: it carries the boards that stood at
+                    // its logical parent.
+                    if let Some((_, boards)) = self.logical_parent.and_then(|parent| {
+                        bookkeeping
+                            .task_board_checkpoints
+                            .range(..=parent)
+                            .next_back()
+                    }) {
+                        compacted_bookkeeping
+                            .task_board_checkpoints
+                            .insert(index, boards.clone());
+                    }
                 }
                 MessageSource::Summary => {
                     compacted.messages.push(self.summary.clone());

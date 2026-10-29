@@ -1138,7 +1138,8 @@ impl Agent {
     }
 
     /// Ends the Run's answer and settles the input it answered. An answer the host lost, or a
-    /// handover's host ended at its ceiling, leaves its input open for a continuation.
+    /// handover's host ended at its ceiling, leaves its input open for a continuation. A root
+    /// Chat's task boards are recorded where the answer ends.
     pub(crate) fn end_response(
         &self,
         chat: &mut Chat,
@@ -1146,6 +1147,7 @@ impl Agent {
         ending: ResponseEnding,
         usage: Usage,
     ) {
+        self.record_task_board_checkpoint(chat);
         let bookkeeping = &mut chat.bookkeeping;
         bookkeeping.lifecycle.end(
             &chat.snapshot,

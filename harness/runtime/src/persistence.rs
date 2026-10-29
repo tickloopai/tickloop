@@ -47,6 +47,7 @@ use tickloop_harness_transcript::{
     FamilyCompletionsEntry, FamilyInputsEntry, FileHistorySnapshotEntry, ForkedFrom, LOOP_SUBTYPE,
     LastPromptEntry, Line, LoopRecord, MonitorMembersEntry, PartialCompactDirection,
     ProvenanceEntry, Recorded, SentAgentMessagesEntry, SubagentsEntry, SummarizeMetadataEntry,
+    TaskBoardCheckpointEntry,
 };
 
 /// Following Claude Code's `NO_RESPONSE_REQUESTED`: the assistant sentinel appended when the
@@ -963,6 +964,18 @@ impl ChatRecorder {
                 blocks,
             });
             lines.push(Line::chain(role, entry));
+            // Boards recorded at an old entry, or before the boundary, stand at the new entry.
+            if compacted_bookkeeping
+                .task_board_checkpoints
+                .contains_key(&index)
+            {
+                lines.push(task_board_checkpoint_line(
+                    compacted.id,
+                    uuid,
+                    compacted_bookkeeping,
+                    index,
+                ));
+            }
         }
         if let Some(content) = loop_update {
             lines.push(record_loop(
@@ -1051,6 +1064,38 @@ impl ChatRecorder {
             })],
             None,
         );
+    }
+
+    /// Queues the root Chat's task boards as they stand at the end of message `index`, keyed by
+    /// that message's last entry; what the Chat changed so far is queued first, so the entry is
+    /// there.
+    fn record_task_board_checkpoint(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        index: usize,
+    ) -> bool {
+        self.enqueue_sync(snapshot, bookkeeping);
+        let Some(leaf) = self
+            .logs
+            .lock()
+            .unwrap()
+            .get(&snapshot.id)
+            .and_then(|log| log.links.get(index)?.uuids.last().copied())
+        else {
+            return false;
+        };
+        self.outbox.enqueue(
+            snapshot.id,
+            vec![task_board_checkpoint_line(
+                snapshot.id,
+                leaf,
+                bookkeeping,
+                index,
+            )],
+            None,
+        );
+        true
     }
 
     /// The project directory of a recorded Chat in the local store.
@@ -1503,6 +1548,25 @@ impl ChatRecorder {
 struct EntryStamp<'a> {
     timestamp: &'a str,
     folder: Option<&'a Path>,
+}
+
+fn task_board_checkpoint_line(
+    chat_id: ChatId,
+    leaf: Uuid,
+    bookkeeping: &ChatBookkeeping,
+    index: usize,
+) -> Line {
+    Line::TaskBoardCheckpoint(TaskBoardCheckpointEntry {
+        chat_id: chat_id.into(),
+        leaf,
+        boards: bookkeeping
+            .task_board_checkpoints
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .map(|(loop_id, board)| (loop_id.uuid(), board.clone()))
+            .collect(),
+    })
 }
 
 fn placement(folder: Option<&Path>) -> ChatPlacement {
@@ -2547,6 +2611,18 @@ fn recover_transcript(
             .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
     );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
+    if chat_id == source_chat_id {
+        bookkeeping.task_board_checkpoints = super::task_board_history::checkpoints_by_message(
+            &loaded.chain,
+            &kept.message_of_entry,
+            &loaded.task_board_checkpoints,
+            chat_id.into(),
+        );
+        bookkeeping.has_task_board_checkpoints = loaded
+            .task_board_checkpoints
+            .values()
+            .any(|checkpoint| checkpoint.chat_id == chat_id.uuid());
+    }
     let mut nested = std::collections::BTreeMap::new();
     for line in &loaded.lifecycle {
         if let Line::NestedCall(entry) = line
@@ -3262,6 +3338,26 @@ impl Agent {
         recorder.outbox.enqueue(chat_id, vec![line], None);
         recorder.notify.notify_one();
         self.ensure_flush_loop(recorder);
+    }
+
+    /// Queues the checkpoint recorded at the end of message `index` and wakes the background
+    /// flush.
+    pub(super) fn record_task_board_line(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        index: usize,
+    ) {
+        let Some(recorder) = &self.inner.recorder else {
+            return;
+        };
+        if !recorder.logs.lock().unwrap().contains_key(&snapshot.id) {
+            return;
+        }
+        if recorder.record_task_board_checkpoint(snapshot, bookkeeping, index) {
+            recorder.notify.notify_one();
+            self.ensure_flush_loop(recorder);
+        }
     }
 
     pub(super) fn record_delegation(
@@ -4206,15 +4302,19 @@ impl StagedBranch {
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();
         snapshot.pending_commands = previous.pending_commands.clone();
-        // Choosing another stored branch changes the conversation alone, as a rewind does.
+        // Choosing another stored branch changes the conversation alone, as a rewind does; the
+        // live task boards then follow it to where the branch recorded them.
         snapshot.scheduled_tasks = previous.scheduled_tasks.clone();
         snapshot.scheduled_task_revocations = previous.scheduled_task_revocations.clone();
+        snapshot.task_boards = previous.task_boards.clone();
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }
         chat.replace_snapshot(snapshot);
         chat.bookkeeping = self.bookkeeping;
         chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
+        chat.bookkeeping.has_task_board_checkpoints |=
+            current.bookkeeping.has_task_board_checkpoints;
         chat.content_replacements = self.content_replacements;
         chat.file_history = self.file_history;
         chat.start_new_tool_result_message = false;

@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, ChatSnapshot, Content, Decision, DirectedSummaryRequest, EventKind,
-    ExecutionMode, LoopState, ModelIdentity, PermissionRule, PromptPolicy, Protocol, Role,
+    AgentHostOptions, ChatId, Content, Decision, DirectedSummaryRequest, EventKind, ExecutionMode,
+    LoopState, ModelIdentity, PermissionRule, PromptPolicy, Protocol, RewindMode, Role,
     SummaryDirection, Usage,
 };
 use tickloop_harness_runtime::transcript::{
@@ -40,6 +40,8 @@ enum Step {
     Hang,
     /// Fails before any content.
     Fail,
+    /// Answers from the request it is given.
+    Respond(fn(&ModelRequest) -> Vec<Content>),
 }
 
 /// Follows a script, records every request and announces a request it holds.
@@ -137,6 +139,7 @@ impl ModelClient for Script {
                 return Err(ModelError::Cancelled);
             }
             Step::Fail => return Err(ModelError::InvalidResponse("no content".into())),
+            Step::Respond(respond) => respond(self.requests.lock().unwrap().last().unwrap()),
         };
         for block in &content {
             if let Content::Text { text } = block {
@@ -518,86 +521,343 @@ async fn a_repeated_regeneration_adds_exactly_one_sibling_answer() {
     agent.shutdown().await;
 }
 
-/// One answer plans and finishes its own tasks: another answer to the prompt, regenerated or
-/// after an edit, starts with an empty task board, also once the Chat is reloaded.
-#[tokio::test]
-async fn another_answer_to_a_prompt_starts_with_an_empty_task_board() {
-    let fixture = fixture();
-    let store = Arc::new(InMemoryTranscriptStore::new());
-    let create = |title: &str| {
-        Step::Reply(call(
-            &format!("create {title}"),
-            "TaskCreate",
-            json!({"mutation_id": Uuid::new_v4(), "title": title, "description": title}),
-        ))
-    };
-    let model = Script::new(vec![
-        create("first plan"),
-        Step::Reply(text("first take")),
-        create("second plan"),
-        Step::Reply(text("second take")),
-        create("edited plan"),
-        Step::Reply(text("edited take")),
-    ]);
-    let agent = agent(store.clone(), model.clone());
+fn create_task(title: &str) -> Step {
+    create_task_once(Uuid::new_v4(), title)
+}
+
+fn create_task_once(mutation: Uuid, title: &str) -> Step {
+    Step::Reply(call(
+        &format!("create {title} {}", Uuid::new_v4()),
+        "TaskCreate",
+        json!({"mutation_id": mutation, "title": title, "description": title}),
+    ))
+}
+
+async fn tasks_agent(
+    fixture: &Fixture,
+    store: Arc<InMemoryTranscriptStore>,
+    model: Arc<Script>,
+) -> (Agent, ChatId) {
+    let agent = agent(store, model);
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
     agent.set_task_tools_enabled(chat, true).await.unwrap();
-    let task_titles = |snapshot: ChatSnapshot| {
-        snapshot
-            .task_boards
-            .values()
+    (agent, chat)
+}
+
+/// The titles on the Chat's task board and its revision.
+async fn task_board(agent: &Agent, chat: ChatId) -> (Vec<String>, u64) {
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let board = snapshot.task_boards.values().next();
+    (
+        board
+            .iter()
             .flat_map(|board| board.tasks.iter().map(|task| task.title.clone()))
-            .collect::<Vec<_>>()
-    };
-    let asked = complete(&agent, chat, after_leaf("the question")).await;
-    assert_eq!(
-        task_titles(agent.snapshot(chat).await.unwrap()),
-        ["first plan"]
-    );
-    let first_take = answer(&agent, &asked).await;
-    let regenerate = TurnRequest {
+            .collect(),
+        board.map_or(0, |board| board.revision),
+    )
+}
+
+fn regenerate(answer: MessageId) -> TurnRequest {
+    TurnRequest {
         input_id: tickloop_ids::Id::from(Uuid::new_v4()),
-        op: TurnOp::RegenerateAnswer { answer: first_take },
+        op: TurnOp::RegenerateAnswer { answer },
         delivery: Delivery::Queue,
         host_context: None,
-    };
-    complete(&agent, chat, regenerate).await;
-    assert_eq!(
-        task_titles(agent.snapshot(chat).await.unwrap()),
-        ["second plan"]
-    );
-    let edit = TurnRequest {
+    }
+}
+
+fn replace(prompt: &Turn, text: &str) -> TurnRequest {
+    TurnRequest {
         input_id: tickloop_ids::Id::from(Uuid::new_v4()),
         op: TurnOp::ReplacePrompt {
-            prompt: asked.input_id().uuid().into(),
+            prompt: prompt.input_id().uuid().into(),
             message: UserMessage {
-                text: "the question, edited".into(),
+                text: text.into(),
                 ..Default::default()
             },
         },
         delivery: Delivery::Queue,
         host_context: None,
-    };
-    complete(&agent, chat, edit).await;
-    assert_eq!(
-        task_titles(agent.snapshot(chat).await.unwrap()),
-        ["edited plan"]
-    );
+    }
+}
+
+/// Another answer to a prompt, regenerated or after an edit, starts from the task board as it
+/// stood before that prompt: earlier answers' tasks stay, the replaced answer's go, a retry of
+/// its mutation reports the task cleared, and the revision only moves on; also once the Chat is
+/// reloaded.
+#[tokio::test]
+async fn another_answer_to_a_prompt_starts_from_the_task_board_before_it() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let abandoned = Uuid::new_v4();
+    let model = Script::new(vec![
+        create_task("first plan"),
+        Step::Reply(text("planned")),
+        create_task_once(abandoned, "first take"),
+        Step::Reply(text("took it")),
+        create_task_once(abandoned, "first take"),
+        Step::Reply(text("retried")),
+        create_task("edited take"),
+        Step::Reply(text("took another")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store.clone(), model.clone()).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    let stepped = complete(&agent, chat, after_leaf("take a step")).await;
+    let (titles, revision) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan", "first take"]);
+
+    complete(&agent, chat, regenerate(answer(&agent, &stepped).await)).await;
+    let (titles, regenerated) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan"]);
+    assert!(regenerated > revision, "{regenerated} > {revision}");
+    let retried = model.last_request();
+    assert!(retried.contains("task_cleared"), "{retried}");
+
+    let edited = complete(&agent, chat, replace(&stepped, "take another step")).await;
+    let (titles, revision) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan", "edited take"]);
+    assert!(revision > regenerated, "{revision} > {regenerated}");
+    let edited_answer = answer(&agent, &edited).await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
     drop(agent);
 
-    let restored = self::agent(store.clone(), Script::replies(&[]));
+    let model = Script::new(vec![Step::Reply(text("again"))]);
+    let restored = self::agent(store.clone(), model);
     restored.resume_chat(chat).await.unwrap();
     assert_eq!(
-        task_titles(restored.snapshot(chat).await.unwrap()),
-        ["edited plan"]
+        task_board(&restored, chat).await,
+        (vec!["first plan".into(), "edited take".into()], revision)
     );
+    complete(&restored, chat, regenerate(edited_answer)).await;
+    let (titles, reloaded) = task_board(&restored, chat).await;
+    assert_eq!(titles, ["first plan"]);
+    assert!(reloaded > revision, "{reloaded} > {revision}");
     restored.shutdown().await;
+}
+
+/// Going on from an answer on another branch shows the task board where that branch ended,
+/// and going back shows the other one again; the revision only moves on.
+#[tokio::test]
+async fn going_on_from_another_branch_shows_the_task_board_where_it_ended() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("first plan"),
+        Step::Reply(text("first take")),
+        create_task("second plan"),
+        Step::Reply(text("second take")),
+        Step::Reply(text("after the first take")),
+        Step::Reply(text("after the second take")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store.clone(), model.clone()).await;
+    let asked = complete(&agent, chat, after_leaf("the question")).await;
+    let first_take = answer(&agent, &asked).await;
+    let regenerated = complete(&agent, chat, regenerate(first_take)).await;
+    let second_take = answer(&agent, &regenerated).await;
+    let (titles, second) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["second plan"]);
+
+    complete(&agent, chat, after(first_take, "follow the first take")).await;
+    let request = model.last_request();
+    assert!(!request.contains("second take"), "{request}");
+    let (titles, first) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan"]);
+    assert!(first > second, "{first} > {second}");
+
+    complete(&agent, chat, after(second_take, "follow the second take")).await;
+    let (titles, back) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["second plan"]);
+    assert!(back > first, "{back} > {first}");
+
+    agent.sync().await.unwrap();
+    let lines = store.lines(chat);
+    let leaf = |text: &str| {
+        lines
+            .iter()
+            .filter_map(Line::chain_entry)
+            .find(|entry| format!("{:?}", entry.message.content).contains(text))
+            .unwrap()
+            .uuid
+    };
+    let shown = |leaf| {
+        tickloop_harness_runtime::task_boards_at(&lines, leaf, true)
+            .unwrap()
+            .into_iter()
+            .flat_map(|board| board.tasks)
+            .map(|task| task.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shown(leaf("first take")), ["first plan"]);
+    assert_eq!(shown(leaf("second take")), ["second plan"]);
+    assert_eq!(shown(leaf("after the first take")), ["first plan"]);
+    // Going on from the first take recorded the board it restored where that branch ends.
+    let restored = tickloop_harness_runtime::task_boards_at(&lines, leaf("first take"), true);
+    assert_eq!(restored.unwrap()[0].revision, first);
+    agent.shutdown().await;
+}
+
+/// Cancels the task the last tool result created, which finishes a board of one task.
+fn cancel_created_task(request: &ModelRequest) -> Vec<Content> {
+    let created = request
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult { content, .. } => {
+                serde_json::from_str::<serde_json::Value>(&content.text()).ok()
+            }
+            _ => None,
+        })
+        .expect("the task was created");
+    call(
+        "cancel the plan",
+        "TaskUpdate",
+        json!({"mutation_id": Uuid::new_v4(), "task_id": created["task"]["id"], "expected_revision": 1, "action": "cancel", "result": "not needed"}),
+    )
+}
+
+/// A board whose tasks all finished starts over with the next answer to a prompt: a new message
+/// or a regeneration clears it, while the answer that finished it keeps it where it ended.
+#[tokio::test]
+async fn a_finished_task_board_starts_over_with_the_next_answer_to_a_prompt() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("plan"),
+        Step::Respond(cancel_created_task),
+        Step::Reply(text("planned")),
+        Step::Reply(text("next answer")),
+        Step::Reply(text("regenerated answer")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store.clone(), model.clone()).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    let (titles, finished) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["plan"]);
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        snapshot
+            .task_boards
+            .values()
+            .all(|board| board.is_finished())
+    );
+
+    let next = complete(&agent, chat, after_leaf("go on")).await;
+    let (titles, cleared) = task_board(&agent, chat).await;
+    assert!(titles.is_empty(), "{titles:?}");
+    assert!(cleared > finished, "{cleared} > {finished}");
+    // Clearing tells the model nothing: the new prompt follows the last answer directly.
+    let messages = model.last_messages();
+    assert_eq!(
+        messages[messages.len() - 2..]
+            .iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (Role::Assistant, text("planned")),
+            (Role::User, text("go on"))
+        ]
+    );
+
+    complete(&agent, chat, regenerate(answer(&agent, &next).await)).await;
+    let (titles, regenerated) = task_board(&agent, chat).await;
+    assert!(titles.is_empty(), "{titles:?}");
+    assert!(regenerated > cleared, "{regenerated} > {cleared}");
+
+    agent.sync().await.unwrap();
+    let lines = store.lines(chat);
+    let planned = lines
+        .iter()
+        .filter_map(Line::chain_entry)
+        .find(|entry| format!("{:?}", entry.message.content).contains("planned"))
+        .unwrap()
+        .uuid;
+    let ended = tickloop_harness_runtime::task_boards_at(&lines, planned, true).unwrap();
+    assert_eq!(ended[0].tasks[0].title, "plan");
+    assert_eq!(ended[0].revision, finished);
+    agent.shutdown().await;
+}
+
+/// A board with work left stays for the next answer.
+#[tokio::test]
+async fn an_unfinished_task_board_stays_for_the_next_answer() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("plan"),
+        Step::Reply(text("planned")),
+        Step::Reply(text("next answer")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store, model).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    let before = task_board(&agent, chat).await;
+    complete(&agent, chat, after_leaf("go on")).await;
+    assert_eq!(task_board(&agent, chat).await, before);
+    agent.shutdown().await;
+}
+
+/// A compaction boundary carries the task board that stood before it, so an answer after the
+/// boundary is answered again from that board once the Chat is reloaded.
+#[tokio::test]
+async fn the_task_board_before_a_compaction_boundary_stands_after_it() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("first plan"),
+        Step::Reply(text("planned")),
+        Step::Reply(text("the full summary")),
+        create_task("second plan"),
+        Step::Reply(text("stepped")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store.clone(), model).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    agent.compact(chat).await.unwrap();
+    let stepped = complete(&agent, chat, after_leaf("take a step")).await;
+    let stepped_answer = answer(&agent, &stepped).await;
+    let (titles, revision) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan", "second plan"]);
+    agent.sync().await.unwrap();
+    agent.shutdown().await;
+    drop(agent);
+
+    let restored = self::agent(store.clone(), Script::replies(&["again"]));
+    restored.resume_chat(chat).await.unwrap();
+    complete(&restored, chat, regenerate(stepped_answer)).await;
+    let (titles, regenerated) = task_board(&restored, chat).await;
+    assert_eq!(titles, ["first plan"]);
+    assert!(regenerated > revision, "{regenerated} > {revision}");
+    restored.shutdown().await;
+}
+
+/// Rewinding the conversation to a prompt puts the task board where it stood before that prompt.
+#[tokio::test]
+async fn a_rewound_conversation_takes_the_task_board_before_the_prompt() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("first plan"),
+        Step::Reply(text("planned")),
+        create_task("second plan"),
+        Step::Reply(text("stepped")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store, model).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    let stepped = complete(&agent, chat, after_leaf("take a step")).await;
+    let (titles, revision) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan", "second plan"]);
+    agent
+        .rewind(chat, stepped.input_id().uuid(), RewindMode::Conversation)
+        .await
+        .unwrap();
+    let (titles, rewound) = task_board(&agent, chat).await;
+    assert_eq!(titles, ["first plan"]);
+    assert!(rewound > revision, "{rewound} > {revision}");
+    agent.shutdown().await;
 }
 
 #[tokio::test]
