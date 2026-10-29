@@ -4,7 +4,7 @@ use serde_json::json;
 use tick_packages::{ApiKey, LoginState};
 use tick_plugins::{
     ExpectedArchive, InstallOutcome, ManifestFormat, PluginError, PluginSource,
-    TICKLOOP_MARKETPLACE,
+    SHIPPED_FILES_RECORD, TICKLOOP_MARKETPLACE,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -388,4 +388,34 @@ fn a_damaged_registry_is_reported_with_its_path() {
         error.to_string().contains("installed.json is damaged"),
         "{error}"
     );
+}
+
+#[test]
+fn an_installed_plugin_records_the_files_it_shipped_with() {
+    let fixture = Fixture::new();
+    let source = fixture.claude_plugin("review", &json!({"name": "review"}), &["check"]);
+    fs::create_dir_all(source.join(".venv/lib")).unwrap();
+    fs::write(source.join(".venv/lib/site.pth"), "import shipped\n").unwrap();
+    std::os::unix::fs::symlink("skills/check/SKILL.md", source.join("link")).unwrap();
+    write_json(&source.join(SHIPPED_FILES_RECORD), &json!(["nothing"]));
+
+    let plugin = fixture.store.install_path(&source).unwrap().plugin;
+    fs::create_dir_all(plugin.root.join("__pycache__")).unwrap();
+    fs::write(plugin.root.join("__pycache__/run.pyc"), "generated").unwrap();
+
+    assert_eq!(
+        plugin.shipped_files().unwrap(),
+        Some(
+            [
+                ".claude-plugin/plugin.json",
+                ".venv/lib/site.pth",
+                "link",
+                "skills/check/SKILL.md",
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        )
+    );
+    fs::remove_file(plugin.root.join(SHIPPED_FILES_RECORD)).unwrap();
+    assert_eq!(plugin.shipped_files().unwrap(), None);
 }

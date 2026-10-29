@@ -612,3 +612,31 @@ fn plugin_validate_uses_declared_user_config_defaults_without_saved_credentials(
     let shown = succeeded(&plugin(&fixture, &["validate", &path_text(&source)]));
     assert!(shown.contains("status: ready"), "{shown}");
 }
+
+#[test]
+fn uninstalling_a_plugin_forgets_only_its_hook_trust_records() {
+    let fixture = Fixture::new();
+    let source = claude_plugin(&fixture, "guard", json!({"name": "guard"}), &[]);
+    succeeded(&plugin(
+        &fixture,
+        &["install", "--path", &path_text(&source)],
+    ));
+    let settings_path = fixture.root.join("config/settings.json");
+    let record = json!({"some-hook": {"trustedHash": "some-hash"}});
+    fs::write(
+        &settings_path,
+        json!({"theme": "dark", "hookTrust": {"plugins": {
+            "guard@local": record, "other@local": record,
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+
+    succeeded(&plugin(&fixture, &["uninstall", "guard"]));
+
+    let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        settings,
+        json!({"theme": "dark", "hookTrust": {"plugins": {"other@local": record}}})
+    );
+}

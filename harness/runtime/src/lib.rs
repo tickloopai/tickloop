@@ -31,6 +31,7 @@ pub use harness::{
     Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
     durable_chat_host_rules,
 };
+mod hook_transcript;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -356,6 +357,7 @@ struct Inner {
     /// Announces a generated Shell description by task, for Shell task subscribers only.
     shell_description_events: broadcast::Sender<Uuid>,
     subagent_registry: Mutex<HashMap<ChatId, Vec<SubagentRegistration>>>,
+    hook_transcripts: hook_transcript::HookTranscripts,
     chats: timing::ChatsMutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
     user_shell_events: broadcast::Sender<UserShellRecord>,
@@ -2129,6 +2131,7 @@ impl Agent {
                 shell_descriptions: Mutex::new(HashMap::new()),
                 shell_description_events: broadcast::channel(256).0,
                 subagent_registry: Mutex::new(HashMap::new()),
+                hook_transcripts: Default::default(),
                 chats: timing::ChatsMutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
                 user_shell_events: broadcast::channel(256).0,
@@ -5556,6 +5559,7 @@ impl Agent {
             }
         }
         self.stop_transcript_flushing();
+        self.discard_hook_transcripts();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
         let host_tools = self.inner.host_tools.read().unwrap().clone();

@@ -1,7 +1,9 @@
 //! The Agent daemon's single controller of the Tickhost. The daemon starts the host on its first
-//! open or Shell spawn, keeps the controller key in its private runtime directory so a restarted
-//! daemon fences the previous one, and never replaces a host it cannot verify. Compatible hosts
-//! keep their instances across product upgrades; changed host content is replaced once empty.
+//! open or Shell spawn and keeps the controller key in its private runtime directory so a
+//! restarted daemon fences the previous one. A running host that refuses that key can never be
+//! controlled again: the next request stops it, and an open or spawn starts one with the key.
+//! Compatible hosts keep their instances across product upgrades; changed host content is
+//! replaced once empty.
 //! An Agent without a daemon that is given a host of its
 //! own, as in tests, controls one served inside its process.
 
@@ -41,10 +43,13 @@ pub const START_WAIT: Duration = Duration::from_secs(3);
 /// An open: the host waits up to the control timeout for the Tick to become ready, plus the
 /// launch itself and its reply.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(2 * CONTROL_TIMEOUT.as_secs());
-/// The longest the daemon may take for one worker lifecycle request: starting a host, then
-/// opening.
-pub const LIFECYCLE_TIMEOUT: Duration =
-    Duration::from_secs(START_ATTEMPTS as u64 * START_WAIT.as_secs() + OPEN_TIMEOUT.as_secs());
+/// The longest the daemon may take for one worker lifecycle request: stopping a host no daemon
+/// can control, starting one, then opening.
+pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(
+    tickhost::stop::STOP_TIMEOUT.as_secs()
+        + START_ATTEMPTS as u64 * START_WAIT.as_secs()
+        + OPEN_TIMEOUT.as_secs(),
+);
 const DISCONNECTED: &str = "Disconnected";
 /// Chat ids per owner snapshot chunk, keeping each chunk well under one registry record
 /// ([`SHARD_BYTES`](super::registry::SHARD_BYTES)).
@@ -53,6 +58,8 @@ const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 /// Only an open or a spawn starts a host; other requests find that no hosted Tick exists.
 const HOST_NOT_RUNNING: &str = "HostNotRunning";
 const INCOMPATIBLE_HOST: &str = "IncompatibleHost";
+/// How a host refuses a hello that does not carry its controller key.
+const FORBIDDEN: &str = "Forbidden";
 /// A host of another build that ran nothing was stopped, so one of this build may start.
 const HOST_REPLACED: &str = "HostReplaced";
 /// What a request meets while a Tickhost of another build runs Ticks, Shell tasks or connections.
@@ -665,28 +672,16 @@ impl HostController {
         unreachable!("the second attempt always returns")
     }
 
-    /// Connects with this daemon's key, or starts a host. A live host this daemon cannot verify
-    /// is refused, never replaced: a new host only binds after taking the host lock.
+    /// Connects with this daemon's key, or starts a host. A new host only binds after taking the
+    /// host lock, so a running host no daemon can control is stopped first.
     async fn connect_or_start(&self) -> Result<HostConnection, HostError> {
         let _starting = self.starting.lock().await;
-        // Only a missing key means no host of this daemon can exist; an unreadable key is never
-        // replaced, or a live host's Ticks would lose their controller.
-        let known = match std::fs::read_to_string(&self.key_file) {
-            Ok(key) => Some(key.trim().to_owned()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(HostError::before(
-                    "HostUnavailable",
-                    format!("cannot read the Tickhost controller key: {error}"),
-                ));
-            }
-        };
-        if let Some(key) = &known
-            && self.paths.socket().exists()
-        {
-            match self.connect(key).await {
+        let known = self.controller_key()?;
+        if self.host_running()? {
+            match self.connect_to_running(known.as_deref()).await {
                 Ok(connection) => return Ok(connection),
                 Err(error) if error.code == HOST_REPLACED => {}
+                Err(error) if error.code == FORBIDDEN => self.stop_uncontrollable_host().await?,
                 Err(error) if is_definite_refusal(&error) => return Err(error),
                 Err(_) => {}
             }
@@ -736,29 +731,92 @@ impl HostController {
     async fn connect_running(&self) -> Result<HostConnection, HostError> {
         // Holding the start lock keeps this probe from racing a host that is taking its lock.
         let _starting = self.starting.lock().await;
-        let running = self
-            .paths
-            .host_running()
-            .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
-        if !running {
+        if !self.host_running()? {
             return Err(HostError::before(
                 HOST_NOT_RUNNING,
                 "no Tickhost is running",
             ));
         }
-        let key = std::fs::read_to_string(&self.key_file).map_err(|_| {
-            HostError::before(
-                "Forbidden",
-                "the running Tickhost was not started by this Agent daemon",
-            )
-        })?;
-        match self.connect(key.trim()).await {
+        let key = self.controller_key()?;
+        match self.connect_to_running(key.as_deref()).await {
             Err(error) if error.code == HOST_REPLACED => Err(HostError::before(
                 HOST_NOT_RUNNING,
                 "no Tickhost of this build is running",
             )),
+            Err(error) if error.code == FORBIDDEN => {
+                self.stop_uncontrollable_host().await?;
+                Err(uncontrollable_host_stopped())
+            }
             result => result,
         }
+    }
+
+    /// This daemon's controller key; `None` when the key file is missing. Only a missing key
+    /// means no host of this daemon can exist; an unreadable key is never replaced, or a live
+    /// host's Ticks would lose their controller.
+    fn controller_key(&self) -> Result<Option<String>, HostError> {
+        match std::fs::read_to_string(&self.key_file) {
+            Ok(key) => Ok(Some(key.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(HostError::before(
+                "HostUnavailable",
+                format!("cannot read the Tickhost controller key: {error}"),
+            )),
+        }
+    }
+
+    /// Connects to the running host with this daemon's `key`. `Forbidden` means no Agent daemon
+    /// can control that host again: it refused the key, the key is missing, or its endpoint is
+    /// gone.
+    async fn connect_to_running(&self, key: Option<&str>) -> Result<HostConnection, HostError> {
+        let Some(key) = key else {
+            return Err(uncontrollable("the Tickhost controller key is missing"));
+        };
+        if !self.endpoint_present().await {
+            return Err(uncontrollable("the running Tickhost has no endpoint"));
+        }
+        self.connect(key).await
+    }
+
+    /// Whether the running host's endpoint exists. A host takes its lock just before it binds,
+    /// so only an endpoint missing for longer than a start may take is gone for good.
+    async fn endpoint_present(&self) -> bool {
+        let deadline = tokio::time::Instant::now() + START_WAIT;
+        loop {
+            if std::fs::symlink_metadata(self.paths.socket()).is_ok() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(CONNECT_INTERVAL).await;
+        }
+    }
+
+    fn host_running(&self) -> Result<bool, HostError> {
+        self.paths
+            .host_running()
+            .map_err(|error| HostError::before("HostUnavailable", error.to_string()))
+    }
+
+    /// Only one daemon serves a config root and only it keeps the controller key, so a running
+    /// host that refuses this daemon's key, runs while the key is missing or lost its endpoint can
+    /// never be controlled by any daemon again, and its Ticks are already unreachable. It is
+    /// stopped as `tickhost stop` stops a host, which signals only a verified `tickhost run`
+    /// process; a host this process serves itself is ended directly. Only a request that may
+    /// start a host starts the next one.
+    async fn stop_uncontrollable_host(&self) -> Result<(), HostError> {
+        self.stop_in_process();
+        tickhost::stop::stop_host(&self.paths)
+            .await
+            .map_err(|error| {
+                HostError::before(
+                    "HostUnavailable",
+                    format!("cannot stop a Tickhost no Agent daemon controls: {error}"),
+                )
+            })?;
+        self.idle.lock().await.clear();
+        Ok(())
     }
 
     /// Negotiates protocol compatibility before choosing whether changed content can be replaced.
@@ -783,6 +841,9 @@ impl HostController {
             // A host that negotiated the business protocol but cannot be asked its build is used
             // as it is, without being remembered as verified.
             Err(_) if connection.is_ok() => return connection,
+            // A host of another business protocol checks the key only on its frozen management
+            // channel.
+            Err(error) if error.code == FORBIDDEN => return Err(error),
             Err(_) => return Err(other_build()),
         };
         if is_this_build(management.hello()) {
@@ -821,21 +882,28 @@ impl HostController {
     }
 
     /// The management channel of the running host, from this daemon's key; `None` when no host
-    /// this daemon could have started runs.
+    /// runs, after stopping one no daemon can control. Called with the start lock held.
     async fn management(&self) -> Result<Option<ManagementConnection>, HostError> {
-        let Ok(key) = std::fs::read_to_string(&self.key_file) else {
-            return Ok(None);
-        };
-        let running = self
-            .paths
-            .host_running()
-            .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
-        if !running {
+        let key = self.controller_key()?;
+        if !self.host_running()? {
             return Ok(None);
         }
-        ManagementConnection::connect(&self.paths.socket(), key.trim())
-            .await
-            .map(Some)
+        let management = match key {
+            Some(key) if self.endpoint_present().await => {
+                ManagementConnection::connect(&self.paths.socket(), &key).await
+            }
+            _ => Err(uncontrollable(
+                "no Agent daemon can reach the running Tickhost",
+            )),
+        };
+        match management {
+            Ok(management) => Ok(Some(management)),
+            Err(error) if error.code == FORBIDDEN => {
+                self.stop_uncontrollable_host().await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The running Tickhost when it is another build than this daemon's and replacing it would
@@ -905,11 +973,7 @@ impl HostController {
 
     async fn wait_stopped(&self) -> Result<(), HostError> {
         let deadline = tokio::time::Instant::now() + START_WAIT;
-        while self
-            .paths
-            .host_running()
-            .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?
-        {
+        while self.host_running()? {
             if tokio::time::Instant::now() >= deadline {
                 return Err(HostError::after(
                     "OutcomeUnknown",
@@ -1000,9 +1064,9 @@ impl HostController {
     }
 }
 
-/// A host that answered and refused this daemon is never retried or replaced.
+/// A host that answered and refused this daemon is not retried.
 fn is_definite_refusal(error: &HostError) -> bool {
-    matches!(error.code.as_str(), INCOMPATIBLE_HOST | "Forbidden")
+    matches!(error.code.as_str(), INCOMPATIBLE_HOST | FORBIDDEN)
 }
 
 /// Product versions do not change the identity of unchanged Tickhost content.
@@ -1025,6 +1089,18 @@ fn runs_nothing(hello: &HelloReply, own_connections: usize) -> bool {
             && occupancy.views == Some(0)
             && occupancy.connections <= own_connections
     })
+}
+
+/// A host no Agent daemon can control, as a host refuses a hello without its controller key.
+fn uncontrollable(reason: &str) -> HostError {
+    HostError::before(FORBIDDEN, reason)
+}
+
+fn uncontrollable_host_stopped() -> HostError {
+    HostError::before(
+        HOST_NOT_RUNNING,
+        "stopped a Tickhost no Agent daemon could control; none runs now",
+    )
 }
 
 fn other_build() -> HostError {

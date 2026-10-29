@@ -2943,6 +2943,36 @@ impl Agent {
         Ok(stored.retained.into_iter().chain(stored.lines).collect())
     }
 
+    /// Every Line the store keeps of the Chat once everything it produced so far is committed:
+    /// `None` when the Chat keeps no Transcript, and none while its Transcript still waits for
+    /// its first message.
+    pub(super) async fn committed_lines(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Option<Vec<Line>>, AgentError> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(None);
+        };
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if !recorder.logs.lock().unwrap().contains_key(&chat_id) {
+                return Ok(None);
+            }
+            if !recorder.outbox.is_materialized(chat_id) {
+                return Ok(Some(Vec::new()));
+            }
+            recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
+        }
+        self.commit_queued(chat_id)
+            .await
+            .map_err(AgentError::Storage)?;
+        let stored = recorder.load_stored(chat_id, LoadRange::Full).await?;
+        Ok(Some(stored.map_or_else(Vec::new, |stored| {
+            stored.retained.into_iter().chain(stored.lines).collect()
+        })))
+    }
+
     /// A newer holder owns this Harness's Chats: nothing more reaches their store.
     pub(super) fn transcripts_fenced(&self) -> bool {
         self.inner

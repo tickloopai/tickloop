@@ -15,6 +15,7 @@ mod family;
 mod file_change;
 mod goal;
 mod history;
+pub mod hooks;
 mod host;
 mod hosted;
 mod ids;

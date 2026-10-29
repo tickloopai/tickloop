@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 pub use tickloop_harness_protocol::{ExecutionIsolation, NetworkIsolation, WriteIsolation};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ use crate::host_tools::HostToolPermission;
 
 pub const TERMINAL_INPUT_BYTES: usize = 4 * 1024;
 pub const SHELL_OUTPUT_BYTES: usize = 64 * 1024;
+/// The most bytes a one-shot command keeps of each output stream; the rest is only counted.
+pub const COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionScope {
@@ -153,6 +155,7 @@ pub enum ExecutionIntent {
         args: Value,
         revision: String,
     },
+    RunCommand(CommandSpec),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +295,101 @@ pub struct ShellSpec {
     pub description: Option<String>,
 }
 
+/// A command run once to completion by `/bin/sh -c`. It is not a Shell task: it has no Shell
+/// record, no Monitor row and no sandbox, and the environment ends its whole process group when
+/// the timeout passes or the execution is cancelled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub command: String,
+    pub stdin: Vec<u8>,
+    /// Added to the environment's own variables, replacing those with the same name.
+    pub env: BTreeMap<String, String>,
+    /// A path in the execution environment, never resolved by the Harness.
+    pub cwd: String,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutput {
+    pub exit: ProgramExit,
+    /// The timeout passed and the environment ended the command's process group.
+    pub timed_out: bool,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+}
+
+impl CommandOutput {
+    pub fn into_result(self) -> ExecutionResult {
+        let status = if self.timed_out {
+            "timed_out"
+        } else {
+            "exited"
+        };
+        ExecutionResult {
+            result: ToolResult {
+                content: serde_json::json!({
+                    "status": status,
+                    "exit_code": self.exit.code,
+                    "signal": self.exit.signal,
+                })
+                .to_string(),
+                is_error: self.timed_out || self.exit.code != Some(0),
+                output_ref: None,
+            },
+            opened: None,
+            shell: None,
+            command: Some(Box::new(self)),
+            handoff: None,
+        }
+    }
+}
+
+/// The first [`COMMAND_OUTPUT_BYTES`] of an output stream and how many bytes it had in all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapturedOutput {
+    data: Vec<u8>,
+    total_bytes: u64,
+}
+
+impl CapturedOutput {
+    pub fn new(bytes: &[u8]) -> Self {
+        let mut captured = Self::default();
+        captured.append(bytes);
+        captured
+    }
+
+    pub fn append(&mut self, chunk: &[u8]) {
+        let room = COMMAND_OUTPUT_BYTES.saturating_sub(self.data.len());
+        self.data.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        self.total_bytes += chunk.len() as u64;
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.total_bytes > self.data.len() as u64
+    }
+
+    /// The kept bytes as text, followed by a notice when the stream was cut.
+    pub fn text(&self) -> String {
+        let mut text = String::from_utf8_lossy(&self.data).into_owned();
+        if self.is_truncated() {
+            text.push_str(&format!(
+                "\n[output truncated: kept the first {} of {} bytes]",
+                self.data.len(),
+                self.total_bytes
+            ));
+        }
+        text
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShellStatus {
     pub instance: InstanceRef,
@@ -370,6 +468,30 @@ pub struct ExecutionFacts {
     pub permission: HostToolPermission,
     pub summary: String,
     pub approval: PreparedApprovalFacts,
+}
+
+impl ExecutionFacts {
+    /// The facts of a one-shot command. They name the variables it adds and the size of its
+    /// input, never their values.
+    pub fn for_command(spec: CommandSpec) -> Self {
+        let normalized_input = serde_json::json!({
+            "command": spec.command,
+            "cwd": spec.cwd,
+            "env": spec.env.keys().collect::<Vec<_>>(),
+            "stdin_bytes": spec.stdin.len(),
+            "timeout_ms": u64::try_from(spec.timeout.as_millis()).unwrap_or(u64::MAX),
+        });
+        Self {
+            summary: format!("Run {}", spec.command),
+            intent: ExecutionIntent::RunCommand(spec),
+            permission: HostToolPermission::Reviewable,
+            approval: PreparedApprovalFacts {
+                normalized_input: normalized_input.clone(),
+                ..Default::default()
+            },
+            normalized_input,
+        }
+    }
 }
 
 impl PreparedExecution {
@@ -491,6 +613,7 @@ pub struct ExecutionResult {
     pub result: ToolResult,
     pub opened: Option<OpenedExecution>,
     pub shell: Option<Box<ShellStatus>>,
+    pub command: Option<Box<CommandOutput>>,
     pub handoff: Option<ExecutionHandoff>,
 }
 

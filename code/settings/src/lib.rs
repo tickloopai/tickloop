@@ -17,6 +17,7 @@
 
 pub mod claude_auto_import;
 mod execution_mode;
+mod hooks;
 pub mod instructions;
 pub mod loop_skill;
 pub mod package_http;
@@ -1329,6 +1330,21 @@ impl UserSettings {
         &self,
         edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), InvalidEntry>,
     ) -> Result<(), SettingsError> {
+        self.update_checked(|settings| {
+            edit(settings).map_err(|entry| SettingsError::InvalidEntry {
+                path: self.path.clone(),
+                key: entry.key,
+                expected: entry.expected,
+            })
+        })
+    }
+
+    /// [`Self::update`] for an edit that can also refuse the content it finds, such as a revision
+    /// that no longer matches.
+    fn update_checked(
+        &self,
+        edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), SettingsError>,
+    ) -> Result<(), SettingsError> {
         let write_error = |source| SettingsError::Write {
             path: self.path.clone(),
             source,
@@ -1340,11 +1356,7 @@ impl UserSettings {
             source,
         })?;
         let mut settings = self.read_object()?;
-        edit(&mut settings).map_err(|entry| SettingsError::InvalidEntry {
-            path: self.path.clone(),
-            key: entry.key,
-            expected: entry.expected,
-        })?;
+        edit(&mut settings)?;
         let mut contents = serde_json::to_vec_pretty(&Value::Object(settings))
             .expect("settings serialize to JSON");
         contents.push(b'\n');

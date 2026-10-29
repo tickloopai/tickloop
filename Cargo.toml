@@ -10,7 +10,7 @@ resolver = "3"
 exclude = ["vendor/crossterm"]
 
 [workspace.package]
-version = "0.2.26"
+version = "0.2.27"
 edition = "2024"
 publish = false
 license = "MIT"
