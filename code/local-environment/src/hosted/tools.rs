@@ -290,6 +290,7 @@ impl HostedTickTools {
             result,
             opened,
             shell: None,
+            command: None,
             handoff: None,
         })
     }
@@ -1389,6 +1390,7 @@ impl OpenedTick {
                     max_rows: self.max_rows,
                 }),
                 shell: None,
+                command: None,
                 handoff: None,
             });
         }

@@ -6,14 +6,15 @@ use tickloop_harness::runtime::environment::*;
 use tickloop_harness::runtime::environment::{shell_host, tools};
 use tickloop_harness::runtime::host_tools::{HostCallResult, HostEffect, PreparedHostCall};
 use tokio_util::sync::CancellationToken;
+mod commands;
 mod dispatch;
 pub(crate) mod local_shells;
 mod observe;
 mod sandbox;
 pub(crate) use dispatch::ExecutionDispatch;
 
-/// This computer: the file tools and project Skills work on the Chat's local Folder, and the
-/// daemon's Tickhost, when it granted one, runs commands and Ticks.
+/// This computer: the file tools and project Skills work on the Chat's local Folder, the daemon's
+/// Tickhost, when it granted one, runs Shells and Ticks, and one-shot commands run in this process.
 #[derive(Clone)]
 pub struct LocalEnvironment {
     hosted_ticks: Option<Arc<HostedTickTools>>,
@@ -72,6 +73,11 @@ impl LocalEnvironment {
             hosted_ticks: Some(hosted_ticks),
         }
     }
+
+    /// Every environment but a bare one runs one-shot commands, directly in this process.
+    fn runs_commands(&self) -> bool {
+        self.hosted_ticks.is_some() || self.shells.is_some()
+    }
 }
 
 impl ExecutionEnvironment for LocalEnvironment {
@@ -92,6 +98,7 @@ impl ExecutionEnvironment for LocalEnvironment {
             source_input: None,
             staged_shell: std::sync::Mutex::new(None),
             samples: Default::default(),
+            runs_commands: self.runs_commands(),
             capabilities: ExecutionCapabilities {
                 ticks: self.hosted_ticks.is_some(),
                 shells: self.shells.is_some(),
@@ -115,6 +122,7 @@ struct LocalPort {
     source_input: Option<serde_json::Value>,
     staged_shell: std::sync::Mutex<Option<tickloop_harness::tools::ShellLaunch>>,
     samples: tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, observe::LocalObservation>>,
+    runs_commands: bool,
 }
 
 #[async_trait::async_trait]
@@ -290,6 +298,20 @@ impl ExecutionPort for LocalPort {
     async fn prepare(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
         self.authority.check(self.scope.chat)?;
         let preparation = async {
+            if let ExecutionIntent::RunCommand(spec) = intent {
+                if !self.runs_commands {
+                    return Err(ExecutionError::new(
+                        "Unsupported",
+                        "this environment cannot run commands",
+                    ));
+                }
+                commands::check(&spec)?;
+                return Ok(PreparedExecution::new(
+                    self.identity,
+                    &self.authority,
+                    ExecutionFacts::for_command(spec),
+                ));
+            }
             if let ExecutionIntent::StopShell { instance, reason } = intent {
                 let prepared = self
                     .shells
@@ -331,6 +353,9 @@ impl ExecutionPort for LocalPort {
                 ExecutionError::new("Unsupported", "this environment has no Tickhost")
             })?;
             let (name, input) = match &intent {
+                ExecutionIntent::RunCommand(_) => {
+                    unreachable!("one-shot commands prepare on their own")
+                }
                 ExecutionIntent::SpawnShell(_) | ExecutionIntent::StopShell { .. } => {
                     return Err(ExecutionError::new(
                         "Unsupported",
@@ -436,6 +461,9 @@ impl ExecutionPort for LocalPort {
             return ExecutionOutcome::NotDispatched(error);
         }
         let operation = prepared.operation();
+        if let ExecutionIntent::RunCommand(spec) = &prepared.facts().intent {
+            return commands::run(spec, operation, &self.authority, self.scope.chat, &cancel).await;
+        }
         let is_shell_start = matches!(prepared.facts().intent, ExecutionIntent::SpawnShell(_));
         let dispatch =
             ExecutionDispatch::new(self.authority.clone(), self.scope.chat, cancel.clone());
@@ -484,6 +512,7 @@ impl ExecutionPort for LocalPort {
                         result,
                         opened: None,
                         shell: None,
+                        command: None,
                         handoff: None,
                     })
                 }
@@ -508,6 +537,7 @@ impl ExecutionPort for LocalPort {
                         result,
                         opened,
                         shell: None,
+                        command: None,
                         handoff: None,
                     })
                 }
@@ -566,6 +596,7 @@ pub(crate) async fn prepare_hosted_call(
         source_input: Some(input.clone()),
         staged_shell: std::sync::Mutex::new(None),
         samples: Default::default(),
+        runs_commands: false,
     });
     tools::prepare_on_port(port, authority, chat, name, input).await
 }
@@ -604,5 +635,6 @@ fn shell_port(
         source_input: None,
         staged_shell: std::sync::Mutex::new(staged),
         samples: Default::default(),
+        runs_commands: false,
     })
 }

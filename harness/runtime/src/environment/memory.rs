@@ -13,6 +13,9 @@ use tickloop_harness_protocol::{ChatId, ToolResult};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// The signal a scripted command reports when its timeout ends it.
+const SIGTERM: i32 = 15;
+
 #[derive(Clone)]
 pub struct MemoryEnvironment {
     state: Arc<Mutex<MemoryState>>,
@@ -35,7 +38,20 @@ struct MemoryState {
     receipts: HashMap<(ChatId, Uuid), ExecutionReceipt>,
     lose_reply: bool,
     call_reply_gate: Option<CancellationToken>,
+    commands: HashMap<String, Arc<CommandScript>>,
 }
+
+/// How one run of a scripted one-shot command behaves.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryCommandRun {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+    /// How long the command runs on the real clock; a timeout or cancellation ends it sooner.
+    pub duration: std::time::Duration,
+}
+
+type CommandScript = dyn Fn(&CommandSpec) -> MemoryCommandRun + Send + Sync;
 
 #[derive(Clone)]
 struct MemoryShellProgram {
@@ -192,6 +208,19 @@ impl MemoryEnvironment {
         finish_due_shells(&mut state);
     }
 
+    /// Scripts the one-shot command with this exact text; a preparation keeps the script it saw.
+    pub fn define_command(
+        &self,
+        command: &str,
+        script: impl Fn(&CommandSpec) -> MemoryCommandRun + Send + Sync + 'static,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .commands
+            .insert(command.into(), Arc::new(script));
+    }
+
     pub fn install_program(&self, path: &str) {
         let mut state = self.state.lock().unwrap();
         *state.programs.entry(path.into()).or_default() += 1;
@@ -333,6 +362,7 @@ struct MemoryPlan {
     program_generation: u64,
     open: Option<OpenSpec>,
     shell_program: Option<MemoryShellProgram>,
+    command: Option<Arc<CommandScript>>,
 }
 
 struct MemoryPort {
@@ -341,6 +371,92 @@ struct MemoryPort {
     authority: ExecutionAuthority,
     state: Arc<Mutex<MemoryState>>,
     plans: Mutex<HashMap<PreparationId, MemoryPlan>>,
+}
+
+impl MemoryPort {
+    fn prepare_command(&self, spec: CommandSpec) -> Result<PreparedExecution, ExecutionError> {
+        let script = self
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .get(&spec.command)
+            .cloned()
+            .ok_or_else(|| {
+                ExecutionError::new(
+                    "ProgramNotFound",
+                    "command has no definition in this environment",
+                )
+            })?;
+        let prepared = PreparedExecution::new(
+            self.identity,
+            &self.authority,
+            ExecutionFacts::for_command(spec),
+        );
+        let mut plans = self.plans.lock().unwrap();
+        plans.retain(|_, plan| plan.lifetime.strong_count() > 0);
+        plans.insert(
+            prepared.preparation(),
+            MemoryPlan {
+                lifetime: prepared.lifetime(),
+                program_generation: 0,
+                open: None,
+                shell_program: None,
+                command: Some(script),
+            },
+        );
+        Ok(prepared)
+    }
+
+    async fn run_command(
+        &self,
+        operation: Uuid,
+        spec: &CommandSpec,
+        script: &CommandScript,
+        cancel: CancellationToken,
+    ) -> ExecutionOutcome {
+        if let Err(error) = self.authority.check(self.scope.chat) {
+            return ExecutionOutcome::NotDispatched(error);
+        }
+        let run = script(spec);
+        let timed_out = run.duration > spec.timeout;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return ExecutionOutcome::OutcomeUnknown {
+                    operation,
+                    reason: "command cancelled after dispatch; it was stopped".into(),
+                };
+            }
+            _ = self.authority.revoked() => {
+                return ExecutionOutcome::OutcomeUnknown {
+                    operation,
+                    reason: "authority revoked after dispatch; the command was stopped".into(),
+                };
+            }
+            _ = tokio::time::sleep(run.duration.min(spec.timeout)) => {}
+        }
+        let exit = if timed_out {
+            ProgramExit {
+                code: None,
+                signal: Some(SIGTERM),
+            }
+        } else {
+            ProgramExit {
+                code: Some(run.exit_code),
+                signal: None,
+            }
+        };
+        ExecutionOutcome::Completed(
+            CommandOutput {
+                exit,
+                timed_out,
+                stdout: CapturedOutput::new(&run.stdout),
+                stderr: CapturedOutput::new(&run.stderr),
+            }
+            .into_result(),
+        )
+    }
 }
 
 #[async_trait]
@@ -548,8 +664,14 @@ impl ExecutionPort for MemoryPort {
 
     async fn prepare(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
         self.authority.check(self.scope.chat)?;
+        if let ExecutionIntent::RunCommand(spec) = intent {
+            return self.prepare_command(spec);
+        }
         let state = self.state.lock().unwrap();
         let (generation, normalized_input, summary, permission, catalog) = match &intent {
+            ExecutionIntent::RunCommand(_) => {
+                unreachable!("one-shot commands prepare on their own")
+            }
             ExecutionIntent::StopShell { instance, .. } => {
                 if state
                     .shells
@@ -750,6 +872,7 @@ impl ExecutionPort for MemoryPort {
                 program_generation: generation,
                 open,
                 shell_program,
+                command: None,
             },
         );
         Ok(prepared)
@@ -776,6 +899,12 @@ impl ExecutionPort for MemoryPort {
                 "preparation was consumed or expired",
             ));
         };
+        if let ExecutionIntent::RunCommand(spec) = &prepared.facts().intent {
+            let script = plan.command.expect("a prepared command keeps its script");
+            return self
+                .run_command(prepared.operation(), spec, script.as_ref(), cancel)
+                .await;
+        }
         let (outcome, gate) = {
             let mut state = self.state.lock().unwrap();
             if let Err(error) = self.authority.check(self.scope.chat) {
@@ -789,6 +918,9 @@ impl ExecutionPort for MemoryPort {
             }
 
             let result = match &prepared.facts().intent {
+                ExecutionIntent::RunCommand(_) => {
+                    unreachable!("one-shot commands run on their own")
+                }
                 ExecutionIntent::StopShell { instance, reason } => {
                     let Some(shell) = state
                         .shells
@@ -824,6 +956,7 @@ impl ExecutionPort for MemoryPort {
                         },
                         opened: None,
                         shell: None,
+                        command: None,
                         handoff: None,
                     }
                 }
@@ -886,6 +1019,7 @@ impl ExecutionPort for MemoryPort {
                         },
                         opened: None,
                         shell: Some(Box::new(status)),
+                        command: None,
                         handoff: None,
                     }
                 }
@@ -951,6 +1085,7 @@ impl ExecutionPort for MemoryPort {
                             max_rows,
                         }),
                         shell: None,
+                        command: None,
                         handoff: None,
                     }
                 }
@@ -980,7 +1115,7 @@ impl ExecutionPort for MemoryPort {
                             exited: false,
                         }),
                     });
-                    ExecutionResult { result: ToolResult { content: json!({"status":"completed", "tick_instance_id":instance, "written":data.len()}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, handoff: None }
+                    ExecutionResult { result: ToolResult { content: json!({"status":"completed", "tick_instance_id":instance, "written":data.len()}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None }
                 }
                 ExecutionIntent::Close { instance } => {
                     if state
@@ -997,7 +1132,7 @@ impl ExecutionPort for MemoryPort {
                     removed
                         .updates
                         .send_modify(|update| update.state = ExecutionLinkState::Gone);
-                    ExecutionResult { result: ToolResult { content: json!({"status":"closed", "host":"tickhost", "tick_instance_id":instance}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, handoff: None }
+                    ExecutionResult { result: ToolResult { content: json!({"status":"closed", "host":"tickhost", "tick_instance_id":instance}).to_string(), is_error: false, output_ref: None }, opened: None, shell: None, command: None, handoff: None }
                 }
                 ExecutionIntent::Call {
                     instance,
@@ -1054,6 +1189,7 @@ impl ExecutionPort for MemoryPort {
                         },
                         opened: None,
                         shell: None,
+                        command: None,
                         handoff: None,
                     }
                 }
