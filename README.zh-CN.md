@@ -222,7 +222,7 @@ tickloop plugin marketplace update MARKETPLACE  # 省略名称刷新全部
 tickloop plugin marketplace remove MARKETPLACE
 ```
 
-`add` 也接受 `OWNER/REPO#REF`、Git 地址（HTTPS、SSH 或 file）、本地目录或 HTTPS 上的 marketplace JSON。名称取自 marketplace 文件。删除 marketplace 不会卸载已安装的插件。浏览使用上次取得的 Git 目录，用 `marketplace update` 刷新；`tickloop` 目录每次实时读取。插件 `update` 会刷新来源并检查 Git 提交，所以显示版本不变时也能更新内容。全部更新会跳过来自已删除 marketplace 的插件。
+`add` 也接受 `OWNER/REPO#REF`、Git 地址（HTTPS、SSH 或 file）、本地目录或 HTTPS 上的 marketplace JSON。名称取自 marketplace 文件。删除 marketplace 不会卸载已安装的插件。浏览使用上次取得的 Git 目录，用 `marketplace update` 刷新；`tickloop` 目录每次实时读取。插件 `update` 会刷新来源并检查 Git 提交，所以显示版本不变时也能更新内容。全部更新会跳过来自已删除 marketplace 的插件。 Git 来源带 `sha` 时始终安装该提交，即使 `ref` 已前进；ref 只作为获取线索。提交不存在时安装失败，原插件保持不变。
 
 本地插件目录或 `.tar.gz` 压缩包：
 
