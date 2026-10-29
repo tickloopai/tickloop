@@ -34,7 +34,7 @@ use crate::transcript::private_family_temp_directory;
 use tickloop_harness_base::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatSnapshot, Content, Message, Receipt, Role, ToolResult, ToolResultContent,
+    ChatId, ChatSnapshot, Content, Message, Receipt, Role, ToolResult, ToolResultContent,
 };
 use tickloop_harness_tools::{
     BASH_TOOL_NAME, ChatDirectory, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL,
@@ -82,21 +82,13 @@ impl Agent {
             return self.folderless_chat_tools(snapshot);
         }
         let chat_id = snapshot.id;
-        let family_id = snapshot
-            .delegation
-            .as_ref()
-            .map_or(chat_id, |delegation| delegation.root_chat_id());
-        let family_temp = private_family_temp_directory(family_id.into());
+        let family_temp = private_family_temp_directory(family_root(snapshot).into());
         let persistent_project = self
             .inner
             .recorder
             .as_ref()
             .and_then(|recorder| recorder.local_project_directory(chat_id));
-        let temporary_chat = if family_id == chat_id {
-            family_temp.clone()
-        } else {
-            family_temp.join(chat_id.uuid().to_string())
-        };
+        let temporary_chat = chat_temp_directory(snapshot);
         let chat_directory = persistent_project.map_or_else(
             || temporary_chat.clone(),
             |project| PrivateDirectory::trusted(project).join(chat_id.uuid().to_string()),
@@ -161,15 +153,9 @@ impl Agent {
         let family = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-            chat.tools.family_temp_directory().map(|_| {
-                private_family_temp_directory(
-                    chat.snapshot
-                        .delegation
-                        .as_ref()
-                        .map_or(receipt.chat_id, |delegation| delegation.root_chat_id())
-                        .into(),
-                )
-            })
+            chat.tools
+                .family_temp_directory()
+                .map(|_| private_family_temp_directory(family_root(&chat.snapshot).into()))
         };
         let call_id = tool_use_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -248,6 +234,25 @@ impl Agent {
         .map_err(|error| {
             AgentError::Storage(format!("tool result storage did not finish: {error}"))
         })
+    }
+}
+
+fn family_root(snapshot: &ChatSnapshot) -> ChatId {
+    snapshot
+        .delegation
+        .as_ref()
+        .map_or(snapshot.id, |delegation| delegation.root_chat_id())
+}
+
+/// The Chat's private temporary directory: its family's for the root, and a directory of its own
+/// inside it for a Subagent.
+pub(super) fn chat_temp_directory(snapshot: &ChatSnapshot) -> PrivateDirectory {
+    let root = family_root(snapshot);
+    let family_temp = private_family_temp_directory(root.into());
+    if root == snapshot.id {
+        family_temp
+    } else {
+        family_temp.join(snapshot.id.uuid().to_string())
     }
 }
 
