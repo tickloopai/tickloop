@@ -111,6 +111,25 @@ pub struct HookPluginDirectories {
     pub data: PathBuf,
 }
 
+/// How a hook runs apart from the event that starts it, as Claude Code's `async` and
+/// `asyncRewake` declare: in the background, without holding up the event, with any decision it
+/// prints ignored.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HookBackground {
+    /// `async`: its `systemMessage` and `additionalContext` reach the model's next request.
+    Async,
+    /// `asyncRewake`: exit status 2 notifies the Loop with its output, waking it when idle.
+    AsyncRewake {
+        /// Claude Code's `rewakeMessage`: what the model reads before the output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Claude Code's `rewakeSummary`: the one line the user sees.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+}
+
 /// One `command` hook as configured for a Folder.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfiguredHook {
@@ -132,6 +151,9 @@ pub struct ConfiguredHook {
     #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
     pub timeout_secs: u64,
+    /// `None` for a hook its event waits for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<HookBackground>,
     pub plugin: Option<HookPluginDirectories>,
     /// What a trust record must match: the declaration with the plugin's whole content, or with
     /// the Folder's `.claude/hooks/` directory. `None` for user hooks.
@@ -210,6 +232,16 @@ pub enum HookDecision {
     IgnoredAllow,
 }
 
+/// Which end of a background hook's run a record is.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBackgroundPhase {
+    /// It started and its event went on without it; the record's outcome is `Success`.
+    Started,
+    /// It ended; any decision it printed was ignored.
+    Ended,
+}
+
 /// One hook run as the Chat's activity history keeps it. It never reaches the model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HookRunRecord {
@@ -245,6 +277,9 @@ pub struct HookRunRecord {
     /// Its standard output and error, shortened; empty when it asked to suppress its output.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    /// `None` for a run its event waited for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<HookBackgroundPhase>,
 }
 
 /// Hooks an event matched that did not run because they may not run yet.

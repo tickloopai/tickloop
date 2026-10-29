@@ -9,8 +9,10 @@
 //! command and `if` once per source, each a one-shot command in the Chat's Folder with the
 //! event's input on standard input and only `CLAUDE_PROJECT_DIR` and a plugin's directories
 //! added to its environment. Each run is kept in the Chat's activity history, never in what the
-//! model reads, and announced as it ends.
+//! model reads, and announced as it ends. A hook declared `async` or `asyncRewake` runs in the
+//! background instead; see [`background`].
 
+mod background;
 mod matcher;
 mod output;
 mod session_events;
@@ -68,6 +70,8 @@ pub(crate) struct ChatHookState {
     stopped_runs: HashSet<tickloop_harness_protocol::RunId>,
     /// What the session and turn hooks keep.
     pub(crate) session: session_events::SessionHookState,
+    /// Ends the hooks running in the background, at `/stop` or shutdown; Esc leaves them.
+    background: Option<CancellationToken>,
 }
 
 impl ChatHookState {
@@ -88,6 +92,7 @@ impl ChatHookState {
 }
 
 /// What a Chat gives every hook it runs.
+#[derive(Clone)]
 struct HookContext {
     folder: PathBuf,
     session_id: String,
@@ -102,9 +107,12 @@ struct FinishedRun {
     exit_code: Option<i32>,
     /// Its standard output, then its standard error.
     output: String,
+    /// What an exit status 2 tells: its standard error, else its standard output.
+    blocking_output: String,
 }
 
 /// One matched hook that may run.
+#[derive(Clone)]
 struct Runnable {
     hook: ConfiguredHook,
     command: String,
@@ -172,9 +180,16 @@ impl Agent {
         };
         let input = hook_input(&context, &call, &transcript_path);
         let stdin = serde_json::to_vec(&input).expect("hook input serializes");
-        let runs = runnable
-            .iter()
-            .map(|runnable| self.run_one_hook(receipt, &context, &call, runnable, &stdin, cancel));
+        let (background, runnable): (Vec<_>, Vec<_>) = runnable
+            .into_iter()
+            .partition(|runnable| runnable.hook.background.is_some());
+        for runnable in background {
+            self.start_background_hook(receipt, &context, &call, runnable, stdin.clone())
+                .await;
+        }
+        let runs = runnable.iter().map(|runnable| {
+            self.run_one_hook(receipt, &context, call.event, runnable, &stdin, cancel)
+        });
         let finished = futures_util::future::join_all(runs).await;
         let (verdict, warning) = HookVerdict::merge(
             runnable
@@ -216,8 +231,8 @@ impl Agent {
         ))
     }
 
-    /// The hooks `call` matches that may run, the same command once per source; announces the
-    /// ones it matches that may not run yet.
+    /// The hooks `call` matches that may run, the same command, `if` and way of running once per
+    /// source; announces the ones it matches that may not run yet.
     async fn select_hooks(
         &self,
         receipt: &Receipt,
@@ -251,6 +266,7 @@ impl Agent {
                         hook.source.clone(),
                         command.clone(),
                         hook.condition.clone(),
+                        hook.background.clone(),
                     )) {
                         runnable.push(Runnable { hook, command });
                     }
@@ -304,7 +320,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         context: &HookContext,
-        call: &HookCall,
+        event: HookEvent,
         runnable: &Runnable,
         stdin: &[u8],
         cancel: &CancellationToken,
@@ -326,24 +342,25 @@ impl Agent {
             cwd: context.folder.to_string_lossy().into_owned(),
             timeout,
         };
-        let (response, exit_code, output) = match self
+        let not_finished = |response| FinishedRun {
+            response,
+            duration: started.elapsed(),
+            exit_code: None,
+            output: String::new(),
+            blocking_output: String::new(),
+        };
+        match self
             .execute_hook_command(receipt, context, spec, cancel)
             .await
         {
-            Err(error) if cancel.is_cancelled() => (
-                HookResponse::failed(HookRunOutcome::Cancelled, error),
-                None,
-                String::new(),
-            ),
-            Err(error) => (
-                HookResponse::failed(HookRunOutcome::NotRun, error),
-                None,
-                String::new(),
-            ),
+            Err(error) if cancel.is_cancelled() => {
+                not_finished(HookResponse::failed(HookRunOutcome::Cancelled, error))
+            }
+            Err(error) => not_finished(HookResponse::failed(HookRunOutcome::NotRun, error)),
             Ok(command) => {
                 let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
                 let response = output::interpret(
-                    call.event,
+                    event,
                     &runnable.hook.command,
                     HookExit {
                         code: command.exit.code,
@@ -357,14 +374,19 @@ impl Agent {
                     .filter(|stream| !stream.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
-                (response, command.exit.code, output)
+                let blocking_output = if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                };
+                FinishedRun {
+                    response,
+                    duration: started.elapsed(),
+                    exit_code: command.exit.code,
+                    output,
+                    blocking_output: blocking_output.to_owned(),
+                }
             }
-        };
-        FinishedRun {
-            response,
-            duration: started.elapsed(),
-            exit_code,
-            output,
         }
     }
 
@@ -424,13 +446,7 @@ impl Agent {
         };
         let count = finished.len();
         for (index, (runnable, run)) in runnable.iter().zip(finished).enumerate() {
-            let response = run.response;
-            let mut reason = response
-                .blocking_error
-                .clone()
-                .or(response.permission_reason.clone())
-                .or(response.error.clone())
-                .or(response.stop_reason.clone());
+            let mut reason = run.response.reason();
             if index + 1 == count
                 && let Some(warning) = &warning
             {
@@ -439,36 +455,58 @@ impl Agent {
                     None => warning.clone(),
                 });
             }
-            let record = HookRunRecord {
-                id: tickloop_ids::generate(),
-                chat_id: receipt.chat_id,
-                loop_id: receipt.loop_id,
-                run_id: receipt.run_id,
-                at_ms: unix_time_milliseconds(),
-                event: call.event,
-                source: runnable.hook.source.clone(),
-                command: runnable.hook.command.clone(),
-                tool_name: call.tool.as_ref().map(|(name, _)| name.clone()),
-                call_id: call.tool.as_ref().map(|(_, call_id)| call_id.clone()),
-                duration_ms: u64::try_from(run.duration.as_millis()).unwrap_or(u64::MAX),
-                outcome: response.outcome,
-                exit_code: run.exit_code,
-                decision: response.decision(&runnable.hook.source),
-                reason: reason.as_deref().map(shortened),
-                system_message: response.system_message.as_deref().map(shortened),
-                updated_input: response
-                    .updated_input
-                    .as_ref()
-                    .map(|input| shortened(&input.to_string())),
-                output: if response.suppress_output {
-                    String::new()
-                } else {
-                    shortened(&run.output)
-                },
-            };
+            let record = run_record(
+                receipt,
+                call.event,
+                call.tool.as_ref(),
+                &runnable.hook,
+                &run,
+                reason,
+            );
             record_hook_run(self, chat, receipt, record);
         }
         self.save(&chat.snapshot);
+    }
+}
+
+/// The record of `hook`'s `run` for `event`, giving `reason` as why it decided, blocked or
+/// failed.
+fn run_record(
+    receipt: &Receipt,
+    event: HookEvent,
+    tool: Option<&(String, String)>,
+    hook: &ConfiguredHook,
+    run: &FinishedRun,
+    reason: Option<String>,
+) -> HookRunRecord {
+    let response = &run.response;
+    HookRunRecord {
+        id: tickloop_ids::generate(),
+        chat_id: receipt.chat_id,
+        loop_id: receipt.loop_id,
+        run_id: receipt.run_id,
+        at_ms: unix_time_milliseconds(),
+        event,
+        source: hook.source.clone(),
+        command: hook.command.clone(),
+        tool_name: tool.map(|(name, _)| name.clone()),
+        call_id: tool.map(|(_, call_id)| call_id.clone()),
+        duration_ms: u64::try_from(run.duration.as_millis()).unwrap_or(u64::MAX),
+        outcome: response.outcome,
+        exit_code: run.exit_code,
+        decision: response.decision(&hook.source),
+        reason: reason.as_deref().map(shortened),
+        system_message: response.system_message.as_deref().map(shortened),
+        updated_input: response
+            .updated_input
+            .as_ref()
+            .map(|input| shortened(&input.to_string())),
+        output: if response.suppress_output {
+            String::new()
+        } else {
+            shortened(&run.output)
+        },
+        background: None,
     }
 }
 

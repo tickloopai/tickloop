@@ -657,7 +657,7 @@ fn hooked_plugin(fixture: &Fixture) -> PathBuf {
             json!({"hooks": {
                 "PreToolUse": [{"matcher": "Bash", "hooks": [
                     {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/check", "timeout": 5},
-                    {"type": "command", "command": "later", "async": true},
+                    {"type": "command", "command": "later", "once": true},
                 ]}],
                 "Stop": [{"hooks": [
                     {"type": "command", "command": "done"},
@@ -676,7 +676,7 @@ fn hooked_plugin(fixture: &Fixture) -> PathBuf {
 const HOOK_WARNINGS: &str = "\
     Warning: hook events not supported yet, so their hooks are not used: Notification\n\
     Warning: hook types not supported yet, so those hooks are not used: prompt\n\
-    Warning: hook fields not supported yet, so the hooks using them are not used: async\n";
+    Warning: hook fields not supported yet, so the hooks using them are not used: once\n";
 
 #[test]
 fn plugin_hooks_show_how_many_need_confirming_instead_of_being_unsupported() {
@@ -721,7 +721,7 @@ fn validate_lists_the_hook_events_types_and_fields_tickloop_runs_and_those_it_do
             "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.\n\
              Skills: none\n\
              Hooks: 2 supported | events: PreToolUse, Stop | types: command | fields: command, timeout\n\
-             Hooks not supported yet: events: Notification | types: prompt | fields: async\n\
+             Hooks not supported yet: events: Notification | types: prompt | fields: once\n\
              {HOOK_WARNINGS}"
         )
     );

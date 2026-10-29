@@ -592,6 +592,8 @@ fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings(
                 {"type": "command", "command": "guard", "timeout": 10, "if": "Bash(rm *)"},
                 {"type": "prompt", "prompt": "Is this safe?"},
                 {"type": "command", "command": "later", "async": true, "once": true},
+                {"type": "command", "command": "review", "asyncRewake": true,
+                 "rewakeMessage": "Review:", "rewakeSummary": "Review found issues"},
             ]}],
             "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
             "PermissionRequest": [{"hooks": [{"type": "command", "command": "ask"}]}],
@@ -604,10 +606,20 @@ fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings(
     assert!(manifest.components.contains(&Component::Hooks));
     assert!(manifest.unsupported().is_empty());
     let support = &manifest.hook_support;
-    assert_eq!(support.runnable, 2);
+    assert_eq!(support.runnable, 3);
     assert_eq!(support.events, names(&["PreToolUse", "Stop"]));
     assert_eq!(support.types, names(&["command"]));
-    assert_eq!(support.fields, names(&["command", "if", "timeout"]));
+    assert_eq!(
+        support.fields,
+        names(&[
+            "asyncRewake",
+            "command",
+            "if",
+            "rewakeMessage",
+            "rewakeSummary",
+            "timeout"
+        ])
+    );
     assert_eq!(
         support.unsupported_events,
         names(&["Notification", "PermissionRequest"])
@@ -616,14 +628,14 @@ fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings(
         support.unsupported_types,
         names(&["agent", "http", "prompt"])
     );
-    assert_eq!(support.unsupported_fields, names(&["async", "once"]));
+    assert_eq!(support.unsupported_fields, names(&["once"]));
     assert_eq!(
         manifest.warnings,
         [
             "hook events not supported yet, so their hooks are not used: Notification, \
              PermissionRequest",
             "hook types not supported yet, so those hooks are not used: agent, http, prompt",
-            "hook fields not supported yet, so the hooks using them are not used: async, once",
+            "hook fields not supported yet, so the hooks using them are not used: once",
         ]
     );
 }

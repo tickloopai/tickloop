@@ -377,7 +377,7 @@ test("hook support is read from validate and reported per plugin as fully, partl
     "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.",
     "Skills: none",
     "Hooks: 2 supported | events: PreToolUse, Stop | types: command | fields: command, timeout",
-    "Hooks not supported yet: events: Notification | types: prompt | fields: async",
+    "Hooks not supported yet: events: Notification | types: prompt | fields: shell",
     "Warning: hook events not supported yet, so their hooks are not used: Notification",
   ].join("\n"));
   assert.deepEqual(partly.hooks, {
@@ -388,7 +388,7 @@ test("hook support is read from validate and reported per plugin as fully, partl
     fields: ["command", "timeout"],
     unsupportedEvents: ["Notification"],
     unsupportedTypes: ["prompt"],
-    unsupportedFields: ["async"],
+    unsupportedFields: ["shell"],
   });
   const fully = parseValidateOutput("Hooks: 1 supported | events: Stop | types: command | fields: command\n").hooks;
   assert.deepEqual(
@@ -414,15 +414,15 @@ test("hook support is read from validate and reported per plugin as fully, partl
   report.totals = summarize(report.plugins);
   assert.deepEqual(report.totals.hooks, {
     plugins: 3, fully: 1, partly: 1, none: 1, supportedHooks: 3,
-    unsupportedEvents: { Notification: 2 }, unsupportedTypes: { prompt: 1 }, unsupportedFields: { async: 1 },
+    unsupportedEvents: { Notification: 2 }, unsupportedTypes: { prompt: 1 }, unsupportedFields: { shell: 1 },
   });
   assert.deepEqual(report.totals.supportedComponents, { hooks: 2 });
 
   const markdown = renderMarkdown(report);
   assert.match(markdown, /^## Hooks$/m);
   assert.match(markdown, /^\| Partly supported \| 1 \|$/m);
-  assert.match(markdown, /^\| guard \| partly \| 2 \| PreToolUse, Stop \| command \| command, timeout \| Notification \| prompt \| async \|$/m);
+  assert.match(markdown, /^\| guard \| partly \| 2 \| PreToolUse, Stop \| command \| command, timeout \| Notification \| prompt \| shell \|$/m);
   assert.match(markdown, /^\| Plugin \| Source \| Status \| Revision \| Manifest \| Version \| Used \| Not supported yet \| Hooks \| Warnings and errors \|$/m);
-  assert.match(markdown, /^\| guard \| path \.\/guard \| installable \| abc \| \S+ \| 1\.0\.0 \| hooks \|  \| partly: 2 supported \(PreToolUse, Stop\); not supported: events Notification; types prompt; fields async \|  \|$/m);
+  assert.match(markdown, /^\| guard \| path \.\/guard \| installable \| abc \| \S+ \| 1\.0\.0 \| hooks \|  \| partly: 2 supported \(PreToolUse, Stop\); not supported: events Notification; types prompt; fields shell \|  \|$/m);
   assert.match(markdown, /^\| plain \| path \.\/plain \| installable \| abc \| \S+ \| 1\.0\.0 \|  \|  \|  \|  \|$/m);
 });

@@ -28,6 +28,9 @@ mod response_lifecycle;
 #[path = "all/approval_budget.rs"]
 mod approval_budget;
 
+#[path = "all/background_hooks.rs"]
+mod background_hooks;
+
 #[path = "all/artifact_real_service.rs"]
 mod artifact_real_service;
 

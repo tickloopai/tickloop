@@ -41,6 +41,7 @@ fn user_hook(event: HookEvent, matcher: Option<&str>, command: &str) -> Configur
         resolved_command: Some(command.into()),
         condition: None,
         timeout_secs: 600,
+        background: None,
         plugin: None,
         trust: HookTrust::Trusted,
     }

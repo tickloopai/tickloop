@@ -107,6 +107,8 @@ use tickloop_harness::protocol::{
 /// and changing their trust records.
 /// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
 /// reason, which older readers reject as unknown, and the hook runs of the approval history.
+/// 37.1 adds how a configured hook runs in the background (`async`, `asyncRewake`) and which end
+/// of a background run a hook run record is.
 /// 38.0 adds the host note carrying what a hook gave the model, which older readers reject as
 /// unknown in the Chat snapshot's host notes, and a launch that starts its Agent after `/clear`.
 pub const PROTOCOL_MAJOR: u16 = 38;

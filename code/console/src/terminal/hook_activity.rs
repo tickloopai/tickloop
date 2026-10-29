@@ -2,7 +2,7 @@
 //! and their records in the Recent activity of `/permissions`.
 
 use tickloop_harness::protocol::hooks::{
-    HookDecision, HookRunOutcome, HookRunRecord, HookSkipNotice, HookSource,
+    HookBackgroundPhase, HookDecision, HookRunOutcome, HookRunRecord, HookSkipNotice, HookSource,
 };
 
 use super::style::Role;
@@ -23,7 +23,7 @@ pub(super) fn source_label(source: &HookSource) -> String {
     }
 }
 
-pub(super) fn outcome_label(outcome: HookRunOutcome) -> &'static str {
+fn outcome_label(outcome: HookRunOutcome) -> &'static str {
     match outcome {
         HookRunOutcome::Success => "ran",
         HookRunOutcome::Blocking => "blocked",
@@ -31,6 +31,17 @@ pub(super) fn outcome_label(outcome: HookRunOutcome) -> &'static str {
         HookRunOutcome::TimedOut => "timed out",
         HookRunOutcome::Cancelled => "cancelled",
         HookRunOutcome::NotRun => "not run",
+    }
+}
+
+/// How a run went, with a background run's start and end told apart.
+pub(super) fn run_label(record: &HookRunRecord) -> String {
+    match record.background {
+        Some(HookBackgroundPhase::Started) => "started in the background".into(),
+        Some(HookBackgroundPhase::Ended) => {
+            format!("{} in the background", outcome_label(record.outcome))
+        }
+        None => outcome_label(record.outcome).into(),
     }
 }
 
@@ -45,8 +56,12 @@ pub(super) fn decision_label(decision: HookDecision) -> &'static str {
 }
 
 /// The lines a finished hook run shows in the conversation: its `systemMessage`, and why it
-/// blocked or failed. A quiet success shows nothing; its record stays in Recent activity.
+/// blocked or failed. A quiet success and a background hook's start show nothing; their records
+/// stay in Recent activity. A background hook that exits 2 shows as the notification it sends.
 pub(super) fn run_notices(record: &HookRunRecord) -> Vec<(String, Role)> {
+    if record.background == Some(HookBackgroundPhase::Started) {
+        return Vec::new();
+    }
     let label = hook_label(record);
     let mut notices = Vec::new();
     if let Some(message) = &record.system_message {
@@ -54,12 +69,13 @@ pub(super) fn run_notices(record: &HookRunRecord) -> Vec<(String, Role)> {
     }
     let reason = record.reason.as_deref().unwrap_or("no reason given");
     match record.outcome {
+        HookRunOutcome::Blocking if record.background.is_some() => {}
         HookRunOutcome::Blocking => {
             notices.push((format!("{label} hook blocked: {reason}"), Role::Warning))
         }
         HookRunOutcome::NonBlockingError | HookRunOutcome::TimedOut | HookRunOutcome::NotRun => {
             notices.push((
-                format!("{label} hook {}: {reason}", outcome_label(record.outcome)),
+                format!("{label} hook {}: {reason}", run_label(record)),
                 Role::Warning,
             ))
         }
@@ -124,6 +140,7 @@ mod tests {
             system_message: None,
             updated_input: None,
             output: String::new(),
+            background: None,
         }
     }
 
@@ -140,6 +157,28 @@ mod tests {
         assert_eq!(
             run_notices(&message)[0].0,
             "PreToolUse:Bash hook: Formatted 2 files"
+        );
+    }
+
+    #[test]
+    fn a_background_hook_shows_its_end_but_not_its_start() {
+        let mut started = record(HookRunOutcome::Success);
+        started.background = Some(HookBackgroundPhase::Started);
+        started.system_message = Some("checking".into());
+        assert!(run_notices(&started).is_empty());
+        assert_eq!(run_label(&started), "started in the background");
+
+        let mut failed = record(HookRunOutcome::NonBlockingError);
+        failed.background = Some(HookBackgroundPhase::Ended);
+        assert_eq!(
+            run_notices(&failed)[0].0,
+            "PreToolUse:Bash hook failed in the background: builds are frozen"
+        );
+        let mut rewoke = record(HookRunOutcome::Blocking);
+        rewoke.background = Some(HookBackgroundPhase::Ended);
+        assert!(
+            run_notices(&rewoke).is_empty(),
+            "its notification already shows"
         );
     }
 

@@ -8,8 +8,8 @@ use tick_plugins::{InstalledPlugin, PluginStore, SHIPPED_FILES_RECORD};
 use tickloop_code_settings::UserSettings;
 use tickloop_harness::policy::settings::{SettingsStore, SettingsStoreError};
 use tickloop_harness::protocol::hooks::{
-    ConfiguredHook, HookEvent, HookList, HookPluginDirectories, HookSource, HookTrust,
-    HookTrustAction, HookTrustChange,
+    ConfiguredHook, HookBackground, HookEvent, HookList, HookPluginDirectories, HookSource,
+    HookTrust, HookTrustAction, HookTrustChange,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
@@ -210,6 +210,68 @@ fn an_if_condition_is_read_and_names_a_hook_apart_from_the_same_command_without_
 }
 
 #[test]
+fn async_and_async_rewake_are_read_and_name_a_hook_apart_from_the_same_command_without_them() {
+    let setup = Setup::new();
+    setup.write_user_settings(json!({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "review"},
+        {"type": "command", "command": "review", "async": true},
+        {"type": "command", "command": "review", "async": true, "asyncRewake": true,
+         "rewakeMessage": "Review:", "rewakeSummary": "Review found issues"},
+        {"type": "command", "command": "quiet", "async": false, "rewakeSummary": "unused"},
+        {"type": "command", "command": "loose", "async": "yes"},
+        {"type": "command", "command": "blank", "asyncRewake": true, "rewakeMessage": " "},
+    ]}]}}));
+
+    let list = setup.hooks();
+
+    let declared = list
+        .hooks
+        .iter()
+        .map(|hook| (hook.command.as_str(), hook.background.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declared,
+        [
+            ("review", None),
+            ("review", Some(HookBackground::Async)),
+            (
+                "review",
+                Some(HookBackground::AsyncRewake {
+                    message: Some("Review:".into()),
+                    summary: Some("Review found issues".into()),
+                })
+            ),
+            ("quiet", None),
+        ],
+        "asyncRewake implies async, and the same command runs each way"
+    );
+    let keys = list.hooks[..3]
+        .iter()
+        .map(|hook| hook.key.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(keys.len(), 3);
+    let settings = setup.settings_path().display().to_string();
+    assert_eq!(
+        list.warnings,
+        [
+            format!("{settings}: PostToolUse hook async must be true or false; it is skipped"),
+            format!(
+                "{settings}: PostToolUse hook rewakeMessage must be non-empty text; it is skipped"
+            ),
+        ]
+    );
+
+    setup.write_user_settings(json!({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "review"},
+    ]}]}}));
+    assert_eq!(
+        setup.hooks().hooks[0].key,
+        list.hooks[0].key,
+        "a hook that waits keeps its identity"
+    );
+}
+
+#[test]
 fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
     let setup = Setup::new();
     let other = setup.directory.path().join("other");
@@ -239,6 +301,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 resolved_command: Some("check-bash".into()),
                 condition: None,
                 timeout_secs: 30,
+                background: None,
                 plugin: None,
                 hash: None,
                 trust: HookTrust::Trusted,
@@ -253,6 +316,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 resolved_command: Some("finish".into()),
                 condition: None,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
+                background: None,
                 plugin: None,
                 hash: None,
                 trust: HookTrust::Trusted,
@@ -385,7 +449,7 @@ fn unsupported_types_events_and_fields_skip_only_their_hook_with_a_warning() {
     setup.write_user_settings(json!({"hooks": {
         "PreToolUse": [{"matcher": "Bash", "hooks": [
             {"type": "prompt", "prompt": "Is this safe?"},
-            {"type": "command", "command": "in-background", "async": true},
+            {"type": "command", "command": "just-once", "once": true},
             {"type": "command", "command": "kept", "statusMessage": "Checking"},
         ]}],
         "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
@@ -404,9 +468,7 @@ fn unsupported_types_events_and_fields_skip_only_their_hook_with_a_warning() {
         list.warnings,
         [
             format!("{settings}: PreToolUse hook type prompt is not supported; it is skipped"),
-            format!(
-                "{settings}: PreToolUse hook field async is not supported; the hook is skipped"
-            ),
+            format!("{settings}: PreToolUse hook field once is not supported; the hook is skipped"),
             format!("{settings}: hook event Notification is not supported; its hooks are skipped"),
             format!("{settings}: Stop hook type http is not supported; it is skipped"),
             format!("{settings}: Stop hook field args is not supported; the hook is skipped"),

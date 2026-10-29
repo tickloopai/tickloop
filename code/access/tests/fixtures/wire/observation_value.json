@@ -1248,6 +1248,10 @@
           "resolved_command": "/home/user/.tickloop/plugins/cache/guard/check.sh",
           "if": "Bash(rm *)",
           "timeout_secs": 30,
+          "background": {
+            "kind": "async_rewake",
+            "message": "Review:"
+          },
           "plugin": {
             "root": "/home/user/.tickloop/plugins/cache/guard",
             "data": "/home/user/.tickloop/plugins/data/guard"
