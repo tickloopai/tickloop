@@ -51,6 +51,10 @@ impl SettingsStore for CommandSettings {
         );
         skills
     }
+
+    fn hooks(&self, folder: Option<&Path>) -> tickloop_harness_protocol::hooks::HookList {
+        self.memory.hooks(folder)
+    }
 }
 
 fn command_agent(
@@ -999,4 +1003,141 @@ async fn durable_restore_rejects_a_queued_command_whose_plan_and_source_were_not
                 && operation.input["command"] == "touch must-not-run")
     );
     resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn command_preprocessing_respects_prompt_hooks_and_session_start_model_boundary() {
+    use std::sync::Mutex;
+    use tickloop_harness_protocol::hooks::{
+        ConfiguredHook, HookEvent, HookList, HookSource, HookTrust,
+    };
+    use tickloop_harness_runtime::environment::memory::MemoryCommandRun;
+
+    for user in [true, false] {
+        for blocked in [true, false] {
+            let folder = tempfile::tempdir().unwrap();
+            let environment = MemoryEnvironment::new();
+            environment.define_shell("printf prepared", Duration::ZERO, b"prepared".to_vec(), 0);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let memory = MemorySettingsStore::default();
+            memory
+                .write(SettingsUpdate::TrustDirectory(
+                    folder.path().canonicalize().unwrap(),
+                ))
+                .unwrap();
+            let mut hooks = Vec::new();
+            for (event, command, matcher) in [
+                (HookEvent::UserPromptSubmit, "prompt", None),
+                (HookEvent::SessionStart, "session", None),
+                (HookEvent::PreToolUse, "pre-bash", Some("Bash")),
+            ] {
+                let order = order.clone();
+                environment.define_command(command, move |_| {
+                    order.lock().unwrap().push(command);
+                    MemoryCommandRun {
+                        exit_code: if command == "prompt" && blocked { 2 } else { 0 },
+                        stdout: if command == "session" { serde_json::to_vec(&json!({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"session-command-context"}})).unwrap() } else { Vec::new() },
+                        stderr: if command == "prompt" && blocked { b"blocked prompt".to_vec() } else { Vec::new() },
+                        ..Default::default()
+                    }
+                });
+                hooks.push(ConfiguredHook {
+                    key: command.into(),
+                    hash: None,
+                    source: HookSource::User,
+                    file: "/settings.json".into(),
+                    event,
+                    matcher: matcher.map(str::to_owned),
+                    command: command.into(),
+                    resolved_command: Some(command.into()),
+                    sensitive_values: Vec::new(),
+                    condition: None,
+                    timeout_secs: 600,
+                    background: None,
+                    plugin: None,
+                    trust: HookTrust::Trusted,
+                });
+            }
+            memory.set_hooks(HookList {
+                hooks,
+                ..Default::default()
+            });
+            let model = Arc::new(ScriptedModel::new(if user {
+                vec![text("done")]
+            } else {
+                vec![
+                    call("skill", "Skill", json!({"skill":"demo:check"})),
+                    text("done"),
+                ]
+            }));
+            let agent = Agent::with_seams(
+                HarnessSeams {
+                    search: None,
+                    transcripts: None,
+                    environment: Some(Arc::new(environment)),
+                    models: ChosenModels::new(model.clone()),
+                },
+                HarnessOptions {
+                    settings: Some(Arc::new(CommandSettings {
+                        memory,
+                        markdown: "---\ndescription: Check\n---\n!`printf prepared`".into(),
+                    })),
+                    ..HarnessOptions::local(config())
+                },
+            )
+            .unwrap();
+            let chat = agent.create_chat(folder.path().into()).await.unwrap();
+            agent
+                .set_execution_mode(chat, ExecutionMode::FullAccess)
+                .await
+                .unwrap();
+            let mut events = agent.subscribe();
+            let receipt = if user {
+                agent.invoke_skill(chat, "demo:check", "").await.unwrap()
+            } else {
+                agent.submit(chat, "Use demo:check".into()).await.unwrap()
+            };
+            loop {
+                let event = next_event(&mut events).await;
+                if event.run_id != receipt.run_id {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::Completed { .. } | EventKind::Interrupted => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            if blocked {
+                assert_eq!(*order.lock().unwrap(), ["prompt"]);
+                assert!(snapshot.invoked_skills.is_empty());
+                assert!(
+                    !snapshot
+                        .operations
+                        .iter()
+                        .any(|operation| operation.name == "Bash")
+                );
+                assert!(model.requests.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    *order.lock().unwrap(),
+                    if user {
+                        vec!["prompt", "pre-bash", "session"]
+                    } else {
+                        vec!["prompt", "session", "pre-bash"]
+                    }
+                );
+                assert!(
+                    snapshot
+                        .invoked_skills
+                        .iter()
+                        .any(|skill| skill.content.contains("prepared"))
+                );
+                let first_request = format!("{:?}", model.requests.lock().unwrap()[0]);
+                assert!(first_request.contains("session-command-context"));
+            }
+            agent.shutdown().await;
+        }
+    }
 }

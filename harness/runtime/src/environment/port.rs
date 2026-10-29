@@ -307,6 +307,40 @@ pub struct CommandSpec {
     /// A path in the execution environment, never resolved by the Harness.
     pub cwd: String,
     pub timeout: Duration,
+    /// Receives the command's standard output as it arrives, besides the captured output.
+    pub stdout_tap: Option<OutputTap>,
+}
+
+/// Hands a caller a one-shot command's standard output as it arrives, so it can act before the
+/// command ends. It is no part of what is prepared or approved: any two taps compare equal.
+#[derive(Clone)]
+pub struct OutputTap(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+impl OutputTap {
+    /// A tap and the receiver of what passes through it.
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (Self(sender), receiver)
+    }
+
+    /// Passes `chunk` on; a caller that stopped listening is no error.
+    pub fn send(&self, chunk: &[u8]) {
+        let _ = self.0.send(chunk.to_vec());
+    }
+}
+
+impl PartialEq for OutputTap {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for OutputTap {}
+
+impl std::fmt::Debug for OutputTap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OutputTap")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

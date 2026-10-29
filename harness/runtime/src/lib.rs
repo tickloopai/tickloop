@@ -50,6 +50,7 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
+mod secret_redaction;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod tick_adapter;
@@ -164,8 +165,9 @@ use tickloop_harness_protocol::{
     OperationState, PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution,
     PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PromptPolicy,
     QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
-    ResponseRejection, Role, RunId, SubagentRegistration, TaskNotification, TriggerSource, Usage,
-    UserShellRecord, UserShellState, VerdictEvidence, projection,
+    ResponseRejection, Role, RunId, SUBAGENT_HANDBACK_TOOL_NAME, SubagentRegistration,
+    TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence,
+    projection,
 };
 use tickloop_harness_tools::permissions::SessionPermissionDecision;
 use tickloop_harness_tools::{
@@ -1348,6 +1350,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct SkillInput {
             skill: String,
             args: Option<String>,
@@ -3890,7 +3893,8 @@ impl Agent {
                 }
                 Err(error) => {
                     if let AgentError::Model(model_error) = &error {
-                        self.notify_stop_failure(&receipt, model_error);
+                        self.notify_stop_failure(&receipt, model_error, &cancel)
+                            .await;
                     }
                     return Err(error.to_string());
                 }
@@ -3930,6 +3934,12 @@ impl Agent {
                     content: output.content,
                 });
                 chat.snapshot.last_model_run = Some(receipt.run_id);
+                if calls
+                    .iter()
+                    .any(|call| call.name != SUBAGENT_HANDBACK_TOOL_NAME)
+                {
+                    chat.hook_state.session.note_tool_calls(receipt.run_id);
+                }
                 self.emit(
                     chat,
                     &receipt,
@@ -5642,22 +5652,35 @@ impl Agent {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)
     }
 
-    /// A background task notification may queue one continuation run. The caller starts it
-    /// after releasing the Chat lock.
+    /// Writes `message`, what a background task's end tells the model, and shows the Chat's
+    /// views its line at once; a view drawing the conversation again reads it from `message`.
+    fn show_task_notification(
+        &self,
+        chat: &mut Chat,
+        notification: TaskNotification,
+        message: Message,
+    ) -> Result<(), AgentError> {
+        self.append_local_messages(chat, [message])?;
+        let _ = self.inner.task_notifications.send(notification);
+        Ok(())
+    }
+
+    /// A background Shell task's notification may queue one continuation run. The caller starts
+    /// it after releasing the Chat lock.
     fn notify_task_completion(
         &self,
         chat: &mut Chat,
         loop_id: Option<LoopId>,
         notification: TaskNotification,
     ) -> Result<bool, AgentError> {
+        let Some(shell) = &notification.shell else {
+            return Ok(false);
+        };
         chat.bookkeeping
             .deferred_notifications
-            .push(tick_protocol::InstanceRef::shell(notification.task_id));
-        self.append_local_messages(
-            chat,
-            [local_messages::task_notification(&chat.ids, &notification)],
-        )?;
-        let _ = self.inner.task_notifications.send(notification);
+            .push(tick_protocol::InstanceRef::shell(shell.task_id));
+        let message = local_messages::task_notification(&chat.ids, shell, &notification.summary);
+        self.show_task_notification(chat, notification, message)?;
         Ok(self.queue_task_continuation(chat, loop_id))
     }
 

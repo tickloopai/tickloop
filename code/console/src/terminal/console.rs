@@ -4317,22 +4317,26 @@ impl Console {
         Ok(())
     }
 
-    pub(super) fn write_shell_notification(
+    /// Adds a background task's line as it ends; a Shell task's flashes with its Monitor row.
+    pub(super) fn write_task_notification(
         &self,
         notification: &tickloop_harness::protocol::TaskNotification,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let runs = super::task_notification_line(notification, state.display);
-        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
-        state.monitor.flash_received(
-            tick_protocol::InstanceRef::shell(notification.task_id),
-            now_ms,
-        );
-        state.scrollback.append_flashing_label(
-            &runs,
-            Some((super::list_row::RowFlash::TakeIn, now_ms)),
-            Some(tick_protocol::InstanceRef::shell(notification.task_id)),
-        );
+        match &notification.shell {
+            Some(shell) => {
+                let instance = tick_protocol::InstanceRef::shell(shell.task_id);
+                let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
+                state.monitor.flash_received(instance.clone(), now_ms);
+                state.scrollback.append_flashing_label(
+                    &runs,
+                    Some((super::list_row::RowFlash::TakeIn, now_ms)),
+                    Some(instance),
+                );
+            }
+            None => state.scrollback.append_flashing_label(&runs, None, None),
+        }
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())

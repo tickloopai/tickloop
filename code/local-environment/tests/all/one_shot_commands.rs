@@ -60,6 +60,7 @@ fn spec(command: &str, cwd: &str, timeout: Duration) -> CommandSpec {
         env: BTreeMap::new(),
         cwd: cwd.into(),
         timeout,
+        stdout_tap: None,
     }
 }
 

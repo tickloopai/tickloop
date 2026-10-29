@@ -111,7 +111,9 @@ use tickloop_harness::protocol::{
 /// of a background run a hook run record is.
 /// 38.0 adds the host note carrying what a hook gave the model, which older readers reject as
 /// unknown in the Chat snapshot's host notes, and a launch that starts its Agent after `/clear`.
-pub const PROTOCOL_MAJOR: u16 = 38;
+/// 39.0 lets a task notification come from a hook that ran in the background: its Shell task
+/// moves under `shell`, which such a notification leaves empty and older readers reject.
+pub const PROTOCOL_MAJOR: u16 = 39;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

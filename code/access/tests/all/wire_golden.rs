@@ -453,6 +453,7 @@ fn hook_list() -> HookList {
             matcher: Some("Bash".into()),
             command: "${CLAUDE_PLUGIN_ROOT}/check.sh".into(),
             resolved_command: Some("/home/user/.tickloop/plugins/cache/guard/check.sh".into()),
+            sensitive_values: Vec::new(),
             condition: Some("Bash(rm *)".into()),
             timeout_secs: 30,
             background: Some(HookBackground::AsyncRewake {
@@ -1150,6 +1151,23 @@ fn observation_changes_keep_their_recorded_wire() {
                 reason: ResetReason::ConversationChanged,
                 snapshot: Box::new(live_chat_snapshot()),
             },
+            ObservationChange::TaskNotification(
+                tickloop_harness::protocol::TaskNotification::for_background_command(
+                    id(0xc1).into(),
+                    id(0x42).into(),
+                    Some("call-1".into()),
+                    "/tmp/task.log".into(),
+                    "make test",
+                    tickloop_harness::protocol::TaskNotificationStatus::Failed,
+                    Some(2),
+                ),
+            ),
+            ObservationChange::TaskNotification(
+                tickloop_harness::protocol::TaskNotification::for_background_hook(
+                    id(0xc1).into(),
+                    "Background check found something",
+                ),
+            ),
         ],
     );
 }

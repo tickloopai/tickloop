@@ -2192,7 +2192,7 @@ impl Menus {
                 title: "Permissions · Choose mode".into(),
                 context: vec![
                     context.into(),
-                    format!("{sandbox_status} · 用 /sandbox 修改"),
+                    format!("{sandbox_status} · change with /sandbox"),
                 ],
                 markdown: None,
                 options,

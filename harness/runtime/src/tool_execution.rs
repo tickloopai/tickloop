@@ -1323,7 +1323,12 @@ impl Agent {
                 .await
             {
                 crate::hooks::PreToolGate::Cancelled => {
-                    return Err("run interrupted while PreToolUse hooks ran".into());
+                    return Ok(ToolCallOutcome {
+                        host_call_status: Some(crate::host_tools::HostCallStatus::NotDispatched),
+                        ..ToolCallOutcome::not_admitted(
+                            crate::recovery::NOT_ADMITTED_AFTER_INTERRUPTION.into(),
+                        )
+                    });
                 }
                 crate::hooks::PreToolGate::Refused { message, feedback } => {
                     return Ok(ToolCallOutcome {

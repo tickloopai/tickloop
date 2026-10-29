@@ -2,19 +2,23 @@
 //! their event, their decisions are ignored, an `async` hook's answer reaches the model's next
 //! request, and an `asyncRewake` hook that exits 2 notifies the Loop, waking it when idle.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tickloop_harness_model::ModelRequest;
-use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
+use tickloop_harness_policy::settings::{
+    MemorySettingsStore, PermissionChanges, SettingsSnapshot, SettingsStore, SettingsStoreError,
+    SettingsUpdate,
+};
 use tickloop_harness_protocol::hooks::{
     ConfiguredHook, HookBackground, HookBackgroundPhase, HookEvent, HookList, HookRunOutcome,
     HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId,
+    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId, TaskNotification,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
 use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
@@ -44,6 +48,7 @@ fn background_hook(
         matcher: matcher.map(Into::into),
         command: command.into(),
         resolved_command: Some(command.into()),
+        sensitive_values: Vec::new(),
         condition: None,
         timeout_secs: 600,
         background,
@@ -66,6 +71,7 @@ fn exits(code: i32, stdout: &str, stderr: &str, duration: Duration) -> MemoryCom
         stderr: stderr.as_bytes().to_vec(),
         exit_code: code,
         duration,
+        ..Default::default()
     }
 }
 
@@ -73,10 +79,57 @@ fn build_call() -> Vec<Content> {
     call("build", "Bash", json!({"command": BUILD}))
 }
 
+/// The Bench's Settings Store: once armed, its next hook list waits until the test lets it go,
+/// as a slow read of the settings would.
+#[derive(Default)]
+struct GatedSettings {
+    inner: MemorySettingsStore,
+    armed: AtomicBool,
+    entered: tokio::sync::Notify,
+    released: (Mutex<bool>, Condvar),
+}
+
+impl GatedSettings {
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+}
+
+impl SettingsStore for GatedSettings {
+    fn read(&self, project: Option<&Path>) -> SettingsSnapshot {
+        self.inner.read(project)
+    }
+
+    fn write(&self, change: SettingsUpdate) -> Result<(), SettingsStoreError> {
+        self.inner.write(change)
+    }
+
+    fn write_permissions(
+        &self,
+        changes: &PermissionChanges,
+        expected: Option<(&Path, &str)>,
+    ) -> Result<(), SettingsStoreError> {
+        self.inner.write_permissions(changes, expected)
+    }
+
+    fn hooks(&self, folder: Option<&Path>) -> HookList {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            let (released, wake) = &self.released;
+            let _released = wake
+                .wait_while(released.lock().unwrap(), |released| !*released)
+                .unwrap();
+        }
+        self.inner.hooks(folder)
+    }
+}
+
 struct Bench {
     agent: Agent,
     chat: ChatId,
     environment: Arc<MemoryEnvironment>,
+    settings: Arc<GatedSettings>,
     model: Arc<ScriptedModel>,
     _directory: tempfile::TempDir,
 }
@@ -95,11 +148,11 @@ impl Bench {
         let folder = directory.path().canonicalize().unwrap();
         let environment = Arc::new(MemoryEnvironment::new());
         environment.define_shell(BUILD, Duration::ZERO, b"built".to_vec(), 0);
-        let settings = Arc::new(MemorySettingsStore::default());
+        let settings = Arc::new(GatedSettings::default());
         settings
             .write(SettingsUpdate::TrustDirectory(folder.clone()))
             .unwrap();
-        settings.set_hooks(HookList {
+        settings.inner.set_hooks(HookList {
             hooks,
             ..Default::default()
         });
@@ -112,7 +165,7 @@ impl Bench {
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
-                settings: Some(settings),
+                settings: Some(settings.clone()),
                 host: AgentHostOptions::embedded_defaults(),
                 ..HarnessOptions::local(config())
             },
@@ -127,6 +180,7 @@ impl Bench {
             agent,
             chat,
             environment,
+            settings,
             model,
             _directory: directory,
         }
@@ -204,6 +258,12 @@ fn texts(request: &ModelRequest) -> Vec<String> {
         .collect()
 }
 
+/// The notifications the Chat's views were shown live so far, once those in flight arrived.
+async fn shown_live(live: &mut Receiver<TaskNotification>) -> Vec<TaskNotification> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::iter::from_fn(|| live.try_recv().ok()).collect()
+}
+
 fn assert_prefix_kept(earlier: &ModelRequest, later: &ModelRequest) {
     assert!(
         later.messages.len() > earlier.messages.len()
@@ -240,6 +300,7 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
         exits(0, &answer.to_string(), "", SLOW_HOOK)
     });
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
     let started = Instant::now();
 
     let turn = bench.turn(&mut events, "Build it.").await;
@@ -274,6 +335,15 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
     );
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     assert_eq!(history.hook_runs, [end.clone(), start.clone()]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show the hook's notification once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(
+        shown.summary,
+        "PreToolUse:Bash hook finished in the background"
+    );
 
     bench.turn(&mut events, "Anything else?").await;
     let requests = bench.requests();
@@ -315,6 +385,7 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
         .environment
         .define_command(broken, |_| exits(1, "", "crashed", Duration::ZERO));
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
 
     let started = Instant::now();
     let first = bench
@@ -348,6 +419,12 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
     );
     assert!(!notification.contains("crashed"));
     assert_prefix_kept(&requests[1], &requests[2]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show only the rewake, once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(shown.summary, "Security review found issues");
 
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     let ended = |command: &str| {
@@ -427,6 +504,62 @@ async fn esc_leaves_background_hooks_running_and_stop_cancels_them() {
 }
 
 #[tokio::test]
+async fn a_stop_while_a_background_hook_is_prepared_keeps_it_from_starting() {
+    let bench = Bench::start(
+        vec![build_call(), text("done")],
+        vec![
+            background_hook(HookEvent::PreToolUse, None, "arm", None),
+            background_hook(
+                HookEvent::PostToolUse,
+                None,
+                AUDIT,
+                Some(HookBackground::Async),
+            ),
+        ],
+    )
+    .await;
+    let settings = bench.settings.clone();
+    bench.environment.define_command("arm", move |_| {
+        settings.armed.store(true, Ordering::SeqCst);
+        exits(0, "", "", Duration::ZERO)
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    bench.environment.define_command(AUDIT, move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        exits(0, "", "", Duration::ZERO)
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(HOOK_END_WAIT, bench.settings.entered.notified())
+        .await
+        .expect("PostToolUse reads its hooks");
+    bench.agent.stop(bench.chat).await.unwrap();
+    bench.settings.release();
+    let turn = follow_turn(&mut events, receipt.run_id).await;
+
+    assert!(turn.interrupted);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "the stop came first: the hook never runs"
+    );
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    assert!(
+        !history.hook_runs.iter().any(|run| run.command == AUDIT),
+        "{:?}",
+        history.hook_runs
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_background_hook_times_out_as_any_hook_does() {
     let mut slow = background_hook(HookEvent::PostToolUse, None, REVIEW, rewake(None, None));
     slow.timeout_secs = 1;
@@ -478,4 +611,293 @@ async fn the_same_command_runs_both_in_the_foreground_and_in_the_background() {
         "the foreground run is not merged into the background one"
     );
     bench.agent.shutdown().await;
+}
+
+/// The line with which Claude Code 2.1.302 lets a running hook go on in the background, as
+/// security-guidance's `SessionStart` bootstrap prints it.
+const ASYNC_FIRST_LINE: &str = "{\"async\": true, \"asyncTimeout\": 180000}\n";
+
+#[tokio::test]
+async fn a_first_line_asking_for_async_sends_a_running_hook_to_the_background() {
+    let bootstrap = "ensure_agent_sdk.sh";
+    let bench = Bench::start(
+        vec![text("hello"), text("noted")],
+        vec![background_hook(
+            HookEvent::SessionStart,
+            None,
+            bootstrap,
+            None,
+        )],
+    )
+    .await;
+    let answer = json!({
+        "metrics": {"sdk_bootstrap": 0},
+        "systemMessage": "SDK ready",
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "the commit reviewer is available",
+        },
+    });
+    bench
+        .environment
+        .define_command(bootstrap, move |_| MemoryCommandRun {
+            early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+            ..exits(0, &answer.to_string(), "", SLOW_HOOK)
+        });
+    let mut events = bench.agent.subscribe();
+    let started = Instant::now();
+
+    let turn = bench.turn(&mut events, "Hi.").await;
+
+    assert!(started.elapsed() < SLOW_HOOK, "the session did not wait");
+    let [start] = turn.hook_runs.as_slice() else {
+        panic!(
+            "only the start is recorded during the turn: {:?}",
+            turn.hook_runs
+        );
+    };
+    assert_eq!(start.event, HookEvent::SessionStart);
+    assert_eq!(start.background, Some(HookBackgroundPhase::Started));
+    assert_eq!(start.outcome, HookRunOutcome::Success);
+    assert!(
+        !texts(&bench.requests()[0])
+            .join("\n")
+            .contains("commit reviewer"),
+        "the first request did not wait for the hook's answer"
+    );
+
+    let end = hook_end(&bench, bootstrap).await;
+    assert_eq!(end.outcome, HookRunOutcome::Success);
+    assert_eq!(end.reason, None, "its output reads as its JSON answer");
+    assert_eq!(end.system_message.as_deref(), Some("SDK ready"));
+    assert!(!end.output.contains("\"async\""), "{}", end.output);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        bench.requests().len(),
+        1,
+        "an async hook never wakes the Loop"
+    );
+
+    bench.turn(&mut events, "Anything else?").await;
+    let requests = bench.requests();
+    let next = texts(&requests[1]).join("\n");
+    assert!(next.contains("the commit reviewer is available"), "{next}");
+    assert!(next.contains("SDK ready"), "{next}");
+    assert_prefix_kept(&requests[0], &requests[1]);
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hook_that_asked_for_async_decides_nothing_however_soon_it_ends() {
+    for duration in [Duration::ZERO, SLOW_HOOK] {
+        let bench = Bench::start(
+            vec![build_call(), text("done")],
+            vec![background_hook(
+                HookEvent::PreToolUse,
+                Some("Bash"),
+                AUDIT,
+                None,
+            )],
+        )
+        .await;
+        let deny = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "too late to refuse",
+            },
+        });
+        bench
+            .environment
+            .define_command(AUDIT, move |_| MemoryCommandRun {
+                early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+                ..exits(0, &deny.to_string(), "", duration)
+            });
+        let mut events = bench.agent.subscribe();
+
+        let turn = bench.turn(&mut events, "Build it.").await;
+
+        assert_eq!(turn.results, ["built"], "the deny is ignored, {duration:?}");
+        assert_eq!(
+            turn.hook_runs[0].background,
+            Some(HookBackgroundPhase::Started),
+            "{duration:?}"
+        );
+        let end = hook_end(&bench, AUDIT).await;
+        assert_eq!(end.decision, None, "{duration:?}");
+        assert!(
+            end.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ignored")),
+            "{:?}",
+            end.reason
+        );
+        bench.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn esc_leaves_a_hook_that_asked_for_async_running_and_stop_ends_it() {
+    for stops in [false, true] {
+        let bench = Bench::start(
+            vec![build_call(), text("done")],
+            vec![background_hook(
+                HookEvent::PreToolUse,
+                Some("Bash"),
+                AUDIT,
+                None,
+            )],
+        )
+        .await;
+        bench
+            .environment
+            .define_command(AUDIT, |_| MemoryCommandRun {
+                early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+                ..exits(0, "", "", SLOW_HOOK)
+            });
+        let mut events = bench.agent.subscribe();
+        let started = Instant::now();
+
+        let turn = bench.turn(&mut events, "Build it.").await;
+        assert_eq!(turn.results, ["built"]);
+        if stops {
+            bench.agent.stop(bench.chat).await.unwrap();
+        } else {
+            bench.agent.interrupt(bench.chat).await.unwrap();
+        }
+
+        let end = hook_end(&bench, AUDIT).await;
+        if stops {
+            assert_eq!(end.outcome, HookRunOutcome::Cancelled);
+            assert!(started.elapsed() < SLOW_HOOK, "/stop ends it at once");
+        } else {
+            assert_eq!(
+                end.outcome,
+                HookRunOutcome::Success,
+                "Esc leaves it running"
+            );
+            assert!(started.elapsed() >= SLOW_HOOK);
+        }
+        bench.agent.shutdown().await;
+    }
+}
+
+const HOOK_SECRET_SENTINEL: &str = "HOOK_SECRET_SENTINEL";
+
+/// A background plugin hook whose command was given the sensitive [`HOOK_SECRET_SENTINEL`].
+fn secret_background_hook(script: &str, background: Option<HookBackground>) -> ConfiguredHook {
+    ConfiguredHook {
+        source: HookSource::Plugin {
+            id: "guard@market".into(),
+        },
+        command: format!("{script} ${{user_config.token}}"),
+        resolved_command: Some(format!("{script} {HOOK_SECRET_SENTINEL}")),
+        sensitive_values: vec![HOOK_SECRET_SENTINEL.into()],
+        hash: Some("hash".into()),
+        ..background_hook(HookEvent::PostToolUse, Some("Bash"), script, background)
+    }
+}
+
+#[tokio::test]
+async fn a_sensitive_plugin_value_a_background_hook_prints_never_reaches_the_model_or_records() {
+    let bench = Bench::start(
+        vec![build_call(), text("done"), text("I will rotate it.")],
+        vec![
+            secret_background_hook(AUDIT, Some(HookBackground::Async)),
+            secret_background_hook(REVIEW, rewake(None, None)),
+        ],
+    )
+    .await;
+    bench
+        .environment
+        .define_command(&format!("{AUDIT} {HOOK_SECRET_SENTINEL}"), |_| {
+            let answer = json!({
+                "systemMessage": format!("audit saw {HOOK_SECRET_SENTINEL}"),
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": format!("audit context {HOOK_SECRET_SENTINEL}"),
+                },
+            });
+            exits(0, &answer.to_string(), "", Duration::ZERO)
+        });
+    bench
+        .environment
+        .define_command(&format!("{REVIEW} {HOOK_SECRET_SENTINEL}"), |_| {
+            exits(
+                2,
+                "",
+                &format!("review found {HOOK_SECRET_SENTINEL}\n"),
+                SLOW_HOOK,
+            )
+        });
+    let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
+
+    let first = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+    follow_turn(&mut events, first.run_id).await;
+    tokio::time::timeout(HOOK_END_WAIT, woken_turn(&mut events, first.run_id))
+        .await
+        .expect("exit status 2 wakes the idle Loop");
+
+    let requests = format!("{:?}", bench.requests());
+    assert!(requests.contains("audit context [redacted]"), "{requests}");
+    assert!(requests.contains("review found [redacted]"), "{requests}");
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    assert_eq!(
+        history
+            .hook_runs
+            .iter()
+            .filter(|run| run.background == Some(HookBackgroundPhase::Ended))
+            .count(),
+        2
+    );
+    let snapshot = format!("{:?}", bench.agent.snapshot(bench.chat).await.unwrap());
+    let shown = format!("{:?}", shown_live(&mut live).await);
+    for (what, text) in [
+        ("model requests", requests),
+        ("activity history", format!("{history:?}")),
+        ("snapshot", snapshot),
+        ("notifications", shown),
+    ] {
+        assert!(!text.contains(HOOK_SECRET_SENTINEL), "{what}: {text}");
+    }
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_background_session_end_hook_keeps_a_sensitive_value_out_of_its_records() {
+    let tidy = ConfiguredHook {
+        event: HookEvent::SessionEnd,
+        matcher: None,
+        ..secret_background_hook("tidy.sh", Some(HookBackground::Async))
+    };
+    let bench = Bench::start(vec![text("done")], vec![tidy]).await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    bench
+        .environment
+        .define_command(&format!("tidy.sh {HOOK_SECRET_SENTINEL}"), move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let answer = json!({"systemMessage": format!("tidied {HOOK_SECRET_SENTINEL}")});
+            exits(0, &answer.to_string(), "", Duration::ZERO)
+        });
+    let mut events = bench.agent.subscribe();
+    bench.turn(&mut events, "Hello.").await;
+
+    bench.agent.shutdown().await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the Worker dispatches it");
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    let end = history
+        .hook_runs
+        .iter()
+        .find(|run| run.background == Some(HookBackgroundPhase::Ended))
+        .expect("its end is recorded");
+    assert_eq!(end.system_message.as_deref(), Some("tidied [redacted]"));
+    let recorded = format!("{history:?}");
+    assert!(!recorded.contains(HOOK_SECRET_SENTINEL), "{recorded}");
 }
