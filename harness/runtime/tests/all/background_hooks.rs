@@ -867,3 +867,37 @@ async fn a_sensitive_plugin_value_a_background_hook_prints_never_reaches_the_mod
     }
     bench.agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_background_session_end_hook_keeps_a_sensitive_value_out_of_its_records() {
+    let tidy = ConfiguredHook {
+        event: HookEvent::SessionEnd,
+        matcher: None,
+        ..secret_background_hook("tidy.sh", Some(HookBackground::Async))
+    };
+    let bench = Bench::start(vec![text("done")], vec![tidy]).await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    bench
+        .environment
+        .define_command(&format!("tidy.sh {HOOK_SECRET_SENTINEL}"), move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let answer = json!({"systemMessage": format!("tidied {HOOK_SECRET_SENTINEL}")});
+            exits(0, &answer.to_string(), "", Duration::ZERO)
+        });
+    let mut events = bench.agent.subscribe();
+    bench.turn(&mut events, "Hello.").await;
+
+    bench.agent.shutdown().await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the Worker dispatches it");
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    let end = history
+        .hook_runs
+        .iter()
+        .find(|run| run.background == Some(HookBackgroundPhase::Ended))
+        .expect("its end is recorded");
+    assert_eq!(end.system_message.as_deref(), Some("tidied [redacted]"));
+    let recorded = format!("{history:?}");
+    assert!(!recorded.contains(HOOK_SECRET_SENTINEL), "{recorded}");
+}
