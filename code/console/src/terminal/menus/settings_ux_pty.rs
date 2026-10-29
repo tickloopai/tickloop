@@ -974,11 +974,17 @@ fn sandbox_pty_config_shows_effective_rules_sources_and_scrolls_without_writing(
     fixture.send(b"/sandbox\r");
     fixture.wait(|frame| frame.contains("[Mode]"));
     fixture.send(b"\x1b[D");
-    fixture.wait(|frame| {
+    let config = fixture.wait(|frame| {
         frame.contains("[Config]")
             && frame.contains("docker:* [global]")
             && frame.contains("cache [global]")
     });
+    assert!(
+        config.contains("ctrl+n/p scroll") && !config.contains("j/k"),
+        "{config}"
+    );
+    fixture.send(b"\x0e");
+    fixture.wait(|frame| frame.contains("[Config]") && frame != config);
     fixture.send(b"\x1b[F");
     fixture.wait(|frame| {
         frame.contains("*.github.com [this Folder]")

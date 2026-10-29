@@ -11065,10 +11065,10 @@ impl State {
         let action = match (key.code, key.modifiers) {
             (KeyCode::Left, _) => Some(DiffDialogAction::Left),
             (KeyCode::Right, _) => Some(DiffDialogAction::Right),
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Some(DiffDialogAction::Up),
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                Some(DiffDialogAction::Down)
-            }
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(DiffDialogAction::Up),
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(DiffDialogAction::Down),
             (KeyCode::PageUp, _) => Some(DiffDialogAction::PageUp),
             (KeyCode::PageDown, _) => Some(DiffDialogAction::PageDown),
             (KeyCode::Home, _) => Some(DiffDialogAction::Home),
@@ -13329,20 +13329,9 @@ impl State {
             return Some(InputEvent::Cancel { menu_id });
         }
         if self.review_focused {
-            let action = match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
-                    Some(DiffNavigationAction::Up)
-                }
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                    Some(DiffNavigationAction::Down)
-                }
-                (KeyCode::PageUp, _) => Some(DiffNavigationAction::PageUp),
-                (KeyCode::PageDown, _) => Some(DiffNavigationAction::PageDown),
-                (KeyCode::Home, _) => Some(DiffNavigationAction::Home),
-                (KeyCode::End, _) => Some(DiffNavigationAction::End),
-                _ => None,
-            };
-            if let Some(action) = action.filter(|_| self.menu_is_visible()) {
+            if let Some(action) =
+                Self::review_navigation_key(key).filter(|_| self.menu_is_visible())
+            {
                 self.navigate_menu_review(action);
                 return None;
             }
@@ -16732,10 +16721,19 @@ mod tests {
         let before = state.menu_review.as_ref().unwrap().navigation.clone();
 
         assert!(state.key(key(KeyCode::Char('j'))).is_none());
+        let scrolled = state.menu_review.as_ref().unwrap().navigation.clone();
+        assert_ne!(scrolled, before, "j should scroll the focused diff");
+        assert!(state.key(control(KeyCode::Char('n'))).is_none());
         assert_ne!(
             state.menu_review.as_ref().unwrap().navigation,
-            before,
-            "j should scroll the focused diff"
+            scrolled,
+            "ctrl+n should scroll the focused diff too"
+        );
+        assert!(state.key(control(KeyCode::Char('p'))).is_none());
+        assert_eq!(
+            state.menu_review.as_ref().unwrap().navigation,
+            scrolled,
+            "ctrl+p should scroll the focused diff back"
         );
         assert!(state.key(key(KeyCode::Enter)).is_none());
         assert!(state.key(key(KeyCode::Char('y'))).is_none());
@@ -16826,6 +16824,33 @@ mod tests {
         assert!(state.key(key(KeyCode::Char('y'))).is_none());
         assert!(state.menu.is_some());
         assert!(state.frame().0.iter().any(|line| line.contains("Resize")));
+    }
+
+    #[test]
+    fn diff_screen_moves_with_ctrl_n_p_exactly_as_with_j_k() {
+        let opened = |keys: &[KeyEvent]| {
+            let mut state = State::new(true, 60, 12);
+            state.prompt_enabled = true;
+            state.diff_screen = Some(DiffScreen {
+                chat_id: Uuid::new_v4(),
+                catalog: diff_catalog(80),
+                dialog: DiffDialog::new(),
+            });
+            state.key(key(KeyCode::Enter));
+            for pressed in keys {
+                state.key(*pressed);
+            }
+            state.draw(&mut Vec::new()).unwrap();
+            state.rendered_screen.clone()
+        };
+        let start = opened(&[]);
+        let by_letter = opened(&[key(KeyCode::Char('j'))]);
+        assert_ne!(by_letter, start, "j scrolls the opened file");
+        assert_eq!(opened(&[control(KeyCode::Char('n'))]), by_letter);
+        assert_eq!(
+            opened(&[control(KeyCode::Char('n')), control(KeyCode::Char('p'))]),
+            opened(&[key(KeyCode::Char('j')), key(KeyCode::Char('k'))])
+        );
     }
 
     #[test]
