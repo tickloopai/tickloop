@@ -368,6 +368,9 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     command.env("HOME", &home);
     command.env("TICKLOOP_TMPDIR", &scratch);
     command.env("TICKLOOP_AGENT_TUI", "inline");
+    for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+        command.env_remove(name);
+    }
     command.arg("--no-session-persistence");
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);

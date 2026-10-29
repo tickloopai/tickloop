@@ -80,6 +80,7 @@ impl RetainedState {
             Line::LastPrompt(entry) => self.metadata.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.metadata.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.metadata.delegation = Some(entry.clone()),
+            Line::AcpSession(entry) => self.metadata.acp_session = Some(entry.clone()),
             Line::FileHistorySnapshot(entry) => {
                 self.file_history_snapshots
                     .insert(entry.message_id, entry.clone());
@@ -96,7 +97,8 @@ impl RetainedState {
                 }
             }
             // Goal events only feed the conversation's display.
-            Line::GoalEvent(_)
+            Line::RecordedEdit(_)
+            | Line::GoalEvent(_)
             | Line::User(_)
             | Line::Assistant(_)
             | Line::System(_)
@@ -143,7 +145,15 @@ pub(crate) fn load_original_user_inputs(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        if text.is_empty() {
+        // Attachments carry material, not textual authority; preserve an empty original input.
+        if text.is_empty()
+            && !entry.contexts.as_ref().is_some_and(|contexts| {
+                serde_json::from_value::<Vec<tickloop_harness_protocol::InputContext>>(
+                    contexts.clone(),
+                )
+                .is_ok_and(|contexts| !contexts.is_empty())
+            })
+        {
             return None;
         }
         originals.push(OriginalUserInput {
@@ -277,10 +287,11 @@ pub(crate) fn assemble(
             }),
     };
     let Some(leaf) = leaf else {
-        let has_chat_without_messages = metadata
-            .artifact_ticks
-            .as_ref()
-            .is_some_and(|entry| entry.cwd.is_some())
+        let has_chat_without_messages = metadata.acp_session.is_some()
+            || metadata
+                .artifact_ticks
+                .as_ref()
+                .is_some_and(|entry| entry.cwd.is_some())
             || metadata
                 .monitor_members
                 .as_ref()

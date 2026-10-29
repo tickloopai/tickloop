@@ -2163,6 +2163,24 @@ impl Agent {
                         chat.snapshot.operations.push(operation.clone());
                         self.save(&chat.snapshot);
                     }
+                    // Only a managed host's history replay reads recorded edits.
+                    if operation.file_change.is_some()
+                        && self.inner.tool_policy.is_managed()
+                        && let Some(recorder) = &self.inner.recorder
+                        && let Ok(Some(review)) = self
+                            .operation_review(receipt.chat_id, receipt.run_id, &id)
+                            .await
+                    {
+                        recorder.record_edit(
+                            receipt.chat_id,
+                            tickloop_harness_transcript::RecordedEditEntry {
+                                operation_id: operation.id,
+                                run_id: receipt.run_id.into(),
+                                call_id: id.clone(),
+                                review,
+                            },
+                        );
+                    }
                     let (
                         mut decision,
                         explicit_ask,

@@ -1395,7 +1395,9 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// Transcript entry types listed in the spec section "Representation of session content".
-const SPECIFIED_LINE_TYPES: [&str; 18] = [
+const SPECIFIED_LINE_TYPES: [&str; 20] = [
+    "acp-session",
+    "recorded-edit",
     "user",
     "assistant",
     "system",

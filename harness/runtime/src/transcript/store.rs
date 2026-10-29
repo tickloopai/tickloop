@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tickloop_harness_protocol::ChatId;
+use tickloop_harness_transcript::display::{DisplayNode, DisplayProjector};
 use tickloop_harness_transcript::{ChainEntry, Line};
 use uuid::Uuid;
 
@@ -102,6 +103,68 @@ impl StoredTranscript {
             _ => None,
         }
     }
+
+    /// The public display ancestry of a selected branch, including history before compaction.
+    /// Callers load `LoadRange::Full` once and keep this immutable snapshot for every page.
+    /// System messages and other internal records never become history items.
+    pub fn display_history(&self, leaf: Option<Uuid>) -> Option<DisplayHistorySnapshot> {
+        let chain = self.chain_to(leaf)?;
+        let mut projector = DisplayProjector::new();
+        for line in self.retained.iter().chain(&self.lines) {
+            projector.apply(line);
+        }
+        let mut cursor = chain
+            .iter()
+            .rev()
+            .find_map(|entry| projector.canonical_id(entry.uuid));
+        let mut visited = std::collections::HashSet::new();
+        let mut nodes = Vec::new();
+        while let Some(id) = cursor {
+            if !visited.insert(id) {
+                return None;
+            }
+            let node = projector.node(id)?;
+            nodes.push(node.clone());
+            cursor = node.parent;
+        }
+        nodes.reverse();
+        Some(DisplayHistorySnapshot {
+            position: self.position,
+            nodes,
+        })
+    }
+}
+
+/// A fixed public history read. Later appends cannot alter its items or page boundaries.
+#[derive(Clone, Debug)]
+pub struct DisplayHistorySnapshot {
+    pub position: StorePosition,
+    pub nodes: Vec<DisplayNode>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DisplayHistoryPage {
+    pub position: StorePosition,
+    pub items: Vec<DisplayNode>,
+    pub next_offset: Option<usize>,
+}
+
+impl DisplayHistorySnapshot {
+    pub const MAX_PAGE_SIZE: usize = 100;
+
+    pub fn page(&self, offset: usize, limit: usize) -> Result<DisplayHistoryPage, TranscriptError> {
+        if limit == 0 || limit > Self::MAX_PAGE_SIZE || offset > self.nodes.len() {
+            return Err(TranscriptError::Storage(
+                "invalid display history page bounds".into(),
+            ));
+        }
+        let end = offset.saturating_add(limit).min(self.nodes.len());
+        Ok(DisplayHistoryPage {
+            position: self.position,
+            items: self.nodes[offset..end].to_vec(),
+            next_offset: (end < self.nodes.len()).then_some(end),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -138,4 +201,81 @@ pub enum TranscriptError {
     /// Possibly temporary; the same batch may be retried.
     #[error("{0}")]
     Storage(String),
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(id: Uuid, parent: Option<Uuid>, kind: &str, text: &str) -> Line {
+        let mut value = json!({
+            "type": kind, "uuid": id, "parentUuid": parent,
+            "chatId": Uuid::nil(), "timestamp": "2026-01-01T00:00:00.000Z",
+            "version": "test", "humanFamilyOrigin": null,
+            "message": {"role": kind, "content": [{"type": "text", "text": text}]}
+        });
+        if kind == "user" {
+            value["executionMode"] = json!("auto");
+        } else if kind == "assistant" {
+            value["responseId"] = json!(id);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn full_display_history_follows_selected_branch_across_compaction_without_system_notes() {
+        let [prompt, answer, sibling, boundary, summary, next] =
+            std::array::from_fn(|_| tickloop_ids::generate());
+        let mut compact = entry(boundary, None, "system", "INTERNAL COMPACTION");
+        if let Line::System(entry) = &mut compact {
+            entry.subtype = Some(tickloop_harness_transcript::COMPACT_BOUNDARY_SUBTYPE.into());
+            entry.logical_parent_uuid = Some(answer);
+        }
+        let mut compact_summary = entry(summary, Some(boundary), "user", "INTERNAL SUMMARY");
+        if let Line::User(entry) = &mut compact_summary {
+            entry.is_compact_summary = true;
+        }
+        let mut stored = StoredTranscript {
+            position: StorePosition(7),
+            lines: vec![
+                entry(prompt, None, "user", "first"),
+                entry(answer, Some(prompt), "assistant", "answer"),
+                entry(sibling, Some(prompt), "assistant", "other branch"),
+                compact,
+                compact_summary,
+                entry(next, Some(summary), "user", "next"),
+            ],
+            ..Default::default()
+        };
+        let snapshot = stored.display_history(Some(next)).unwrap();
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![prompt, answer, next]
+        );
+        assert_eq!(
+            stored.display_history(Some(sibling)).unwrap().nodes.len(),
+            2
+        );
+        assert!(snapshot.page(0, 0).is_err());
+        assert!(snapshot.page(0, 101).is_err());
+        assert!(snapshot.page(4, 1).is_err());
+        let first = snapshot.page(0, 2).unwrap();
+        assert_eq!(first.position, StorePosition(7));
+        assert_eq!(first.next_offset, Some(2));
+        stored.lines.push(entry(
+            tickloop_ids::generate(),
+            Some(next),
+            "user",
+            "later append",
+        ));
+        let last = snapshot.page(2, 2).unwrap();
+        assert_eq!(last.items.len(), 1);
+        assert_eq!(last.items[0].id, next);
+        assert_eq!(last.next_offset, None);
+    }
 }

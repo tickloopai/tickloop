@@ -266,6 +266,7 @@ impl Agent {
                 family_stopping: false,
                 task_checkpoint_pending: false,
                 family_finishing: HashSet::new(),
+                unsettled_runs: HashSet::new(),
                 snapshot: snapshot.clone(),
                 bookkeeping,
                 start_new_tool_result_message: false,

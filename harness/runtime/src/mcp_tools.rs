@@ -902,7 +902,9 @@ impl McpHostToolProvider {
         if names.len() != ARTIFACT_TOOL_NAMES.len() {
             return Err("MCP tool directory lacks an Artifact tool".into());
         }
-        let serialized = serde_json::to_vec(&accepted)
+        // The service's schemas keep their key order, which must not change the fingerprint.
+        let serialized = serde_json::to_value(&accepted)
+            .and_then(|accepted| tickloop_harness_base::canonical_json_bytes(&accepted))
             .map_err(|_| "MCP tool directory cannot be fingerprinted")?;
         Ok(Directory {
             credential_key: self.credential_key(credential),

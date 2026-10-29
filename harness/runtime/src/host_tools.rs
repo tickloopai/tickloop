@@ -449,6 +449,29 @@ pub trait HostToolProvider: Send + Sync {
         std::collections::BTreeMap::new()
     }
 
+    /// Host-initiated session starts; preparation alone must never spawn a process.
+    fn session_bootstrap(&self) -> Result<Vec<PreparedHostCall>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Whether `call`, from this provider's `session_bootstrap`, starts one of its servers.
+    fn owns_session_start(&self, _call: &PreparedHostCall) -> bool {
+        false
+    }
+
+    async fn start_session_server(
+        &self,
+        _call: PreparedHostCall,
+        _cancel: CancellationToken,
+    ) -> Result<(), String> {
+        Err("session MCP startup is unavailable".into())
+    }
+
+    /// Ends session-owned processes, unlike per-prompt settlement.
+    async fn close_session(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Private process-transfer state. `None` defers replacement while the provider owns an
     /// interaction that cannot move, such as a pending device sign-in.
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {

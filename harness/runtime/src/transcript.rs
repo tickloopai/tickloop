@@ -18,8 +18,8 @@ pub(crate) use jsonl::load_file;
 pub use listing::TranscriptSummary;
 pub use retained::retained_before;
 pub use store::{
-    AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
-    TranscriptError, TranscriptStore,
+    AppendAck, AppendBatch, BatchId, ChatPlacement, DisplayHistoryPage, DisplayHistorySnapshot,
+    LoadRange, StorePosition, StoredTranscript, TranscriptError, TranscriptStore,
 };
 
 pub(crate) use outbox::{CachedMetadata, FLUSH_INTERVAL, Settled, TranscriptOutbox};

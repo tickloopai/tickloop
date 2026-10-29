@@ -1,7 +1,7 @@
 [
   {
     "Hello": {
-      "major": 36,
+      "major": 37,
       "minor": 0
     }
   },
@@ -96,6 +96,7 @@
         "command": {
           "kind": "create",
           "launch": {
+            "profile": "local",
             "folder": "/work/project",
             "config_root": "/home/user/.tickloop",
             "model": {

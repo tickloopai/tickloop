@@ -14,6 +14,20 @@ fn main() {
         default_to_development_config_root();
     }
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().is_some_and(|argument| {
+        argument == tickloop_code_daemon::mcp_supervisor::SUPERVISOR_ARGUMENT
+    }) {
+        // Private process plumbing must not enter Console setup, updater logic, or View recovery.
+        let result = if arguments.len() == 1 {
+            tickloop_code_daemon::mcp_supervisor::run()
+        } else {
+            Err("invalid MCP supervisor invocation".into())
+        };
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     let build = tickloop_code_updater::Build {
         version: env!("CARGO_PKG_VERSION").into(),
         identity: env!("TICKLOOP_BUILD_IDENTITY").into(),
@@ -52,6 +66,10 @@ fn main() {
     }
     if arguments.len() == 1 {
         match arguments[0].to_str() {
+            Some("--help" | "-h") => {
+                tickloop_code_console::terminal::print_help();
+                return;
+            }
             Some("--version" | "-V") => {
                 println!("tickloop {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -77,15 +95,16 @@ fn main() {
             _ => {}
         }
     }
-    let is_console = !arguments.first().is_some_and(|arg| {
-        matches!(
-            arg.to_str(),
-            Some("update" | "daemon" | "worker" | "tick" | "plugin" | "mcp")
-        )
-    }) && !arguments
-        .iter()
-        .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")));
-    if is_console {
+    let entry = tickloop_code::client_entry(&arguments);
+    let is_managed = matches!(
+        entry,
+        tickloop_code::ClientEntry::Print | tickloop_code::ClientEntry::Acp
+    );
+    let is_console = entry == tickloop_code::ClientEntry::Console
+        && !arguments
+            .iter()
+            .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")));
+    if is_console || is_managed {
         match tickloop_code_updater::prepare_launch(&build) {
             Ok(Some(executable)) => {
                 use std::os::unix::process::CommandExt;
@@ -107,7 +126,9 @@ fn main() {
         }
     }
     tickloop_code::name_this_build();
-    if let Err(error) = tickloop_code_console::terminal::prepare_view_handoff(&arguments) {
+    if !is_managed
+        && let Err(error) = tickloop_code_console::terminal::prepare_view_handoff(&arguments)
+    {
         fail_startup(
             &arguments,
             &format!("Cannot prepare View restoration: {error}"),
@@ -132,7 +153,12 @@ fn main() {
                 &format!("Cannot start the Agent terminal runtime: {error}"),
             )
         });
+    let mut exit_code = 0;
     let result = runtime.block_on(async {
+        if let Some(code) = tickloop_code::run_noninteractive(entry, &arguments).await {
+            exit_code = code;
+            return Ok(());
+        }
         if arguments.first().is_some_and(|arg| arg == "update") {
             let result = tickloop_code_updater::command(&arguments[1..], build)
                 .await
@@ -178,13 +204,15 @@ fn main() {
         }
     });
     if let Err(error) = result {
-        if let Err(recovery_error) =
-            tickloop_code_console::terminal::recover_view_handoff(&arguments)
+        if !is_managed
+            && let Err(recovery_error) =
+                tickloop_code_console::terminal::recover_view_handoff(&arguments)
         {
             eprintln!("View recovery unavailable: {recovery_error}");
         }
         let stderr = io::stderr();
-        let use_color = stderr.is_terminal()
+        let use_color = !is_managed
+            && stderr.is_terminal()
             && std::env::var_os("NO_COLOR").is_none()
             && std::env::var("TERM").is_ok_and(|term| term != "dumb");
         let error = tickloop_code_console::terminal::safe_text(&error);
@@ -199,6 +227,9 @@ fn main() {
             let _ = writeln!(output, "{body}");
         }
         std::process::exit(1);
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 
@@ -215,7 +246,11 @@ fn default_to_development_config_root() {
 }
 
 fn fail_startup(arguments: &[std::ffi::OsString], message: &str) -> ! {
-    if let Err(error) = tickloop_code_console::terminal::recover_view_handoff(arguments) {
+    if !matches!(
+        tickloop_code::client_entry(arguments),
+        tickloop_code::ClientEntry::Print | tickloop_code::ClientEntry::Acp
+    ) && let Err(error) = tickloop_code_console::terminal::recover_view_handoff(arguments)
+    {
         eprintln!("View recovery unavailable: {error}");
     }
     eprintln!(
