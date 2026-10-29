@@ -232,13 +232,13 @@ tickloop plugin install --path ./my-plugin
 
 本地路径安装的插件只能重新运行 `install --path` 更新，同版本也会重装；`update` 和面板不更新它们。`validate` 报告清单、组件和路径警告；安装还会检查文件树。安装失败保留原安装。插件标为不可用时，从原来源重装；看不出种类的不可用插件同时列在 `/ticks` 和 `/plugins` 中。
 
-`/plugins` 的用法与 `/ticks` 相同：已安装和可安装两页，`Enter` 打开操作（启用/禁用、更新）或安装，`/` 过滤，同一行按两次 `x` 卸载。已安装行还显示暂不支持的组件。取不到的 marketplace 各自显示最多三行的错误摘要，其他来源和已安装页仍可用。
+`/plugins` 的用法与 `/ticks` 相同：已安装和可安装两页，`Enter` 打开操作（启用/禁用、更新）或安装，`/` 过滤，同一行按两次 `x` 卸载。已安装行还显示暂不支持的组件，以及插件有几个 Hook 待确认。取不到的 marketplace 各自显示最多三行的错误摘要，其他来源和已安装页仍可用。
 
 `/plugins` 的第三页 **Marketplaces** 完成 `tickloop plugin marketplace` 能做的事。每行显示名字、来源、上次更新时间和是否内置；读取失败的 marketplace 在该行下显示错误。按 `a` 打开单行输入，接受与 `marketplace add` 相同的来源；`Enter` 添加，`Ctrl+G` 打开外部编辑器，`Esc` 取消。在某行按 `Enter` 重新读取该 marketplace，与 `marketplace update NAME` 相同。在同一行 3 秒内按两次 `x` 删除，已安装的插件保留；`tickloop` 行不显示 `x remove`，按 `x` 无操作也无提示；默认的 `claude-plugins-official` 可以删除，结果提示说明如何加回。添加、刷新和删除在后台进行，可安装页随之更新。`/ticks` 没有这一页，提示改到 `/plugins` 管理。
 
 输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目以及已启用插件和 Tick 的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
 
-已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装放置文件；已启用的 MCP 服务随 Agent 启动，或从下一次请求起运行。插件 Skill 和 MCP 工具的调用照常审批。本版本支持 Skill、Tick 程序、MCP 服务和插件用户配置，其余组件列为暂不支持；npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
+已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装放置文件；已启用的 MCP 服务随 Agent 启动，或从下一次请求起运行。插件 Skill 和 MCP 工具的调用照常审批。本版本支持 Skill、Tick 程序、MCP 服务和插件用户配置；Hook 在安装和 `tickloop plugin list` 中显示几个待确认，并警告 Tickloop 跳过的事件、类型与字段；其余组件列为暂不支持。卸载插件时一并清除其 Hook 的信任记录。npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
 
 ### MCP 服务
 

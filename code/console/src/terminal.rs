@@ -106,6 +106,7 @@ mod thinking_preview;
 pub mod tick_actions;
 mod tick_labels;
 mod ticks_panel;
+pub use ticks_panel::hooks_to_confirm_summary;
 mod ticks_work;
 mod transcript;
 mod update_notice;

@@ -10,6 +10,8 @@ mod support;
 mod tick_package_logins;
 #[path = "all/tick_package_opens.rs"]
 mod tick_package_opens;
+#[path = "all/tickhost_orphans.rs"]
+mod tickhost_orphans;
 #[path = "all/tickhost_shells.rs"]
 mod tickhost_shells;
 #[path = "all/tickhost_versions.rs"]

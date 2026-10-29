@@ -7,6 +7,7 @@
 
 mod catalog;
 mod git;
+mod hooks;
 mod http;
 mod manifest;
 mod marketplace;
@@ -20,6 +21,7 @@ use std::{ffi::OsStr, io, path::PathBuf};
 
 pub use catalog::{MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource};
 pub use git::{GitCheckout, GitClient};
+pub use hooks::{COMMAND_HOOK_TYPE, HOOK_EVENTS, HookSupport, UNSUPPORTED_COMMAND_FIELDS};
 pub use manifest::{
     CLAUDE_MANIFEST, Component, ManifestFormat, PluginHooks, PluginManifest, TICKLOOP_MANIFEST,
     TickProgram, UserConfigField, UserConfigType, skill_directories, validate_plugin_name,
