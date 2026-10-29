@@ -4,19 +4,19 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tickloop_harness_model::ModelRequest;
+use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
 use tickloop_harness_protocol::hooks::{
     ConfiguredHook, HookEvent, HookList, HookRunOutcome, HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
     AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalStatus, Message,
-    Receipt, Role,
+    Receipt, Role, RunId,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
 use tickloop_harness_runtime::transcript::{JsonlTranscriptStore, TranscriptStore};
@@ -24,6 +24,8 @@ use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
 use tickloop_harness_test_support::harness::ChosenModels;
 use tickloop_harness_test_support::routed::RoutedModel;
 use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
+use tokio::sync::{Notify, broadcast};
+use tokio_util::sync::CancellationToken;
 
 /// Requests start with the system prompt and the user context.
 const FIRST_CONVERSATION_MESSAGE: usize = 2;
@@ -66,6 +68,46 @@ fn context_answer(event: HookEvent, context: &str) -> MemoryCommandRun {
     }))
 }
 
+/// The Bench's model, which keeps the request it is told to hold until the test releases it.
+struct GatedModel {
+    inner: Arc<dyn ModelClient>,
+    holds_next: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl ModelClient for GatedModel {
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        deltas: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        self.inner.generate_title(request, deltas, cancel).await
+    }
+
+    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+        self.inner.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        deltas: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        if self.holds_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = self.release.notified() => {}
+            }
+        }
+        self.inner.complete(request, deltas, cancel).await
+    }
+}
+
 /// One Agent with a Folder, the reference environment and hooks from the Settings Store.
 struct Bench {
     agent: Agent,
@@ -74,6 +116,7 @@ struct Bench {
     settings: Arc<MemorySettingsStore>,
     model: Arc<ScriptedModel>,
     routed: Option<Arc<RoutedModel>>,
+    gate: Arc<GatedModel>,
     hook_inputs: Arc<Mutex<Vec<(String, Value)>>>,
     directory: tempfile::TempDir,
 }
@@ -101,12 +144,20 @@ impl Bench {
             ..Default::default()
         });
         let model = Arc::new(ScriptedModel::new(replies));
+        let gate = Arc::new(GatedModel {
+            inner: match &routed {
+                Some(routed) => routed.clone(),
+                None => model.clone(),
+            },
+            holds_next: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
         let agent = build_agent(
             &directory,
             &environment,
             &settings,
-            &model,
-            routed.clone(),
+            gate.clone(),
             keeps_transcripts,
         );
         let chat = agent.create_chat(folder).await.unwrap();
@@ -121,6 +172,7 @@ impl Bench {
             settings,
             model,
             routed,
+            gate,
             hook_inputs: Arc::default(),
             directory,
         }
@@ -163,14 +215,43 @@ impl Bench {
         let receipt = self.agent.submit(self.chat, prompt.into()).await.unwrap();
         observe(&mut events, &receipt).await
     }
+
+    /// Runs `prompt`, queueing `queued` to its turn while its first model request is in flight.
+    async fn run_queueing(&self, prompt: &str, queued: &[&str]) -> QueuedRun {
+        let mut events = self.agent.subscribe();
+        self.gate.holds_next.store(true, Ordering::SeqCst);
+        let receipt = self.agent.submit(self.chat, prompt.into()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.gate.entered.notified())
+            .await
+            .expect("the first model request starts");
+        let mut receipts = Vec::new();
+        for input in queued {
+            receipts.push(self.agent.submit(self.chat, (*input).into()).await.unwrap());
+        }
+        self.gate.release.notify_one();
+        let observed = observe(&mut events, &receipt).await;
+        QueuedRun {
+            receipt,
+            observed,
+            queued: receipts,
+            events,
+        }
+    }
+}
+
+/// A run with input queued to it while it went on.
+struct QueuedRun {
+    receipt: Receipt,
+    observed: Observed,
+    queued: Vec<Receipt>,
+    events: broadcast::Receiver<tickloop_harness_protocol::Event>,
 }
 
 fn build_agent(
     directory: &tempfile::TempDir,
     environment: &Arc<MemoryEnvironment>,
     settings: &Arc<MemorySettingsStore>,
-    model: &Arc<ScriptedModel>,
-    routed: Option<Arc<RoutedModel>>,
+    model: Arc<dyn ModelClient>,
     keeps_transcripts: bool,
 ) -> Agent {
     Agent::with_seams(
@@ -181,10 +262,7 @@ fn build_agent(
                     as Arc<dyn TranscriptStore>
             }),
             environment: Some(environment.clone()),
-            models: match routed {
-                Some(routed) => ChosenModels::new(routed),
-                None => ChosenModels::new(model.clone()),
-            },
+            models: ChosenModels::new(model),
         },
         HarnessOptions {
             settings: Some(settings.clone()),
@@ -198,6 +276,10 @@ fn build_agent(
 #[derive(Default)]
 struct Observed {
     hook_runs: Vec<HookRunRecord>,
+    /// Each queued input that joined a run, with the run it joined.
+    merged: Vec<(RunId, RunId)>,
+    /// How often views were told to redraw the conversation.
+    rewinds: usize,
     interrupted: bool,
     failed: Option<String>,
 }
@@ -214,6 +296,10 @@ async fn observe(
         }
         match event.kind {
             EventKind::HookRan { record } => observed.hook_runs.push(*record),
+            EventKind::InputMerged { into_run_id } => {
+                observed.merged.push((event.run_id, into_run_id));
+            }
+            EventKind::ConversationRewound { .. } => observed.rewinds += 1,
             EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
             EventKind::Interrupted if event.run_id == receipt.run_id => {
                 observed.interrupted = true;
@@ -398,8 +484,7 @@ async fn a_blocked_prompt_never_enters_the_conversation_and_the_user_sees_why() 
         &bench.directory,
         &bench.environment,
         &bench.settings,
-        &model,
-        None,
+        model,
         true,
     );
     let texts = conversation_texts(&reloaded.resume_chat(bench.chat).await.unwrap().messages);
@@ -728,6 +813,281 @@ async fn a_ralph_loop_stop_hook_keeps_going_until_esc_or_stop_ends_it() {
     }
 }
 
+/// ralph-loop's Stop hook, which lets the turn end once it has gone on.
+fn ralph_until_active(input: &Value) -> MemoryCommandRun {
+    if input["stop_hook_active"] == json!(true) {
+        exits(0, "", "")
+    } else {
+        answer(json!({"decision": "block", "reason": RALPH_PROMPT}))
+    }
+}
+
+fn texts_of(request: &ModelRequest) -> Vec<String> {
+    conversation_texts(&request.messages)
+}
+
+#[tokio::test]
+async fn a_stop_block_takes_in_input_queued_meanwhile_after_its_feedback() {
+    const QUEUED: &str = "Also update the changelog.";
+    let bench = Bench::start(
+        vec![
+            text("Improved the README."),
+            text("Updated the changelog too."),
+        ],
+        vec![
+            user_hook(HookEvent::Stop, None, "ralph.sh"),
+            user_hook(HookEvent::UserPromptSubmit, None, "context.sh"),
+        ],
+    )
+    .await;
+    bench.define("ralph.sh", ralph_until_active);
+    bench.define("context.sh", |input| {
+        context_answer(
+            HookEvent::UserPromptSubmit,
+            &format!("checked {}", input["prompt"].as_str().unwrap()),
+        )
+    });
+    let run = bench.run_queueing(RALPH_PROMPT, &[QUEUED]).await;
+    assert!(run.observed.failed.is_none() && !run.observed.interrupted);
+    assert_eq!(
+        run.observed.merged,
+        [(run.queued[0].run_id, run.receipt.run_id)],
+        "the queued input joins the turn the Stop hook keeps going"
+    );
+    let prompts = bench
+        .inputs_of("context.sh")
+        .iter()
+        .map(|input| input["prompt"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, [json!(RALPH_PROMPT), json!(QUEUED)]);
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2, "no turn of its own");
+    let trailing = trailing_texts(&requests[1]);
+    let feedback = trailing
+        .iter()
+        .position(|text| text.contains(&format!("Stop hook feedback:\n{RALPH_PROMPT}")))
+        .expect("the Stop hook's reason goes on first");
+    let queued = trailing
+        .iter()
+        .position(|text| text == QUEUED)
+        .expect("the model reads the queued input in the continuation");
+    assert!(feedback < queued, "{trailing:?}");
+    assert!(
+        trailing[queued + 1].contains(&format!(
+            "UserPromptSubmit hook additional context: checked {QUEUED}"
+        )),
+        "its hooks' context follows it: {trailing:?}"
+    );
+    assert!(
+        bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .is_empty()
+    );
+    assert_prefix_stable(&bench).await;
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_queued_prompt_a_hook_blocks_is_taken_back_and_the_next_one_joins() {
+    const LEAKED: &str = "My password is hunter2.";
+    const QUEUED: &str = "Also update the changelog.";
+    let bench = Bench::start_with(
+        vec![
+            text("Improved the README."),
+            text("Updated the changelog too."),
+        ],
+        None,
+        vec![
+            user_hook(HookEvent::Stop, None, "ralph.sh"),
+            user_hook(HookEvent::UserPromptSubmit, None, "secrets.sh"),
+        ],
+        true,
+    )
+    .await;
+    bench.define("ralph.sh", ralph_until_active);
+    bench.define("secrets.sh", |input| {
+        if input["prompt"].as_str().unwrap().contains("password") {
+            exits(2, "", "prompts must not carry passwords\n")
+        } else {
+            exits(0, "", "")
+        }
+    });
+    let run = bench.run_queueing(RALPH_PROMPT, &[LEAKED, QUEUED]).await;
+    assert!(run.observed.failed.is_none() && !run.observed.interrupted);
+    assert_eq!(
+        run.observed.merged,
+        [(run.queued[1].run_id, run.receipt.run_id)],
+        "only the prompt its hooks let through joins"
+    );
+    assert_eq!(
+        run.observed.rewinds, 0,
+        "views never showed it, so they do not redraw mid-turn"
+    );
+    let blocked = run
+        .observed
+        .hook_runs
+        .iter()
+        .find(|record| {
+            record.event == HookEvent::UserPromptSubmit
+                && record.outcome == HookRunOutcome::Blocking
+        })
+        .expect("the user sees why");
+    assert_eq!(
+        blocked.reason.as_deref(),
+        Some("[secrets.sh]: prompts must not carry passwords")
+    );
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|request| !texts_of(request)
+            .iter()
+            .any(|text| text.contains("hunter2"))),
+        "the model never reads it"
+    );
+    let trailing = trailing_texts(&requests[1]);
+    assert_eq!(
+        trailing.last().map(String::as_str),
+        Some(QUEUED),
+        "{trailing:?}"
+    );
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert!(snapshot.queued_inputs().is_empty());
+    let texts = conversation_texts(&snapshot.messages);
+    assert!(
+        !texts.iter().any(|text| text.contains("hunter2")),
+        "{texts:?}"
+    );
+    assert!(texts.iter().any(|text| text == QUEUED));
+    assert_prefix_stable(&bench).await;
+    bench.agent.shutdown().await;
+
+    let reloaded = build_agent(
+        &bench.directory,
+        &bench.environment,
+        &bench.settings,
+        Arc::new(ScriptedModel::new(Vec::new())),
+        true,
+    );
+    let texts = conversation_texts(&reloaded.resume_chat(bench.chat).await.unwrap().messages);
+    assert!(
+        !texts.iter().any(|text| text.contains("hunter2")),
+        "a load keeps it out too: {texts:?}"
+    );
+    assert!(texts.iter().any(|text| text == QUEUED));
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "Updated the changelog too.")
+    );
+    reloaded.shutdown().await;
+}
+
+#[tokio::test]
+async fn input_merged_after_a_tool_call_runs_its_prompt_hooks() {
+    const QUEUED: &str = "Then run the tests.";
+    let bench = Bench::start(
+        vec![
+            call("build", "Bash", json!({"command": "cargo build"})),
+            text("Built; the tests are next."),
+        ],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "context.sh")],
+    )
+    .await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    bench.define("context.sh", |input| {
+        context_answer(
+            HookEvent::UserPromptSubmit,
+            &format!("checked {}", input["prompt"].as_str().unwrap()),
+        )
+    });
+    let run = bench.run_queueing("Build it.", &[QUEUED]).await;
+    assert!(run.observed.failed.is_none());
+    assert_eq!(
+        run.observed.merged,
+        [(run.queued[0].run_id, run.receipt.run_id)]
+    );
+    let prompts = bench
+        .inputs_of("context.sh")
+        .iter()
+        .map(|input| input["prompt"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, [json!("Build it."), json!(QUEUED)]);
+    let trailing = trailing_texts(&bench.requests()[1]);
+    let queued = trailing
+        .iter()
+        .position(|text| text == QUEUED)
+        .expect("the queued input follows the tool's result");
+    assert!(
+        trailing[queued + 1].contains(&format!(
+            "UserPromptSubmit hook additional context: checked {QUEUED}"
+        )),
+        "{trailing:?}"
+    );
+    assert_prefix_stable(&bench).await;
+    bench.agent.shutdown().await;
+}
+
+/// Claude Code leaves a queued prompt whose hook ends its turn queued until the running turn
+/// ends; its own turn then keeps it unanswered.
+#[tokio::test]
+async fn a_queued_prompt_whose_hook_ends_the_turn_waits_for_a_turn_of_its_own() {
+    const HELD: &str = "Deploy it.";
+    let bench = Bench::start(
+        vec![
+            call("build", "Bash", json!({"command": "cargo build"})),
+            text("Built."),
+        ],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "review.sh")],
+    )
+    .await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    bench.define("review.sh", |input| {
+        if input["prompt"] == HELD {
+            answer(json!({"continue": false, "stopReason": "Deploys wait for review"}))
+        } else {
+            exits(0, "", "")
+        }
+    });
+    let mut run = bench.run_queueing("Build it.", &[HELD]).await;
+    assert!(run.observed.failed.is_none());
+    assert!(
+        run.observed.merged.is_empty(),
+        "it does not join the running turn"
+    );
+    let held = observe(&mut run.events, &run.queued[0]).await;
+    assert!(held.failed.is_none());
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2, "the model is never asked to answer it");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !texts_of(request).iter().any(|text| text == HELD))
+    );
+    let texts = conversation_texts(&bench.agent.snapshot(bench.chat).await.unwrap().messages);
+    let kept = texts
+        .iter()
+        .position(|text| text == HELD)
+        .expect("its own turn keeps it");
+    assert_eq!(
+        texts[kept - 1],
+        "Built.",
+        "after the turn it waited for: {texts:?}"
+    );
+    assert!(
+        texts[kept + 1].contains("Deploys wait for review"),
+        "{texts:?}"
+    );
+    bench.agent.shutdown().await;
+}
+
 fn is_child_request(request: &ModelRequest) -> bool {
     request
         .messages
@@ -888,8 +1248,7 @@ async fn session_end_runs_when_the_worker_ends_and_a_loaded_chat_resumes_its_ses
         &bench.directory,
         &bench.environment,
         &bench.settings,
-        &model,
-        None,
+        model,
         true,
     );
     resumed.resume_chat(bench.chat).await.unwrap();

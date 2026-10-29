@@ -666,6 +666,46 @@ fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
         .then_some(TriggerTake::Waits)
 }
 
+/// The input queued to the Run `active`'s Loop that joins its conversation before the next model
+/// request, in queue order. Trigger input waits for the turn to end, user input queued behind a
+/// `!` command or slash command waits for it, and so do prompts a `UserPromptSubmit` hook held
+/// and the prompts queued after them.
+fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat PendingInput> {
+    let snapshot = &chat.snapshot;
+    let queue_barrier = snapshot
+        .user_shells
+        .iter()
+        .filter(|record| record.state == UserShellState::Queued && record.armed)
+        .map(|record| record.queued_sequence)
+        .chain(
+            snapshot
+                .pending_commands
+                .iter()
+                .map(|command| command.queued_sequence),
+        )
+        .min();
+    let mut is_behind_held_prompt = false;
+    let mut mergeable = Vec::new();
+    for pending in &snapshot.pending_inputs {
+        if !pending.armed
+            || pending.trigger_source.is_some()
+            || pending.receipt.loop_id != active.loop_id
+            || (pending.agent_message.is_none()
+                && queue_barrier.is_some_and(|sequence| pending.queued_sequence >= sequence))
+        {
+            continue;
+        }
+        if hooks::is_user_prompt(pending) {
+            is_behind_held_prompt |= chat.hook_state.session.holds_prompt(pending.receipt.run_id);
+            if is_behind_held_prompt {
+                continue;
+            }
+        }
+        mergeable.push(pending);
+    }
+    mergeable
+}
+
 /// Queues a Run that continues the conversation without a message of its own.
 fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
@@ -3439,60 +3479,77 @@ impl Agent {
         Ok(response.output)
     }
 
+    /// Takes the input queued to the Run `active`'s Loop into its conversation before its next
+    /// model request. Each prompt among it runs its `UserPromptSubmit` hooks first, outside the
+    /// Chat's lock: a blocked prompt is taken back out of the conversation as it joins, and a
+    /// held one waits for a turn of its own.
     async fn merge_queued_messages(&self, active: &Receipt) -> Result<(), AgentError> {
+        // Input queued before an interruption is answered by the run that follows it.
+        let takes_in_input = |chat: &Chat| {
+            chat.active_run == Some(active.run_id)
+                && !chat.user_cancelled_runs.contains(&active.run_id)
+        };
+        let mut chats = self.inner.chats.lock().await;
+        let (merging, prompts, cancel) = {
+            let chat = chats.get(&active.chat_id).ok_or(AgentError::NotFound)?;
+            if !takes_in_input(chat) {
+                return Ok(());
+            }
+            let merging = mergeable_inputs(chat, active);
+            if merging.is_empty() {
+                return Ok(());
+            }
+            let prompts = merging
+                .iter()
+                .filter(|pending| hooks::is_user_prompt(pending))
+                .map(|pending| (pending.receipt.run_id, pending.input.clone()))
+                .collect::<Vec<_>>();
+            let merging = merging
+                .iter()
+                .map(|pending| pending.receipt.run_id)
+                .collect::<HashSet<_>>();
+            (merging, prompts, chat.run_cancel(active.run_id).cloned())
+        };
+        let mut checked = HashMap::new();
+        if !prompts.is_empty() {
+            drop(chats);
+            let Some(cancel) = cancel else {
+                return Ok(());
+            };
+            let Some(verdicts) = self.check_queued_prompts(active, prompts, &cancel).await else {
+                return Ok(());
+            };
+            checked = verdicts;
+            chats = self.inner.chats.lock().await;
+        }
         let events = {
-            let mut chats = self.inner.chats.lock().await;
             let original = chats.get_mut(&active.chat_id).ok_or(AgentError::NotFound)?;
-            // Input queued before an interruption is answered by the run that follows it.
-            if original.active_run != Some(active.run_id)
-                || original.user_cancelled_runs.contains(&active.run_id)
-            {
+            if !takes_in_input(original) {
                 return Ok(());
             }
             let mut candidate = original.clone();
-            let queue_barrier = candidate
-                .snapshot
-                .user_shells
-                .iter()
-                .filter(|record| record.state == UserShellState::Queued && record.armed)
-                .map(|record| record.queued_sequence)
-                .chain(
-                    candidate
-                        .snapshot
-                        .pending_commands
-                        .iter()
-                        .map(|command| command.queued_sequence),
-                )
-                .min();
-            let merge_indexes = candidate
-                .snapshot
-                .pending_inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, pending)| {
-                    // Trigger input waits for the turn to end.
-                    pending.armed
-                        && pending.trigger_source.is_none()
-                        && pending.receipt.loop_id == active.loop_id
-                        && (pending.agent_message.is_some()
-                            || queue_barrier
-                                .is_none_or(|sequence| pending.queued_sequence < sequence))
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if merge_indexes.is_empty() {
+            let mut joining = Vec::new();
+            let mut blocked = Vec::new();
+            let mut retained = Vec::new();
+            for pending in std::mem::take(&mut candidate.snapshot.pending_inputs) {
+                if !merging.contains(&pending.receipt.run_id) {
+                    retained.push(pending);
+                } else if !hooks::is_user_prompt(&pending) {
+                    joining.push((pending, Vec::new()));
+                } else {
+                    match checked.remove(&pending.receipt.run_id) {
+                        Some(hooks::QueuedPrompt::Joins(notes)) => joining.push((pending, notes)),
+                        Some(hooks::QueuedPrompt::Blocked) => blocked.push(pending),
+                        None => retained.push(pending),
+                    }
+                }
+            }
+            candidate.snapshot.pending_inputs = retained;
+            if joining.is_empty() && blocked.is_empty() {
                 return Ok(());
             }
-            let merged = merge_indexes
-                .into_iter()
-                .rev()
-                .map(|index| candidate.snapshot.pending_inputs.remove(index))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            let mut events = Vec::with_capacity(merged.len());
-            for pending in merged {
+            let mut events = Vec::with_capacity(joining.len());
+            for (pending, notes) in joining {
                 let receipt = pending.receipt.clone();
                 if pending.agent_message.is_none() {
                     self.merge_host_context(active, &receipt);
@@ -3504,25 +3561,12 @@ impl Agent {
                         skill.run_id = Some(active.run_id);
                     }
                 }
-                let index = candidate.snapshot.messages.len();
-                self.append_input_message(&mut candidate, pending);
-                if let Some(response) = candidate
-                    .bookkeeping
-                    .lifecycle
-                    .active_response(active.run_id)
-                    && index < candidate.snapshot.messages.len()
-                {
-                    candidate
-                        .bookkeeping
-                        .message_responses
-                        .insert(index, response);
-                }
-                self.settle_input(
+                self.append_merged_input(&mut candidate, active, pending);
+                hooks::append_hook_notes(
                     &mut candidate,
-                    receipt.run_id,
-                    SettledOutcome::Merged {
-                        into: active.run_id.into(),
-                    },
+                    active,
+                    tickloop_harness_protocol::hooks::HookEvent::UserPromptSubmit,
+                    notes,
                 );
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
@@ -3537,18 +3581,50 @@ impl Agent {
                 candidate.snapshot.events.push(event.clone());
                 events.push(event);
             }
+            // Blocked prompts join last, so taking them back leaves the others in place.
+            let first_blocked = blocked
+                .first()
+                .map(|pending| (pending.receipt.run_id, candidate.snapshot.messages.len()));
+            for mut pending in blocked {
+                pending.attached_file_reads.clear();
+                self.append_merged_input(&mut candidate, active, pending);
+            }
             while candidate.snapshot.events.len() > 1024 {
                 candidate.snapshot.events.remove(0);
             }
             self.save(&candidate.snapshot);
             *original = candidate;
+            if let Some((run, index)) = first_blocked {
+                self.take_back_blocked_prompt(original, run, index, false);
+            }
             events
         };
+        drop(chats);
         for event in events {
             let _ = self.inner.events.send(event);
         }
         self.flush_subagent_notifications(active.chat_id).await;
         Ok(())
+    }
+
+    /// Appends `pending`, queued to the Run `active`, to its conversation, answered by the Run's
+    /// response.
+    fn append_merged_input(&self, chat: &mut Chat, active: &Receipt, pending: PendingInput) {
+        let consumed = pending.receipt.run_id;
+        let index = chat.snapshot.messages.len();
+        self.append_input_message(chat, pending);
+        if let Some(response) = chat.bookkeeping.lifecycle.active_response(active.run_id)
+            && index < chat.snapshot.messages.len()
+        {
+            chat.bookkeeping.message_responses.insert(index, response);
+        }
+        self.settle_input(
+            chat,
+            consumed,
+            SettledOutcome::Merged {
+                into: active.run_id.into(),
+            },
+        );
     }
 
     async fn admit_host_operation(
@@ -3921,7 +3997,7 @@ impl Agent {
         self.save(&chat.snapshot);
         self.emit(chat, &receipt, event);
         if let Some(prompt) = chat.hook_state.session.take_blocked_prompt(receipt.run_id) {
-            self.take_back_blocked_prompt(chat, receipt.run_id, prompt);
+            self.take_back_blocked_prompt(chat, receipt.run_id, prompt, true);
         }
         self.inner
             .host_contexts
@@ -4628,10 +4704,7 @@ impl Agent {
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
             self.mark_run_inputs_handled(&mut candidate, &pending);
-            if pending.trigger_source.is_none()
-                && pending.agent_message.is_none()
-                && !pending.task_continuation
-            {
+            if hooks::is_user_prompt(&pending) {
                 candidate
                     .hook_state
                     .session

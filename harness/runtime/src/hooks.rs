@@ -37,7 +37,9 @@ use crate::environment::{
 use crate::{Agent, Chat};
 use output::{HookExit, HookResponse};
 pub(crate) use output::{HookPermission, HookVerdict};
-pub(crate) use session_events::{PromptGate, SessionSource};
+pub(crate) use session_events::{
+    PromptGate, QueuedPrompt, SessionSource, append_hook_notes, is_user_prompt,
+};
 pub(crate) use tool_events::{PreToolGate, ToolHookFeedback};
 
 /// Claude Code's default hook timeout, used when a hook declares none.

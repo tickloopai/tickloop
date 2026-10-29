@@ -8,13 +8,18 @@
 //!   request: a block takes the prompt back out of the conversation, as an interrupted prompt
 //!   is, and ends the Run; `continue: false` keeps the prompt and ends the Run unanswered.
 //!   Triggers and Agent messages are not prompts and run no hook.
+//! - It runs too for each prompt queued to a running turn as the turn takes queued input in, at
+//!   a tool boundary or as a `Stop` block goes on, as Claude Code's main thread does: a blocked
+//!   prompt is taken back the same way while the turn goes on, and a prompt whose hook ends its
+//!   turn waits, with the prompts queued after it, for a turn of its own.
 //! - `SessionStart` runs before the next model request of a root Chat after it was created
 //!   (`startup`), loaded from history (`resume`), started by `/clear` (`clear`) or compacted
 //!   (`compact`).
 //! - `Stop` runs when a root Chat's model ends its turn without calling tools, `SubagentStop`
 //!   when a Subagent's does or before its report is handed back: a block goes on with the
 //!   hooks' reasons, the hooks then reading `stop_hook_active: true`, as often as they block;
-//!   Esc and `/stop` end the Run as always. A Run that read an `asyncRewake` hook's
+//!   Esc and `/stop` end the Run as always. Input queued meanwhile joins after the reasons, so a
+//!   loop that never calls tools still reads it. A Run that read an `asyncRewake` hook's
 //!   notification reads `stop_hook_active: true` too, as Claude Code queues that notification.
 //! - `StopFailure` tells the hooks a turn ended on a model error, `SessionEnd` that a root Chat
 //!   ends with its Worker; neither changes anything.
@@ -27,7 +32,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 use tickloop_harness_model::{ModelError, ModelFailureKind, ModelRequest};
 use tickloop_harness_protocol::hooks::HookEvent;
-use tickloop_harness_protocol::{Content, HostNote, Message, Receipt, Role, RunId};
+use tickloop_harness_protocol::{Content, HostNote, Message, PendingInput, Receipt, Role, RunId};
 use tokio_util::sync::CancellationToken;
 
 use super::{HookCall, HookVerdict};
@@ -75,6 +80,9 @@ pub(crate) struct SessionHookState {
     unchecked_prompts: HashSet<RunId>,
     /// `asyncRewake` notifications no model request has read yet.
     unread_rewakes: Vec<Message>,
+    /// Queued prompts a hook ended the turn of: they, and the prompts queued after them, wait
+    /// for the running turn to end.
+    held_prompts: HashSet<RunId>,
 }
 
 impl SessionHookState {
@@ -85,7 +93,13 @@ impl SessionHookState {
 
     /// `run` starts with a user's prompt, which its `UserPromptSubmit` hooks check first.
     pub(crate) fn await_prompt_hooks(&mut self, run: RunId) {
+        self.held_prompts.remove(&run);
         self.unchecked_prompts.insert(run);
+    }
+
+    /// Whether the queued prompt of `run` waits for the running turn to end.
+    pub(crate) fn holds_prompt(&self, run: RunId) -> bool {
+        self.held_prompts.contains(&run)
     }
 
     /// An `asyncRewake` hook notified the Loop with `notification`: the Run whose model reads
@@ -120,6 +134,22 @@ impl SessionHookState {
     pub(crate) fn take_blocked_prompt(&mut self, run: RunId) -> Option<usize> {
         self.blocked_prompts.remove(&run)
     }
+}
+
+/// Whether `pending` is a prompt a person gave, which `UserPromptSubmit` hooks check.
+pub(crate) fn is_user_prompt(pending: &PendingInput) -> bool {
+    pending.trigger_source.is_none()
+        && pending.agent_message.is_none()
+        && !pending.task_continuation
+}
+
+/// What a prompt queued to a running turn does as the turn takes it in, after its
+/// `UserPromptSubmit` hooks.
+pub(crate) enum QueuedPrompt {
+    /// It joins the turn, followed by these notes from its hooks.
+    Joins(Vec<String>),
+    /// A hook blocked it: it is taken back out of the conversation as it joins.
+    Blocked,
 }
 
 /// What `UserPromptSubmit` lets the Run that a prompt started do.
@@ -216,7 +246,12 @@ fn failure_name(error: &ModelError) -> &'static str {
     }
 }
 
-fn append_hook_notes(chat: &mut Chat, receipt: &Receipt, event: HookEvent, notes: Vec<String>) {
+pub(crate) fn append_hook_notes(
+    chat: &mut Chat,
+    receipt: &Receipt,
+    event: HookEvent,
+    notes: Vec<String>,
+) {
     for note in notes {
         crate::host_notes::append_note(&mut chat.snapshot, receipt, note, HostNote::Hook(event));
     }
@@ -328,6 +363,50 @@ impl Agent {
         })
     }
 
+    /// Runs `UserPromptSubmit` for the `prompts` queued to the Run `active`, in queue order, as
+    /// the Run takes them in: what each does, or `None` when the Run was interrupted meanwhile,
+    /// which leaves them all queued. A prompt a hook ends the turn of is held with the prompts
+    /// after it, which are not checked and get no entry, as Claude Code leaves them queued.
+    pub(crate) async fn check_queued_prompts(
+        &self,
+        active: &Receipt,
+        prompts: Vec<(RunId, String)>,
+        cancel: &CancellationToken,
+    ) -> Option<HashMap<RunId, QueuedPrompt>> {
+        let name = hook_name(HookEvent::UserPromptSubmit, None);
+        let mut checked = HashMap::new();
+        for (run, prompt) in prompts {
+            let mut fields = Map::new();
+            fields.insert("prompt".into(), json!(prompt));
+            let verdict = self
+                .run_hooks(
+                    active,
+                    HookCall {
+                        event: HookEvent::UserPromptSubmit,
+                        match_query: None,
+                        fields,
+                        tool: None,
+                    },
+                    cancel,
+                )
+                .await;
+            if verdict.cancelled || cancel.is_cancelled() {
+                return None;
+            }
+            if !verdict.blocking_errors.is_empty() {
+                checked.insert(run, QueuedPrompt::Blocked);
+            } else if verdict.prevent_continuation {
+                if let Some(chat) = self.inner.chats.lock().await.get_mut(&active.chat_id) {
+                    chat.hook_state.session.held_prompts.insert(run);
+                }
+                break;
+            } else {
+                checked.insert(run, QueuedPrompt::Joins(context_notes(&name, &verdict)));
+            }
+        }
+        Some(checked)
+    }
+
     /// The prompt of the Run `receipt` passed its hooks: the Chat's title may come from it.
     async fn let_prompt_through(&self, receipt: &Receipt) {
         if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
@@ -394,7 +473,8 @@ impl Agent {
     }
 
     /// Runs `Stop`, or `SubagentStop` in a Subagent, as the model ends its turn without calling
-    /// tools: the request that goes on with the hooks' reasons when one blocks the turn's end.
+    /// tools: the request that goes on with the hooks' reasons when one blocks the turn's end,
+    /// followed by the input queued to the turn meanwhile, as at a tool boundary.
     pub(crate) async fn stop_turn_hooks(
         &self,
         receipt: &Receipt,
@@ -403,16 +483,24 @@ impl Agent {
         let Some(feedback) = self.run_stop_hooks(receipt, cancel).await? else {
             return Ok(None);
         };
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or("Agent is unavailable")?;
-        if chat.active_run != Some(receipt.run_id) {
-            return Ok(None);
+        {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or("Agent is unavailable")?;
+            if chat.active_run != Some(receipt.run_id) {
+                return Ok(None);
+            }
+            let event = stop_event(chat);
+            append_hook_notes(chat, receipt, event, feedback);
+            self.save(&chat.snapshot);
         }
-        let event = stop_event(chat);
-        append_hook_notes(chat, receipt, event, feedback);
-        self.save(&chat.snapshot);
+        self.merge_queued_messages(receipt)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.complete_file_history_snapshots(receipt.chat_id).await;
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&receipt.chat_id).ok_or("Agent is unavailable")?;
         self.continuation_request(chat).map(Some)
     }
 
