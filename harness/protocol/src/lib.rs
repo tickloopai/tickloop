@@ -132,7 +132,8 @@ pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_inp
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
 pub use local_messages::{
     FOLDED_TICK_REPLY_CHARACTERS, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE, LocalMessage,
-    SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
+    ShellTaskEnd, SubagentReportMessage, TaskNotification, TaskNotificationStatus,
+    TickDeliveryLine,
 };
 pub use loops::{
     Authority, Coalesce, EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice,

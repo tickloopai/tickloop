@@ -5567,22 +5567,35 @@ impl Agent {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)
     }
 
-    /// A background task notification may queue one continuation run. The caller starts it
-    /// after releasing the Chat lock.
+    /// Writes `message`, what a background task's end tells the model, and shows the Chat's
+    /// views its line at once; a view drawing the conversation again reads it from `message`.
+    fn show_task_notification(
+        &self,
+        chat: &mut Chat,
+        notification: TaskNotification,
+        message: Message,
+    ) -> Result<(), AgentError> {
+        self.append_local_messages(chat, [message])?;
+        let _ = self.inner.task_notifications.send(notification);
+        Ok(())
+    }
+
+    /// A background Shell task's notification may queue one continuation run. The caller starts
+    /// it after releasing the Chat lock.
     fn notify_task_completion(
         &self,
         chat: &mut Chat,
         loop_id: Option<LoopId>,
         notification: TaskNotification,
     ) -> Result<bool, AgentError> {
+        let Some(shell) = &notification.shell else {
+            return Ok(false);
+        };
         chat.bookkeeping
             .deferred_notifications
-            .push(tick_protocol::InstanceRef::shell(notification.task_id));
-        self.append_local_messages(
-            chat,
-            [local_messages::task_notification(&chat.ids, &notification)],
-        )?;
-        let _ = self.inner.task_notifications.send(notification);
+            .push(tick_protocol::InstanceRef::shell(shell.task_id));
+        let message = local_messages::task_notification(&chat.ids, shell, &notification.summary);
+        self.show_task_notification(chat, notification, message)?;
         Ok(self.queue_task_continuation(chat, loop_id))
     }
 

@@ -67,18 +67,41 @@ impl TaskNotificationStatus {
     }
 }
 
-/// Task notification written to the owning Chat when a background Shell task ends.
+/// A background task's end as the owning Chat's views show it at once: a Shell task's, written to
+/// the Chat as its task notification, or that of a hook that ran in the background and told the
+/// model something.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskNotification {
     pub chat_id: ChatId,
+    /// The Shell task that ended; a hook that ran in the background has none.
+    pub shell: Option<ShellTaskEnd>,
+    pub summary: String,
+}
+
+/// The Shell task a task notification is about.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShellTaskEnd {
     pub task_id: ShellTaskId,
     pub tool_use_id: Option<String>,
     pub output_file: PathBuf,
     pub status: TaskNotificationStatus,
-    pub summary: String,
 }
 
 impl TaskNotification {
+    /// What the views show of a hook that ran in the background, beside the
+    /// [`background_hook_notification`] the model reads.
+    pub fn for_background_hook(chat_id: ChatId, summary: &str) -> Self {
+        Self {
+            chat_id,
+            shell: None,
+            summary: summary.into(),
+        }
+    }
+
+    pub fn status(&self) -> Option<TaskNotificationStatus> {
+        self.shell.as_ref().map(|shell| shell.status)
+    }
+
     pub fn for_background_command(
         chat_id: ChatId,
         task_id: ShellTaskId,
@@ -99,28 +122,14 @@ impl TaskNotification {
         };
         Self {
             chat_id,
-            task_id,
-            tool_use_id,
-            output_file,
-            status,
+            shell: Some(ShellTaskEnd {
+                task_id,
+                tool_use_id,
+                output_file,
+                status,
+            }),
             summary: format!("{BACKGROUND_COMMAND_SUMMARY_PREFIX}\"{command}\" {outcome}"),
         }
-    }
-
-    /// The notification as the model reads it, written once when it is delivered.
-    pub fn text(&self, ids: &IdContext) -> String {
-        let tool_use_id_line = self
-            .tool_use_id
-            .as_ref()
-            .map(|id| format!("\n<{TOOL_USE_ID_TAG}>{id}</{TOOL_USE_ID_TAG}>"))
-            .unwrap_or_default();
-        format!(
-            "<{TASK_NOTIFICATION_TAG}>\n<{TASK_ID_TAG}>{}</{TASK_ID_TAG}>{tool_use_id_line}\n<{OUTPUT_FILE_TAG}>{}</{OUTPUT_FILE_TAG}>\n<{STATUS_TAG}>{}</{STATUS_TAG}>\n<{SUMMARY_TAG}>{}</{SUMMARY_TAG}>\n</{TASK_NOTIFICATION_TAG}>",
-            ids.model_text(self.task_id),
-            self.output_file.display(),
-            self.status.as_str(),
-            escape_xml(&self.summary),
-        )
     }
 }
 
@@ -430,8 +439,20 @@ pub fn goal_steering(text: &str) -> Message {
     ))
 }
 
-pub fn task_notification(ids: &IdContext, notification: &TaskNotification) -> Message {
-    user_text(&notification.text(ids))
+/// What a background Shell task's end tells the model, written once when it is delivered.
+pub fn task_notification(ids: &IdContext, shell: &ShellTaskEnd, summary: &str) -> Message {
+    let tool_use_id_line = shell
+        .tool_use_id
+        .as_ref()
+        .map(|id| format!("\n<{TOOL_USE_ID_TAG}>{id}</{TOOL_USE_ID_TAG}>"))
+        .unwrap_or_default();
+    user_text(&format!(
+        "<{TASK_NOTIFICATION_TAG}>\n<{TASK_ID_TAG}>{}</{TASK_ID_TAG}>{tool_use_id_line}\n<{OUTPUT_FILE_TAG}>{}</{OUTPUT_FILE_TAG}>\n<{STATUS_TAG}>{}</{STATUS_TAG}>\n<{SUMMARY_TAG}>{}</{SUMMARY_TAG}>\n</{TASK_NOTIFICATION_TAG}>",
+        ids.model_text(shell.task_id),
+        shell.output_file.display(),
+        shell.status.as_str(),
+        escape_xml(summary),
+    ))
 }
 
 /// What a hook that ran in the background tells the model when it ends: a line the user sees and
