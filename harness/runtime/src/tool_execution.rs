@@ -1401,9 +1401,15 @@ impl Agent {
     ) -> ToolCallOutcome {
         let mut outcome = ToolCallOutcome::not_admitted(error);
         if !cancel.is_cancelled() {
-            outcome.hook_feedback = self
-                .post_tool_use(receipt, call_id, name, input, &outcome.result, cancel)
-                .await;
+            outcome.hook_feedback = Box::pin(self.post_tool_use(
+                receipt,
+                call_id,
+                name,
+                input,
+                &outcome.result,
+                cancel,
+            ))
+            .await;
         }
         outcome
     }
