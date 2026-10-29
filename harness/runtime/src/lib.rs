@@ -1970,7 +1970,7 @@ impl Agent {
             queued.id == run_id && queued.armed && queued.kind == QueuedInputKind::Message
         });
         let has_work_ahead = chat.active.is_some() || !chat.parked.is_empty();
-        if !is_queued_message || !has_work_ahead {
+        if !is_queued_message || !has_work_ahead || chat.active_run == Some(run_id) {
             return Ok(Vec::new());
         }
         Ok(chat.interrupt())
@@ -3025,11 +3025,7 @@ impl Agent {
         let requested_receipt = receipt.clone();
         if trigger_source.is_none() {
             self.apply_pending_model(chat)?;
-            recovery::before_resume(
-                &mut chat.snapshot,
-                loop_id,
-                self.inner.config_root.as_deref(),
-            )?;
+            recovery::before_resume(&mut chat.snapshot, self.inner.config_root.as_deref())?;
         }
         if !chat.snapshot.accepts_images()
             && contexts
@@ -3101,7 +3097,7 @@ impl Agent {
             attached_file_reads,
         };
         if hooks::is_user_prompt(&queued) {
-            hooks::resume_prompt_inputs(chat);
+            hooks::resume_prompt_inputs(chat, self.inner.waits);
         }
         chat.bookkeeping.lifecycle.accept(&ledger, &queued);
         chat.snapshot.pending_inputs.insert(index, queued);
@@ -3761,17 +3757,18 @@ impl Agent {
         let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
             RunStart::Request(request) => {
-                self.checkpoint_pending_prompt(&receipt)
+                Box::pin(self.checkpoint_pending_prompt(&receipt))
                     .await
                     .map_err(|error| error.to_string())?;
-                self.announce_session_start(&receipt, &cancel)
+                Box::pin(self.announce_session_start(&receipt, &cancel))
                     .await
                     .map_err(|error| error.to_string())?;
-                if let hooks::PromptGate::End = self
+                let prompt_gate = self
                     .user_prompt_submit(&receipt, &cancel)
                     .await
-                    .map_err(|error| error.to_string())?
-                {
+                    .map_err(|error| error.to_string())?;
+                self.complete_file_history_snapshots(receipt.chat_id).await;
+                if let hooks::PromptGate::End = prompt_gate {
                     return Ok(Usage::default());
                 }
                 request
@@ -4314,7 +4311,7 @@ impl Agent {
             match admission {
                 RunAdmission::Idle => return Ok(None),
                 RunAdmission::Ready(receipt, mut request, cancel) => {
-                    if self.commit_unhooked_prompt(&receipt, &cancel).await? {
+                    if Box::pin(self.commit_unhooked_prompt(&receipt, &cancel)).await? {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
                         (request.messages, request.history_sources) = context::model_history(chat)?;
@@ -4708,7 +4705,6 @@ impl Agent {
             }
             recovery::before_resume(
                 &mut candidate.snapshot,
-                pending.receipt.loop_id,
                 self.inner.config_root.as_deref(),
             )?;
             let queued_before_hooks = candidate.snapshot.pending_inputs.clone();
@@ -5477,6 +5473,16 @@ impl Agent {
             }
             let mut candidate = original.clone();
             let ids = taken.iter().map(|entry| entry.id).collect::<HashSet<_>>();
+            if candidate.active_run.is_some_and(|run| {
+                ids.contains(&run.uuid())
+                    && candidate
+                        .hook_state
+                        .session
+                        .preparing_inputs
+                        .contains_key(&run)
+            }) {
+                candidate.interrupt();
+            }
             candidate.snapshot.pending_inputs.retain(|pending| {
                 pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id.uuid())
             });

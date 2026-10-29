@@ -156,13 +156,15 @@ pub(crate) fn is_user_prompt(pending: &PendingInput) -> bool {
         && !pending.task_continuation
 }
 
-pub(crate) fn resume_prompt_inputs(chat: &mut Chat) {
+pub(crate) fn resume_prompt_inputs(chat: &mut Chat, waits: crate::WaitHosting) {
     for pending in &mut chat.snapshot.pending_inputs {
         if is_user_prompt(pending) && !pending.armed {
             pending.armed = true;
-            chat.bookkeeping
-                .lifecycle
-                .set_queued_armed(pending.receipt.run_id, true);
+            if waits == crate::WaitHosting::Durable {
+                chat.bookkeeping
+                    .lifecycle
+                    .set_queued_armed(pending.receipt.run_id, true);
+            }
         }
     }
 }
@@ -303,12 +305,29 @@ impl Agent {
         receipt: &Receipt,
     ) -> Result<(), AgentError> {
         let preparing = {
-            let chats = self.inner.chats.lock().await;
-            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-            chat.hook_state
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            let inputs = chat
+                .hook_state
                 .session
                 .preparing_inputs
-                .contains_key(&receipt.run_id)
+                .get(&receipt.run_id)
+                .cloned();
+            if self.inner.waits == crate::WaitHosting::Process
+                && let Some(inputs) = &inputs
+            {
+                for pending in &chat.snapshot.pending_inputs {
+                    if inputs.contains(&pending.receipt.run_id) && is_user_prompt(pending) {
+                        // A process restart keeps this input but waits for explicit continuation.
+                        chat.bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
+                    }
+                }
+            }
+            inputs.is_some()
         };
         if preparing {
             self.commit_transcripts(&[receipt.chat_id])

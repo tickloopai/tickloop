@@ -49,6 +49,7 @@ pub(super) struct HookTasks {
     /// The Folders whose review this Console has shown.
     reviewed: HashSet<PathBuf>,
     announced_warnings: HashSet<(PathBuf, String)>,
+    warning_reads: HashSet<(Option<Uuid>, PathBuf)>,
     /// The Folder of the New Agent shown, once its hooks have been asked for.
     checked: Option<PathBuf>,
     /// A review found for the New Agent's Folder, waiting for the screen to be free.
@@ -63,6 +64,19 @@ impl HookTasks {
     /// The next finished work; `None` for work that panicked.
     pub(super) async fn join_next(&mut self) -> Option<Done> {
         self.running.join_next().await?.ok()
+    }
+
+    fn read_folder(&mut self, agent: &ConsoleExecution, chat: Option<Uuid>, folder: &Path) {
+        self.warning_reads.insert((chat, folder.to_owned()));
+        let (agent, folder) = (agent.clone(), folder.to_owned());
+        self.running.spawn(async move {
+            let folder = chat_folder(&agent, chat, folder).await;
+            let listing = agent
+                .hooks(folder.clone())
+                .await
+                .map_err(|error| error.to_string());
+            Done::ReviewRead { folder, listing }
+        });
     }
 
     fn read(&mut self, agent: &ConsoleExecution, panel: Uuid) {
@@ -157,9 +171,7 @@ pub(super) fn finish(
 ) -> Result<(), String> {
     let (panel, result) = match done {
         Done::ReviewRead { folder, listing } => {
-            if tasks.checked.as_ref() == Some(&folder)
-                && let Ok(listing) = listing
-            {
+            if let Ok(listing) = listing {
                 for warning in &listing.warnings {
                     if tasks
                         .announced_warnings
@@ -168,7 +180,8 @@ pub(super) fn finish(
                         console.write_line(&format!("Warning: {}", safe_line(warning)))?;
                     }
                 }
-                if listing.hooks.iter().any(needs_review) {
+                if tasks.checked.as_ref() == Some(&folder) && listing.hooks.iter().any(needs_review)
+                {
                     tasks.waiting = Some((folder, listing));
                 }
             }
@@ -204,11 +217,13 @@ pub(super) fn finish(
 
 /// Offers the review of the New Agent's hooks in `folder` while `on_new_agent`: reads them the
 /// first time the New Agent shows that Folder, and shows the review once the screen is free.
-/// Each Folder's review shows at most once for the Console's lifetime.
+/// Existing Chats also read their Folder's warnings. Each Folder's review shows at most once
+/// for the Console's lifetime.
 pub(super) fn offer_review(
     console: &Console,
     agent: &ConsoleExecution,
     on_new_agent: bool,
+    chat: Option<Uuid>,
     folder: &Path,
     tasks: &mut HookTasks,
 ) -> Result<(), String> {
@@ -217,18 +232,14 @@ pub(super) fn offer_review(
         tasks.waiting = None;
     }
     if !on_new_agent || tasks.reviewed.contains(folder) {
+        if !tasks.warning_reads.contains(&(chat, folder.to_owned())) {
+            tasks.read_folder(agent, chat, folder);
+        }
         return Ok(());
     }
     if tasks.checked.is_none() {
         tasks.checked = Some(folder.to_owned());
-        let (agent, folder) = (agent.clone(), folder.to_owned());
-        tasks.running.spawn(async move {
-            let listing = agent
-                .hooks(folder.clone())
-                .await
-                .map_err(|error| error.to_string());
-            Done::ReviewRead { folder, listing }
-        });
+        tasks.read_folder(agent, chat, folder);
         return Ok(());
     }
     if tasks.waiting.is_none() || !console.can_offer_hook_review()? {
@@ -245,4 +256,72 @@ pub(super) fn offer_review(
     );
     tasks.reviewed.insert(folder);
     console.show_user_panel(UserPanel::Hooks(panel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tickloop_harness::test_support::{ScriptedModel, config};
+
+    #[tokio::test]
+    async fn an_existing_chat_still_starts_a_folder_warning_read() {
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let agent =
+            ConsoleExecution::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+        let directory = tempfile::tempdir().unwrap();
+        let mut tasks = HookTasks::default();
+        offer_review(
+            &console,
+            &agent,
+            false,
+            Some(Uuid::nil()),
+            directory.path(),
+            &mut tasks,
+        )
+        .unwrap();
+        assert!(!tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_warning_read_finishing_after_submission_is_shown_once() {
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let agent =
+            ConsoleExecution::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+        let directory = tempfile::tempdir().unwrap();
+        let mut tasks = HookTasks::default();
+        offer_review(&console, &agent, true, None, directory.path(), &mut tasks).unwrap();
+        offer_review(
+            &console,
+            &agent,
+            false,
+            Some(Uuid::nil()),
+            directory.path(),
+            &mut tasks,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            finish(
+                &console,
+                &agent,
+                Done::ReviewRead {
+                    folder: directory.path().into(),
+                    listing: Ok(HookList {
+                        warnings: vec!["settings.local.json: unsupported event".into()],
+                        ..Default::default()
+                    }),
+                },
+                &mut tasks,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            console
+                .test_conversation_text()
+                .matches("settings.local.json: unsupported event")
+                .count(),
+            1
+        );
+        assert!(tasks.waiting.is_none());
+    }
 }

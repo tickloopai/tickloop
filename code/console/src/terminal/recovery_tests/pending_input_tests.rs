@@ -8,6 +8,7 @@ const QUEUE_STAGE: &str = "queue-stage";
 const QUEUE_PROOF: &str = "queue-proof.json";
 const OTHER_VIEW_SUBMIT: &str = "other-view-submit";
 const QUEUE_DISCONNECTED: &str = "queue-disconnected";
+const HOOK_RELEASE: &str = "release-hook";
 const QUEUED_MESSAGE: &str = "Hello";
 const INITIAL_MESSAGE: &str = "Queue initial input";
 
@@ -130,7 +131,7 @@ fn pending_input_pty_fixture() {
                     use tickloop_harness::runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
                     let environment = Arc::new(MemoryEnvironment::new());
                     environment.define_command("wait-for-prompt", |_| MemoryCommandRun {
-                        duration: if std::path::Path::new("release-hook").exists() { Duration::ZERO } else { Duration::from_secs(60) },
+                        duration: if std::path::Path::new(HOOK_RELEASE).exists() { Duration::ZERO } else { Duration::from_secs(60) },
                         stdout: b"session context".to_vec(),
                         ..Default::default()
                     });
@@ -181,7 +182,7 @@ fn pending_input_pty_fixture() {
                     let mut resumed_hook=false;
                     loop {
                         if let Some(snapshot) = proof_core.list_chats().await.into_iter().next() {
-                            if !resumed_hook && std::path::Path::new("release-hook").exists() && snapshot.pending_inputs.iter().any(|input| !input.armed) {
+                            if !resumed_hook && std::path::Path::new(HOOK_RELEASE).exists() && snapshot.pending_inputs.iter().any(|input| !input.armed) {
                                 resumed_hook=true;
                                 proof_core.continue_loop(snapshot.id).await.unwrap();
                             }
@@ -510,6 +511,10 @@ fn a_prompt_waiting_for_session_hooks_stays_queued_then_echoes_once() {
         .repaint_after_recovery("an interruptible prompt waiting for hooks", |frame| {
             screen::queued_inputs(frame).len() == 1 && frame.contains("esc to interrupt")
         });
+    assert!(
+        !queued.contains("ctrl+enter to send now"),
+        "the active prompt cannot send itself now: {queued}"
+    );
     let (body, _) = screen::split_at_queue(&queued).unwrap();
     assert_eq!(body.matches(QUEUED_MESSAGE).count(), 0, "{queued}");
     assert!(
@@ -530,7 +535,7 @@ fn a_prompt_waiting_for_session_hooks_stays_queued_then_echoes_once() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::fs::write(directory.path().join("release-hook"), "").unwrap();
+    std::fs::write(directory.path().join(HOOK_RELEASE), "").unwrap();
     let proof = wait_queue_proof(&fixture, directory.path(), 1, 0);
     assert_eq!(proof["hello_messages"], 1);
     let consumed = fixture.repaint_after_recovery("the hook-checked prompt echoed once", |frame| {

@@ -10257,7 +10257,7 @@ impl State {
                 width,
                 rows,
                 self.display,
-                self.can_send_now(),
+                self.can_send_now() && self.oldest_queued_message().is_some(),
             );
         }
         if rows == 0 {
@@ -12460,9 +12460,20 @@ impl State {
     }
 
     fn oldest_queued_message(&self) -> Option<Uuid> {
+        let active = self
+            .monitor
+            .chat_status
+            .as_ref()
+            .filter(|status| {
+                status.chat_loop.state == tickloop_harness::protocol::LoopState::Running
+            })
+            .and_then(|status| status.chat_loop.run_id)
+            .map(|run| run.uuid());
         self.queued_inputs
             .iter()
-            .find(|entry| entry.kind == QueuedInputKind::Message)
+            .find(|entry| {
+                entry.kind == QueuedInputKind::Message && entry.armed && Some(entry.id) != active
+            })
             .map(|entry| entry.id)
     }
 

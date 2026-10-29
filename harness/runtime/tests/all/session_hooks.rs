@@ -856,6 +856,199 @@ async fn a_storage_failure_before_input_hooks_keeps_the_prompt_for_explicit_retr
 }
 
 #[tokio::test]
+async fn taking_back_a_prompt_cancels_its_input_hooks_and_unblocks_new_input() {
+    for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
+        let bench = Bench::start(vec![text("done")], vec![user_hook(event, None, "wait.sh")]).await;
+        let entered = Arc::new(Notify::new());
+        let notify = entered.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        bench.define("wait.sh", move |_| {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            notify.notify_one();
+            MemoryCommandRun {
+                duration: if first {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::ZERO
+                },
+                ..exits(0, "", "")
+            }
+        });
+        let mut events = bench.agent.subscribe();
+        bench
+            .agent
+            .submit(bench.chat, "Take this back.".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let taken = bench
+            .agent
+            .take_queued_inputs(bench.chat, true)
+            .await
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+        let receipt = bench
+            .agent
+            .submit(bench.chat, "Use this instead.".into())
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), observe(&mut events, &receipt))
+            .await
+            .unwrap();
+        assert!(observed.failed.is_none() && !observed.interrupted);
+        let texts = conversation_texts(&bench.requests()[0].messages);
+        assert!(texts.iter().any(|text| text == "Use this instead."));
+        assert!(!texts.iter().any(|text| text == "Take this back."));
+        bench.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn send_now_does_not_interrupt_the_prompt_whose_hooks_are_already_running() {
+    for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
+        let bench = Bench::start(vec![text("done")], vec![user_hook(event, None, "wait.sh")]).await;
+        let entered = Arc::new(Notify::new());
+        let notify = entered.clone();
+        bench.define("wait.sh", move |_| {
+            notify.notify_one();
+            MemoryCommandRun {
+                duration: Duration::from_millis(200),
+                ..exits(0, "", "")
+            }
+        });
+        let mut events = bench.agent.subscribe();
+        let receipt = bench
+            .agent
+            .submit(bench.chat, "Already starting.".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        bench
+            .agent
+            .send_now(bench.chat, receipt.run_id)
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), observe(&mut events, &receipt))
+            .await
+            .unwrap();
+        assert!(!observed.interrupted, "{event:?}");
+        assert_eq!(bench.requests().len(), 1);
+        bench.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn send_now_for_a_later_prompt_interrupts_the_earlier_input_hook() {
+    let bench = Bench::start(
+        vec![text("done")],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "wait.sh")],
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("wait.sh", move |input| {
+        let first = input["prompt"] == "Earlier prompt.";
+        if first {
+            notify.notify_one();
+        }
+        MemoryCommandRun {
+            duration: if first {
+                Duration::from_secs(60)
+            } else {
+                Duration::ZERO
+            },
+            ..exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Earlier prompt.".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Urgent prompt.".into())
+        .await
+        .unwrap();
+    bench
+        .agent
+        .send_now(bench.chat, receipt.run_id)
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observe(&mut events, &receipt))
+        .await
+        .unwrap();
+    assert!(!observed.interrupted);
+    assert!(
+        conversation_texts(&bench.requests()[0].messages)
+            .iter()
+            .any(|text| text == "Urgent prompt.")
+    );
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert_eq!(snapshot.pending_inputs[0].input, "Earlier prompt.");
+    assert!(!snapshot.pending_inputs[0].armed);
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_hooks_finish_the_file_snapshot_before_the_first_edit_of_each_turn() {
+    let bench = Bench::start_with(
+        vec![
+            call("read", "Read", json!({"file_path":"tracked.txt"})),
+            call(
+                "first",
+                "Edit",
+                json!({"file_path":"tracked.txt","old_string":"A","new_string":"B"}),
+            ),
+            text("first done"),
+            call(
+                "second",
+                "Edit",
+                json!({"file_path":"tracked.txt","old_string":"B","new_string":"C"}),
+            ),
+            text("second done"),
+        ],
+        None,
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "check.sh")],
+        true,
+    )
+    .await;
+    bench.define("check.sh", |_| exits(0, "", ""));
+    let file = bench.directory.path().join("tracked.txt");
+    std::fs::write(&file, "A").unwrap();
+    bench.run("First edit.").await;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "B");
+    bench.run("Second edit.").await;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "C");
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    let index = snapshot
+        .messages
+        .iter()
+        .position(|message| conversation_texts(std::slice::from_ref(message)) == ["Second edit."])
+        .unwrap();
+    bench
+        .agent
+        .rewind(
+            bench.chat,
+            snapshot.message_ids[&index],
+            tickloop_harness_protocol::RewindMode::Code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "B");
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn session_start_tells_hooks_a_chat_was_cleared() {
     let bench = Bench::start(
         vec![text("fresh")],

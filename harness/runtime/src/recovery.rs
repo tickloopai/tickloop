@@ -5,15 +5,13 @@ use tickloop_harness_model::validate_model_for_resume_in_root;
 use tickloop_harness_protocol::OperationId;
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatSnapshot, Content, LoopId, Message, OperationState, Role, RunId, ToolCallRecovery,
-    ToolResult,
+    ChatSnapshot, Content, Message, OperationState, Role, RunId, ToolCallRecovery, ToolResult,
 };
 use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tickloop_ids::IdContext;
 
 pub(super) fn before_resume(
     snapshot: &mut ChatSnapshot,
-    loop_id: LoopId,
     state_root: Option<&std::path::Path>,
 ) -> Result<(), AgentError> {
     // A Chat without a Folder has no local directory or credential to check.
@@ -38,14 +36,6 @@ pub(super) fn before_resume(
         }
         validate_model_for_resume_in_root(&snapshot.model, state_root)
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
-    }
-    for pending in &mut snapshot.pending_inputs {
-        if pending.receipt.loop_id == loop_id
-            && pending.trigger_source.is_none()
-            && pending.agent_message.is_none()
-        {
-            pending.armed = true;
-        }
     }
     Ok(())
 }

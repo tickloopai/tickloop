@@ -825,12 +825,21 @@ fn distinct_commands(command: &str, unclear: UnclearCommands) -> Option<Vec<Stri
     if let Some(commands) = split_shell_commands(command) {
         return Some(commands.into_iter().map(str::to_owned).collect());
     }
-    let commands = split_shell_parts(command, true)?
-        .iter()
-        .map(|part| without_redirections(part))
-        .collect::<Vec<_>>();
+    let commands = split_shell_parts_with_redirections(
+        command,
+        true,
+        matches!(unclear, UnclearCommands::Match),
+    )?
+    .into_iter()
+    .map(|part| match unclear {
+        UnclearCommands::Match => without_hook_redirections(part),
+        UnclearCommands::MatchWhereTheRuleCouldRun => Some(without_redirections(part)),
+    })
+    .collect::<Option<Vec<_>>>()?;
     (!commands.iter().any(|command| match unclear {
-        UnclearCommands::Match => split_shell_commands(command).is_none(),
+        UnclearCommands::Match => {
+            split_shell_commands(command).is_none_or(|parts| parts.len() != 1)
+        }
         UnclearCommands::MatchWhereTheRuleCouldRun => {
             command.contains(['(', ')', '{', '}', '<', '>'])
         }
@@ -1045,6 +1054,106 @@ fn without_wrappers(command: &str) -> String {
     words.join(" ")
 }
 
+/// Removes only unquoted redirections for hook conditions. Permission restrictions keep their
+/// older conservative parser; substitutions, here-documents and unclear targets still match.
+fn without_hook_redirections(command: &str) -> Option<String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut quote = None;
+    let mut index = 0;
+    while let Some(&character) = chars.get(index) {
+        if character == '\\' && quote != Some('\'') {
+            output.push(character);
+            output.push(*chars.get(index + 1)?);
+            index += 2;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            output.push(character);
+            if character == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        if matches!(character, '<' | '>') || character == '&' && chars.get(index + 1) == Some(&'>')
+        {
+            let word_start = output
+                .char_indices()
+                .rev()
+                .find(|(_, character)| matches!(character, ' ' | '\t' | '\n'))
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            if character != '&'
+                && !output[word_start..].is_empty()
+                && output[word_start..]
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+            {
+                output.truncate(word_start);
+            }
+            if character == '&' {
+                index += 1;
+            }
+            let operator = chars[index];
+            index += 1;
+            if operator == '<' && chars.get(index) == Some(&'<') {
+                return None;
+            }
+            if chars.get(index) == Some(&'&')
+                || operator == '>' && matches!(chars.get(index), Some('>' | '|'))
+                || operator == '<' && chars.get(index) == Some(&'>')
+            {
+                index += 1;
+            }
+            while chars
+                .get(index)
+                .is_some_and(|character| matches!(character, ' ' | '\t' | '\n'))
+            {
+                index += 1;
+            }
+            let target_start = index;
+            let mut target_quote = None;
+            while let Some(&character) = chars.get(index) {
+                if character == '\\' && target_quote != Some('\'') {
+                    chars.get(index + 1)?;
+                    index += 2;
+                    continue;
+                }
+                if let Some(delimiter) = target_quote {
+                    if character == delimiter {
+                        target_quote = None;
+                    }
+                } else if matches!(character, '\'' | '"') {
+                    target_quote = Some(character);
+                } else if matches!(character, ' ' | '\t' | '\n')
+                    || matches!(character, '<' | '>' | '&' | '|' | ';')
+                {
+                    break;
+                } else if matches!(character, '(' | ')' | '{' | '}') {
+                    return None;
+                }
+                index += 1;
+            }
+            if index == target_start || target_quote.is_some() {
+                return None;
+            }
+            if !output.is_empty() {
+                output.push(' ');
+            }
+            continue;
+        }
+        output.push(character);
+        index += 1;
+    }
+    quote.is_none().then_some(output)
+}
+
 /// A simple command with its redirections, such as `> out.txt` or `2>&1`, left out.
 fn without_redirections(command: &str) -> String {
     let is_redirection = |token: &str| {
@@ -1179,25 +1288,37 @@ fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
 }
 
 fn split_shell_parts(command: &str, allow_special_syntax: bool) -> Option<Vec<&str>> {
+    split_shell_parts_with_redirections(command, allow_special_syntax, false)
+}
+
+fn split_shell_parts_with_redirections(
+    command: &str,
+    allow_special_syntax: bool,
+    keep_redirection_operators: bool,
+) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
     let mut commands = Vec::new();
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
     let mut index = 0;
+    let mut previous_redirection = false;
     while index < bytes.len() {
         let byte = bytes[index];
         if escaped {
+            previous_redirection = false;
             escaped = false;
             index += 1;
             continue;
         }
         if byte == b'\\' && quote != Some(b'\'') {
+            previous_redirection = false;
             escaped = true;
             index += 1;
             continue;
         }
         if matches!(byte, b'\'' | b'"') {
+            previous_redirection = false;
             if quote == Some(byte) {
                 quote = None;
             } else if quote.is_none() {
@@ -1213,6 +1334,14 @@ fn split_shell_parts(command: &str, allow_special_syntax: bool) -> Option<Vec<&s
             {
                 return None;
             }
+            if keep_redirection_operators
+                && ((matches!(byte, b'&' | b'|') && previous_redirection)
+                    || (byte == b'&' && bytes.get(index + 1) == Some(&b'>')))
+            {
+                previous_redirection = false;
+                index += 1;
+                continue;
+            }
             let separator_length = match (byte, bytes.get(index + 1).copied()) {
                 (b'&', Some(b'&')) | (b'|', Some(b'|')) | (b'|', Some(b'&')) => 2,
                 (b';' | b'|' | b'&' | b'\n', _) => 1,
@@ -1224,11 +1353,13 @@ fn split_shell_parts(command: &str, allow_special_syntax: bool) -> Option<Vec<&s
                     return None;
                 }
                 commands.push(part);
+                previous_redirection = false;
                 index += separator_length;
                 start = index;
                 continue;
             }
         }
+        previous_redirection = quote.is_none() && matches!(byte, b'<' | b'>');
         index += 1;
     }
     if escaped || quote.is_some() {
@@ -1406,6 +1537,25 @@ mod restriction_tests {
                 "the existing conservative permission restriction stays unchanged"
             );
         }
+    }
+
+    #[test]
+    fn hook_conditions_parse_quoted_and_attached_redirections() {
+        for command in [
+            "echo 'a > b' > /dev/null && git status | head",
+            "echo 'a < b' >'/tmp/out file' 2>&1 && git status | head",
+            "echo hello>/dev/null && git status | head",
+            "echo hello &>/dev/null && git status | head",
+            r"echo \>& git status >/dev/null",
+        ] {
+            assert!(!bash_matches("git push*", command), "{command}");
+            assert!(bash_matches("git status*", command), "{command}");
+        }
+        assert!(bash_matches("git push*", "git push>push.log 2>&1"));
+        assert!(bash_matches("echo 2*", "echo 2&>/dev/null"));
+        assert!(bash_matches("git push*", "3<>lock git push"));
+        assert!(bash_matches("git push*", "cat <(git push)"));
+        assert!(bash_matches("git push*", "cat <(date)"));
     }
 
     #[test]

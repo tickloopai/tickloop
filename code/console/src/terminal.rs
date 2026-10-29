@@ -2216,6 +2216,7 @@ async fn interact_with_herdr(
                 console,
                 agent,
                 selected_chat.is_none() && !overview_active,
+                selected_chat.map(Into::into),
                 &dispatch_directory,
                 &mut hook_tasks,
             )?;

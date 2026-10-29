@@ -1122,7 +1122,7 @@ impl Agent {
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            crate::hooks::resume_prompt_inputs(chat);
+            crate::hooks::resume_prompt_inputs(chat, self.inner.waits);
             self.save(&chat.snapshot);
         }
         self.resume_family_messages(chat_id).await;
