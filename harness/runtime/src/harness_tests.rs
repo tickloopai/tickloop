@@ -329,11 +329,11 @@ fn composed(environment: bool, options: HarnessOptions) -> Result<Agent, AgentEr
 }
 
 #[tokio::test]
-async fn managed_settlement_preserves_unknown_operations_and_reports_incomplete_cleanup() {
+async fn managed_settlement_reports_an_unknown_operation_once_and_keeps_it() {
     let agent = composed(
         true,
         HarnessOptions {
-            tools: ToolPolicy::one_shot(),
+            tools: ToolPolicy::acp(),
             host: AgentHostOptions::embedded_defaults(),
             waits: WaitHosting::Process,
             ..durable_chat_options()
@@ -343,31 +343,37 @@ async fn managed_settlement_preserves_unknown_operations_and_reports_incomplete_
     let folder = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(folder.path().into()).await.unwrap();
     let operation = tickloop_ids::generate();
-    agent
-        .inner
-        .chats
-        .lock()
-        .await
-        .get_mut(&chat)
-        .unwrap()
-        .snapshot
-        .operations
-        .push(tickloop_harness_protocol::OperationRecord {
-            parent_call_id: None,
-            parent_call_index: None,
-            task_binding: None,
-            id: operation,
-            loop_id: tickloop_ids::generate().into(),
-            run_id: tickloop_ids::generate().into(),
-            call_id: "unknown-call".into(),
-            name: "TickCall".into(),
-            input: serde_json::json!({}),
-            file_change: None,
-            state: OperationState::Unknown,
-            result: None,
-        });
-    let error = agent.settle_managed(chat, true).await.unwrap_err();
+    let run: tickloop_harness_protocol::RunId = tickloop_ids::generate().into();
+    {
+        let mut chats = agent.inner.chats.lock().await;
+        let state = chats.get_mut(&chat).unwrap();
+        // As a Run of this invocation left it.
+        state.unsettled_runs.insert(run);
+        state
+            .snapshot
+            .operations
+            .push(tickloop_harness_protocol::OperationRecord {
+                parent_call_id: None,
+                parent_call_index: None,
+                task_binding: None,
+                id: operation,
+                loop_id: tickloop_ids::generate().into(),
+                run_id: run,
+                call_id: "unknown-call".into(),
+                name: "TickCall".into(),
+                input: serde_json::json!({}),
+                file_change: None,
+                state: OperationState::Unknown,
+                result: None,
+            });
+    }
+    let error = agent.settle_managed(chat, false).await.unwrap_err();
     assert!(error.to_string().contains(&operation.to_string()));
+    // Reported once: later prompts and the release settle without inheriting it, and the
+    // session stays configurable.
+    assert!(agent.managed_session_idle(chat).await.unwrap());
+    agent.settle_managed(chat, false).await.unwrap();
+    agent.settle_managed(chat, true).await.unwrap();
     assert_eq!(
         agent.snapshot(chat).await.unwrap().operations[0].state,
         OperationState::Unknown

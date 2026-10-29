@@ -378,6 +378,7 @@ impl Agent {
                     family_stopping: false,
                     task_checkpoint_pending: false,
                     family_finishing: HashSet::new(),
+                    unsettled_runs: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
                     announced_loop_state,
                     active: saved

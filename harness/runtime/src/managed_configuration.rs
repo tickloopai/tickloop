@@ -216,16 +216,18 @@ async fn managed_chat_idle(chat: &Chat) -> Result<bool, AgentError> {
                 | LoopState::WaitingQuestion
                 | LoopState::WaitingPlan
         )
+        // An outcome-unknown record is history, not activity; only an unsettled Run's operation
+        // can still be in flight.
         || snapshot.operations.iter().any(|operation| {
-            !matches!(
+            matches!(
                 operation.state,
-                OperationState::Completed | OperationState::Failed
-            )
+                OperationState::Proposed | OperationState::Admitted
+            ) && chat.unsettled_runs.contains(&operation.run_id)
         })
         || snapshot
             .commands
             .iter()
-            .any(|command| !command_finished(&command.state))
+            .any(|command| command_running(&command.state))
         || snapshot.user_shells.iter().any(|shell| {
             !matches!(
                 shell.state,
@@ -236,23 +238,26 @@ async fn managed_chat_idle(chat: &Chat) -> Result<bool, AgentError> {
         return Ok(false);
     }
     // Watchers project command updates asynchronously. Consult the source as well, while the
-    // Chat lock excludes new model and user-Shell admissions. Unknown outcomes fail closed.
+    // Chat lock excludes new model and user-Shell admissions.
     Ok(!chat
         .tools
         .commands()
         .await
         .iter()
-        .any(|command| !command_finished(&command.state))
+        .any(|command| command_running(&command.state))
         && !chat
             .tools
             .user_commands()
             .await
             .iter()
-            .any(|command| !command_finished(&command.state)))
+            .any(|command| command_running(&command.state)))
 }
 
-fn command_finished(state: &CommandState) -> bool {
-    matches!(state, CommandState::Completed | CommandState::Failed)
+fn command_running(state: &CommandState) -> bool {
+    matches!(
+        state,
+        CommandState::Running | CommandState::Background | CommandState::Cancelling
+    )
 }
 
 #[cfg(test)]
@@ -428,16 +433,21 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_commands_are_not_idle() {
+    fn only_running_commands_keep_a_managed_chat_busy() {
         for state in [
             CommandState::Running,
             CommandState::Background,
             CommandState::Cancelling,
+        ] {
+            assert!(command_running(&state));
+        }
+        // An unknown outcome is history the settlement already reported, not activity.
+        for state in [
+            CommandState::Completed,
+            CommandState::Failed,
             CommandState::Unknown,
         ] {
-            assert!(!command_finished(&state));
+            assert!(!command_running(&state));
         }
-        assert!(command_finished(&CommandState::Completed));
-        assert!(command_finished(&CommandState::Failed));
     }
 }

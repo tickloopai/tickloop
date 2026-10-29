@@ -619,6 +619,22 @@ impl Agent {
             failures.push(format!("Transcript flush failed: {error}"));
         }
         let snapshot = self.snapshot(chat_id).await?;
+        // Each settlement answers for the Runs since the previous one. Their outcome-unknown
+        // records fail it once and then stay as history: a later prompt of an ACP Chat, or its
+        // release, does not inherit them.
+        let runs = std::mem::take(
+            &mut self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get_mut(&chat_id)
+                .ok_or(AgentError::NotFound)?
+                .unsettled_runs,
+        );
+        let settles = |operation: &tickloop_harness_protocol::OperationRecord| {
+            runs.contains(&operation.run_id)
+        };
         let unresolved = snapshot
             .operations
             .iter()
@@ -626,14 +642,16 @@ impl Agent {
                 matches!(
                     operation.state,
                     OperationState::Admitted | OperationState::Unknown
-                )
+                ) && settles(operation)
             })
             .collect::<Vec<_>>();
-        if snapshot.commands.iter().any(|command| {
-            !matches!(
-                command.state,
-                CommandState::Completed | CommandState::Failed
-            )
+        if snapshot.commands.iter().any(|command| match command.state {
+            CommandState::Completed | CommandState::Failed => false,
+            CommandState::Unknown => snapshot
+                .operations
+                .iter()
+                .any(|operation| operation.id == command.operation_id && settles(operation)),
+            CommandState::Running | CommandState::Background | CommandState::Cancelling => true,
         }) || snapshot.user_shells.iter().any(|shell| {
             !matches!(
                 shell.state,

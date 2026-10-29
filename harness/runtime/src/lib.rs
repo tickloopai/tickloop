@@ -492,6 +492,9 @@ struct Chat {
     family_stopping: bool,
     task_checkpoint_pending: bool,
     family_finishing: HashSet<RunId>,
+    /// A managed Chat's Runs started since its last settlement, which answers for their
+    /// unresolved outcomes once; ordinary Chats keep none.
+    unsettled_runs: HashSet<RunId>,
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
@@ -4611,6 +4614,9 @@ impl Agent {
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
+            if self.inner.tool_policy.is_managed() {
+                candidate.unsettled_runs.insert(pending.receipt.run_id);
+            }
             let receipt = pending.receipt.clone();
             self.mark_run_inputs_handled(&mut candidate, &pending);
             candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
@@ -5810,6 +5816,7 @@ impl NewChat {
             family_stopping: false,
             task_checkpoint_pending: false,
             family_finishing: HashSet::new(),
+            unsettled_runs: HashSet::new(),
             snapshot,
             bookkeeping,
             start_new_tool_result_message: false,
