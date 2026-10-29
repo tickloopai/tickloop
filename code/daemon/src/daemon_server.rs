@@ -870,6 +870,22 @@ impl DaemonServer {
                 self.inner.factory.replace_tickhost().await?;
                 Ok((CommandResult::Done, PersistenceState::NotApplicable))
             }
+            AgentCommand::WriteHookTrust {
+                launch,
+                changes,
+                expected_revision,
+            } => {
+                let hooks = crate::hook_trust::write_trust(
+                    launch,
+                    changes.clone(),
+                    expected_revision.clone(),
+                )
+                .await?;
+                Ok((
+                    CommandResult::Hooks(Box::new(hooks)),
+                    PersistenceState::NotApplicable,
+                ))
+            }
             AgentCommand::StopAgent { execution } => {
                 self.stop_agent(*execution).await?;
                 Ok((CommandResult::Done, PersistenceState::NotApplicable))
@@ -1004,6 +1020,11 @@ impl AgentAccess for DaemonServer {
                 ObservationValue::McpServers(vec![
                     self.inner.factory.draft_mcp_server(&launch, &name).await?,
                 ]),
+                self.cursor(),
+                None,
+            )),
+            ObservationRequest::Hooks { launch } => Ok(Observation::single(
+                ObservationValue::Hooks(Box::new(crate::hook_trust::hooks(&launch).await?)),
                 self.cursor(),
                 None,
             )),

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
+use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
 use tickloop_harness::protocol::{
     AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
@@ -102,6 +103,8 @@ use tickloop_harness::protocol::{
 /// 36.0 adds an ended root Agent whose last turn had finished (`EndedOutcome::Completed`,
 /// `EndReason::Finished`), which older readers reject as unknown, and whether an Agent summary
 /// still has work pending while its Loop is idle.
+/// 36.1 adds reading the hooks configured for the Folder a launch starts in, with their trust,
+/// and changing their trust records.
 /// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
 /// reason, which older readers reject as unknown, and the hook runs of the approval history.
 pub const PROTOCOL_MAJOR: u16 = 37;
@@ -435,6 +438,16 @@ pub enum AgentCommand {
     },
     TrustWorkingDirectory {
         folder: PathBuf,
+    },
+    /// Changes the trust records of hooks configured for the Folder `launch` starts in, in the
+    /// configuration root it names, and answers with the hooks as they then stand. With
+    /// `expected_revision`, the change applies only while the records are still at the
+    /// [`HookList::revision`] the user reviewed.
+    WriteHookTrust {
+        launch: Box<LaunchSpec>,
+        changes: Vec<HookTrustChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<String>,
     },
     FlushTranscripts,
     UpgradeRuntime {
@@ -770,6 +783,11 @@ pub enum ObservationRequest {
     /// Worker's.
     EndedAgents {
         store_root: Option<PathBuf>,
+    },
+    /// The hooks configured for the Folder `launch` starts in, from the configuration root it
+    /// names, each with its trust; read alike before and after an Agent starts there.
+    Hooks {
+        launch: Box<LaunchSpec>,
     },
 }
 
@@ -1111,6 +1129,7 @@ pub enum ObservationValue {
     OtherTickhost(Option<OtherTickhost>),
     RuntimeVersion(Box<crate::RuntimeVersion>),
     PlanFile(Option<PathBuf>),
+    Hooks(Box<HookList>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1251,6 +1270,7 @@ pub enum CommandResult {
         snapshot: Box<LiveChatSnapshot>,
         draft: TakenBackPrompt,
     },
+    Hooks(Box<HookList>),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
