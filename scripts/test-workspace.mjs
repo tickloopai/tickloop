@@ -44,11 +44,12 @@ try {
     child.on('exit', code => resolve(code ?? 1));
   });
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  let remaining = [];
-  for (let attempt = 0; attempt < 50; attempt++) {
+  const leakGraceMs = 5000;
+  const leakDeadline = Date.now() + leakGraceMs;
+  let remaining;
+  for (;; await sleep(100)) {
     remaining = processes().filter(process => !before.has(process.identity));
-    if (!remaining.length) break;
-    await sleep(100);
+    if (!remaining.length || Date.now() >= leakDeadline) break;
   }
   const runtimes = registeredDirectories();
   function runtimeDirectoriesIn(root) {
@@ -59,17 +60,18 @@ try {
   const leftoverDirectories = [...new Set([...runtimes.filter(path => existsSync(path)), ...runtimeDirectoriesIn(temporary)])];
   console.error(`Test cleanup: ${remaining.length} owned processes, ${leftoverDirectories.length} owned runtime directories left by tests (report-only).`);
   if (remaining.length || leftoverDirectories.length) {
-    for (const { pid, identity } of remaining) {
-      if (processes().some(process => process.identity === identity)) {
-        console.error(`Stopping leaked test PID ${pid}`);
-        try { process.kill(pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-      }
+    const stillRunning = () => {
+      if (!remaining.length) return [];
+      const running = new Set(processes().map(process => process.identity));
+      return remaining.filter(process => running.has(process.identity));
+    };
+    for (const { pid } of stillRunning()) {
+      console.error(`Stopping leaked test PID ${pid}`);
+      try { process.kill(pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
     }
     await sleep(1000);
-    for (const { pid, identity } of remaining) {
-      if (processes().some(process => process.identity === identity)) {
-        try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-      }
+    for (const { pid } of stillRunning()) {
+      try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
     }
     for (const path of leftoverDirectories) {
       console.error(`Removing leaked owned runtime ${path}`);
