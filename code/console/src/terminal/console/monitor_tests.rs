@@ -625,7 +625,7 @@ fn an_artifact_row_routes_copy_and_feedback_to_artifact_actions() {
     entry.actions = fixture_actions(&entry.instance);
     state.monitor.replace(TickGroup::Artifacts, vec![entry]);
     state.monitor.focus(false, None);
-    for action in ['c', 'f', 'h'] {
+    for action in ['c', 'f', 'u'] {
         assert!(
             matches!(state.key(KeyEvent::new(KeyCode::Char(action), KeyModifiers::NONE)), Some(InputEvent::TickAction { action: received, .. }) if received.key == action)
         );
@@ -3007,7 +3007,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_twice_unlinks_it() {
             ('x', "unlink"),
             ('c', "copy"),
             ('f', "feedback"),
-            ('h', "include earlier feedback")
+            ('u', "include earlier feedback")
         ]
     );
     assert_eq!(requested_key(confirm_removal(&mut state)), 'x');
@@ -3031,7 +3031,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_twice_unlinks_it() {
             ('x', "unlink"),
             ('c', "copy"),
             ('f', "feedback"),
-            ('h', "include earlier feedback")
+            ('u', "include earlier feedback")
         ]
     );
 }

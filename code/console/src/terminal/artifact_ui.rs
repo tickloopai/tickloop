@@ -80,12 +80,12 @@ pub(super) async fn tick_action(
             }
         }
         'c' => console.copy_artifact_link(&tick.url)?,
-        'f' | 'h' => {
+        'f' | 'u' => {
             agent
                 .link_artifact(
                     chat,
                     tick,
-                    if action == 'h' {
+                    if action == 'u' {
                         tickloop_harness::protocol::ArtifactFeedbackHistory::All
                     } else {
                         tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly
@@ -721,7 +721,7 @@ mod tests {
                 tickloop_harness::protocol::ArtifactFeedbackHistory::NewOnly
             )]
         );
-        tick_action(&agent, &console, None, chat, tick.instance_id(), 'h')
+        tick_action(&agent, &console, None, chat, tick.instance_id(), 'u')
             .await
             .unwrap();
         assert_eq!(

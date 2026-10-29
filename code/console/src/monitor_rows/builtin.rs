@@ -745,7 +745,7 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
         ),
         ('c', "copy"),
         ('f', "feedback"),
-        ('h', "include earlier feedback"),
+        ('u', "include earlier feedback"),
     ]
     .into_iter()
     .map(|(key, label)| MonitorAction {
