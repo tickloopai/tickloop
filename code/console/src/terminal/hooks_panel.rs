@@ -1,6 +1,7 @@
 //! `/hooks`: the hooks configured for a Folder, grouped by where they come from, each with its
 //! event, matcher, command and trust. Space or `t` trusts the selected plugin or repository hook,
-//! `x` twice disables it or restores it, and Enter shows its details with what its trust covers.
+//! `x` twice disables it or restores it, and Enter shows its details with what its trust covers,
+//! which the arrows and Ctrl+N/Ctrl+P scroll when they do not fit.
 //! The review a New Agent offers once per Folder is the same panel opened on its menu; reviewing
 //! one by one turns it into the list. The panel keeps what it shows and what the user chose; the
 //! Console runs the work and hands each result back through [`HooksPanel::apply`].
@@ -155,6 +156,8 @@ pub(super) struct HooksPanel {
     read: u64,
     selected: usize,
     top: usize,
+    /// The first row of the details shown.
+    details_top: usize,
     /// The hook a first `x` named, by source and key, and when.
     confirmation: Option<(HookSource, String, Instant)>,
     pending: Option<Pending>,
@@ -174,6 +177,7 @@ impl HooksPanel {
             read: 0,
             selected: 0,
             top: 0,
+            details_top: 0,
             confirmation: None,
             pending: None,
             notice: None,
@@ -315,7 +319,15 @@ impl HooksPanel {
             };
         }
         if let Some(down) = movement {
-            self.selected = step(self.selected, self.hooks().len(), down);
+            if self.view == View::Details {
+                self.details_top = if down {
+                    self.details_top.saturating_add(1)
+                } else {
+                    self.details_top.saturating_sub(1)
+                };
+            } else {
+                self.selected = step(self.selected, self.hooks().len(), down);
+            }
             return HooksPanelEffect::None;
         }
         match (key.code, key.modifiers) {
@@ -326,6 +338,7 @@ impl HooksPanel {
             (KeyCode::Esc, _) => HooksPanelEffect::Close,
             (KeyCode::Enter, _) if self.view == View::List && self.selected_hook().is_some() => {
                 self.view = View::Details;
+                self.details_top = 0;
                 HooksPanelEffect::None
             }
             (KeyCode::Char(' ' | 't'), KeyModifiers::NONE) => self.trust_selected(),
@@ -584,10 +597,25 @@ impl HooksPanel {
             HookSource::Repository => REPOSITORY_COVERAGE,
         };
         push_wrapped(&mut body, coverage, INDENT, width, Role::MutedText);
-        let mut hints = self.action_hints(hook);
-        hints.push(("esc back".to_owned(), 9));
-        body.hint = fit_hint(&hints, width, display);
+        body.hint = self.details_hint(hook, false, width, display);
         body
+    }
+
+    /// The details' key hints, naming the scrolling when the details do not fit.
+    fn details_hint(
+        &self,
+        hook: &ConfiguredHook,
+        scrolls: bool,
+        width: usize,
+        display: DisplayProfile,
+    ) -> String {
+        let mut hints = Vec::new();
+        if scrolls {
+            hints.push(("↑↓ scroll".to_owned(), 9));
+        }
+        hints.extend(self.action_hints(hook));
+        hints.push(("esc back".to_owned(), 9));
+        fit_hint(&hints, width, display)
     }
 
     fn list_body(&self, width: usize, display: DisplayProfile) -> Body {
@@ -718,19 +746,28 @@ impl HooksPanel {
         let mut lines = vec![RoleLine::role(title, Role::DialogTitle)];
         let status = self.status_lines(width);
         let capacity = height.saturating_sub(CHROME_ROWS + status.len());
-        let body = self.body(width, display);
-        // The review and the details scroll to their focus alone; the list keeps its place.
-        let mut focus_top = 0;
-        let top = if self.view == View::List {
-            &mut self.top
-        } else {
-            &mut focus_top
-        };
-        if body.focus.start < *top {
-            *top = body.focus.start;
+        let mut body = self.body(width, display);
+        if self.view == View::Details
+            && body.lines.len() > capacity
+            && let Some(hook) = self.selected_hook()
+        {
+            body.hint = self.details_hint(hook, true, width, display);
         }
-        if body.focus.end > *top + capacity {
-            *top = body.focus.end.saturating_sub(capacity);
+        // The list keeps its place and the review scrolls to its focus alone; the details
+        // scroll as the user moves them.
+        let mut focus_top = 0;
+        let top = match self.view {
+            View::List => &mut self.top,
+            View::Details => &mut self.details_top,
+            View::Review { .. } => &mut focus_top,
+        };
+        if self.view != View::Details {
+            if body.focus.start < *top {
+                *top = body.focus.start;
+            }
+            if body.focus.end > *top + capacity {
+                *top = body.focus.end.saturating_sub(capacity);
+            }
         }
         *top = (*top).min(body.lines.len().saturating_sub(capacity));
         let skip = *top;
@@ -1104,7 +1141,9 @@ mod tests {
         ] {
             assert!(shown.contains(part), "{part} in {shown}");
         }
+        press(&mut panel, KeyCode::Esc);
         press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Enter);
         let shown = text(&mut panel);
         assert!(shown.contains("Source: Plugin guard@market"), "{shown}");
         assert!(shown.contains("plugin's whole content"), "{shown}");
@@ -1116,6 +1155,85 @@ mod tests {
             press(&mut panel, KeyCode::Esc),
             HooksPanelEffect::Close
         ));
+    }
+
+    /// The frame's rows run together without whitespace, so text the frame wraps anywhere
+    /// reads as written; then its key hints.
+    fn unwrapped(panel: &mut HooksPanel, width: usize, height: usize) -> (String, String) {
+        let lines = panel
+            .frame(width, height, DisplayProfile::default())
+            .lines
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>();
+        let hint = lines.last().cloned().unwrap_or_default();
+        let shown = lines.concat().split_whitespace().collect();
+        (shown, hint)
+    }
+
+    #[test]
+    fn details_taller_than_a_short_screen_scroll_with_arrows_and_control_keys() {
+        const SHORT_WIDTH: usize = 40;
+        const SHORT_HEIGHT: usize = 12;
+        let flags = (1..=30)
+            .map(|flag| format!("--flag-{flag}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut long = hook(HookSource::Repository, "format", HookTrust::Pending);
+        long.command = format!("./format.sh {flags} --last-flag");
+        long.resolved_command = Some(long.command.clone());
+        let mut panel = loaded(vec![long, hook(plugin(), "lint", HookTrust::Pending)]);
+        press(&mut panel, KeyCode::Enter);
+
+        let (shown, hint) = unwrapped(&mut panel, SHORT_WIDTH, SHORT_HEIGHT);
+        assert!(shown.contains("Source:Thisfolder"), "{shown}");
+        assert!(!shown.contains("--last-flag"), "{shown}");
+        assert!(
+            hint.contains("↑↓ scroll") && hint.contains("esc back"),
+            "{hint}"
+        );
+
+        let mut seen = shown;
+        for step in 0..40 {
+            if step % 2 == 0 {
+                press(&mut panel, KeyCode::Down);
+            } else {
+                panel.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            }
+            seen.push(' ');
+            seen.push_str(&unwrapped(&mut panel, SHORT_WIDTH, SHORT_HEIGHT).0);
+        }
+        let (bottom, _) = unwrapped(&mut panel, SHORT_WIDTH, SHORT_HEIGHT);
+        assert!(seen.contains("--flag-15--flag-16"), "{seen}");
+        assert!(seen.contains("--last-flag"), "{seen}");
+        assert!(
+            bottom.contains("Filesthecommandrunsfromanywhereelsearenotcovered"),
+            "the coverage note is reachable and scrolling stops at it: {bottom}"
+        );
+        assert!(
+            !seen.contains("./lint.sh"),
+            "scrolling never moves to another hook"
+        );
+
+        for step in 0..40 {
+            if step % 2 == 0 {
+                press(&mut panel, KeyCode::Up);
+            } else {
+                panel.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+            }
+        }
+        let (top, _) = unwrapped(&mut panel, SHORT_WIDTH, SHORT_HEIGHT);
+        assert!(top.contains("Source:Thisfolder"), "{top}");
+
+        press(&mut panel, KeyCode::Esc);
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Enter);
+        let (short, hint) = unwrapped(&mut panel, WIDTH, HEIGHT);
+        assert!(short.contains("Command:./lint.sh"), "{short}");
+        assert!(
+            !hint.contains("scroll"),
+            "details that fit name no scrolling: {hint}"
+        );
     }
 
     #[test]
