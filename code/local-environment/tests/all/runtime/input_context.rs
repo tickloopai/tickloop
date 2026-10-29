@@ -329,10 +329,20 @@ async fn attached_images_can_be_submitted_without_fabricating_prompt_text() {
     assert!(
         matches!(&snapshot.messages[0].content[..], [Content::Text { text }] if text.is_empty())
     );
-    assert_eq!(
-        requested_images(&model.requests.lock().unwrap()[0]).len(),
-        1
-    );
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requested_images(&requests[0]).len(), 1);
+        // The stored prompt keeps its empty text; the request sends only the attachment.
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(content, Content::Text { text } if text.is_empty())),
+            "{:?}",
+            requests[0].messages
+        );
+    }
     assert_eq!(snapshot.highest_pasted_image_id(), None);
     agent.shutdown().await;
     drop(agent);
