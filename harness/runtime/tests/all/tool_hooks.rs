@@ -57,6 +57,7 @@ fn hook(
         matcher: matcher.map(Into::into),
         command: command.into(),
         resolved_command: Some(command.into()),
+        sensitive_values: Vec::new(),
         condition: None,
         timeout_secs: 600,
         background: None,
@@ -1130,5 +1131,93 @@ async fn an_unrestricted_host_still_asks_when_a_hook_asks() {
     assert_eq!(observed.requests.len(), 1);
     assert!(observed.started.is_empty());
     assert!(observed.results[0].is_error);
+    bench.agent.shutdown().await;
+}
+
+const HOOK_SECRET_SENTINEL: &str = "HOOK_SECRET_SENTINEL";
+
+/// A plugin hook whose command was given the sensitive [`HOOK_SECRET_SENTINEL`].
+fn secret_hook(event: HookEvent, script: &str) -> ConfiguredHook {
+    ConfiguredHook {
+        command: format!("{script} ${{user_config.token}}"),
+        resolved_command: Some(format!("{script} {HOOK_SECRET_SENTINEL}")),
+        sensitive_values: vec![HOOK_SECRET_SENTINEL.into()],
+        ..plugin_hook(event, Some("Bash"), script)
+    }
+}
+
+/// Fails when anything the model, the Chat's views or its records got holds the secret.
+async fn assert_secret_kept(bench: &Bench, observed: &Observed) {
+    let requests = format!("{:?}", bench.model.requests.lock().unwrap());
+    let snapshot = format!("{:?}", bench.agent.snapshot(bench.chat).await.unwrap());
+    let history = format!(
+        "{:?}",
+        bench.agent.approval_history_view(bench.chat).await.unwrap()
+    );
+    let shown = format!("{:?} {:?}", observed.results, observed.hook_runs);
+    for (what, text) in [
+        ("model requests", requests),
+        ("snapshot", snapshot),
+        ("activity history", history),
+        ("events", shown),
+    ] {
+        assert!(!text.contains(HOOK_SECRET_SENTINEL), "{what}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_sensitive_plugin_value_a_hook_prints_never_reaches_the_model_views_or_records() {
+    let denying = "deny.sh";
+    let blocking = "block.sh";
+    let bench = Bench::start(
+        Options::new(ExecutionMode::FullAccess, vec![build_call(), text("done")]),
+        vec![
+            secret_hook(HookEvent::PreToolUse, denying),
+            secret_hook(HookEvent::PreToolUse, blocking),
+        ],
+    )
+    .await;
+    bench.define(&format!("{denying} {HOOK_SECRET_SENTINEL}"), |_| {
+        let mut run = pre_tool_answer(json!({
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!("token {HOOK_SECRET_SENTINEL} is stale"),
+            "additionalContext": format!("context {HOOK_SECRET_SENTINEL}"),
+            "updatedInput": {"command": format!("{BUILD} --token {HOOK_SECRET_SENTINEL}")},
+        }));
+        run.stderr = format!("debug {HOOK_SECRET_SENTINEL}").into_bytes();
+        run
+    });
+    bench.define(&format!("{blocking} {HOOK_SECRET_SENTINEL}"), |_| {
+        exits(2, "", &format!("rejected {HOOK_SECRET_SENTINEL}\n"))
+    });
+
+    let observed = bench.run("Build it.", true).await;
+
+    assert!(observed.started.is_empty());
+    let refusal = &observed.results[0].content;
+    assert!(refusal.contains("[redacted]"), "{refusal}");
+    assert_secret_kept(&bench, &observed).await;
+    bench.agent.shutdown().await;
+
+    let bench = Bench::start(
+        Options::new(ExecutionMode::FullAccess, vec![build_call(), text("done")]),
+        vec![secret_hook(HookEvent::PostToolUse, GUARD)],
+    )
+    .await;
+    bench.define(&format!("{GUARD} {HOOK_SECRET_SENTINEL}"), |_| {
+        answer(json!({
+            "systemMessage": format!("saw {HOOK_SECRET_SENTINEL}"),
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": format!("context {HOOK_SECRET_SENTINEL}"),
+            },
+        }))
+    });
+
+    let observed = bench.run("Build it.", true).await;
+
+    let requests = format!("{:?}", bench.model.requests.lock().unwrap());
+    assert!(requests.contains("context [redacted]"), "{requests}");
+    assert_secret_kept(&bench, &observed).await;
     bench.agent.shutdown().await;
 }

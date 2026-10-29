@@ -299,6 +299,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: Some("Bash".into()),
                 command: "check-bash".into(),
                 resolved_command: Some("check-bash".into()),
+                sensitive_values: Vec::new(),
                 condition: None,
                 timeout_secs: 30,
                 background: None,
@@ -314,6 +315,7 @@ fn user_hooks_merge_the_top_level_and_the_folder_partition_and_need_no_trust() {
                 matcher: None,
                 command: "finish".into(),
                 resolved_command: Some("finish".into()),
+                sensitive_values: Vec::new(),
                 condition: None,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
                 background: None,
@@ -907,5 +909,210 @@ fn content_behind_symlinks_counts_for_the_fingerprint() {
         trust_after(&setup, command, || {}),
         HookTrust::Trusted,
         "cycles hash the same each time"
+    );
+}
+
+const HOOK_SECRET_SENTINEL: &str = "HOOK_SECRET_SENTINEL";
+
+#[test]
+fn a_plugin_hook_carries_its_sensitive_values_and_views_get_it_without_them() {
+    use tickloop_code_settings::plugin_config::PluginUserConfig;
+    let setup = Setup::new();
+    let command = "check ${user_config.token} ${user_config.level}";
+    let plugin = setup.install_plugin(
+        "guard",
+        json!({
+            "name": "guard",
+            "userConfig": {
+                "token": {"type": "string", "title": "Token", "sensitive": true},
+                "unused": {"type": "string", "title": "Unused", "sensitive": true},
+                "level": {"type": "string", "title": "Level"},
+            },
+        }),
+        &[(
+            "hooks/hooks.json",
+            &hooks_json(hooks_of("PreToolUse", None, &[command])),
+        )],
+    );
+    PluginUserConfig::load(&setup.config_root, &plugin.manifest)
+        .unwrap()
+        .save(
+            &setup.config_root,
+            &plugin.manifest,
+            &serde_json::from_value(json!({
+                "token": HOOK_SECRET_SENTINEL,
+                "unused": "other-secret",
+                "level": "high",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    let hook = only(&setup.hooks(), command);
+    assert_eq!(
+        hook.resolved_command.as_deref(),
+        Some("check HOOK_SECRET_SENTINEL high"),
+        "the hook runs with the value"
+    );
+    assert_eq!(hook.sensitive_values, [HOOK_SECRET_SENTINEL]);
+
+    let shown = hook.for_views();
+    assert_eq!(
+        shown.resolved_command.as_deref(),
+        Some("check [redacted] high")
+    );
+    assert!(shown.sensitive_values.is_empty());
+    let wire = serde_json::to_string(&shown).unwrap();
+    assert!(!wire.contains(HOOK_SECRET_SENTINEL), "{wire}");
+}
+
+const MOVED_PAYLOAD_COMMAND: &str =
+    "test ! -f .claude/hooks/a/payload.sh || sh .claude/hooks/a/payload.sh";
+
+/// A Folder whose hook runs `.claude/hooks/a/payload.sh` only once it exists, with the payload
+/// beside `a/` for now; returns `.claude/hooks`.
+fn payload_beside_its_directory(setup: &Setup) -> PathBuf {
+    setup.write_repository_file(
+        &setup.folder,
+        "settings.json",
+        json!({"hooks": hooks_of("Stop", None, &[MOVED_PAYLOAD_COMMAND])}),
+    );
+    let scripts = setup.folder.join(".claude/hooks");
+    fs::create_dir_all(scripts.join("a")).unwrap();
+    fs::write(scripts.join("a/anchor"), "").unwrap();
+    fs::write(scripts.join("payload.sh"), "printf changed").unwrap();
+    scripts
+}
+
+#[test]
+fn moving_a_script_into_a_subdirectory_lapses_repository_trust() {
+    let setup = Setup::new();
+    let scripts = payload_beside_its_directory(&setup);
+
+    assert_eq!(
+        trust_after(&setup, MOVED_PAYLOAD_COMMAND, || fs::rename(
+            scripts.join("payload.sh"),
+            scripts.join("a/payload.sh")
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+}
+
+#[test]
+fn moving_a_file_into_a_subdirectory_of_a_plugin_without_a_record_lapses_its_trust() {
+    let setup = Setup::new();
+    let plugin = setup.install_plugin(
+        "guard",
+        json!({"name": "guard"}),
+        &[
+            (
+                "hooks/hooks.json",
+                &hooks_json(hooks_of("Stop", None, &["guard"])),
+            ),
+            ("z/anchor", ""),
+            ("zz.sh", "printf changed"),
+        ],
+    );
+    fs::remove_file(plugin.root.join(SHIPPED_FILES_RECORD)).unwrap();
+
+    assert_eq!(
+        trust_after(&setup, "guard", || fs::rename(
+            plugin.root.join("zz.sh"),
+            plugin.root.join("z/zz.sh")
+        )
+        .unwrap()),
+        HookTrust::Modified
+    );
+}
+
+/// The hash the hook of [`payload_beside_its_directory`] had under the previous fingerprint
+/// encoding, which named only each entry's last component and marked no directory's end.
+const PREVIOUS_ENCODING_HASH: &str = "cabfd4617c6a450051066ba76b85b3bb23fa12d63519f8f70eb4733fa6f577c7/sha256:c9dbd6f4a2feaa88188b4b546e66542171b9be82933b9a99fc4e4d9495b91ec3";
+
+#[test]
+fn trust_confirmed_under_the_previous_fingerprint_encoding_lapses() {
+    let setup = Setup::new();
+    payload_beside_its_directory(&setup);
+    let hook = only(&setup.hooks(), MOVED_PAYLOAD_COMMAND);
+    setup.write_user_settings(json!({"projects": {
+        setup.folder.to_str().unwrap(): {"hookTrust": {
+            hook.key.clone(): {"trustedHash": PREVIOUS_ENCODING_HASH}
+        }}
+    }}));
+
+    let hook = only(&setup.hooks(), MOVED_PAYLOAD_COMMAND);
+    assert_ne!(hook.hash.as_deref(), Some(PREVIOUS_ENCODING_HASH));
+    assert_eq!(hook.trust, HookTrust::Modified);
+}
+
+/// Takes every permission from `path` until the guard drops.
+fn without_permissions(path: &Path) -> impl Drop + use<> {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(PathBuf, fs::Permissions);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let saved = fs::metadata(path).unwrap().permissions();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    Restore(path.to_owned(), saved)
+}
+
+#[test]
+fn a_read_failure_behind_a_linked_directory_skips_the_hooks_as_in_a_direct_directory() {
+    let setup = Setup::new();
+    setup.write_repository_file(
+        &setup.folder,
+        "settings.json",
+        json!({"hooks": hooks_of("Stop", None, &[".claude/hooks/z/check.sh"])}),
+    );
+    let hooks = setup.folder.join(".claude/hooks");
+    let scripts = setup.folder.join("scripts");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(scripts.join("check.sh"), "exit 0\n").unwrap();
+    fs::write(scripts.join("helper.sh"), "exit 0\n").unwrap();
+    std::os::unix::fs::symlink("../../scripts", hooks.join("z")).unwrap();
+    assert_eq!(setup.hooks().hooks.len(), 1);
+
+    let _restore = without_permissions(&scripts.join("helper.sh"));
+    let list = setup.hooks();
+
+    assert!(list.hooks.is_empty(), "{:#?}", list.hooks);
+    assert!(
+        list.warnings
+            .iter()
+            .any(|warning| warning.contains("the Folder's hooks are skipped")),
+        "{:?}",
+        list.warnings
+    );
+}
+
+#[test]
+fn a_link_whose_target_cannot_be_opened_counts_as_a_fixed_marker() {
+    let setup = Setup::new();
+    let command = ".claude/hooks/check.sh";
+    setup.write_repository_file(
+        &setup.folder,
+        "settings.json",
+        json!({"hooks": hooks_of("Stop", None, &[command])}),
+    );
+    let hooks = setup.folder.join(".claude/hooks");
+    let locked = setup.folder.join("locked");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("inside.sh"), "exit 0\n").unwrap();
+    fs::write(hooks.join("check.sh"), "exit 0\n").unwrap();
+    std::os::unix::fs::symlink("../../locked", hooks.join("locked")).unwrap();
+    let _restore = without_permissions(&locked);
+
+    let list = setup.hooks();
+    assert!(list.warnings.is_empty(), "{:?}", list.warnings);
+    assert_eq!(
+        trust_after(&setup, command, || {}),
+        HookTrust::Trusted,
+        "an unreachable target hashes the same each time"
     );
 }

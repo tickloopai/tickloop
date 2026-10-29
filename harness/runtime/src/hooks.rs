@@ -8,10 +8,12 @@
 //! tool event to the calls its Permission Rule matches. Matching hooks run in parallel, the same
 //! command and `if` once per source, each a one-shot command in the Chat's Folder with the
 //! event's input on standard input and only `CLAUDE_PROJECT_DIR` and a plugin's directories
-//! added to its environment. Each run is kept in the Chat's activity history, never in what the
-//! model reads, and announced as it ends. A hook declared `async` or `asyncRewake` runs in the
-//! background instead, and so does the rest of a running hook whose first line of output is
-//! `{"async": true}`; see [`background`].
+//! added to its environment. The plugin's sensitive configuration values a command was given are
+//! removed from everything it prints and every error it gets before anything reads them. Each
+//! run is kept in the Chat's activity history, never in what the model reads, and announced as
+//! it ends. A hook declared `async` or `asyncRewake` runs in the background instead, and so does
+//! the rest of a running hook whose first line of output is `{"async": true}`; see
+//! [`background`].
 
 mod background;
 mod matcher;
@@ -38,6 +40,7 @@ use crate::environment::{
     CommandOutput, CommandSpec, ExecutionAuthority, ExecutionIntent, ExecutionOutcome,
     ExecutionScope, OutputTap,
 };
+use crate::secret_redaction::SecretRedactor;
 use crate::{Agent, Chat};
 use output::{HookExit, HookResponse};
 pub(crate) use output::{HookPermission, HookVerdict};
@@ -138,7 +141,8 @@ impl FinishedRun {
         }
     }
 
-    /// A run of `runnable` for `event` started at `started` that ended with `ending`.
+    /// A run of `runnable` for `event` started at `started` that ended with `ending`, read once
+    /// the plugin's sensitive values it was given are removed.
     fn read(
         event: HookEvent,
         runnable: &Runnable,
@@ -146,22 +150,29 @@ impl FinishedRun {
         ending: Result<CommandOutput, String>,
         cancelled: bool,
     ) -> Self {
+        let redactor = (!runnable.hook.sensitive_values.is_empty())
+            .then(|| SecretRedactor::new(&runnable.hook.sensitive_values));
+        let redacted = |text: String| match &redactor {
+            Some(redactor) => redactor.redact(text),
+            None => text,
+        };
         let command = match ending {
             Err(error) if cancelled => {
                 return Self::unfinished(
-                    HookResponse::failed(HookRunOutcome::Cancelled, error),
+                    HookResponse::failed(HookRunOutcome::Cancelled, redacted(error)),
                     started,
                 );
             }
             Err(error) => {
                 return Self::unfinished(
-                    HookResponse::failed(HookRunOutcome::NotRun, error),
+                    HookResponse::failed(HookRunOutcome::NotRun, redacted(error)),
                     started,
                 );
             }
             Ok(command) => command,
         };
-        let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
+        let stdout = redacted(command.stdout.text());
+        let stderr = redacted(command.stderr.text());
         let stdout = output::after_background_request(&stdout).unwrap_or(&stdout);
         let response = output::interpret(
             event,
