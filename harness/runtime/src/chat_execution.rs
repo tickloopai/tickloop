@@ -5,7 +5,10 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use tickloop_harness_protocol::{ChatId, ChatSnapshot};
@@ -20,17 +23,21 @@ use crate::environment::{
 pub(crate) struct BoundPort {
     pub(crate) port: Arc<dyn ExecutionPort>,
     pub(crate) capabilities: ExecutionCapabilities,
+    /// Which binding of the Chat this Port is; a later binding supersedes it.
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone)]
 pub(crate) struct ChatExecution {
     authority: ExecutionAuthority,
     binding: Arc<RwLock<Binding>>,
+    bindings: Arc<AtomicU64>,
 }
 
 struct Binding {
     scope: Option<ExecutionScope>,
     port: Result<BoundPort, ExecutionError>,
+    generation: u64,
 }
 
 impl ChatExecution {
@@ -41,7 +48,9 @@ impl ChatExecution {
             binding: Arc::new(RwLock::new(Binding {
                 scope: None,
                 port: Err(no_folder()),
+                generation: 0,
             })),
+            bindings: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -65,9 +74,12 @@ impl ChatExecution {
         if self.binding.read().unwrap().scope == Some(scope.clone()) {
             return;
         }
+        let generation = self.bindings.fetch_add(1, Ordering::Relaxed) + 1;
         let port = match environment {
             _ if scope.folder.is_none() => Err(no_folder()),
-            Some(environment) => bind_port(environment.as_ref(), &scope, &self.authority).await,
+            Some(environment) => {
+                bind_port(environment.as_ref(), &scope, &self.authority, generation).await
+            }
             None => Err(ExecutionError::new(
                 error_code::UNSUPPORTED,
                 "no execution environment",
@@ -76,6 +88,7 @@ impl ChatExecution {
         *self.binding.write().unwrap() = Binding {
             scope: Some(scope),
             port,
+            generation,
         };
     }
 
@@ -85,6 +98,12 @@ impl ChatExecution {
 
     pub(crate) fn port(&self) -> Result<BoundPort, ExecutionError> {
         self.binding.read().unwrap().port.clone()
+    }
+
+    /// Whether `generation` is still the Chat's binding, so that its roots are the Chat's
+    /// directories.
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.binding.read().unwrap().generation == generation
     }
 
     /// The file roots of the bound Port; none when binding failed.
@@ -129,10 +148,15 @@ async fn bind_port(
     environment: &dyn ExecutionEnvironment,
     scope: &ExecutionScope,
     authority: &ExecutionAuthority,
+    generation: u64,
 ) -> Result<BoundPort, ExecutionError> {
     let port = environment.bind(scope.clone(), authority.clone())?;
     match port.inspect(ExecutionQuery::Capabilities).await? {
-        ExecutionInspection::Capabilities(capabilities) => Ok(BoundPort { port, capabilities }),
+        ExecutionInspection::Capabilities(capabilities) => Ok(BoundPort {
+            port,
+            capabilities,
+            generation,
+        }),
         _ => Err(ExecutionError::new(
             "ProtocolViolation",
             "execution environment returned no capabilities",

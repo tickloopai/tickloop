@@ -1,7 +1,9 @@
+//! Files and directories a prompt mentions with `@`, attached to it as context. They are read
+//! through the Chat's Execution Environment, from its Folder and the Additional Directories it can
+//! read, wherever those are.
+
 use std::{
-    collections::{BinaryHeap, HashSet},
-    fs::{self, File},
-    io::Read,
+    collections::HashSet,
     path::{Path, PathBuf},
 };
 
@@ -9,13 +11,16 @@ use tickloop_harness_base::image::{self, MAX_BASE64_BYTES};
 use tickloop_harness_protocol::{
     FileReadRecord, Image, ImageContext, ImageOrigin, InputContext, TextContext,
 };
-use tickloop_harness_tools::{FileReadRecordExt, Workspace};
+use tickloop_harness_tools::FileReadRecordExt;
+use tickloop_harness_tools::file_port::{
+    FileCapabilities, FileContent, FileHost, FileInspection, FileKind, FilePath, FileQuery,
+};
 
 pub(super) const MAX_REFERENCES: usize = 20;
 const MAX_RESTORED_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
-const IMAGE_SIGNATURE_BYTES: u64 = 12;
+const IMAGE_SIGNATURE_BYTES: usize = 12;
 /// Image extensions recognised even when the header is unsupported, so the user gets an
 /// image-format error instead of a text-encoding one.
 const IMAGE_EXTENSIONS: [&str; 12] = [
@@ -47,6 +52,28 @@ pub(super) fn restored_contexts_are_valid(contexts: &[InputContext]) -> bool {
     })
 }
 
+/// Refuses `path`, absolute or relative to the Folder, before anything else is done with it when
+/// it lies in a directory the Chat cannot read, or outside every directory where the environment
+/// reads nothing.
+pub(super) fn check_readable(capabilities: &FileCapabilities, path: &Path) -> Result<(), String> {
+    let readable = path
+        .to_str()
+        .and_then(|text| capabilities.resolve(text).ok())
+        .is_some_and(|requested| capabilities.access(&requested).can_read());
+    if readable {
+        Ok(())
+    } else {
+        Err(outside_workspace(path))
+    }
+}
+
+fn outside_workspace(path: &Path) -> String {
+    format!(
+        "referenced path is outside the configured workspace: {}",
+        path.display()
+    )
+}
+
 /// Attached contexts, plus a read record for each file attached whole: like Claude Code's
 /// @-mentioned files, those count as read for `Write` and `Edit`.
 pub(super) struct LoadedContexts {
@@ -54,110 +81,133 @@ pub(super) struct LoadedContexts {
     pub file_reads: Vec<(PathBuf, FileReadRecord)>,
 }
 
-pub(super) fn load(workspace: &Workspace, paths: Vec<PathBuf>) -> Result<LoadedContexts, String> {
+/// Reads what `paths` name in the Folder and the Additional Directories the Chat can read, with
+/// their links resolved; anything elsewhere is refused.
+pub(super) async fn load(
+    files: &dyn FileHost,
+    paths: Vec<PathBuf>,
+) -> Result<LoadedContexts, String> {
     if paths.len() > MAX_REFERENCES {
         return Err(format!(
             "a prompt can reference at most {MAX_REFERENCES} files or directories"
         ));
     }
-    let roots = allowed_roots(workspace)?;
+    let capabilities = files.capabilities();
     let mut seen = HashSet::new();
     let mut loaded = LoadedContexts {
         contexts: Vec::with_capacity(paths.len()),
         file_reads: Vec::new(),
     };
     for path in paths {
-        let canonical_path = path
-            .canonicalize()
-            .map_err(|_| format!("referenced path is unavailable: {}", path.display()))?;
-        if canonical_path.to_str().is_none() {
+        let Some(text) = path.to_str() else {
             return Err(format!(
                 "referenced path is not valid UTF-8: {}",
                 path.display()
             ));
+        };
+        check_readable(&capabilities, &path)?;
+        let requested = capabilities
+            .resolve(text)
+            .map_err(|_| outside_workspace(&path))?;
+        let unavailable = || format!("referenced path is unavailable: {}", path.display());
+        let resolved = match files.inspect(FileQuery::Resolve(requested)).await {
+            Ok(FileInspection::Resolved(resolved)) => resolved,
+            _ => return Err(unavailable()),
+        };
+        let Some(kind) = resolved.kind else {
+            return Err(unavailable());
+        };
+        if resolved.path.root().is_none() || !capabilities.access(&resolved.path).can_read() {
+            return Err(outside_workspace(&path));
         }
-        if !roots.iter().any(|root| canonical_path.starts_with(root)) {
-            return Err(format!(
-                "referenced path is outside the configured workspace: {}",
-                path.display()
-            ));
-        }
-        if !seen.insert(canonical_path.clone()) {
+        if !seen.insert(resolved.path.clone()) {
             continue;
         }
-        let (context, file_read) = read_context(&roots[0], canonical_path)?;
+        let (context, file_read) = read_context(files, &capabilities, resolved.path, kind).await?;
         loaded.contexts.push(context);
         loaded.file_reads.extend(file_read);
     }
     Ok(loaded)
 }
 
-fn allowed_roots(workspace: &Workspace) -> Result<Vec<PathBuf>, String> {
-    workspace
-        .folder
-        .iter()
-        .chain(&workspace.additional_directories)
-        .map(|root| {
-            root.canonicalize()
-                .map_err(|_| format!("configured directory is unavailable: {}", root.display()))
-        })
-        .collect()
-}
-
-fn read_context(
-    workdir: &Path,
-    canonical_path: PathBuf,
+async fn read_context(
+    files: &dyn FileHost,
+    capabilities: &FileCapabilities,
+    path: FilePath,
+    kind: FileKind,
 ) -> Result<(InputContext, Option<(PathBuf, FileReadRecord)>), String> {
-    let metadata = fs::metadata(&canonical_path)
-        .map_err(|error| format!("cannot inspect {}: {error}", canonical_path.display()))?;
-    let path = canonical_path
-        .strip_prefix(workdir)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| canonical_path.clone());
-    if metadata.is_file() && is_image_file(&canonical_path)? {
-        let image = read_image(&canonical_path)
-            .map_err(|error| format!("cannot attach image {}: {error}", path.display()))?;
-        let context = InputContext::Image(ImageContext {
-            origin: ImageOrigin::Mentioned { path },
-            image,
-        });
-        return Ok((context, None));
-    }
-    if metadata.is_file() {
-        let (content, truncated) = read_file(&canonical_path, metadata.len())?;
-        // The time is taken before reading, so a change made while reading still reads as newer.
-        let file_read = metadata
-            .modified()
-            .ok()
-            .filter(|_| !truncated)
-            .map(|modified| {
-                let record = FileReadRecord::whole_file(&content, modified);
-                (canonical_path.clone(), record)
+    let shown = PathBuf::from(capabilities.display(&path));
+    let mentioned = capabilities
+        .folder()
+        .and_then(|folder| shown.strip_prefix(&folder.display_path).ok())
+        .map_or_else(|| shown.clone(), Path::to_path_buf);
+    match kind {
+        FileKind::File if is_image_file(files, &path, &shown).await? => {
+            let image = read_image(files, &path)
+                .await
+                .map_err(|error| format!("cannot attach image {}: {error}", mentioned.display()))?;
+            let context = InputContext::Image(ImageContext {
+                origin: ImageOrigin::Mentioned { path: mentioned },
+                image,
             });
-        let context = InputContext::File(TextContext {
-            path,
-            content,
-            truncated,
-        });
-        return Ok((context, file_read));
+            Ok((context, None))
+        }
+        FileKind::File => {
+            let file = read(files, &path, MAX_FILE_BYTES + 4)
+                .await
+                .map_err(|error| format!("cannot read {}: {error}", shown.display()))?;
+            let (content, truncated) = text_of(&file, &shown)?;
+            // The modification time comes with the content it describes.
+            let file_read = file
+                .metadata
+                .modified
+                .filter(|_| !truncated)
+                .map(|modified| (shown, FileReadRecord::whole_file(&content, modified)));
+            let context = InputContext::File(TextContext {
+                path: mentioned,
+                content,
+                truncated,
+            });
+            Ok((context, file_read))
+        }
+        FileKind::Directory => {
+            let (content, truncated) = read_directory(files, &path, &shown).await?;
+            let context = InputContext::Directory(TextContext {
+                path: mentioned,
+                content,
+                truncated,
+            });
+            Ok((context, None))
+        }
+        FileKind::Other => Err(format!(
+            "referenced path is not a regular file or directory: {}",
+            shown.display()
+        )),
     }
-    if metadata.is_dir() {
-        let (content, truncated) = read_directory(&canonical_path)?;
-        let context = InputContext::Directory(TextContext {
-            path,
-            content,
-            truncated,
-        });
-        return Ok((context, None));
-    }
-    Err(format!(
-        "referenced path is not a regular file or directory: {}",
-        canonical_path.display()
-    ))
 }
 
-fn is_image_file(path: &Path) -> Result<bool, String> {
-    let has_image_extension = path
+/// The first `limit` bytes of the file.
+async fn read(files: &dyn FileHost, path: &FilePath, limit: usize) -> Result<FileContent, String> {
+    match files
+        .inspect(FileQuery::Read {
+            path: path.clone(),
+            offset: 0,
+            limit,
+        })
+        .await
+    {
+        Ok(FileInspection::Read(content)) => Ok(content),
+        Ok(_) => Err("the environment answered a read with something else".into()),
+        Err(error) => Err(error.message),
+    }
+}
+
+async fn is_image_file(
+    files: &dyn FileHost,
+    path: &FilePath,
+    shown: &Path,
+) -> Result<bool, String> {
+    let has_image_extension = shown
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -168,36 +218,23 @@ fn is_image_file(path: &Path) -> Result<bool, String> {
     if has_image_extension {
         return Ok(true);
     }
-    let mut header = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(IMAGE_SIGNATURE_BYTES).read_to_end(&mut header))
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    Ok(image::is_supported_image(&header))
+    let header = read(files, path, IMAGE_SIGNATURE_BYTES)
+        .await
+        .map_err(|error| format!("cannot read {}: {error}", shown.display()))?;
+    Ok(image::is_supported_image(&header.data))
 }
 
-fn read_image(path: &Path) -> Result<Image, String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take(image::MAX_SOURCE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(|error| error.to_string())?;
-    image::prepare(&bytes).map_err(|error| error.to_string())
+async fn read_image(files: &dyn FileHost, path: &FilePath) -> Result<Image, String> {
+    let file = read(files, path, image::MAX_SOURCE_BYTES + 1).await?;
+    image::prepare(&file.data).map_err(|error| error.to_string())
 }
 
-fn read_file(path: &Path, total_bytes: u64) -> Result<(String, bool), String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take((MAX_FILE_BYTES + 4) as u64)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+fn text_of(file: &FileContent, shown: &Path) -> Result<(String, bool), String> {
+    let bytes = &file.data;
     if bytes.contains(&0) {
         return Err(format!(
             "referenced file is not UTF-8 text: {}",
-            path.display()
+            shown.display()
         ));
     }
     let length = bytes.len().min(MAX_FILE_BYTES);
@@ -209,68 +246,87 @@ fn read_file(path: &Path, total_bytes: u64) -> Result<(String, bool), String> {
         Err(_) => {
             return Err(format!(
                 "referenced file is not UTF-8 text: {}",
-                path.display()
+                shown.display()
             ));
         }
     };
-    Ok((text.into(), total_bytes > text.len() as u64))
+    Ok((text.into(), file.metadata.len > text.len() as u64))
 }
 
-fn read_directory(path: &Path) -> Result<(String, bool), String> {
-    let mut entries = BinaryHeap::with_capacity(MAX_DIRECTORY_ENTRIES + 1);
-    let mut entry_count = 0usize;
-    for entry in
-        fs::read_dir(path).map_err(|error| format!("cannot list {}: {error}", path.display()))?
+/// The directory's first entries in lexical order, a directory marked with a trailing `/`.
+async fn read_directory(
+    files: &dyn FileHost,
+    path: &FilePath,
+    shown: &Path,
+) -> Result<(String, bool), String> {
+    let listing = match files
+        .inspect(FileQuery::List {
+            path: path.clone(),
+            limit: MAX_DIRECTORY_ENTRIES,
+        })
+        .await
     {
-        let entry = entry.map_err(|error| format!("cannot list {}: {error}", path.display()))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| format!("directory contains a non-UTF-8 name: {}", path.display()))?;
-        if name.chars().any(char::is_control) {
+        Ok(FileInspection::List(listing)) => listing,
+        Ok(_) => {
             return Err(format!(
-                "directory contains a control character in a name: {}",
-                path.display()
+                "cannot list {}: the environment answered with something else",
+                shown.display()
             ));
         }
-        let is_directory = entry
-            .file_type()
-            .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?
-            .is_dir();
-        let suffix = if is_directory { "/" } else { "" };
-        entry_count += 1;
-        entries.push(format!("{name}{suffix}"));
-        if entries.len() > MAX_DIRECTORY_ENTRIES {
-            entries.pop();
+        Err(error) => {
+            return Err(format!(
+                "cannot list {}: {}",
+                shown.display(),
+                error.message
+            ));
         }
+    };
+    let mut entries = Vec::with_capacity(listing.entries.len());
+    for entry in listing.entries {
+        if entry.name.chars().any(char::is_control) {
+            return Err(format!(
+                "directory contains a control character in a name: {}",
+                shown.display()
+            ));
+        }
+        let suffix = if entry.kind == FileKind::Directory {
+            "/"
+        } else {
+            ""
+        };
+        entries.push(format!("{}{suffix}", entry.name));
     }
-    let truncated = entry_count > MAX_DIRECTORY_ENTRIES;
-    let entries = entries.into_sorted_vec();
-    Ok((entries.join("\n"), truncated))
+    entries.sort();
+    Ok((entries.join("\n"), listing.truncated))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tickloop_harness_tools::local_roots::LocalRoots;
+
     use super::*;
 
-    #[test]
-    fn loads_files_and_immediate_directory_entries_without_following_outside_symlinks() {
+    fn folder(directory: &Path) -> LocalRoots {
+        LocalRoots::new(directory.to_str(), &[])
+    }
+
+    #[tokio::test]
+    async fn loads_files_and_immediate_directory_entries_without_following_outside_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("notes.txt"), "hello").unwrap();
         fs::create_dir(directory.path().join("src")).unwrap();
         fs::write(directory.path().join("src/main.rs"), "fn main() {}").unwrap();
-        let workspace = Workspace {
-            folder: Some(directory.path().into()),
-            additional_directories: Vec::new(),
-        };
 
         let loaded = load(
-            &workspace,
+            &folder(directory.path()),
             vec![
                 directory.path().join("notes.txt"),
                 directory.path().join("src"),
             ],
         )
+        .await
         .unwrap();
         let contexts = loaded.contexts;
         let [(read_path, record)] = loaded.file_reads.as_slice() else {
@@ -313,28 +369,35 @@ mod tests {
         assert_eq!(contexts[1].path(), Some(Path::new("src")));
     }
 
-    #[test]
-    fn rejects_paths_outside_the_workspace() {
+    #[tokio::test]
+    async fn rejects_paths_outside_the_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let workspace = Workspace {
-            folder: Some(directory.path().into()),
-            additional_directories: Vec::new(),
-        };
 
-        let error = load(&workspace, vec![outside.path().into()]).err().unwrap();
+        let error = load(&folder(directory.path()), vec![outside.path().into()])
+            .await
+            .err()
+            .unwrap();
 
         assert!(error.contains("outside the configured workspace"));
     }
 
-    #[test]
-    fn directory_listing_keeps_the_same_lexicographic_prefix_regardless_of_creation_order() {
+    #[tokio::test]
+    async fn directory_listing_keeps_the_same_lexicographic_prefix_regardless_of_creation_order() {
         let directory = tempfile::tempdir().unwrap();
         for index in (0..=MAX_DIRECTORY_ENTRIES).rev() {
             fs::write(directory.path().join(format!("entry-{index:04}")), "").unwrap();
         }
+        let files = folder(directory.path());
+        let root = files.capabilities().folder().unwrap().name.clone();
 
-        let (content, truncated) = read_directory(directory.path()).unwrap();
+        let (content, truncated) = read_directory(
+            &files,
+            &FilePath::in_root(root, "").unwrap(),
+            directory.path(),
+        )
+        .await
+        .unwrap();
 
         assert!(truncated);
         assert_eq!(content.lines().count(), MAX_DIRECTORY_ENTRIES);

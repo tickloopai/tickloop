@@ -903,6 +903,11 @@ impl Chat {
         self.snapshot = snapshot;
     }
 
+    /// The file history of a Chat with a Folder and where it finds the files it tracks.
+    fn history_files(&self) -> Option<(FileHistory, tickloop_harness_tools::FileLocator)> {
+        Some((self.file_history.clone()?, self.tools.file_locator()?))
+    }
+
     fn has_human_input_for_run(&self, run: RunId) -> bool {
         approval_context::originals_for_active_chain(&self.snapshot, &self.bookkeeping)
             .is_ok_and(|inputs| inputs.iter().any(|input| input.run_id == run))
@@ -2726,7 +2731,7 @@ impl Agent {
                 "restored prompt context is invalid, duplicated, or too large".into(),
             ));
         }
-        let admission = {
+        let (workspace, tools, ids, files) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             if let Some(ledger) = &ledger
@@ -2762,25 +2767,38 @@ impl Agent {
                 folder: snapshot.folder.clone(),
                 additional_directories: snapshot.additional_directories.clone(),
             };
-            let reads = paths
-                .iter()
-                .map(PathBuf::as_path)
-                .chain(contexts.iter().filter_map(InputContext::path))
-                .map(|path| {
-                    tickloop_harness_tools::prepare(
-                        &workspace,
-                        tickloop_harness_tools::READ_TOOL_NAME,
-                        &serde_json::json!({"file_path":path}),
-                    )
-                    .map_err(|error| AgentError::Invalid(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let admission = family::AttachmentAdmission { workspace, reads };
+            let files: Arc<dyn tickloop_harness_tools::file_port::FileHost> = Arc::new(
+                environment::file_host::EnvironmentFileHost::new(chat.execution.clone()),
+            );
+            (workspace, chat.tools.clone(), chat.ids, files)
+        };
+        // Each attachment is admitted as the Chat's own `Read` of it, prepared where the Chat's
+        // file tools reach its files and outside the lock, since that may wait on the environment.
+        let capabilities = files.capabilities();
+        let mut reads = Vec::with_capacity(paths.len() + contexts.len());
+        for path in paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(contexts.iter().filter_map(InputContext::path))
+        {
+            input_context::check_readable(&capabilities, path).map_err(AgentError::Invalid)?;
+            let read = tools
+                .prepare(
+                    &ids,
+                    &workspace,
+                    tickloop_harness_tools::READ_TOOL_NAME,
+                    &serde_json::json!({"file_path":path}),
+                )
+                .await
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            reads.push(read);
+        }
+        let admission = family::AttachmentAdmission { workspace, reads };
+        {
+            let chats = self.inner.chats.lock().await;
             let sessions = self.inner.session_permissions.lock().await;
             Self::validate_attachment_admission(&chats, &sessions, chat_id, &admission)?;
-            admission
-        };
-        let workspace = admission.workspace.clone();
+        }
         let paths: Vec<PathBuf> = admission
             .reads
             .iter()
@@ -2795,13 +2813,9 @@ impl Agent {
             .collect();
         let mut attached_file_reads = Vec::new();
         if !paths.is_empty() {
-            let loaded =
-                tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
-                    .await
-                    .map_err(|_| {
-                        AgentError::Invalid("referenced paths could not be loaded".into())
-                    })?
-                    .map_err(AgentError::Invalid)?;
+            let loaded = input_context::load(files.as_ref(), paths)
+                .await
+                .map_err(AgentError::Invalid)?;
             for context in loaded.contexts {
                 contexts.retain(|existing| existing.path() != context.path());
                 contexts.push(context);

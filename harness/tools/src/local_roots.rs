@@ -247,7 +247,9 @@ pub fn delete_resolved(target: &Path, expected: &FileVersion) -> Result<(), Loca
 }
 
 /// The tools on their own and the Harness's own directories reach these roots on the calling
-/// thread, which every operation blocks.
+/// thread, which every operation but a search blocks: a search walks a blocking thread instead and
+/// stops when its future is dropped, as a cancelled call drops it. Preparing a call on its own
+/// relies on the other operations answering without waiting.
 #[async_trait::async_trait]
 impl FileHost for LocalRoots {
     fn capabilities(&self) -> FileCapabilities {
@@ -255,7 +257,15 @@ impl FileHost for LocalRoots {
     }
 
     async fn inspect(&self, query: FileQuery) -> Result<FileInspection, ExecutionError> {
-        self.inspect_blocking(query, &CancellationToken::new())
+        if !matches!(query, FileQuery::Glob { .. } | FileQuery::Grep { .. }) {
+            return self.inspect_blocking(query, &CancellationToken::new());
+        }
+        let roots = self.clone();
+        let cancel = CancellationToken::new();
+        let _stop_on_drop = cancel.clone().drop_guard();
+        tokio::task::spawn_blocking(move || roots.inspect_blocking(query, &cancel))
+            .await
+            .map_err(|error| ExecutionError::new(error_code::IO, error.to_string()))?
     }
 
     async fn prepare_write(
@@ -270,6 +280,14 @@ impl FileHost for LocalRoots {
             expected,
             operation: tickloop_ids::generate(),
         })))
+    }
+
+    async fn delete(&self, path: FilePath, expected: FileVersion) -> Result<(), FileWriteError> {
+        let target = self
+            .resolve_change(&path)
+            .map_err(FileWriteError::NotWritten)?;
+        delete_resolved(&target, &expected)
+            .map_err(|error| FileWriteError::NotWritten(execution_error(error, true)))
     }
 }
 
@@ -454,4 +472,56 @@ pub fn execution_error(error: LocalFileError, prepared: bool) -> ExecutionError 
         }
     };
     ExecutionError::new(code, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+
+    use super::*;
+    use crate::file_search::GlobQuery;
+
+    const SEARCHED_FILES: usize = 2_000;
+
+    #[tokio::test]
+    async fn a_search_of_the_harness_directories_waits_off_the_calling_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..SEARCHED_FILES {
+            std::fs::write(directory.path().join(format!("output-{index}.txt")), "").unwrap();
+        }
+        let roots = LocalRoots::harness_directories(&[directory.path()]);
+        let root = roots.capabilities().roots()[0].name.clone();
+        let query = FileQuery::Glob {
+            path: FilePath::in_root(root.clone(), "").unwrap(),
+            query: GlobQuery {
+                pattern: "*.txt".into(),
+                limit: SEARCHED_FILES,
+            },
+        };
+
+        let mut search = std::pin::pin!(roots.inspect(query));
+        let first_poll = search
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(
+            first_poll.is_pending(),
+            "the walk ran on the calling thread"
+        );
+        let Ok(FileInspection::Glob(found)) = search.await else {
+            panic!("the search failed");
+        };
+        assert_eq!(found.files.len(), SEARCHED_FILES);
+
+        let stat = roots.inspect(FileQuery::Stat(FilePath::in_root(root, "").unwrap()));
+        let answered = std::pin::pin!(stat)
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(
+            matches!(answered, Poll::Ready(Ok(FileInspection::Stat(_)))),
+            "other operations answer without waiting, as preparing a call on its own needs"
+        );
+    }
 }

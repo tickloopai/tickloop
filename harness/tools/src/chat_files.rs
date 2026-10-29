@@ -47,6 +47,58 @@ impl std::fmt::Debug for FileTarget {
     }
 }
 
+/// A file of a Chat and the host that holds it, before its links are resolved.
+#[derive(Clone)]
+pub struct FileLocation {
+    pub host: Arc<dyn FileHost>,
+    pub path: FilePath,
+}
+
+impl FileLocation {
+    /// The absolute path the model sees for the file.
+    pub fn display(&self) -> String {
+        self.host.capabilities().display(&self.path)
+    }
+}
+
+impl std::fmt::Debug for FileLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileLocation")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Finds the files of one Chat by the absolute paths the model sees for them, where its file
+/// tools find them: in its own directories on this machine, or through its environment.
+#[derive(Clone)]
+pub struct FileLocator {
+    files: ChatFiles,
+}
+
+impl FileLocator {
+    /// Files reached only through `environment`.
+    pub fn new(environment: Arc<dyn FileHost>) -> Self {
+        Self {
+            files: ChatFiles::new(environment, None),
+        }
+    }
+
+    pub(crate) fn for_chat(files: ChatFiles) -> Self {
+        Self { files }
+    }
+
+    /// Where `path` is, without resolving its links; the Chat must be able to read there.
+    pub fn locate(&self, path: &Path) -> Result<FileLocation, ToolError> {
+        let placement = self.files.place(path)?;
+        Ok(FileLocation {
+            host: placement.host,
+            path: placement.path,
+        })
+    }
+}
+
 /// A path below one host's roots, before its links are resolved.
 struct Placement {
     host: Arc<dyn FileHost>,
@@ -228,6 +280,13 @@ fn outside_readable(path: &Path) -> ToolError {
 }
 
 impl FileTarget {
+    pub(crate) fn location(&self) -> FileLocation {
+        FileLocation {
+            host: self.host.clone(),
+            path: self.path.clone(),
+        }
+    }
+
     /// Refuses a change of a file in a directory the Chat may only read, before any approval.
     pub(crate) fn check_writable(&self, tool: &str) -> Result<(), ToolError> {
         if self.host.capabilities().access(&self.path) == FileAccess::ReadWrite {

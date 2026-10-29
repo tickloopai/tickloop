@@ -464,9 +464,12 @@ pub trait FileHost: Send + Sync {
         content: Vec<u8>,
         expected: Option<FileVersion>,
     ) -> Result<FileWritePreparation, ExecutionError>;
+    /// Deletes the file at `path` while it still has `expected`. Its callers ask for no approval
+    /// between preparing and carrying out the deletion, so both happen in this one call.
+    async fn delete(&self, path: FilePath, expected: FileVersion) -> Result<(), FileWriteError>;
 }
 
-/// Why a prepared write reports no file.
+/// Why a write or deletion reports no result.
 #[derive(Debug)]
 pub enum FileWriteError {
     /// Nothing was dispatched, or the environment refused the write and changed nothing.

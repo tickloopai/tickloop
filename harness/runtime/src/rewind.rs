@@ -26,6 +26,7 @@ use tickloop_harness_protocol::{
     RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId, TakenBackPrompt,
     UserShellRecord, UserShellState,
 };
+use tickloop_harness_tools::FileLocation;
 
 impl Agent {
     /// Following Claude Code's Rewind selector: restores code, conversation or both depending on
@@ -57,9 +58,9 @@ impl Agent {
             let point = chat.snapshot.rewind_point(message_id).ok_or_else(|| {
                 AgentError::Invalid("this message is no longer part of the conversation".into())
             })?;
-            let history = match (mode.restores_code(), &chat.file_history) {
+            let history = match (mode.restores_code(), chat.history_files()) {
                 (false, _) => None,
-                (true, Some(history)) => Some(history.clone()),
+                (true, Some(history)) => Some(history),
                 (true, None) => return Err(AgentError::Invalid(super::FOLDERLESS_CHAT.into())),
             };
             if mode.restores_conversation() {
@@ -78,9 +79,9 @@ impl Agent {
         // Run inside a host task so the occupation is released even if the caller stops waiting.
         self.inner.tasks.spawn(async move {
             let restored = match history {
-                Some(history) => {
-                    Some(tokio::task::spawn_blocking(move || history.rewind(message_id)).await)
-                }
+                Some((history, files)) => Some(
+                    tokio::spawn(async move { history.rewind(&files, message_id).await }).await,
+                ),
                 None => None,
             };
             let result = {
@@ -205,7 +206,7 @@ impl Agent {
         })
     }
 
-    /// Files that restoring to the target prompt would change, without touching disk. Returns
+    /// Files that restoring to the target prompt would change, without changing any. Returns
     /// `None` when the prompt has no snapshot.
     pub async fn rewind_file_changes(
         &self,
@@ -213,17 +214,16 @@ impl Agent {
         message_id: Uuid,
     ) -> Result<Option<Vec<PathBuf>>, AgentError> {
         self.require_root_chat(chat_id, "rewind files").await?;
-        let history = self
+        let (history, files) = self
             .inner
             .chats
             .lock()
             .await
             .get(&chat_id)
             .ok_or(AgentError::NotFound)?
-            .file_history
-            .clone()
+            .history_files()
             .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?;
-        tokio::task::spawn_blocking(move || history.files_changed_by_rewind(message_id))
+        tokio::spawn(async move { history.files_changed_by_rewind(&files, message_id).await })
             .await
             .map_err(|error| AgentError::Invalid(format!("file comparison ended: {error}")))
     }
@@ -295,17 +295,17 @@ impl Agent {
     /// edit-tracking snapshot updates are always written after it.
     pub(super) async fn complete_file_history_snapshots(&self, chat_id: ChatId) {
         loop {
-            let plan = {
+            let (plan, files) = {
                 let chats = self.inner.chats.lock().await;
-                let Some(plan) = chats
-                    .get(&chat_id)
-                    .and_then(|chat| chat.file_history.as_ref()?.next_snapshot_plan())
-                else {
+                let Some((plan, files)) = chats.get(&chat_id).and_then(|chat| {
+                    let (history, files) = chat.history_files()?;
+                    Some((history.next_snapshot_plan()?, files))
+                }) else {
                     return;
                 };
-                plan
+                (plan, files)
             };
-            let Ok(computed) = tokio::task::spawn_blocking(move || plan.compute()).await else {
+            let Ok(computed) = tokio::spawn(async move { plan.compute(&files).await }).await else {
                 return;
             };
             let mut chats = self.inner.chats.lock().await;
@@ -341,9 +341,16 @@ impl Agent {
 
     /// Following Claude Code's `fileHistoryTrackEdit`: before an edit tool runs, makes the initial
     /// backup for an untracked file and writes the snapshot update keyed by the assistant message
-    /// that issued the edit. A failed backup (including a file replaced by a symlink or not a
-    /// regular file) only gives up tracking and does not block the edit.
-    pub(super) async fn track_file_edit(&self, chat_id: ChatId, path: &Path, message_id: Uuid) {
+    /// that issued the edit. A failed backup (including a file replaced by a symlink, not a
+    /// regular file or in a directory the Chat can only read) only gives up tracking and does not
+    /// block the edit.
+    pub(super) async fn track_file_edit(
+        &self,
+        chat_id: ChatId,
+        file: FileLocation,
+        message_id: Uuid,
+    ) {
+        let key = file.display();
         let directory = {
             let chats = self.inner.chats.lock().await;
             let Some(history) = chats
@@ -352,14 +359,13 @@ impl Agent {
             else {
                 return;
             };
-            if !history.needs_backup(path) {
+            if !history.needs_backup(&key) {
                 return;
             }
             history.backup_directory().clone()
         };
-        let source = path.to_path_buf();
         let backup =
-            tokio::task::spawn_blocking(move || create_first_backup(&directory, &source)).await;
+            tokio::spawn(async move { create_first_backup(&directory, &file).await }).await;
         let Ok(Ok(backup)) = backup else {
             return;
         };
@@ -370,7 +376,7 @@ impl Agent {
         if let Some(snapshot) = chat
             .file_history
             .as_mut()
-            .and_then(|history| history.commit_tracked_edit(path, backup))
+            .and_then(|history| history.commit_tracked_edit(&key, backup))
         {
             self.record_file_history_snapshot(chat_id, message_id, &snapshot, true);
         }

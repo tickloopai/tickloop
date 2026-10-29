@@ -22,6 +22,7 @@ use tickloop_harness_protocol::{
 };
 
 mod chat_files;
+pub use chat_files::{FileLocation, FileLocator};
 pub mod file_change;
 pub mod file_port;
 pub mod file_search;
@@ -382,9 +383,12 @@ impl PreparedTool {
         }
     }
 
-    /// Returns the resolved file edited by write tools, or `None` for other tools.
-    pub fn edited_file_path(&self) -> Option<&Path> {
-        matches!(self.operation, Operation::Write(_)).then_some(self.resolved_path.as_path())
+    /// The file a `Write` or `Edit` changes, with its links resolved, or `None` for other tools.
+    pub fn edited_file(&self) -> Option<FileLocation> {
+        match self.operation {
+            Operation::Write(_) => self.file.as_ref().map(FileTarget::location),
+            _ => None,
+        }
     }
 
     /// Whether this `Read`, `Write` or `Edit` resolves to exactly `path`.
@@ -934,13 +938,15 @@ impl Tools {
             .files
             .clone()
             .unwrap_or_else(|| Arc::new(LocalRoots::for_workspace(workspace)) as Arc<dyn FileHost>);
-        ChatFiles::new(
-            environment,
-            Some(LocalRoots::harness_directories(&[
-                directory.chat.path(),
-                directory.family_temp.path(),
-            ])),
-        )
+        chat_files_on(environment, directory)
+    }
+
+    /// Where this Chat's files are for what reaches them outside a tool call, such as file
+    /// history; `None` for tools without a Chat's Folder.
+    pub fn file_locator(&self) -> Option<FileLocator> {
+        let directory = self.directory.as_ref()?;
+        let environment = self.files.clone()?;
+        Some(FileLocator::for_chat(chat_files_on(environment, directory)))
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -1292,6 +1298,16 @@ pub fn is_concurrency_safe(workspace: &Workspace, name: &str, input: &Value) -> 
         BASH_TOOL_NAME => shell::is_read_only_input(workspace, input),
         _ => false,
     }
+}
+
+fn chat_files_on(environment: Arc<dyn FileHost>, directory: &ChatDirectory) -> ChatFiles {
+    ChatFiles::new(
+        environment,
+        Some(LocalRoots::harness_directories(&[
+            directory.chat.path(),
+            directory.family_temp.path(),
+        ])),
+    )
 }
 
 /// Prepares a call outside any Chat, on the workspace's files on this machine: nothing has been

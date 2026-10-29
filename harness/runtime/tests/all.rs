@@ -46,6 +46,9 @@ mod folder_capabilities;
 #[path = "all/folder_file_tools.rs"]
 mod folder_file_tools;
 
+#[path = "all/folder_history_and_mentions.rs"]
+mod folder_history_and_mentions;
+
 #[path = "all/plan_auto.rs"]
 mod plan_auto;
 

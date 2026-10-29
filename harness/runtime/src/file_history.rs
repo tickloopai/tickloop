@@ -4,31 +4,33 @@
 //! Before the Agent edits a file, an initial backup is made for files not yet tracked; each user
 //! prompt takes a snapshot of every tracked file (unchanged files reuse the previous version,
 //! changed files bump the version, deleted files are recorded as empty), keeping at most 100.
-//! Rewind restores files from the last snapshot of the target message. Backups live in
-//! `<root>/file-history/<chatId>/`, named by the first 16 hex digits of the path's SHA-256 plus the
-//! version number. Like Claude Code, there is no file locking and no coordination of multiple
-//! processes modifying the same file at once.
+//! Rewind restores files from the last snapshot of the target message. Backups live on this
+//! machine in `<root>/file-history/<chatId>/`, named by the first 16 hex digits of the path's
+//! SHA-256 plus the version number. Like Claude Code, there is no file locking and no coordination
+//! of multiple processes modifying the same file at once.
 //!
-//! Unlike Claude Code, reading and writing tracked files does not follow symlinks: parent
-//! directories are opened segment by segment from the root with `O_NOFOLLOW`, and the file is read,
-//! removed with `unlinkat`, or replaced by writing a temporary file and `renameat` within that
-//! directory. When a file or its parent directory has been replaced by a symlink, or is no longer a
-//! regular file, the snapshot does not back it up and rewind records it as a failure and skips it,
-//! neither reading nor modifying files outside the workspace. Tracking keys are the canonical paths
-//! resolved by the file tools, so the per-segment check does not wrongly reject the path containing
-//! the working directory itself.
+//! Tracked files are reached where the Chat's file tools reach them: the Folder and Additional
+//! Directories through the Chat's Execution Environment, the Chat's own directories on this
+//! machine. Tracking keys are the absolute paths the model sees for the files, with links resolved
+//! by the file tools (locally the canonical paths), and each use maps a key to its root again.
+//! Restoring writes or deletes a file only while it still has the version read just before, so a
+//! change made meanwhile is kept and reported. File history only changes files in directories the
+//! Chat can write and does not follow symbolic links: a tracked path that now leads elsewhere, or
+//! is no longer a regular file, is neither backed up nor restored, and rewind records it as a
+//! failure and skips it. Backups do not keep permission bits, which the Port does not report; a
+//! restored file keeps its own, and a recreated one gets what the environment gives new files.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata};
-use std::io::{self, Read, Seek};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tickloop_harness_base::private_fs::{
@@ -36,6 +38,10 @@ use tickloop_harness_base::private_fs::{
     open_without_following_links,
 };
 use tickloop_harness_base::timestamp::now_timestamp;
+use tickloop_harness_tools::file_port::{
+    FileContent, FileInspection, FileKind, FileMetadata, FileQuery, FileWriteError, error_code,
+};
+use tickloop_harness_tools::{FileLocation, FileLocator};
 
 /// Directory under the state root (or the project temp directory when not persisting) holding each
 /// Chat's backups.
@@ -44,12 +50,10 @@ pub(crate) const FILE_HISTORY_DIRECTORY: &str = "file-history";
 pub(crate) const MAX_SNAPSHOTS: usize = 100;
 const BACKUP_NAME_HASH_HEX_LENGTH: usize = 16;
 const FIRST_VERSION: u32 = 1;
-/// Workspace directories recreated during restore are created as 0777 like `create_dir_all`; the
-/// actual permissions are determined by the umask.
-const WORKSPACE_DIRECTORY_MODE: u32 = 0o777;
 const STAGED_FILE_PREFIX: &str = ".tickloop-file-history-";
 const PERMISSION_BITS: u32 = 0o7777;
-const COMPARE_CHUNK_BYTES: usize = 64 * 1024;
+/// How much of a tracked file one read through its host asks for.
+const READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// A file's version in one snapshot; an empty `backup_file_name` means the file does not exist in
 /// that version.
@@ -248,13 +252,11 @@ impl FileHistory {
             .collect()
     }
 
-    /// Whether an initial backup is needed before editing the file. Following Claude Code: nothing
-    /// is tracked while there are no snapshots yet; when the latest snapshot already tracks the
-    /// file, the next snapshot checks for changes and the initial backup is not rewritten.
-    pub(crate) fn needs_backup(&self, path: &Path) -> bool {
-        let Some(key) = tracking_key(path) else {
-            return false;
-        };
+    /// Whether an initial backup is needed before editing the file the model sees at `key`.
+    /// Following Claude Code: nothing is tracked while there are no snapshots yet; when the latest
+    /// snapshot already tracks the file, the next snapshot checks for changes and the initial
+    /// backup is not rewritten.
+    pub(crate) fn needs_backup(&self, key: &str) -> bool {
         self.snapshots
             .last()
             .is_some_and(|latest| !latest.tracked_file_backups.contains_key(key))
@@ -266,10 +268,9 @@ impl FileHistory {
     /// file in the meantime.
     pub(crate) fn commit_tracked_edit(
         &mut self,
-        path: &Path,
+        key: &str,
         backup: FileHistoryBackup,
     ) -> Option<FileHistorySnapshot> {
-        let key = tracking_key(path)?;
         let latest = self.snapshots.last_mut()?;
         if latest.tracked_file_backups.contains_key(key) {
             return None;
@@ -279,15 +280,23 @@ impl FileHistory {
         Some(latest.clone())
     }
 
-    /// Completes `fileHistoryTrackEdit` synchronously: makes the initial backup when needed and
+    /// Completes `fileHistoryTrackEdit` in one step: makes the initial backup when needed and
     /// records it into the latest snapshot.
     #[cfg(test)]
-    pub(crate) fn track_edit(&mut self, path: &Path) -> io::Result<Option<FileHistorySnapshot>> {
-        if !self.needs_backup(path) {
+    pub(crate) async fn track_edit(
+        &mut self,
+        files: &FileLocator,
+        path: &Path,
+    ) -> io::Result<Option<FileHistorySnapshot>> {
+        let location = files
+            .locate(path)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let key = location.display();
+        if !self.needs_backup(&key) {
             return Ok(None);
         }
-        let backup = create_first_backup(&self.directory, path)?;
-        Ok(self.commit_tracked_edit(path, backup))
+        let backup = create_first_backup(&self.directory, &location).await?;
+        Ok(self.commit_tracked_edit(&key, backup))
     }
 
     /// Following the start of Claude Code's `fileHistoryMakeSnapshot`: appends the snapshot
@@ -394,12 +403,16 @@ impl FileHistory {
         Some(snapshot.clone())
     }
 
-    /// Completes one `fileHistoryMakeSnapshot` synchronously.
+    /// Completes one `fileHistoryMakeSnapshot` in one step.
     #[cfg(test)]
-    pub(crate) fn make_snapshot(&mut self, message_id: Uuid) -> FileHistorySnapshot {
+    pub(crate) async fn make_snapshot(
+        &mut self,
+        files: &FileLocator,
+        message_id: Uuid,
+    ) -> FileHistorySnapshot {
         self.begin_snapshot(message_id);
         while let Some(plan) = self.next_snapshot_plan() {
-            self.commit_snapshot(plan.compute());
+            self.commit_snapshot(plan.compute(files).await);
         }
         self.snapshots.last().cloned().unwrap()
     }
@@ -407,7 +420,11 @@ impl FileHistory {
     /// Following Claude Code's `applySnapshot`: deletes the file when the target is empty; uses the
     /// initial backup for files absent from the snapshot; copies back only when the content
     /// differs. Errors without touching any file when no snapshot of the target message is found.
-    pub(crate) fn rewind(&self, message_id: Uuid) -> Result<FileRestoreReport, FileHistoryError> {
+    pub(crate) async fn rewind(
+        &self,
+        files: &FileLocator,
+        message_id: Uuid,
+    ) -> Result<FileRestoreReport, FileHistoryError> {
         let target = self.target_snapshot(message_id)?;
         let mut report = FileRestoreReport::default();
         for key in &self.tracked_files {
@@ -418,7 +435,10 @@ impl FileHistory {
                     .push((path, "no backup of this file can be found".into()));
                 continue;
             };
-            match self.apply_backup(&path, backup_file_name.as_deref()) {
+            match self
+                .apply_backup(files, key, backup_file_name.as_deref())
+                .await
+            {
                 Ok(true) => report.changed_files.push(path),
                 Ok(false) => {}
                 Err(error) => report.failures.push((path, error.to_string())),
@@ -428,35 +448,40 @@ impl FileHistory {
     }
 
     /// Following Claude Code's `fileHistoryHasAnyChanges`/`fileHistoryGetDiffStats`: the files that
-    /// restoring to the target message would change, without touching disk. Returns `None` when the
+    /// restoring to the target message would change, without changing any. Returns `None` when the
     /// message has no snapshot. Files that cannot be compared safely (for example, replaced by a
     /// symlink) are also listed; rewind will report them as failures.
-    pub(crate) fn files_changed_by_rewind(&self, message_id: Uuid) -> Option<Vec<PathBuf>> {
+    pub(crate) async fn files_changed_by_rewind(
+        &self,
+        files: &FileLocator,
+        message_id: Uuid,
+    ) -> Option<Vec<PathBuf>> {
         let target = self.target_snapshot(message_id).ok()?;
-        Some(
-            self.tracked_files
-                .iter()
-                .filter(|key| {
-                    let path = Path::new(key.as_str());
-                    match self.target_backup_name(target, key) {
-                        None => false,
-                        Some(None) => tracked_entry_may_exist(path),
-                        Some(Some(name)) => {
-                            match (
-                                open_tracked_file(path),
-                                open_backup_file(&self.directory, &name),
-                            ) {
-                                (Ok(mut current), Ok(mut backup)) => {
-                                    origin_changed(current.as_mut(), backup.as_mut())
-                                }
-                                _ => true,
-                            }
+        let mut changed = Vec::new();
+        for key in &self.tracked_files {
+            let changes = match self.target_backup_name(target, key) {
+                None => false,
+                Some(None) => tracked_file(files, key)
+                    .await
+                    .is_none_or(|tracked| tracked.exists),
+                Some(Some(name)) => match tracked_file(files, key).await {
+                    Some(tracked) => match (
+                        tracked.read().await,
+                        read_backup(&self.directory, &name).await,
+                    ) {
+                        (Ok(current), Ok(backup)) => {
+                            content_changed(current.as_ref(), backup.as_deref())
                         }
-                    }
-                })
-                .map(PathBuf::from)
-                .collect(),
-        )
+                        _ => true,
+                    },
+                    None => true,
+                },
+            };
+            if changes {
+                changed.push(PathBuf::from(key));
+            }
+        }
+        Some(changed)
     }
 
     /// The same snapshots moved to another backup directory without copying backup files; together
@@ -530,32 +555,42 @@ impl FileHistory {
         })
     }
 
-    /// Returns `true` when the file was changed.
-    fn apply_backup(&self, path: &Path, backup_file_name: Option<&str>) -> io::Result<bool> {
+    /// Returns `true` when the file was changed. The change carries the version just read, so a
+    /// file changed after that read is left as it is and reported.
+    async fn apply_backup(
+        &self,
+        files: &FileLocator,
+        key: &str,
+        backup_file_name: Option<&str>,
+    ) -> io::Result<bool> {
         #[cfg(test)]
-        test_pause::wait_if_paused(path);
+        test_pause::wait_if_paused(key).await;
+        let tracked = locate_tracked(files, key)?.inspect().await?;
+        let current = tracked.read().await?;
+        let host = &tracked.location.host;
+        let path = tracked.location.path.clone();
         let Some(name) = backup_file_name else {
-            return remove_tracked_file(path);
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            host.delete(path, current.metadata.version)
+                .await
+                .map_err(change_error)?;
+            return Ok(true);
         };
-        let mut backup = open_backup_file(&self.directory, name)?;
-        let mut current = open_tracked_file(path)?;
-        if !origin_changed(current.as_mut(), backup.as_mut()) {
+        let backup = read_backup(&self.directory, name).await?;
+        if !content_changed(current.as_ref(), backup.as_deref()) {
             return Ok(false);
         }
-        let mut backup = backup
+        let backup = backup
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the backup file is missing"))?;
-        backup.file.rewind()?;
-        let (parent, file_name) = split_path(path)?;
-        let parent_directory = open_directory(parent, Some(WORKSPACE_DIRECTORY_MODE))?;
-        // The file may have been replaced after the comparison; check again and do not write
-        // symlinks or non-regular files.
-        ensure_regular_or_missing(&parent_directory, &file_name)?;
-        publish_copy(
-            &parent_directory,
-            &file_name,
-            &mut backup.file,
-            backup.metadata.mode(),
-        )?;
+        let expected = current.map(|current| current.metadata.version);
+        host.prepare_write(path, backup, expected)
+            .await
+            .map_err(|error| io::Error::other(error.message))?
+            .write(CancellationToken::new())
+            .await
+            .map_err(change_error)?;
         Ok(true)
     }
 }
@@ -563,83 +598,77 @@ impl FileHistory {
 impl SnapshotPlan {
     /// Following the per-file handling of Claude Code's `fileHistoryMakeSnapshot`: unchanged files
     /// reuse the previous version, changed files bump the version, deleted files are recorded as
-    /// empty. Reads and writes files, so it should be called in `spawn_blocking`.
-    pub(crate) fn compute(self) -> ComputedSnapshot {
-        let files = self
-            .files
-            .into_iter()
-            .map(|file| {
-                let resolved = match next_backup(
-                    &self.directory,
-                    Path::new(&file.key),
-                    file.previous.as_ref(),
-                ) {
-                    Ok(backup) => Some(backup),
-                    Err(_) => file.previous,
-                };
-                ComputedFile {
-                    key: file.key,
-                    expected: file.expected,
-                    resolved,
-                }
-            })
-            .collect();
+    /// empty.
+    pub(crate) async fn compute(self, files: &FileLocator) -> ComputedSnapshot {
+        let mut computed = Vec::with_capacity(self.files.len());
+        for file in self.files {
+            let resolved = match next_backup(
+                &self.directory,
+                files,
+                &file.key,
+                file.previous.as_ref(),
+            )
+            .await
+            {
+                Ok(backup) => Some(backup),
+                Err(_) => file.previous,
+            };
+            computed.push(ComputedFile {
+                key: file.key,
+                expected: file.expected,
+                resolved,
+            });
+        }
         ComputedSnapshot {
             message_id: self.message_id,
-            files,
+            files: computed,
         }
     }
 }
 
-/// Only UTF-8 paths are tracked: snapshots store paths as JSON object keys.
-fn tracking_key(path: &Path) -> Option<&str> {
-    path.to_str()
-}
-
-fn backup_file_name(path: &str, version: u32) -> String {
-    let digest = format!("{:x}", Sha256::digest(path.as_bytes()));
+fn backup_file_name(key: &str, version: u32) -> String {
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
     format!("{}@v{version}", &digest[..BACKUP_NAME_HASH_HEX_LENGTH])
 }
 
 /// Following the backup phase of Claude Code's `fileHistoryTrackEdit`: makes the initial backup of
-/// the file before it is edited.
-pub(crate) fn create_first_backup(
+/// the file at `location` before it is edited.
+pub(crate) async fn create_first_backup(
     directory: &PrivateDirectory,
-    path: &Path,
-) -> io::Result<FileHistoryBackup> {
-    create_backup(directory, path, FIRST_VERSION)
-}
-
-/// Following Claude Code's `createBackup`: records empty when the source file does not exist;
-/// otherwise copies it into the backup directory, preserving permission bits. Returns an error
-/// explaining why, without making a backup, when the source file or its parent directory is a
-/// symlink or the source file is not a regular file.
-fn create_backup(
-    directory: &PrivateDirectory,
-    path: &Path,
-    version: u32,
+    location: &FileLocation,
 ) -> io::Result<FileHistoryBackup> {
     let backup_time = now_timestamp();
-    match open_tracked_file(path)? {
-        Some(mut source) => write_backup(directory, path, version, &mut source, backup_time),
+    let tracked = TrackedLocation::new(location.clone())?.inspect().await?;
+    match tracked.read().await? {
+        Some(source) => {
+            write_backup(
+                directory,
+                &location.display(),
+                FIRST_VERSION,
+                source.data,
+                backup_time,
+            )
+            .await
+        }
         None => Ok(FileHistoryBackup {
             backup_file_name: None,
-            version,
+            version: FIRST_VERSION,
             backup_time,
         }),
     }
 }
 
-fn next_backup(
+async fn next_backup(
     directory: &PrivateDirectory,
-    path: &Path,
+    files: &FileLocator,
+    key: &str,
     previous: Option<&FileHistoryBackup>,
 ) -> io::Result<FileHistoryBackup> {
     #[cfg(test)]
-    test_pause::wait_if_paused(path);
+    test_pause::wait_if_paused(key).await;
     let backup_time = now_timestamp();
     let version = previous.map_or(FIRST_VERSION, |backup| backup.version + 1);
-    let Some(mut source) = open_tracked_file(path)? else {
+    let Some(source) = locate_tracked(files, key)?.inspect().await?.read().await? else {
         return Ok(FileHistoryBackup {
             backup_file_name: None,
             version,
@@ -648,41 +677,194 @@ fn next_backup(
     };
     if let Some(previous) = previous
         && let Some(name) = &previous.backup_file_name
-        && let Ok(mut backup) = open_backup_file(directory, name)
-        && !origin_changed(Some(&mut source), backup.as_mut())
+        && let Ok(backup) = read_backup(directory, name).await
+        && !content_changed(Some(&source), backup.as_deref())
     {
         return Ok(previous.clone());
     }
-    source.file.rewind()?;
-    write_backup(directory, path, version, &mut source, backup_time)
+    write_backup(directory, key, version, source.data, backup_time).await
 }
 
-fn write_backup(
+async fn write_backup(
     directory: &PrivateDirectory,
-    path: &Path,
+    key: &str,
     version: u32,
-    source: &mut OpenedFile,
+    content: Vec<u8>,
     backup_time: String,
 ) -> io::Result<FileHistoryBackup> {
-    let key = tracking_key(path).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file history only tracks UTF-8 paths",
-        )
-    })?;
     let name = backup_file_name(key, version);
-    let backup_directory = open_backup_directory(directory, true)?;
-    publish_copy(
-        &backup_directory,
-        &c_string(name.as_bytes())?,
-        &mut source.file,
-        source.metadata.mode(),
-    )?;
+    let directory = directory.clone();
+    let staged_name = name.clone();
+    tokio::task::spawn_blocking(move || {
+        let backup_directory = open_backup_directory(&directory, true)?;
+        publish_copy(
+            &backup_directory,
+            &c_string(staged_name.as_bytes())?,
+            &mut content.as_slice(),
+            PRIVATE_FILE_MODE,
+        )
+    })
+    .await
+    .map_err(io::Error::other)??;
     Ok(FileHistoryBackup {
         backup_file_name: Some(name),
         version,
         backup_time,
     })
+}
+
+/// The content of a backup, or `None` when it is missing.
+async fn read_backup(directory: &PrivateDirectory, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let directory = directory.clone();
+    let name = name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let Some(mut backup) = open_backup_file(&directory, &name)? else {
+            return Ok(None);
+        };
+        let mut content = Vec::new();
+        backup.file.read_to_end(&mut content)?;
+        Ok(Some(content))
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Following Claude Code's `checkOriginFileChanged`: one side existing and the other missing
+/// counts as changed, and otherwise the content is compared. The modification times Claude Code
+/// compares first come from two machines' clocks here, so they are not trusted.
+fn content_changed(current: Option<&FileContent>, backup: Option<&[u8]>) -> bool {
+    match (current, backup) {
+        (None, None) => false,
+        (Some(current), Some(backup)) => current.data != backup,
+        _ => true,
+    }
+}
+
+/// The failure of a restore the host refused or whose outcome is unknown; neither is retried.
+fn change_error(error: FileWriteError) -> io::Error {
+    match error {
+        FileWriteError::NotWritten(error) => io::Error::other(error.message),
+        FileWriteError::OutcomeUnknown(reason) => io::Error::other(format!(
+            "the restore was sent but its answer was lost ({reason}), so it may or may not have taken effect; it was not sent again"
+        )),
+    }
+}
+
+/// A tracked file located where the Chat can change it.
+struct TrackedLocation {
+    location: FileLocation,
+}
+
+/// A tracked file whose path was found to lead to itself.
+struct TrackedFile {
+    location: FileLocation,
+    exists: bool,
+}
+
+/// Locates the tracked file the model sees at `key`.
+fn locate_tracked(files: &FileLocator, key: &str) -> io::Result<TrackedLocation> {
+    let location = files
+        .locate(Path::new(key))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    TrackedLocation::new(location)
+}
+
+/// The tracked file at `key` when it can be located and its path leads to itself.
+async fn tracked_file(files: &FileLocator, key: &str) -> Option<TrackedFile> {
+    locate_tracked(files, key).ok()?.inspect().await.ok()
+}
+
+impl TrackedLocation {
+    /// File history changes only files in directories the Chat can write.
+    fn new(location: FileLocation) -> io::Result<Self> {
+        if !location
+            .host
+            .capabilities()
+            .access(&location.path)
+            .can_write()
+        {
+            return Err(io::Error::other(
+                "the file is in a directory this Chat can only read",
+            ));
+        }
+        Ok(Self { location })
+    }
+
+    /// What is at the path now: an error when the path leads elsewhere through a symbolic link or
+    /// to something other than a regular file.
+    async fn inspect(self) -> io::Result<TrackedFile> {
+        let location = self.location;
+        let resolved = match location
+            .host
+            .inspect(FileQuery::Resolve(location.path.clone()))
+            .await
+        {
+            Ok(FileInspection::Resolved(resolved)) => resolved,
+            Ok(_) => return Err(unexpected_answer()),
+            Err(error) => return Err(io::Error::other(error.message)),
+        };
+        if resolved.path != location.path {
+            return Err(io::Error::other(format!(
+                "the path now leads to {} through a symbolic link; file history does not follow links",
+                location.host.capabilities().display(&resolved.path)
+            )));
+        }
+        let exists = match resolved.kind {
+            None => false,
+            Some(FileKind::File) => true,
+            Some(FileKind::Directory | FileKind::Other) => return Err(not_regular_error()),
+        };
+        Ok(TrackedFile { location, exists })
+    }
+}
+
+impl TrackedFile {
+    /// The whole file, read in chunks that must all come from one version of it; `None` when
+    /// nothing is there.
+    async fn read(&self) -> io::Result<Option<FileContent>> {
+        if !self.exists {
+            return Ok(None);
+        }
+        let mut data = Vec::new();
+        let mut metadata: Option<FileMetadata> = None;
+        loop {
+            let query = FileQuery::Read {
+                path: self.location.path.clone(),
+                offset: data.len() as u64,
+                limit: READ_CHUNK_BYTES,
+            };
+            let chunk = match self.location.host.inspect(query).await {
+                Ok(FileInspection::Read(chunk)) => chunk,
+                Ok(_) => return Err(unexpected_answer()),
+                Err(error) if error.code == error_code::NOT_FOUND && metadata.is_none() => {
+                    return Ok(None);
+                }
+                Err(error) if error.code == error_code::IS_DIRECTORY => {
+                    return Err(not_regular_error());
+                }
+                Err(error) => return Err(io::Error::other(error.message)),
+            };
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.version != chunk.metadata.version)
+            {
+                return Err(io::Error::other(
+                    "the file changed while file history read it",
+                ));
+            }
+            let is_last = chunk.data.len() < READ_CHUNK_BYTES;
+            data.extend(chunk.data);
+            metadata = Some(chunk.metadata);
+            if is_last {
+                break;
+            }
+        }
+        Ok(metadata.map(|metadata| FileContent { metadata, data }))
+    }
+}
+
+fn unexpected_answer() -> io::Error {
+    io::Error::other("the environment answered a file query with something else")
 }
 
 struct OpenedFile {
@@ -715,64 +897,6 @@ fn open_backup_file(directory: &PrivateDirectory, name: &str) -> io::Result<Opti
         Err(error) => return Err(error),
     };
     open_regular_file_at(&backup_directory, &c_string(name.as_bytes())?)
-}
-
-/// Opens a tracked file without following symlinks; returns `None` when the file or its parent
-/// directory does not exist.
-fn open_tracked_file(path: &Path) -> io::Result<Option<OpenedFile>> {
-    let (parent, name) = split_path(path)?;
-    match open_directory(parent, None) {
-        Ok(directory) => open_regular_file_at(&directory, &name),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Whether rewind might delete the file when the target version is empty; when this cannot be
-/// determined safely, the file is treated as existing and rewind reports the failure.
-fn tracked_entry_may_exist(path: &Path) -> bool {
-    let Ok((parent, name)) = split_path(path) else {
-        return true;
-    };
-    match open_directory(parent, None) {
-        Ok(directory) => !matches!(entry_kind_at(&directory, &name), Ok(None)),
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
-    }
-}
-
-/// Deletes a file whose target version is empty, following Claude Code; only regular files are
-/// deleted, and a missing parent directory counts as already deleted.
-fn remove_tracked_file(path: &Path) -> io::Result<bool> {
-    let (parent, name) = split_path(path)?;
-    let directory = match open_directory(parent, None) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if entry_kind_at(&directory, &name)?.is_none() {
-        return Ok(false);
-    }
-    ensure_regular_or_missing(&directory, &name)?;
-    // SAFETY: The directory descriptor is valid and the name is a single NUL-terminated path
-    // segment.
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        let error = io::Error::last_os_error();
-        return match error.kind() {
-            io::ErrorKind::NotFound => Ok(false),
-            _ => Err(error),
-        };
-    }
-    Ok(true)
-}
-
-fn split_path(path: &Path) -> io::Result<(&Path, CString)> {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => Ok((parent, c_string(name.as_bytes())?)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file history only tracks files with a parent directory",
-        )),
-    }
 }
 
 fn c_string(bytes: &[u8]) -> io::Result<CString> {
@@ -822,14 +946,6 @@ fn entry_kind_at(directory: &File, name: &CStr) -> io::Result<Option<EntryKind>>
     }))
 }
 
-fn ensure_regular_or_missing(directory: &File, name: &CStr) -> io::Result<()> {
-    match entry_kind_at(directory, name)? {
-        None | Some(EntryKind::Regular) => Ok(()),
-        Some(EntryKind::SymbolicLink) => Err(symbolic_link_error()),
-        Some(EntryKind::Other) => Err(not_regular_error()),
-    }
-}
-
 fn symbolic_link_error() -> io::Error {
     io::Error::other("the file is a symbolic link; file history does not follow links")
 }
@@ -869,10 +985,16 @@ fn open_regular_file_at(directory: &File, name: &CStr) -> io::Result<Option<Open
     Ok(Some(OpenedFile { file, metadata }))
 }
 
-/// Writes a temporary file in the directory, sets its permission bits, then replaces `name` with
-/// `renameat`; the temporary file is removed on failure. The directory entry itself is replaced, so
-/// even if `name` is a symlink at that moment, nothing is written to the link's target.
-fn publish_copy(directory: &File, name: &CStr, source: &mut File, mode: u32) -> io::Result<()> {
+/// Writes a temporary file in the backup directory, sets its permission bits, then replaces
+/// `name` with `renameat`; the temporary file is removed on failure. The directory entry itself is
+/// replaced, so even if `name` is a symlink at that moment, nothing is written to the link's
+/// target.
+fn publish_copy(
+    directory: &File,
+    name: &CStr,
+    source: &mut impl Read,
+    mode: u32,
+) -> io::Result<()> {
     let staged = c_string(format!("{STAGED_FILE_PREFIX}{}", tickloop_ids::generate()).as_bytes())?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: The directory descriptor is valid and the name is NUL-terminated; on success the
@@ -954,62 +1076,8 @@ fn link_or_copy(source: &File, target: &File, name: &str) -> bool {
     }
 }
 
-/// Following Claude Code's `checkOriginFileChanged`: one side existing and the other missing counts
-/// as changed; differing permissions or size count as changed; when the original file's
-/// modification time is earlier than the backup's, the content is not compared; otherwise the
-/// content is compared.
-fn origin_changed(original: Option<&mut OpenedFile>, backup: Option<&mut OpenedFile>) -> bool {
-    let (original, backup) = match (original, backup) {
-        (None, None) => return false,
-        (Some(original), Some(backup)) => (original, backup),
-        _ => return true,
-    };
-    if original.metadata.mode() != backup.metadata.mode()
-        || original.metadata.len() != backup.metadata.len()
-    {
-        return true;
-    }
-    if modified_nanos(&original.metadata) < modified_nanos(&backup.metadata) {
-        return false;
-    }
-    !same_content(&mut original.file, &mut backup.file).unwrap_or(false)
-}
-
-fn same_content(left: &mut File, right: &mut File) -> io::Result<bool> {
-    let mut left_chunk = vec![0; COMPARE_CHUNK_BYTES];
-    let mut right_chunk = vec![0; COMPARE_CHUNK_BYTES];
-    loop {
-        let left_length = read_chunk(left, &mut left_chunk)?;
-        let right_length = read_chunk(right, &mut right_chunk)?;
-        if left_chunk[..left_length] != right_chunk[..right_length] {
-            return Ok(false);
-        }
-        if left_length == 0 {
-            return Ok(true);
-        }
-    }
-}
-
-/// Reads until the buffer is full or the end of the file is reached.
-fn read_chunk(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match file.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(filled)
-}
-
-fn modified_nanos(metadata: &Metadata) -> i128 {
-    i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec())
-}
-
-/// Test seam: makes file-history operations reading or writing a given path stop in the blocking
-/// thread until the test releases them.
+/// Test seam: makes file-history operations reading or writing a given path wait until the test
+/// releases them.
 #[cfg(test)]
 pub(crate) mod test_pause {
     use std::collections::HashMap;
@@ -1017,23 +1085,25 @@ pub(crate) mod test_pause {
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
 
+    use tokio::sync::oneshot;
+
     /// Deadline after which the pause releases itself if the test has not, so a failing test does
     /// not hang forever.
     const PAUSE_LIMIT: Duration = Duration::from_secs(5);
 
-    type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+    type Gate = (mpsc::Sender<()>, oneshot::Receiver<()>);
 
     static GATES: Mutex<Option<HashMap<PathBuf, Gate>>> = Mutex::new(None);
 
     /// A one-shot pause; released when dropped.
     pub(crate) struct Pause {
         pub(crate) entered: mpsc::Receiver<()>,
-        _release: mpsc::Sender<()>,
+        _release: oneshot::Sender<()>,
     }
 
     pub(crate) fn pause_next(path: &Path) -> Pause {
         let (entered_sender, entered) = mpsc::channel();
-        let (release, release_receiver) = mpsc::channel();
+        let (release, release_receiver) = oneshot::channel();
         GATES
             .lock()
             .unwrap()
@@ -1045,15 +1115,15 @@ pub(crate) mod test_pause {
         }
     }
 
-    pub(super) fn wait_if_paused(path: &Path) {
+    pub(super) async fn wait_if_paused(key: &str) {
         let gate = GATES
             .lock()
             .unwrap()
             .as_mut()
-            .and_then(|gates| gates.remove(path));
+            .and_then(|gates| gates.remove(Path::new(key)));
         if let Some((entered, release)) = gate {
             let _ = entered.send(());
-            let _ = release.recv_timeout(PAUSE_LIMIT);
+            let _ = tokio::time::timeout(PAUSE_LIMIT, release).await;
         }
     }
 }
@@ -1061,6 +1131,9 @@ pub(crate) mod test_pause {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use tickloop_harness_tools::local_roots::LocalRoots;
 
     use super::*;
 
@@ -1070,24 +1143,29 @@ mod tests {
         ))
     }
 
-    /// Per-segment `O_NOFOLLOW` opening requires canonical paths (the macOS temp directory sits
-    /// under the symlink `/var`).
+    /// The files of a Chat whose Folder is `root` on this machine.
+    fn local_files(root: &Path) -> FileLocator {
+        FileLocator::new(Arc::new(LocalRoots::new(root.to_str(), &[])))
+    }
+
+    /// Local roots are real paths (the macOS temp directory sits under the symlink `/var`).
     fn canonical_temp_directory() -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         (directory, root)
     }
 
-    #[test]
-    fn backups_follow_claude_code_names_and_keep_permission_bits() {
+    #[tokio::test]
+    async fn backups_follow_claude_code_names_in_a_private_directory() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let path = root.join("script.sh");
         std::fs::write(&path, "echo one\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
         let mut history = history(&root);
-        history.make_snapshot(Uuid::from_u128(1));
+        history.make_snapshot(&files, Uuid::from_u128(1)).await;
 
-        let updated = history.track_edit(&path).unwrap().unwrap();
+        let updated = history.track_edit(&files, &path).await.unwrap().unwrap();
         let backup = &updated.tracked_file_backups[path.to_str().unwrap()];
         let digest = format!("{:x}", Sha256::digest(path.to_str().unwrap().as_bytes()));
         assert_eq!(
@@ -1100,41 +1178,48 @@ mod tests {
         assert_eq!(std::fs::read(&backup_path).unwrap(), b"echo one\n");
         assert_eq!(
             std::fs::metadata(&backup_path).unwrap().mode() & 0o777,
-            0o751
+            PRIVATE_FILE_MODE
         );
         assert_eq!(
             std::fs::metadata(history.directory()).unwrap().mode() & 0o777,
             0o700
         );
-        assert!(history.track_edit(&path).unwrap().is_none());
+        assert!(history.track_edit(&files, &path).await.unwrap().is_none());
     }
 
-    #[test]
-    fn edits_without_a_snapshot_are_not_tracked() {
+    #[tokio::test]
+    async fn edits_without_a_snapshot_are_not_tracked() {
         let (_directory, root) = canonical_temp_directory();
         let path = root.join("untracked.txt");
         let mut history = history(&root);
-        assert!(history.track_edit(&path).unwrap().is_none());
+        assert!(
+            history
+                .track_edit(&local_files(&root), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!history.directory().exists());
     }
 
-    #[test]
-    fn snapshots_reuse_unchanged_versions_bump_changed_ones_and_mark_deletions() {
+    #[tokio::test]
+    async fn snapshots_reuse_unchanged_versions_bump_changed_ones_and_mark_deletions() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let [kept, changed, deleted] =
             ["kept.txt", "changed.txt", "deleted.txt"].map(|name| root.join(name));
         for path in [&kept, &changed, &deleted] {
             std::fs::write(path, "original").unwrap();
         }
         let mut history = history(&root);
-        history.make_snapshot(Uuid::from_u128(1));
+        history.make_snapshot(&files, Uuid::from_u128(1)).await;
         for path in [&kept, &changed, &deleted] {
-            history.track_edit(path).unwrap();
+            history.track_edit(&files, path).await.unwrap();
         }
         std::fs::write(&changed, "changed content").unwrap();
         std::fs::remove_file(&deleted).unwrap();
 
-        let snapshot = history.make_snapshot(Uuid::from_u128(2));
+        let snapshot = history.make_snapshot(&files, Uuid::from_u128(2)).await;
         let version =
             |path: &PathBuf| snapshot.tracked_file_backups[path.to_str().unwrap()].clone();
         assert_eq!(version(&kept).version, 1);
@@ -1144,28 +1229,30 @@ mod tests {
         assert!(version(&deleted).backup_file_name.is_none());
     }
 
-    #[test]
-    fn pending_snapshots_keep_prompt_order_and_edits_committed_while_computing() {
+    #[tokio::test]
+    async fn pending_snapshots_keep_prompt_order_and_edits_committed_while_computing() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let [first, second] = ["first.txt", "second.txt"].map(|name| root.join(name));
         std::fs::write(&first, "one").unwrap();
         let mut history = history(&root);
-        history.make_snapshot(Uuid::from_u128(1));
-        history.track_edit(&first).unwrap();
+        history.make_snapshot(&files, Uuid::from_u128(1)).await;
+        history.track_edit(&files, &first).await.unwrap();
         std::fs::write(&first, "two").unwrap();
 
         history.begin_snapshot(Uuid::from_u128(2));
         history.begin_snapshot(Uuid::from_u128(3));
         let plan = history.next_snapshot_plan().unwrap();
         std::fs::write(&second, "second").unwrap();
-        history.track_edit(&second).unwrap();
-        let committed = history.commit_snapshot(plan.compute()).unwrap();
+        history.track_edit(&files, &second).await.unwrap();
+        let committed = history.commit_snapshot(plan.compute(&files).await).unwrap();
         assert_eq!(committed.message_id, Uuid::from_u128(2));
         assert_eq!(
             committed.tracked_file_backups[first.to_str().unwrap()].version,
             2
         );
-        let latest = history.commit_snapshot(history.next_snapshot_plan().unwrap().compute());
+        let plan = history.next_snapshot_plan().unwrap();
+        let latest = history.commit_snapshot(plan.compute(&files).await);
         let latest = latest.unwrap();
         assert_eq!(latest.message_id, Uuid::from_u128(3));
         assert_eq!(
@@ -1179,40 +1266,46 @@ mod tests {
         assert!(history.next_snapshot_plan().is_none());
     }
 
-    #[test]
-    fn rewind_restores_modified_created_and_deleted_files() {
+    #[tokio::test]
+    async fn rewind_restores_modified_created_and_deleted_files() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let modified = root.join("modified.txt");
         let created = root.join("created.txt");
         let deleted = root.join("deleted.txt");
         std::fs::write(&modified, "before").unwrap();
         std::fs::write(&deleted, "keep me").unwrap();
         let mut history = history(&root);
-        history.make_snapshot(Uuid::from_u128(1));
+        history.make_snapshot(&files, Uuid::from_u128(1)).await;
         for path in [&modified, &created, &deleted] {
-            history.track_edit(path).unwrap();
+            history.track_edit(&files, path).await.unwrap();
         }
         std::fs::write(&modified, "after").unwrap();
         std::fs::write(&created, "new").unwrap();
         std::fs::remove_file(&deleted).unwrap();
-        history.make_snapshot(Uuid::from_u128(2));
+        history.make_snapshot(&files, Uuid::from_u128(2)).await;
 
-        let mut changed = history.files_changed_by_rewind(Uuid::from_u128(1)).unwrap();
+        let mut changed = history
+            .files_changed_by_rewind(&files, Uuid::from_u128(1))
+            .await
+            .unwrap();
         changed.sort();
         let mut expected = vec![created.clone(), deleted.clone(), modified.clone()];
         expected.sort();
         assert_eq!(changed, expected);
-        let report = history.rewind(Uuid::from_u128(1)).unwrap();
-        assert!(report.failures.is_empty());
+        let report = history.rewind(&files, Uuid::from_u128(1)).await.unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(std::fs::read_to_string(&modified).unwrap(), "before");
         assert!(!created.exists());
         assert_eq!(std::fs::read_to_string(&deleted).unwrap(), "keep me");
         assert_eq!(
-            history.files_changed_by_rewind(Uuid::from_u128(1)),
+            history
+                .files_changed_by_rewind(&files, Uuid::from_u128(1))
+                .await,
             Some(Vec::new())
         );
 
-        history.rewind(Uuid::from_u128(2)).unwrap();
+        history.rewind(&files, Uuid::from_u128(2)).await.unwrap();
         assert_eq!(std::fs::read_to_string(&modified).unwrap(), "after");
         assert_eq!(std::fs::read_to_string(&created).unwrap(), "new");
         assert!(!deleted.exists());
@@ -1223,37 +1316,41 @@ mod tests {
             .count();
         assert_eq!(staged, 0);
         assert!(matches!(
-            history.rewind(Uuid::from_u128(3)),
+            history.rewind(&files, Uuid::from_u128(3)).await,
             Err(FileHistoryError::SnapshotNotFound)
         ));
     }
 
-    #[test]
-    fn symbolic_links_and_special_files_are_never_backed_up() {
+    #[tokio::test]
+    async fn symbolic_links_and_special_files_are_never_backed_up() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let outside = root.join("outside.txt");
         std::fs::write(&outside, "outside").unwrap();
         let link = root.join("link.txt");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let history = history(&root);
+        let first_backup = |path: PathBuf| {
+            let files = files.clone();
+            let directory = history.backup_directory().clone();
+            async move { create_first_backup(&directory, &files.locate(&path).unwrap()).await }
+        };
 
-        let error = create_first_backup(history.backup_directory(), &link).unwrap_err();
+        let error = first_backup(link).await.unwrap_err();
         assert!(error.to_string().contains("symbolic link"), "{error}");
         let linked_parent = root.join("linked");
         std::os::unix::fs::symlink(&root, &linked_parent).unwrap();
-        let error = create_first_backup(
-            history.backup_directory(),
-            &linked_parent.join("outside.txt"),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("parent directory"), "{error}");
-        let error = create_first_backup(history.backup_directory(), &root).unwrap_err();
+        let error = first_backup(linked_parent.join("outside.txt"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error = first_backup(root.clone()).await.unwrap_err();
         assert!(error.to_string().contains("not a regular file"), "{error}");
         assert!(!history.directory().exists());
     }
 
-    #[test]
-    fn backup_directories_that_are_symbolic_links_are_rejected() {
+    #[tokio::test]
+    async fn backup_directories_that_are_symbolic_links_are_rejected() {
         let (_directory, root) = canonical_temp_directory();
         let elsewhere = root.join("elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
@@ -1262,43 +1359,50 @@ mod tests {
         std::fs::write(&path, "content").unwrap();
         let history = history(&root);
 
-        assert!(create_first_backup(history.backup_directory(), &path).is_err());
+        let location = local_files(&root).locate(&path).unwrap();
+        assert!(
+            create_first_backup(history.backup_directory(), &location)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
-    #[test]
-    fn only_the_latest_hundred_snapshots_are_kept_and_old_files_use_their_first_backup() {
+    #[tokio::test]
+    async fn only_the_latest_hundred_snapshots_are_kept_and_old_files_use_their_first_backup() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let path = root.join("file.txt");
         std::fs::write(&path, "first").unwrap();
         let mut history = history(&root);
-        history.make_snapshot(Uuid::from_u128(0));
-        history.track_edit(&path).unwrap();
+        history.make_snapshot(&files, Uuid::from_u128(0)).await;
+        history.track_edit(&files, &path).await.unwrap();
         std::fs::write(&path, "second").unwrap();
         for index in 1..=MAX_SNAPSHOTS as u128 {
-            history.make_snapshot(Uuid::from_u128(index));
+            history.make_snapshot(&files, Uuid::from_u128(index)).await;
         }
         assert_eq!(history.snapshots().len(), MAX_SNAPSHOTS);
         assert!(!history.can_restore(Uuid::from_u128(0)));
         assert!(matches!(
-            history.rewind(Uuid::from_u128(0)),
+            history.rewind(&files, Uuid::from_u128(0)).await,
             Err(FileHistoryError::SnapshotNotFound)
         ));
         std::fs::write(&path, "third").unwrap();
-        history.rewind(Uuid::from_u128(1)).unwrap();
+        history.rewind(&files, Uuid::from_u128(1)).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
     }
 
-    #[test]
-    fn copies_share_backups_through_hard_links_and_restore_independently() {
+    #[tokio::test]
+    async fn copies_share_backups_through_hard_links_and_restore_independently() {
         let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
         let path = root.join("file.txt");
         std::fs::write(&path, "before the copy").unwrap();
         let mut source = history(&root);
-        source.make_snapshot(Uuid::from_u128(1));
-        source.track_edit(&path).unwrap();
+        source.make_snapshot(&files, Uuid::from_u128(1)).await;
+        source.track_edit(&files, &path).await.unwrap();
         std::fs::write(&path, "after the copy").unwrap();
-        source.make_snapshot(Uuid::from_u128(2));
+        source.make_snapshot(&files, Uuid::from_u128(2)).await;
 
         let target = root.join(FILE_HISTORY_DIRECTORY).join("copy");
         let (copy, recorded) = source.copy_to(PrivateDirectory::trusted(target.clone()));
@@ -1314,7 +1418,7 @@ mod tests {
             std::fs::metadata(target.join(&name)).unwrap().ino()
         );
         std::fs::remove_dir_all(source.directory()).unwrap();
-        copy.rewind(Uuid::from_u128(1)).unwrap();
+        copy.rewind(&files, Uuid::from_u128(1)).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "before the copy");
     }
 }

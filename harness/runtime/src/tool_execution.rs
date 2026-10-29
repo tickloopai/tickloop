@@ -2652,12 +2652,10 @@ impl Agent {
                             receipt,
                             chat.client.clone(),
                         );
-                        let edited_file = prepared
-                            .edited_file_path()
-                            .map(std::path::Path::to_path_buf);
+                        let edited_file = prepared.edited_file();
                         drop(chats);
-                        if let Some(path) = edited_file {
-                            self.track_file_edit(receipt.chat_id, &path, assistant_message_id)
+                        if let Some(file) = edited_file {
+                            self.track_file_edit(receipt.chat_id, file, assistant_message_id)
                                 .await;
                         }
                         let execution = tools
