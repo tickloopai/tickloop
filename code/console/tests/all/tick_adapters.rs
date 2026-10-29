@@ -500,7 +500,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         ('x', "remove"),
         ('c', "copy"),
         ('f', "feedback"),
-        ('u', "include earlier feedback"),
+        ('u', "all feedback"),
     ]
     .map(|(key, label)| {
         action(

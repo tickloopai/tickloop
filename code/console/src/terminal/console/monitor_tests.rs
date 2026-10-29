@@ -3007,7 +3007,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_twice_unlinks_it() {
             ('x', "unlink"),
             ('c', "copy"),
             ('f', "feedback"),
-            ('u', "include earlier feedback")
+            ('u', "all feedback")
         ]
     );
     assert_eq!(requested_key(confirm_removal(&mut state)), 'x');
@@ -3031,7 +3031,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_twice_unlinks_it() {
             ('x', "unlink"),
             ('c', "copy"),
             ('f', "feedback"),
-            ('u', "include earlier feedback")
+            ('u', "all feedback")
         ]
     );
 }
