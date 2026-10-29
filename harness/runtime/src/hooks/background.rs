@@ -8,7 +8,14 @@
 //! reads it after its current tool results, and an idle Loop starts a turn for it. Either
 //! notification shows the Chat's views its summary line as the hook ends, as a finished
 //! background command's does. Any other ending only shows the user. A background hook keeps its
-//! timeout; Esc leaves it running, while `/stop` and shutdown end it.
+//! timeout; Esc leaves it running, while `/stop` and shutdown end it. An event that Esc or `/stop`
+//! ended before its background hooks started starts none of them, as Claude Code starts none once
+//! its event was aborted.
+//!
+//! `SessionEnd` hooks run as the Worker ends, after shutdown ended every Chat's background hooks:
+//! Claude Code 2.1.302 still starts an `async` one, which outlives its process, while the Worker
+//! ends every command it started as it exits. They therefore run within the event's own budget,
+//! and the Worker waits for them with its other `SessionEnd` hooks; what they print tells no one.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -31,14 +38,16 @@ const REWAKE_EXIT_CODE: i32 = 2;
 const DEFAULT_REWAKE_SUMMARY: &str = "Stop hook feedback";
 
 impl ChatHookState {
-    fn background_cancel(&mut self, shutdown: &CancellationToken) -> CancellationToken {
+    pub(super) fn background_cancel(&mut self, shutdown: &CancellationToken) -> CancellationToken {
         self.background
             .get_or_insert_with(|| shutdown.child_token())
             .clone()
     }
 
-    /// Ends the hooks the Chat runs in the background, as `/stop` does.
+    /// Ends the hooks the Chat runs in the background, as `/stop` does; the events under way
+    /// start none after it.
     pub(crate) fn cancel_background(&mut self) {
+        self.background_generation += 1;
         if let Some(cancel) = self.background.take() {
             cancel.cancel();
         }
@@ -111,23 +120,76 @@ fn rewake_notification(
     }
 }
 
+/// A background hook that was started and has yet to run to its end.
+pub(super) struct BackgroundRun {
+    agent: Agent,
+    receipt: Receipt,
+    context: HookContext,
+    event: HookEvent,
+    tool: Option<(String, String)>,
+    runnable: Runnable,
+    stdin: Vec<u8>,
+    cancel: CancellationToken,
+}
+
+impl BackgroundRun {
+    /// Runs the hook to its end, then records how it ended and tells the model what it has to
+    /// say.
+    pub(super) async fn finish(self) {
+        let run = self
+            .agent
+            .run_one_hook(
+                &self.receipt,
+                &self.context,
+                self.event,
+                &self.runnable,
+                &self.stdin,
+                &self.cancel,
+            )
+            .await;
+        self.agent
+            .finish_background_hook(
+                &self.receipt,
+                self.event,
+                self.tool.as_ref(),
+                &self.runnable,
+                run,
+            )
+            .await;
+    }
+}
+
 impl Agent {
     /// Starts `runnable` in the background for `call` and records its start; its event does not
-    /// wait for it.
+    /// wait for it. `None` when the event was ended or stopped before the hook could start, or
+    /// the Worker is ending. A `SessionEnd` hook runs within `cancel`, the event's own budget;
+    /// any other within the Chat's background lifetime.
     pub(super) async fn start_background_hook(
         &self,
         receipt: &Receipt,
         context: &HookContext,
         call: &HookCall,
         runnable: Runnable,
-        stdin: Vec<u8>,
-    ) {
-        let cancel = {
+        stdin: &[u8],
+        cancel: &CancellationToken,
+    ) -> Option<BackgroundRun> {
+        let lifetime = {
             let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&receipt.chat_id) else {
-                return;
+            let chat = chats.get_mut(&receipt.chat_id)?;
+            // Checked under the lock `/stop` takes, so an event it ended, or one prepared before
+            // it, never starts a hook with a lifetime of its own after it.
+            if cancel.is_cancelled()
+                || chat.hook_state.background_generation != context.background_generation
+            {
+                return None;
+            }
+            let lifetime = if call.event == HookEvent::SessionEnd {
+                cancel.clone()
+            } else if self.inner.closed.load(Ordering::SeqCst) {
+                return None;
+            } else {
+                chat.hook_state.background_cancel(&self.inner.shutdown)
             };
-            let cancel = chat.hook_state.background_cancel(&self.inner.shutdown);
             let started = FinishedRun {
                 response: HookResponse::success(),
                 duration: Duration::ZERO,
@@ -146,24 +208,22 @@ impl Agent {
             record.background = Some(HookBackgroundPhase::Started);
             record_hook_run(self, chat, receipt, record);
             self.save(&chat.snapshot);
-            cancel
+            lifetime
         };
-        let agent = self.clone();
-        let receipt = receipt.clone();
-        let context = context.clone();
-        let event = call.event;
-        let tool = call.tool.clone();
-        self.inner.tasks.spawn(async move {
-            let run = agent
-                .run_one_hook(&receipt, &context, event, &runnable, &stdin, &cancel)
-                .await;
-            agent
-                .finish_background_hook(&receipt, event, tool.as_ref(), &runnable, run)
-                .await;
-        });
+        Some(BackgroundRun {
+            agent: self.clone(),
+            receipt: receipt.clone(),
+            context: context.clone(),
+            event: call.event,
+            tool: call.tool.clone(),
+            runnable,
+            stdin: stdin.to_vec(),
+            cancel: lifetime,
+        })
     }
 
-    /// Records how a background run ended and tells the model what it has to say.
+    /// Records how a background run ended and, unless the Worker is ending, tells the model
+    /// what it has to say.
     async fn finish_background_hook(
         &self,
         receipt: &Receipt,
@@ -175,9 +235,6 @@ impl Agent {
         let Some(background) = &runnable.hook.background else {
             return;
         };
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return;
-        }
         let label = hook_label(event, tool);
         let response = &run.response;
         let rewakes = matches!(background, HookBackground::AsyncRewake { .. })
@@ -204,6 +261,7 @@ impl Agent {
             };
         }
         let notice = match background {
+            _ if self.inner.closed.load(Ordering::SeqCst) => None,
             HookBackground::Async => async_notification(&label, response),
             HookBackground::AsyncRewake { message, summary } if rewakes => {
                 Some(rewake_notification(

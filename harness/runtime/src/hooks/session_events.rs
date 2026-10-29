@@ -17,16 +17,18 @@
 //!   (`compact`).
 //! - `Stop` runs when a root Chat's model ends its turn without calling tools, `SubagentStop`
 //!   when a Subagent's does or before its report is handed back: a block goes on with the
-//!   hooks' reasons, the hooks then reading `stop_hook_active: true`, as often as they block;
-//!   Esc and `/stop` end the Run as always. Input queued meanwhile joins after the reasons, so a
-//!   loop that never calls tools still reads it. A Run that read an `asyncRewake` hook's
+//!   hooks' reasons and additional context, the hooks then reading `stop_hook_active: true`, as
+//!   often as they block; Esc and `/stop` end the Run as always. Input queued meanwhile joins
+//!   after them, so a loop that never calls tools still reads it. A Run that read an `asyncRewake` hook's
 //!   notification reads `stop_hook_active: true` too, as Claude Code queues that notification.
-//! - `StopFailure` tells the hooks a turn ended on a model error, `SessionEnd` that a root Chat
-//!   ends with its Worker; neither changes anything.
+//! - `StopFailure` tells the hooks a turn ended on a model error, within the Chat's background
+//!   lifetime that `/stop` ends, and `SessionEnd` that a root Chat ends with its Worker; neither
+//!   changes anything.
 //! - `PreCompact` runs before a compaction: a block cancels it, and plain output from the others
 //!   joins the summary's instructions.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -169,15 +171,19 @@ fn hook_name(event: HookEvent, query: Option<&str>) -> String {
     }
 }
 
-/// Claude Code's notes for a hook's additional context and plain output.
-fn context_notes(name: &str, verdict: &HookVerdict) -> Vec<String> {
-    let mut notes = Vec::new();
-    if !verdict.additional_context.is_empty() {
-        notes.push(format!(
+/// Claude Code's note for the hooks' additional context; `None` when they gave none.
+fn additional_context_note(name: &str, verdict: &HookVerdict) -> Option<String> {
+    (!verdict.additional_context.is_empty()).then(|| {
+        format!(
             "{name} hook additional context: {}",
             verdict.additional_context.join("\n")
-        ));
-    }
+        )
+    })
+}
+
+/// Claude Code's notes for a hook's additional context and plain output.
+fn context_notes(name: &str, verdict: &HookVerdict) -> Vec<String> {
+    let mut notes = Vec::from_iter(additional_context_note(name, verdict));
     notes.extend(
         verdict
             .plain_text
@@ -517,8 +523,9 @@ impl Agent {
             .map(|feedback| feedback.join("\n\n")))
     }
 
-    /// The `Stop` or `SubagentStop` hooks' feedback when they block the turn's end, after which
-    /// they read `stop_hook_active`.
+    /// The `Stop` or `SubagentStop` hooks' feedback when they block the turn's end, followed by
+    /// their additional context, as Claude Code goes on with both; the hooks then read
+    /// `stop_hook_active`.
     async fn run_stop_hooks(
         &self,
         receipt: &Receipt,
@@ -575,21 +582,39 @@ impl Agent {
                 .continued_by_stop
                 .insert(receipt.run_id);
         }
-        Ok(Some(
-            verdict
-                .blocking_errors
-                .iter()
-                .map(|error| format!("{} hook feedback:\n{error}", event.name()))
-                .collect(),
-        ))
+        let mut feedback = verdict
+            .blocking_errors
+            .iter()
+            .map(|error| format!("{} hook feedback:\n{error}", event.name()))
+            .collect::<Vec<_>>();
+        feedback.extend(additional_context_note(event.name(), &verdict));
+        Ok(Some(feedback))
     }
 
     /// Tells the `StopFailure` hooks the Run `receipt` ends on a model error, without waiting for
-    /// them.
-    pub(crate) fn notify_stop_failure(&self, receipt: &Receipt, error: &ModelError) {
+    /// them. They run within the Chat's background lifetime, which `/stop` and shutdown end; a
+    /// Run that `run_cancel` shows was interrupted first tells them nothing.
+    pub(crate) async fn notify_stop_failure(
+        &self,
+        receipt: &Receipt,
+        error: &ModelError,
+        run_cancel: &CancellationToken,
+    ) {
         if error.kind() == ModelFailureKind::Cancelled {
             return;
         }
+        let cancel = {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&receipt.chat_id) else {
+                return;
+            };
+            // Taken under the lock `/stop` takes, so a stop either ended the Run first or ends
+            // these hooks too.
+            if run_cancel.is_cancelled() || self.inner.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            chat.hook_state.background_cancel(&self.inner.shutdown)
+        };
         let kind = failure_name(error);
         let details = error.to_string();
         let mut fields = Map::new();
@@ -598,7 +623,6 @@ impl Agent {
         fields.insert("last_assistant_message".into(), json!(details));
         let agent = self.clone();
         let receipt = receipt.clone();
-        let cancel = self.inner.shutdown.child_token();
         self.inner.tasks.spawn(async move {
             agent
                 .run_hooks(

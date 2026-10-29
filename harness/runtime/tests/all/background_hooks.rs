@@ -2,13 +2,17 @@
 //! their event, their decisions are ignored, an `async` hook's answer reaches the model's next
 //! request, and an `asyncRewake` hook that exits 2 notifies the Loop, waking it when idle.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tickloop_harness_model::ModelRequest;
-use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
+use tickloop_harness_policy::settings::{
+    MemorySettingsStore, PermissionChanges, SettingsSnapshot, SettingsStore, SettingsStoreError,
+    SettingsUpdate,
+};
 use tickloop_harness_protocol::hooks::{
     ConfiguredHook, HookBackground, HookBackgroundPhase, HookEvent, HookList, HookRunOutcome,
     HookRunRecord, HookSource, HookTrust,
@@ -73,10 +77,57 @@ fn build_call() -> Vec<Content> {
     call("build", "Bash", json!({"command": BUILD}))
 }
 
+/// The Bench's Settings Store: once armed, its next hook list waits until the test lets it go,
+/// as a slow read of the settings would.
+#[derive(Default)]
+struct GatedSettings {
+    inner: MemorySettingsStore,
+    armed: AtomicBool,
+    entered: tokio::sync::Notify,
+    released: (Mutex<bool>, Condvar),
+}
+
+impl GatedSettings {
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+}
+
+impl SettingsStore for GatedSettings {
+    fn read(&self, project: Option<&Path>) -> SettingsSnapshot {
+        self.inner.read(project)
+    }
+
+    fn write(&self, change: SettingsUpdate) -> Result<(), SettingsStoreError> {
+        self.inner.write(change)
+    }
+
+    fn write_permissions(
+        &self,
+        changes: &PermissionChanges,
+        expected: Option<(&Path, &str)>,
+    ) -> Result<(), SettingsStoreError> {
+        self.inner.write_permissions(changes, expected)
+    }
+
+    fn hooks(&self, folder: Option<&Path>) -> HookList {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            let (released, wake) = &self.released;
+            let _released = wake
+                .wait_while(released.lock().unwrap(), |released| !*released)
+                .unwrap();
+        }
+        self.inner.hooks(folder)
+    }
+}
+
 struct Bench {
     agent: Agent,
     chat: ChatId,
     environment: Arc<MemoryEnvironment>,
+    settings: Arc<GatedSettings>,
     model: Arc<ScriptedModel>,
     _directory: tempfile::TempDir,
 }
@@ -95,11 +146,11 @@ impl Bench {
         let folder = directory.path().canonicalize().unwrap();
         let environment = Arc::new(MemoryEnvironment::new());
         environment.define_shell(BUILD, Duration::ZERO, b"built".to_vec(), 0);
-        let settings = Arc::new(MemorySettingsStore::default());
+        let settings = Arc::new(GatedSettings::default());
         settings
             .write(SettingsUpdate::TrustDirectory(folder.clone()))
             .unwrap();
-        settings.set_hooks(HookList {
+        settings.inner.set_hooks(HookList {
             hooks,
             ..Default::default()
         });
@@ -112,7 +163,7 @@ impl Bench {
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
-                settings: Some(settings),
+                settings: Some(settings.clone()),
                 host: AgentHostOptions::embedded_defaults(),
                 ..HarnessOptions::local(config())
             },
@@ -127,6 +178,7 @@ impl Bench {
             agent,
             chat,
             environment,
+            settings,
             model,
             _directory: directory,
         }
@@ -447,6 +499,62 @@ async fn esc_leaves_background_hooks_running_and_stop_cancels_them() {
         }
         bench.agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn a_stop_while_a_background_hook_is_prepared_keeps_it_from_starting() {
+    let bench = Bench::start(
+        vec![build_call(), text("done")],
+        vec![
+            background_hook(HookEvent::PreToolUse, None, "arm", None),
+            background_hook(
+                HookEvent::PostToolUse,
+                None,
+                AUDIT,
+                Some(HookBackground::Async),
+            ),
+        ],
+    )
+    .await;
+    let settings = bench.settings.clone();
+    bench.environment.define_command("arm", move |_| {
+        settings.armed.store(true, Ordering::SeqCst);
+        exits(0, "", "", Duration::ZERO)
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    bench.environment.define_command(AUDIT, move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        exits(0, "", "", Duration::ZERO)
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(HOOK_END_WAIT, bench.settings.entered.notified())
+        .await
+        .expect("PostToolUse reads its hooks");
+    bench.agent.stop(bench.chat).await.unwrap();
+    bench.settings.release();
+    let turn = follow_turn(&mut events, receipt.run_id).await;
+
+    assert!(turn.interrupted);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "the stop came first: the hook never runs"
+    );
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    assert!(
+        !history.hook_runs.iter().any(|run| run.command == AUDIT),
+        "{:?}",
+        history.hook_runs
+    );
+    bench.agent.shutdown().await;
 }
 
 #[tokio::test]

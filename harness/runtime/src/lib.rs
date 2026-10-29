@@ -3808,7 +3808,8 @@ impl Agent {
                 }
                 Err(error) => {
                     if let AgentError::Model(model_error) = &error {
-                        self.notify_stop_failure(&receipt, model_error);
+                        self.notify_stop_failure(&receipt, model_error, &cancel)
+                            .await;
                     }
                     return Err(error.to_string());
                 }

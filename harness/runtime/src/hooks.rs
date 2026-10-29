@@ -72,8 +72,12 @@ pub(crate) struct ChatHookState {
     stopped_runs: HashSet<tickloop_harness_protocol::RunId>,
     /// What the session and turn hooks keep.
     pub(crate) session: session_events::SessionHookState,
-    /// Ends the hooks running in the background, at `/stop` or shutdown; Esc leaves them.
+    /// Ends the hooks running in the background and the `StopFailure` hooks, at `/stop` or
+    /// shutdown; Esc leaves them.
     background: Option<CancellationToken>,
+    /// How many times `/stop` ended the hooks in the background: an event prepared before a
+    /// stop starts none after it.
+    background_generation: u64,
 }
 
 impl ChatHookState {
@@ -100,6 +104,8 @@ struct HookContext {
     session_id: String,
     permission_mode: &'static str,
     subagent_id: Option<String>,
+    /// The Chat's background generation as the event began.
+    background_generation: u64,
 }
 
 /// One run as it ended.
@@ -185,14 +191,28 @@ impl Agent {
         let (background, runnable): (Vec<_>, Vec<_>) = runnable
             .into_iter()
             .partition(|runnable| runnable.hook.background.is_some());
+        let mut session_end_runs = Vec::new();
         for runnable in background {
-            self.start_background_hook(receipt, &context, &call, runnable, stdin.clone())
-                .await;
+            let Some(run) = self
+                .start_background_hook(receipt, &context, &call, runnable, &stdin, cancel)
+                .await
+            else {
+                continue;
+            };
+            if call.event == HookEvent::SessionEnd {
+                session_end_runs.push(run.finish());
+            } else {
+                self.inner.tasks.spawn(run.finish());
+            }
         }
         let runs = runnable.iter().map(|runnable| {
             self.run_one_hook(receipt, &context, call.event, runnable, &stdin, cancel)
         });
-        let finished = futures_util::future::join_all(runs).await;
+        let (finished, _) = futures_util::future::join(
+            futures_util::future::join_all(runs),
+            futures_util::future::join_all(session_end_runs),
+        )
+        .await;
         let (verdict, warning) = HookVerdict::merge(
             runnable
                 .iter()
@@ -228,6 +248,7 @@ impl Agent {
                     .delegation
                     .as_ref()
                     .map(|_| receipt.chat_id.uuid().to_string()),
+                background_generation: chat.hook_state.background_generation,
             },
             settings,
         ))

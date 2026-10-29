@@ -6,13 +6,14 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
 use tickloop_harness_protocol::hooks::{
-    ConfiguredHook, HookEvent, HookList, HookRunOutcome, HookRunRecord, HookSource, HookTrust,
+    ConfiguredHook, HookBackground, HookBackgroundPhase, HookEvent, HookList, HookRunOutcome,
+    HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
     AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalStatus, Message,
@@ -1372,12 +1373,10 @@ async fn subagent_stop_runs_before_an_auto_subagent_hands_its_report_back() {
 #[tokio::test]
 async fn a_turn_an_async_rewake_hook_starts_tells_stop_hooks_they_are_active() {
     let mut review = user_hook(HookEvent::PostToolUse, Some("Bash"), "review.sh");
-    review.background = Some(
-        tickloop_harness_protocol::hooks::HookBackground::AsyncRewake {
-            message: None,
-            summary: None,
-        },
-    );
+    review.background = Some(HookBackground::AsyncRewake {
+        message: None,
+        summary: None,
+    });
     let bench = Bench::start(
         vec![
             call("build", "Bash", json!({"command": "cargo build"})),
@@ -1416,4 +1415,201 @@ async fn a_turn_an_async_rewake_hook_starts_tells_stop_hooks_they_are_active() {
     assert_eq!(inputs[1]["stop_hook_active"], true);
     assert_eq!(inputs[1]["last_assistant_message"], "moved the token");
     bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stop_block_goes_on_with_its_additional_context_after_its_reason() {
+    let bench = Bench::start(
+        vec![text("first"), text("second")],
+        vec![user_hook(HookEvent::Stop, None, "check.sh")],
+    )
+    .await;
+    bench.define("check.sh", |input| {
+        if input["stop_hook_active"] == json!(true) {
+            exits(0, "", "")
+        } else {
+            answer(json!({
+                "decision": "block",
+                "reason": "Check it again.",
+                "hookSpecificOutput": {
+                    "hookEventName": "Stop",
+                    "additionalContext": "Check A, then B.",
+                },
+            }))
+        }
+    });
+    let observed = bench.run("Fix the bug.").await;
+    assert!(observed.failed.is_none());
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2);
+    let trailing = trailing_texts(&requests[1]);
+    let position = |part: &str| {
+        trailing
+            .iter()
+            .position(|text| text.contains(part))
+            .unwrap_or_else(|| panic!("{part} in {trailing:?}"))
+    };
+    assert!(
+        position("Stop hook feedback:\nCheck it again.")
+            < position("Stop hook additional context: Check A, then B.")
+    );
+    assert_prefix_stable(&bench).await;
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_subagent_stop_block_hands_the_subagent_its_additional_context() {
+    let routed = Arc::new(RoutedModel::new(move |request| {
+        if is_child_request(request) {
+            text("child report")
+        } else if tickloop_harness_test_support::routed::has_tool_result(request, "delegate") {
+            text("parent done")
+        } else {
+            call("delegate", "Subagent", json!({"task": "Check the build"}))
+        }
+    }));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::SubagentStop, None, "verify.sh")],
+        false,
+    )
+    .await;
+    bench.define("verify.sh", |input| {
+        if input["stop_hook_active"] == json!(true) {
+            exits(0, "", "")
+        } else {
+            answer(json!({
+                "decision": "block",
+                "reason": "Include the build log.",
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStop",
+                    "additionalContext": "The log is in target/build.log.",
+                },
+            }))
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Delegate the check.".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while bench.inputs_of("verify.sh").len() < 2 {
+            let _ = next_event(&mut events).await;
+        }
+    })
+    .await
+    .expect("the Subagent goes on after the block");
+    let child_feedback = bench
+        .requests()
+        .into_iter()
+        .rfind(is_child_request)
+        .map(|request| trailing_texts(&request))
+        .unwrap();
+    let position = |part: &str| {
+        child_feedback
+            .iter()
+            .position(|text| text.contains(part))
+            .unwrap_or_else(|| panic!("{part} in {child_feedback:?}"))
+    };
+    assert!(
+        position("SubagentStop hook feedback:\nInclude the build log.")
+            < position("SubagentStop hook additional context: The log is in target/build.log.")
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_ends_a_stop_failure_hook_that_is_still_running() {
+    let bench = Bench::start(
+        Vec::new(),
+        vec![user_hook(HookEvent::StopFailure, None, "alert.sh")],
+    )
+    .await;
+    let alerted = Arc::new(Notify::new());
+    let notify = alerted.clone();
+    bench.define("alert.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(60),
+            ..exits(0, "", "")
+        }
+    });
+    let observed = bench.run("Go.").await;
+    assert!(observed.failed.is_some());
+    tokio::time::timeout(Duration::from_secs(5), alerted.notified())
+        .await
+        .expect("StopFailure runs");
+
+    bench.agent.stop(bench.chat).await.unwrap();
+
+    let record = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+            if let Some(record) = history
+                .hook_runs
+                .into_iter()
+                .find(|record| record.event == HookEvent::StopFailure)
+            {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("/stop ends the StopFailure hook");
+    assert_eq!(record.outcome, HookRunOutcome::Cancelled);
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_background_session_end_hook_runs_within_the_session_end_budget() {
+    let background = |command: &str, timeout_secs| ConfiguredHook {
+        background: Some(HookBackground::Async),
+        timeout_secs,
+        ..user_hook(HookEvent::SessionEnd, None, command)
+    };
+    let bench = Bench::start(
+        vec![text("before")],
+        vec![background("tidy.sh", 600), background("slow.sh", 1)],
+    )
+    .await;
+    bench.define("tidy.sh", |_| answer(json!({"systemMessage": "tidied"})));
+    bench.define("slow.sh", |_| MemoryCommandRun {
+        duration: Duration::from_secs(30),
+        ..exits(0, "", "")
+    });
+    bench.run("Remember this.").await;
+    assert!(bench.inputs_of("tidy.sh").is_empty(), "the session goes on");
+
+    let started = Instant::now();
+    bench.agent.shutdown().await;
+
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let ended = bench.inputs_of("tidy.sh");
+    assert_eq!(ended.len(), 1, "the Worker dispatches it as it ends");
+    assert_eq!(ended[0]["hook_event_name"], "SessionEnd");
+    assert_eq!(ended[0]["reason"], "other");
+    let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
+    let phases = |command: &str| {
+        history
+            .hook_runs
+            .iter()
+            .filter(|run| run.command == command)
+            .map(|run| (run.background, run.outcome))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        phases("tidy.sh"),
+        [
+            (Some(HookBackgroundPhase::Ended), HookRunOutcome::Success),
+            (Some(HookBackgroundPhase::Started), HookRunOutcome::Success),
+        ]
+    );
+    assert_eq!(
+        phases("slow.sh")[0],
+        (Some(HookBackgroundPhase::Ended), HookRunOutcome::TimedOut)
+    );
 }
