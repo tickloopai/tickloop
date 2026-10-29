@@ -131,7 +131,7 @@ impl SandboxFixture {
     fn new(sandbox: serde_json::Value) -> Self {
         use tickloop_harness::{
             base::private_fs::PrivateDirectory,
-            tools::{ChatDirectory, Tools, Workspace},
+            tools::{ChatDirectory, Tools, Workspace, local_roots::LocalRoots},
         };
         let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -150,6 +150,10 @@ impl SandboxFixture {
         let environment = LocalEnvironment::with_shells(Arc::new(OwnTickhost::new()))
             .with_sandbox(settings.clone());
         let family = PrivateDirectory::trusted(root.path().join("family"));
+        let workspace = Workspace {
+            folder: Some(folder),
+            additional_directories: vec![],
+        };
         let tools = Tools::for_chat(
             ChatDirectory {
                 chat: family.clone(),
@@ -160,15 +164,13 @@ impl SandboxFixture {
                 .shell_tasks()
                 .unwrap()
                 .for_chat(tickloop_ids::generate()),
+            Arc::new(LocalRoots::for_workspace(&workspace)),
         );
         Self {
             root,
             settings,
             environment,
-            workspace: Workspace {
-                folder: Some(folder),
-                additional_directories: vec![],
-            },
+            workspace,
             tools,
         }
     }

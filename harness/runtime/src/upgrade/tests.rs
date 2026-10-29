@@ -616,6 +616,9 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
                 family_temp: family,
             },
             host.clone(),
+            Arc::new(crate::environment::file_host::EnvironmentFileHost::new(
+                state.execution.clone(),
+            )),
         ));
     }
     original

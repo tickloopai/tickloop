@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::host_tools::{HostCallResult, HostEffect, PreparedHostCall};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod file_host;
 mod files;
 mod local;
 #[cfg(any(test, feature = "test-support"))]

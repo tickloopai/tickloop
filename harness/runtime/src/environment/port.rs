@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 pub use tickloop_harness_protocol::{ExecutionIsolation, NetworkIsolation, WriteIsolation};
+pub use tickloop_harness_tools::file_port::ExecutionError;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -94,22 +95,6 @@ impl ExecutionAuthority {
             ));
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{code}: {message}")]
-pub struct ExecutionError {
-    pub code: String,
-    pub message: String,
-}
-
-impl ExecutionError {
-    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-        }
     }
 }
 

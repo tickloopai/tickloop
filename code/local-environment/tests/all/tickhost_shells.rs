@@ -23,6 +23,7 @@ use tickloop_harness::protocol::{CommandState, HostedViewGrant, ToolResult, User
 use tickloop_harness::runtime::Agent;
 use tickloop_harness::tools::{
     ChatDirectory, ExecutionContext, PreparedTool, SecondaryModel, ToolError, Tools, Workspace,
+    local_roots::LocalRoots,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -67,6 +68,10 @@ impl Fixture {
         let workdir = root.join("work");
         std::fs::create_dir(&workdir).unwrap();
         let output = PrivateDirectory::trusted(root.join("output"));
+        let workspace = Workspace {
+            folder: Some(workdir),
+            additional_directories: Vec::new(),
+        };
         let tools = Tools::for_chat(
             ChatDirectory {
                 chat: output.clone(),
@@ -74,14 +79,12 @@ impl Fixture {
                 family_temp: output,
             },
             shells.for_chat(Uuid::new_v4()),
+            Arc::new(LocalRoots::for_workspace(&workspace)),
         );
         Self {
             _agent: agent,
             directory,
-            workspace: Workspace {
-                folder: Some(workdir),
-                additional_directories: Vec::new(),
-            },
+            workspace,
             tools,
         }
     }

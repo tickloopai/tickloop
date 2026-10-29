@@ -4411,6 +4411,7 @@ mod tests {
                     before: FileVersion {
                         exists: true,
                         identity: None,
+                        version: None,
                         byte_len: 11,
                         line_count: 1,
                         ends_with_newline: false,
@@ -4419,6 +4420,7 @@ mod tests {
                     after: FileVersion {
                         exists: true,
                         identity: None,
+                        version: None,
                         byte_len: 11,
                         line_count: 1,
                         ends_with_newline: false,

@@ -462,6 +462,7 @@ mod tests {
         FileVersion {
             exists,
             identity: None,
+            version: None,
             byte_len: bytes,
             line_count: lines,
             ends_with_newline: exists,

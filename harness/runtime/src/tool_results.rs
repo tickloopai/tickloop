@@ -79,7 +79,8 @@ impl Agent {
 
     /// Each family owns one private temporary root; children share it without widening
     /// access to other families in the same project. A Chat without a Folder has no directory
-    /// and binds no Port. The Port bound here serves the Chat's tool listing and its shell host.
+    /// and binds no Port. The Port bound here serves the Chat's tool listing, its shell host and
+    /// its file tools.
     pub(super) async fn create_chat_tools(
         &self,
         snapshot: &ChatSnapshot,
@@ -119,6 +120,9 @@ impl Agent {
                     family_temp,
                 },
                 shells,
+                Arc::new(crate::environment::file_host::EnvironmentFileHost::new(
+                    execution.clone(),
+                )),
             )
             .with_search_configuration(
                 snapshot.search_config.clone(),

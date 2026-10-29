@@ -15269,6 +15269,7 @@ mod tests {
         let before = FileVersion {
             exists: true,
             identity: None,
+            version: None,
             byte_len: line_count,
             line_count,
             ends_with_newline: true,

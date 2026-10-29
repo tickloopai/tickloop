@@ -308,6 +308,7 @@ fn file_version(content: &str, exists: bool, identity: Option<FileIdentity>) -> 
     FileVersion {
         exists,
         identity,
+        version: None,
         byte_len: content.len() as u64,
         line_count: content.split_inclusive('\n').count() as u64,
         ends_with_newline: content.ends_with('\n'),

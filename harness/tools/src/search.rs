@@ -7,16 +7,16 @@ use std::path::{Path, PathBuf};
 use ignore::overrides::OverrideBuilder;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 use super::{
     Operation, READ_TOOL_NAME, ToolDefinition, ToolError,
+    chat_files::{FileTarget, tool_error},
+    file_port::{FileInspection, FileKind, FilePath, FileQuery, error_code},
     file_search::{
-        FileSearchError, GLOB_RESULT_LIMIT, GlobQuery, GrepOutputMode, GrepQuery, file_types,
-        glob_text, grep_text, override_matcher,
+        FileSearchError, GLOB_RESULT_LIMIT, GlobQuery, GrepLine, GrepOutput, GrepOutputMode,
+        GrepQuery, file_types, glob_text, grep_text, override_matcher,
     },
-    io_error,
-    local_files::{self, LocalFileError},
+    is_sensitive_path,
     read::semantic_integer,
     shell::BASH_TOOL_NAME,
     write::{FILE_NOT_FOUND_CWD_NOTE, semantic_boolean},
@@ -359,32 +359,27 @@ impl SearchRequest {
     /// and remembers the Chat working directory that result paths are shown relative to.
     pub(super) fn bind(
         &mut self,
-        root: &Path,
+        root: &FileTarget,
         requested_path: &str,
         workdir: &Path,
+        display_base: PathBuf,
     ) -> Result<(), ToolError> {
-        let metadata = match std::fs::metadata(root) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let missing = match self.kind {
-                    SearchKind::Glob { .. } => "Directory does not exist",
-                    SearchKind::Grep(_) => "Path does not exist",
-                };
-                return Err(ToolError::Rejected(format!(
-                    "{missing}: {requested_path}. {FILE_NOT_FOUND_CWD_NOTE} {}.",
-                    workdir.display()
-                )));
-            }
-            Err(error) => return Err(io_error(root, error)),
+        let Some(kind) = root.kind else {
+            let missing = match self.kind {
+                SearchKind::Glob { .. } => "Directory does not exist",
+                SearchKind::Grep(_) => "Path does not exist",
+            };
+            return Err(ToolError::Rejected(format!(
+                "{missing}: {requested_path}. {FILE_NOT_FOUND_CWD_NOTE} {}.",
+                workdir.display()
+            )));
         };
-        if matches!(self.kind, SearchKind::Glob { .. }) && !metadata.is_dir() {
+        if matches!(self.kind, SearchKind::Glob { .. }) && kind != FileKind::Directory {
             return Err(ToolError::Rejected(format!(
                 "Path is not a directory: {requested_path}"
             )));
         }
-        self.display_base = workdir
-            .canonicalize()
-            .unwrap_or_else(|_| workdir.to_path_buf());
+        self.display_base = display_base;
         Ok(())
     }
 }
@@ -394,18 +389,33 @@ fn display_path(path: &Path, workdir: &Path) -> PathBuf {
     path.strip_prefix(workdir).unwrap_or(path).to_path_buf()
 }
 
-/// Runs the search on this machine through [`local_files`], with found paths below the filesystem
-/// root, and prints them the way Claude Code does.
-pub(super) fn execute(
-    root: &Path,
+/// Runs the search where the searched path's host keeps it and prints the found paths the way
+/// Claude Code does, leaving out any below the searched path that look like credentials.
+pub(super) async fn execute(
+    root: &FileTarget,
     request: &SearchRequest,
-    cancel: &CancellationToken,
 ) -> Result<ToolResult, ToolError> {
-    let filesystem_root = Path::new(FILESYSTEM_ROOT);
+    let root_display = match root.path.root() {
+        Some(name) => PathBuf::from(
+            root.host
+                .capabilities()
+                .display(&FilePath::in_root(name.clone(), "").expect("a root's own path")),
+        ),
+        None => PathBuf::from(FILESYSTEM_ROOT),
+    };
     let display = |below: &str| {
-        display_path(&filesystem_root.join(below), &request.display_base)
+        display_path(&root_display.join(below), &request.display_base)
             .to_string_lossy()
             .into_owned()
+    };
+    let searched = root.path.path().trim_start_matches('/');
+    let is_hidden = |below: &str| {
+        let below = below.trim_start_matches('/');
+        let inside = below
+            .strip_prefix(searched)
+            .filter(|rest| searched.is_empty() || rest.is_empty() || rest.starts_with('/'))
+            .unwrap_or(below);
+        is_sensitive_path(Path::new(inside))
     };
     let content = match &request.kind {
         SearchKind::Glob { pattern } => {
@@ -413,19 +423,37 @@ pub(super) fn execute(
                 pattern: pattern.clone(),
                 limit: GLOB_RESULT_LIMIT,
             };
-            let matches = local_files::glob(filesystem_root, root, &query, cancel)?;
+            let FileInspection::Glob(mut matches) = root
+                .inspect(FileQuery::Glob {
+                    path: root.path.clone(),
+                    query,
+                })
+                .await?
+            else {
+                return Err(unexpected_answer(root));
+            };
+            matches.files.retain(|file| !is_hidden(&file.path));
             glob_text(&matches, display)
         }
         SearchKind::Grep(query) => {
-            let matches = local_files::grep(filesystem_root, root, query, cancel).map_err(
-                |error| match error {
-                    LocalFileError::TooLarge(path) => ToolError::Rejected(format!(
-                        "{} is larger than 8 MiB, so {GREP_TOOL_NAME} does not search it. Use {READ_TOOL_NAME} with offset and limit to page through it.",
-                        path.display()
+            let inspection = root
+                .host
+                .inspect(FileQuery::Grep {
+                    path: root.path.clone(),
+                    query: (**query).clone(),
+                })
+                .await
+                .map_err(|error| match error.code.as_str() {
+                    error_code::TOO_LARGE => ToolError::Rejected(format!(
+                        "{}, so {GREP_TOOL_NAME} does not search it. Use {READ_TOOL_NAME} with offset and limit to page through it.",
+                        error.message
                     )),
-                    other => other.into(),
-                },
-            )?;
+                    _ => tool_error(error, &root.shown),
+                })?;
+            let FileInspection::Grep(mut matches) = inspection else {
+                return Err(unexpected_answer(root));
+            };
+            hide_grep_output(&mut matches.output, is_hidden);
             grep_text(&matches, query, display)
         }
     };
@@ -434,4 +462,37 @@ pub(super) fn execute(
         is_error: false,
         output_ref: None,
     })
+}
+
+/// Leaves out what the search found in files `is_hidden` names, and the group separators that
+/// would then stand next to each other or at either end.
+fn hide_grep_output(output: &mut GrepOutput, is_hidden: impl Fn(&str) -> bool) {
+    let shown = |path: &Option<String>| path.as_deref().is_none_or(|path| !is_hidden(path));
+    match output {
+        GrepOutput::Files(files) => files.retain(|file| !is_hidden(&file.path)),
+        GrepOutput::Counts(counts) => counts.retain(|count| !is_hidden(&count.path)),
+        GrepOutput::Content(lines) => {
+            lines.retain(|line| match line {
+                GrepLine::Match(text) | GrepLine::Context(text) => shown(&text.path),
+                GrepLine::Binary(binary) => shown(&binary.path),
+                GrepLine::Break => true,
+            });
+            lines.dedup_by(|next, previous| {
+                matches!(next, GrepLine::Break) && matches!(previous, GrepLine::Break)
+            });
+            if matches!(lines.first(), Some(GrepLine::Break)) {
+                lines.remove(0);
+            }
+            if matches!(lines.last(), Some(GrepLine::Break)) {
+                lines.pop();
+            }
+        }
+    }
+}
+
+fn unexpected_answer(root: &FileTarget) -> ToolError {
+    ToolError::Io {
+        path: root.shown.clone(),
+        reason: "the environment answered a search with something else".into(),
+    }
 }

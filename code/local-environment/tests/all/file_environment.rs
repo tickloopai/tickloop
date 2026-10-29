@@ -15,9 +15,9 @@ use tickloop_code_local_environment::{
 use tickloop_harness::runtime::environment::{
     ExecutionAuthority, ExecutionCapabilities, ExecutionEnvironment, ExecutionError,
     ExecutionInspection, ExecutionIntent, ExecutionOutcome, ExecutionPort, ExecutionQuery,
-    ExecutionScope, FileAccess, FileInspection, FileMetadata, FilePath, FileQuery, FileStat,
-    FolderEnvironment, GLOB_RESULT_LIMIT, GlobQuery, GrepOutput, GrepOutputMode, GrepQuery,
-    RootName, error_code,
+    ExecutionScope, FileAccess, FileInspection, FileKind, FileMetadata, FilePath, FileQuery,
+    FileStat, FolderEnvironment, GLOB_RESULT_LIMIT, GlobQuery, GrepOutput, GrepOutputMode,
+    GrepQuery, ResolvedPath, RootName, error_code,
 };
 use tickloop_harness::test_support::file_contracts::{
     LocalFileHost, MemoryFileHost, file_contract,
@@ -349,6 +349,65 @@ async fn symbolic_links_out_of_a_root_are_refused_for_reads_and_writes() {
     );
     assert!(!outside.path().join("new.txt").exists());
     assert!(!outside.path().join("missing.txt").exists());
+}
+
+#[tokio::test]
+async fn resolving_a_path_names_where_its_links_lead() {
+    let folder = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("notes.txt"), "inside").unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+    symlink(folder.path().join("notes.txt"), folder.path().join("alias")).unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        folder.path().join("escape"),
+    )
+    .unwrap();
+    symlink(
+        outside.path().join("missing.txt"),
+        folder.path().join("dangling"),
+    )
+    .unwrap();
+    let bound = Bound::local(folder.path()).await;
+    let resolve = |path: FilePath| {
+        let bound = &bound;
+        async move {
+            match bound.inspect(FileQuery::Resolve(path)).await? {
+                FileInspection::Resolved(resolved) => Ok(resolved),
+                other => panic!("not a resolution: {other:?}"),
+            }
+        }
+    };
+    let real_outside = outside.path().canonicalize().unwrap();
+    for (below, expected, kind) in [
+        ("alias", bound.path("notes.txt"), Some(FileKind::File)),
+        (
+            "escape",
+            FilePath::outside_roots(real_outside.join("secret.txt").to_str().unwrap()).unwrap(),
+            Some(FileKind::File),
+        ),
+        ("new/plan.md", bound.path("new/plan.md"), None),
+    ] {
+        assert_eq!(
+            resolve(bound.path(below)).await.unwrap(),
+            ResolvedPath {
+                path: expected,
+                kind
+            },
+            "{below}"
+        );
+    }
+    assert_code(
+        resolve(bound.path("dangling")).await,
+        error_code::OUTSIDE_ROOT,
+    );
+    let spelled =
+        FilePath::outside_roots(folder.path().join("notes.txt").to_str().unwrap()).unwrap();
+    assert_eq!(
+        resolve(spelled).await.unwrap().path,
+        bound.path("notes.txt"),
+        "a path spelled through a link to the root lands in the root"
+    );
 }
 
 #[tokio::test]

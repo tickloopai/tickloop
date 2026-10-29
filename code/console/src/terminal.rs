@@ -9269,6 +9269,7 @@ mod tests {
         let version = |sha256: &str| FileVersion {
             exists: true,
             identity: None,
+            version: None,
             byte_len: 3,
             line_count: 1,
             ends_with_newline: false,

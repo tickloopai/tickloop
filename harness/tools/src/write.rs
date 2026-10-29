@@ -2,7 +2,7 @@
 //! `FileEditTool/utils.ts`): read-before-write validation against the Chat's read state, a file
 //! review prepared before approval, and a publication that refuses files changed after approval.
 
-use std::{fs::Metadata, io::Read, path::Path};
+use std::{path::Path, time::SystemTime};
 
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
@@ -10,15 +10,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     FileReadRecordExt,
+    chat_files::{FileTarget, tool_error},
     file_change::{FileChangeReview, build_file_change_review},
-    local_files,
+    file_port::{
+        FileInspection, FileKind, FileMetadata, FileQuery, FileVersion, FileWriteError,
+        FileWritePreparation,
+    },
+    local_roots::file_identity,
 };
 
 use super::{
-    FileReadState, Operation, READ_TOOL_NAME, ToolDefinition, ToolError, io_error, open_existing,
-    read::recorded_text,
+    FileReadState, Operation, READ_TOOL_NAME, ToolDefinition, ToolError, read::recorded_text,
 };
-use tickloop_harness_protocol::{FileChangeAction, FileIdentity, FileReadRecord, ToolResult};
+use tickloop_harness_protocol::{FileChangeAction, FileReadRecord, ToolResult};
 
 pub const WRITE_TOOL_NAME: &str = "Write";
 pub const EDIT_TOOL_NAME: &str = "Edit";
@@ -45,8 +49,10 @@ pub(super) struct PreparedWrite {
     tool: FileChangeTool,
     change: Option<Change>,
     content: Option<String>,
-    expected: Option<FileIdentity>,
+    expected: Option<FileVersion>,
     review: Option<Box<FileChangeReview>>,
+    /// The `WriteFile` the environment prepared before approval, carried out after it.
+    publication: Option<FileWritePreparation>,
 }
 
 /// The tool that asked for the change, which decides Claude Code's success text.
@@ -205,6 +211,7 @@ pub(super) fn prepare_input(
             content: None,
             expected: None,
             review: None,
+            publication: None,
         })),
         normalized_input,
     ))
@@ -234,18 +241,20 @@ pub(super) fn semantic_boolean<'de, D: Deserializer<'de>>(
 }
 
 /// Binds the requested change to the file as it is now: validates it the way Claude Code's
-/// `validateInput` does, then computes the exact content to publish and its review.
-pub(super) fn bind(
-    path: &Path,
+/// `validateInput` does, computes the exact content to publish and its review, and has the
+/// file's host prepare the write.
+pub(super) async fn bind(
+    target: &FileTarget,
     mut operation: PreparedWrite,
     reads: &FileReadState,
     workdir: &Path,
 ) -> Result<PreparedWrite, ToolError> {
+    let path = target.shown.as_path();
     let change = operation
         .change
         .take()
         .expect("unbound write operation must contain a requested change");
-    let current = read_for_review(path)?;
+    let current = read_for_review(target).await?;
     let (action, content) = match change {
         Change::Write(content) => {
             if let Some((_, metadata)) = &current {
@@ -267,39 +276,62 @@ pub(super) fn bind(
     }
     operation.expected = current
         .as_ref()
-        .map(|(_, metadata)| FileIdentity::from_metadata(metadata));
+        .map(|(_, metadata)| metadata.version.clone());
+    let identity = operation.expected.as_ref().and_then(file_identity);
     let before = current.as_ref().map_or("", |(content, _)| content.as_str());
-    operation.review = Some(Box::new(build_file_change_review(
+    let mut review = build_file_change_review(
         action,
         path.to_path_buf(),
         before,
         operation.expected.is_some(),
-        operation.expected.clone(),
+        identity.clone(),
         &content,
         true,
-    )));
+    );
+    if identity.is_none() {
+        review.before.version = operation
+            .expected
+            .as_ref()
+            .map(|version| version.as_str().to_owned());
+    }
+    operation.review = Some(Box::new(review));
+    operation.publication = Some(
+        target
+            .host
+            .prepare_write(
+                target.path.clone(),
+                content.clone().into_bytes(),
+                operation.expected.clone(),
+            )
+            .await
+            .map_err(|error| tool_error(error, path))?,
+    );
     operation.content = Some(content);
     Ok(operation)
 }
 
 /// Claude Code's read-before-write check: an existing file must have been read in this Chat and
-/// must not have changed since. With `current_text`, a full read whose content still matches
-/// passes a newer modification time, as `Edit` allows.
+/// must not have changed since, by its modification time when the environment reports one and by
+/// its version otherwise. With `current_text`, a full read whose content still matches passes a
+/// change, as `Edit` allows.
 fn verify_read(
     path: &Path,
     reads: &FileReadState,
-    metadata: &Metadata,
+    metadata: &FileMetadata,
     current_text: Option<&str>,
 ) -> Result<(), ToolError> {
-    let record = reads
-        .get(path)
+    let (record, version) = reads
+        .get_with_version(path)
         .ok_or_else(|| ToolError::Rejected(FILE_NOT_READ.into()))?;
-    let modified = metadata.modified().map_err(|error| io_error(path, error))?;
     let is_unchanged_full_read = || {
         record.is_full_read
             && current_text.is_some_and(|text| recorded_text(text) == record.content)
     };
-    if modified > record.modified && !is_unchanged_full_read() {
+    let changed = match metadata.modified {
+        Some(modified) => modified > record.modified,
+        None => version.as_ref() != Some(&metadata.version),
+    };
+    if changed && !is_unchanged_full_read() {
         return Err(ToolError::Rejected(FILE_MODIFIED_SINCE_READ.into()));
     }
     Ok(())
@@ -309,7 +341,7 @@ fn verify_read(
 /// file with `\r\n` normalized to `\n`, and a file that mostly used `\r\n` keeps it.
 fn edit(
     path: &Path,
-    current: Option<&(String, Metadata)>,
+    current: Option<&(String, FileMetadata)>,
     reads: &FileReadState,
     workdir: &Path,
     request: &EditRequest,
@@ -487,35 +519,44 @@ pub(super) fn take_review(operation: &mut PreparedWrite) -> Box<FileChangeReview
         .expect("bound write operation must contain a file change review")
 }
 
-/// Publishes the bound content through [`local_files::write_file`], which refuses a file changed
-/// externally after approval with a conflict and creates a new file's missing parent directories.
-/// On success the written content is returned as a full read, so later changes need no new `Read`.
-pub(super) fn execute(
+/// Carries out the write the file's host prepared, which refuses a file changed after approval
+/// with a conflict and creates a new file's missing parent directories. On success the written
+/// content is returned as a full read, so later changes need no new `Read`. A write whose answer
+/// was lost is never sent again; its file counts as unread until the model reads it.
+pub(super) async fn execute(
     path: &Path,
     operation: PreparedWrite,
-    operation_id: uuid::Uuid,
-    cancel: &CancellationToken,
-) -> Result<(ToolResult, FileReadRecord), ToolError> {
-    let text = operation.content.as_deref().ok_or_else(|| {
-        ToolError::InvalidInput("write was not bound to its target; use Tools::prepare".into())
-    })?;
-    let published = local_files::write_file(
-        path,
-        text.as_bytes(),
-        operation.expected.as_ref(),
-        operation_id,
-        cancel,
-    )?;
-    let modified = published
-        .modified()
-        .map_err(|error| io_error(path, error))?;
+    reads: &FileReadState,
+    cancel: CancellationToken,
+) -> Result<(ToolResult, FileReadRecord, FileVersion), ToolError> {
+    let (Some(text), Some(publication)) =
+        (operation.content.as_deref(), operation.publication.as_ref())
+    else {
+        return Err(ToolError::InvalidInput(
+            "write was not bound to its target; use Tools::prepare".into(),
+        ));
+    };
+    let published = publication
+        .write(cancel)
+        .await
+        .map_err(|error| match error {
+            FileWriteError::NotWritten(error) => tool_error(error, path),
+            FileWriteError::OutcomeUnknown(reason) => {
+                reads.forget(path);
+                ToolError::Rejected(format!(
+                    "The change to {} was sent, but its answer was lost ({reason}), so it may or may not have taken effect; it was not sent again. Read the file before deciding what to do next.",
+                    path.display()
+                ))
+            }
+        })?;
     Ok((
         ToolResult {
             content: success_message(operation.tool, path, operation.expected.is_none()),
             is_error: false,
             output_ref: None,
         },
-        FileReadRecord::whole_file(text, modified),
+        FileReadRecord::whole_file(text, published.modified.unwrap_or(SystemTime::UNIX_EPOCH)),
+        published.version,
     ))
 }
 
@@ -534,44 +575,55 @@ fn success_message(tool: FileChangeTool, path: &Path, is_new_file: bool) -> Stri
     }
 }
 
-fn read_for_review(path: &Path) -> Result<Option<(String, Metadata)>, ToolError> {
-    let mut file = match open_existing(path, false) {
-        Ok(file) => file,
+/// The file's current text and metadata, or `None` when there is no file yet.
+async fn read_for_review(target: &FileTarget) -> Result<Option<(String, FileMetadata)>, ToolError> {
+    let path = target.shown.as_path();
+    match target.kind {
+        None => return Ok(None),
+        Some(FileKind::File) => {}
+        Some(FileKind::Directory | FileKind::Other) => {
+            return Err(ToolError::UnsupportedType(path.into()));
+        }
+    }
+    let content = match target
+        .inspect(FileQuery::Read {
+            path: target.path.clone(),
+            offset: 0,
+            limit: MAX_WRITE_BYTES + 1,
+        })
+        .await
+    {
+        Ok(FileInspection::Read(content)) => content,
+        Ok(_) => {
+            return Err(ToolError::Io {
+                path: path.into(),
+                reason: "the environment answered a read with something else".into(),
+            });
+        }
         Err(ToolError::NotFound(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let before_metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if !before_metadata.is_file() {
-        return Err(ToolError::UnsupportedType(path.into()));
-    }
-    if before_metadata.len() > MAX_WRITE_BYTES as u64 {
+    if content.metadata.len > MAX_WRITE_BYTES as u64 {
         return Err(ToolError::InvalidInput(
             "existing file exceeds 8 MiB review limit".into(),
         ));
     }
-    let mut bytes = Vec::with_capacity(before_metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take((MAX_WRITE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(path, error))?;
-    let after_metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    let before_identity = FileIdentity::from_metadata(&before_metadata);
-    let after_identity = FileIdentity::from_metadata(&after_metadata);
-    if before_identity != after_identity || bytes.len() as u64 != before_metadata.len() {
+    if content.data.len() as u64 != content.metadata.len {
         return Err(ToolError::Conflict(path.into()));
     }
-    let content = String::from_utf8(bytes)
+    let text = String::from_utf8(content.data)
         .map_err(|_| ToolError::InvalidInput("existing file is not UTF-8 text".into()))?;
-    Ok(Some((content, before_metadata)))
+    Ok(Some((text, content.metadata)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::{chat_files::ChatFiles, local_files, local_roots::LocalRoots};
+    use std::{fs, sync::Arc};
 
     /// Binds a `Write` of `content` as a Chat that has just read the current file would.
-    fn prepared(path: &Path, content: &str) -> PreparedWrite {
+    async fn prepared(path: &Path, content: &str) -> PreparedWrite {
         let (_, Operation::Write(operation), _) = prepare_input(
             WRITE_TOOL_NAME,
             &json!({"file_path": path,"content":content}),
@@ -587,50 +639,48 @@ mod tests {
                 FileReadRecord::whole_file(&current, modified),
             );
         }
-        bind(path, *operation, &reads, path.parent().unwrap()).unwrap()
+        let folder = path.parent().unwrap();
+        let files = ChatFiles::new(Arc::new(LocalRoots::new(folder.to_str(), &[])), None);
+        let target = files.resolve(path).await.unwrap();
+        bind(&target, *operation, &reads, folder).await.unwrap()
     }
 
-    #[test]
-    fn failure_before_publish_preserves_the_original_and_removes_the_staged_file() {
+    async fn publish(path: &Path, operation: PreparedWrite) -> Result<String, ToolError> {
+        execute(
+            path,
+            operation,
+            &FileReadState::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .map(|(result, _, _)| result.content)
+    }
+
+    #[tokio::test]
+    async fn failure_before_publish_preserves_the_original_and_removes_the_staged_file() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().canonicalize().unwrap().join("target");
         fs::write(&target, "old").unwrap();
-        let operation = prepared(&target, "new");
+        let operation = prepared(&target, "new").await;
         local_files::FAIL_BEFORE_PUBLISH.with(|failure| failure.set(true));
-        let result = execute(
-            &target,
-            operation,
-            uuid::Uuid::new_v4(),
-            &CancellationToken::new(),
-        );
+        let result = publish(&target, operation).await;
         local_files::FAIL_BEFORE_PUBLISH.with(|failure| failure.set(false));
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
-    #[test]
-    fn a_new_file_never_replaces_a_file_created_after_approval() {
+    #[tokio::test]
+    async fn a_new_file_never_replaces_a_file_created_after_approval() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().canonicalize().unwrap().join("target");
-        let operation = prepared(&target, "agent content");
+        let operation = prepared(&target, "agent content").await;
         fs::write(&target, "created meanwhile").unwrap();
-        let result = execute(
-            &target,
-            operation,
-            uuid::Uuid::new_v4(),
-            &CancellationToken::new(),
-        );
+        let result = publish(&target, operation).await;
         assert!(matches!(result, Err(ToolError::Conflict(_))));
         assert_eq!(fs::read(&target).unwrap(), b"created meanwhile");
-        let operation = prepared(&target, "replacement");
-        execute(
-            &target,
-            operation,
-            uuid::Uuid::new_v4(),
-            &CancellationToken::new(),
-        )
-        .unwrap();
+        let operation = prepared(&target, "replacement").await;
+        publish(&target, operation).await.unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"replacement");
     }
 }

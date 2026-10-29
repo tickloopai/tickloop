@@ -942,6 +942,7 @@ mod tests {
         FileVersion {
             exists: bytes > 0 || lines > 0,
             identity: None,
+            version: None,
             byte_len: bytes,
             line_count: lines,
             ends_with_newline: newline,

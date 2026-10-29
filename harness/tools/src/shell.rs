@@ -17,10 +17,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError, io_error, open_existing,
-    read::semantic_integer, write::semantic_boolean,
+    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError, io_error, read::semantic_integer,
+    write::semantic_boolean,
 };
-use tickloop_harness_base::private_fs::PrivateDirectory;
+use tickloop_harness_base::private_fs::{
+    OpenTarget, PrivateDirectory, open_without_following_links,
+};
 
 mod command_tables;
 mod host;
@@ -101,6 +103,60 @@ impl DirectoryIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
+    }
+
+    pub(super) fn at(path: &Path) -> Option<Self> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| Self::of(&metadata))
+    }
+}
+
+/// Opens an existing path without following symlinks; with `directory`, the last component must
+/// also be a directory.
+pub(super) fn open_existing(path: &Path, directory: bool) -> Result<std::fs::File, ToolError> {
+    let target = if directory {
+        OpenTarget::Directory { create_mode: None }
+    } else {
+        OpenTarget::Entry
+    };
+    open_without_following_links(path, target).map_err(|error| io_error(path, error))
+}
+
+/// The canonical working directory a command names on this machine, where commands run until
+/// Shells follow the Chat's file roots. With `allow_missing`, a missing last component keeps its
+/// name below its canonical parent; a dangling link counts as a changed path.
+pub(super) fn resolve_cwd(path: &Path, allow_missing: bool) -> Result<PathBuf, ToolError> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(ToolError::PathChanged(path.into()));
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| ToolError::InvalidInput("path has no parent".into()))?;
+            let parent = parent
+                .canonicalize()
+                .map_err(|error| io_error(parent, error))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| ToolError::InvalidInput("path has no file name".into()))?;
+            Ok(parent.join(name))
+        }
+        Err(error) => Err(io_error(path, error)),
+    }
+}
+
+/// `path` with its parent made canonical and its last name kept, or `resolved` for a path
+/// without both.
+pub(super) fn cwd_scope(path: &Path, resolved: &Path) -> Result<PathBuf, ToolError> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Ok(parent
+            .canonicalize()
+            .map_err(|error| io_error(parent, error))?
+            .join(name)),
+        _ => Ok(resolved.to_path_buf()),
     }
 }
 

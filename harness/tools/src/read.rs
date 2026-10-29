@@ -3,8 +3,6 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{BufRead, Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
@@ -15,7 +13,10 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
 use super::{
-    FileOutcome, Operation, ToolDefinition, ToolError, format_file_size, io_error, open_for_read,
+    FileOutcome, Operation, ToolDefinition, ToolError,
+    chat_files::{FileTarget, tool_error},
+    file_port::{FileContent, FileInspection, FileMetadata, FileQuery, FileVersion, error_code},
+    format_file_size,
     shell::BASH_TOOL_NAME,
 };
 use tickloop_harness_base::image;
@@ -33,7 +34,9 @@ const MAX_OUTPUT_BYTES: usize = MAX_OUTPUT_TOKENS * BYTES_PER_TOKEN;
 /// Normalizing `\r\n` and dropping the terminator after the last selected line remove at most
 /// one byte per line plus one, so a selection larger than this can never fit the output budget.
 const MAX_SCANNED_BYTES: usize = 2 * MAX_OUTPUT_BYTES + 2;
-const READ_BUFFER_BYTES: usize = 64 * 1024;
+/// Bytes asked of the file per read: one read takes in any file small enough to read without a
+/// `limit`.
+const READ_CHUNK_BYTES: usize = 1024 * 1024;
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const LINE_NUMBER_WIDTH: usize = 6;
 const EMPTY_FILE_REMINDER: &str =
@@ -42,7 +45,7 @@ const NARROW_READ_ADVICE: &str = "Use offset and limit parameters to read specif
 /// Claude Code `READ_FILE_STATE_CACHE_SIZE` and its default cache byte budget.
 const MAX_RECORDED_FILES: usize = 100;
 const MAX_RECORDED_BYTES: usize = 25 * 1024 * 1024;
-const IMAGE_SIGNATURE_BYTES: u64 = 12;
+const IMAGE_SIGNATURE_BYTES: usize = 12;
 
 pub(super) fn definition() -> ToolDefinition {
     ToolDefinition {
@@ -148,48 +151,117 @@ pub(super) fn semantic_integer<'de, D: Deserializer<'de>>(
 }
 
 /// Reads text as numbered lines, or an image for the model to view when `accepts_images`.
-pub(super) fn execute(
-    path: &Path,
+pub(super) async fn execute(
+    target: &FileTarget,
     request: &ReadRequest,
     accepts_images: bool,
 ) -> Result<FileOutcome, ToolError> {
-    let (mut file, metadata) = open_for_read(path)?;
-    let mut signature = Vec::new();
-    (&mut file)
-        .take(IMAGE_SIGNATURE_BYTES)
-        .read_to_end(&mut signature)
-        .map_err(|error| io_error(path, error))?;
-    if image::is_supported_image(&signature) {
-        return read_image(file, path, metadata.len(), accepts_images);
+    let (mut chunks, first) = FileChunks::open(target).await?;
+    let signature = &first[..first.len().min(IMAGE_SIGNATURE_BYTES)];
+    if image::is_supported_image(signature) {
+        return read_image(chunks, first, &target.shown, accepts_images).await;
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| io_error(path, error))?;
-    read_text(file, path, &metadata, request).map(FileOutcome::from)
+    let version = chunks.metadata.version.clone();
+    let (result, record) = read_text(&mut chunks, first, &target.shown, request).await?;
+    Ok(FileOutcome {
+        result,
+        read: Some((record, version)),
+        images: Vec::new(),
+    })
 }
 
-fn read_text(
-    file: File,
+/// A file read through its host chunk by chunk; every chunk must come from the version the first
+/// one did.
+struct FileChunks<'t> {
+    target: &'t FileTarget,
+    metadata: FileMetadata,
+    offset: u64,
+}
+
+impl<'t> FileChunks<'t> {
+    async fn open(target: &'t FileTarget) -> Result<(Self, Vec<u8>), ToolError> {
+        let content = read_chunk(target, 0, READ_CHUNK_BYTES).await?;
+        Ok((
+            Self {
+                target,
+                offset: content.data.len() as u64,
+                metadata: content.metadata,
+            },
+            content.data,
+        ))
+    }
+
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, ToolError> {
+        if self.offset >= self.metadata.len {
+            return Ok(None);
+        }
+        let content = read_chunk(self.target, self.offset, READ_CHUNK_BYTES).await?;
+        if content.metadata.version != self.metadata.version {
+            return Err(ToolError::Conflict(self.target.shown.clone()));
+        }
+        if content.data.is_empty() {
+            return Ok(None);
+        }
+        self.offset += content.data.len() as u64;
+        Ok(Some(content.data))
+    }
+}
+
+/// `limit` bytes of the file from `offset`, with Claude Code's answer for a directory.
+pub(super) async fn read_chunk(
+    target: &FileTarget,
+    offset: u64,
+    limit: usize,
+) -> Result<FileContent, ToolError> {
+    let inspection = target
+        .host
+        .inspect(FileQuery::Read {
+            path: target.path.clone(),
+            offset,
+            limit,
+        })
+        .await
+        .map_err(|error| match error.code.as_str() {
+            error_code::IS_DIRECTORY => ToolError::Rejected(format!(
+                "EISDIR: illegal operation on a directory, read '{}'",
+                target.shown.display()
+            )),
+            _ => tool_error(error, &target.shown),
+        })?;
+    match inspection {
+        FileInspection::Read(content) => Ok(content),
+        _ => Err(ToolError::Io {
+            path: target.shown.clone(),
+            reason: "the environment answered a read with something else".into(),
+        }),
+    }
+}
+
+async fn read_text(
+    chunks: &mut FileChunks<'_>,
+    first: Vec<u8>,
     path: &Path,
-    metadata: &std::fs::Metadata,
     request: &ReadRequest,
 ) -> Result<(ToolResult, FileReadRecord), ToolError> {
-    if request.limit.is_none() && metadata.len() > MAX_FILE_BYTES_WITHOUT_LIMIT {
+    let total_bytes = chunks.metadata.len;
+    if request.limit.is_none() && total_bytes > MAX_FILE_BYTES_WITHOUT_LIMIT {
         return Err(ToolError::Rejected(format!(
             "File content ({}) exceeds maximum allowed size ({}). {NARROW_READ_ADVICE}",
-            format_file_size(usize::try_from(metadata.len()).unwrap_or(usize::MAX)),
+            format_file_size(usize::try_from(total_bytes).unwrap_or(usize::MAX)),
             format_file_size(MAX_FILE_BYTES_WITHOUT_LIMIT as usize),
         )));
     }
-    let modified = metadata.modified().map_err(|error| io_error(path, error))?;
+    let modified = chunks.metadata.modified.unwrap_or(SystemTime::UNIX_EPOCH);
     let start_line = request.offset.unwrap_or(1).max(1);
     let first_index = start_line - 1;
     let selection =
         first_index..first_index.saturating_add(request.limit.unwrap_or(DEFAULT_LINE_LIMIT));
-    let scanned = scan_lines(
-        &mut std::io::BufReader::with_capacity(READ_BUFFER_BYTES, file),
-        &selection,
-    )
-    .map_err(|error| io_error(path, error))?;
+    let mut scanner = LineScanner::new(selection.clone());
+    scanner.feed(first.strip_prefix(UTF8_BOM).unwrap_or(&first));
+    while let Some(chunk) = chunks.next().await? {
+        scanner.feed(&chunk);
+    }
+    let scanned = scanner.finish();
     if scanned.selected.contains(&0) {
         return Err(binary_file_error(path));
     }
@@ -236,12 +308,13 @@ fn read_text(
 /// Like Claude Code `Read`: the model receives the whole prepared image, while the text result
 /// only summarizes it. A model without image input gets an explanation it can relay instead,
 /// as a successful result so the run continues, and the image is never loaded.
-fn read_image(
-    mut file: File,
+async fn read_image(
+    mut chunks: FileChunks<'_>,
+    mut bytes: Vec<u8>,
     path: &Path,
-    total_bytes: u64,
     accepts_images: bool,
 ) -> Result<FileOutcome, ToolError> {
+    let total_bytes = chunks.metadata.len;
     if !accepts_images {
         return Ok(ToolResult {
             content: format!(
@@ -253,12 +326,12 @@ fn read_image(
         }
         .into());
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| io_error(path, error))?;
-    let mut bytes = Vec::new();
-    file.take(image::MAX_SOURCE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(path, error))?;
+    while bytes.len() <= image::MAX_SOURCE_BYTES
+        && let Some(chunk) = chunks.next().await?
+    {
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes.truncate(image::MAX_SOURCE_BYTES + 1);
     let image = image::prepare(&bytes).map_err(|source| ToolError::Image {
         path: path.into(),
         source,
@@ -307,47 +380,61 @@ struct ScannedLines {
     total_lines: usize,
 }
 
-/// Splits like Claude Code `readFileInRange`: a leading BOM is dropped, every `\n` ends a line,
-/// and the fragment after the last `\n` is one more line, so only an empty file has no lines.
-fn scan_lines(
-    reader: &mut impl BufRead,
-    selection: &Range<usize>,
-) -> std::io::Result<ScannedLines> {
-    if reader.fill_buf()?.starts_with(UTF8_BOM) {
-        reader.consume(UTF8_BOM.len());
-    }
-    let mut selected = Vec::new();
-    let mut selected_bytes = 0;
-    let mut line_index = 0;
-    let mut has_content = false;
-    loop {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
-            break;
+/// Splits like Claude Code `readFileInRange`, fed the file after a leading BOM: every `\n` ends a
+/// line, and the fragment after the last `\n` is one more line, so only an empty file has no
+/// lines.
+struct LineScanner {
+    selection: Range<usize>,
+    selected: Vec<u8>,
+    selected_bytes: usize,
+    line_index: usize,
+    has_content: bool,
+}
+
+impl LineScanner {
+    fn new(selection: Range<usize>) -> Self {
+        Self {
+            selection,
+            selected: Vec::new(),
+            selected_bytes: 0,
+            line_index: 0,
+            has_content: false,
         }
-        has_content = true;
-        let newline = chunk.iter().position(|&byte| byte == b'\n');
-        let piece_length = newline.map_or(chunk.len(), |index| index + 1);
-        if selection.contains(&line_index) {
-            selected_bytes += piece_length;
-            if selected_bytes <= MAX_SCANNED_BYTES {
-                selected.extend_from_slice(&chunk[..piece_length]);
+    }
+
+    fn feed(&mut self, mut chunk: &[u8]) {
+        while !chunk.is_empty() {
+            self.has_content = true;
+            let newline = chunk.iter().position(|&byte| byte == b'\n');
+            let piece_length = newline.map_or(chunk.len(), |index| index + 1);
+            if self.selection.contains(&self.line_index) {
+                self.selected_bytes += piece_length;
+                if self.selected_bytes <= MAX_SCANNED_BYTES {
+                    self.selected.extend_from_slice(&chunk[..piece_length]);
+                }
+            }
+            chunk = &chunk[piece_length..];
+            if newline.is_some() {
+                self.line_index += 1;
             }
         }
-        reader.consume(piece_length);
-        if newline.is_some() {
-            line_index += 1;
+    }
+
+    fn finish(self) -> ScannedLines {
+        let total_lines = if self.has_content {
+            self.line_index + 1
+        } else {
+            0
+        };
+        ScannedLines {
+            selected: self.selected,
+            selected_bytes: self.selected_bytes,
+            line_count: total_lines
+                .min(self.selection.end)
+                .saturating_sub(self.selection.start),
+            total_lines,
         }
     }
-    let total_lines = if has_content { line_index + 1 } else { 0 };
-    Ok(ScannedLines {
-        selected,
-        selected_bytes,
-        line_count: total_lines
-            .min(selection.end)
-            .saturating_sub(selection.start),
-        total_lines,
-    })
 }
 
 fn normalized_lines(selected: &[u8], line_count: usize) -> Vec<u8> {
@@ -396,8 +483,9 @@ pub(super) fn recorded_text(text: &str) -> String {
         .join("\n")
 }
 
-/// One Chat's in-memory reads keyed by resolved absolute path; like Claude Code's LRU cache it
-/// keeps the most recently used 100 files within 25 MB of content.
+/// One Chat's in-memory reads keyed by the absolute path the model sees for the file once links
+/// are resolved, with the version the environment reported; like Claude Code's LRU cache it keeps
+/// the most recently used 100 files within 25 MB of content.
 #[derive(Clone, Default)]
 pub struct FileReadState {
     reads: Arc<Mutex<RecentReads>>,
@@ -413,6 +501,7 @@ struct RecentReads {
 struct RecentRead {
     last_used: u64,
     record: FileReadRecord,
+    version: Option<FileVersion>,
 }
 
 impl FileReadState {
@@ -427,21 +516,39 @@ impl FileReadState {
     }
 
     pub fn get(&self, path: &Path) -> Option<FileReadRecord> {
+        self.get_with_version(path).map(|(record, _)| record)
+    }
+
+    /// The read of `path` and the version the file had then, when the environment reported one.
+    pub(crate) fn get_with_version(
+        &self,
+        path: &Path,
+    ) -> Option<(FileReadRecord, Option<FileVersion>)> {
         let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
         reads.clock += 1;
         let clock = reads.clock;
         let entry = reads.entries.get_mut(path)?;
         entry.last_used = clock;
-        Some(entry.record.clone())
+        Some((entry.record.clone(), entry.version.clone()))
     }
 
     pub fn record(&self, path: PathBuf, record: FileReadRecord) {
+        self.record_version(path, record, None);
+    }
+
+    pub(crate) fn record_version(
+        &self,
+        path: PathBuf,
+        record: FileReadRecord,
+        version: Option<FileVersion>,
+    ) {
         let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
         reads.clock += 1;
         reads.content_bytes += record.content.len();
         let entry = RecentRead {
             last_used: reads.clock,
             record,
+            version,
         };
         if let Some(replaced) = reads.entries.insert(path, entry) {
             reads.content_bytes -= replaced.record.content.len();
@@ -458,6 +565,14 @@ impl FileReadState {
             if let Some(evicted) = reads.entries.remove(&least_recent) {
                 reads.content_bytes -= evicted.record.content.len();
             }
+        }
+    }
+
+    /// Forgets the read of `path`, whose content is no longer known.
+    pub(crate) fn forget(&self, path: &Path) {
+        let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(forgotten) = reads.entries.remove(path) {
+            reads.content_bytes -= forgotten.record.content.len();
         }
     }
 

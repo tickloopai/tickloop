@@ -109,8 +109,18 @@ pub fn resolve_existing(root: &Path, below: &str) -> Result<PathBuf, LocalFileEr
 pub fn resolve_target(root: &Path, below: &str) -> Result<PathBuf, LocalFileError> {
     let real_root = real_path(root)?;
     let requested = join_below(&real_root, below)?;
+    inside(&real_root, real_target(&requested)?, &requested)
+}
+
+/// The real path `below` in `root` leads to, inside the root or not: resolved like
+/// [`resolve_target`], with a dangling symbolic link refused the same way.
+pub fn resolve_anywhere(root: &Path, below: &str) -> Result<PathBuf, LocalFileError> {
+    real_target(&join_below(&real_path(root)?, below)?)
+}
+
+fn real_target(requested: &Path) -> Result<PathBuf, LocalFileError> {
     let mut missing_names = Vec::new();
-    let mut candidate = requested.as_path();
+    let mut candidate = requested;
     let existing = loop {
         match candidate.canonicalize() {
             Ok(existing) => break existing,
@@ -118,20 +128,19 @@ pub fn resolve_target(root: &Path, below: &str) -> Result<PathBuf, LocalFileErro
             Err(error) => return Err(LocalFileError::io(candidate, error)),
         }
         if std::fs::symlink_metadata(candidate).is_ok() {
-            return Err(LocalFileError::OutsideRoot(requested));
+            return Err(LocalFileError::OutsideRoot(requested.into()));
         }
         // The real root exists, so the walk up stops at it at the latest.
         let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
-            return Err(LocalFileError::NotFound(requested));
+            return Err(LocalFileError::NotFound(requested.into()));
         };
         missing_names.push(name);
         candidate = parent;
     };
-    let resolved = missing_names
+    Ok(missing_names
         .iter()
         .rev()
-        .fold(existing, |resolved, name| resolved.join(name));
-    inside(&real_root, resolved, &requested)
+        .fold(existing, |resolved, name| resolved.join(name)))
 }
 
 fn real_path(root: &Path) -> Result<PathBuf, LocalFileError> {

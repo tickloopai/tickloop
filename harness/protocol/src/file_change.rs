@@ -37,6 +37,9 @@ impl FileIdentity {
 pub struct FileVersion {
     pub exists: bool,
     pub identity: Option<FileIdentity>,
+    /// The environment's opaque version of the file, kept when it gives no identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub byte_len: u64,
     pub line_count: u64,
     pub ends_with_newline: bool,

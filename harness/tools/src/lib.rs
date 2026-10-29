@@ -1,29 +1,32 @@
 use std::{
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::chat_files::{ChatFiles, FileTarget};
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
+use crate::file_port::{FileHost, FileVersion};
 use crate::local_files::LocalFileError;
+use crate::local_roots::LocalRoots;
 use tickloop_harness_base::git_worktree::sibling_linked_worktrees;
 use tickloop_harness_base::image::ImageError;
 use tickloop_harness_base::network::Reach;
-use tickloop_harness_base::private_fs::{
-    OpenTarget, PrivateDirectory, open_without_following_links,
-};
+use tickloop_harness_base::private_fs::PrivateDirectory;
 use tickloop_harness_protocol::{
     CommandSnapshot, CommandState, FileReadRecord, Image, PreparedFileChange, SearchConfig,
     ToolDefinition, ToolResult,
 };
 
+mod chat_files;
 pub mod file_change;
+pub mod file_port;
 pub mod file_search;
 pub mod local_files;
+pub mod local_roots;
 pub mod permissions;
 mod persisted_output;
 pub use persisted_output::{
@@ -70,6 +73,14 @@ pub const SCRATCHPAD_SUBDIRECTORY: &str = "scratchpad";
 /// Why a tool that works on local files or commands refuses a Chat without a Folder.
 const FOLDERLESS_REJECTION: &str =
     "This Chat has no Folder, so it cannot read or change files or run commands.";
+/// The tools that reach files where the Chat's file host keeps them.
+const FILE_TOOL_NAMES: [&str; 5] = [
+    READ_TOOL_NAME,
+    WRITE_TOOL_NAME,
+    EDIT_TOOL_NAME,
+    GLOB_TOOL_NAME,
+    GREP_TOOL_NAME,
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
@@ -79,7 +90,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Whether the canonical `path` lies in the canonical form of a workspace directory.
+    /// Whether the canonical `path` lies in the canonical form of a workspace directory on this
+    /// machine.
     fn contains(&self, path: &Path) -> bool {
         self.folder
             .iter()
@@ -102,22 +114,10 @@ impl Workspace {
                 .collect(),
         })
     }
-
-    /// `path` below the workspace directory that holds it, as written or in canonical form, or
-    /// the whole path when no directory does.
-    fn below_directory<'a>(&self, path: &'a Path) -> &'a Path {
-        self.folder
-            .iter()
-            .chain(&self.additional_directories)
-            .flat_map(|directory| [Some(directory.clone()), directory.canonicalize().ok()])
-            .flatten()
-            .find_map(|directory| path.strip_prefix(directory).ok())
-            .unwrap_or(path)
-    }
 }
 
-/// A local file a host tool sends elsewhere, read whole by the `Read` path rules: it needs no
-/// approval in the workspace or this Chat's own directories and approval anywhere else. `read`
+/// A file of the Chat a host tool sends elsewhere, read whole by the `Read` path rules: it needs
+/// no approval in the workspace or this Chat's own directories and approval anywhere else. `read`
 /// is that `Read`, which the Chat admitted before the file was opened.
 #[derive(Clone, Debug)]
 pub struct LocalFile {
@@ -136,15 +136,17 @@ pub trait LocalReadAdmission: Send + Sync {
     async fn admit(&self, read: &PreparedTool) -> Result<bool, String>;
 }
 
-/// Read-only access to one Chat's local files, lent to a host tool that sends a file elsewhere: it
-/// reads whole files by that Chat's `Read` path rules in its workspace, only once the Chat admits
-/// each `Read`, and can neither write files nor run anything.
+/// Read-only access to one Chat's files, lent to a host tool that sends a file elsewhere: it reads
+/// whole files by that Chat's `Read` path rules in its workspace, where the Chat's file tools
+/// reach them, only once the Chat admits each `Read`, and can neither write files nor run
+/// anything.
 #[derive(Clone)]
 pub struct LocalFileReader {
     workspace: Workspace,
+    files: ChatFiles,
     readable_directories: Vec<PathBuf>,
     family_temp: PathBuf,
-    admission: std::sync::Arc<dyn LocalReadAdmission>,
+    admission: Arc<dyn LocalReadAdmission>,
 }
 
 impl LocalFileReader {
@@ -152,39 +154,8 @@ impl LocalFileReader {
     /// at most `max_bytes` of it. A path that looks like it holds credentials or secrets is
     /// refused, whatever the approval.
     pub async fn read(&self, file_path: &str, max_bytes: usize) -> Result<LocalFile, ToolError> {
-        let reader = self.clone();
-        let requested = file_path.to_owned();
-        let read = run_blocking(file_path, move || reader.resolve(&requested)).await?;
-        let read_asks = self
-            .admission
-            .admit(&read)
-            .await
-            .map_err(ToolError::Rejected)?;
-        let workspace = self.workspace.clone();
-        let (read, bytes) = run_blocking(file_path, move || {
-            if [&read.original_path, &read.resolved_path]
-                .into_iter()
-                .any(|path| is_sensitive_path(workspace.below_directory(path)))
-            {
-                return Err(ToolError::Rejected(format!(
-                    "{} looks like it holds credentials or secrets, so its contents are never sent",
-                    read.original_path.display()
-                )));
-            }
-            let bytes = read_whole_file(&read.resolved_path, max_bytes)?;
-            Ok((read, bytes))
-        })
-        .await?;
-        Ok(LocalFile {
-            path: read.resolved_path.clone(),
-            read,
-            read_asks,
-            bytes,
-        })
-    }
-
-    fn resolve(&self, file_path: &str) -> Result<PreparedTool, ToolError> {
-        prepare_with_readable_directories(
+        let read = prepare_call(
+            Some(&self.files),
             &self.workspace,
             READ_TOOL_NAME,
             &json!({"file_path": file_path}),
@@ -192,19 +163,33 @@ impl LocalFileReader {
             Some(&self.family_temp),
             &FileReadState::default(),
         )
+        .await?;
+        let read_asks = self
+            .admission
+            .admit(&read)
+            .await
+            .map_err(ToolError::Rejected)?;
+        if [&read.original_path, &read.resolved_path]
+            .into_iter()
+            .any(|path| is_sensitive_path(&self.files.below_roots(path)))
+        {
+            return Err(ToolError::Rejected(format!(
+                "{} looks like it holds credentials or secrets, so its contents are never sent",
+                read.original_path.display()
+            )));
+        }
+        let target = read
+            .file
+            .as_ref()
+            .expect("a prepared Read names the file it reads");
+        let bytes = read_whole_file(target, &read.original_path, max_bytes).await?;
+        Ok(LocalFile {
+            path: read.resolved_path.clone(),
+            read,
+            read_asks,
+            bytes,
+        })
     }
-}
-
-async fn run_blocking<T: Send + 'static>(
-    file_path: &str,
-    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
-) -> Result<T, ToolError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| ToolError::Io {
-            path: file_path.into(),
-            reason: format!("file read did not finish: {error}"),
-        })?
 }
 
 /// A write Claude Code never admits through a fast path, following its
@@ -262,6 +247,8 @@ pub struct PreparedTool {
     automatic_shell_workspace: Option<Workspace>,
     original_path: PathBuf,
     resolved_path: PathBuf,
+    /// The file a `Read`, `Write`, `Edit`, `Glob` or `Grep` acts on, shown as `resolved_path`.
+    file: Option<FileTarget>,
     operation: Operation,
 }
 
@@ -293,13 +280,11 @@ impl Operation {
         !matches!(self, Operation::TaskStop(_))
     }
 
-    /// Resolves the operation's path to the canonical target it acts on. A write may name a file
-    /// that does not exist yet, and a new file may also be missing parent directories.
-    fn resolve_target(&self, path: &Path, is_read_only: bool) -> Result<PathBuf, ToolError> {
-        match self {
-            Operation::Write(_) => resolve_write_target(path),
-            _ => resolve_path(path, !is_read_only),
-        }
+    fn is_file_operation(&self) -> bool {
+        matches!(
+            self,
+            Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
+        )
     }
 }
 
@@ -378,9 +363,7 @@ impl PreparedTool {
         else {
             return Ok(());
         };
-        let cwd = self
-            .operation
-            .resolve_target(&self.original_path, self.is_read_only)?;
+        let cwd = shell::resolve_cwd(&self.original_path, !self.is_read_only)?;
         if cwd != self.resolved_path || !input.is_allowed_with_family_temp(&cwd, workspace) {
             return Err(ToolError::PathChanged(self.original_path.clone()));
         }
@@ -654,6 +637,9 @@ pub struct Tools {
     /// `None` for a Chat without a Folder, whose tools write no local file.
     directory: Option<ChatDirectory>,
     commands: shell::Registry,
+    /// Where the file tools reach the Folder and Additional Directories; `None` reaches each
+    /// call's workspace on this machine.
+    files: Option<Arc<dyn FileHost>>,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
     /// What this Chat's fetches saw that may give provenance to later URLs.
@@ -668,8 +654,9 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// When used standalone, attachments and task output both go under `output_dir`; with no host
-    /// to run commands, Shell commands are rejected.
+    /// When used standalone, attachments and task output both go under `output_dir` and the files
+    /// of each call's workspace are those on this machine; with no host to run commands, Shell
+    /// commands are rejected.
     pub fn new(output_dir: PathBuf) -> Self {
         let output_dir = PrivateDirectory::trusted(output_dir);
         Self::with_commands(
@@ -679,15 +666,22 @@ impl Tools {
                 chat: output_dir,
             }),
             shell::Registry::without_host(),
+            None,
             Reach::Anywhere,
         )
     }
 
-    /// The tools of one Chat with a Folder, whose shell commands run in `shells`.
-    pub fn for_chat(directory: ChatDirectory, shells: std::sync::Arc<dyn ShellHost>) -> Self {
+    /// The tools of one Chat with a Folder, whose shell commands run in `shells` and whose file
+    /// tools reach the Folder and Additional Directories through `files`.
+    pub fn for_chat(
+        directory: ChatDirectory,
+        shells: Arc<dyn ShellHost>,
+        files: Arc<dyn FileHost>,
+    ) -> Self {
         Self::with_commands(
             Some(directory),
             shell::Registry::new(shells),
+            Some(files),
             Reach::Anywhere,
         )
     }
@@ -695,17 +689,19 @@ impl Tools {
     /// The tools of a Chat without a Folder: they touch no local file, run no command, and fetch
     /// only from the addresses `reach` admits.
     pub fn folderless(reach: Reach) -> Self {
-        Self::with_commands(None, shell::Registry::without_folder(), reach)
+        Self::with_commands(None, shell::Registry::without_folder(), None, reach)
     }
 
     fn with_commands(
         directory: Option<ChatDirectory>,
         commands: shell::Registry,
+        files: Option<Arc<dyn FileHost>>,
         reach: Reach,
     ) -> Self {
         Self {
             directory,
             commands,
+            files,
             search: std::sync::Arc::new(tokio::sync::RwLock::new(SearchConfig::enabled_default())),
             fetched_pages: web::FetchCache::default(),
             observed_urls: web_provenance::Observations::default(),
@@ -787,22 +783,13 @@ impl Tools {
         input: &Value,
     ) -> Result<PreparedTool, ToolError> {
         let Some(directory) = self.directory.clone() else {
-            let prepared = prepare_with_readable_directories(
-                workspace,
-                name,
-                input,
-                &[],
-                None,
-                &self.file_reads,
-            )?;
+            let prepared =
+                prepare_call(None, workspace, name, input, &[], None, &self.file_reads).await?;
             if let Operation::WebFetch(fetch) = &prepared.operation {
                 web::check_reach(&fetch.url, self.reach)?;
             }
             return self.bind_search(prepared).await;
         };
-        let owned_workspace = workspace.clone();
-        let owned_name = name.to_owned();
-        let owned_input = input.clone();
         let family_temp = directory.family_temp.clone();
         family_temp
             .create()
@@ -815,20 +802,46 @@ impl Tools {
             directory.chat.path().to_path_buf(),
             family_temp.path().to_path_buf(),
         ];
-        let file_reads = self.file_reads.clone();
-        let output_dir = directory.chat;
-        let join_error_path = output_dir.path().to_path_buf();
-        let prepared = tokio::task::spawn_blocking(move || {
-            let mut prepared = prepare_with_readable_directories(
-                &owned_workspace,
-                &owned_name,
-                &owned_input,
+        let mut prepared = if FILE_TOOL_NAMES.contains(&name) {
+            prepare_call(
+                Some(&self.chat_files(workspace, &directory)),
+                workspace,
+                name,
+                input,
                 &readable_directories,
                 Some(family_temp.path()),
-                &file_reads,
-            )?;
-            if let Operation::Write(operation) = &mut prepared.operation {
-                let review = write::take_review(operation);
+                &self.file_reads,
+            )
+            .await?
+        } else {
+            // The other tools resolve their paths on this machine, which blocks.
+            let workspace = workspace.clone();
+            let name = name.to_owned();
+            let input = input.clone();
+            let file_reads = self.file_reads.clone();
+            let join_error_path = directory.chat.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                complete_now(prepare_call(
+                    None,
+                    &workspace,
+                    &name,
+                    &input,
+                    &readable_directories,
+                    Some(family_temp.path()),
+                    &file_reads,
+                ))
+            })
+            .await
+            .map_err(|error| ToolError::Io {
+                path: join_error_path,
+                reason: format!("tool preparation did not finish: {error}"),
+            })??
+        };
+        if let Operation::Write(operation) = &mut prepared.operation {
+            let review = write::take_review(operation);
+            let output_dir = directory.chat;
+            let join_error_path = output_dir.path().to_path_buf();
+            let file_change = tokio::task::spawn_blocking(move || {
                 let review_directory = output_dir.join(ARTIFACT_DIRECTORY);
                 review_directory
                     .create()
@@ -836,16 +849,15 @@ impl Tools {
                         path: review_directory.path().to_path_buf(),
                         reason: error.to_string(),
                     })?;
-                prepared.file_change =
-                    Some(persist_file_change_review(output_dir.path(), &review)?);
-            }
-            Ok::<_, ToolError>(prepared)
-        })
-        .await
-        .map_err(|error| ToolError::Io {
-            path: join_error_path,
-            reason: format!("tool preparation did not finish: {error}"),
-        })??;
+                persist_file_change_review(output_dir.path(), &review)
+            })
+            .await
+            .map_err(|error| ToolError::Io {
+                path: join_error_path,
+                reason: format!("tool preparation did not finish: {error}"),
+            })??;
+            prepared.file_change = Some(file_change);
+        }
         if let Operation::TaskStop(input) = &prepared.operation {
             self.commands.stoppable_task(ids, &input.task_id).await?;
         }
@@ -906,6 +918,7 @@ impl Tools {
         let directory = self.directory.as_ref()?;
         Some(LocalFileReader {
             workspace: workspace.clone(),
+            files: self.chat_files(workspace, directory),
             readable_directories: vec![
                 directory.chat.path().to_path_buf(),
                 directory.family_temp.path().to_path_buf(),
@@ -913,6 +926,21 @@ impl Tools {
             family_temp: directory.family_temp.path().to_path_buf(),
             admission,
         })
+    }
+
+    /// Where this Chat's file tools find the files of `workspace` and the Chat's own directories.
+    fn chat_files(&self, workspace: &Workspace, directory: &ChatDirectory) -> ChatFiles {
+        let environment = self
+            .files
+            .clone()
+            .unwrap_or_else(|| Arc::new(LocalRoots::for_workspace(workspace)) as Arc<dyn FileHost>);
+        ChatFiles::new(
+            environment,
+            Some(LocalRoots::harness_directories(&[
+                directory.chat.path(),
+                directory.family_temp.path(),
+            ])),
+        )
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -1001,9 +1029,7 @@ impl Tools {
         chat_id: uuid::Uuid,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
-        let current = prepared
-            .operation
-            .resolve_target(&prepared.original_path, prepared.is_read_only)?;
+        let current = shell::resolve_cwd(&prepared.original_path, !prepared.is_read_only)?;
         if current != prepared.resolved_path {
             return Err(ToolError::PathChanged(prepared.original_path));
         }
@@ -1122,7 +1148,7 @@ impl Tools {
                 if cancel.is_cancelled() {
                     return Err(ToolError::Cancelled);
                 }
-                if resolve_path(&prepared.original_path, false)? != prepared.resolved_path {
+                if shell::resolve_cwd(&prepared.original_path, false)? != prepared.resolved_path {
                     return Err(ToolError::PathChanged(prepared.original_path.clone()));
                 }
                 self.commands
@@ -1178,16 +1204,15 @@ impl Tools {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled).into();
         }
+        let Some(target) = prepared.file.clone() else {
+            return Err(ToolError::InvalidInput(
+                "file operation was not bound to its file; use Tools::prepare".into(),
+            ))
+            .into();
+        };
         let is_read_only = prepared.is_read_only;
-        let resolved_path = prepared.resolved_path.clone();
-        let execution_cancel = cancel.clone();
-        let execution = tokio::task::spawn_blocking(move || {
-            let current = prepared
-                .operation
-                .resolve_target(&prepared.original_path, is_read_only)?;
-            if current != prepared.resolved_path {
-                return Err(ToolError::PathChanged(prepared.original_path));
-            }
+        let original_path = prepared.original_path;
+        let execution = async {
             match prepared.operation {
                 Operation::Shell(_)
                 | Operation::TaskStop(_)
@@ -1195,23 +1220,28 @@ impl Tools {
                 | Operation::WebSearch(_) => Err(ToolError::InvalidInput(
                     "shell requires asynchronous execution".into(),
                 )),
-                Operation::Write(operation) => write::execute(
-                    &prepared.resolved_path,
-                    *operation,
-                    context.operation_id,
-                    &execution_cancel,
-                )
-                .map(FileOutcome::from),
+                Operation::Write(operation) => {
+                    write::execute(&target.shown, *operation, &self.file_reads, cancel.clone())
+                        .await
+                        .map(|(result, read, version)| FileOutcome {
+                            result,
+                            read: Some((read, version)),
+                            images: Vec::new(),
+                        })
+                }
                 Operation::Read(request) => {
-                    read::execute(&prepared.resolved_path, &request, context.accepts_images)
+                    target.check_unchanged(&original_path).await?;
+                    read::execute(&target, &request, context.accepts_images).await
                 }
                 Operation::Search(request) => {
-                    search::execute(&prepared.resolved_path, &request, &execution_cancel)
+                    target.check_unchanged(&original_path).await?;
+                    search::execute(&target, &request)
+                        .await
                         .map(FileOutcome::from)
                 }
             }
-        });
-        let joined = if !is_read_only {
+        };
+        let outcome = if !is_read_only {
             execution.await
         } else {
             tokio::select! {
@@ -1220,19 +1250,11 @@ impl Tools {
                 result = execution => result,
             }
         };
-        let outcome = joined.unwrap_or_else(|_| {
-            Err(ToolError::Io {
-                path: self.chat_directory().map_or_else(
-                    || resolved_path.clone(),
-                    |directory| directory.path().into(),
-                ),
-                reason: "file task did not finish".into(),
-            })
-        });
         match outcome {
             Ok(outcome) => {
-                if let Some(read) = outcome.read {
-                    self.file_reads.record(resolved_path, read);
+                if let Some((read, version)) = outcome.read {
+                    self.file_reads
+                        .record_version(target.shown.clone(), read, Some(version));
                 }
                 ToolExecution {
                     result: Ok(outcome.result),
@@ -1245,10 +1267,11 @@ impl Tools {
     }
 }
 
-/// A finished file operation, what the model saw of the file's lines, and any images it views.
+/// A finished file operation, what the model saw of the file's lines and the version it saw them
+/// in, and any images it views.
 struct FileOutcome {
     result: ToolResult,
-    read: Option<FileReadRecord>,
+    read: Option<(FileReadRecord, FileVersion)>,
     images: Vec<Image>,
 }
 
@@ -1262,18 +1285,6 @@ impl From<ToolResult> for FileOutcome {
     }
 }
 
-impl From<(ToolResult, FileReadRecord)> for FileOutcome {
-    fn from((result, read): (ToolResult, FileReadRecord)) -> Self {
-        Self {
-            result,
-            read: Some(read),
-            images: Vec::new(),
-        }
-    }
-}
-
-/// Prepares a call outside any Chat: nothing has been read, so `Write` and `Edit` only accept
-/// files that do not exist yet.
 pub fn is_concurrency_safe(workspace: &Workspace, name: &str, input: &Value) -> bool {
     match name {
         READ_TOOL_NAME | GLOB_TOOL_NAME | GREP_TOOL_NAME | WEB_FETCH_TOOL_NAME
@@ -1283,12 +1294,34 @@ pub fn is_concurrency_safe(workspace: &Workspace, name: &str, input: &Value) -> 
     }
 }
 
+/// Prepares a call outside any Chat, on the workspace's files on this machine: nothing has been
+/// read, so `Write` and `Edit` only accept files that do not exist yet.
 pub fn prepare(
     workspace: &Workspace,
     name: &str,
     input: &Value,
 ) -> Result<PreparedTool, ToolError> {
-    prepare_with_readable_directories(workspace, name, input, &[], None, &FileReadState::default())
+    let files = ChatFiles::new(Arc::new(LocalRoots::for_workspace(workspace)), None);
+    complete_now(prepare_call(
+        Some(&files),
+        workspace,
+        name,
+        input,
+        &[],
+        None,
+        &FileReadState::default(),
+    ))
+}
+
+/// Finishes a preparation on [`LocalRoots`], whose file operations block the calling thread
+/// instead of waiting.
+fn complete_now<T>(preparation: impl std::future::Future<Output = T>) -> T {
+    let mut preparation = std::pin::pin!(preparation);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match preparation.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(prepared) => prepared,
+        std::task::Poll::Pending => unreachable!("local roots answer without waiting"),
+    }
 }
 
 type PrepareBuiltin = fn(&str, &Value) -> Result<(String, Operation, Value), ToolError>;
@@ -1333,7 +1366,10 @@ fn builtin_registrations() -> Vec<BuiltinRegistration> {
     registrations
 }
 
-fn prepare_with_readable_directories(
+/// Prepares a call of a Chat whose file tools find files through `files`; `Bash` still resolves
+/// its working directory on this machine.
+async fn prepare_call(
+    files: Option<&ChatFiles>,
     workspace: &Workspace,
     name: &str,
     input: &Value,
@@ -1367,20 +1403,18 @@ fn prepare_with_readable_directories(
             automatic_shell_workspace: None,
             original_path: PathBuf::new(),
             resolved_path: PathBuf::new(),
+            file: None,
             operation,
         });
     };
     let original_path = folder.join(&path);
-    if let Operation::Search(request) = &mut operation {
-        request.bind(&original_path, &path, folder)?;
-    }
     let mut automatic_shell_workspace = None;
     let is_read_only = match &mut operation {
         Operation::Write(_) => false,
         Operation::Shell(input) => {
             input.readable_directories = readable_directories.to_vec();
             input.editable_directory = family_temp.map(Path::to_path_buf);
-            let cwd = resolve_path(&original_path, true).ok();
+            let cwd = shell::resolve_cwd(&original_path, true).ok();
             if let Some(cwd) = &cwd
                 && input.is_allowed_with_family_temp(cwd, workspace)
             {
@@ -1391,43 +1425,49 @@ fn prepare_with_readable_directories(
         Operation::TaskStop(_) => false,
         _ => true,
     };
-    let resolved_path = operation.resolve_target(&original_path, is_read_only)?;
-    if let Operation::Shell(input) = &mut operation {
-        input.approved_directory = std::fs::metadata(&resolved_path)
-            .ok()
-            .and_then(|metadata| shell::DirectoryIdentity::of(&metadata));
-    }
-    let original_scope = match (original_path.parent(), original_path.file_name()) {
-        (Some(parent), Some(name)) if matches!(operation, Operation::Write(_)) => {
-            resolve_write_target(parent)?.join(name)
-        }
-        (Some(parent), Some(name)) => parent
-            .canonicalize()
-            .map_err(|error| io_error(parent, error))?
-            .join(name),
-        _ => resolved_path.clone(),
-    };
-    let operation = match operation {
-        Operation::Write(operation) => Operation::Write(Box::new(write::bind(
-            &resolved_path,
-            *operation,
+    let (operation, location) = if operation.is_file_operation() {
+        let files = files.ok_or_else(|| ToolError::Rejected(FOLDERLESS_REJECTION.into()))?;
+        locate_file(
+            files,
+            workspace,
+            name,
+            &original_path,
+            &path,
+            operation,
             file_reads,
-            folder,
-        )?)),
-        other => other,
+        )
+        .await?
+    } else {
+        let resolved_path = shell::resolve_cwd(&original_path, !is_read_only)?;
+        if let Operation::Shell(input) = &mut operation {
+            input.approved_directory = shell::DirectoryIdentity::at(&resolved_path);
+        }
+        let original_scope = shell::cwd_scope(&original_path, &resolved_path)?;
+        let is_local = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_));
+        let in_workspace =
+            is_local && workspace.contains(&original_scope) && workspace.contains(&resolved_path);
+        let in_sibling_worktree = is_local
+            && !in_workspace
+            && workspace.with_sibling_worktrees().is_some_and(|scope| {
+                scope.contains(&original_scope) && scope.contains(&resolved_path)
+            });
+        let location = Location {
+            resolved_path,
+            original_scope,
+            in_workspace,
+            in_sibling_worktree,
+            file: None,
+        };
+        (operation, location)
     };
-    let is_local = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_));
-    let in_workspace =
-        is_local && workspace.contains(&original_scope) && workspace.contains(&resolved_path);
-    let in_sibling_worktree = is_local
-        && !in_workspace
-        && workspace
-            .with_sibling_worktrees()
-            .is_some_and(|scope| scope.contains(&original_scope) && scope.contains(&resolved_path));
-    let is_file_operation = matches!(
-        operation,
-        Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
-    );
+    let Location {
+        resolved_path,
+        original_scope,
+        in_workspace,
+        in_sibling_worktree,
+        file,
+    } = location;
+    let is_file_operation = operation.is_file_operation();
     let in_family_temp = is_file_operation
         && family_temp.is_some_and(|root| {
             original_scope.starts_with(root) && resolved_path.starts_with(root)
@@ -1457,53 +1497,101 @@ fn prepare_with_readable_directories(
         automatic_shell_workspace,
         original_path,
         resolved_path,
+        file,
         operation,
     })
 }
 
-/// Opens an existing path without following symlinks; with `directory`, the last component must
-/// also be a directory.
-pub(crate) fn open_existing(path: &Path, directory: bool) -> Result<File, ToolError> {
-    let target = if directory {
-        OpenTarget::Directory { create_mode: None }
-    } else {
-        OpenTarget::Entry
+/// Where a call acts: the resolved path it is shown with, the path as written with only its
+/// parent resolved, and whether both lie in the workspace or in another linked worktree of the
+/// Folder's repository.
+struct Location {
+    resolved_path: PathBuf,
+    original_scope: PathBuf,
+    in_workspace: bool,
+    in_sibling_worktree: bool,
+    file: Option<FileTarget>,
+}
+
+/// Resolves the file of a `Read`, `Write`, `Edit`, `Glob` or `Grep` where the Chat's files are,
+/// refuses what the Chat may not do there before any approval, and binds the operation to the
+/// file as it is now.
+async fn locate_file(
+    files: &ChatFiles,
+    workspace: &Workspace,
+    name: &str,
+    original_path: &Path,
+    requested_path: &str,
+    operation: Operation,
+    file_reads: &FileReadState,
+) -> Result<(Operation, Location), ToolError> {
+    let folder = workspace
+        .folder
+        .as_deref()
+        .expect("only a Chat with a Folder has file operations");
+    if let Operation::Write(_) = operation {
+        files.check_parent_steps(original_path).await?;
+    }
+    let target = files.resolve(original_path).await?;
+    let original_scope = files.resolve_scope(original_path, &target).await?;
+    let operation = match operation {
+        Operation::Read(_) if target.kind.is_none() => {
+            return Err(ToolError::NotFound(original_path.into()));
+        }
+        Operation::Search(mut request) => {
+            request.bind(
+                &target,
+                requested_path,
+                folder,
+                files.folder_display().unwrap_or_else(|| folder.into()),
+            )?;
+            Operation::Search(request)
+        }
+        Operation::Write(write) => {
+            target.check_writable(name)?;
+            Operation::Write(Box::new(
+                write::bind(&target, *write, file_reads, folder).await?,
+            ))
+        }
+        other => other,
     };
-    open_without_following_links(path, target).map_err(|error| io_error(path, error))
+    let in_workspace = files.is_in_roots(&original_scope) && files.is_in_roots(&target.shown);
+    let in_sibling_worktree = !in_workspace
+        && files.local_folder().is_some()
+        && workspace
+            .with_sibling_worktrees()
+            .is_some_and(|scope| scope.contains(&original_scope) && scope.contains(&target.shown));
+    Ok((
+        operation,
+        Location {
+            resolved_path: target.shown.clone(),
+            original_scope,
+            in_workspace,
+            in_sibling_worktree,
+            file: Some(target),
+        },
+    ))
 }
 
-/// Opens the regular file at `path` for `Read`, with Claude Code's answer for a directory.
-fn open_for_read(path: &Path) -> Result<(File, std::fs::Metadata), ToolError> {
-    local_files::open_file(path).map_err(|error| match error {
-        LocalFileError::IsDirectory(path) => ToolError::Rejected(format!(
-            "EISDIR: illegal operation on a directory, read '{}'",
-            path.display()
-        )),
-        other => other.into(),
-    })
-}
-
-fn read_whole_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
-    let (file, metadata) = open_for_read(path)?;
-    let too_large = |size: usize| {
-        ToolError::Rejected(format!(
+/// At most `max_bytes` of the whole file, once its path is known to still lead where it did.
+async fn read_whole_file(
+    target: &FileTarget,
+    requested: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ToolError> {
+    target.check_unchanged(requested).await?;
+    let content = read::read_chunk(target, 0, max_bytes.saturating_add(1)).await?;
+    let size = usize::try_from(content.metadata.len)
+        .unwrap_or(usize::MAX)
+        .max(content.data.len());
+    if size > max_bytes {
+        return Err(ToolError::Rejected(format!(
             "File content ({}) exceeds maximum allowed size ({}).",
             format_file_size(size),
             format_file_size(max_bytes)
-        ))
-    };
-    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    if size > max_bytes {
-        return Err(too_large(size));
+        )));
     }
-    let mut bytes = Vec::with_capacity(size);
-    file.take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(path, error))?;
-    if bytes.len() > max_bytes {
-        return Err(too_large(bytes.len()));
-    }
-    Ok(bytes)
+    Ok(content.data)
 }
 
 /// Claude Code `formatFileSize`.
@@ -1533,61 +1621,6 @@ fn io_error(path: &Path, error: std::io::Error) -> ToolError {
             path: path.into(),
             reason: error.to_string(),
         }
-    }
-}
-
-/// Resolves a file to write: the deepest existing ancestor is canonicalized and the missing names
-/// below it are appended unchanged. A missing part may not climb with `..`, and a dangling link
-/// anywhere on the way counts as a changed path.
-fn resolve_write_target(path: &Path) -> Result<PathBuf, ToolError> {
-    let mut missing_names = Vec::new();
-    let mut candidate = path;
-    loop {
-        match candidate.canonicalize() {
-            Ok(existing) => {
-                return Ok(missing_names
-                    .iter()
-                    .rev()
-                    .fold(existing, |resolved, name| resolved.join(name)));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(candidate, error)),
-        }
-        if std::fs::symlink_metadata(candidate).is_ok() {
-            return Err(ToolError::PathChanged(path.into()));
-        }
-        let Some(std::path::Component::Normal(name)) = candidate.components().next_back() else {
-            return Err(ToolError::InvalidInput(format!(
-                "{} must name a file below existing directories without `..`",
-                path.display()
-            )));
-        };
-        missing_names.push(name);
-        candidate = candidate
-            .parent()
-            .ok_or_else(|| ToolError::InvalidInput("path has no parent".into()))?;
-    }
-}
-
-fn resolve_path(path: &Path, allow_missing: bool) -> Result<PathBuf, ToolError> {
-    match path.canonicalize() {
-        Ok(resolved) => Ok(resolved),
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-            if std::fs::symlink_metadata(path).is_ok() {
-                return Err(ToolError::PathChanged(path.into()));
-            }
-            let parent = path
-                .parent()
-                .ok_or_else(|| ToolError::InvalidInput("path has no parent".into()))?;
-            let parent = parent
-                .canonicalize()
-                .map_err(|error| io_error(parent, error))?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| ToolError::InvalidInput("path has no file name".into()))?;
-            Ok(parent.join(name))
-        }
-        Err(error) => Err(io_error(path, error)),
     }
 }
 

@@ -8,11 +8,12 @@ use tickloop_ids::IdContext;
 
 use serde::Serialize;
 
+use super::open_existing;
 use super::{
     CANCELLED_COMMAND_REASON, MAX_COMMAND_OUTPUT_BYTES, OUTPUT_LIMIT_REASON, TIMED_OUT_REASON,
     syntax,
 };
-use crate::{ToolError, format_file_size, io_error, large_output_message, open_existing};
+use crate::{ToolError, format_file_size, io_error, large_output_message};
 use tickloop_harness_protocol::{CommandSnapshot, ToolResult};
 
 /// Claude Code `BASH_MAX_OUTPUT_DEFAULT`: how much of the output file a result carries inline.

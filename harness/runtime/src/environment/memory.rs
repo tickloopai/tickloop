@@ -769,6 +769,15 @@ impl MemoryPort {
         let tree = tree(&state, &path);
         let below = tree_path(&path);
         let inspection = match query {
+            FileQuery::Resolve(path) => FileInspection::Resolved(ResolvedPath {
+                kind: match tree.stat(below) {
+                    Ok(FileStat::File(_)) => Some(FileKind::File),
+                    Ok(FileStat::Directory { .. }) => Some(FileKind::Directory),
+                    Ok(FileStat::Other) => Some(FileKind::Other),
+                    Err(_) => None,
+                },
+                path,
+            }),
             FileQuery::Stat(_) => FileInspection::Stat(tree.stat(below)?),
             FileQuery::Read { offset, limit, .. } => {
                 let file = tree.file(below)?;

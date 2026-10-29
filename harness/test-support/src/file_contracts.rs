@@ -253,6 +253,7 @@ pub async fn file_contract<H: FileContractHost>(fresh: impl Fn() -> H) {
     conflict_contract(&fresh()).await;
     outside_root_contract(&fresh()).await;
     lost_reply_contract(&fresh()).await;
+    resolve_contract(&fresh()).await;
     held_read_contract(&fresh()).await;
     revocation_contract(&fresh()).await;
     glob_contract(&fresh()).await;
@@ -719,6 +720,44 @@ async fn lost_reply_contract(host: &impl FileContractHost) {
     }
     let again = bound.read("lost.txt").await.unwrap();
     assert_eq!(again, read, "nothing sent the lost write again");
+}
+
+/// Paths without links resolve to themselves in their root, with what is there; a missing file
+/// keeps its names, and the Folder's display path names the Folder root.
+async fn resolve_contract(host: &impl FileContractHost) {
+    let bound = bind(host).await;
+    host.put_file("docs/guide.md", b"guide", SystemTime::now());
+    let resolve = |path: FilePath| {
+        let bound = &bound;
+        async move {
+            match bound.inspect(FileQuery::Resolve(path)).await.unwrap() {
+                FileInspection::Resolved(resolved) => resolved,
+                other => panic!("not a resolution: {other:?}"),
+            }
+        }
+    };
+    for (path, kind) in [
+        ("docs/guide.md", Some(FileKind::File)),
+        ("docs", Some(FileKind::Directory)),
+        ("", Some(FileKind::Directory)),
+        ("docs/missing/new.md", None),
+    ] {
+        assert_eq!(
+            resolve(bound.path(path)).await,
+            ResolvedPath {
+                path: bound.path(path),
+                kind
+            },
+            "{path:?}"
+        );
+    }
+    let folder = bound.files.folder().expect("a Folder root");
+    let shown = bound
+        .files
+        .resolve(&format!("{}/docs/guide.md", folder.display_path))
+        .unwrap();
+    assert_eq!(shown, bound.path("docs/guide.md"));
+    assert_eq!(resolve(shown).await.path, bound.path("docs/guide.md"));
 }
 
 async fn held_read_contract(host: &impl FileContractHost) {
