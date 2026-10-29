@@ -12977,6 +12977,17 @@ impl State {
                 }
                 (KeyCode::Tab, KeyModifiers::NONE) => return self.cycle_rows(1),
                 (KeyCode::BackTab, _) => return self.cycle_rows(-1),
+                (
+                    KeyCode::Char(crate::monitor_rows::MONITOR_HIDE_CARDS_KEY),
+                    KeyModifiers::NONE,
+                ) => {
+                    self.hide_all_cards();
+                }
+                // Terminals report Shift+z with or without the Shift modifier.
+                (
+                    KeyCode::Char(crate::monitor_rows::MONITOR_SHOW_CARDS_KEY),
+                    KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ) => self.show_all_cards(),
                 (KeyCode::Char(super::monitor::NEXT_UNSEEN_KEY), KeyModifiers::NONE) => {
                     self.monitor.select_next_unseen();
                     self.rendered_region = None;
@@ -13021,6 +13032,9 @@ impl State {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
                 }
+                // Space is the list's card key; on a Tick row without a card, such as a lost
+                // Tick's, it does nothing rather than leave the list and type into the input.
+                (KeyCode::Char(' '), KeyModifiers::NONE) if self.monitor.selected().is_some() => {}
                 (KeyCode::Enter, KeyModifiers::NONE)
                     if self
                         .monitor
