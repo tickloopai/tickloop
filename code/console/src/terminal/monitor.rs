@@ -240,6 +240,8 @@ pub(super) struct MonitorFrame {
     pub(super) tick_rows: std::ops::Range<usize>,
     /// The Tick screen size of each card shown, which its view's terminal takes.
     pub(super) card_sizes: Vec<(InstanceRef, CardSize)>,
+    /// The open cards that did not fit, whose rows say `collapsed`.
+    pub(super) collapsed_cards: Vec<InstanceRef>,
 }
 
 /// How the open cards show in one frame: each card's rows when shown, by its place in `cards`.
@@ -268,6 +270,15 @@ impl CardLayout<'_> {
             .map(|rows| 1 + usize::from(rows.shown))
             .sum::<usize>()
             + usize::from(self.allocation.collapsed > 0)
+    }
+
+    fn collapsed(&self) -> Vec<InstanceRef> {
+        self.cards
+            .iter()
+            .zip(&self.allocation.cards)
+            .filter(|(_, rows)| rows.is_none())
+            .map(|(card, _)| card.instance.clone())
+            .collect()
     }
 
     fn sizes(&self) -> Vec<(InstanceRef, CardSize)> {
@@ -1858,6 +1869,7 @@ impl Monitor {
             targets,
             tick_rows: 0..0,
             card_sizes: Vec::new(),
+            collapsed_cards: Vec::new(),
         }
     }
 
@@ -2183,6 +2195,7 @@ impl Monitor {
             targets,
             tick_rows,
             card_sizes: cards.sizes(),
+            collapsed_cards: cards.collapsed(),
         }
     }
 }
