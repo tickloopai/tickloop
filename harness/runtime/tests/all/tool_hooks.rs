@@ -410,10 +410,7 @@ async fn a_plugin_hook_may_deny_and_gets_its_directories_but_its_allow_admits_no
     });
     let observed = bench.run("Build it.", true).await;
     assert!(observed.started.is_empty());
-    assert_eq!(
-        observed.results[0].content,
-        "PreToolUse:Bash hook error: use make"
-    );
+    assert_eq!(observed.results[0].content, "use make");
     assert_eq!(observed.hook_runs[0].decision, Some(HookDecision::Deny));
     bench.agent.shutdown().await;
 }
@@ -439,6 +436,40 @@ async fn a_deny_without_a_reason_names_the_hook_that_denied_the_tool() {
         ["Hook PreToolUse:Bash denied this tool"]
     );
     bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_and_specific_denials_use_only_their_permission_reason() {
+    for (output, expected) in [
+        (
+            json!({"decision":"block"}),
+            "Hook PreToolUse:Bash denied this tool",
+        ),
+        (
+            json!({"decision":"block","reason":"legacy reason"}),
+            "legacy reason",
+        ),
+        (
+            json!({"reason":"not a permission reason","hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"}}),
+            "Hook PreToolUse:Bash denied this tool",
+        ),
+        (
+            json!({"reason":"outer","hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"specific reason"}}),
+            "specific reason",
+        ),
+    ] {
+        let bench = Bench::start(
+            Options::new(ExecutionMode::FullAccess, vec![build_call(), text("done")]),
+            vec![user_hook(HookEvent::PreToolUse, Some("Bash"), GUARD)],
+        )
+        .await;
+        bench.define(GUARD, move |_| answer(output.clone()));
+        let observed = bench.run("Build it.", true).await;
+        assert!(observed.started.is_empty());
+        assert_eq!(observed.results[0].content, expected);
+        assert_eq!(bench.model_tool_results(), [expected]);
+        bench.agent.shutdown().await;
+    }
 }
 
 #[tokio::test]

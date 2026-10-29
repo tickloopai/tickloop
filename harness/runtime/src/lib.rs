@@ -1947,6 +1947,22 @@ impl Agent {
         let operations = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(run) = chat.active_run
+                && chat.hook_state.session.preparing_inputs.contains_key(&run)
+            {
+                for pending in &mut chat.snapshot.pending_inputs {
+                    if pending.receipt.loop_id == chat.snapshot.chat_loop.id
+                        && hooks::is_user_prompt(pending)
+                    {
+                        pending.armed = false;
+                        chat.bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
+                    }
+                }
+                chat.hook_state.session.paused_preparations.insert(run);
+                self.save(&chat.snapshot);
+            }
             chat.interrupt()
         };
         self.pause_goal(chat_id, goal::state::GoalEvent::Interrupted)
@@ -1970,7 +1986,15 @@ impl Agent {
             queued.id == run_id && queued.armed && queued.kind == QueuedInputKind::Message
         });
         let has_work_ahead = chat.active.is_some() || !chat.parked.is_empty();
-        if !is_queued_message || !has_work_ahead || chat.active_run == Some(run_id) {
+        let is_preparing = chat.active_run.is_some_and(|active| {
+            chat.hook_state
+                .session
+                .preparing_inputs
+                .get(&active)
+                .is_some_and(|inputs| inputs.contains(&run_id))
+        });
+        if !is_queued_message || !has_work_ahead || chat.active_run == Some(run_id) || is_preparing
+        {
             return Ok(Vec::new());
         }
         Ok(chat.interrupt())
@@ -3923,45 +3947,31 @@ impl Agent {
             receipt.loop_id, chat.snapshot.chat_loop.id,
             "every run belongs to its Chat's one Loop"
         );
-        if let Some(inputs) = chat
+        let preparing_inputs = chat
             .hook_state
             .session
             .preparing_inputs
-            .remove(&receipt.run_id)
-        {
-            let interrupted_by_user = chat.user_cancelled_runs.remove(&receipt.run_id);
-            if interrupted_by_user
+            .remove(&receipt.run_id);
+        let was_unstarted = preparing_inputs.is_some();
+        let queue_already_paused = chat
+            .hook_state
+            .session
+            .paused_preparations
+            .remove(&receipt.run_id);
+        if let Some(inputs) = &preparing_inputs
+            && !queue_already_paused
+            && (chat.user_cancelled_runs.contains(&receipt.run_id)
                 || internal_failure
-                || (!cancel.is_cancelled() && result.is_err())
-            {
-                for pending in &mut chat.snapshot.pending_inputs {
-                    if inputs.contains(&pending.receipt.run_id) && hooks::is_user_prompt(pending) {
-                        pending.armed = false;
-                        chat.bookkeeping
-                            .lifecycle
-                            .set_queued_armed(pending.receipt.run_id, false);
-                    }
+                || (!cancel.is_cancelled() && result.is_err()))
+        {
+            for pending in &mut chat.snapshot.pending_inputs {
+                if inputs.contains(&pending.receipt.run_id) && hooks::is_user_prompt(pending) {
+                    pending.armed = false;
+                    chat.bookkeeping
+                        .lifecycle
+                        .set_queued_armed(pending.receipt.run_id, false);
                 }
             }
-            run_supervision::clear_run_state(chat, receipt.run_id);
-            let event = if cancel.is_cancelled() && !internal_failure {
-                chat.snapshot.chat_loop.set_state(LoopState::Interrupted);
-                EventKind::Interrupted
-            } else if let Err(error) = result {
-                chat.snapshot.chat_loop.set_state(LoopState::Failed);
-                EventKind::Failed(error)
-            } else {
-                chat.snapshot.chat_loop.set_state(LoopState::Idle);
-                EventKind::Completed {
-                    usage: Usage::default(),
-                }
-            };
-            self.emit(chat, &receipt, event);
-            let snapshot = chat.snapshot.clone();
-            let bookkeeping = chat.bookkeeping.clone();
-            drop(chats);
-            let _ = self.checkpoint_transcript(&snapshot, &bookkeeping).await;
-            return self.next_run(receipt.chat_id).await.ok().flatten();
         }
         chat.family_finishing.insert(receipt.run_id);
         chat.feedback_inputs.remove(&receipt.run_id);
@@ -3979,7 +3989,11 @@ impl Agent {
             result = Err(error.to_string());
         }
         let is_user_cancelled = chat.user_cancelled_runs.remove(&receipt.run_id);
-        if cancel.is_cancelled() && is_user_cancelled && !self.inner.closed.load(Ordering::SeqCst) {
+        if !was_unstarted
+            && cancel.is_cancelled()
+            && is_user_cancelled
+            && !self.inner.closed.load(Ordering::SeqCst)
+        {
             chat.snapshot
                 .message_runs
                 .insert(chat.snapshot.messages.len(), receipt.run_id);
@@ -4038,12 +4052,15 @@ impl Agent {
         let goal_turn = self.goal_turn_events(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
-        let is_settled = !(self.inner.waits == WaitHosting::Durable
-            && ending
-                == ResponseEnding::Interrupted {
-                    by: InterruptedBy::Host,
-                });
-        self.end_response(chat, receipt.run_id, ending, usage);
+        let is_settled = !was_unstarted
+            && !(self.inner.waits == WaitHosting::Durable
+                && ending
+                    == ResponseEnding::Interrupted {
+                        by: InterruptedBy::Host,
+                    });
+        if !was_unstarted {
+            self.end_response(chat, receipt.run_id, ending, usage);
+        }
         // An interrupted or failed turn does not hold back a Tick delivery that came due.
         let is_deliverable = matches!(
             chat.snapshot.chat_loop.state,

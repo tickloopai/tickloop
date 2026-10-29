@@ -75,6 +75,11 @@ impl SessionSource {
 }
 
 /// What the session and turn hooks keep for a Chat in this process.
+///
+/// `PendingInput::armed` in the live snapshot controls scheduling. On Process hosts only,
+/// the persisted queue copy is disarmed before input hooks run: that existing ledger bit
+/// marks input to retain, but not start, after a restart. Explicit continuation re-arms the
+/// live copy without erasing this retention marker; committing the prompt clears the queue.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionHookState {
     /// The `SessionStart` the Chat's next model request runs first.
@@ -86,6 +91,9 @@ pub(crate) struct SessionHookState {
     stop_blocks: HashMap<RunId, u32>,
     /// Accepted inputs reserved for a Run whose prompt hooks have not finished.
     pub(crate) preparing_inputs: HashMap<RunId, Vec<RunId>>,
+    /// Esc already paused the user queue of these preparations. Finishing must not pause it
+    /// again: a later explicit submission may have re-armed it in the meantime.
+    pub(crate) paused_preparations: HashSet<RunId>,
     /// Runs a user's prompt started whose `UserPromptSubmit` hooks have not let it through yet.
     unchecked_prompts: HashSet<RunId>,
     /// `asyncRewake` notifications no model request has read yet.
@@ -146,6 +154,7 @@ impl SessionHookState {
         self.stop_blocks.remove(&run);
         self.unchecked_prompts.remove(&run);
         self.preparing_inputs.remove(&run);
+        self.paused_preparations.remove(&run);
     }
 }
 
@@ -507,10 +516,6 @@ impl Agent {
                     tickloop_harness_protocol::EventKind::InputTakenBack,
                 );
             }
-            chat.hook_state
-                .session
-                .preparing_inputs
-                .remove(&receipt.run_id);
             chat.hook_state
                 .session
                 .unchecked_prompts

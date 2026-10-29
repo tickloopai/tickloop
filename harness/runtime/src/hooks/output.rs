@@ -39,7 +39,8 @@ pub(crate) struct HookResponse {
     pub permission: Option<HookPermission>,
     /// Why it gave its permission.
     pub permission_reason: Option<String>,
-    /// What blocks: the reason a deny or block gave, or `[command]: stderr` for status 2.
+    /// An event's blocking error, or `[command]: stderr` for status 2. Explicit PreToolUse
+    /// denials use `permission_reason`, so an absent reason stays absent.
     pub blocking_error: Option<String>,
     pub system_message: Option<String>,
     pub updated_input: Option<Value>,
@@ -149,7 +150,8 @@ fn apply_answer(
         Some("block") => {
             response.permission = Some(HookPermission::Deny);
             response.permission_reason = reason.clone();
-            response.blocking_error = Some(reason.clone().unwrap_or(BLOCKED_BY_HOOK.into()));
+            response.blocking_error = (event != HookEvent::PreToolUse)
+                .then(|| reason.clone().unwrap_or(BLOCKED_BY_HOOK.into()));
         }
         Some(other) => {
             return Err(format!(
@@ -186,7 +188,7 @@ fn apply_answer(
         Some("ask") => response.permission = Some(HookPermission::Ask),
         Some("deny") => {
             response.permission = Some(HookPermission::Deny);
-            response.blocking_error = decision_reason.clone().or(reason);
+            response.blocking_error = None;
         }
         Some(other) => {
             return Err(format!(
@@ -194,9 +196,7 @@ fn apply_answer(
             ));
         }
     }
-    if decision_reason.is_some() {
-        response.permission_reason = decision_reason;
-    }
+    response.permission_reason = decision_reason;
     match specific.get("updatedInput") {
         None | Some(Value::Null) => {}
         Some(Value::Object(input)) => response.updated_input = Some(Value::Object(input.clone())),
@@ -282,11 +282,16 @@ pub(crate) fn interpret(event: HookEvent, command: &str, exit: HookExit<'_>) -> 
                 response = HookResponse::success();
             }
             response.outcome = HookRunOutcome::Blocking;
-            if response.blocking_error.is_none() {
+            if response.blocking_error.is_none()
+                && response.permission != Some(HookPermission::Deny)
+            {
                 let stderr = if stderr.is_empty() { NO_STDERR } else { stderr };
                 response.blocking_error = Some(format!("[{command}]: {stderr}"));
             }
             if event == HookEvent::PreToolUse {
+                if response.permission != Some(HookPermission::Deny) {
+                    response.permission_reason = None;
+                }
                 response.permission = Some(HookPermission::Deny);
             }
             response
@@ -442,7 +447,8 @@ mod tests {
         let answered = pre(1, r#"{"decision":"block","reason":"no"}"#, "boom");
         assert_eq!(answered.outcome, HookRunOutcome::Blocking);
         assert_eq!(answered.permission, Some(HookPermission::Deny));
-        assert_eq!(answered.blocking_error.as_deref(), Some("no"));
+        assert_eq!(answered.permission_reason.as_deref(), Some("no"));
+        assert!(answered.blocking_error.is_none());
         let quiet = pre(1, r#"{"systemMessage":"careful"}"#, "boom");
         assert_eq!(quiet.outcome, HookRunOutcome::NonBlockingError);
         assert_eq!(quiet.system_message.as_deref(), Some("careful"));
@@ -467,7 +473,8 @@ mod tests {
             "",
         );
         assert_eq!(deny.permission, Some(HookPermission::Deny));
-        assert_eq!(deny.blocking_error.as_deref(), Some("no"));
+        assert_eq!(deny.permission_reason.as_deref(), Some("no"));
+        assert!(deny.blocking_error.is_none());
         assert_eq!(deny.outcome, HookRunOutcome::Blocking);
         let ask = pre(
             0,
@@ -489,7 +496,8 @@ mod tests {
             "",
         );
         assert_eq!(block.permission, Some(HookPermission::Deny));
-        assert_eq!(block.blocking_error.as_deref(), Some("nope"));
+        assert_eq!(block.permission_reason.as_deref(), Some("nope"));
+        assert!(block.blocking_error.is_none());
         assert_eq!(block.system_message.as_deref(), Some("Blocked"));
         let unknown = pre(0, r#"{"decision":"maybe"}"#, "");
         assert_eq!(unknown.outcome, HookRunOutcome::NonBlockingError);

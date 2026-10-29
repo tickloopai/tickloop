@@ -1049,6 +1049,377 @@ async fn prompt_hooks_finish_the_file_snapshot_before_the_first_edit_of_each_tur
 }
 
 #[tokio::test]
+async fn escape_during_session_start_keeps_later_prompts_in_queue_order() {
+    let bench = Bench::start(
+        vec![text("done")],
+        vec![user_hook(HookEvent::SessionStart, None, "start.sh")],
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("start.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(300),
+            ..exits(0, "context", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    let first = bench
+        .agent
+        .submit(bench.chat, "First prompt.".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    bench
+        .agent
+        .submit(bench.chat, "Second prompt.".into())
+        .await
+        .unwrap();
+    bench.agent.interrupt(bench.chat).await.unwrap();
+    assert!(observe(&mut events, &first).await.interrupted);
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert_eq!(snapshot.pending_inputs.len(), 2);
+    assert!(snapshot.pending_inputs.iter().all(|input| !input.armed));
+    assert!(bench.requests().is_empty());
+    bench.define("start.sh", |_| exits(0, "context", ""));
+    bench.agent.continue_loop(bench.chat).await.unwrap();
+    observe(&mut events, &first).await;
+    let texts = conversation_texts(&bench.requests()[0].messages);
+    assert!(
+        texts
+            .iter()
+            .position(|text| text == "First prompt.")
+            .unwrap()
+            < texts
+                .iter()
+                .position(|text| text == "Second prompt.")
+                .unwrap()
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_during_session_start_discards_all_waiting_user_prompts() {
+    let bench = Bench::start(
+        vec![text("done")],
+        vec![user_hook(HookEvent::SessionStart, None, "start.sh")],
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("start.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(300),
+            ..exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    let first = bench
+        .agent
+        .submit(bench.chat, "Stopped first.".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    bench
+        .agent
+        .submit(bench.chat, "Stopped second.".into())
+        .await
+        .unwrap();
+    bench.agent.stop(bench.chat).await.unwrap();
+    assert!(observe(&mut events, &first).await.interrupted);
+    assert!(
+        bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+    assert!(bench.requests().is_empty());
+    bench.define("start.sh", |_| exits(0, "", ""));
+    bench.run("New request.").await;
+    assert!(
+        !conversation_texts(&bench.requests()[0].messages)
+            .iter()
+            .any(|text| text.starts_with("Stopped "))
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_now_for_an_input_already_merged_into_preparation_is_a_noop() {
+    let bench = Bench::start(
+        vec![text("initial"), text("merged")],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "prompt.sh")],
+    )
+    .await;
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("prompt.sh", move |input| {
+        let grouped = input["prompt"].as_str().unwrap().contains("First queued.");
+        if grouped {
+            notify.notify_one();
+        }
+        MemoryCommandRun {
+            duration: if grouped {
+                Duration::from_millis(200)
+            } else {
+                Duration::ZERO
+            },
+            ..exits(0, "", "")
+        }
+    });
+    bench.gate.holds_next.store(true, Ordering::SeqCst);
+    let mut events = bench.agent.subscribe();
+    bench
+        .agent
+        .submit(bench.chat, "Initial.".into())
+        .await
+        .unwrap();
+    bench.gate.entered.notified().await;
+    let first = bench
+        .agent
+        .submit(bench.chat, "First queued.".into())
+        .await
+        .unwrap();
+    let second = bench
+        .agent
+        .submit(bench.chat, "Second queued.".into())
+        .await
+        .unwrap();
+    bench.agent.interrupt(bench.chat).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    bench
+        .agent
+        .send_now(bench.chat, second.run_id)
+        .await
+        .unwrap();
+    let observed = observe(&mut events, &first).await;
+    assert!(!observed.interrupted);
+    assert!(
+        bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+    assert!(
+        bench
+            .inputs_of("prompt.sh")
+            .iter()
+            .any(|input| input["prompt"] == "First queued.\n\nSecond queued.")
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompts_queued_during_session_start_join_once_with_their_own_prompt_hook() {
+    let bench = Bench::start(
+        vec![
+            call("read", "Read", json!({"file_path":"notes.txt"})),
+            text("second reply"),
+        ],
+        vec![
+            user_hook(HookEvent::SessionStart, None, "start.sh"),
+            user_hook(HookEvent::UserPromptSubmit, None, "prompt.sh"),
+        ],
+    )
+    .await;
+    std::fs::write(bench.directory.path().join("notes.txt"), "hello").unwrap();
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("start.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_millis(200),
+            ..exits(0, "context", "")
+        }
+    });
+    bench.define("prompt.sh", |input| {
+        context_answer(
+            HookEvent::UserPromptSubmit,
+            &format!("checked {}", input["prompt"].as_str().unwrap()),
+        )
+    });
+    let mut events = bench.agent.subscribe();
+    let first = bench
+        .agent
+        .submit(bench.chat, "First input.".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    bench
+        .agent
+        .submit(bench.chat, "Queued input.".into())
+        .await
+        .unwrap();
+    observe(&mut events, &first).await;
+    let inputs = bench.inputs_of("prompt.sh");
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| input["prompt"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["First input.", "Queued input."]
+    );
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    let texts = conversation_texts(&snapshot.messages);
+    assert_eq!(
+        texts.iter().filter(|text| *text == "Queued input.").count(),
+        1
+    );
+    assert!(snapshot.pending_inputs.is_empty());
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_preparation_panic_finishes_the_goal_without_consuming_the_prompt() {
+    let bench = Bench::start(
+        Vec::new(),
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "panic.sh")],
+    )
+    .await;
+    bench.agent.hold_goal_continuations_for_tests();
+    bench
+        .agent
+        .manage_goal(
+            bench.chat,
+            GoalAction::Set {
+                objective: "Finish the requested work".into(),
+                token_budget: None,
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    bench.define("panic.sh", |_| {
+        panic!("injected execution environment failure")
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Keep this input.".into())
+        .await
+        .unwrap();
+    assert!(
+        observe(&mut events, &receipt)
+            .await
+            .failed
+            .unwrap()
+            .contains("internal")
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(next_event(&mut events).await.kind, EventKind::GoalUpdated {goal: Some(goal), ..} if matches!(goal.status, GoalStatus::Blocked {..})) { break; }
+        }
+    }).await.unwrap();
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert!(matches!(
+        snapshot.goal.as_ref().unwrap().status,
+        GoalStatus::Blocked {
+            by: tickloop_harness_protocol::GoalBlock::ExecutionFailed { .. }
+        }
+    ));
+    assert!(!snapshot.pending_inputs[0].armed);
+    assert!(bench.requests().is_empty());
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_preparation_flushes_a_tick_delivery_without_waiting_for_retry() {
+    use tick_protocol::InstanceRef;
+    use tickloop_harness_protocol::ObservationKind;
+    use tickloop_harness_runtime::tick_stream::{InMemoryTickStream, TickObservation};
+    let bench = Bench::start(
+        vec![text("received tick")],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "wait.sh")],
+    )
+    .await;
+    let stream = InMemoryTickStream::new();
+    let instance = InstanceRef::new("calendar", "hook-wait").unwrap();
+    bench
+        .agent
+        .install_tick_stream(Arc::new(stream.clone()))
+        .await;
+    bench
+        .agent
+        .tick_subscribe_for_user(bench.chat, instance.clone())
+        .await
+        .unwrap();
+    let entered = Arc::new(Notify::new());
+    let notify = entered.clone();
+    bench.define("wait.sh", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(300),
+            ..exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Still waiting.".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    stream.push(TickObservation {
+        instance,
+        sequence: 1,
+        observed_at: "2026-10-30T00:00:00Z".into(),
+        dropped: 0,
+        data: json!({"phase":"due-during-hook"}),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    });
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(bench.requests().is_empty());
+    bench.agent.interrupt(bench.chat).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = next_event(&mut events).await;
+            if event.chat_id == bench.chat
+                && event.run_id != receipt.run_id
+                && matches!(event.kind, EventKind::Completed { .. })
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the held Tick is delivered without the five-second retry");
+    assert!(
+        conversation_texts(&bench.requests()[0].messages)
+            .iter()
+            .any(|text| text.contains("due-during-hook"))
+    );
+    assert_eq!(
+        bench
+            .agent
+            .snapshot(bench.chat)
+            .await
+            .unwrap()
+            .pending_inputs[0]
+            .input,
+        "Still waiting."
+    );
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn session_start_tells_hooks_a_chat_was_cleared() {
     let bench = Bench::start(
         vec![text("fresh")],
