@@ -25,6 +25,9 @@ pub enum Line {
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
     TaskBoards(TaskBoardsEntry),
+    /// The root Chat's task boards as they stood at a chain entry; the latest record of an entry
+    /// wins.
+    TaskBoardCheckpoint(TaskBoardCheckpointEntry),
     /// The Chat's goal as it is now; the latest record wins.
     Goal(GoalEntry),
     /// A goal change the conversation shows as one line; every one is kept.
@@ -151,6 +154,7 @@ pub enum MetadataKind {
     Provenance,
     CitationSources,
     TaskBoards,
+    TaskBoardCheckpoint,
     Goal,
     GoalEvent,
     ScheduledTasks,
@@ -190,9 +194,10 @@ impl MetadataKind {
             Self::Response | Self::Input | Self::Wait | Self::NestedCall | Self::RecordedEdit => {
                 Retention::LatestById
             }
-            Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
-                Retention::Accumulating
-            }
+            Self::FileHistorySnapshot
+            | Self::TaskBoardCheckpoint
+            | Self::ContentReplacement
+            | Self::GoalEvent => Retention::Accumulating,
             Self::RetainedSnapshot => Retention::Snapshot,
             Self::Other => Retention::Unknown,
         }
@@ -250,6 +255,7 @@ impl Line {
             Self::AiTitle(_) => MetadataKind::AiTitle,
             Self::Subagents(_) => MetadataKind::Subagents,
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
+            Self::TaskBoardCheckpoint(_) => MetadataKind::TaskBoardCheckpoint,
             Self::Goal(_) => MetadataKind::Goal,
             Self::GoalEvent(_) => MetadataKind::GoalEvent,
             Self::ScheduledTasks(_) => MetadataKind::ScheduledTasks,
@@ -923,6 +929,18 @@ pub struct ProvenanceEntry {
 #[serde(rename_all = "camelCase")]
 pub struct TaskBoardsEntry {
     pub chat_id: Uuid,
+    pub boards: std::collections::BTreeMap<Uuid, tickloop_harness_protocol::TaskBoard>,
+}
+
+/// The root Chat's task boards as they stood at the end of the conversation up to the chain
+/// entry `leaf`, by root Loop id. The board at any place on a chain is the one recorded for the
+/// nearest entry at or above it, so answering a prompt again starts from the board before it and
+/// another branch shows the board at its end.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBoardCheckpointEntry {
+    pub chat_id: Uuid,
+    pub leaf: Uuid,
     pub boards: std::collections::BTreeMap<Uuid, tickloop_harness_protocol::TaskBoard>,
 }
 
@@ -1661,6 +1679,11 @@ mod tests {
             }),
             Line::TaskBoards(TaskBoardsEntry {
                 chat_id,
+                boards: Default::default(),
+            }),
+            Line::TaskBoardCheckpoint(TaskBoardCheckpointEntry {
+                chat_id,
+                leaf: Uuid::nil(),
                 boards: Default::default(),
             }),
             Line::FamilyCompletions(FamilyCompletionsEntry {

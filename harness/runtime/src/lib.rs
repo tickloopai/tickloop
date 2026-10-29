@@ -25,6 +25,8 @@ mod handover;
 pub use handover::HandOver;
 mod harness;
 pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
+use task_board_history::ConversationChange;
+pub use task_board_history::{TaskBoardQueryError, task_boards_at};
 
 pub use harness::{
     CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
@@ -112,6 +114,7 @@ mod commands;
 mod permission_management;
 mod plan;
 mod shared_tasks;
+mod task_board_history;
 mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
@@ -468,6 +471,14 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
+    /// The root Chat's task boards as they stood at the end of each message they were recorded
+    /// at, which its Transcript keeps as task board checkpoints.
+    #[serde(default)]
+    task_board_checkpoints: BTreeMap<usize, task_board_history::TaskBoards>,
+    /// Whether the Chat's Transcript records task board checkpoints; one from before them keeps
+    /// its board when the conversation moves.
+    #[serde(default)]
+    has_task_board_checkpoints: bool,
 }
 
 /// What a Subagent's Chat takes from its parent's.
@@ -2928,6 +2939,11 @@ impl Agent {
                 "the goal's continuation waits for the Chat's background work".into(),
             ));
         }
+        let live = if turn.placement.is_some() || turn.branch.is_some() {
+            shared_tasks::live_runs(chats.values())
+        } else {
+            Default::default()
+        };
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
@@ -2956,6 +2972,23 @@ impl Agent {
         let inherit_branch_session = continues_chat && base.snapshot.branch_origin.is_some();
         let mut candidate = base.clone();
         Self::prepare_cut(base, &mut candidate, cut)?;
+        let board_moved = if cut.is_some() || staged.is_some() {
+            let change = match turn.placement {
+                Some(turn::Placement::Replacing(_)) => ConversationChange::NewAnswer,
+                _ => ConversationChange::Moved,
+            };
+            let before = cut.map_or(candidate.snapshot.messages.len(), |(index, _)| index);
+            task_board_history::follow_conversation(
+                &mut candidate.snapshot,
+                &mut candidate.bookkeeping,
+                before,
+                change,
+                &live,
+            )
+            .map_err(AgentError::Invalid)?
+        } else {
+            false
+        };
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         let loop_id = chat.snapshot.chat_loop.id;
@@ -3107,6 +3140,9 @@ impl Agent {
         {
             self.emit_conversation_rewound(original, leaf);
         }
+        if board_moved {
+            self.queue_task_boards(original);
+        }
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
@@ -3123,6 +3159,9 @@ impl Agent {
         self.remember_host_context(&receipt, host_context);
         if let (Some(mut context), Some(candidate)) = (session_context, session_candidate) {
             *context = candidate;
+        }
+        if board_moved {
+            self.publish_task_board(&mut chats, chat_id, loop_id);
         }
         drop(chats);
         drop(family_mailbox);
@@ -4166,7 +4205,19 @@ impl Agent {
                 if chat.family_stopping {
                     return Ok(None);
                 }
-                self.select_next_run(chat, None, background_work)?
+                let loop_id = chat.snapshot.chat_loop.id;
+                let board_revision = |chat: &Chat| {
+                    chat.snapshot
+                        .task_boards
+                        .get(&loop_id)
+                        .map(|board| board.revision)
+                };
+                let revision = board_revision(chat);
+                let admission = self.select_next_run(chat, None, background_work)?;
+                if board_revision(chat) != revision {
+                    self.publish_task_board(&mut chats, chat_id, loop_id);
+                }
+                admission
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
@@ -4618,6 +4669,9 @@ impl Agent {
                 candidate.unsettled_runs.insert(pending.receipt.run_id);
             }
             let receipt = pending.receipt.clone();
+            let answers_prompt = pending.agent_message.is_none()
+                && pending.trigger_source.is_none()
+                && !pending.task_continuation;
             self.mark_run_inputs_handled(&mut candidate, &pending);
             candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
             self.append_input_message(&mut candidate, pending);
@@ -4636,6 +4690,14 @@ impl Agent {
                     },
                 );
                 merged_receipts.push(consumed);
+            }
+            if answers_prompt
+                && let Some(board) = shared_tasks::cleared_finished_board(&candidate.snapshot)
+                    .map_err(AgentError::Invalid)?
+            {
+                let loop_id = candidate.snapshot.chat_loop.id;
+                candidate.snapshot.task_boards.insert(loop_id, board);
+                self.queue_task_boards(&mut candidate);
             }
             self.save(&candidate.snapshot);
             self.start_response(&mut candidate, &receipt);

@@ -6,7 +6,7 @@ use tickloop_harness_base::timestamp::parse_timestamp_ms;
 use tickloop_harness_protocol::{Content, OriginalUserInput, Role, Usage};
 use tickloop_harness_transcript::{
     ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, GoalEntry, Line,
-    ScheduledTasksEntry,
+    ScheduledTasksEntry, TaskBoardCheckpointEntry,
 };
 
 use super::outbox::CachedMetadata;
@@ -26,6 +26,9 @@ pub(crate) struct LoadedTranscript {
     /// Following Claude Code: file rollback snapshots keyed by entry `messageId`, the last entry
     /// winning for the same key.
     pub file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
+    /// The root Chat's task boards by the chain entry they stood at, the last record winning for
+    /// the same entry.
+    pub task_board_checkpoints: HashMap<Uuid, TaskBoardCheckpointEntry>,
     /// All content-replacement entries in file order; callers take them by chatId (Claude Code
     /// takes them by sessionId).
     pub content_replacements: Vec<ContentReplacementEntry>,
@@ -50,6 +53,7 @@ struct RetainedState {
     goal: Option<GoalEntry>,
     scheduled_tasks: Option<ScheduledTasksEntry>,
     file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
+    task_board_checkpoints: HashMap<Uuid, TaskBoardCheckpointEntry>,
     content_replacements: Vec<ContentReplacementEntry>,
     lifecycle: Vec<Line>,
 }
@@ -84,6 +88,10 @@ impl RetainedState {
             Line::FileHistorySnapshot(entry) => {
                 self.file_history_snapshots
                     .insert(entry.message_id, entry.clone());
+            }
+            Line::TaskBoardCheckpoint(entry) => {
+                self.task_board_checkpoints
+                    .insert(entry.leaf, entry.clone());
             }
             Line::ContentReplacement(entry) => self.content_replacements.push(entry.clone()),
             Line::Response(_) | Line::Input(_) | Line::Wait(_) | Line::NestedCall(_) => {
@@ -241,6 +249,7 @@ pub(crate) fn assemble(
         goal,
         scheduled_tasks,
         file_history_snapshots,
+        task_board_checkpoints,
         content_replacements,
         lifecycle,
     } = state;
@@ -308,6 +317,7 @@ pub(crate) fn assemble(
             goal,
             scheduled_tasks,
             file_history_snapshots,
+            task_board_checkpoints,
             content_replacements,
             warnings,
             position: stored.position,
@@ -355,6 +365,7 @@ pub(crate) fn assemble(
         goal,
         scheduled_tasks,
         file_history_snapshots,
+        task_board_checkpoints,
         content_replacements,
         warnings,
         position: stored.position,

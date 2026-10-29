@@ -93,6 +93,18 @@ impl TaskBoard {
             .checked_add(1)
     }
 
+    /// A board with tasks, every one of them completed or cancelled: it may be cleared, and a
+    /// new answer to a prompt starts over without it.
+    pub fn is_finished(&self) -> bool {
+        !self.tasks.is_empty()
+            && self.tasks.iter().all(|task| {
+                matches!(
+                    task.status,
+                    SharedTaskStatus::Completed | SharedTaskStatus::Cancelled
+                )
+            })
+    }
+
     pub fn blocked_by(&self, task: &SharedTask) -> Vec<SharedTaskId> {
         task.dependencies
             .iter()

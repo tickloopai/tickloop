@@ -120,6 +120,8 @@ pub(crate) struct RetainedFold {
     goal_events: Vec<Kept>,
     /// The latest file history snapshot of each message.
     file_history: HashMap<Uuid, Kept>,
+    /// The latest task board checkpoint of each chain entry.
+    task_board_checkpoints: HashMap<Uuid, Kept>,
     unknown: HashMap<String, VecDeque<Kept>>,
     chain: LoadableChain,
     lines_since_snapshot: usize,
@@ -196,6 +198,9 @@ impl RetainedFold {
             }
             (Retention::Accumulating, Line::FileHistorySnapshot(entry)) => {
                 self.file_history.insert(entry.message_id, kept);
+            }
+            (Retention::Accumulating, Line::TaskBoardCheckpoint(entry)) => {
+                self.task_board_checkpoints.insert(entry.leaf, kept);
             }
             (Retention::Unknown, Line::Unknown(unknown)) => {
                 let lines = self.unknown.entry(unknown.kind.clone()).or_default();
@@ -281,7 +286,8 @@ impl RetainedFold {
             .chain(
                 self.file_history
                     .iter()
-                    .filter(|(message, _)| self.chain.keeps_entry(**message))
+                    .chain(&self.task_board_checkpoints)
+                    .filter(|(entry, _)| self.chain.keeps_entry(**entry))
                     .map(|(_, kept)| kept),
             )
             .chain(self.unknown.values().flatten())

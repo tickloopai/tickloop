@@ -64,7 +64,7 @@ pub(super) async fn prompt_input(request: &PromptRequest) -> Result<UserInput, E
                         text.push('\n');
                     }
                     text.push_str(part);
-                } else {
+                } else if !part.is_empty() {
                     contexts.push(InputContext::PromptText {
                         text: part.to_owned(),
                     });

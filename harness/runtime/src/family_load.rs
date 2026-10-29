@@ -197,7 +197,7 @@ impl FamilyRecords {
                 // The receipt holds the input as the call was prepared, the Transcript as the
                 // model wrote it.
                 let prepared = if name == "TaskUpdate" {
-                    crate::shared_tasks::prepared_update_input(input.clone()).ok()?
+                    crate::shared_tasks::prepared_update_input(input.clone())
                 } else {
                     input.clone()
                 };

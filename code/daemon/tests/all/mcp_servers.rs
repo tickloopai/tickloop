@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::{path::Path, sync::Arc, time::Duration};
-use tickloop_code_access::LaunchSpec;
+use tickloop_code_access::{ExecutionProfile, LaunchSpec};
 use tickloop_harness::{
     model::{LocalModelClients, ModelClients},
     protocol::{EventKind, ExecutionMode, ModelConfig},
@@ -31,6 +31,14 @@ async fn configured_agent(
     model: ModelConfig,
     models: Arc<dyn ModelClients>,
 ) -> (Agent, McpService, McpService) {
+    configured_agent_with_profile(root, model, models, ExecutionProfile::Local).await
+}
+async fn configured_agent_with_profile(
+    root: &Path,
+    model: ModelConfig,
+    models: Arc<dyn ModelClients>,
+    profile: ExecutionProfile,
+) -> (Agent, McpService, McpService) {
     let canonical_root = root.canonicalize().unwrap();
     let root = canonical_root.as_path();
     let local = McpService::start().await;
@@ -49,6 +57,7 @@ async fn configured_agent(
     )
     .unwrap();
     let mut launch = LaunchSpec::embedded(root.to_owned());
+    launch.profile = profile;
     launch.config_root = Some(root.to_owned());
     launch.model = Some(model);
     launch.session_persistence = false;
@@ -63,6 +72,117 @@ async fn configured_agent(
         .unwrap();
     (agent, local, remote)
 }
+#[tokio::test]
+async fn acp_defers_configured_and_plugin_mcp_until_a_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    tickloop_harness::base::credentials::save_api_key(&canonical, "ANTHROPIC_API_KEY", "fixture")
+        .unwrap();
+    let plugin = McpService::start().await;
+    plugin.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{}}}]));
+    let source = canonical.join("source-deferred");
+    std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        source.join(".claude-plugin/plugin.json"),
+        json!({"name":"deferred","mcpServers":{"peer":{"exposure":"direct","url":plugin.url()}}})
+            .to_string(),
+    )
+    .unwrap();
+    tick_plugins::PluginStore::in_config_root(&canonical)
+        .install_path(&source)
+        .unwrap();
+    let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+    let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5")
+        .unwrap();
+    let (agent, local, remote) = configured_agent_with_profile(
+        &canonical,
+        model,
+        ChosenModels::new(scripted.clone()),
+        ExecutionProfile::Acp,
+    )
+    .await;
+    let chat = agent.create_chat(canonical).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent.snapshot(chat).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let startup = [local.methods(), remote.methods(), plugin.methods()];
+    if startup.iter().any(|methods| !methods.is_empty()) {
+        agent.shutdown().await;
+        panic!("ACP initialization started MCP before a prompt: {startup:?}");
+    }
+    assert!(scripted.requests.lock().unwrap().is_empty());
+    scripted.enqueue(text("ready"));
+    complete(&agent, chat, "Report configured MCP tools").await;
+    {
+        let requests = scripted.requests.lock().unwrap();
+        let tools = &requests.last().unwrap().tools;
+        for name in [
+            "mcp__local__probe",
+            "mcp__remote__probe",
+            "mcp__plugin_deferred_peer__probe",
+        ] {
+            assert!(tools.iter().any(|tool| tool.name == name), "missing {name}");
+        }
+    }
+    for service in [&local, &remote, &plugin] {
+        assert!(
+            service
+                .methods()
+                .iter()
+                .any(|method| method == "initialize")
+        );
+    }
+    scripted.enqueue(call("local", "mcp__local__probe", json!({})));
+    scripted.enqueue(call("remote", "mcp__remote__probe", json!({})));
+    scripted.enqueue(call(
+        "plugin",
+        "mcp__plugin_deferred_peer__probe",
+        json!({}),
+    ));
+    scripted.enqueue(text("done"));
+    complete(&agent, chat, "Call the configured probes").await;
+    assert_eq!(local.calls().len(), 1);
+    assert_eq!(remote.calls().len(), 1);
+    assert_eq!(plugin.calls().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_and_one_shot_start_configured_mcp_before_a_prompt() {
+    for profile in [ExecutionProfile::Local, ExecutionProfile::OneShot] {
+        let root = tempfile::tempdir().unwrap();
+        let scripted = Arc::new(ScriptedModel::new(Vec::new()));
+        let model = tickloop_harness::model::cards::ModelCatalog::defaults()
+            .get("anthropic-api", "claude-sonnet-5")
+            .unwrap();
+        let (agent, local, remote) = configured_agent_with_profile(
+            root.path(),
+            model,
+            ChosenModels::new(scripted.clone()),
+            profile,
+        )
+        .await;
+        let initialized = tokio::time::timeout(Duration::from_secs(5), async {
+            while [&local, &remote].iter().any(|service| {
+                !service
+                    .methods()
+                    .iter()
+                    .any(|method| method == "initialize")
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        agent.shutdown().await;
+        initialized.expect("ordinary Worker startup must still initialize configured MCP");
+        assert!(scripted.requests.lock().unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn worker_configuration_exposes_both_transports_to_the_agent() {
     let root = tempfile::tempdir().unwrap();

@@ -163,12 +163,7 @@ async fn completed_cleanup_rechecks_settings_scope_revision_and_every_task_statu
             .await
             .is_err()
     );
-    for status in [
-        Status::Pending,
-        Status::InProgress,
-        Status::Cancelled,
-        Status::NeedsAttention,
-    ] {
+    for status in [Status::Pending, Status::InProgress, Status::NeedsAttention] {
         let revision = {
             let mut chats = core.inner.chats.lock().await;
             let board = chats
@@ -210,9 +205,10 @@ async fn completed_cleanup_rechecks_settings_scope_revision_and_every_task_statu
             .iter_mut()
             .find(|task| task.id == second.id)
             .unwrap()
-            .status = Status::Completed;
+            .status = Status::Cancelled;
         board.revision
     };
+    // Completed and cancelled tasks alike finish a board.
     core.set_task_tools_enabled(root.chat_id, false)
         .await
         .unwrap();

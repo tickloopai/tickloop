@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::event_sources::ExternalDelivery;
 use crate::lifecycle::{LedgerInput, ledger_state};
+use crate::task_board_history::ConversationChange;
 use crate::{
     Agent, AgentError, Chat, LoopSnapshotExt, TurnAdmission, WeakAgent, chat_is_busy, rewind,
 };
@@ -827,6 +828,7 @@ impl Agent {
         let receipt = {
             let mut chats = self.inner.chats.lock().await;
             self.refuse_when_closed()?;
+            let live = crate::shared_tasks::live_runs(chats.values());
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             if let Some(replay) = crate::lifecycle::replay(chat, &ledger) {
                 return replay;
@@ -852,6 +854,18 @@ impl Agent {
             let mut candidate = base.clone();
             let cut = (index < base.snapshot.messages.len()).then_some((index, None));
             Self::prepare_cut(base, &mut candidate, cut)?;
+            let board_moved = crate::task_board_history::follow_conversation(
+                &mut candidate.snapshot,
+                &mut candidate.bookkeeping,
+                node.first,
+                ConversationChange::NewAnswer,
+                &live,
+            )
+            .map_err(AgentError::Invalid)?;
+            // The new answer starts over without a finished board; the restored one still
+            // stands before its prompt.
+            let cleared = crate::shared_tasks::cleared_finished_board(&candidate.snapshot)
+                .map_err(AgentError::Invalid)?;
             let selected_leaf = staged.map(|staged| self.install_branch(chat, staged));
             if cut.is_some() {
                 self.commit_cut(chat, &mut candidate, index);
@@ -861,6 +875,15 @@ impl Agent {
                 && let Some(leaf) = selected_leaf
             {
                 self.emit_conversation_rewound(chat, leaf);
+            }
+            if board_moved {
+                self.queue_task_boards(chat);
+            }
+            let board_changed = board_moved || cleared.is_some();
+            if let Some(board) = cleared {
+                let loop_id = chat.snapshot.chat_loop.id;
+                chat.snapshot.task_boards.insert(loop_id, board);
+                self.queue_latest_task_boards(chat);
             }
             let receipt = Receipt {
                 chat_id,
@@ -876,6 +899,9 @@ impl Agent {
                 .expect("the answer's Run is queued")
                 .clone();
             chat.bookkeeping.lifecycle.accept(&ledger, &queued);
+            if board_changed {
+                self.publish_task_board(&mut chats, chat_id, receipt.loop_id);
+            }
             receipt
         };
         self.start_next_run(chat_id).await?;

@@ -1195,14 +1195,7 @@ impl Agent {
                 .as_ref()
                 .is_some_and(|tool| matches!(tool.route, ToolRoute::SharedTask))
         {
-            match shared_tasks::prepared_update_input(input) {
-                Ok(input) => input,
-                Err(error) => {
-                    return Ok(ToolCallOutcome::not_admitted(format!(
-                        "invalid TaskUpdate input: {error}"
-                    )));
-                }
-            }
+            shared_tasks::prepared_update_input(input)
         } else {
             input
         };
