@@ -378,3 +378,50 @@ fn overlapping_shell_markers_are_rejected_before_any_execution_plan_is_returned(
     let expanded = registry.expand("demo:check", "", SkillCaller::User);
     assert!(expanded.is_err(), "{expanded:?}");
 }
+
+#[test]
+fn command_backtick_arguments_can_complete_a_body_shell_marker() {
+    for (body, args) in [
+        ("!$ARGUMENTS", "`printf inserted`"),
+        ("!$0", "'`printf inserted`'"),
+    ] {
+        let expansion = command_registry(body)
+            .expand("demo:check", args, SkillCaller::User)
+            .unwrap();
+        assert_eq!(expansion.shell_commands.len(), 1);
+        assert_eq!(expansion.shell_commands[0].command, "printf inserted");
+    }
+}
+
+#[test]
+fn command_escaped_digits_remove_the_escape_even_with_a_word_suffix() {
+    let expansion = command_registry(r"\$5abc|\$0_suffix|\$HOME|$ARGUMENTS")
+        .expand("demo:check", "value", SkillCaller::User)
+        .unwrap();
+    assert!(
+        expansion.content.ends_with(r"$5abc|$0_suffix|\$HOME|value"),
+        "{}",
+        expansion.content
+    );
+}
+
+#[test]
+fn command_allowed_tools_warn_without_granting_permissions_or_retrying_discovery() {
+    for value in ["[Bash]", "false", "null", "{ [Bash, Write]: anything }"] {
+        let registry = command_registry(&format!("---\nallowed-tools: {value}\n---\nGuide"));
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning
+                    .contains("allowed-tools is ignored and grants no permissions"))
+        );
+        assert!(
+            registry
+                .expand("demo:check", "", SkillCaller::User)
+                .unwrap()
+                .allowed_tools
+                .is_empty()
+        );
+    }
+}

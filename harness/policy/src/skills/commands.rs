@@ -70,9 +70,7 @@ impl<'de> serde::Deserialize<'de> for CommandFields {
                         fields.insert(key, map.next_value()?);
                     } else {
                         map.next_value::<serde::de::IgnoredAny>()?;
-                        if key != "allowed-tools" {
-                            fields.insert(key, Value::Null);
-                        }
+                        fields.insert(key, Value::Null);
                     }
                 }
                 Ok(CommandFields(fields))
@@ -176,6 +174,10 @@ impl SkillRegistry {
             ("model", "model"),
             ("allowedTools", "allowed-tools"),
         ] {
+            if field == "allowed-tools" && document.metadata.contains_key(metadata) {
+                fields.insert(field.into(), Value::Null);
+                continue;
+            }
             if let Some(value) = document.metadata.get(metadata)
                 && !value.is_null()
                 && value != &Value::Bool(false)
@@ -186,6 +188,11 @@ impl SkillRegistry {
             }
         }
         for field in fields.keys() {
+            if field == "allowed-tools" {
+                self.warn_compatibility(format!(
+                    "Command {name}: allowed-tools is ignored and grants no permissions"
+                ));
+            }
             if !matches!(
                 field.as_str(),
                 "description"
@@ -354,6 +361,16 @@ pub(super) fn expand_arguments(
         let start = offset + relative;
         result.push_str(&body[offset..start]);
         let rest = &body[start + 1..];
+        let preceding = &body[..start];
+        if preceding.ends_with('\\')
+            && !preceding.ends_with("\\\\")
+            && rest.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            result.pop();
+            result.push('$');
+            offset = start + 1;
+            continue;
+        }
         let Some((length, value)) = parameter(rest, arguments, &tokens, &matching_names) else {
             result.push('$');
             offset = start + 1;

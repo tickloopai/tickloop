@@ -155,6 +155,19 @@ async fn command_shells_run_before_activation_through_both_invocation_paths() {
             .collect::<Vec<_>>();
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].input["command"], "printf hello");
+        assert_eq!(operations[0].input_message_id.is_some(), user);
+        if let Some(input) = operations[0].input_message_id {
+            assert!(
+                observation
+                    .snapshot
+                    .message_ids
+                    .iter()
+                    .any(|(index, id)| *id == input
+                        && observation.snapshot.message_runs.get(index) == Some(&receipt.run_id)
+                        && observation.snapshot.messages[*index].role
+                            == tickloop_harness_protocol::Role::User)
+            );
+        }
         assert_eq!(
             operations[0].parent_call_id.as_deref(),
             (!user).then_some("skill-call")
@@ -163,6 +176,33 @@ async fn command_shells_run_before_activation_through_both_invocation_paths() {
             let requests = model.requests.lock().unwrap();
             assert_eq!(requests.len(), if user { 1 } else { 2 });
             assert!(format!("{:?}", requests.last().unwrap()).contains("prepared-value"));
+            if user {
+                assert!(
+                    !requests[0]
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .any(|content| matches!(
+                            content,
+                            tickloop_harness_protocol::Content::ToolUse { .. }
+                                | tickloop_harness_protocol::Content::ToolResult { .. }
+                        ))
+                );
+                let history = serde_json::to_string(&requests[0].messages).unwrap();
+                assert_eq!(history.matches("prepared-value").count(), 1);
+            }
+        }
+        if user {
+            let input = operations[0].input_message_id.unwrap();
+            agent
+                .rewind(
+                    chat,
+                    input,
+                    tickloop_harness_protocol::RewindMode::Conversation,
+                )
+                .await
+                .unwrap();
+            assert!(agent.snapshot(chat).await.unwrap().operations.is_empty());
         }
         agent.shutdown().await;
     }
@@ -494,28 +534,24 @@ async fn queued_command_waits_for_its_own_turn_and_cancelled_preparation_never_a
 }
 
 #[tokio::test]
-async fn model_cannot_repeat_a_user_command_preparation_call_id() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn user_command_preparation_has_no_model_authored_call_identity() {
     use tickloop_harness_protocol::Content;
     use tickloop_harness_test_support::routed::RoutedModel;
     let folder = tempfile::tempdir().unwrap();
     let environment = MemoryEnvironment::new();
     environment.define_shell("printf once", Duration::ZERO, b"once".to_vec(), 0);
-    let repeated = AtomicBool::new(false);
     let model = Arc::new(RoutedModel::new(move |request| {
-        if repeated.swap(true, Ordering::SeqCst) {
-            return text("done");
-        }
-        let id = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .find_map(|content| match content {
-                Content::ToolUse { id, name, .. } if name == "Bash" => Some(id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        call(&id, "Bash", json!({"command":"printf once"}))
+        assert!(
+            !request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|content| matches!(
+                    content,
+                    Content::ToolUse { .. } | Content::ToolResult { .. }
+                ))
+        );
+        text("done")
     }));
     let agent = command_agent(
         environment,
@@ -722,12 +758,18 @@ async fn cold_restore_keeps_preparation_records_without_resending_shells() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(bash_history(&snapshot), ["printf first"]);
-    assert!(format!("{:?}", snapshot.messages).contains("first"));
-    assert!(
-        snapshot.operations.is_empty(),
-        "ordinary operations are live state, not replayed history"
-    );
+    assert!(bash_history(&snapshot).is_empty());
+    assert_eq!(snapshot.operations.len(), 2);
+    assert!(snapshot.operations.iter().all(
+        |operation| operation.input_message_id.is_some() && operation.parent_call_id.is_none()
+    ));
+    assert!(snapshot.operations.iter().any(|operation| {
+        operation.input["command"] == "printf first"
+            && operation
+                .result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("first"))
+    }));
     let mut events = restored.subscribe();
     let receipt = restored
         .submit(chat, "Continue without retrying the command".into())
@@ -748,11 +790,11 @@ async fn cold_restore_keeps_preparation_records_without_resending_shells() {
             .iter()
             .filter(|operation| operation.name == "Bash")
             .count(),
-        0
+        2
     );
     assert_eq!(
         bash_history(&restored.snapshot(chat).await.unwrap()),
-        ["printf first"]
+        Vec::<String>::new()
     );
     first.shutdown().await;
     restored.shutdown().await;
@@ -819,18 +861,16 @@ async fn old_checkpoint_retains_queued_guidance_without_rebuilding_an_execution_
             if event.run_id == queued.run_id {
                 match event.kind {
                     EventKind::Completed { .. } => {
-                        assert!(legacy);
                         break;
                     }
                     EventKind::Failed(error) => {
-                        assert!(!legacy, "{error}");
-                        break;
+                        panic!("{error}");
                     }
                     _ => {}
                 }
             }
         }
-        assert_eq!(model.requests.lock().unwrap().len(), usize::from(legacy));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
         assert!(
             successor
                 .snapshot(chat)
@@ -1139,5 +1179,420 @@ async fn command_preprocessing_respects_prompt_hooks_and_session_start_model_bou
             }
             agent.shutdown().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn durable_restore_continues_a_queued_plain_command_with_retained_guidance() {
+    use super::durable_queue::{Script, Step};
+    use tickloop_harness_runtime::SkillInvocation;
+    use tickloop_harness_runtime::{Delivery, ParentSelection, TurnOp, TurnRequest, WaitHosting};
+    use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
+    use tickloop_harness_transcript::SettledOutcome;
+    let folder = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let make = |store: Arc<InMemoryTranscriptStore>, model: Arc<Script>| {
+        let environment = MemoryEnvironment::new();
+        environment.define_shell("printf active", Duration::ZERO, b"active".to_vec(), 0);
+        environment.define_shell("touch must-not-run", Duration::ZERO, b"wrong".to_vec(), 0);
+        let mut options = HarnessOptions::local(config());
+        options.waits = WaitHosting::Durable;
+        options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DenyOnPrompt;
+        options.tools.tick_subscriptions = false;
+        options.tools.user_skills = true;
+        options.settings = Some(Arc::new(CommandSettings {
+            memory: Default::default(),
+            markdown: "---\ndescription: Check\n---\nRetained plain command guidance".into(),
+        }));
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model),
+            },
+            options,
+        )
+        .unwrap()
+    };
+    let model = Script::new(vec![Step::Hang]);
+    let first = make(store.clone(), model.clone());
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    first.submit(chat, "Do ordinary work".into()).await.unwrap();
+    model.until_holding().await;
+    let input_id = tickloop_ids::generate().into();
+    first
+        .advance(
+            chat,
+            TurnRequest {
+                input_id,
+                op: TurnOp::Skill {
+                    after: ParentSelection::CurrentLeaf,
+                    skill: SkillInvocation {
+                        name: "demo:check".into(),
+                        arguments: String::new(),
+                    },
+                },
+                delivery: Delivery::Queue,
+                host_context: None,
+            },
+        )
+        .await
+        .unwrap();
+    first.sync().await.unwrap();
+    let image = Arc::new(InMemoryTranscriptStore::new());
+    image.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    first.shutdown().await;
+    let resumed_model = Script::new(vec![
+        Step::Reply(call("active", "Bash", json!({"command":"printf active"}))),
+        Step::Reply(text("done")),
+    ]);
+    let resumed = make(image, resumed_model.clone());
+    let mut events = resumed.subscribe();
+    resumed.resume_chat(chat).await.unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        resumed.settled_input(chat, input_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SettledOutcome::Completed { .. } | SettledOutcome::Merged { .. }
+        ),
+        "{outcome:?}"
+    );
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        resumed_model
+            .conversation_requests()
+            .iter()
+            .any(|request| request.contains("Retained plain command guidance"))
+    );
+    assert!(
+        !resumed
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .iter()
+            .any(|operation| operation.name == "Bash"
+                && operation.input["command"] == "touch must-not-run")
+    );
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DEEPSEEK_API_KEY and calls the real thinking-enabled model"]
+async fn live_deepseek_thinking_accepts_user_command_preprocessing() {
+    use tickloop_harness_model::{LocalModelClients, ModelClients, cards::ModelCatalog};
+    use tickloop_harness_protocol::Content;
+    struct ThinkingClient(Arc<dyn tickloop_harness_model::ModelClient>);
+    #[async_trait::async_trait]
+    impl tickloop_harness_model::ModelClient for ThinkingClient {
+        fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+            self.0.identity()
+        }
+        fn supports_reasoning_effort(
+            &self,
+            effort: tickloop_harness_protocol::ReasoningEffort,
+        ) -> bool {
+            self.0.supports_reasoning_effort(effort)
+        }
+        async fn generate_title(
+            &self,
+            request: tickloop_harness_model::ModelRequest,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError>
+        {
+            tickloop_harness_model::ModelClient::generate_title(
+                &ScriptedModel::new(vec![]),
+                request,
+                events,
+                cancel,
+            )
+            .await
+        }
+        async fn complete(
+            &self,
+            request: tickloop_harness_model::ModelRequest,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError>
+        {
+            assert_eq!(
+                request.reasoning_effort,
+                Some(tickloop_harness_protocol::ReasoningEffort::High)
+            );
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|content| matches!(
+                        content,
+                        Content::ToolUse { .. } | Content::ToolResult { .. }
+                    ))
+            );
+            assert_eq!(
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .matches("ROUND06_PREPARED_OK")
+                    .count(),
+                1
+            );
+            let output = self.0.complete(request, events, cancel).await?;
+            println!("Live response: thinking blocks={}, text blocks={}, prepared token={}", output.content.iter().filter(|content| matches!(content, Content::Thinking { .. })).count(), output.content.iter().filter(|content| matches!(content, Content::Text { .. })).count(), output.content.iter().any(|content| matches!(content, Content::Text { text } if text.trim() == "ROUND06_PREPARED_OK")));
+            Ok(output)
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut model_config = ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-flash")
+        .unwrap();
+    model_config.max_output_tokens = 4096;
+    model_config.card.as_mut().unwrap().max_output_tokens = 4096;
+    let client = LocalModelClients::new(Some(root.path().join("config")))
+        .client(&model_config)
+        .unwrap();
+    let environment = MemoryEnvironment::new();
+    environment.define_shell(
+        "printf round06",
+        Duration::ZERO,
+        b"ROUND06_PREPARED_OK".to_vec(),
+        0,
+    );
+    let agent = Agent::with_seams(HarnessSeams {
+        search: None, transcripts: None, environment: Some(Arc::new(environment)), models: ChosenModels::new(Arc::new(ThinkingClient(client))),
+    }, HarnessOptions {
+        settings: Some(Arc::new(CommandSettings { memory: Default::default(), markdown: "---\ndescription: Verify user command preprocessing\n---\nReply with exactly the following prepared token and no other text. Do not call any tools.\n!`printf round06`".into() })),
+        ..HarnessOptions::local(model_config)
+    }).unwrap();
+    let chat = agent.create_chat(root.path().into()).await.unwrap();
+    agent.set_thinking_enabled(chat, true).await.unwrap();
+    agent
+        .set_reasoning_effort(chat, Some(tickloop_harness_protocol::ReasoningEffort::High))
+        .await
+        .unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.invoke_skill(chat, "demo:check", "").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("Live command failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.thinking_enabled);
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(tickloop_harness_protocol::ReasoningEffort::High)
+    );
+
+    assert!(
+        !snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(
+                content,
+                Content::ToolUse { .. } | Content::ToolResult { .. }
+            ))
+    );
+    assert!(snapshot.messages.iter().filter(|message| message.role == tickloop_harness_protocol::Role::Assistant).flat_map(|message| &message.content).any(|content| matches!(content, Content::Text { text } if text.trim() == "ROUND06_PREPARED_OK")));
+    assert_eq!(snapshot.operations.len(), 1);
+    assert!(snapshot.operations[0].input_message_id.is_some());
+    println!(
+        "DeepSeek deepseek-flash: thinking enabled, explicit high effort verified on the request, prepared token returned, no synthetic tool messages, one persisted input operation"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn user_command_hook_refusal_cancellation_and_stop_keep_input_records() {
+    use tickloop_harness_protocol::{
+        Content, OperationState,
+        hooks::{ConfiguredHook, HookEvent, HookList, HookSource, HookTrust},
+    };
+    use tickloop_harness_runtime::environment::memory::MemoryCommandRun;
+    use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
+    for scenario in ["refused", "cancelled", "stopped"] {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let environment = MemoryEnvironment::new();
+        environment.define_shell(
+            "printf guarded",
+            Duration::ZERO,
+            b"guarded-output".to_vec(),
+            0,
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        environment.define_command("guard", move |_| {
+            signal.notify_one();
+            MemoryCommandRun {
+                exit_code: if scenario == "refused" { 2 } else { 0 },
+                stderr: if scenario == "refused" {
+                    b"command refused".to_vec()
+                } else {
+                    vec![]
+                },
+                stdout: if scenario == "stopped" {
+                    serde_json::to_vec(&json!({"continue":false,"stopReason":"No model request"}))
+                        .unwrap()
+                } else {
+                    vec![]
+                },
+                duration: if scenario == "cancelled" {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::ZERO
+                },
+                ..Default::default()
+            }
+        });
+        let memory = MemorySettingsStore::default();
+        memory
+            .write(SettingsUpdate::TrustDirectory(
+                folder.path().canonicalize().unwrap(),
+            ))
+            .unwrap();
+        memory.set_hooks(HookList {
+            hooks: vec![ConfiguredHook {
+                key: "guard".into(),
+                hash: None,
+                source: HookSource::User,
+                file: "/settings.json".into(),
+                event: if scenario == "stopped" {
+                    HookEvent::PostToolUse
+                } else {
+                    HookEvent::PreToolUse
+                },
+                matcher: Some("Bash".into()),
+                command: "guard".into(),
+                resolved_command: Some("guard".into()),
+                sensitive_values: vec![],
+                condition: None,
+                timeout_secs: 600,
+                background: None,
+                plugin: None,
+                trust: HookTrust::Trusted,
+            }],
+            ..Default::default()
+        });
+        let settings = Arc::new(CommandSettings {
+            memory,
+            markdown: "---\ndescription: Check\n---\n!`printf guarded`".into(),
+        });
+        let model = Arc::new(ScriptedModel::new(vec![text("must not call model")]));
+        let make = |transcripts: Arc<InMemoryTranscriptStore>| {
+            Agent::with_seams(
+                HarnessSeams {
+                    search: None,
+                    transcripts: Some(transcripts),
+                    environment: Some(Arc::new(environment.clone())),
+                    models: ChosenModels::new(model.clone()),
+                },
+                HarnessOptions {
+                    settings: Some(settings.clone()),
+                    ..HarnessOptions::local(config())
+                },
+            )
+            .unwrap()
+        };
+        let agent = make(store.clone());
+        let chat = agent.create_chat(folder.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        let receipt = agent.invoke_skill(chat, "demo:check", "").await.unwrap();
+        if scenario == "cancelled" {
+            tokio::time::timeout(Duration::from_secs(10), started.notified())
+                .await
+                .unwrap();
+            agent.interrupt(chat).await.unwrap();
+        }
+        let mut dispatched = 0;
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::ToolStarted { name, .. } if name == "Bash" => dispatched += 1,
+                EventKind::Completed { .. } => {
+                    assert_eq!(scenario, "stopped");
+                    break;
+                }
+                EventKind::Failed(_) | EventKind::Interrupted => {
+                    assert_ne!(scenario, "stopped");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(model.requests.lock().unwrap().is_empty(), "{scenario}");
+        assert_eq!(dispatched, usize::from(scenario == "stopped"));
+        agent.sync().await.unwrap();
+        let image = Arc::new(InMemoryTranscriptStore::new());
+        image.seed(chat, store.lines(chat), store.position(chat).unwrap());
+        let restored = make(image);
+        let snapshot = restored.resume_chat(chat).await.unwrap();
+        assert_eq!(snapshot.operations.len(), 1, "{scenario}");
+        let operation = &snapshot.operations[0];
+        assert!(operation.input_message_id.is_some());
+        assert_eq!(operation.input["command"], "printf guarded");
+        assert_eq!(
+            operation.state,
+            if scenario == "stopped" {
+                OperationState::Completed
+            } else {
+                OperationState::Failed
+            }
+        );
+        assert_eq!(
+            operation.result.as_ref().unwrap().is_error,
+            scenario != "stopped"
+        );
+        assert!(
+            !snapshot
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|content| matches!(
+                    content,
+                    Content::ToolUse { .. } | Content::ToolResult { .. }
+                ))
+        );
+        agent.shutdown().await;
+        restored.shutdown().await;
     }
 }

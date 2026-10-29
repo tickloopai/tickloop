@@ -4,6 +4,12 @@ use serde_json::Value;
 use tickloop_harness_policy::skills::SkillExpansion;
 use tickloop_harness_protocol::ProposedToolCall;
 
+tokio::task_local! { static INPUT_MESSAGE: Uuid; }
+
+pub(super) fn input_message_id() -> Option<Uuid> {
+    INPUT_MESSAGE.try_with(|id| *id).ok()
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) enum UserSkillPreparation {
     Pending(SkillExpansion),
@@ -20,12 +26,12 @@ pub(super) fn ordinary_guidance_is_active(chat: &Chat, run: RunId) -> bool {
         .user_skill_invocations
         .get(&run)
         .is_some_and(|invocation| {
-            chat.skills.is_plugin_command(&invocation.name) == Some(false)
-                && chat
-                    .snapshot
-                    .invoked_skills
-                    .iter()
-                    .any(|skill| skill.name == invocation.name && skill.source == invocation.source)
+            chat.snapshot.invoked_skills.iter().any(|skill| {
+                skill.name == invocation.name
+                    && skill.source == invocation.source
+                    && (skill.shell_preprocessing == Some(false)
+                        || chat.skills.is_plugin_command(&invocation.name) == Some(false))
+            })
         })
 }
 
@@ -93,66 +99,46 @@ impl Agent {
                 return Err("Skill preparation cancelled before dispatch".into());
             }
             let registry = self.prepare_tool_registry(receipt, cancel).await?;
-            let message_id = tickloop_ids::generate();
+            let message_id = {
+                let chats = self.inner.chats.lock().await;
+                let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+                chat.snapshot
+                    .message_runs
+                    .iter()
+                    .find_map(|(index, run)| {
+                        (*run == receipt.run_id
+                            && chat.snapshot.prompt_execution_modes.contains_key(index))
+                        .then(|| chat.snapshot.message_ids.get(index).copied())
+                        .flatten()
+                    })
+                    .ok_or("Skill input has no retained message identity")?
+            };
             let call = ProposedToolCall {
                 call_id: tickloop_ids::generate().to_string(),
                 name: "Bash".into(),
                 input: shell_input(&expansion.name, &shell.command),
             };
-            {
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats
-                    .get_mut(&receipt.chat_id)
-                    .ok_or("chat is unavailable")?;
-                let index = chat.snapshot.messages.len();
-                chat.snapshot.message_ids.insert(index, message_id);
-                chat.snapshot.message_runs.insert(index, receipt.run_id);
-                chat.snapshot.messages.push(Message {
-                    role: Role::Assistant,
-                    content: vec![Content::ToolUse {
-                        id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        input: call.input.clone(),
-                    }],
-                });
-                self.emit(
-                    chat,
-                    receipt,
-                    EventKind::AssistantMessageCommitted {
-                        message_id,
-                        tool_calls: vec![call.clone()],
-                    },
-                );
-                self.save(&chat.snapshot);
-            }
-            let batch = ToolBatch {
-                message_id,
-                calls: vec![call.clone()],
-                is_reentered: false,
-            };
             let child = cancel.child_token();
-            // No handover safe point inside this unit: its remaining plan is consumed once.
-            self.execute_and_commit_tool_call(
-                receipt,
-                &batch,
-                call.clone(),
-                &registry,
-                child.clone(),
-                cancel,
-            )
-            .await?;
-            let result = {
-                let chats = self.inner.chats.lock().await;
-                chats[&receipt.chat_id]
-                    .snapshot
-                    .operations
-                    .iter()
-                    .find(|operation| {
-                        operation.run_id == receipt.run_id && operation.call_id == call.call_id
-                    })
-                    .and_then(|operation| operation.result.clone())
-                    .ok_or("Shell preparation has no recorded result")?
-            };
+            // No handover safe point inside this unit: the frozen plan is consumed once.
+            let result = INPUT_MESSAGE
+                .scope(message_id, async {
+                    let outcome = self
+                        .execute_registered_call(
+                            receipt,
+                            message_id,
+                            ToolInvocation::new(
+                                call.call_id.clone(),
+                                call.name.clone(),
+                                call.input.clone(),
+                                registry.resolve(&call.name),
+                            ),
+                            child.clone(),
+                        )
+                        .await;
+                    self.complete_input_call(receipt, &call, outcome, cancel)
+                        .await
+                })
+                .await?;
             match self
                 .skill_shell_output(receipt, &call.call_id, &result)
                 .await

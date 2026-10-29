@@ -175,6 +175,18 @@ impl Agent {
             if is_queued {
                 continue;
             }
+            if pending.is_skill_invocation
+                && let Some(skill) = &pending.skill_guidance
+            {
+                chat.snapshot.user_skill_invocations.insert(
+                    pending.receipt.run_id,
+                    tickloop_harness_protocol::UserSkillInvocation {
+                        name: skill.name.clone(),
+                        source: skill.source.clone(),
+                    },
+                );
+                super::record_invoked_skill(chat, skill.clone());
+            }
             pending.receipt.loop_id = chat.snapshot.chat_loop.id;
             if let Some(TriggerSource::TickUpdate { items }) = &mut pending.trigger_source {
                 self.tick_deliveries().rebind_restored_items(

@@ -1678,6 +1678,7 @@ impl Agent {
             )
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
+                input_message_id: crate::command_skills::input_message_id(),
                 parent_call_id: crate::nested_calls::parent_call_id(),
                 parent_call_index: crate::nested_calls::parent_call_index(),
                 task_binding: task_binding.flatten(),
@@ -2292,6 +2293,7 @@ impl Agent {
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
+                        input_message_id: crate::command_skills::input_message_id(),
                         parent_call_id: crate::nested_calls::parent_call_id(),
                         parent_call_index: crate::nested_calls::parent_call_index(),
                         task_binding: task_binding.flatten(),

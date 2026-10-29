@@ -999,6 +999,7 @@ mod tests {
                     chat.snapshot
                         .pending_inputs
                         .push(tickloop_harness_protocol::PendingInput {
+                            skill_guidance: None,
                             receipt: tickloop_harness_protocol::Receipt {
                                 chat_id: chat.snapshot.id,
                                 loop_id: loop_id.into(),
@@ -1138,6 +1139,7 @@ mod tests {
                     chat.snapshot
                         .operations
                         .push(tickloop_harness_protocol::OperationRecord {
+                            input_message_id: None,
                             parent_call_id: None,
                             parent_call_index: None,
                             task_binding: None,

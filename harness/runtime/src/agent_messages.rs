@@ -746,6 +746,7 @@ impl Agent {
             .position(|pending| pending.trigger_source.is_some())
             .unwrap_or(receiver.snapshot.pending_inputs.len());
         let queued = PendingInput {
+            skill_guidance: None,
             receipt: receipt.clone(),
             input,
             contexts: Vec::new(),

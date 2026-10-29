@@ -64,6 +64,8 @@ pub struct SkillExpansion {
     pub source: SkillSource,
     pub allowed_tools: Vec<String>,
     pub shell_commands: Vec<SkillShellCommand>,
+    #[serde(default)]
+    pub shell_preprocessing: Option<bool>,
 }
 
 impl TryFrom<SkillExpansion> for InvokedSkill {
@@ -73,14 +75,13 @@ impl TryFrom<SkillExpansion> for InvokedSkill {
         if !expansion.shell_commands.is_empty() {
             return Err(SkillError::ShellExecutionRequired(expansion.name));
         }
-        if !expansion.allowed_tools.is_empty() {
-            return Err(SkillError::AllowedToolsUnsupported(expansion.name));
-        }
+        expansion.validate()?;
         Ok(Self {
             name: expansion.name,
             content: expansion.content,
             source: expansion.source,
             run_id: None,
+            shell_preprocessing: expansion.shell_preprocessing,
         })
     }
 }
@@ -520,6 +521,7 @@ Available Skills:
             content,
             source: skill.source.clone(),
             allowed_tools: skill.allowed_tools.clone(),
+            shell_preprocessing: skill.command.as_ref().map(|_| !shell_commands.is_empty()),
             shell_commands,
         })
     }
@@ -583,6 +585,7 @@ pub fn expand_remote(
         content,
         source: definition.source.clone(),
         run_id: None,
+        shell_preprocessing: None,
     })
 }
 

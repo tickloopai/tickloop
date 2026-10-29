@@ -728,6 +728,7 @@ fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
     let queued_sequence = chat.snapshot.last_queue_sequence;
     chat.snapshot.pending_inputs.push(PendingInput {
+        skill_guidance: None,
         receipt,
         input: String::new(),
         contexts: Vec::new(),
@@ -3164,7 +3165,28 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
+        let skill_guidance = chat
+            .snapshot
+            .user_skill_invocations
+            .get(&receipt.run_id)
+            .and_then(|invocation| {
+                matches!(
+                    chat.user_skill_preparations.get(&receipt.run_id),
+                    Some(command_skills::UserSkillPreparation::Complete)
+                )
+                .then(|| {
+                    chat.snapshot
+                        .invoked_skills
+                        .iter()
+                        .find(|skill| {
+                            skill.name == invocation.name && skill.source == invocation.source
+                        })
+                        .cloned()
+                })
+                .flatten()
+            });
         let queued = PendingInput {
+            skill_guidance,
             receipt: receipt.clone(),
             input,
             contexts,
@@ -3843,6 +3865,9 @@ impl Agent {
                     return Ok(Usage::default());
                 }
                 if self.prepare_user_skill(&receipt, &cancel).await? {
+                    if let Some(usage) = self.finish_tool_results(&receipt).await? {
+                        return Ok(usage);
+                    }
                     let chats = self.inner.chats.lock().await;
                     self.continuation_request(&chats[&receipt.chat_id])?
                 } else {

@@ -585,6 +585,9 @@ pub enum OperationState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationRecord {
+    /// The user input that caused this host-prepared operation, rather than a model tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,6 +674,9 @@ pub struct UserShellReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendingInput {
+    /// Already prepared guidance for a queued Skill with no Shell plan to replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_guidance: Option<crate::InvokedSkill>,
     pub receipt: Receipt,
     pub input: String,
     #[serde(default)]
