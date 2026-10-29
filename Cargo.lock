@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4099,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-access"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "serde",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-client"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-console"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "arboard",
  "async-trait",
@@ -4183,7 +4183,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-daemon"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-local-environment"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-settings"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "libc",
@@ -4283,7 +4283,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-code-updater"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4302,7 +4302,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "tickloop-harness-artifacts",
  "tickloop-harness-base",
@@ -4320,7 +4320,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-artifacts"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "libc",
@@ -4342,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-base"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "base64 0.22.1",
  "hyper-util",
@@ -4362,7 +4362,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-connector"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4383,7 +4383,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-cron"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4395,7 +4395,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-model"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4433,7 +4433,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-policy"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -4449,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-protocol"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -4462,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-runtime"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-test-support"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4535,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-tools"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "grep-printer",
@@ -4564,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-harness-transcript"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -4576,7 +4576,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-ids"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-installer"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -4600,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-oauth"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -4615,7 +4615,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-oauth-test-server"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -4625,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-packages"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "flate2",
@@ -4646,7 +4646,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-plugins"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "flate2",
  "libc",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-protocol"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "jsonschema",
  "serde",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tick-sdk"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "futures-util",
  "schemars",
@@ -4688,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tickhost"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-tickhost-connect"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "async-trait",
  "libc",
@@ -4735,7 +4735,7 @@ dependencies = [
 
 [[package]]
 name = "tickloop-ui"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "lru",
  "pulldown-cmark",
