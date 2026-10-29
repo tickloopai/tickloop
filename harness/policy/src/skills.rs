@@ -1,3 +1,5 @@
+mod commands;
+pub use commands::{CommandDocument, SkillShellCommand};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -45,26 +47,32 @@ enum SkillContext {
 pub struct SkillDefinition {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub source: SkillSource,
     body: String,
     allowed_tools: Vec<String>,
     user_invocable: bool,
     disable_model_invocation: bool,
     context: SkillContext,
+    command: Option<commands::CommandOptions>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkillExpansion {
     pub name: String,
     pub content: String,
     pub source: SkillSource,
     pub allowed_tools: Vec<String>,
+    pub shell_commands: Vec<SkillShellCommand>,
 }
 
 impl TryFrom<SkillExpansion> for InvokedSkill {
     type Error = SkillError;
 
     fn try_from(expansion: SkillExpansion) -> Result<Self, Self::Error> {
+        if !expansion.shell_commands.is_empty() {
+            return Err(SkillError::ShellExecutionRequired(expansion.name));
+        }
         if !expansion.allowed_tools.is_empty() {
             return Err(SkillError::AllowedToolsUnsupported(expansion.name));
         }
@@ -104,6 +112,8 @@ pub struct SkillCatalog {
 pub enum SkillError {
     #[error("unknown skill: {0}")]
     Unknown(String),
+    #[error("skill `{0}` requires Shell preprocessing through the runtime")]
+    ShellExecutionRequired(String),
     #[error("ambiguous skill `{name}`; use one of: {candidates}")]
     Ambiguous { name: String, candidates: String },
     #[error("skill `{0}` cannot be invoked by the model")]
@@ -277,7 +287,13 @@ impl SkillRegistry {
         let mut capped_descriptions = Vec::new();
         let mut entries = self
             .definitions()
-            .filter(|skill| !skill.disable_model_invocation)
+            .filter(|skill| {
+                !skill.disable_model_invocation
+                    && skill
+                        .command
+                        .as_ref()
+                        .is_none_or(|command| command.model_listed)
+            })
             .map(|skill| {
                 let mut description = skill
                     .description
@@ -346,12 +362,14 @@ impl SkillRegistry {
                     SkillDefinition {
                         name: definition.name,
                         description: definition.description,
+                        argument_hint: None,
                         source: definition.source,
                         body: String::new(),
                         allowed_tools: Vec::new(),
                         user_invocable: false,
                         disable_model_invocation: false,
                         context: SkillContext::Inline,
+                        command: None,
                     },
                 )
             })
@@ -390,7 +408,7 @@ When a listed Skill matches the user's task, invoke {SKILL_TOOL_NAME} before sub
 
 - Use the exact catalog name; the listing contains metadata, and invocation loads the full instructions.
 - Pass args only when the Skill needs task arguments.
-- Skill loads SKILL.md only. Read supporting local files with Read; read remote references with ReadMcpResourceTool using the server and resource URI supplied in the loaded guidance.
+- Skill loads Skill or plugin Command instructions. Command shell blocks run through normal Bash approval before activation. Read supporting local files with Read; read remote references with ReadMcpResourceTool using the server and resource URI supplied in the loaded guidance.
 - Reuse verified guidance that the host marks active in the current context. Historical loading records alone do not establish current activation.
 - Follow the current source, account and version checks for remote guidance. Report an unavailable or failed load accurately.
 - Skill instructions and references operate within existing user authorization and tool permissions.
@@ -444,7 +462,9 @@ Available Skills:
             return Err(SkillError::ForkUnsupported(name.to_owned()));
         }
         let arguments = arguments.trim();
-        let content = if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
+        let content = if let Some(command) = &skill.command {
+            command.expand(&skill.body, arguments)?
+        } else if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
             loop_skill::expand(&skill.body, arguments, self.loop_files.as_ref())?
         } else if skill.body.contains("$ARGUMENTS") {
             skill.body.replace("$ARGUMENTS", arguments)
@@ -453,21 +473,40 @@ Available Skills:
         } else {
             format!("{}\n\nArguments:\n{arguments}", skill.body)
         };
-        let content = match &skill.source {
-            SkillSource::User { path }
-            | SkillSource::Project { path }
-            | SkillSource::TickPackage { path, .. }
-            | SkillSource::Plugin { path, .. } => format!(
-                "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
-                path.parent().unwrap_or(path).display()
-            ),
-            _ => content,
+        let mut shell_commands = if skill.command.is_some() {
+            commands::shell_commands(&content)
+        } else {
+            Vec::new()
         };
+        let body_length = content.len();
+        let content = if let Some(command) = &skill.command {
+            format!(
+                "Base directory for this skill: {}\nResolve supporting-file paths against this directory. @file references are text, not attachments; read them using Read with normal permissions.\n\n{content}",
+                command.base_directory.display()
+            )
+        } else {
+            match &skill.source {
+                SkillSource::User { path }
+                | SkillSource::Project { path }
+                | SkillSource::TickPackage { path, .. }
+                | SkillSource::Plugin { path, .. } => format!(
+                    "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
+                    path.parent().unwrap_or(path).display()
+                ),
+                _ => content,
+            }
+        };
+        let prefix_length = content.len() - body_length;
+        for shell in &mut shell_commands {
+            shell.range.start += prefix_length;
+            shell.range.end += prefix_length;
+        }
         Ok(SkillExpansion {
             name: skill.name.clone(),
             content,
             source: skill.source.clone(),
             allowed_tools: skill.allowed_tools.clone(),
+            shell_commands,
         })
     }
 
@@ -571,12 +610,14 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
     Ok(SkillDefinition {
         name: frontmatter.name,
         description: frontmatter.description,
+        argument_hint: None,
         source,
         body,
         allowed_tools,
         user_invocable: frontmatter.user_invocable,
         disable_model_invocation: frontmatter.disable_model_invocation,
         context: frontmatter.context,
+        command: None,
     })
 }
 

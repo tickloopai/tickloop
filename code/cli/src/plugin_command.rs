@@ -709,6 +709,39 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
     } else {
         println!("Skills: {}", skills.join(", "));
     }
+    let commands = tick_plugins::discover_commands(&root, &manifest);
+    let mut registry = tickloop_code_settings::skills::SkillRegistry::default();
+    for command in commands.commands {
+        registry.register_command(
+            tickloop_code_settings::skills::CommandDocument {
+                name: command.name,
+                markdown: command.markdown,
+                source: tickloop_harness::protocol::SkillSource::Plugin {
+                    plugin: manifest.name.clone(),
+                    path: command.path,
+                },
+                base_directory: command.base_directory,
+                metadata: command.metadata,
+                public_config: Default::default(),
+            },
+            &[],
+        );
+    }
+    let names = registry
+        .definitions()
+        .map(|command| safe_line(&command.name))
+        .collect::<Vec<_>>();
+    println!(
+        "Commands: {}",
+        if names.is_empty() {
+            "none".into()
+        } else {
+            names.join(", ")
+        }
+    );
+    for warning in commands.warnings.iter().chain(registry.warnings()) {
+        println!("Warning: {}", safe_line(&warning));
+    }
     if let Some(tick) = &manifest.tick {
         let protocol = if tick.protocol {
             "speaks the Tick protocol"

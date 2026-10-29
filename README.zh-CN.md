@@ -239,7 +239,14 @@ tickloop plugin install --path ./my-plugin
 
 输入 `/` 可发现当前工作目录可由用户调用的 Skill，包括内置、用户、项目以及已启用插件和 Tick 的 Skill。Skills 分组显示名称、简短说明和来源；用 `Ctrl+N` / `Ctrl+P` 选择，再按 `Enter` 或 `Tab` 补全。Skill 文件或插件变化后，候选会自动刷新。用 `/plugin:skill [参数]` 调用；短名唯一时也可用 `/skill [参数]`。短名重名时会列出可用的完整名，完整名优先，内置命令始终优先。每次调用显示 `Skill · 名称 · 来源` 行，重开历史仍可见。
 
-已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装放置文件；已启用的 MCP 服务随 Agent 启动，或从下一次请求起运行。插件 Skill 和 MCP 工具的调用照常审批。本版本支持 Skill、Tick 程序、MCP 服务、Hook 和插件用户配置；Hook 在安装和 `tickloop plugin list` 中显示几个待确认，并警告 Tickloop 跳过的事件、类型与字段（见 [Hook](#hook)）；其余组件列为暂不支持。卸载插件时一并清除其 Hook 的信任记录。npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
+已启用插件的 Skill 以 `plugin:skill` 命名，从下一次模型请求起可用，无需重启。禁用会隐藏 Skill；重装或更新后仍保持禁用。安装放置文件；已启用的 MCP 服务随 Agent 启动，或从下一次请求起运行。插件 Skill 和 MCP 工具的调用照常审批。本版本支持 Skill、转为 Skill 的 Commands、Tick 程序、MCP 服务、Hook 和插件用户配置；Hook 在安装和 `tickloop plugin list` 中显示几个待确认，并警告 Tickloop 跳过的事件、类型与字段（见 [Hook](#hook)）；其余组件列为暂不支持。卸载插件时一并清除其 Hook 的信任记录。npm、pip 插件来源可以列出但不能安装。安装、更新、卸载和登录由用户发起，模型不会自行执行。
+
+插件的 Markdown Commands 同样作为 Skill 使用：输入 `/plugin:command`，或由模型通过 `Skill` 工具按完整名字调用。清单 `commands` 可指定文件、目录或内联正文；未声明时递归扫描 `commands/`。子目录加入冒号命名空间，同目录的 `SKILL.md` 优先于其它 Markdown 文件；Command 与 Skill 完整名相同时，Command 优先。`argument-hint` 显示在补全中；`user-invocable: false` 禁止用户直接调用；`disable-model-invocation: true` 禁止模型调用。没有显式 description 或 `when_to_use` 的 Command 不列入模型目录，但仍可按完整名字调用。
+
+Commands 替换 `$ARGUMENTS`、零基位置参数 `$0`、`$1`、`$ARGUMENTS[0]`，以及 `arguments` 声明的命名参数；引号内参数保持为一个参数，缺少的位置参数保留占位符。没有成功替换占位符时，非空参数追加到正文。以 ! 加反引号或 ` ```! ` 围栏书写的 Shell 块，只在调用时通过普通 Bash 准备和审批执行；成功完成后的输出才进入指导。失败或结果未知会停止准备，不自动重试。安装、发现和补全均不执行这些块。
+
+`allowed-tools` 不授予权限。`model`（含 `inherit`）警告并忽略，保持当前 Chat 模型。`@文件` 保留为文字，Agent 通过 `Read` 在正常权限下读取。不支持的字段（包括 `name` 别名、`context`、`agent`、`background`、`effort`、`shell` 和 frontmatter `hooks`）警告后忽略；调用开关必须是 YAML 布尔值。只读取已启用插件的 Commands，不扫描用户或项目的 `.claude/commands`。
+
 
 ### MCP 服务
 

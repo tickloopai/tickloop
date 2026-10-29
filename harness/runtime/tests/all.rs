@@ -122,3 +122,6 @@ mod tool_hooks;
 
 #[path = "all/session_hooks.rs"]
 mod session_hooks;
+
+#[path = "all/command_skills.rs"]
+mod command_skills;

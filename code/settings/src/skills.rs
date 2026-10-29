@@ -149,6 +149,7 @@ fn load_plugins(
         ] {
             watched.push(plugin.root.join(manifest));
         }
+        load_plugin_commands(registry, &store, plugin, watched);
         for path in &plugin.manifest.skill_paths {
             let directory = plugin.root.join(path);
             watched.push(directory.join(SKILL_FILE_NAME));
@@ -173,6 +174,70 @@ fn load_plugins(
             &SkillOrigin::Plugin(&store, plugin),
             seen_files,
             watched,
+        );
+    }
+}
+
+fn load_plugin_commands(
+    registry: &mut SkillRegistry,
+    store: &PluginStore,
+    plugin: &InstalledPlugin,
+    watched: &mut Vec<PathBuf>,
+) {
+    let discovery = tick_plugins::discover_commands(&plugin.root, &plugin.manifest);
+    watched.extend(discovery.watched);
+    for warning in discovery.warnings {
+        registry.warn(format!("Plugin {}: {warning}", plugin.name()));
+    }
+    if discovery.commands.is_empty() {
+        return;
+    }
+    watched.push(
+        store
+            .config_root()
+            .join("credentials")
+            .join(plugin.name())
+            .join("user-config.json"),
+    );
+    let config =
+        match crate::plugin_config::PluginUserConfig::load(store.config_root(), &plugin.manifest) {
+            Ok(config) => config,
+            Err(_) => {
+                registry.warn(format!("Plugin {}: cannot read user config", plugin.name()));
+                return;
+            }
+        };
+    for command in discovery.commands {
+        let markdown = command.markdown;
+        let data = plugin_data_directory(registry, store, plugin, &markdown);
+        let mut variables = vec![(PACKAGE_ROOT_VARIABLE, plugin.root.as_path())];
+        variables.extend(PLUGIN_ROOT_VARIABLES.map(|name| (name, plugin.root.as_path())));
+        variables.extend(PLUGIN_DATA_VARIABLES.map(|name| (name, data.as_path())));
+        variables
+            .extend(SKILL_DIRECTORY_VARIABLES.map(|name| (name, command.base_directory.as_path())));
+        registry.register_command(
+            CommandDocument {
+                name: command.name,
+                markdown,
+                source: SkillSource::Plugin {
+                    plugin: plugin.name().into(),
+                    path: command.path,
+                },
+                base_directory: command.base_directory.clone(),
+                metadata: command.metadata,
+                public_config: plugin
+                    .manifest
+                    .user_config
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            config.skill_text(&format!("${{user_config.{key}}}")),
+                        )
+                    })
+                    .collect(),
+            },
+            &variables,
         );
     }
 }

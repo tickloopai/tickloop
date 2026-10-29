@@ -1165,6 +1165,7 @@ impl Agent {
     }
 
     pub(crate) fn settle_input(&self, chat: &mut Chat, run: RunId, outcome: SettledOutcome) {
+        chat.user_skill_preparations.remove(&run);
         if chat.bookkeeping.lifecycle.settle(run, outcome) {
             self.inner.ledger_changes.send_replace(());
         }

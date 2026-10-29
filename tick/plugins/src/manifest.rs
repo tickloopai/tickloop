@@ -99,7 +99,12 @@ impl Component {
     pub fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Tick | Self::Skills | Self::Hooks | Self::McpServers | Self::UserConfig
+            Self::Tick
+                | Self::Skills
+                | Self::Commands
+                | Self::Hooks
+                | Self::McpServers
+                | Self::UserConfig
         )
     }
 
@@ -153,6 +158,8 @@ pub struct PluginManifest {
     pub auth: PackageAuth,
     /// The directories that hold Skills, relative to the plugin root.
     pub skill_paths: Vec<PathBuf>,
+    /// Explicit Commands selection; absent uses the default commands directory.
+    pub commands: Option<Value>,
     pub components: BTreeSet<Component>,
     /// Raw MCP entries; the host resolves variables and interprets transports.
     pub mcp_servers: BTreeMap<String, Value>,
@@ -426,6 +433,7 @@ fn from_document(
         tick,
         auth,
         skill_paths,
+        commands: document.get("commands").cloned(),
         components,
         mcp_servers,
         hooks,
@@ -483,6 +491,7 @@ fn from_tick_package(
         }),
         auth: package.auth,
         skill_paths,
+        commands: None,
         components,
         mcp_servers,
         hooks,
@@ -682,7 +691,7 @@ fn contained_paths(
     paths
 }
 
-fn contained_path(root: &Path, text: &str) -> Result<PathBuf, &'static str> {
+pub(crate) fn contained_path(root: &Path, text: &str) -> Result<PathBuf, &'static str> {
     let Some(relative) = text.strip_prefix("./") else {
         return Err("it must start with ./");
     };

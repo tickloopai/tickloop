@@ -98,7 +98,7 @@ function hookSupport(hooks) {
 
 /** What `tickloop plugin validate` printed for a plugin it could read. */
 export function parseValidateOutput(stdout) {
-  const result = { name: null, displayName: null, version: null, format: null, skills: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [] };
+  const result = { name: null, displayName: null, version: null, format: null, skills: [], commands: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [] };
   const hooks = { supported: 0, events: [], types: [], fields: [], unsupportedEvents: [], unsupportedTypes: [], unsupportedFields: [] };
   let declaresHooks = false;
   for (const line of stdout.split("\n")) {
@@ -109,6 +109,8 @@ export function parseValidateOutput(stdout) {
       result.displayName = match[1];
     } else if ((match = /^Skills: (.+)$/.exec(line))) {
       result.skills = match[1] === "none" ? [] : match[1].split(", ");
+    } else if ((match = /^Commands: (.+)$/.exec(line))) {
+      result.commands = nameList(match[1]);
     } else if ((match = /^Tick program: (.+) \((.+)\)$/.exec(line))) {
       result.tick = { executable: match[1], kind: match[2] };
     } else if ((match = /^Not supported yet, so not used: (.+)\.$/.exec(line))) {
@@ -370,6 +372,7 @@ async function examinePlugin(plugin, context) {
     manifestFormat: null,
     version: null,
     skills: [],
+    commands: [],
     tick: null,
     mcp: [],
     hooks: null,
@@ -412,11 +415,13 @@ async function examinePlugin(plugin, context) {
   result.version = validated.version;
   result.skills = validated.skills;
   result.tick = validated.tick;
+  result.commands = validated.commands;
   result.mcp = validated.mcp;
   result.hooks = validated.hooks;
   result.supportedComponents = [
     ...(validated.tick ? ["tick"] : []),
     ...(validated.skills.length ? ["skills"] : []),
+    ...(validated.commands.length ? ["commands"] : []),
     ...(validated.mcp.length ? ["MCP servers"] : []),
     ...(validated.hooks?.supported ? ["hooks"] : []),
   ];
@@ -453,7 +458,7 @@ export function summarize(plugins) {
     },
     plugins: plugins.length,
     installable: installable.length,
-    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.some(component => component === "skills" || component === "tick")).length,
+    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.some(component => component === "skills" || component === "commands" || component === "tick")).length,
     invalid: plugins.filter(plugin => plugin.status === STATUS.invalid).length,
     notFetchable: plugins.filter(plugin => plugin.status === STATUS.notFetchable).length,
     unsupportedSource: plugins.filter(plugin => plugin.status === STATUS.unsupportedSource).length,

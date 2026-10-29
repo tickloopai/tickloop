@@ -440,7 +440,7 @@ impl Agent {
 
     /// Runs one call under `call_cancel` and appends its result; a result that ends the Run
     /// cancels `run_cancel`.
-    async fn execute_and_commit_tool_call(
+    pub(super) async fn execute_and_commit_tool_call(
         &self,
         receipt: &Receipt,
         batch: &ToolBatch,

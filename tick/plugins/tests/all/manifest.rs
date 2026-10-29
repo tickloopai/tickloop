@@ -42,7 +42,7 @@ fn a_claude_plugin_lists_its_skills_and_the_components_tickloop_does_not_use_yet
             Component::McpServers,
         ])
     );
-    assert_eq!(manifest.unsupported(), vec![Component::Commands]);
+    assert!(manifest.unsupported().is_empty());
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
     let root = root.canonicalize().unwrap();
     assert_eq!(
@@ -386,7 +386,6 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
     assert_eq!(
         manifest.unsupported(),
         vec![
-            Component::Commands,
             Component::Agents,
             Component::LspServers,
             Component::OutputStyles,
@@ -416,7 +415,7 @@ fn inline_commands_are_recognized_without_a_source_path() {
         &[],
     );
     let manifest = PluginManifest::load(&root, "unused", None).unwrap();
-    assert_eq!(manifest.unsupported(), vec![Component::Commands]);
+    assert!(manifest.unsupported().is_empty());
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
 }
 
@@ -692,5 +691,106 @@ fn hooks_that_cannot_be_read_are_ignored_with_a_warning() {
             "hooks in .claude-plugin/plugin.json that do not follow the Claude Code hooks format \
              are ignored",
         ]
+    );
+}
+
+#[test]
+fn command_selection_names_recursion_metadata_and_inline_content() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("commands", &json!({"name":"commands"}), &[]);
+    fs::create_dir_all(root.join("commands/deep/task")).unwrap();
+    fs::write(root.join("commands/check.md"), "check").unwrap();
+    fs::write(root.join("commands/deep/task/SKILL.md"), "skill command").unwrap();
+    fs::write(root.join("commands/deep/task/ignored.md"), "ignored").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(
+        discovery
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>(),
+        ["check", "deep:task"]
+    );
+    write_json(
+        &root.join(".claude-plugin/plugin.json"),
+        &json!({"name":"commands", "commands": {
+            "renamed":{"source":"./commands/check.md","description":"override"},
+            "inline":{"content":"inline body"}
+        }}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(discovery.commands.len(), 2);
+    assert!(
+        discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "renamed"
+                && command.metadata["description"] == "override")
+    );
+    assert!(
+        !discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "deep:task")
+    );
+    assert!(
+        discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "inline"
+                && command.base_directory == root.canonicalize().unwrap())
+    );
+}
+
+#[test]
+fn command_discovery_rejects_escaping_links_and_stops_directory_cycles() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("commands", &json!({"name":"commands"}), &[]);
+    fs::create_dir_all(root.join("commands")).unwrap();
+    let outside = fixture.source("outside");
+    fs::write(outside.join("secret.md"), "secret").unwrap();
+    symlink(outside.join("secret.md"), root.join("commands/escape.md")).unwrap();
+    symlink(root.join("commands"), root.join("commands/cycle")).unwrap();
+    symlink(root.join("missing.md"), root.join("commands/missing.md")).unwrap();
+    fs::write(root.join("commands/good.md"), "good").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(discovery.commands.len(), 1);
+    assert_eq!(discovery.commands[0].name, "good");
+    assert_eq!(discovery.warnings.len(), 2);
+}
+
+#[test]
+fn explicit_command_files_keep_their_stem_and_invalid_arrays_are_not_loaded() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "commands",
+        &json!({"name":"commands", "commands":"./custom/SKILL.md"}),
+        &[],
+    );
+    fs::create_dir_all(root.join("custom")).unwrap();
+    fs::write(root.join("custom/SKILL.md"), "Guide").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(
+        tick_plugins::discover_commands(&root, &manifest).commands[0].name,
+        "SKILL"
+    );
+    write_json(
+        &root.join(".claude-plugin/plugin.json"),
+        &json!({"name":"commands", "commands":["./custom/SKILL.md",7]}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert!(
+        tick_plugins::discover_commands(&root, &manifest)
+            .commands
+            .is_empty()
+    );
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commands is ignored"))
     );
 }

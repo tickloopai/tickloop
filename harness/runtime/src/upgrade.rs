@@ -62,6 +62,8 @@ struct ChatCheckpoint {
     launch_rules: Vec<PermissionRule>,
     #[serde(default)]
     ceiling_launch_rules: Vec<PermissionRule>,
+    #[serde(default)]
+    user_skill_preparations: HashMap<RunId, command_skills::UserSkillPreparation>,
     deferred_messages: Vec<Message>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     output_style: OutputStyle,
@@ -168,6 +170,7 @@ impl Agent {
                     .unwrap_or_default(),
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
+                user_skill_preparations: chat.user_skill_preparations.clone(),
                 deferred_messages: chat.deferred_messages.clone(),
                 feedback_inputs: chat.feedback_inputs.clone(),
                 output_style: chat.output_style,
@@ -396,6 +399,7 @@ impl Agent {
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
                     user_loops: HashMap::new(),
+                    user_skill_preparations: saved.user_skill_preparations.clone(),
                     deferred_messages: saved.deferred_messages.clone(),
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,

@@ -59,8 +59,9 @@ enum ToolRoute {
     Unavailable(ListingGroup),
 }
 
-/// What a call's admission hands its dispatch besides the call itself.
-struct DispatchGrant {
+/// The conversation identity and admitted authority accompanying dispatch.
+struct DispatchContext {
+    assistant_message_id: Uuid,
     /// The host authority a Tick watch was admitted under.
     watch_authority: Option<HostToolAuthority>,
 }
@@ -972,7 +973,7 @@ impl Agent {
         operation: &OperationRecord,
         registered: &RegisteredTool,
         prepared_local: Option<&PreparedLocalCall>,
-        grant: DispatchGrant,
+        context: DispatchContext,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
@@ -1033,7 +1034,16 @@ impl Agent {
                 self.mcp_resource_tool(receipt, &operation.call_id, provider, prepared, cancel)
                     .await
             }
-            ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
+            ToolRoute::Skill(skills) => {
+                self.skill_tool(
+                    receipt,
+                    skills,
+                    operation,
+                    context.assistant_message_id,
+                    cancel,
+                )
+                .await
+            }
             ToolRoute::TickManage(_) => Err("TickManage route was not prepared".into()),
             ToolRoute::Unavailable(_) => Err(UNAVAILABLE_HOST_TOOL_MESSAGE.into()),
             ToolRoute::TickSubscription => {
@@ -1041,7 +1051,7 @@ impl Agent {
                     receipt,
                     &operation.name,
                     &operation.input,
-                    grant.watch_authority,
+                    context.watch_authority,
                 )
                 .await
             }
@@ -2231,7 +2241,10 @@ impl Agent {
                                     .as_ref()
                                     .expect("registered local or Host tool"),
                                 prepared_local.as_ref(),
-                                DispatchGrant { watch_authority },
+                                DispatchContext {
+                                    watch_authority,
+                                    assistant_message_id,
+                                },
                                 cancel.clone(),
                             )
                             .await

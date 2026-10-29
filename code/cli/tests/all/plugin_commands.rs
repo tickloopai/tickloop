@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::tick_package_commands::{Fixture, failed, path_text, succeeded};
 
 /// A Claude Code plugin directory `label` with `manifest`, a Skill per name in `skills/`, and the
-/// commands Tickloop does not use yet.
+/// Markdown commands.
 fn claude_plugin(fixture: &Fixture, label: &str, manifest: Value, skills: &[&str]) -> PathBuf {
     let directory = fixture.root.join("sources").join(label);
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
@@ -70,13 +70,12 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
         succeeded(&plugin(&fixture, &["install", "--path", &source_path])),
         format!(
             "Installed plugin notes@local 1.0.0 in {root}.\n\
-             Not supported yet, so not used: commands.\n\
              Warning: skills path \"./missing\" is ignored: it does not exist\n"
         )
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  enabled  no login needed  not supported yet: commands\n"
+        "notes@local  1.0.0  enabled  no login needed\n"
     );
 
     assert_eq!(
@@ -97,7 +96,7 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  disabled  no login needed  not supported yet: commands\n"
+        "notes@local  1.0.0  disabled  no login needed\n"
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["enable", "notes"])),
@@ -166,7 +165,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
         succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
         "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.\n\
          Skills: skills/read, skills/write\n\
-         Not supported yet, so not used: commands.\n\
+         Commands: notes:tidy\n\
          Warning: skills path \"../outside\" is ignored: it must start with ./\n"
     );
 
@@ -174,7 +173,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
     fs::create_dir_all(&bare).unwrap();
     assert_eq!(
         succeeded(&plugin(&fixture, &["validate", &path_text(&bare)])),
-        "Plugin bare-plugin, read from its directory.\nSkills: none\n"
+        "Plugin bare-plugin, read from its directory.\nSkills: none\nCommands: none\n"
     );
 
     fs::write(source.join(".claude-plugin/plugin.json"), r#"{"name": 7}"#).unwrap();
@@ -720,6 +719,7 @@ fn validate_lists_the_hook_events_types_and_fields_tickloop_runs_and_those_it_do
         format!(
             "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.\n\
              Skills: none\n\
+             Commands: none\n\
              Hooks: 2 supported | events: PreToolUse, Stop | types: command | fields: command, timeout\n\
              Hooks not supported yet: events: Notification | types: prompt | fields: once\n\
              {HOOK_WARNINGS}"
@@ -736,6 +736,7 @@ fn validate_lists_the_hook_events_types_and_fields_tickloop_runs_and_those_it_do
         succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
         "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.\n\
          Skills: none\n\
+         Commands: none\n\
          Not supported yet, so not used: hooks.\n\
          Hooks: 0 supported | events: none | types: none | fields: none\n\
          Hooks not supported yet: events: Notification | types: none | fields: none\n\
