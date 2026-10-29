@@ -212,6 +212,9 @@ impl Agent {
             record_hook_run(self, chat, receipt, record);
             let mut wakes = false;
             if let Some(notification) = notification {
+                if rewakes {
+                    chat.hook_state.session.note_rewake(notification.clone());
+                }
                 match self.append_local_messages(chat, [notification]) {
                     Ok(()) => {
                         wakes = rewakes && self.queue_task_continuation(chat, Some(receipt.loop_id))

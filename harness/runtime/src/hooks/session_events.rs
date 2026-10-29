@@ -14,7 +14,8 @@
 //! - `Stop` runs when a root Chat's model ends its turn without calling tools, `SubagentStop`
 //!   when a Subagent's does or before its report is handed back: a block goes on with the
 //!   hooks' reasons, the hooks then reading `stop_hook_active: true`, as often as they block;
-//!   Esc and `/stop` end the Run as always.
+//!   Esc and `/stop` end the Run as always. A Run that read an `asyncRewake` hook's
+//!   notification reads `stop_hook_active: true` too, as Claude Code queues that notification.
 //! - `StopFailure` tells the hooks a turn ended on a model error, `SessionEnd` that a root Chat
 //!   ends with its Worker; neither changes anything.
 //! - `PreCompact` runs before a compaction: a block cancels it, and plain output from the others
@@ -26,7 +27,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 use tickloop_harness_model::{ModelError, ModelFailureKind, ModelRequest};
 use tickloop_harness_protocol::hooks::HookEvent;
-use tickloop_harness_protocol::{Content, HostNote, Receipt, Role, RunId};
+use tickloop_harness_protocol::{Content, HostNote, Message, Receipt, Role, RunId};
 use tokio_util::sync::CancellationToken;
 
 use super::{HookCall, HookVerdict};
@@ -72,6 +73,8 @@ pub(crate) struct SessionHookState {
     blocked_prompts: HashMap<RunId, usize>,
     /// Runs a user's prompt started whose `UserPromptSubmit` hooks have not let it through yet.
     unchecked_prompts: HashSet<RunId>,
+    /// `asyncRewake` notifications no model request has read yet.
+    unread_rewakes: Vec<Message>,
 }
 
 impl SessionHookState {
@@ -83,6 +86,23 @@ impl SessionHookState {
     /// `run` starts with a user's prompt, which its `UserPromptSubmit` hooks check first.
     pub(crate) fn await_prompt_hooks(&mut self, run: RunId) {
         self.unchecked_prompts.insert(run);
+    }
+
+    /// An `asyncRewake` hook notified the Loop with `notification`: the Run whose model reads
+    /// it goes on as a `Stop` block's Run does.
+    pub(crate) fn note_rewake(&mut self, notification: Message) {
+        self.unread_rewakes.push(notification);
+    }
+
+    /// The Run `run` is about to send `messages`: the rewake notifications among them were
+    /// read by it.
+    fn read_rewakes(&mut self, messages: &[Message], run: RunId) {
+        let unread = self.unread_rewakes.len();
+        self.unread_rewakes
+            .retain(|notification| !messages.contains(notification));
+        if self.unread_rewakes.len() < unread {
+            self.continued_by_stop.insert(run);
+        }
     }
 
     /// Whether a prompt waits for its `UserPromptSubmit` hooks.
@@ -320,7 +340,8 @@ impl Agent {
     }
 
     /// Runs the `SessionStart` hooks the Chat waits for, before a model request of the Run
-    /// `receipt`; the source waits on when the Run is interrupted while they run.
+    /// `receipt`; the source waits on when the Run is interrupted while they run. Notes first
+    /// which `asyncRewake` notifications the request reads.
     pub(crate) async fn announce_session_start(
         &self,
         receipt: &Receipt,
@@ -331,6 +352,12 @@ impl Agent {
             let chat = chats
                 .get_mut(&receipt.chat_id)
                 .ok_or(AgentError::NotFound)?;
+            if !chat.hook_state.session.unread_rewakes.is_empty() {
+                let start = chat.snapshot.active_start();
+                chat.hook_state
+                    .session
+                    .read_rewakes(&chat.snapshot.messages[start..], receipt.run_id);
+            }
             let Some(source) = chat.hook_state.session.session_start.take() else {
                 return Ok(());
             };

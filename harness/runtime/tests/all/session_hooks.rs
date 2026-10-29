@@ -1007,3 +1007,54 @@ async fn subagent_stop_runs_before_an_auto_subagent_hands_its_report_back() {
     );
     bench.agent.shutdown().await;
 }
+
+/// Claude Code queues an `asyncRewake` notification as a Stop hook's feedback, so the turn it
+/// starts reads `stop_hook_active: true` at its end.
+#[tokio::test]
+async fn a_turn_an_async_rewake_hook_starts_tells_stop_hooks_they_are_active() {
+    let mut review = user_hook(HookEvent::PostToolUse, Some("Bash"), "review.sh");
+    review.background = Some(
+        tickloop_harness_protocol::hooks::HookBackground::AsyncRewake {
+            message: None,
+            summary: None,
+        },
+    );
+    let bench = Bench::start(
+        vec![
+            call("build", "Bash", json!({"command": "cargo build"})),
+            text("built"),
+            text("moved the token"),
+        ],
+        vec![review, user_hook(HookEvent::Stop, None, "check.sh")],
+    )
+    .await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    bench
+        .environment
+        .define_command("review.sh", move |_| MemoryCommandRun {
+            duration: Duration::from_millis(300),
+            ..exits(2, "", "hardcoded token in config.py")
+        });
+    bench.define("check.sh", |_| exits(0, "", ""));
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+    observe(&mut events, &receipt).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while bench.inputs_of("check.sh").len() < 2 {
+            let _ = next_event(&mut events).await;
+        }
+    })
+    .await
+    .expect("the rewake starts a turn whose end runs the Stop hook");
+    let inputs = bench.inputs_of("check.sh");
+    assert_eq!(inputs[0]["stop_hook_active"], false);
+    assert_eq!(inputs[1]["stop_hook_active"], true);
+    assert_eq!(inputs[1]["last_assistant_message"], "moved the token");
+    bench.agent.shutdown().await;
+}
