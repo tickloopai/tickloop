@@ -11,6 +11,7 @@ pub mod screen;
 pub mod screen_signals;
 pub mod shell;
 mod shell_screen;
+pub mod stop;
 pub mod views;
 
 pub mod sandbox;
