@@ -194,7 +194,14 @@ impl FamilyRecords {
                     });
                 let board = self.task_boards.get(&(root, loop_id))?;
                 let mutation = board.mutations.get(&mutation_id)?;
-                if mutation.actor != snapshot.id || mutation.input != format!("{name}:{input}") {
+                // The receipt holds the input as the call was prepared, the Transcript as the
+                // model wrote it.
+                let prepared = if name == "TaskUpdate" {
+                    crate::shared_tasks::prepared_update_input(input.clone())
+                } else {
+                    input.clone()
+                };
+                if mutation.actor != snapshot.id || mutation.input != format!("{name}:{prepared}") {
                     return None;
                 }
                 Some(crate::shared_tasks::reconciled_mutation_result(

@@ -18,6 +18,8 @@ mod busy_inputs;
 mod family_records;
 #[path = "all/live_context.rs"]
 mod live_context;
+#[path = "all/managed_execution.rs"]
+mod managed_execution;
 #[path = "all/permission_claims.rs"]
 mod permission_claims;
 #[path = "all/prompt_render.rs"]

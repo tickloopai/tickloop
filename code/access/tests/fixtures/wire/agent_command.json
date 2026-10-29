@@ -2,6 +2,7 @@
   {
     "kind": "create",
     "launch": {
+      "profile": "local",
       "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {

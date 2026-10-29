@@ -41,6 +41,10 @@ pub enum Line {
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
+    /// Durable ACP origin and session-only configuration; never client credentials.
+    AcpSession(AcpSessionEntry),
+    /// Bounded, validated proposed edit hunks; never a complete file snapshot or proof of success.
+    RecordedEdit(RecordedEditEntry),
     /// Following Claude Code: a file-rewind snapshot, associated with a message on the chain by
     /// message id.
     FileHistorySnapshot(FileHistorySnapshotEntry),
@@ -136,6 +140,8 @@ pub enum MetadataKind {
     LastPrompt,
     BranchOrigin,
     Delegation,
+    AcpSession,
+    RecordedEdit,
     ArtifactTicks,
     MonitorMembers,
     Subagents,
@@ -169,6 +175,7 @@ impl MetadataKind {
             | Self::LastPrompt
             | Self::BranchOrigin
             | Self::Delegation
+            | Self::AcpSession
             | Self::ArtifactTicks
             | Self::MonitorMembers
             | Self::Subagents
@@ -180,7 +187,9 @@ impl MetadataKind {
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Goal | Self::ScheduledTasks => Retention::SourceState,
-            Self::Response | Self::Input | Self::Wait | Self::NestedCall => Retention::LatestById,
+            Self::Response | Self::Input | Self::Wait | Self::NestedCall | Self::RecordedEdit => {
+                Retention::LatestById
+            }
             Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
                 Retention::Accumulating
             }
@@ -253,6 +262,8 @@ impl Line {
             Self::LastPrompt(_) => MetadataKind::LastPrompt,
             Self::BranchOrigin(_) => MetadataKind::BranchOrigin,
             Self::Delegation(_) => MetadataKind::Delegation,
+            Self::AcpSession(_) => MetadataKind::AcpSession,
+            Self::RecordedEdit(_) => MetadataKind::RecordedEdit,
             Self::FileHistorySnapshot(_) => MetadataKind::FileHistorySnapshot,
             Self::ContentReplacement(_) => MetadataKind::ContentReplacement,
             Self::Response(_) => MetadataKind::Response,
@@ -263,6 +274,17 @@ impl Line {
             Self::Unknown(_) => MetadataKind::Other,
         }
     }
+}
+
+/// Public review captured from a validated sidecar at preparation time. The terminal tool
+/// result determines whether the operation succeeded; these hunks alone grant no authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedEditEntry {
+    pub operation_id: Uuid,
+    pub run_id: Uuid,
+    pub call_id: String,
+    pub review: tickloop_harness_protocol::RecordedFileChangeReview,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -646,6 +668,58 @@ pub struct DelegationEntry {
     pub delegation: DelegationMetadata,
     #[serde(default = "tickloop_harness_protocol::SearchConfig::enabled_default")]
     pub search_config: Option<tickloop_harness_protocol::SearchConfig>,
+}
+
+/// The local authority boundary that created an ACP session. Paths are canonical and the
+/// directory identity detects a replacement at the same spelling after a restart.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionOrigin {
+    pub canonical_cwd: PathBuf,
+    pub cwd_device: u64,
+    pub cwd_inode: u64,
+    pub config_root: PathBuf,
+}
+
+impl AcpSessionOrigin {
+    pub fn capture(cwd: &std::path::Path, config_root: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let canonical_cwd = std::fs::canonicalize(cwd)?;
+        let metadata = std::fs::metadata(&canonical_cwd)?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ACP working directory is not a directory",
+            ));
+        }
+        Ok(Self {
+            canonical_cwd,
+            cwd_device: metadata.dev(),
+            cwd_inode: metadata.ino(),
+            config_root: std::fs::canonicalize(config_root)?,
+        })
+    }
+
+    pub fn matches_current(
+        &self,
+        cwd: &std::path::Path,
+        config_root: &std::path::Path,
+    ) -> std::io::Result<bool> {
+        Ok(*self == Self::capture(cwd, config_root)?)
+    }
+}
+
+/// The latest ACP session configuration. Only model identity is recorded, not its provider
+/// connection, token, environment or any MCP server configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionEntry {
+    pub chat_id: Uuid,
+    pub origin: AcpSessionOrigin,
+    pub startup_permission_ceiling: tickloop_harness_protocol::PermissionPolicy,
+    pub execution_mode: tickloop_harness_protocol::ExecutionMode,
+    pub model: ModelIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1214,6 +1288,12 @@ mod tests {
     }
 
     #[test]
+    fn acp_metadata_is_chat_latest_and_a_broken_known_record_is_not_unknown() {
+        assert_eq!(MetadataKind::AcpSession.retention(), Retention::ChatLatest);
+        assert!(serde_json::from_str::<Line>(r#"{"type":"acp-session","chatId":7}"#).is_err());
+    }
+
+    #[test]
     fn a_broken_line_of_a_known_kind_is_not_unknown() {
         assert!(serde_json::from_str::<Line>(r#"{"type":"user","uuid":7}"#).is_err());
     }
@@ -1603,6 +1683,23 @@ mod tests {
             Line::Provenance(ProvenanceEntry {
                 chat_id,
                 ..Default::default()
+            }),
+            Line::AcpSession(AcpSessionEntry {
+                chat_id,
+                origin: AcpSessionOrigin {
+                    canonical_cwd: PathBuf::from("/project"),
+                    cwd_device: 1,
+                    cwd_inode: 2,
+                    config_root: PathBuf::from("/config"),
+                },
+                startup_permission_ceiling: Default::default(),
+                execution_mode: tickloop_harness_protocol::ExecutionMode::Auto,
+                model: ModelIdentity {
+                    profile: "test".into(),
+                    protocol: tickloop_harness_protocol::Protocol::Responses,
+                    requested_model: "test".into(),
+                    provider: Default::default(),
+                },
             }),
             Line::LastPrompt(LastPromptEntry {
                 chat_id,

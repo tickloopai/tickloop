@@ -852,6 +852,8 @@ impl Agent {
             let mut candidate = base.clone();
             let cut = (index < base.snapshot.messages.len()).then_some((index, None));
             Self::prepare_cut(base, &mut candidate, cut)?;
+            let board_cleared = crate::shared_tasks::clear_board_for_new_answer(&mut candidate)
+                .map_err(AgentError::Invalid)?;
             let selected_leaf = staged.map(|staged| self.install_branch(chat, staged));
             if cut.is_some() {
                 self.commit_cut(chat, &mut candidate, index);
@@ -861,6 +863,9 @@ impl Agent {
                 && let Some(leaf) = selected_leaf
             {
                 self.emit_conversation_rewound(chat, leaf);
+            }
+            if board_cleared {
+                self.queue_task_boards(chat);
             }
             let receipt = Receipt {
                 chat_id,
@@ -876,6 +881,9 @@ impl Agent {
                 .expect("the answer's Run is queued")
                 .clone();
             chat.bookkeeping.lifecycle.accept(&ledger, &queued);
+            if board_cleared {
+                self.publish_task_board(&mut chats, chat_id, receipt.loop_id);
+            }
             receipt
         };
         self.start_next_run(chat_id).await?;

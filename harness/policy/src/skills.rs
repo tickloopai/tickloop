@@ -61,6 +61,11 @@ pub struct SkillExpansion {
     pub allowed_tools: Vec<String>,
 }
 
+impl SkillDefinition {
+    pub fn user_invocable(&self) -> bool {
+        self.user_invocable
+    }
+}
 impl TryFrom<SkillExpansion> for InvokedSkill {
     type Error = SkillError;
 

@@ -27,3 +27,6 @@ mod retired_herdr_views;
 mod runtime;
 #[path = "all/sandbox.rs"]
 mod sandbox;
+
+#[path = "all/managed.rs"]
+mod managed;

@@ -74,7 +74,7 @@ It first checks dependency boundaries and the Tick public API, then runs `cargo 
 
 ## Repository layout
 
-The shared Harness lives in `harness/`, with its only host entry point at `harness/sdk` (`tickloop-harness`). Tickloop Code lives in `code/`: `code/cli` is package `tickloop-code` and still builds the `tickloop` executable; `code/access` owns AgentAccess, `code/settings` persists settings.json, and `code/local-environment` implements local execution. Harness implementation packages use `tickloop-harness-*`; Code packages use `tickloop-code-*`. Both share the workspace version and release tag.
+The shared Harness lives in `harness/`, with its only host entry point at `harness/sdk` (`tickloop-harness`). Tickloop Code lives in `code/`: `code/cli` is package `tickloop-code` and still builds the `tickloop` executable; `code/access` owns AgentAccess, `code/acp` and `code/print` are its managed native clients, `code/settings` persists settings.json, and `code/local-environment` implements local execution. Harness implementation packages use `tickloop-harness-*`; Code packages use `tickloop-code-*`. Both share the workspace version and release tag.
 
 The Tick host stays in `tickhost/`, the Tick standard, SDK, package compatibility layer, plugin mechanism, installer, OAuth and examples in `tick/`, shared terminal presentation in `ui/`, the crates.io launcher in `distribution/cargo/`, and the patched crossterm copy in `vendor/crossterm/`. These public paths and package names are unchanged. Tick authors depend on the Tick public layer and `ui`, never on Harness or Code internals. The per-crate table and dependency rules are in [AGENTS.md](AGENTS.md) under "Structure and integration boundaries".
 

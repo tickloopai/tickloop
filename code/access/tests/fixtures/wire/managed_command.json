@@ -1,0 +1,315 @@
+[
+  {
+    "kind": "managed_load",
+    "session_uuid": "00000000-0000-0000-0000-000000000071",
+    "launch": {
+      "profile": "acp",
+      "folder": "/work/project",
+      "config_root": "/home/user/.tickloop",
+      "model": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "host_options": {
+        "execution_mode_override": "acceptEdits",
+        "directory_trust": "CallerManaged",
+        "prompt_policy": "Interactive"
+      },
+      "session_persistence": true,
+      "exact_chat": null,
+      "environment": [
+        {
+          "name": [
+            84,
+            69,
+            82,
+            77
+          ],
+          "value": [
+            120,
+            116,
+            101,
+            114,
+            109,
+            45,
+            50,
+            53,
+            54,
+            99,
+            111,
+            108,
+            111,
+            114
+          ]
+        }
+      ],
+      "host_work_context": {
+        "socket": "/run/herdr.sock",
+        "workspace": "w1"
+      },
+      "session_mcp_servers": [
+        {
+          "name": "example",
+          "program": "/usr/bin/example-mcp",
+          "args": [
+            "--stdio"
+          ],
+          "env": {},
+          "cwd": "/work/project"
+        }
+      ]
+    },
+    "session_id": "00000000-0000-0000-0000-000000000070",
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  {
+    "kind": "managed_configure",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "change": {
+      "model_id": "example-large",
+      "mode": "acceptEdits"
+    }
+  },
+  {
+    "kind": "managed_finalize_release",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  {
+    "kind": "create_managed",
+    "launch": {
+      "profile": "acp",
+      "folder": "/work/project",
+      "config_root": "/home/user/.tickloop",
+      "model": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "host_options": {
+        "execution_mode_override": "acceptEdits",
+        "directory_trust": "CallerManaged",
+        "prompt_policy": "Interactive"
+      },
+      "session_persistence": true,
+      "exact_chat": null,
+      "environment": [
+        {
+          "name": [
+            84,
+            69,
+            82,
+            77
+          ],
+          "value": [
+            120,
+            116,
+            101,
+            114,
+            109,
+            45,
+            50,
+            53,
+            54,
+            99,
+            111,
+            108,
+            111,
+            114
+          ]
+        }
+      ],
+      "host_work_context": {
+        "socket": "/run/herdr.sock",
+        "workspace": "w1"
+      },
+      "session_mcp_servers": [
+        {
+          "name": "example",
+          "program": "/usr/bin/example-mcp",
+          "args": [
+            "--stdio"
+          ],
+          "env": {},
+          "cwd": "/work/project"
+        }
+      ]
+    },
+    "initial": null,
+    "session_id": "00000000-0000-0000-0000-000000000070",
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  {
+    "kind": "managed_submit",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "input": {
+      "kind": "text",
+      "text": "inspect the project",
+      "contexts": [
+        {
+          "kind": "resource",
+          "uri": "custom://example/notes",
+          "mime_type": "text/plain",
+          "name": "Notes",
+          "content": "client-supplied material"
+        },
+        {
+          "kind": "prompt_text",
+          "text": "compare with the attached material"
+        }
+      ],
+      "paths": []
+    }
+  },
+  {
+    "kind": "managed_decide_permission",
+    "request": {
+      "execution": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "agent_id": "00000000-0000-0000-0000-0000000000a1",
+        "generation": 3
+      },
+      "request_id": "00000000-0000-0000-0000-000000000061",
+      "kind": "Permission",
+      "version": 1
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "allow": true,
+    "scope": "Once",
+    "comment": null,
+    "rule": null
+  },
+  {
+    "kind": "managed_heartbeat",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  {
+    "kind": "managed_settle",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "cancel": false
+  },
+  {
+    "kind": "managed_release",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+]

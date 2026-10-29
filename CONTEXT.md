@@ -179,6 +179,9 @@ The AI executor that understands goals, makes judgments, and calls tools to get 
 **Chat**:
 A persistent conversation between the user and one Agent, through which the user starts, observes, and controls its single Loop; the same Chat can be open in several Agent Views at once. A Chat is not a Tick and cannot be subscribed to.
 
+**Managed Execution**:
+An Agent invocation whose lifecycle belongs to a native ACP or Print client, scoped to its Chat and client control lease. ACP sessions name Chats and each prompt starts a turn of that Chat's single Loop; neither a session nor an execution profile is a Tick type or an execution mode.
+
 **Transcript**:
 The persistent record of a Chat's conversation, storing conversation content and Loop state changes in the order they happen; the Chat is restored from it after a restart. When the same Transcript is continued in several places it can form several conversation chains, all still belonging to the same Chat.
 _Avoid_: Session, session archive

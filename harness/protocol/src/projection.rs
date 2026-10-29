@@ -690,6 +690,14 @@ pub fn append_raw_projection(
                         content.push(Content::Text { text: format!("The result for tool call {} became available at archive message {}, after the intervening conversation. Earlier intervening turns occurred while this result was pending; its result is paired with the original call in this model context.", call.wire_id, message_index - active_start) });
                     }
                 }
+                // A prompt that opens with an attachment keeps no text of its own. Providers
+                // such as Anthropic reject an empty text block, so its contexts stand alone.
+                Content::Text { text }
+                    if text.is_empty()
+                        && snapshot
+                            .message_contexts
+                            .get(&message_index)
+                            .is_some_and(|contexts| !contexts.is_empty()) => {}
                 _ => content.push(block.clone()),
             }
         }
@@ -740,12 +748,10 @@ pub fn complete_boundaries(messages: &[Message]) -> Result<Vec<usize>, InvalidCo
     for (index, message) in messages.iter().enumerate() {
         for content in &message.content {
             match content {
-                Content::ToolUse { id, .. } => {
-                    if !pending.insert(id.clone()) {
-                        return Err(InvalidConversation(
-                            "context has duplicate unresolved tool calls".into(),
-                        ));
-                    }
+                Content::ToolUse { id, .. } if !pending.insert(id.clone()) => {
+                    return Err(InvalidConversation(
+                        "context has duplicate unresolved tool calls".into(),
+                    ));
                 }
                 Content::ToolResult { tool_use_id, .. } if !pending.remove(tool_use_id) => {
                     return Err(InvalidConversation(

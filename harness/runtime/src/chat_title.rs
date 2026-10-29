@@ -22,6 +22,16 @@ impl Agent {
         if pending.contains_key(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
+        // No model call precedes a pending session MCP startup approval; the admitted startup
+        // starts the title instead, and a denied one never does.
+        let provider = self.inner.host_tools.read().unwrap().clone();
+        if provider.is_some_and(|provider| {
+            !provider
+                .session_bootstrap()
+                .is_ok_and(|starts| starts.is_empty())
+        }) {
+            return;
+        }
         let (client, prompt, message_id) = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {

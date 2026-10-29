@@ -102,8 +102,62 @@ use tickloop_harness::protocol::{
 /// 36.0 adds an ended root Agent whose last turn had finished (`EndedOutcome::Completed`,
 /// `EndReason::Finished`), which older readers reject as unknown, and whether an Agent summary
 /// still has work pending while its Loop is idle.
-pub const PROTOCOL_MAJOR: u16 = 36;
+/// 37.0 adds managed ACP and Print executions (profiles, control leases, settlement and
+/// session loading), resource and image input contexts and recorded-edit replay, which older
+/// readers reject as unknown.
+pub const PROTOCOL_MAJOR: u16 = 37;
 pub const PROTOCOL_MINOR: u16 = 0;
+pub const MANAGED_LEASE_SECONDS: u64 = 45;
+
+/// An execution contract, enforced by the Worker rather than by a View.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionProfile {
+    #[default]
+    Local,
+    OneShot,
+    Acp,
+}
+
+/// A client-generated control secret. Never include it in transcripts, diagnostics or results.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ManagedToken(String);
+
+impl ManagedToken {
+    pub fn new() -> Self {
+        // A random control secret, not a time-ordered Tickloop identity.
+        Self(format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        let left = self.0.as_bytes();
+        let right = other.0.as_bytes();
+        left.len() == 64
+            && right.len() == 64
+            && left
+                .iter()
+                .zip(right)
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                == 0
+    }
+}
+
+impl Default for ManagedToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ManagedToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedToken([redacted])")
+    }
+}
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -240,6 +294,8 @@ impl std::fmt::Debug for EnvironmentValue {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LaunchSpec {
+    #[serde(default)]
+    pub profile: ExecutionProfile,
     pub folder: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<PathBuf>,
@@ -250,11 +306,15 @@ pub struct LaunchSpec {
     pub exact_chat: Option<Uuid>,
     pub environment: Vec<EnvironmentValue>,
     pub host_work_context: Option<HostWorkContext>,
+    /// Invocation-private descriptors. Never persisted in transcript metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_mcp_servers: Vec<tickloop_harness::protocol::SessionMcpServer>,
 }
 
 impl LaunchSpec {
     pub fn embedded(folder: PathBuf) -> Self {
         Self {
+            profile: ExecutionProfile::Local,
             folder,
             additional_directories: Vec::new(),
             config_root: None,
@@ -264,8 +324,71 @@ impl LaunchSpec {
             exact_chat: None,
             environment: Vec::new(),
             host_work_context: None,
+            session_mcp_servers: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfigurationChange {
+    pub model_id: Option<String>,
+    pub mode: Option<ExecutionMode>,
+    /// Omitted keeps the effort; null selects the model's automatic effort.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub reasoning_effort: Option<Option<ReasoningEffort>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedSkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedConfiguration {
+    pub model_id: String,
+    pub mode: ExecutionMode,
+    pub models: Vec<ManagedModelInfo>,
+    pub modes: Vec<ExecutionMode>,
+    /// `None` is the model's automatic effort.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The effort levels the current model's card offers.
+    #[serde(default)]
+    pub efforts: Vec<ReasoningEffort>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedSessionInfo {
+    pub session_id: Uuid,
+    pub cwd: PathBuf,
+    pub title: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedSessionPage {
+    pub sessions: Vec<ManagedSessionInfo>,
+    pub next_cursor: Option<String>,
+}
+
+/// Public Transcript DisplayNode values, not model/system messages.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedHistoryPage {
+    pub session_id: Uuid,
+    pub items: Vec<serde_json::Value>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -297,6 +420,56 @@ pub struct CommandEnvelope {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum AgentCommand {
+    /// Must be bound to the actual IPC session before dispatch; initial input must be absent.
+    CreateManaged {
+        launch: LaunchSpec,
+        initial: Option<UserInput>,
+        session_id: Uuid,
+        token: ManagedToken,
+    },
+    /// ACP-only restore. Bound to the real IPC session, never accepts initial input.
+    ManagedLoad {
+        session_uuid: Uuid,
+        launch: LaunchSpec,
+        session_id: Uuid,
+        token: ManagedToken,
+    },
+    ManagedConfigure {
+        execution: ExecutionRef,
+        token: ManagedToken,
+        change: ManagedConfigurationChange,
+    },
+    ManagedSubmit {
+        execution: ExecutionRef,
+        token: ManagedToken,
+        input: UserInput,
+    },
+    ManagedDecidePermission {
+        request: RequestRef,
+        token: ManagedToken,
+        allow: bool,
+        scope: PermissionScope,
+        comment: Option<String>,
+        rule: Option<String>,
+    },
+    ManagedHeartbeat {
+        execution: ExecutionRef,
+        token: ManagedToken,
+    },
+    ManagedSettle {
+        execution: ExecutionRef,
+        token: ManagedToken,
+        cancel: bool,
+    },
+    /// Internal daemon-to-Worker acknowledgement after *all* ownership cleanup succeeded.
+    ManagedFinalizeRelease {
+        execution: ExecutionRef,
+        token: ManagedToken,
+    },
+    ManagedRelease {
+        execution: ExecutionRef,
+        token: ManagedToken,
+    },
     AddArtifactTick {
         execution: ExecutionRef,
         tick: ArtifactTick,
@@ -453,12 +626,33 @@ pub enum AgentCommand {
 }
 
 impl AgentCommand {
+    pub fn is_managed(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateManaged { .. }
+                | Self::ManagedLoad { .. }
+                | Self::ManagedConfigure { .. }
+                | Self::ManagedSubmit { .. }
+                | Self::ManagedDecidePermission { .. }
+                | Self::ManagedHeartbeat { .. }
+                | Self::ManagedSettle { .. }
+                | Self::ManagedRelease { .. }
+                | Self::ManagedFinalizeRelease { .. }
+        )
+    }
+
     pub fn execution(&self) -> Option<ExecutionRef> {
         match self {
             Self::SendFamilyInput {
                 source_execution, ..
             } => Some(*source_execution),
             Self::Submit { execution, .. }
+            | Self::ManagedSubmit { execution, .. }
+            | Self::ManagedConfigure { execution, .. }
+            | Self::ManagedHeartbeat { execution, .. }
+            | Self::ManagedSettle { execution, .. }
+            | Self::ManagedRelease { execution, .. }
+            | Self::ManagedFinalizeRelease { execution, .. }
             | Self::ContinueLoop { execution, .. }
             | Self::Configure { execution, .. }
             | Self::EditHistory { execution, .. }
@@ -479,6 +673,7 @@ impl AgentCommand {
             | Self::ReconnectMcpServer { execution, .. }
             | Self::ClearCompletedTasks { execution, .. } => Some(*execution),
             Self::DecidePermission { request, .. }
+            | Self::ManagedDecidePermission { request, .. }
             | Self::AnswerQuestion { request, .. }
             | Self::DeclineQuestion { request } => Some(request.execution),
             _ => None,
@@ -681,6 +876,17 @@ pub enum AgentDetailQuery {
         run_id: Uuid,
         call_id: String,
     },
+    OperationReview {
+        run_id: Uuid,
+        call_id: String,
+    },
+    ManagedConfiguration {
+        token: ManagedToken,
+    },
+    ManagedHistory {
+        token: ManagedToken,
+        cursor: Option<String>,
+    },
     /// The events still in the Chat's replay window after sequence `after`, such as one a feed
     /// could not carry.
     Events {
@@ -722,6 +928,10 @@ pub enum AgentDetailQuery {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationRequest {
+    ManagedSessions {
+        launch: Box<LaunchSpec>,
+        cursor: Option<String>,
+    },
     Overview {
         filter: AgentFilter,
         page: Page,
@@ -1078,6 +1288,10 @@ impl RequestRef {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationValue {
+    ManagedConfiguration(ManagedConfiguration),
+    ManagedSessions(ManagedSessionPage),
+    ManagedHistory(ManagedHistoryPage),
+    OperationReview(Option<tickloop_harness::protocol::RecordedFileChangeReview>),
     SearchTestPending,
     AccountModelsPending,
     ProviderCredentials(Box<ProviderCredentialScope>),
@@ -1100,6 +1314,8 @@ pub enum ObservationValue {
     Skills {
         available: Option<bool>,
         warnings: Vec<String>,
+        #[serde(default)]
+        commands: Vec<ManagedSkillInfo>,
     },
     Warnings(Vec<String>),
     McpServers(Vec<tickloop_harness::protocol::mcp::McpServerStatus>),
@@ -1176,6 +1392,10 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
+    ManagedConfigured(ManagedConfiguration),
+    ManagedSettled {
+        snapshot: Box<LiveChatSnapshot>,
+    },
     AutoEnvironmentDraft(tickloop_harness::protocol::AutoEnvironmentDraft),
     ArtifactTicks(Vec<ArtifactTick>),
     MonitorMembership(MonitorMembership),
@@ -1349,6 +1569,11 @@ pub struct DisplayReceipt {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum AccessCapability {
+    ManagedExecutions,
+    ManagedConfiguration,
+    ManagedHistory,
+    ManagedSessionLoad,
+    ManagedSessionList,
     Overview,
     AgentDetails,
     Records,
@@ -1695,6 +1920,8 @@ fn carries_history(value: &ObservationValue) -> bool {
         | ObservationValue::Operation(_)
         | ObservationValue::Events(_)
         | ObservationValue::Transcript(_)
+        | ObservationValue::ManagedHistory(_)
+        | ObservationValue::OperationReview(_)
         | ObservationValue::RewindPoints(_) => true,
         ObservationValue::Receipt(Some(receipt)) => receipt_carries_history(receipt),
         _ => false,
@@ -1707,6 +1934,7 @@ fn receipt_carries_history(receipt: &CommandReceipt) -> bool {
         Some(
             CommandResult::Created { .. }
                 | CommandResult::Loaded { .. }
+                | CommandResult::ManagedSettled { .. }
                 | CommandResult::Branch { .. }
                 | CommandResult::Compact { .. }
                 | CommandResult::DirectedSummary { .. }
@@ -1715,4 +1943,12 @@ fn receipt_carries_history(receipt: &CommandReceipt) -> bool {
                 | CommandResult::QueueTaken(_)
         )
     )
+}
+
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }

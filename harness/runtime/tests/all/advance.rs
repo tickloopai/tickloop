@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use tickloop_harness_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Content, Decision, DirectedSummaryRequest, EventKind, LoopState,
-    ModelIdentity, PermissionRule, PromptPolicy, Protocol, Role, SummaryDirection, Usage,
+    AgentHostOptions, ChatId, ChatSnapshot, Content, Decision, DirectedSummaryRequest, EventKind,
+    ExecutionMode, LoopState, ModelIdentity, PermissionRule, PromptPolicy, Protocol, Role,
+    SummaryDirection, Usage,
 };
 use tickloop_harness_runtime::transcript::{
     AppendAck, AppendBatch, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
@@ -515,6 +516,88 @@ async fn a_repeated_regeneration_adds_exactly_one_sibling_answer() {
         LoopState::Idle
     );
     agent.shutdown().await;
+}
+
+/// One answer plans and finishes its own tasks: another answer to the prompt, regenerated or
+/// after an edit, starts with an empty task board, also once the Chat is reloaded.
+#[tokio::test]
+async fn another_answer_to_a_prompt_starts_with_an_empty_task_board() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let create = |title: &str| {
+        Step::Reply(call(
+            &format!("create {title}"),
+            "TaskCreate",
+            json!({"mutation_id": Uuid::new_v4(), "title": title, "description": title}),
+        ))
+    };
+    let model = Script::new(vec![
+        create("first plan"),
+        Step::Reply(text("first take")),
+        create("second plan"),
+        Step::Reply(text("second take")),
+        create("edited plan"),
+        Step::Reply(text("edited take")),
+    ]);
+    let agent = agent(store.clone(), model.clone());
+    let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent.set_task_tools_enabled(chat, true).await.unwrap();
+    let task_titles = |snapshot: ChatSnapshot| {
+        snapshot
+            .task_boards
+            .values()
+            .flat_map(|board| board.tasks.iter().map(|task| task.title.clone()))
+            .collect::<Vec<_>>()
+    };
+    let asked = complete(&agent, chat, after_leaf("the question")).await;
+    assert_eq!(
+        task_titles(agent.snapshot(chat).await.unwrap()),
+        ["first plan"]
+    );
+    let first_take = answer(&agent, &asked).await;
+    let regenerate = TurnRequest {
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
+        op: TurnOp::RegenerateAnswer { answer: first_take },
+        delivery: Delivery::Queue,
+        host_context: None,
+    };
+    complete(&agent, chat, regenerate).await;
+    assert_eq!(
+        task_titles(agent.snapshot(chat).await.unwrap()),
+        ["second plan"]
+    );
+    let edit = TurnRequest {
+        input_id: tickloop_ids::Id::from(Uuid::new_v4()),
+        op: TurnOp::ReplacePrompt {
+            prompt: asked.input_id().uuid().into(),
+            message: UserMessage {
+                text: "the question, edited".into(),
+                ..Default::default()
+            },
+        },
+        delivery: Delivery::Queue,
+        host_context: None,
+    };
+    complete(&agent, chat, edit).await;
+    assert_eq!(
+        task_titles(agent.snapshot(chat).await.unwrap()),
+        ["edited plan"]
+    );
+    agent.sync().await.unwrap();
+    agent.shutdown().await;
+    drop(agent);
+
+    let restored = self::agent(store.clone(), Script::replies(&[]));
+    restored.resume_chat(chat).await.unwrap();
+    assert_eq!(
+        task_titles(restored.snapshot(chat).await.unwrap()),
+        ["edited plan"]
+    );
+    restored.shutdown().await;
 }
 
 #[tokio::test]

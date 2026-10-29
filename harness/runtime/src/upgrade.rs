@@ -83,6 +83,11 @@ impl Agent {
     /// Freezes a complete Worker family at a boundary with no in-flight execution. A busy
     /// family stays live and returns `None`; no user operation is cancelled to make it idle.
     pub async fn prepare_upgrade(&self) -> Result<Option<AgentUpgradeCheckpoint>, AgentError> {
+        // Kernel-held ACP claims cannot be reconstructed from serialized state while the old
+        // Worker owns them. Keep this Worker pinned until the invocation explicitly releases.
+        if !self.inner.acp_claims.lock().await.is_empty() {
+            return Ok(None);
+        }
         if self.inner.closed.load(Ordering::SeqCst)
             || self.inner.upgrade_paused.load(Ordering::SeqCst)
         {
@@ -373,6 +378,7 @@ impl Agent {
                     family_stopping: false,
                     task_checkpoint_pending: false,
                     family_finishing: HashSet::new(),
+                    unsettled_runs: HashSet::new(),
                     start_new_tool_result_message: saved.start_new_tool_result_message,
                     announced_loop_state,
                     active: saved
