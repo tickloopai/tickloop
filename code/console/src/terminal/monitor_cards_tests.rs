@@ -563,7 +563,7 @@ fn cards_close_with_their_chat_and_their_rows_and_lose_the_focus_with_them() {
 }
 
 #[test]
-fn the_revealed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it() {
+fn the_revealed_or_previewed_card_comes_right_after_the_focused_one() {
     let chat = Uuid::from_u128(1);
     let [focused, user, agent, closed]: [InstanceRef; 4] = [
         "hosted:focused",
@@ -596,6 +596,36 @@ fn the_revealed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it()
     assert!(!cards.reveal(&closed), "a card not open is not opened");
     assert!(!cards.is_open(&closed) && cards.revealed().is_none());
 
+    assert!(
+        !cards.preview(chat, agent.clone()),
+        "Tab on an open card reveals it"
+    );
+    assert_eq!(cards.revealed(), Some(&agent));
+    assert_eq!(cards.card(&agent).unwrap().origin, CardOrigin::Agent);
+    assert!(cards.end_reveal());
+    assert!(cards.is_open(&agent));
+
+    assert!(
+        cards.preview(chat, closed.clone()),
+        "Tab opens a card not open"
+    );
+    assert_eq!(cards.card(&closed).unwrap().origin, CardOrigin::Preview);
+    assert!(priority(&cards, &closed) > priority(&cards, &user));
+    assert!(cards.end_reveal());
+    assert!(
+        !cards.is_open(&closed),
+        "a card open only as a preview closes"
+    );
+
+    cards.preview(chat, closed.clone());
+    cards.open(chat, closed.clone());
+    assert!(cards.end_reveal());
+    assert_eq!(
+        cards.card(&closed).unwrap().origin,
+        CardOrigin::User,
+        "a preview the user kept stays"
+    );
+
     cards.reveal(&user);
     cards.close(&user);
     assert_eq!(
@@ -606,11 +636,12 @@ fn the_revealed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it()
 }
 
 #[test]
-fn a_chats_cards_are_remembered_until_the_console_forgets_the_chat() {
+fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_chat() {
     let chat = Uuid::from_u128(1);
     let shown: InstanceRef = "hosted:shown".parse().unwrap();
     let used: InstanceRef = "hosted:used".parse().unwrap();
     let hidden: InstanceRef = "hosted:hidden".parse().unwrap();
+    let previewed: InstanceRef = "hosted:previewed".parse().unwrap();
     let gone: InstanceRef = "hosted:gone".parse().unwrap();
     let mut cards = MonitorCards::default();
     cards.open(chat, shown.clone());
@@ -618,7 +649,7 @@ fn a_chats_cards_are_remembered_until_the_console_forgets_the_chat() {
     cards.open(chat, gone.clone());
     cards.open(chat, hidden.clone());
     cards.hide(&hidden);
-    cards.reveal(&used);
+    cards.preview(chat, previewed.clone());
     cards.focus(shown.clone());
     let sequences: Vec<u64> = [&shown, &used]
         .iter()
@@ -627,7 +658,7 @@ fn a_chats_cards_are_remembered_until_the_console_forgets_the_chat() {
 
     cards.remember();
     assert!(cards.cards().is_empty() && cards.focused().is_none());
-    assert_eq!(cards.revealed(), None, "the reveal is not remembered");
+    assert_eq!(cards.revealed(), None, "the preview is not remembered");
     assert!(cards.agent_may_show(&hidden), "no Chat is shown");
     let restored = cards.restore(chat, |_| true, |instance| instance != &gone);
     assert_eq!(restored, [shown.clone(), used.clone()]);

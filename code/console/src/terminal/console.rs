@@ -1013,9 +1013,6 @@ pub(super) struct State {
     shown_cards: Vec<tick_protocol::InstanceRef>,
     /// The open cards the last frame collapsed for lack of room.
     collapsed_cards: Vec<tick_protocol::InstanceRef>,
-    /// Where the selection rests on a row with an open card while the Monitor list has the keys;
-    /// the card shows once it rested long enough.
-    selection_rest: Option<cards::SelectionRest>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
     /// Agent's use showed; the input loop sends it.
     queued_card_inputs: Vec<InputEvent>,
@@ -6452,7 +6449,6 @@ impl State {
             awaited_agent_cards: Vec::new(),
             shown_cards: Vec::new(),
             collapsed_cards: Vec::new(),
-            selection_rest: None,
             queued_card_inputs: Vec::new(),
             card_press: None,
             member_probes: Vec::new(),
@@ -12979,8 +12975,8 @@ impl State {
                     self.monitor.overlay = false;
                     self.rendered_region = None;
                 }
-                (KeyCode::Tab, KeyModifiers::NONE) => self.cycle_rows(1),
-                (KeyCode::BackTab, _) => self.cycle_rows(-1),
+                (KeyCode::Tab, KeyModifiers::NONE) => return self.cycle_rows(1),
+                (KeyCode::BackTab, _) => return self.cycle_rows(-1),
                 (
                     KeyCode::Char(crate::monitor_rows::MONITOR_HIDE_CARDS_KEY),
                     KeyModifiers::NONE,
@@ -14253,17 +14249,7 @@ fn read_keys(
         if !settle_background_work(state, stop, sender, input_was_idle, &mut deferred_frame)? {
             break;
         }
-        // The selected row's open card shows on time even while nothing is typed.
-        let wait = state
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .selection_reveal_deadline()
-            .map_or(INPUT_POLL_INTERVAL, |deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(INPUT_POLL_INTERVAL)
-            });
-        if !event::poll(wait)? {
+        if !event::poll(INPUT_POLL_INTERVAL)? {
             if !idle_tick(state, stop, sender)? {
                 break;
             }
@@ -14312,7 +14298,6 @@ fn read_keys(
                 None
             }
         };
-        redraw |= state.settle_selection_reveal(Instant::now());
         if (redraw || submission_released) && in_burst && event::poll(Duration::ZERO)? {
             deferred_frame = true;
         } else if redraw || submission_released || std::mem::take(&mut deferred_frame) {
@@ -14378,7 +14363,7 @@ fn idle_tick(
     // scrolling from here.
     let selection_scrolled = state.scroll_selection(Instant::now());
     let requested_plan_edit = state.take_requested_plan_edit();
-    let (cards_changed, card_inputs) = state.settle_card_signals(Instant::now());
+    let (cards_changed, card_inputs) = state.settle_card_signals();
     if state.poll_clipboard_hint(Instant::now())
         || confirmation_expired
         || rows_changed
