@@ -1635,6 +1635,205 @@ fn cards_shown_in_a_subagents_chat_come_back_when_the_user_returns_to_it() {
     assert_eq!(origin(&state, &tick), Some(CardOrigin::User));
 }
 
+fn shift_z() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT)
+}
+
+#[test]
+fn z_hides_every_shown_card_and_the_agents_use_shows_them_again_unless_the_user_hid_one() {
+    let (mut state, rows) = four_hosted_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    show_with_space(&mut state, one);
+    show_with_space(&mut state, four);
+    assert!(state.key(key(KeyCode::Char(' '))).is_none(), "hides four");
+    state.monitor.flash_use(two.clone(), 1);
+    assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(two));
+    state.monitor.select(two);
+    assert!(press_at(&mut state, KeyCode::Tab, KeyModifiers::NONE, *SETTLED_AT).is_none());
+    attaches(rest_until(&mut state, *SETTLED_AT + RESTED), chat, three);
+    assert_eq!(origin(&state, one), Some(CardOrigin::User));
+    assert_eq!(origin(&state, two), Some(CardOrigin::Agent));
+    assert_eq!(origin(&state, three), Some(CardOrigin::Preview));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.monitor_list_hint().contains("z/Z hide/show all"));
+
+    assert!(state.key(key(KeyCode::Char('z'))).is_none());
+    assert!(state.cards.cards().is_empty(), "every card hides");
+    assert!(state.monitor.focused && !state.card_focused());
+    assert_eq!(selected(&state), *three, "the selection stays");
+    assert!(state.editor.draft().is_empty(), "z is the list's key");
+    assert!(queued_attaches(&mut state, chat).is_empty());
+    assert!(
+        rest_until(&mut state, *SETTLED_AT + Duration::from_secs(10)).is_none(),
+        "the selected row previews again only once the selection comes back"
+    );
+    assert!(
+        state.key(key(KeyCode::Char('z'))).is_none(),
+        "nothing to hide"
+    );
+    assert!(state.monitor.focused && state.editor.draft().is_empty());
+
+    for (sequence, row) in [one, two, three, four].into_iter().enumerate() {
+        state.monitor.flash_use(row.clone(), sequence as u64 + 2);
+    }
+    let mut shown_again = queued_attaches(&mut state, chat);
+    shown_again.sort_by_key(|instance| rows.iter().position(|row| row == instance));
+    assert_eq!(
+        shown_again,
+        [one.clone(), two.clone(), three.clone()],
+        "z does not hide them from the Agent's use; the card the user hid stays hidden"
+    );
+    for row in [one, two, three] {
+        assert_eq!(origin(&state, row), Some(CardOrigin::Agent));
+    }
+}
+
+/// A View of a Chat whose focused Monitor lists a row without a card above four hosted Ticks,
+/// too short for all their cards; returns the rows in the list's order, the first selected.
+fn short_fixture() -> (State, Vec<tick_protocol::InstanceRef>) {
+    let mut state = State::new(true, 140, 30);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state
+        .monitor
+        .replace(TickGroup::Artifacts, vec![plain_entry("notes")]);
+    state.monitor.replace(
+        TickGroup::Ticks,
+        ["one", "two", "three", "four"].map(hosted_entry).into(),
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.monitor.focus(false, None);
+    let rows: Vec<_> = state
+        .monitor
+        .entries()
+        .iter()
+        .map(|entry| entry.instance.clone())
+        .collect();
+    state.monitor.select(&rows[0]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    (state, rows)
+}
+
+#[test]
+fn shift_z_shows_every_card_as_the_users_and_the_higher_rows_take_the_room() {
+    for show_key in [shift_z(), key(KeyCode::Char('Z'))] {
+        let (mut state, rows) = short_fixture();
+        let chat = state.chat.unwrap();
+        let [notes, one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3], &rows[4]];
+        show_with_space(&mut state, one);
+        show_with_space(&mut state, three);
+        assert!(state.key(key(KeyCode::Char(' '))).is_none(), "hides three");
+        state.monitor.flash_use(two.clone(), 1);
+        assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(two));
+        state.monitor.select(notes);
+
+        assert!(state.key(show_key).is_none());
+        assert_eq!(
+            queued_attaches(&mut state, chat),
+            [three.clone(), four.clone()],
+            "the views of the cards not shown yet attach, in the list's order"
+        );
+        assert!(
+            !state.cards.is_open(notes),
+            "a row without a card only stays"
+        );
+        for row in [one, two, three, four] {
+            assert_eq!(origin(&state, row), Some(CardOrigin::User), "{show_key:?}");
+            assert!(state.cards.agent_may_show(row), "no row stays hidden");
+        }
+        assert!(state.monitor.focused && !state.card_focused());
+        assert_eq!(selected(&state), *notes, "the selection stays");
+        assert!(state.editor.draft().is_empty(), "Z is the list's key");
+
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let mut shown = state.shown_cards.clone();
+        shown.sort_by_key(|instance| rows.iter().position(|row| row == instance));
+        assert!(
+            !shown.is_empty() && shown.len() < 4,
+            "the fixture is too short for every card: {shown:?}"
+        );
+        assert_eq!(
+            shown,
+            rows[1..=shown.len()],
+            "the higher rows win the room, the one shown first before Z included"
+        );
+
+        assert!(state.key(show_key).is_none());
+        assert!(
+            queued_attaches(&mut state, chat).is_empty(),
+            "nothing more to show"
+        );
+    }
+}
+
+#[test]
+fn z_and_shift_z_are_text_in_the_input_and_the_ticks_keys_in_a_focused_card() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    show_with_space(&mut state, &rows[1]);
+    state.monitor.focused = false;
+    state.key(key(KeyCode::Char('z')));
+    state.key(shift_z());
+    assert_eq!(state.editor.draft(), "zZ");
+    assert!(state.cards.is_open(&rows[1]) && !state.cards.is_open(&rows[2]));
+    assert!(queued_attaches(&mut state, chat).is_empty());
+
+    let mut state = cards_fixture();
+    let (instance, mut requests) = attached_hosted_card(&mut state);
+    state.enter_card(instance.clone());
+    queued_requests(&mut requests);
+    state.card_input(b"zZ", Instant::now(), &mut Vec::new());
+    assert!(state.card_focused() && state.cards.is_open(&instance));
+    assert_eq!(
+        queued_requests(&mut requests),
+        [crate::terminal::monitor_cards::CardRequest::Input(
+            b"zZ".to_vec()
+        )]
+    );
+}
+
+#[test]
+fn cards_shift_z_showed_come_back_in_the_same_order_after_a_chat_switch() {
+    let (mut state, rows) = short_fixture();
+    let chat = state.chat.unwrap();
+    assert!(state.key(shift_z()).is_none());
+    let card_rows = &rows[1..];
+    assert_eq!(queued_attaches(&mut state, chat), card_rows);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let shown = state.shown_cards.clone();
+
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.switch_view_chat(Some(chat));
+    let mut restored = queued_attaches(&mut state, chat);
+    restored.sort_by_key(|instance| rows.iter().position(|row| row == instance));
+    assert_eq!(restored, card_rows);
+    for row in card_rows {
+        assert_eq!(origin(&state, row), Some(CardOrigin::User));
+    }
+    state.monitor.focus(false, None);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(
+        state.shown_cards, shown,
+        "the higher rows still win the room"
+    );
+
+    assert!(state.key(key(KeyCode::Char('z'))).is_none());
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.switch_view_chat(Some(chat));
+    assert!(
+        queued_attaches(&mut state, chat).is_empty(),
+        "cards z hid stay hidden after a Chat switch"
+    );
+    state.monitor.flash_use(rows[1].clone(), 1);
+    assert_eq!(
+        queued_attaches(&mut state, chat),
+        std::slice::from_ref(&rows[1]),
+        "and the Agent's use still shows them"
+    );
+}
+
 fn collapsed(state: &State, instance: &tick_protocol::InstanceRef) -> bool {
     state.cards.is_open(instance) && !state.shown_cards.contains(instance)
 }
@@ -1845,4 +2044,51 @@ fn space_hides_a_preview_until_the_selection_comes_back_and_shows_a_card_before_
         Some(CardOrigin::User),
         "shown as the user's"
     );
+}
+
+#[test]
+fn space_keeps_the_keys_on_a_tick_row_without_a_card_and_types_on_an_artifact_row() {
+    let mut state = cards_fixture();
+    let (instance, _requests) = attached_hosted_card(&mut state);
+    state.key(key(KeyCode::Enter));
+    assert!(state.card_focused());
+    change_row(&mut state, &instance, |entry| {
+        entry.status = "lost".into();
+        entry.tone = crate::monitor_rows::StatusTone::Gone;
+        entry.ended = Some("lost".into());
+        entry.actions = vec![crate::monitor_rows::MonitorAction {
+            key: crate::monitor_rows::MONITOR_ENTER_KEY,
+            label: "reopen",
+            intent: crate::monitor_rows::TickIntent::ReopenHosted(instance.clone()),
+        }];
+    });
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(!state.card_focused(), "a lost Tick takes no keys");
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(!state.cards.is_open(&instance), "Space hides its card");
+
+    for _ in 0..2 {
+        assert!(state.key(key(KeyCode::Char(' '))).is_none());
+        assert!(!state.cards.is_open(&instance), "a lost Tick shows no card");
+        assert!(
+            state.monitor_owns_keys(),
+            "Space never leaves the list for the input"
+        );
+        assert!(
+            state.editor.draft().is_empty(),
+            "{:?}",
+            state.editor.draft()
+        );
+    }
+
+    let (mut state, rows) = tab_fixture();
+    assert_eq!(selected(&state), rows[0], "an Artifact row");
+    assert!(!state.monitor_list_hint().contains("space"));
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(
+        !state.monitor_owns_keys(),
+        "an Artifact row has no card, so Space leaves the list"
+    );
+    assert_eq!(state.editor.draft(), " ");
+    assert!(state.cards.cards().is_empty());
 }

@@ -660,6 +660,22 @@ impl MonitorCards {
         true
     }
 
+    /// The user shows the cards of `instances`, given in the list's order, as the user's, each
+    /// leaving the hidden set; among them the higher rows stay shown first when not all fit.
+    /// Returns the ones that were not open, whose views attach.
+    pub(super) fn show_all(&mut self, chat: Uuid, instances: &[InstanceRef]) -> Vec<InstanceRef> {
+        let mut opened = Vec::new();
+        for instance in instances.iter().rev() {
+            if self.open_as(chat, instance.clone(), CardOrigin::User) {
+                opened.push(instance.clone());
+            } else {
+                self.raise(instance);
+            }
+        }
+        opened.reverse();
+        opened
+    }
+
     /// The user shows an open card again, such as one collapsed for lack of room: it becomes the
     /// user's most recent, so it stays shown before every card but the focused one.
     pub(super) fn raise(&mut self, instance: &InstanceRef) {

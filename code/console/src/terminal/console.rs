@@ -12981,6 +12981,17 @@ impl State {
                 }
                 (KeyCode::Tab, KeyModifiers::NONE) => self.cycle_rows(1),
                 (KeyCode::BackTab, _) => self.cycle_rows(-1),
+                (
+                    KeyCode::Char(crate::monitor_rows::MONITOR_HIDE_CARDS_KEY),
+                    KeyModifiers::NONE,
+                ) => {
+                    self.hide_all_cards();
+                }
+                // Terminals report Shift+z with or without the Shift modifier.
+                (
+                    KeyCode::Char(crate::monitor_rows::MONITOR_SHOW_CARDS_KEY),
+                    KeyModifiers::NONE | KeyModifiers::SHIFT,
+                ) => self.show_all_cards(),
                 (KeyCode::Char(super::monitor::NEXT_UNSEEN_KEY), KeyModifiers::NONE) => {
                     self.monitor.select_next_unseen();
                     self.rendered_region = None;
@@ -13025,6 +13036,14 @@ impl State {
                     let instance = self.monitor.selected()?.instance.clone();
                     return self.toggle_card(instance);
                 }
+                // Space is the card key of hosted Tick and Shell rows; on one without a card, such
+                // as a lost Tick's, it does nothing rather than leave the list and type into the
+                // input. An Artifact row never has a card, so there Space types into the input.
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| entry.group != TickGroup::Artifacts) => {}
                 (KeyCode::Enter, KeyModifiers::NONE)
                     if self
                         .monitor

@@ -31,6 +31,7 @@ const OPENING_NOTE: &str = "opening";
 /// How long the selection rests on a row before its card shows; rows passed over sooner never
 /// attach a view.
 pub(super) const SELECTION_PREVIEW_DELAY: Duration = Duration::from_millis(150);
+const ALL_CARDS_HINT: &str = "z/Z hide/show all";
 /// How long the card of a row the Agent used waits for the row to be listed.
 const AGENT_CARD_WAIT: Duration = Duration::from_secs(30);
 /// The most such cards that wait at once.
@@ -179,6 +180,49 @@ impl State {
         let rest = self.selection_rest.as_ref()?;
         (!rest.declined && self.cards.previewed() != Some(&rest.instance))
             .then_some(rest.since + SELECTION_PREVIEW_DELAY)
+    }
+
+    /// z on the list: hides every shown card, the user's, the Agent's and the selection's
+    /// preview alike, without hiding them from the Agent's use, which shows them again as usual;
+    /// the selected row previews again only once the selection comes back to it. The focus and
+    /// selection stay on the list.
+    pub(super) fn hide_all_cards(&mut self) {
+        if let Some(rest) = &mut self.selection_rest {
+            rest.declined = true;
+        }
+        if self.cards.cards().is_empty() {
+            return;
+        }
+        self.cards.close_all();
+        self.card_sizes.clear();
+        self.collapsed_cards.clear();
+        self.rendered_region = None;
+    }
+
+    /// Z on the list: shows the card of every row that has one as the user's, as Space on each
+    /// would; the higher rows take the room first. The focus and selection stay on the list, and
+    /// the views attach with the next card settle.
+    pub(super) fn show_all_cards(&mut self) {
+        let Some(chat) = self.chat else {
+            return;
+        };
+        let rows: Vec<InstanceRef> = self
+            .monitor
+            .entries()
+            .iter()
+            .map(|entry| entry.instance.clone())
+            .filter(|instance| self.row_toggles_card(instance))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let opened = self.cards.show_all(chat, &rows);
+        self.queued_card_inputs
+            .extend(opened.into_iter().map(|instance| InputEvent::TickAction {
+                chat,
+                action: super::super::tick_actions::builtin::attach_card(instance),
+            }));
+        self.rendered_region = None;
     }
 
     /// Enter, or a click inside a card: shows the card if it is hidden, keeps it, and gives it
@@ -778,7 +822,8 @@ impl State {
         }
     }
 
-    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card.
+    /// The key hints of the focused Monitor list, with Space on a row whose Tick has a card, and
+    /// z/Z while any row has one.
     pub(super) fn monitor_list_hint(&self) -> String {
         if let Some(focused) = self.cards.focused() {
             return if focused.shell_task().is_some() {
@@ -794,19 +839,33 @@ impl State {
         let Some(entry) = self.monitor.selected() else {
             return hint;
         };
-        if !self.row_toggles_card(&entry.instance) {
+        let mut card_keys = Vec::new();
+        if self.row_toggles_card(&entry.instance) {
+            card_keys.push(
+                if self.cards.is_open(&entry.instance)
+                    && !self.collapsed_cards.contains(&entry.instance)
+                {
+                    "space hide"
+                } else {
+                    "space show"
+                },
+            );
+        }
+        if self
+            .monitor
+            .entries()
+            .iter()
+            .any(|entry| self.row_toggles_card(&entry.instance))
+        {
+            card_keys.push(ALL_CARDS_HINT);
+        }
+        if card_keys.is_empty() {
             return hint;
         }
-        let space = if self.cards.is_open(&entry.instance)
-            && !self.collapsed_cards.contains(&entry.instance)
-        {
-            "space hide"
-        } else {
-            "space show"
-        };
+        let card_keys = card_keys.join(" · ");
         match hint.rsplit_once(" · ") {
-            Some((keys, last)) => format!("{keys} · {space} · {last}"),
-            None => format!("{space} · {hint}"),
+            Some((keys, last)) => format!("{keys} · {card_keys} · {last}"),
+            None => format!("{card_keys} · {hint}"),
         }
     }
 }
