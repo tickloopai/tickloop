@@ -355,16 +355,13 @@ pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
 /// match what a key does.
 pub const MONITOR_PAUSE_KEY: char = 'p';
-/// Selects the next row with an unseen update.
-pub const MONITOR_NEXT_UNSEEN_KEY: char = 'n';
 /// Hides every shown card, without hiding it from the Agent's use.
 pub const MONITOR_HIDE_CARDS_KEY: char = 'z';
 /// Shows the card of every row that has one, as the user's.
 pub const MONITOR_SHOW_CARDS_KEY: char = 'Z';
-pub const MONITOR_KEYS: [char; 5] = [
+pub const MONITOR_KEYS: [char; 4] = [
     MONITOR_REFRESH_KEY,
     MONITOR_PAUSE_KEY,
-    MONITOR_NEXT_UNSEEN_KEY,
     MONITOR_HIDE_CARDS_KEY,
     MONITOR_SHOW_CARDS_KEY,
 ];

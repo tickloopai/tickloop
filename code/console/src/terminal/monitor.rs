@@ -39,8 +39,6 @@ const TOO_SHORT_NOTE: &str = "terminal too short";
 
 /// The fewest list lines that make room for an edge line telling of unseen updates.
 const UNSEEN_EDGE_MIN_ROWS: usize = 3;
-/// Selects the next row with an unseen update while the list has the keyboard.
-pub(super) const NEXT_UNSEEN_KEY: char = crate::monitor_rows::MONITOR_NEXT_UNSEEN_KEY;
 
 /// Monitor's column beside a content area `width` columns wide: the user's preferred width or
 /// the default, narrowed so the conversation keeps its minimum, or `None` when even the narrowest
@@ -186,9 +184,6 @@ pub(super) struct Monitor {
     agent_touched: Vec<InstanceRef>,
     /// A row the next frame scrolls into view without selecting it.
     reveal: std::cell::RefCell<Option<InstanceRef>>,
-    /// The rows with unseen updates above and below the visible part of the list, as the last
-    /// frame counted them.
-    unseen_edges: Cell<(usize, usize)>,
     /// The first and last row the last frame showed of the list, wholly or partly, outside its
     /// edge lines.
     visible_rows: std::cell::RefCell<(Option<InstanceRef>, Option<InstanceRef>)>,
@@ -1406,32 +1401,6 @@ impl Monitor {
             .collect()
     }
 
-    /// `n`: selects the next row with an unseen update after the selected one, wrapping, so
-    /// pressing it again walks through them.
-    pub(super) fn select_next_unseen(&mut self) {
-        let unseen = self.unseen_rows();
-        let order: Vec<&InstanceRef> = self.listing.iter().map(|row| &row.instance).collect();
-        let current = self.selected().and_then(|entry| {
-            order
-                .iter()
-                .position(|instance| **instance == entry.instance)
-        });
-        let position = |instance: &InstanceRef| {
-            order
-                .iter()
-                .position(|listed| *listed == instance)
-                .unwrap_or(0)
-        };
-        let next = unseen
-            .iter()
-            .find(|instance| current.is_none_or(|current| position(instance) > current))
-            .or_else(|| unseen.first())
-            .cloned();
-        if let Some(instance) = next {
-            self.select_listed(&instance);
-        }
-    }
-
     /// A click on an edge line: selects the unseen row nearest to the visible part, above it or
     /// below it.
     fn select_nearest_unseen(&mut self, below: bool) {
@@ -1590,9 +1559,6 @@ impl Monitor {
             .unwrap_or_default();
         if let Some(mark) = self.selected().and_then(|entry| entry.subscription) {
             hints.push(if mark.paused { "p resume" } else { "p pause" }.into());
-        }
-        if self.unseen_edges.get() != (0, 0) {
-            hints.push(format!("{NEXT_UNSEEN_KEY} next update"));
         }
         hints.push("tab next".into());
         hints.push("esc input".into());
@@ -2073,8 +2039,6 @@ impl Monitor {
                 unseen = self.unseen_edges_of(&row_ids, offset, tick_capacity);
             }
         }
-        self.unseen_edges
-            .set((unseen.above.len(), unseen.below.len()));
         // The lines under the edge lines are not visible, so their rows count as out of view.
         let covered_top = usize::from(!unseen.above.is_empty());
         let covered_bottom = usize::from(!unseen.below.is_empty());
@@ -4052,7 +4016,7 @@ mod scrolling_tests {
     }
 
     #[test]
-    fn rows_with_unseen_updates_out_of_view_are_counted_at_the_edges_and_n_walks_through_them() {
+    fn rows_with_unseen_updates_out_of_view_are_counted_at_the_edges_and_clicks_reach_them() {
         let display = DisplayProfile::default();
         let mut monitor = monitor(30);
         observe(&mut monitor, &[1, 2, 25, 28], 5_000);
@@ -4082,7 +4046,7 @@ mod scrolling_tests {
             );
         }
         assert!(
-            monitor.hint().contains("n next update"),
+            !monitor.hint().contains("next update"),
             "{}",
             monitor.hint()
         );
@@ -4121,15 +4085,12 @@ mod scrolling_tests {
             "nearest below"
         );
 
-        let mut walked = Vec::new();
-        for _ in 0..6 {
-            monitor.select_next_unseen();
-            walked.push(monitor.selected().unwrap().instance.clone());
-        }
+        monitor.frame(30, 12, display, 7_500);
+        monitor.select_target(&MonitorTarget::Unseen { below: true });
         assert_eq!(
-            walked,
-            [25, 28, 1, 2, 20, 25].map(calendar),
-            "n walks through them in list order, wrapping"
+            monitor.selected().unwrap().instance,
+            calendar(25),
+            "the next click below reaches the next one"
         );
         let shown = monitor.frame(30, 12, display, 7_500);
         assert!(texts(&shown).iter().any(|line| line.contains("Tick 025")));

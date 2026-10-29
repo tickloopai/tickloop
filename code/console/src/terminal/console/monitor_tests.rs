@@ -1729,6 +1729,48 @@ fn a_focused_monitor_has_no_add_key_and_types_a_into_the_input() {
 }
 
 #[test]
+fn n_in_the_monitor_list_no_longer_jumps_to_an_update_and_types_into_the_input() {
+    let calendar = |index: usize| -> tick_protocol::InstanceRef {
+        format!("calendar:{index:03}").parse().unwrap()
+    };
+    let mut state = State::new(true, 140, 14);
+    let chat = Uuid::new_v4();
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let mut status = chat_status(chat);
+    for index in 0..30 {
+        status
+            .monitor
+            .members
+            .push(tickloop_harness::protocol::MonitorMember {
+                instance: calendar(index),
+                title: Some(format!("Tick {index:03}")),
+                is_terminal: false,
+                min_rows: None,
+                max_rows: None,
+            });
+    }
+    for index in [1, 25] {
+        status.monitor.mark_observed(calendar(index), 5_000);
+    }
+    state.monitor.set_chat_status(Arc::new(status));
+    state.monitor.focus(false, None);
+    state.monitor.select(&calendar(15));
+    let rendered = screen(&mut state);
+    assert!(rendered.contains("↓ 1 updated"), "{rendered}");
+    assert!(!state.monitor.hint().contains("next update"));
+
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.monitor.focused);
+    assert_eq!(state.monitor.selected().unwrap().instance, calendar(15));
+    assert_eq!(state.editor.draft(), "n");
+}
+
+#[test]
 fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     let mut state = State::new(true, 140, 25);
     let chat = Uuid::new_v4();

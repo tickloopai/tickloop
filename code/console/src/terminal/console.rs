@@ -12988,10 +12988,6 @@ impl State {
                     KeyCode::Char(crate::monitor_rows::MONITOR_SHOW_CARDS_KEY),
                     KeyModifiers::NONE | KeyModifiers::SHIFT,
                 ) => self.show_all_cards(),
-                (KeyCode::Char(super::monitor::NEXT_UNSEEN_KEY), KeyModifiers::NONE) => {
-                    self.monitor.select_next_unseen();
-                    self.rendered_region = None;
-                }
                 (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
