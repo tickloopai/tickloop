@@ -536,7 +536,8 @@ pub(super) enum CardState {
 pub(super) enum CardOrigin {
     /// The user showed or entered it: Space, Enter or a click.
     User,
-    /// Tab selected its row; it closes when Tab moves on unless the user keeps it.
+    /// The selection rested on its row; it closes when the selection moves on unless the user
+    /// keeps it.
     Preview,
     /// The Agent used its Tick or took in its update; it stays until the user hides it.
     Agent,
@@ -556,8 +557,8 @@ pub(super) struct OpenCard {
     early_input_overflowed: bool,
 }
 
-/// What a Chat's cards were while another Chat is shown: the cards shown, without a Tab preview,
-/// and the ones the user hid.
+/// What a Chat's cards were while another Chat is shown: the cards shown, without the
+/// selection's preview, and the ones the user hid.
 #[derive(Default)]
 struct RememberedCards {
     shown: Vec<RememberedCard>,
@@ -577,6 +578,9 @@ pub(super) struct MonitorCards {
     chat: Option<Uuid>,
     open: Vec<OpenCard>,
     focused: Option<InstanceRef>,
+    /// The selected row's card, shown ahead of every card but the focused one while the
+    /// selection rests on its row.
+    previewed: Option<InstanceRef>,
     /// The cards the user hid in this Chat; the Agent's use shows them again only after the user
     /// does.
     hidden: HashSet<InstanceRef>,
@@ -679,17 +683,31 @@ impl MonitorCards {
         !self.hidden.contains(instance)
     }
 
-    /// Closes the preview card, unless it is `keep`, when Tab moves on.
-    pub(super) fn close_preview(&mut self, keep: Option<&InstanceRef>) {
-        let previews: Vec<InstanceRef> = self
-            .open
-            .iter()
-            .filter(|card| card.origin == CardOrigin::Preview && Some(&card.instance) != keep)
-            .map(|card| card.instance.clone())
-            .collect();
-        for instance in previews {
+    /// Shows `instance`'s card as the selected row's in `chat`: an open card keeps who showed
+    /// it, any other opens as a preview. Returns whether it opened.
+    pub(super) fn preview(&mut self, chat: Uuid, instance: InstanceRef) -> bool {
+        let opened = self.open_as(chat, instance.clone(), CardOrigin::Preview);
+        self.previewed = Some(instance);
+        opened
+    }
+
+    pub(super) fn previewed(&self) -> Option<&InstanceRef> {
+        self.previewed.as_ref()
+    }
+
+    /// The selection left the previewed row: a card open only as its preview closes, and any
+    /// other goes back to its own priority. Returns whether a card was previewed.
+    pub(super) fn end_preview(&mut self) -> bool {
+        let Some(instance) = self.previewed.take() else {
+            return false;
+        };
+        if self
+            .card(&instance)
+            .is_some_and(|card| card.origin == CardOrigin::Preview)
+        {
             self.close(&instance);
         }
+        true
     }
 
     /// Closes the card, which detaches its view; a focused card loses the focus.
@@ -697,19 +715,24 @@ impl MonitorCards {
         if self.focused.as_ref() == Some(instance) {
             self.leave_focus();
         }
+        if self.previewed.as_ref() == Some(instance) {
+            self.previewed = None;
+        }
         self.open.retain(|card| &card.instance != instance);
     }
 
     pub(super) fn close_all(&mut self) {
         self.leave_focus();
+        self.previewed = None;
         self.open.clear();
     }
 
     /// Remembers the shown Chat's cards and the ones the user hid, then closes them, which
-    /// detaches their views; no Chat's cards are shown until [`MonitorCards::restore`]. A Tab
-    /// preview and the focus are not remembered.
+    /// detaches their views; no Chat's cards are shown until [`MonitorCards::restore`]. The
+    /// selection's preview and the focus are not remembered.
     pub(super) fn remember(&mut self) {
         self.leave_focus();
+        self.previewed = None;
         let open = std::mem::take(&mut self.open);
         let hidden = std::mem::take(&mut self.hidden);
         let Some(chat) = self.chat.take() else {
@@ -920,12 +943,15 @@ impl MonitorCards {
         }
     }
 
-    /// Which card stays shown first when not all fit: the focused one, then the ones the user
-    /// opened, most recent first, then the ones the Agent or Tab showed, most recent first.
+    /// Which card stays shown first when not all fit: the focused one, then the previewed one,
+    /// then the ones the user opened, most recent first, then the ones the Agent showed, most
+    /// recent first.
     pub(super) fn priority(&self, card: &OpenCard) -> u64 {
         const USER_OPENED: u64 = 1 << 62;
         if self.focused.as_ref() == Some(&card.instance) {
             u64::MAX
+        } else if self.previewed.as_ref() == Some(&card.instance) {
+            u64::MAX - 1
         } else if card.origin == CardOrigin::User {
             USER_OPENED + card.sequence
         } else {
@@ -1043,45 +1069,37 @@ impl CardRows {
 pub(super) struct CardAllocation {
     /// Per demand, in the order given: its rows when shown, `None` when collapsed.
     pub(super) cards: Vec<Option<CardRows>>,
-    pub(super) collapsed: usize,
 }
 
 /// Shares a list viewport `height` rows tall among open cards. `list_rows` is what the list
 /// needs without cards, the cards' own rows included. Every shown card gets exactly its minimum
 /// below its row and a rule; when not all fit, the ones of highest priority stay and the others
-/// collapse behind one `+N collapsed` line. When even one does not fit, the first stays shown,
+/// collapse, staying open without showing. When even one does not fit, the first stays shown,
 /// cropped. Height the list leaves over goes to the shown cards that can use more rows, shared
 /// evenly up to each one's maximum; what none of them can use stays empty below the list.
 pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) -> CardAllocation {
     let mut order: Vec<usize> = (0..demands.len()).collect();
     order.sort_by_key(|index| std::cmp::Reverse(demands[*index].priority));
     let need = |index: usize| CARD_ROW + RULE_ROWS + usize::from(demands[index].min_rows);
-    let collapsed_line = |shown: usize| usize::from(shown < demands.len());
     let mut shown = 0;
     let mut used = 0;
-    while shown < demands.len() && used + need(order[shown]) + collapsed_line(shown + 1) <= height {
+    while shown < demands.len() && used + need(order[shown]) <= height {
         used += need(order[shown]);
         shown += 1;
     }
     let mut cards = vec![None; demands.len()];
     if demands.is_empty() {
-        return CardAllocation {
-            cards,
-            collapsed: 0,
-        };
+        return CardAllocation { cards };
     }
     if shown == 0 {
         let first = order[0];
         let screen = demands[first].min_rows;
-        let room = height.saturating_sub(CARD_ROW + RULE_ROWS + collapsed_line(1));
+        let room = height.saturating_sub(CARD_ROW + RULE_ROWS);
         cards[first] = Some(CardRows {
             screen,
             shown: screen.min(u16::try_from(room).unwrap_or(u16::MAX)),
         });
-        return CardAllocation {
-            cards,
-            collapsed: demands.len() - 1,
-        };
+        return CardAllocation { cards };
     }
     let mut kept: Vec<usize> = order[..shown].to_vec();
     kept.sort_unstable();
@@ -1089,7 +1107,7 @@ pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) 
         .iter()
         .map(|index| RULE_ROWS + usize::from(demands[*index].min_rows))
         .sum();
-    let spare = height.saturating_sub(list_rows + card_rows + collapsed_line(shown));
+    let spare = height.saturating_sub(list_rows + card_rows);
     let screens = grow_into(
         spare,
         &kept.iter().map(|index| demands[*index]).collect::<Vec<_>>(),
@@ -1100,10 +1118,7 @@ pub(super) fn allocate(height: usize, list_rows: usize, demands: &[CardDemand]) 
             shown: screen,
         });
     }
-    CardAllocation {
-        cards,
-        collapsed: demands.len() - shown,
-    }
+    CardAllocation { cards }
 }
 
 /// Each card's screen rows: its minimum, and a fair share of `spare` rows up to its maximum.
@@ -1125,11 +1140,6 @@ fn grow_into(mut spare: usize, demands: &[CardDemand]) -> Vec<u16> {
             spare -= added;
         }
     }
-}
-
-/// The line `+N collapsed` under the list while open cards do not fit.
-pub(super) fn collapsed_line(collapsed: usize) -> RoleLine {
-    RoleLine::role(format!("+{collapsed} collapsed"), Role::MutedText)
 }
 
 /// The rule between a card's row and the Tick's screen: light, or heavy in the accent colour

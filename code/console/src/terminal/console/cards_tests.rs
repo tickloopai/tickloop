@@ -70,6 +70,15 @@ fn screen(state: &State) -> String {
     state.rendered_screen.join("\n")
 }
 
+/// The moment every [`settle_signals`] of a test happens at, so the selection's preview never
+/// falls due there; the tests of the preview move their own clock on.
+static SETTLED_AT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Settles what cards settle between keys, as the idle input loop does.
+fn settle_signals(state: &mut State) -> (bool, Vec<InputEvent>) {
+    state.settle_card_signals(*SETTLED_AT)
+}
+
 #[test]
 fn space_shows_and_hides_a_card_and_the_focus_stays_on_the_list() {
     let mut state = cards_fixture();
@@ -671,7 +680,7 @@ fn a_view_that_saw_its_tick_end_says_so_before_the_row_does() {
 }
 
 #[test]
-fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_collapsed() {
+fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_nothing() {
     let mut monitor = crate::terminal::monitor::Monitor::default();
     let (first, second) = (shell_entry("first log"), shell_entry("second log"));
     let instances = [first.instance.clone(), second.instance.clone()];
@@ -693,19 +702,16 @@ fn a_card_collapsed_for_lack_of_room_keeps_its_rows_glyph_and_says_collapsed() {
         .iter()
         .map(|line| line.text())
         .collect::<Vec<_>>();
+    assert_eq!(frame.collapsed_cards.len(), 1, "{texts:?}");
     assert!(
-        texts.iter().any(|line| line.contains("+1 collapsed")),
-        "{texts:?}"
+        texts.iter().all(|line| !line.contains("collapsed")),
+        "neither its row nor a line under the list tells of it: {texts:?}"
     );
     let rows = texts
         .iter()
         .filter(|line| line.starts_with("$ "))
         .collect::<Vec<_>>();
     assert_eq!(rows.len(), 2, "{texts:?}");
-    assert!(
-        rows.iter().any(|row| row.trim_end().ends_with("collapsed")),
-        "the collapsed card's row says so: {texts:?}"
-    );
     assert!(
         texts
             .iter()
@@ -851,53 +857,191 @@ fn origin(state: &State, instance: &tick_protocol::InstanceRef) -> Option<CardOr
     state.cards.card(instance).map(|card| card.origin)
 }
 
+/// Presses `code` with `modifiers` at `at`, then settles the selection's preview then, as the
+/// input loop does after each key; returns the attach of a card that showed.
+fn press_at(
+    state: &mut State,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    at: Instant,
+) -> Option<InputEvent> {
+    let event = state.key(KeyEvent::new(code, modifiers));
+    let (_, attach) = state.settle_selection_preview(at);
+    event.or(attach)
+}
+
+/// Settles the selection's preview at `at`, as the idle input loop does; returns the attach of a
+/// card that showed.
+fn rest_until(state: &mut State, at: Instant) -> Option<InputEvent> {
+    state.settle_selection_preview(at).1
+}
+
+const RESTED: Duration = super::cards::SELECTION_PREVIEW_DELAY;
+const QUICKLY: Duration = Duration::from_millis(149);
+
 #[test]
-fn tab_selects_every_row_in_turn_and_previews_the_cards_it_passes() {
+fn every_move_key_previews_the_card_of_the_row_the_selection_rests_on() {
     let (mut state, rows) = tab_fixture();
     let chat = state.chat.unwrap();
     let [notes, one, two, three] = [&rows[0], &rows[1], &rows[2], &rows[3]];
     assert!(state.monitor_list_hint().contains("tab next"));
+    let control = KeyModifiers::CONTROL;
+    let none = KeyModifiers::NONE;
+    let pairs = [
+        (
+            "j/k",
+            (KeyCode::Char('j'), none),
+            (KeyCode::Char('k'), none),
+        ),
+        ("arrows", (KeyCode::Down, none), (KeyCode::Up, none)),
+        (
+            "Ctrl+N/P",
+            (KeyCode::Char('n'), control),
+            (KeyCode::Char('p'), control),
+        ),
+        (
+            "Tab",
+            (KeyCode::Tab, none),
+            (KeyCode::BackTab, KeyModifiers::SHIFT),
+        ),
+    ];
+    let mut clock = Instant::now();
+    for (keys, (down, down_modifiers), (up, up_modifiers)) in pairs {
+        state.monitor.select(notes);
+        assert!(rest_until(&mut state, clock).is_none());
+        clock += Duration::from_secs(1);
+        assert!(
+            rest_until(&mut state, clock).is_none(),
+            "{keys}: a row without a card is only selected"
+        );
+        assert!(state.cards.cards().is_empty(), "{keys}");
 
-    attaches(state.key(key(KeyCode::Tab)), chat, one);
-    assert_eq!(selected(&state), *one);
-    assert_eq!(origin(&state, one), Some(CardOrigin::Preview));
-    assert!(state.monitor_list_hint().contains("space hide"));
-    assert!(!state.card_focused(), "Tab leaves the keys on the list");
+        assert!(press_at(&mut state, down, down_modifiers, clock).is_none());
+        assert_eq!(selected(&state), *one, "{keys}");
+        assert!(rest_until(&mut state, clock + QUICKLY).is_none(), "{keys}");
+        assert!(!state.cards.is_open(one), "{keys}: not before it rested");
+        assert!(state.monitor_list_hint().contains("space show"), "{keys}");
+        attaches(rest_until(&mut state, clock + RESTED), chat, one);
+        assert_eq!(origin(&state, one), Some(CardOrigin::Preview), "{keys}");
+        assert!(state.monitor_list_hint().contains("space hide"), "{keys}");
+        assert!(
+            !state.card_focused() && state.monitor.focused,
+            "{keys}: the keys stay on the list"
+        );
 
-    attaches(state.key(key(KeyCode::Tab)), chat, two);
-    assert!(
-        !state.cards.is_open(one),
-        "the preview closes as Tab moves on"
-    );
-    assert_eq!(origin(&state, two), Some(CardOrigin::Preview));
-    assert!(state.key(key(KeyCode::Char(' '))).is_none());
-    assert!(!state.cards.is_open(two), "Space hides a preview too");
-    attaches(state.key(key(KeyCode::Char(' '))), chat, two);
-    assert_eq!(
-        origin(&state, two),
-        Some(CardOrigin::User),
-        "Space shows it as the user's"
-    );
+        clock += Duration::from_secs(1);
+        assert!(press_at(&mut state, down, down_modifiers, clock).is_none());
+        assert!(
+            !state.cards.is_open(one),
+            "{keys}: the preview closes as the selection moves on"
+        );
+        assert!(press_at(&mut state, down, down_modifiers, clock + QUICKLY).is_none());
+        assert_eq!(selected(&state), *three, "{keys}");
+        assert!(
+            !state.cards.is_open(two),
+            "{keys}: a row passed over attaches no view"
+        );
+        assert!(rest_until(&mut state, clock + QUICKLY + QUICKLY).is_none());
+        attaches(
+            rest_until(&mut state, clock + QUICKLY + RESTED),
+            chat,
+            three,
+        );
 
-    attaches(state.key(key(KeyCode::Tab)), chat, three);
-    assert!(state.cards.is_open(two), "a card the user showed stays");
-    assert!(state.key(key(KeyCode::Tab)).is_none());
+        clock += Duration::from_secs(1);
+        assert!(press_at(&mut state, up, up_modifiers, clock).is_none());
+        assert_eq!(selected(&state), *two, "{keys}");
+        assert!(!state.cards.is_open(three), "{keys}");
+        attaches(rest_until(&mut state, clock + RESTED), chat, two);
+        assert_eq!(state.cards.cards().len(), 1, "{keys}");
+        clock += Duration::from_secs(1);
+    }
+
+    state.monitor.select(three);
+    rest_until(&mut state, clock);
+    assert!(press_at(&mut state, KeyCode::Tab, none, clock).is_none());
     assert_eq!(
         selected(&state),
         *notes,
         "Tab wraps to a row without a card"
     );
-    assert!(!state.cards.is_open(three));
-    assert!(!state.monitor.detail.is_some(), "it only selects that row");
-
-    attaches(state.key(key(KeyCode::BackTab)), chat, three);
+    assert!(rest_until(&mut state, clock + RESTED).is_none());
+    assert!(state.cards.cards().is_empty());
+    assert!(state.monitor.detail.is_none(), "it only selects that row");
+    assert!(press_at(&mut state, KeyCode::BackTab, KeyModifiers::SHIFT, clock).is_none());
     assert_eq!(selected(&state), *three, "Shift+Tab wraps back");
-    assert!(state.key(key(KeyCode::Enter)).is_none());
+    state.monitor.select(notes);
+    rest_until(&mut state, clock);
+    assert!(press_at(&mut state, KeyCode::Char('k'), none, clock).is_none());
+    assert_eq!(selected(&state), *notes, "k stops at the first row");
+}
+
+#[test]
+fn the_selection_previews_wherever_it_lands_and_only_while_the_list_has_the_keys() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two] = [&rows[1], &rows[2]];
+    let start = Instant::now();
+    state.monitor.focused = false;
+    state.monitor.select(one);
+    assert!(rest_until(&mut state, start).is_none());
+    assert!(
+        rest_until(&mut state, start + RESTED).is_none(),
+        "no preview while the input has the keys"
+    );
+    assert!(press_at(&mut state, KeyCode::Right, KeyModifiers::NONE, start).is_some());
+    assert!(state.monitor.focused, "Right gives the list the keys");
+    assert!(rest_until(&mut state, start + QUICKLY).is_none());
+    attaches(rest_until(&mut state, start + RESTED), chat, one);
+
+    let later = start + Duration::from_secs(1);
+    assert!(press_at(&mut state, KeyCode::Esc, KeyModifiers::NONE, later).is_none());
+    assert!(!state.monitor.focused);
+    assert!(
+        !state.cards.is_open(one),
+        "the preview closes when the list loses the keys"
+    );
+
+    // `n`, an edge line and a bubbled key select a row without a move key.
+    state.monitor.focus(false, None);
+    state.monitor.select(two);
+    assert!(rest_until(&mut state, later).is_none());
+    attaches(rest_until(&mut state, later + RESTED), chat, two);
+    assert_eq!(origin(&state, two), Some(CardOrigin::Preview));
+    assert!(
+        rest_until(&mut state, later + RESTED + RESTED).is_none(),
+        "it shows once"
+    );
+
+    assert!(
+        press_at(
+            &mut state,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            later + RESTED
+        )
+        .is_none()
+    );
     assert!(state.card_focused());
     assert_eq!(
-        origin(&state, three),
+        origin(&state, two),
         Some(CardOrigin::User),
         "entering keeps it"
+    );
+    assert!(state.cards.previewed().is_none());
+    state.leave_card();
+    assert!(
+        press_at(
+            &mut state,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            later + RESTED
+        )
+        .is_none()
+    );
+    assert!(
+        state.cards.is_open(two),
+        "a kept card stays when the selection moves on"
     );
 }
 
@@ -954,7 +1098,7 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
     );
 
     bubble(&mut state, one, BubbledKey::Down);
-    let (changed, inputs) = state.settle_card_signals();
+    let (changed, inputs) = settle_signals(&mut state);
     assert!(changed && inputs.is_empty());
     assert!(
         !state.card_focused() && state.monitor.focused,
@@ -965,13 +1109,22 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
         state.cards.is_open(one) && state.cards.is_open(two),
         "both cards stay shown"
     );
+    assert!(
+        rest_until(&mut state, *SETTLED_AT + RESTED).is_none(),
+        "an open card attaches nothing more"
+    );
+    assert_eq!(
+        state.cards.previewed(),
+        Some(two),
+        "the row it landed on previews its card"
+    );
 
     state.enter_card(two.clone());
     state.draw_frame(&mut Vec::new()).unwrap();
     bubble(&mut state, two, BubbledKey::Right);
     bubble(&mut state, two, BubbledKey::Up);
     bubble(&mut state, two, BubbledKey::Down);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(!state.card_focused() && state.monitor.focused);
     assert_eq!(
         selected(&state),
@@ -981,7 +1134,7 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
 
     state.enter_card(one.clone());
     bubble(&mut state, one, BubbledKey::Up);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(
         !state.card_focused() && state.monitor.focused,
         "up past the first: the list"
@@ -990,7 +1143,7 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
 
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Down);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(
         !state.card_focused() && state.monitor.focused,
         "down past the last shown card: the list"
@@ -999,7 +1152,7 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
 
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Esc);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(
         !state.card_focused() && state.monitor.focused,
         "esc: the list at once"
@@ -1007,18 +1160,18 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
 
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Tab);
-    let (changed, inputs) = state.settle_card_signals();
-    assert!(changed);
-    attaches(inputs.into_iter().next(), chat, three);
+    let (changed, inputs) = settle_signals(&mut state);
+    assert!(changed && inputs.is_empty());
     assert!(
         !state.card_focused() && state.monitor.focused,
         "tab acts as Tab on the list"
     );
     assert_eq!(selected(&state), *three);
+    attaches(rest_until(&mut state, *SETTLED_AT + RESTED), chat, three);
     assert_eq!(
         origin(&state, three),
         Some(CardOrigin::Preview),
-        "the next row's card is only previewed"
+        "the next row's card is only previewed once the selection rested there"
     );
     assert_eq!(
         origin(&state, two),
@@ -1028,7 +1181,7 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
 
     state.enter_card(one.clone());
     bubble(&mut state, one, BubbledKey::Backtab);
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(&mut state);
     assert!(inputs.is_empty());
     assert!(!state.card_focused() && state.monitor.focused);
     assert_eq!(
@@ -1036,19 +1189,19 @@ fn bubbled_keys_leave_the_card_for_the_list_without_entering_another() {
         *notes,
         "backtab from the first Tick wraps upward"
     );
-    assert!(!state.cards.is_open(three), "the preview Tab showed closes");
+    assert!(!state.cards.is_open(three), "the preview closes");
     assert!(state.cards.is_open(one));
 
     state.monitor.overlay = true;
     state.enter_card(two.clone());
     bubble(&mut state, two, BubbledKey::Left);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(
         !state.card_focused() && !state.monitor.focused && !state.monitor.overlay,
         "left: the input, closing an overlay Monitor"
     );
     bubble(&mut state, two, BubbledKey::Down);
-    let (changed, inputs) = state.settle_card_signals();
+    let (changed, inputs) = settle_signals(&mut state);
     assert!(
         !changed && inputs.is_empty(),
         "with no card focused nothing bubbles"
@@ -1067,7 +1220,7 @@ fn esc_esc_on_a_tick_that_bubbles_esc_lands_on_the_list() {
     state.expire_card_keys(start + Duration::from_millis(60));
     assert!(state.card_focused(), "the first Esc went to the Tick");
     bubble(&mut state, one, BubbledKey::Esc);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert!(!state.card_focused() && state.monitor.focused);
     assert!(state.key(key(KeyCode::Esc)).is_none());
     assert!(
@@ -1086,7 +1239,7 @@ fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it()
     state.monitor.focused = false;
     state.monitor.flash_use(rows[0].clone(), 1);
     state.monitor.flash_use(one.clone(), 1);
-    let (changed, inputs) = state.settle_card_signals();
+    let (changed, inputs) = settle_signals(&mut state);
     assert!(changed);
     assert_eq!(inputs.len(), 1, "only the row with a card opens one");
     attaches(inputs.into_iter().next(), chat, one);
@@ -1103,7 +1256,7 @@ fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it()
     assert!(state.key(key(KeyCode::Char(' '))).is_none());
     assert!(!state.cards.is_open(one));
     state.monitor.flash_use(one.clone(), 2);
-    let (changed, inputs) = state.settle_card_signals();
+    let (changed, inputs) = settle_signals(&mut state);
     assert!(
         !changed && inputs.is_empty(),
         "a card the user hid stays hidden"
@@ -1111,7 +1264,7 @@ fn the_agents_use_shows_a_card_without_moving_the_focus_unless_the_user_hid_it()
     attaches(state.key(key(KeyCode::Char(' '))), chat, one);
     state.cards.close(one);
     state.monitor.flash_use(one.clone(), 3);
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(&mut state);
     attaches(inputs.into_iter().next(), chat, one);
 }
 
@@ -1165,20 +1318,20 @@ fn the_agents_use_shows_a_card_whose_row_is_not_loaded_or_not_listed_yet() {
         .expect("a row on a page not loaded yet")
         .clone();
     state.monitor.flash_use(unloaded.clone(), 1);
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(&mut state);
     attaches(inputs.into_iter().next(), chat, &unloaded);
     assert_eq!(origin(&state, &unloaded), Some(CardOrigin::Agent));
 
     let arriving = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
     state.monitor.flash_use(arriving.clone(), 2);
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(&mut state);
     assert!(inputs.is_empty(), "no row yet");
     let mut status = (**state.monitor.chat_status.as_ref().unwrap()).clone();
     status
         .monitor
         .record_opened(arriving.clone(), Some("Late".into()));
     state.monitor.set_chat_status(Arc::new(status));
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(&mut state);
     attaches(inputs.into_iter().next(), chat, &arriving);
 }
 
@@ -1220,7 +1373,7 @@ fn a_card_tells_its_tick_it_has_the_keyboard_only_when_the_tick_wants_focus_repo
 
     state.enter_card(instance.clone());
     wants_focus_reports(&state, &instance);
-    state.settle_card_signals();
+    settle_signals(&mut state);
     assert_eq!(
         focus_requests(&mut requests),
         [true],
@@ -1266,12 +1419,12 @@ fn leaving_a_card_for_the_list_and_switching_chats_tell_each_tick_its_focus() {
         wants_focus_reports(&state, row);
         queues.push(requests);
     }
-    state.settle_card_signals();
+    settle_signals(&mut state);
     state.draw_frame(&mut Vec::new()).unwrap();
     for key in [BubbledKey::Down, BubbledKey::Tab] {
         state.enter_card(one.clone());
         bubble(&mut state, one, key);
-        state.settle_card_signals();
+        settle_signals(&mut state);
         assert!(!state.card_focused());
         assert_eq!(selected(&state), *two);
         assert_eq!(focus_requests(&mut queues[0]), [true, false], "{key:?}");
@@ -1318,7 +1471,7 @@ fn hosted_fixture(height: u16) -> (State, Vec<tick_protocol::InstanceRef>) {
 
 /// The cards whose views the next settle attaches, all for `chat`.
 fn queued_attaches(state: &mut State, chat: Uuid) -> Vec<tick_protocol::InstanceRef> {
-    let (_, inputs) = state.settle_card_signals();
+    let (_, inputs) = settle_signals(state);
     inputs
         .into_iter()
         .map(|input| match input {
@@ -1351,7 +1504,8 @@ fn switching_chats_away_and_back_restores_the_shown_cards_and_the_hidden_set() {
     assert_eq!(queued_attaches(&mut state, chat), std::slice::from_ref(two));
     show_with_space(&mut state, three);
     assert!(state.key(key(KeyCode::Char(' '))).is_none(), "hides it");
-    attaches(state.key(key(KeyCode::Tab)), chat, four);
+    assert!(press_at(&mut state, KeyCode::Tab, KeyModifiers::NONE, *SETTLED_AT).is_none());
+    attaches(rest_until(&mut state, *SETTLED_AT + RESTED), chat, four);
     assert_eq!(origin(&state, four), Some(CardOrigin::Preview));
     for row in [one, two] {
         let (view, _requests) =
@@ -1379,7 +1533,7 @@ fn switching_chats_away_and_back_restores_the_shown_cards_and_the_hidden_set() {
         CardState::Opening
     ));
     assert!(!state.cards.is_open(three));
-    assert!(!state.cards.is_open(four), "a Tab preview is not restored");
+    assert!(!state.cards.is_open(four), "a preview is not restored");
     state.draw_frame(&mut Vec::new()).unwrap();
     assert_eq!(screen(&state).matches("── opening ──").count(), 2);
 
@@ -1489,7 +1643,7 @@ fn collapsed(state: &State, instance: &tick_protocol::InstanceRef) -> bool {
 fn space_or_a_click_on_a_collapsed_cards_row_shows_it_in_one_press() {
     let (mut state, rows) = hosted_fixture(26);
     let chat = state.chat.unwrap();
-    let [one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    let [one, two, three] = [&rows[0], &rows[1], &rows[2]];
     for row in [one, two, three] {
         show_with_space(&mut state, row);
     }
@@ -1540,13 +1694,155 @@ fn space_or_a_click_on_a_collapsed_cards_row_shows_it_in_one_press() {
         "a click shows it the same way: {}",
         screen(&state)
     );
+}
 
-    state.monitor.select(three);
-    attaches(state.key(key(KeyCode::Tab)), chat, four);
+#[test]
+fn the_selected_rows_card_takes_the_room_ahead_of_the_users_and_gives_it_back() {
+    let (mut state, rows) = hosted_fixture(26);
+    let chat = state.chat.unwrap();
+    let [one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    for row in [one, two, three] {
+        show_with_space(&mut state, row);
+    }
     state.draw_frame(&mut Vec::new()).unwrap();
-    assert!(collapsed(&state, four), "{}", screen(&state));
-    assert!(state.key(key(KeyCode::Char(' '))).is_none());
-    assert_eq!(origin(&state, four), Some(CardOrigin::User), "kept");
+    assert!(collapsed(&state, one) && !collapsed(&state, two) && !collapsed(&state, three));
+
+    let start = Instant::now();
+    rest_until(&mut state, start);
+    assert!(press_at(&mut state, KeyCode::Char('j'), KeyModifiers::NONE, start).is_none());
+    attaches(rest_until(&mut state, start + RESTED), chat, four);
     state.draw_frame(&mut Vec::new()).unwrap();
-    assert!(!collapsed(&state, four), "{}", screen(&state));
+    assert!(
+        !collapsed(&state, four) && !collapsed(&state, three) && collapsed(&state, two),
+        "the preview comes before the user's cards: {}",
+        screen(&state)
+    );
+    assert!(!screen(&state).contains("collapsed"), "{}", screen(&state));
+
+    let later = start + Duration::from_secs(1);
+    assert!(press_at(&mut state, KeyCode::Esc, KeyModifiers::NONE, later).is_none());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(!state.cards.is_open(four));
+    assert!(
+        !collapsed(&state, two) && !collapsed(&state, three) && collapsed(&state, one),
+        "the card it took the room from comes back: {}",
+        screen(&state)
+    );
+
+    state.monitor.focus(false, None);
+    state.monitor.select(one);
+    rest_until(&mut state, later);
+    assert!(
+        rest_until(&mut state, later + RESTED).is_none(),
+        "an open card only rises"
+    );
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        !collapsed(&state, one) && !collapsed(&state, three) && collapsed(&state, two),
+        "{}",
+        screen(&state)
+    );
+    assert_eq!(origin(&state, one), Some(CardOrigin::User));
+    assert!(state.monitor_list_hint().contains("space hide"));
+    assert!(press_at(&mut state, KeyCode::Char('j'), KeyModifiers::NONE, later).is_none());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        collapsed(&state, one) && !collapsed(&state, two) && !collapsed(&state, three),
+        "it goes back to its own place: {}",
+        screen(&state)
+    );
+    assert_eq!(origin(&state, one), Some(CardOrigin::User));
+}
+
+#[test]
+fn space_hides_a_preview_until_the_selection_comes_back_and_shows_a_card_before_it() {
+    let (mut state, rows) = tab_fixture();
+    let chat = state.chat.unwrap();
+    let [one, two] = [&rows[1], &rows[2]];
+    let start = Instant::now();
+    rest_until(&mut state, start);
+    assert!(press_at(&mut state, KeyCode::Char('j'), KeyModifiers::NONE, start).is_none());
+    assert!(state.monitor_list_hint().contains("space show"));
+    attaches(
+        press_at(
+            &mut state,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+            start + QUICKLY,
+        ),
+        chat,
+        one,
+    );
+    assert_eq!(
+        origin(&state, one),
+        Some(CardOrigin::User),
+        "Space before the preview shows the card as the user's"
+    );
+    assert!(rest_until(&mut state, start + RESTED).is_none());
+    assert!(state.monitor_list_hint().contains("space hide"));
+
+    let moved = start + Duration::from_secs(1);
+    assert!(press_at(&mut state, KeyCode::Char('j'), KeyModifiers::NONE, moved).is_none());
+    assert!(state.cards.is_open(one), "the user's card stays");
+    attaches(rest_until(&mut state, moved + RESTED), chat, two);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(state.monitor_list_hint().contains("space hide"));
+    assert!(
+        press_at(
+            &mut state,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+            moved + RESTED
+        )
+        .is_none()
+    );
+    assert!(!state.cards.is_open(two), "Space hides the preview");
+    assert!(
+        rest_until(&mut state, moved + Duration::from_secs(10)).is_none(),
+        "and it stays hidden while the selection stays"
+    );
+    assert!(!state.cards.is_open(two));
+    assert!(state.monitor_list_hint().contains("space show"));
+
+    let back = moved + Duration::from_secs(20);
+    assert!(press_at(&mut state, KeyCode::Char('k'), KeyModifiers::NONE, back).is_none());
+    assert!(
+        press_at(
+            &mut state,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            back + QUICKLY
+        )
+        .is_none()
+    );
+    attaches(rest_until(&mut state, back + QUICKLY + RESTED), chat, two);
+    assert_eq!(
+        origin(&state, two),
+        Some(CardOrigin::Preview),
+        "coming back previews it again"
+    );
+    assert!(
+        press_at(
+            &mut state,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+            back + RESTED
+        )
+        .is_none()
+    );
+    attaches(
+        press_at(
+            &mut state,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+            back + RESTED,
+        ),
+        chat,
+        two,
+    );
+    assert_eq!(
+        origin(&state, two),
+        Some(CardOrigin::User),
+        "shown as the user's"
+    );
 }

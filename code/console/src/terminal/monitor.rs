@@ -37,21 +37,10 @@ const FOCUSED_CARD_MARK: &str = "input";
 /// The rule of a card cropped because not even its minimum fits.
 const TOO_SHORT_NOTE: &str = "terminal too short";
 
-/// A row whose card other cards took the room from says so at its end.
-const COLLAPSED_CARD_NOTE: &str = "collapsed";
 /// The fewest list lines that make room for an edge line telling of unseen updates.
 const UNSEEN_EDGE_MIN_ROWS: usize = 3;
 /// Selects the next row with an unseen update while the list has the keyboard.
 pub(super) const NEXT_UNSEEN_KEY: char = crate::monitor_rows::MONITOR_NEXT_UNSEEN_KEY;
-
-/// How a row shows that its card is open; its glyph stays its own state mark either way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CardMark {
-    Shown,
-    Focused,
-    /// Open, but other cards took the room.
-    Collapsed,
-}
 
 /// Monitor's column beside a content area `width` columns wide: the user's preferred width or
 /// the default, narrowed so the conversation keeps its minimum, or `None` when even the narrowest
@@ -240,7 +229,7 @@ pub(super) struct MonitorFrame {
     pub(super) tick_rows: std::ops::Range<usize>,
     /// The Tick screen size of each card shown, which its view's terminal takes.
     pub(super) card_sizes: Vec<(InstanceRef, CardSize)>,
-    /// The open cards that did not fit, whose rows say `collapsed`.
+    /// The open cards that did not fit; their rows look as if they were closed.
     pub(super) collapsed_cards: Vec<InstanceRef>,
 }
 
@@ -261,7 +250,7 @@ impl CardLayout<'_> {
         Some((&self.cards[index], self.allocation.cards[index]))
     }
 
-    /// The lines the shown cards add to the list, their `+N collapsed` line included.
+    /// The lines the shown cards add to the list.
     fn extra_lines(&self) -> usize {
         self.allocation
             .cards
@@ -269,7 +258,6 @@ impl CardLayout<'_> {
             .flatten()
             .map(|rows| 1 + usize::from(rows.shown))
             .sum::<usize>()
-            + usize::from(self.allocation.collapsed > 0)
     }
 
     fn collapsed(&self) -> Vec<InstanceRef> {
@@ -1559,34 +1547,27 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> Vec<RoleLine> {
-        self.entry_lines_with_card(entry, width, display, now_ms, None)
+        self.entry_lines_with_card(entry, width, display, now_ms, false)
     }
 
-    /// The row of `entry` with its own glyph whether its card shows or not: ending with
-    /// `collapsed` while its card is open but other cards took the room, and in the accent colour
-    /// on the selection background, ending with `input`, while its card has the focus.
+    /// The row of `entry` with its own glyph whether its card shows or not, and in the accent
+    /// colour on the selection background, ending with `input`, while its card has the focus.
     fn entry_lines_with_card(
         &self,
         entry: &MonitorEntry,
         width: usize,
         display: DisplayProfile,
         now_ms: u64,
-        card: Option<CardMark>,
+        focused_card: bool,
     ) -> Vec<RoleLine> {
         let title = super::safe_line(&entry.title);
         let paused = entry.subscription.is_some_and(|mark| mark.paused);
-        let focused_card = card == Some(CardMark::Focused);
         let mut details = list_row::row_details(entry.tone, &entry.notes, now_ms);
-        let card_note = match card {
-            Some(CardMark::Focused) => Some(FOCUSED_CARD_MARK),
-            Some(CardMark::Collapsed) => Some(COLLAPSED_CARD_NOTE),
-            Some(CardMark::Shown) | None => None,
-        };
-        if let Some(card_note) = card_note {
+        if focused_card {
             if !details.is_empty() {
                 details.push_str(" · ");
             }
-            details.push_str(card_note);
+            details.push_str(FOCUSED_CARD_MARK);
         }
         let glyph = display.glyph(entry.glyph);
         let mut lines = ListRow {
@@ -1735,12 +1716,9 @@ impl Monitor {
             row_ids.push(None);
             for entry in entries {
                 let card = cards.of(&entry.instance);
-                let mark = card.map(|(card, rows)| match rows {
-                    None => CardMark::Collapsed,
-                    Some(_) if card.focused => CardMark::Focused,
-                    Some(_) => CardMark::Shown,
-                });
-                let entry_lines = self.entry_lines_with_card(entry, width, display, now_ms, mark);
+                let focused_card = card.is_some_and(|(card, rows)| card.focused && rows.is_some());
+                let entry_lines =
+                    self.entry_lines_with_card(entry, width, display, now_ms, focused_card);
                 let start = rows.len();
                 for line in entry_lines {
                     rows.push(line);
@@ -1784,12 +1762,6 @@ impl Monitor {
                     selected_rows = start..rows.len();
                 }
             }
-        }
-        if cards.allocation.collapsed > 0 {
-            rows.push(super::monitor_cards::collapsed_line(
-                cards.allocation.collapsed,
-            ));
-            row_ids.push(None);
         }
         TickLines {
             lines: rows,

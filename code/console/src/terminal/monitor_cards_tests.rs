@@ -381,7 +381,6 @@ fn cards_get_exactly_their_minimum_and_leave_the_rest_below_the_list() {
         allocate(30, 4, &[demand(6, 1), demand(9, 2)]),
         CardAllocation {
             cards: vec![rows(6), rows(9)],
-            collapsed: 0,
         }
     );
     assert_eq!(
@@ -412,9 +411,8 @@ fn spare_height_goes_fairly_to_cards_that_declare_a_maximum() {
     assert_eq!(
         allocate(15, 3, &[growing(6, 60, 1), growing(6, 60, u64::MAX)]),
         CardAllocation {
-            // 15 - 3 list rows - (1 + 6) - the collapsed line = 4 spare rows.
-            cards: vec![None, rows(10)],
-            collapsed: 1,
+            // 15 - 3 list rows - (1 + 6) = 5 spare rows.
+            cards: vec![None, rows(11)],
         },
         "no card grows into another one's minimum: the other collapses"
     );
@@ -422,19 +420,18 @@ fn spare_height_goes_fairly_to_cards_that_declare_a_maximum() {
 
 #[test]
 fn cards_that_do_not_fit_collapse_keeping_the_highest_priority() {
-    // Each card needs its row, a rule and 6 screen rows: 8; two need 16, plus the collapsed line.
-    assert_eq!(
-        allocate(17, 3, &[demand(6, 1), demand(6, u64::MAX), demand(6, 2)]),
-        CardAllocation {
-            cards: vec![None, rows(6), rows(6)],
-            collapsed: 1,
-        }
-    );
+    // Each card needs its row, a rule and 6 screen rows: 8; two need 16, and no line tells of
+    // the others.
     assert_eq!(
         allocate(16, 3, &[demand(6, 1), demand(6, u64::MAX), demand(6, 2)]),
         CardAllocation {
+            cards: vec![None, rows(6), rows(6)],
+        }
+    );
+    assert_eq!(
+        allocate(15, 3, &[demand(6, 1), demand(6, u64::MAX), demand(6, 2)]),
+        CardAllocation {
             cards: vec![None, rows(6), None],
-            collapsed: 2,
         },
         "the focused card stays first"
     );
@@ -566,6 +563,65 @@ fn cards_close_with_their_chat_and_their_rows_and_lose_the_focus_with_them() {
 }
 
 #[test]
+fn the_previewed_card_comes_right_after_the_focused_one_and_keeps_who_showed_it() {
+    let chat = Uuid::from_u128(1);
+    let [focused, user, agent, other]: [InstanceRef; 4] = [
+        "hosted:focused",
+        "hosted:user",
+        "hosted:agent",
+        "hosted:other",
+    ]
+    .map(|instance| instance.parse().unwrap());
+    let mut cards = MonitorCards::default();
+    cards.open(chat, focused.clone());
+    cards.open_as(chat, agent.clone(), CardOrigin::Agent);
+    cards.open(chat, user.clone());
+    cards.focus(focused.clone());
+    let priority = |cards: &MonitorCards, instance: &InstanceRef| {
+        cards.priority(cards.card(instance).unwrap())
+    };
+    assert!(priority(&cards, &user) > priority(&cards, &agent));
+
+    assert!(
+        !cards.preview(chat, agent.clone()),
+        "an open card is only raised"
+    );
+    assert_eq!(cards.previewed(), Some(&agent));
+    assert_eq!(cards.card(&agent).unwrap().origin, CardOrigin::Agent);
+    assert!(priority(&cards, &agent) > priority(&cards, &user));
+    assert!(priority(&cards, &agent) < priority(&cards, &focused));
+    assert!(cards.end_preview());
+    assert!(cards.is_open(&agent), "a raised card stays open");
+    assert!(priority(&cards, &user) > priority(&cards, &agent));
+    assert!(!cards.end_preview(), "nothing is previewed any more");
+
+    assert!(cards.preview(chat, other.clone()), "a closed card opens");
+    assert_eq!(cards.card(&other).unwrap().origin, CardOrigin::Preview);
+    assert!(priority(&cards, &other) > priority(&cards, &user));
+    assert!(cards.end_preview());
+    assert!(
+        !cards.is_open(&other),
+        "a card open only as a preview closes"
+    );
+
+    cards.preview(chat, other.clone());
+    cards.open(chat, other.clone());
+    assert!(cards.end_preview());
+    assert_eq!(
+        cards.card(&other).unwrap().origin,
+        CardOrigin::User,
+        "a preview the user kept stays"
+    );
+    cards.preview(chat, user.clone());
+    cards.close(&user);
+    assert_eq!(
+        cards.previewed(),
+        None,
+        "closing the previewed card ends the preview"
+    );
+}
+
+#[test]
 fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_chat() {
     let chat = Uuid::from_u128(1);
     let shown: InstanceRef = "hosted:shown".parse().unwrap();
@@ -579,7 +635,7 @@ fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_
     cards.open(chat, gone.clone());
     cards.open(chat, hidden.clone());
     cards.hide(&hidden);
-    cards.open_as(chat, previewed.clone(), CardOrigin::Preview);
+    cards.preview(chat, previewed.clone());
     cards.focus(shown.clone());
     let sequences: Vec<u64> = [&shown, &used]
         .iter()
@@ -588,6 +644,7 @@ fn a_chats_cards_are_remembered_without_a_preview_until_the_console_forgets_the_
 
     cards.remember();
     assert!(cards.cards().is_empty() && cards.focused().is_none());
+    assert_eq!(cards.previewed(), None);
     assert!(cards.agent_may_show(&hidden), "no Chat is shown");
     let restored = cards.restore(chat, |_| true, |instance| instance != &gone);
     assert_eq!(restored, [shown.clone(), used.clone()]);
