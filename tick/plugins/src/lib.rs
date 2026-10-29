@@ -21,8 +21,8 @@ use std::{ffi::OsStr, io, path::PathBuf};
 pub use catalog::{MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource};
 pub use git::{GitCheckout, GitClient};
 pub use manifest::{
-    CLAUDE_MANIFEST, Component, ManifestFormat, PluginManifest, TICKLOOP_MANIFEST, TickProgram,
-    UserConfigField, UserConfigType, skill_directories, validate_plugin_name,
+    CLAUDE_MANIFEST, Component, ManifestFormat, PluginHooks, PluginManifest, TICKLOOP_MANIFEST,
+    TickProgram, UserConfigField, UserConfigType, skill_directories, validate_plugin_name,
 };
 pub use marketplace::{
     CLAUDE_OFFICIAL_MARKETPLACE, HttpClient, HttpRequest, MarketplaceRegistration,

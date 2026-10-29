@@ -22,6 +22,8 @@ const DEFAULT_SKILLS_DIRECTORY: &str = "skills";
 const MAX_VERSION_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 2000;
 const ANY_EXECUTE_PERMISSION: u32 = 0o111;
+/// Where a plugin's hooks are read from whether or not its manifest names them.
+const DEFAULT_HOOKS_FILE: &str = "hooks/hooks.json";
 
 /// Manifest fields that declare a component, besides `skills` and the Tick fields.
 const COMPONENT_FIELDS: [(&str, Component); 10] = [
@@ -41,7 +43,7 @@ const DEFAULT_COMPONENT_LOCATIONS: [(&str, Component); 7] = [
     ("commands", Component::Commands),
     ("agents", Component::Agents),
     ("output-styles", Component::OutputStyles),
-    ("hooks/hooks.json", Component::Hooks),
+    (DEFAULT_HOOKS_FILE, Component::Hooks),
     (".mcp.json", Component::McpServers),
     (".lsp.json", Component::LspServers),
     ("settings.json", Component::Settings),
@@ -124,6 +126,15 @@ pub struct TickProgram {
     pub protocol: bool,
 }
 
+/// One place a plugin declares hooks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginHooks {
+    /// A hooks file, relative to the plugin root, holding a `hooks` object.
+    File(PathBuf),
+    /// An object of the manifest's `hooks` field, mapping events to matcher groups.
+    Inline(Value),
+}
+
 /// What a plugin declares, wherever it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginManifest {
@@ -141,6 +152,9 @@ pub struct PluginManifest {
     pub components: BTreeSet<Component>,
     /// Raw MCP entries; the host resolves variables and interprets transports.
     pub mcp_servers: BTreeMap<String, Value>,
+    /// Where the plugin declares hooks: its default hooks file first, then its manifest's `hooks`
+    /// field in order. The host reads and interprets them.
+    pub hooks: Vec<PluginHooks>,
     pub user_config: BTreeMap<String, UserConfigField>,
     /// What was ignored in the manifest, and why.
     pub warnings: Vec<String>,
@@ -390,6 +404,7 @@ fn from_document(
         components.insert(Component::Tick);
     }
     let mcp_servers = read_mcp_servers(root, document.get("mcpServers"), &mut warnings);
+    let hooks = hook_declarations(root, document.get("hooks"));
     let user_config = read_user_config(document.get("userConfig"), &mut warnings);
     Ok(PluginManifest {
         name,
@@ -402,6 +417,7 @@ fn from_document(
         skill_paths,
         components,
         mcp_servers,
+        hooks,
         user_config,
         warnings,
     })
@@ -441,6 +457,7 @@ fn from_tick_package(
     }
     insert_default_components(root, &mut components, &mut warnings);
     let mcp_servers = read_mcp_servers(root, None, &mut warnings);
+    let hooks = hook_declarations(root, None);
     Ok(PluginManifest {
         name: marketplace_name.map_or(package.name, str::to_owned),
         display_name,
@@ -455,6 +472,7 @@ fn from_tick_package(
         skill_paths,
         components,
         mcp_servers,
+        hooks,
         user_config: BTreeMap::new(),
         warnings,
     })
@@ -752,6 +770,35 @@ fn read_mcp_declaration(
         }
         _ => warnings.push("mcpServers must be an object, path or array".into()),
     }
+}
+
+/// The default hooks file, then each path and object of the manifest's `hooks` field; a path that
+/// names the default file again is read once. Paths that are not contained in the plugin are
+/// dropped, as the component check already warned about them.
+fn hook_declarations(root: &Path, declaration: Option<&Value>) -> Vec<PluginHooks> {
+    let mut hooks = Vec::new();
+    if contained_path(root, &format!("./{DEFAULT_HOOKS_FILE}")).is_ok() {
+        hooks.push(PluginHooks::File(PathBuf::from(DEFAULT_HOOKS_FILE)));
+    }
+    let declared = match declaration {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(item) => vec![item],
+        None => Vec::new(),
+    };
+    for item in declared {
+        let declared_hooks = match item {
+            Value::Object(_) => PluginHooks::Inline(item.clone()),
+            Value::String(path) => match contained_path(root, path) {
+                Ok(path) => PluginHooks::File(path),
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        if !hooks.contains(&declared_hooks) {
+            hooks.push(declared_hooks);
+        }
+    }
+    hooks
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
