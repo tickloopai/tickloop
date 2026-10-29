@@ -63,7 +63,7 @@ struct ChatCheckpoint {
     #[serde(default)]
     ceiling_launch_rules: Vec<PermissionRule>,
     #[serde(default)]
-    user_skill_preparations: HashMap<RunId, command_skills::UserSkillPreparation>,
+    user_skill_preparations: Option<HashMap<RunId, command_skills::UserSkillPreparation>>,
     deferred_messages: Vec<Message>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     output_style: OutputStyle,
@@ -170,7 +170,7 @@ impl Agent {
                     .unwrap_or_default(),
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
-                user_skill_preparations: chat.user_skill_preparations.clone(),
+                user_skill_preparations: Some(chat.user_skill_preparations.clone()),
                 deferred_messages: chat.deferred_messages.clone(),
                 feedback_inputs: chat.feedback_inputs.clone(),
                 output_style: chat.output_style,
@@ -364,6 +364,30 @@ impl Agent {
                     ));
                 }
             };
+            // Before command preprocessing, queued Skills were already activated. Only an old
+            // authenticated checkpoint may carry that state forward; history never rebuilds a plan.
+            let user_skill_preparations =
+                saved.user_skill_preparations.clone().unwrap_or_else(|| {
+                    snapshot
+                        .pending_inputs
+                        .iter()
+                        .filter(|pending| pending.is_skill_invocation)
+                        .map(|pending| pending.receipt.run_id)
+                        .chain(saved.waiting.iter().map(|receipt| receipt.run_id))
+                        .filter(|run| {
+                            snapshot
+                                .user_skill_invocations
+                                .get(run)
+                                .is_some_and(|invocation| {
+                                    snapshot.invoked_skills.iter().any(|skill| {
+                                        skill.name == invocation.name
+                                            && skill.source == invocation.source
+                                    })
+                                })
+                        })
+                        .map(|run| (run, command_skills::UserSkillPreparation::Complete))
+                        .collect()
+                });
             self.inner.chats.lock().await.insert(
                 snapshot.id,
                 Chat {
@@ -399,7 +423,7 @@ impl Agent {
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
                     user_loops: HashMap::new(),
-                    user_skill_preparations: saved.user_skill_preparations.clone(),
+                    user_skill_preparations,
                     deferred_messages: saved.deferred_messages.clone(),
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,

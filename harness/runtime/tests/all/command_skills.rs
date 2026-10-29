@@ -155,10 +155,11 @@ async fn command_shells_run_before_activation_through_both_invocation_paths() {
             operations[0].parent_call_id.as_deref(),
             (!user).then_some("skill-call")
         );
-        let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), if user { 1 } else { 2 });
-        assert!(format!("{:?}", requests.last().unwrap()).contains("prepared-value"));
-        drop(requests);
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), if user { 1 } else { 2 });
+            assert!(format!("{:?}", requests.last().unwrap()).contains("prepared-value"));
+        }
         agent.shutdown().await;
     }
 }
@@ -751,4 +752,91 @@ async fn cold_restore_keeps_preparation_records_without_resending_shells() {
     );
     first.shutdown().await;
     restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn old_checkpoint_retains_queued_guidance_without_rebuilding_an_execution_plan() {
+    use tickloop_harness_runtime::upgrade::AgentUpgradeCheckpoint;
+    for legacy in [true, false] {
+        let folder = tempfile::tempdir().unwrap();
+        let markdown = "---\ndescription: Check\n---\nLegacy guidance";
+        let agent = command_agent(
+            MemoryEnvironment::new(),
+            Arc::new(ScriptedModel::new(vec![])),
+            markdown,
+        );
+        let chat = agent.create_chat(folder.path().into()).await.unwrap();
+        let barrier = agent.queue_command(chat, "/help".into()).await.unwrap();
+        let queued = agent.invoke_skill(chat, "demo:check", "").await.unwrap();
+        let checkpoint = agent.prepare_upgrade().await.unwrap().unwrap();
+        let settings = CommandSettings {
+            memory: Default::default(),
+            markdown: markdown.into(),
+        };
+        let activated = tickloop_harness_protocol::InvokedSkill::try_from(
+            settings
+                .skills(Some(folder.path()))
+                .expand(
+                    "demo:check",
+                    "",
+                    tickloop_harness_policy::skills::SkillCaller::User,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let mut checkpoint = serde_json::to_value(checkpoint).unwrap();
+        checkpoint["chats"][0]["snapshot"]["history"]["invoked_skills"] = json!([activated]);
+        if legacy {
+            checkpoint["chats"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("user_skill_preparations");
+        } else {
+            checkpoint["chats"][0]["user_skill_preparations"] = json!({});
+        }
+        let checkpoint: AgentUpgradeCheckpoint = serde_json::from_value(checkpoint).unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![text("done")]));
+        let successor = command_agent(MemoryEnvironment::new(), model.clone(), markdown);
+        successor.restore_upgrade(checkpoint).await.unwrap();
+        successor.activate_upgrade().await.unwrap();
+        successor.release_upgrade().await.unwrap();
+        let mut events = successor.subscribe();
+        successor
+            .take_next_queued_command(chat)
+            .await
+            .unwrap()
+            .unwrap();
+        successor
+            .finish_queued_command(chat, barrier)
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id == queued.run_id {
+                match event.kind {
+                    EventKind::Completed { .. } => {
+                        assert!(legacy);
+                        break;
+                    }
+                    EventKind::Failed(error) => {
+                        assert!(!legacy, "{error}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(model.requests.lock().unwrap().len(), usize::from(legacy));
+        assert!(
+            successor
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+        agent.cancel_upgrade().await;
+        agent.shutdown().await;
+        successor.shutdown().await;
+    }
 }

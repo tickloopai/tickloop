@@ -341,3 +341,33 @@ fn command_argument_hints_accept_the_arrays_used_by_official_plugins() {
             .is_ok()
     );
 }
+
+#[test]
+fn named_arguments_precede_generic_placeholders_and_keep_indexed_fallback() {
+    for (names, body, expected) in [
+        ("[ARGUMENTS]", "$ARGUMENTS", "first"),
+        ("[ARGUMENTSfoo]", "$ARGUMENTSfoo", "first"),
+        ("[ARGUMENTS]", "$ARGUMENTS[1]", "second"),
+    ] {
+        let registry = command_registry(&format!("---\narguments: {names}\n---\n{body}"));
+        assert!(
+            registry
+                .expand("demo:check", "first second", SkillCaller::User)
+                .unwrap()
+                .content
+                .ends_with(expected)
+        );
+    }
+}
+
+#[test]
+fn positional_argument_boundaries_follow_ascii_rules_beside_chinese_text() {
+    let registry = command_registry("处理 $0文件; $1_unchanged; $١");
+    assert!(
+        registry
+            .expand("demo:check", "demo next", SkillCaller::User)
+            .unwrap()
+            .content
+            .ends_with("处理 demo文件; $1_unchanged; $١")
+    );
+}

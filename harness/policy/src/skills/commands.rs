@@ -196,7 +196,7 @@ impl SkillRegistry {
                     | "user-invocable"
                     | "when_to_use"
             ) {
-                self.warn(format!(
+                self.warn_compatibility(format!(
                     "Command {name}: {field} is not supported and is ignored"
                 ));
             }
@@ -340,72 +340,37 @@ pub(super) fn expand_arguments(
 ) -> Result<String, SkillError> {
     let mut matching_names = names
         .iter()
-        .filter(|name| {
-            !name.is_empty()
-                && name.len() <= MAX_ARGUMENT_NAME_BYTES
-                && !name.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        .enumerate()
+        .filter(|(_, name)| !name.is_empty() && name.len() <= MAX_ARGUMENT_NAME_BYTES)
         .take(MAX_ARGUMENT_NAMES)
         .collect::<Vec<_>>();
-    matching_names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-    let mut pattern = String::from(r"\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS|\$(\d+)\b");
-    if !matching_names.is_empty() {
-        pattern.push_str(&format!(
-            r"|\$({})",
-            matching_names
-                .iter()
-                .map(|name| regex::escape(name))
-                .collect::<Vec<_>>()
-                .join("|")
-        ));
-    }
-    let parameter = Regex::new(&pattern).expect("escaped argument names form a valid regex");
+    matching_names.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
     let tokens = shell_words::split(arguments)
         .unwrap_or_else(|_| arguments.split_whitespace().map(str::to_owned).collect());
     let mut result = String::new();
     let mut offset = 0;
     let mut substituted = false;
-    for captures in parameter.captures_iter(body) {
-        let matched = captures.get(0).unwrap();
-        if captures.get(3).is_some()
-            && body[matched.end()..]
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"_[".contains(&byte))
-        {
+    while let Some(relative) = body[offset..].find('$') {
+        let start = offset + relative;
+        result.push_str(&body[offset..start]);
+        let rest = &body[start + 1..];
+        let Some((length, value)) = parameter(rest, arguments, &tokens, &matching_names) else {
+            result.push('$');
+            offset = start + 1;
             continue;
-        }
-        let preceding = &body[..matched.start()];
-        let escaped = preceding.ends_with('\\') && !preceding.ends_with("\\\\");
-        result.push_str(&body[offset..matched.start()]);
-        if escaped {
+        };
+        let end = start + 1 + length;
+        let preceding = &body[..start];
+        if preceding.ends_with('\\') && !preceding.ends_with("\\\\") {
             result.pop();
-            result.push_str(matched.as_str());
+            result.push_str(&body[start..end]);
+        } else if let Some(value) = value {
+            result.push_str(&neutralize_shell_markers(value));
+            substituted = true;
         } else {
-            let index = captures.get(1).or_else(|| captures.get(2));
-            let value = if let Some(index) = index {
-                index
-                    .as_str()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| tokens.get(index))
-                    .map(String::as_str)
-            } else if let Some(name) = captures.get(3) {
-                names
-                    .iter()
-                    .position(|candidate| candidate == name.as_str())
-                    .map(|index| tokens.get(index).map_or("", String::as_str))
-            } else {
-                Some(arguments)
-            };
-            if let Some(value) = value {
-                result.push_str(&neutralize_shell_markers(value));
-                substituted = true;
-            } else {
-                result.push_str(matched.as_str());
-            }
+            result.push_str(&body[start..end]);
         }
-        offset = matched.end();
+        offset = end;
         if result.len() > MAX_EXPANSION_BYTES {
             return Err(SkillError::Invalid(
                 "command expansion exceeds size limit".into(),
@@ -425,6 +390,58 @@ pub(super) fn expand_arguments(
         ));
     }
     Ok(result)
+}
+
+fn parameter<'a>(
+    rest: &str,
+    arguments: &'a str,
+    tokens: &'a [String],
+    names: &[(usize, &String)],
+) -> Option<(usize, Option<&'a str>)> {
+    for (index, name) in names {
+        if let Some(after) = rest.strip_prefix(name.as_str())
+            && !after
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"_[".contains(&byte))
+        {
+            return Some((
+                name.len(),
+                Some(tokens.get(*index).map_or("", String::as_str)),
+            ));
+        }
+    }
+    if let Some(indexed) = rest.strip_prefix("ARGUMENTS[") {
+        let length = indexed.bytes().take_while(u8::is_ascii_digit).count();
+        if length > 0 && indexed[length..].starts_with(']') {
+            let value = indexed[..length]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| tokens.get(index))
+                .map(String::as_str);
+            return Some(("ARGUMENTS[".len() + length + 1, value));
+        }
+    }
+    if rest.starts_with("ARGUMENTS") {
+        return Some(("ARGUMENTS".len(), Some(arguments)));
+    }
+    let length = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if length == 0
+        || rest[length..]
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    Some((
+        length,
+        rest[..length]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| tokens.get(index))
+            .map(String::as_str),
+    ))
 }
 
 pub(super) fn shell_commands(content: &str) -> Vec<SkillShellCommand> {

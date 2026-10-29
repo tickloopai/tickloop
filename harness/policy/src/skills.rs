@@ -96,6 +96,7 @@ pub struct SkillRegistry {
     skills: BTreeMap<String, SkillDefinition>,
     remote: BTreeMap<String, SkillDefinition>,
     warnings: Vec<String>,
+    discovery_incomplete: bool,
     loop_files: Arc<dyn LoopInstructionSource>,
 }
 
@@ -174,7 +175,16 @@ impl SkillRegistry {
     }
 
     pub fn warn(&mut self, warning: String) {
+        self.discovery_incomplete = true;
         self.warnings.push(warning);
+    }
+
+    fn warn_compatibility(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
+
+    pub fn needs_discovery_retry(&self) -> bool {
+        self.discovery_incomplete
     }
 
     /// Registers the Skill in `markdown`. A Tick package's or a plugin's Skill is named
@@ -516,7 +526,7 @@ Available Skills:
 
     fn register(&mut self, parsed: Result<SkillDefinition, SkillError>, path: Option<&Path>) {
         match parsed {
-            Ok(skill) if self.skills.contains_key(&skill.name) => self.warnings.push(format!(
+            Ok(skill) if self.skills.contains_key(&skill.name) => self.warn(format!(
                 "Skill `{}` from {} is ignored because that name is already registered",
                 skill.name,
                 display_source(path)
@@ -524,9 +534,7 @@ Available Skills:
             Ok(skill) => {
                 self.skills.insert(skill.name.clone(), skill);
             }
-            Err(error) => self
-                .warnings
-                .push(format!("{} is ignored: {error}", display_source(path))),
+            Err(error) => self.warn(format!("{} is ignored: {error}", display_source(path))),
         }
     }
 }
@@ -709,6 +717,7 @@ impl Default for SkillRegistry {
             skills: BTreeMap::new(),
             remote: BTreeMap::new(),
             warnings: Vec::new(),
+            discovery_incomplete: false,
             loop_files: Arc::new(MaintenanceInstructions),
         }
     }

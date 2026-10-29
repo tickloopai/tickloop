@@ -66,7 +66,8 @@ impl SkillDiscoveryCache {
             .collect();
         // Invalid manifests may hide their own input paths; retry incomplete discovery so repairs
         // become visible even when the installation registry did not change.
-        self.retry_at = (!registry.warnings().is_empty())
+        self.retry_at = registry
+            .needs_discovery_retry()
             .then(|| std::time::Instant::now() + INCOMPLETE_DISCOVERY_RETRY);
         self.context = Some(context);
         Some(registry)

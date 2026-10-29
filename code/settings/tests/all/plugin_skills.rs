@@ -694,3 +694,36 @@ fn a_command_can_alias_a_skill_file_without_hiding_the_differently_named_skill()
         expanded.content
     );
 }
+
+#[test]
+fn command_compatibility_notices_do_not_force_periodic_rediscovery() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "notices",
+        serde_json::json!({"name":"notices"}),
+        &[],
+    );
+    fs::create_dir_all(source.join("commands")).unwrap();
+    fs::write(
+        source.join("commands/check.md"),
+        "---\nmodel: inherit\n---\nGuide",
+    )
+    .unwrap();
+    install(&config, &source);
+    let mut cache = SkillDiscoveryCache::default();
+    let registry = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert!(!registry.warnings().is_empty());
+    assert!(!registry.needs_discovery_retry());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(cache.refresh(directory.path(), Some(&config)).is_none());
+    fs::write(config.join("plugins/installed.json"), "not json").unwrap();
+    assert!(
+        cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .needs_discovery_retry()
+    );
+}
