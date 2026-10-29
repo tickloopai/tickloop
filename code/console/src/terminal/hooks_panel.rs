@@ -1,6 +1,7 @@
 //! `/hooks`: the hooks configured for a Folder, grouped by where they come from, each with its
-//! event, matcher, command and trust. Space or `t` trusts the selected plugin or repository hook,
-//! `x` twice disables it or restores it, and Enter shows its details with what its trust covers.
+//! event, matcher, `if` condition, command and trust. Space or `t` trusts the selected plugin or
+//! repository hook, `x` twice disables it or restores it, and Enter shows its details with what
+//! its trust covers.
 //! The review a New Agent offers once per Folder is the same panel opened on its menu; reviewing
 //! one by one turns it into the list. The panel keeps what it shows and what the user chose; the
 //! Console runs the work and hands each result back through [`HooksPanel::apply`].
@@ -812,16 +813,23 @@ fn source_heading(source: &HookSource) -> String {
     }
 }
 
-/// The hook's event, with its matcher when it has one.
+/// The hook's event, with its matcher and its `if` condition when it has them, so hooks that
+/// differ only by their condition read apart.
 fn hook_name(hook: &ConfiguredHook) -> String {
-    match hook
+    let mut name = hook.event.name().to_owned();
+    if let Some(matcher) = hook
         .matcher
         .as_deref()
         .filter(|matcher| !matcher.is_empty())
     {
-        Some(matcher) => format!("{} {}", hook.event.name(), compact_line(matcher)),
-        None => hook.event.name().to_owned(),
+        name.push(' ');
+        name.push_str(&compact_line(matcher));
     }
+    if let Some(condition) = &hook.condition {
+        name.push_str(" if ");
+        name.push_str(&compact_line(condition));
+    }
+    name
 }
 
 fn hook_count(count: usize) -> String {
@@ -1117,6 +1125,39 @@ mod tests {
             press(&mut panel, KeyCode::Esc),
             HooksPanelEffect::Close
         ));
+    }
+
+    #[test]
+    fn rows_that_differ_only_by_their_if_condition_show_it_before_the_command() {
+        let command = "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/sg-python.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/security_reminder_hook.py\"";
+        let reviewer = |key: &str, condition: &str| {
+            let mut reviewer = hook(plugin(), key, HookTrust::Trusted);
+            reviewer.event = HookEvent::PostToolUse;
+            reviewer.command = command.into();
+            reviewer.condition = Some(condition.into());
+            reviewer
+        };
+        let mut panel = loaded(vec![
+            reviewer("commit", "Bash(git*commit*)"),
+            reviewer("push", "Bash(git*push*)"),
+            reviewer("stack", "Bash(gt\n  *)"),
+        ]);
+        let shown = text(&mut panel);
+        for row in [
+            "PostToolUse Bash if Bash(git*commit*) · bash",
+            "PostToolUse Bash if Bash(git*push*) · bash",
+            "PostToolUse Bash if Bash(gt *) · bash",
+        ] {
+            assert!(shown.contains(row), "{row} in {shown}");
+        }
+        press(&mut panel, KeyCode::Down);
+        press(&mut panel, KeyCode::Char('x'));
+        assert!(
+            text(&mut panel)
+                .contains("Press x again to disable PostToolUse Bash if Bash(git*push*)"),
+            "{}",
+            text(&mut panel)
+        );
     }
 
     #[test]

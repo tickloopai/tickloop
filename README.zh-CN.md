@@ -325,7 +325,7 @@ Hook 在 Agent 工作的固定时刻运行 Shell 命令：工具调用前后、�
 
 确认之前这些 Hook 不运行，对话中会说明，例如 `PreToolUse:Bash hooks not run: 1 hook not confirmed yet · review in /hooks`。只有你能信任 Hook，Agent 没有办法代你确认。运行中从不停下来询问：任何对话（包括 Subagent 和无人观看的对话）都直接跳过未确认的 Hook。
 
-`/hooks` 按 **Your settings**、**This folder** 与 **Plugin NAME@MARKETPLACE** 分组列出当前目录的 Hook。每行显示事件、matcher、命令和状态：`trusted`、`pending`（从未信任）、`modified`（信任后有改动）或 `disabled`。用 `ctrl+n`/`ctrl+p` 或方向键选择，`enter` 查看详情（完整命令、所在文件、超时、`if` 条件、后台方式，以及信任覆盖的范围），`space` 或 `t` 信任，三秒内按两次 `x` 停用或恢复已停用的 Hook，`r` 刷新，`esc` 关闭。你自己的 Hook 也可以停用，停用后在所有目录都不运行。面板不编辑 Hook，请到它所在的文件里修改。信任记录保存在你的 `settings.json` 的 `hookTrust` 中（仓库的记在该目录的 `projects` 条目里），卸载插件时一并删除。
+`/hooks` 按 **Your settings**、**This folder** 与 **Plugin NAME@MARKETPLACE** 分组列出当前目录的 Hook。每行显示事件、matcher、`if` 条件、命令和状态：`trusted`、`pending`（从未信任）、`modified`（信任后有改动）或 `disabled`。用 `ctrl+n`/`ctrl+p` 或方向键选择，`enter` 查看详情（完整命令、所在文件、超时、`if` 条件、后台方式，以及信任覆盖的范围），`space` 或 `t` 信任，三秒内按两次 `x` 停用或恢复已停用的 Hook，`r` 刷新，`esc` 关闭。你自己的 Hook 也可以停用，停用后在所有目录都不运行。面板不编辑 Hook，请到它所在的文件里修改。信任记录保存在你的 `settings.json` 的 `hookTrust` 中（仓库的记在该目录的 `projects` 条目里），卸载插件时一并删除。
 
 新对话开始时，如果当前目录有待确认或已修改的 Hook，会显示 **Hooks need review** 菜单：逐个审查（打开 `/hooks`）、全部信任并继续，或不信任直接继续（这些 Hook 不运行）。每次打开 Tickloop，每个目录只提示一次。
 
@@ -350,8 +350,8 @@ Tickloop 为以下十个事件运行 `command` 类型的 Hook，stdin 输入、�
 - 输入含 `session_id`（Chat 的 ID）、`transcript_path`（Claude Code 格式的对话副本，读转录的脚本可以照常使用）、`cwd`、`permission_mode`、`hook_event_name`，以及各事件自己的字段。命令在工作目录中运行，并设有 `CLAUDE_PROJECT_DIR`；插件 Hook 另有 `TICKLOOP_PLUGIN_ROOT`、`TICKLOOP_PLUGIN_DATA` 及其 `CLAUDE_` 别名，命令中的 `${CLAUDE_PLUGIN_ROOT}`、`${user_config.KEY}` 会被替换。插件 Hook 引用的 `user_config` 值缺失时不运行，等待配置。
 - 退出码 0 表示成功：stdout 是 JSON 时按 JSON 解析，否则在 `UserPromptSubmit` 与 `SessionStart` 中作为上下文。退出码 2 表示拦下，stderr 交给模型（或拒绝该提示、让本轮继续）。其他退出码和超时只提醒你。
 - 匹配到的 Hook 并行运行；决定不一致时 deny 优先于 ask，ask 优先于 allow。`ask` 在 Auto 下也会问你。你自己的 Hook 返回 `allow` 时跳过审批提示与 Auto 审查，显式的 Ask、Deny 规则、敏感路径检查与 Plan 照常生效。`updatedInput` 之后，审批界面显示实际将运行的参数。
-- `async: true` 让 Hook 在后台运行、不阻塞 Agent；结束后显示结果，其 `systemMessage` 与 `additionalContext` 随下一次请求交给模型。`asyncRewake: true` 同样在后台运行，退出码 2 时以 Hook 的输出唤醒 Agent，就像后台命令完成时一样。后台 Hook 的决定类输出一律忽略。
-- `esc` 和 `/stop` 取消当前步骤正在等待的 Hook；这样被取消的 `PreToolUse` Hook 也会取消对应的工具调用。后台 Hook 不随 `esc` 取消，`/stop` 与停止 Agent 时结束。持续拦下的 `Stop` Hook 可用 `esc` 或 `/stop` 结束循环。与 Claude Code 一致，`Stop`、`SubagentStop` Hook 在中间没有工具调用时最多连续拦下 8 次，第 9 次拦截被忽略并给出警告，本轮结束；调用工具后重新计数，因此每轮都调用工具的循环不受影响。
+- `async: true` 让 Hook 在后台运行、不阻塞 Agent；结束后显示结果，其 `systemMessage` 与 `additionalContext` 随下一次请求交给模型。`asyncRewake: true` 同样在后台运行，退出码 2 时以 Hook 的输出唤醒 Agent，就像后台命令完成时一样。运行中的 Hook 以第一行输出 `{"async": true}` 时同样转入后台（与 Claude Code 一致），之后按 `async` Hook 处理，超时仍从开始运行时算起。后台 Hook 的决定类输出一律忽略。
+- `esc` 和 `/stop` 取消当前步骤正在等待的 Hook；这样被取消的 `PreToolUse` Hook 也会取消对应的工具调用，模型读到该调用未执行。后台 Hook 不随 `esc` 取消，`/stop` 与停止 Agent 时结束。持续拦下的 `Stop` Hook 可用 `esc` 或 `/stop` 结束循环。与 Claude Code 一致，`Stop`、`SubagentStop` Hook 在中间没有工具调用时最多连续拦下 8 次，第 9 次拦截被忽略并给出警告，本轮结束；调用工具后重新计数，因此每轮都调用工具的循环不受影响。
 - Hook 的 `systemMessage`、拦下的原因和失败会在对话中显示一行。每次运行（来源、事件、耗时、退出码、决定与截断后的输出）都列在 `/permissions` → Recent activity 中（每个对话最近 100 条）。
 
 Hook 以你的身份在沙箱之外运行，与 Claude Code 中相同。
@@ -363,7 +363,6 @@ Hook 以你的身份在沙箱之外运行，与 Claude Code 中相同。
 - `UserPromptSubmit` 对你发送的提示运行，包括 Agent 工作时排队、在本轮中被读入的提示，但不对定时任务、Tick 更新等自动输入运行。
 - `tool_response` 是工具的结果文本（是 JSON 时按 JSON 解析），不是 Claude Code 按工具区分的结构；转录副本中的工具结果也只保留文本。
 - `asyncRewake` Hook 在 `esc` 或 `/stop` 之后才以退出码 2 结束时，通知留到下一轮，不唤醒 Agent。
-- 像 Claude Code 允许的那样以第一行输出 `{"async": true}` 把自己转入后台的 Hook 不会转入后台：它照常运行到结束，输出被报告为无效 JSON。
 
 ## 运行环境
 

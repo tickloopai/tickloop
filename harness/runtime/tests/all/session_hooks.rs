@@ -56,6 +56,7 @@ fn exits(code: i32, stdout: &str, stderr: &str) -> MemoryCommandRun {
         stderr: stderr.as_bytes().to_vec(),
         exit_code: code,
         duration: Duration::ZERO,
+        ..Default::default()
     }
 }
 

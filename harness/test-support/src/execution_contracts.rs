@@ -910,6 +910,8 @@ pub const COMMAND_CONTRACT_VARIABLE: &str = "CONTRACT_VALUE";
 /// exits with 3.
 pub const ECHO_COMMAND: &str = "cat; printf '%s|%s' \"$CONTRACT_VALUE\" \"$(pwd -P)\" >&2; exit 3";
 pub const HANGING_COMMAND: &str = "sleep 30";
+/// Writes a line, then keeps running.
+pub const FIRST_LINE_COMMAND: &str = "printf 'first line\\n'; sleep 30";
 pub const LARGE_OUTPUT_BYTES: usize = COMMAND_OUTPUT_BYTES + 4096;
 
 pub fn large_output_command() -> String {
@@ -938,6 +940,11 @@ pub fn define_command_contract(
         duration: std::time::Duration::from_secs(30),
         ..Default::default()
     });
+    environment.define_command(FIRST_LINE_COMMAND, |_| MemoryCommandRun {
+        early_stdout: b"first line\n".to_vec(),
+        duration: std::time::Duration::from_secs(30),
+        ..Default::default()
+    });
     environment.define_command(&large_output_command(), |_| MemoryCommandRun {
         stdout: vec![b'x'; LARGE_OUTPUT_BYTES],
         ..Default::default()
@@ -959,6 +966,7 @@ pub async fn one_shot_command_contract(
         env: Default::default(),
         cwd: cwd.clone(),
         timeout,
+        stdout_tap: None,
     };
     let long = std::time::Duration::from_secs(30);
 
@@ -1044,6 +1052,20 @@ pub async fn one_shot_command_contract(
         cancel.clone(),
         || cancel.cancel(),
     )
+    .await;
+    assert!(matches!(outcome, ExecutionOutcome::OutcomeUnknown { .. }));
+
+    let (tap, mut tapped) = OutputTap::new();
+    let tapped_command = CommandSpec {
+        stdout_tap: Some(tap),
+        ..command(FIRST_LINE_COMMAND, long)
+    };
+    let cancel = CancellationToken::new();
+    let outcome = interrupt_command(&port, &authority, tapped_command, cancel.clone(), || {
+        let first = tapped.try_recv().expect("the tap passed on the first line");
+        assert_eq!(first, b"first line\n");
+        cancel.cancel();
+    })
     .await;
     assert!(matches!(outcome, ExecutionOutcome::OutcomeUnknown { .. }));
 
