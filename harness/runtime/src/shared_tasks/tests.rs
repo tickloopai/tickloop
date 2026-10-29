@@ -658,11 +658,10 @@ fn task_references_resolve_in_either_form() {
 }
 
 /// The flat TaskUpdate schema offers every action's fields, and models fill the ones the action
-/// does not take with empty values; those are dropped before the call is prepared, so they
-/// neither fail it nor make a retry differ. Another action's field with content still fails,
-/// naming the fields the action takes.
+/// does not take, empty or with placeholder content; those are dropped before the call is
+/// prepared, so they neither fail it nor make a retry differ.
 #[tokio::test]
-async fn task_update_drops_empty_fields_of_other_actions() {
+async fn task_update_drops_fields_of_other_actions() {
     use tickloop_harness_test_support::routed::tool_result;
     let completion = Uuid::new_v4();
     let model = Arc::new(RoutedModel::new(move |request| {
@@ -685,29 +684,17 @@ async fn task_update_drops_empty_fields_of_other_actions() {
         for (id, input) in [
             (
                 "claim",
-                json!({"mutation_id":Uuid::new_v4(),"task_id":task_id,"expected_revision":1,"action":"claim","owner":null,"result":"","dependencies":[]}),
-            ),
-            (
-                "claim-with-result",
-                update(
-                    json!({"mutation_id":Uuid::new_v4(),"action":"claim","result":"started","owner":"main"}),
-                ),
+                json!({"mutation_id":Uuid::new_v4(),"task_id":task_id,"expected_revision":1,"action":"claim","owner":"main","result":"started","title":"Inspect","description":"Inspect authorized work","dependencies":[]}),
             ),
             (
                 "complete",
                 update(
-                    json!({"mutation_id":completion,"action":"complete","result":"Verified","dependencies":[],"title":"","owner":null}),
+                    json!({"mutation_id":completion,"action":"complete","result":"Verified","dependencies":[task_id],"title":"Inspect","owner":null}),
                 ),
             ),
             (
                 "retry",
                 update(json!({"mutation_id":completion,"action":"complete","result":"Verified"})),
-            ),
-            (
-                "complete-with-dependencies",
-                update(
-                    json!({"mutation_id":Uuid::new_v4(),"action":"complete","result":"Verified","title":"","dependencies":[task_id]}),
-                ),
             ),
         ] {
             if !has_tool_result(request, id) {
@@ -757,14 +744,6 @@ async fn task_update_drops_empty_fields_of_other_actions() {
     };
     let (claimed, is_error) = result("claim");
     assert!(!is_error, "{claimed}");
-    assert_eq!(
-        result("claim-with-result"),
-        (
-            "invalid TaskUpdate input: action 'claim' accepts no action fields (got: owner, result)"
-                .into(),
-            true
-        )
-    );
     let (completed, is_error) = result("complete");
     assert!(!is_error, "{completed}");
     assert_eq!(
@@ -776,14 +755,6 @@ async fn task_update_drops_empty_fields_of_other_actions() {
     assert_eq!(
         serde_json::from_str::<Value>(&retried).unwrap()["status"],
         "already_applied"
-    );
-    assert_eq!(
-        result("complete-with-dependencies"),
-        (
-            "invalid TaskUpdate input: action 'complete' accepts only: result (got: dependencies)"
-                .into(),
-            true
-        )
     );
     let board = &snapshot.task_boards[&receipt.loop_id];
     assert_eq!(board.tasks[0].status, Status::Completed);
@@ -797,8 +768,8 @@ async fn task_update_drops_empty_fields_of_other_actions() {
     );
 }
 
-/// Only empty fields of other actions are dropped; an action's own fields, keys outside the
-/// schema and input without a known action reach the strict parse as written.
+/// Fields of other actions are dropped whatever they hold; an action's own fields, keys outside
+/// the schema and input without a known action reach the strict parse as written.
 #[test]
 fn prepared_update_input_keeps_what_the_strict_parse_judges() {
     for unchanged in [
@@ -806,28 +777,28 @@ fn prepared_update_input_keeps_what_the_strict_parse_judges() {
         json!({"action":"edit","title":"t","description":"d","dependencies":[]}),
         json!({"action":"assign","owner":""}),
         json!({"action":"claim","foo":""}),
-        json!({"action":"merge","dependencies":[]}),
-        json!({"result":"","dependencies":[]}),
+        json!({"action":"merge","dependencies":["x"]}),
+        json!({"result":"r","dependencies":[]}),
         json!({"action":7,"dependencies":[]}),
     ] {
-        assert_eq!(prepared_update_input(unchanged.clone()), Ok(unchanged));
+        assert_eq!(prepared_update_input(unchanged.clone()), unchanged);
     }
     assert_eq!(
         prepared_update_input(
-            json!({"action":"edit","title":"t","description":"d","dependencies":[],"owner":null,"result":""})
+            json!({"action":"edit","title":"t","description":"d","dependencies":[],"owner":null,"result":"r"})
         ),
-        Ok(json!({"action":"edit","title":"t","description":"d","dependencies":[]}))
+        json!({"action":"edit","title":"t","description":"d","dependencies":[]})
     );
     assert_eq!(
         prepared_update_input(
             json!({"action":"assign","owner":"a","dependencies":["x"],"title":"t","result":""})
         ),
-        Err("action 'assign' accepts only: owner (got: title, dependencies)".into())
+        json!({"action":"assign","owner":"a"})
     );
     assert_eq!(
         prepared_update_input(
-            json!({"action":"edit","title":"t","description":"d","dependencies":[],"result":"r"})
+            json!({"action":"claim","owner":"main","result":"started","title":"t","description":"d","dependencies":[]})
         ),
-        Err("action 'edit' accepts only: title, description, dependencies (got: result)".into())
+        json!({"action":"claim"})
     );
 }

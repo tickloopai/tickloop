@@ -2956,6 +2956,9 @@ impl Agent {
         let inherit_branch_session = continues_chat && base.snapshot.branch_origin.is_some();
         let mut candidate = base.clone();
         Self::prepare_cut(base, &mut candidate, cut)?;
+        let board_cleared = matches!(turn.placement, Some(turn::Placement::Replacing(_)))
+            && shared_tasks::clear_board_for_new_answer(&mut candidate)
+                .map_err(AgentError::Invalid)?;
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         let loop_id = chat.snapshot.chat_loop.id;
@@ -3107,6 +3110,9 @@ impl Agent {
         {
             self.emit_conversation_rewound(original, leaf);
         }
+        if board_cleared {
+            self.queue_task_boards(original);
+        }
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
@@ -3123,6 +3129,9 @@ impl Agent {
         self.remember_host_context(&receipt, host_context);
         if let (Some(mut context), Some(candidate)) = (session_context, session_candidate) {
             *context = candidate;
+        }
+        if board_cleared {
+            self.publish_task_board(&mut chats, chat_id, loop_id);
         }
         drop(chats);
         drop(family_mailbox);
