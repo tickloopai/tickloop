@@ -736,37 +736,64 @@ fn parse_transport(value: &Value, directory: &Path) -> Result<McpTransport, Stri
 }
 
 fn expand_variables(text: &str, environment: &BTreeMap<String, String>) -> Result<String, String> {
+    expand(text, environment, UnknownVariable::Fail)
+}
+
+/// Substitutes the variables `environment` holds and `user_config` values, with their defaults;
+/// any other `${...}` stays as written for the shell to expand.
+pub(crate) fn expand_known_variables(text: &str, environment: &BTreeMap<String, String>) -> String {
+    expand(text, environment, UnknownVariable::Keep).expect("keeping unknown variables never fails")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownVariable {
+    Fail,
+    Keep,
+}
+
+fn expand(
+    text: &str,
+    environment: &BTreeMap<String, String>,
+    unknown: UnknownVariable,
+) -> Result<String, String> {
     let mut output = String::new();
     let mut rest = text;
     while let Some(start) = rest.find("${") {
         output.push_str(&rest[..start]);
         let variable = &rest[start + 2..];
-        let end = variable
-            .find('}')
-            .ok_or("unterminated MCP environment variable")?;
+        let Some(end) = variable.find('}') else {
+            if unknown == UnknownVariable::Keep {
+                output.push_str(&rest[start..]);
+                return Ok(output);
+            }
+            return Err("unterminated MCP environment variable".into());
+        };
         let expression = &variable[..end];
         let (name, default) = expression
             .split_once(":-")
             .map_or((expression, None), |(name, default)| (name, Some(default)));
-        if name.is_empty()
-            || (!name.starts_with("user_config.")
-                && !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
-        {
-            return Err("invalid MCP environment variable name".into());
-        }
+        let is_user_config = name.starts_with("user_config.");
+        let is_valid_name = !name.is_empty()
+            && (is_user_config || name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'));
         let value = environment
             .get(name)
             .map(String::as_str)
-            .filter(|value| !value.is_empty())
-            .or(default)
-            .ok_or_else(|| {
-                if name.starts_with("user_config.") {
-                    "missing userConfig; configure the plugin".into()
-                } else {
-                    format!("missing environment variable {name}")
-                }
-            })?;
-        output.push_str(value);
+            .filter(|value| is_valid_name && !value.is_empty())
+            .or(default
+                .filter(|_| is_valid_name && (is_user_config || unknown == UnknownVariable::Fail)));
+        match (value, unknown) {
+            (Some(value), _) => output.push_str(value),
+            (None, UnknownVariable::Keep) => output.push_str(&rest[start..start + 2 + end + 1]),
+            (None, UnknownVariable::Fail) if !is_valid_name => {
+                return Err("invalid MCP environment variable name".into());
+            }
+            (None, UnknownVariable::Fail) if is_user_config => {
+                return Err("missing userConfig; configure the plugin".into());
+            }
+            (None, UnknownVariable::Fail) => {
+                return Err(format!("missing environment variable {name}"));
+            }
+        }
         rest = &variable[end + 1..];
     }
     output.push_str(rest);

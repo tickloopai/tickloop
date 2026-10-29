@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, os::unix::fs::symlink, path::PathBuf};
 
 use serde_json::json;
 use tick_packages::PackageAuth;
-use tick_plugins::{Component, ManifestFormat, PluginManifest, TickProgram};
+use tick_plugins::{Component, ManifestFormat, PluginHooks, PluginManifest, TickProgram};
 
 use crate::support::{Fixture, write_json, write_program, write_skill};
 
@@ -519,4 +519,54 @@ fn user_config_declarations_keep_supported_types_and_ignore_unknown_types() {
             .any(|warning| warning.contains("unknown"))
     );
     assert!(!format!("{:?}", manifest.warnings).contains("do-not-print"));
+}
+
+#[test]
+fn hook_declarations_list_the_default_file_once_then_manifest_paths_and_inline_objects() {
+    let fixture = Fixture::new();
+    let inline = json!({"Stop": [{"hooks": [{"type": "command", "command": "inline"}]}]});
+    let root = fixture.claude_plugin(
+        "hooked",
+        &json!({
+            "name": "hooked",
+            "hooks": ["./extra/more.json", "./hooks/hooks.json", inline, "./missing.json"],
+        }),
+        &[],
+    );
+    write_json(&root.join("hooks/hooks.json"), &json!({"hooks": {}}));
+    write_json(&root.join("extra/more.json"), &json!({"hooks": {}}));
+
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+
+    assert_eq!(
+        manifest.hooks,
+        [
+            PluginHooks::File(PathBuf::from("hooks/hooks.json")),
+            PluginHooks::File(PathBuf::from("extra/more.json")),
+            PluginHooks::Inline(inline),
+        ]
+    );
+    assert_eq!(
+        manifest.warnings,
+        ["hooks path \"./missing.json\" is ignored: it does not exist"]
+    );
+}
+
+#[test]
+fn a_plugin_without_a_hooks_field_declares_only_its_default_hooks_file() {
+    let fixture = Fixture::new();
+    let plain = fixture.claude_plugin("plain", &json!({"name": "plain"}), &[]);
+    let hooked = fixture.claude_plugin("hooked", &json!({"name": "hooked"}), &[]);
+    write_json(&hooked.join("hooks/hooks.json"), &json!({"hooks": {}}));
+
+    assert!(
+        PluginManifest::load(&plain, "unused", None)
+            .unwrap()
+            .hooks
+            .is_empty()
+    );
+    assert_eq!(
+        PluginManifest::load(&hooked, "unused", None).unwrap().hooks,
+        [PluginHooks::File(PathBuf::from("hooks/hooks.json"))]
+    );
 }

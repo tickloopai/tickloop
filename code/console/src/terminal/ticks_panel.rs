@@ -2131,6 +2131,7 @@ mod tests {
         InstalledPlugin {
             manifest: PluginManifest {
                 mcp_servers: Default::default(),
+                hooks: Vec::new(),
                 user_config: Default::default(),
                 name: name.into(),
                 display_name: None,

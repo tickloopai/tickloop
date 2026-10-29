@@ -500,6 +500,15 @@ fn uninstall(
         uninstalled.marketplace,
         uninstalled.version
     );
+    let id = format!("{}@{}", uninstalled.name, uninstalled.marketplace);
+    if let Err(error) =
+        tickloop_code_settings::UserSettings::in_root(store.config_root()).forget_plugin_hooks(&id)
+    {
+        eprintln!(
+            "Warning: its hook trust records were not removed: {}",
+            safe_line(&error.to_string())
+        );
+    }
     if let Some(data) = uninstalled.data {
         println!(
             "Its data stays in {}.",

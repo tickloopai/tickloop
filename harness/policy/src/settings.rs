@@ -8,6 +8,7 @@ use std::{
 };
 use tickloop_harness_base::output_style::OutputStyle;
 use tickloop_harness_model::judgment::JevConfig;
+use tickloop_harness_protocol::hooks::{HookList, HookTrustChange};
 use tickloop_harness_protocol::{
     AutoReviewerPreference, AutoRuleSettings, AutoSettingsRevision, ExecutionMode, ModelConfig,
     PermissionRule, ReasoningEffort, SearchConfig,
@@ -152,6 +153,25 @@ pub trait SettingsStore: Send + Sync {
         changes: &PermissionChanges,
         expected: Option<(&Path, &str)>,
     ) -> Result<(), SettingsStoreError>;
+
+    /// The hooks configured for `folder`: the user's, the enabled plugins' and the Folder's own,
+    /// each with its trust state.
+    fn hooks(&self, _folder: Option<&Path>) -> HookList {
+        HookList::default()
+    }
+
+    /// Applies trust changes to the hooks of `folder` atomically; when supplied, the expected
+    /// revision of [`HookList::revision`] is checked under the same transaction before any write.
+    fn write_hook_trust(
+        &self,
+        _folder: Option<&Path>,
+        _changes: &[HookTrustChange],
+        _expected_revision: Option<&str>,
+    ) -> Result<(), SettingsStoreError> {
+        Err(SettingsStoreError::Storage(
+            "this settings store keeps no hook trust records".into(),
+        ))
+    }
 }
 
 #[derive(Default)]
