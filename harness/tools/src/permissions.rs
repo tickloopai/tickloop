@@ -675,7 +675,17 @@ fn rule_matches_any(
     rule.decision == decision
         && rule_applies_to_tool_and_goal(rule, name, loop_id)
         && match &rule.specifier {
-            Some(specifier) if name == BASH_TOOL_NAME => shell_rule_matches_any(specifier, input),
+            Some(specifier) if name == BASH_TOOL_NAME => input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| match decision {
+                    Decision::Deny | Decision::Ask => bash_restriction_may_match(
+                        specifier,
+                        command,
+                        UnclearCommands::MatchWhereTheRuleCouldRun,
+                    ),
+                    _ => shell_rule_matches_any(specifier, command),
+                }),
             Some(specifier) => {
                 permission_rule_content(name, input).is_some_and(|content| content == *specifier)
             }
@@ -740,10 +750,10 @@ pub fn is_supported_rule_text(text: &str) -> bool {
 }
 
 /// Whether a restriction written as `rule` may apply to the call, failing closed: as Deny and Ask
-/// rules match, a compound command matches when any of its commands does, here with its
-/// redirections set aside, and a command whose commands cannot be told apart matches whatever
-/// the pattern. An MCP rule names its service by the call's own name, and a call whose service
-/// that name does not show matches too.
+/// rules match, a compound command matches when any of its commands does, with its redirections
+/// set aside and seen through wrappers, assignments and program paths, and a command whose
+/// commands cannot be told apart matches whatever the pattern. An MCP rule names its service by
+/// the call's own name, and a call whose service that name does not show matches too.
 pub fn restriction_may_match_call(
     rule: &PermissionRule,
     name: &str,
@@ -770,41 +780,204 @@ pub fn restriction_may_match_call(
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return true;
     };
-    // A substitution runs a command of its own, quoted or not.
-    if shell_rule_matches_any(pattern, input) || command.contains("$(") || command.contains('`') {
-        return true;
-    }
-    let commands = match split_shell_commands(command) {
-        Some(commands) => commands.into_iter().map(str::to_owned).collect::<Vec<_>>(),
-        None => {
-            let Some(parts) = split_shell_parts(command, true) else {
-                return true;
-            };
-            let commands = parts
-                .iter()
-                .map(|part| without_redirections(part))
-                .collect::<Vec<_>>();
-            if commands
-                .iter()
-                .any(|command| command.contains(['(', ')', '{', '}', '<', '>']))
-            {
-                return true;
-            }
-            commands
-        }
-    };
-    commands.iter().any(|command| {
-        bash_pattern_matches(pattern, command)
-            || bash_pattern_matches(pattern, &without_wrappers(command))
-    })
+    bash_restriction_may_match(pattern, command, UnclearCommands::Match)
 }
 
-/// A simple command as the program it runs sees it: without leading variable assignments, the
-/// `env` and `command` wrappers and their options, and with the program named without its
-/// directory.
+/// What a restriction makes of a command whose commands cannot be told apart, such as one with a
+/// command substitution, a subshell or an unclosed quote.
+#[derive(Clone, Copy)]
+enum UnclearCommands {
+    /// It matches whatever the pattern, so a hook's `if` lets its hook run.
+    Match,
+    /// It matches when the rule's command could start anywhere in it, quoted, substituted or
+    /// named by an expansion, so a Deny or Ask rule never misses it while ordinary commands that
+    /// cannot run the rule's command stay clear of unrelated rules.
+    MatchWhereTheRuleCouldRun,
+}
+
+fn bash_restriction_may_match(pattern: &str, command: &str, unclear: UnclearCommands) -> bool {
+    if shell_rule_matches_any(pattern, command) {
+        return true;
+    }
+    match distinct_commands(command) {
+        Some(commands) => commands
+            .iter()
+            .any(|command| simple_command_may_match(pattern, command)),
+        None => match unclear {
+            UnclearCommands::Match => true,
+            UnclearCommands::MatchWhereTheRuleCouldRun => [
+                command.to_owned(),
+                with_substitutions_as_expansions(command),
+            ]
+            .iter()
+            .flat_map(|text| possible_commands(text))
+            .any(|candidate| simple_command_may_match(pattern, &candidate)),
+        },
+    }
+}
+
+/// The simple commands of `command` with their redirections set aside, or `None` when they
+/// cannot be told apart: a substitution runs a command of its own, quoted or not.
+fn distinct_commands(command: &str) -> Option<Vec<String>> {
+    if command.contains("$(") || command.contains('`') {
+        return None;
+    }
+    if let Some(commands) = split_shell_commands(command) {
+        return Some(commands.into_iter().map(str::to_owned).collect());
+    }
+    let commands = split_shell_parts(command, true)?
+        .iter()
+        .map(|part| without_redirections(part))
+        .collect::<Vec<_>>();
+    (!commands
+        .iter()
+        .any(|command| command.contains(['(', ')', '{', '}', '<', '>'])))
+    .then_some(commands)
+}
+
+/// Every place in `text` where a command could start, read without regard to quotes: after a
+/// separator, a pipe, a newline, an opening or closing parenthesis or a backtick. Each comes
+/// without quotes, backslashes and redirections.
+fn possible_commands(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let is_redirection_next_to = |index: usize| {
+        index
+            .checked_sub(1)
+            .is_some_and(|before| matches!(bytes[before], b'<' | b'>'))
+            || bytes.get(index + 1) == Some(&b'>')
+    };
+    text.char_indices()
+        .filter(|(index, character)| match character {
+            '(' | ')' | '`' | ';' | '|' | '\n' => true,
+            '&' => !is_redirection_next_to(*index),
+            _ => false,
+        })
+        .map(|(index, _)| index)
+        .chain([text.len()])
+        .scan(0, |start, end| {
+            let segment = &text[*start..end];
+            *start = (end + 1).min(text.len());
+            Some(segment)
+        })
+        .map(|segment| without_redirections(&segment.replace(['\'', '"', '\\'], "")))
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// `text` with each command substitution replaced by the expansion `$_`, so a command whose
+/// program a substitution names shows that its program could be any.
+fn with_substitutions_as_expansions(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = [rest.find('`'), rest.find("$(")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        result.push_str(&rest[..start]);
+        result.push_str("$_");
+        let substitution = &rest[start..];
+        let end = if let Some(quoted) = substitution.strip_prefix('`') {
+            quoted.find('`').map(|end| end + 2)
+        } else {
+            let mut depth = 0usize;
+            substitution.char_indices().find_map(|(index, character)| {
+                match character {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0 && character == ')').then_some(index + 1)
+            })
+        };
+        rest = end.map_or("", |end| &substitution[end..]);
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Whether a simple command may run what `pattern` names: as written, as the program it runs
+/// sees it once wrappers are set aside, or with a program an expansion names standing for the
+/// rule's own program.
+fn simple_command_may_match(pattern: &str, command: &str) -> bool {
+    let unwrapped = without_wrappers(command);
+    if bash_pattern_matches(pattern, command) || bash_pattern_matches(pattern, &unwrapped) {
+        return true;
+    }
+    let (program, arguments) = unwrapped.split_once(' ').unwrap_or((&unwrapped, ""));
+    program.starts_with('$')
+        && rule_program(pattern).is_some_and(|rule_program| {
+            bash_pattern_matches(pattern, format!("{rule_program} {arguments}").trim_end())
+        })
+}
+
+/// The program a Bash rule's pattern names, such as `git` for `git push*` or `git:*`; `None`
+/// when the pattern starts with a wildcard and so names any program.
+fn rule_program(pattern: &str) -> Option<&str> {
+    let first_word = pattern.split_whitespace().next()?;
+    let program = first_word.split('*').next()?;
+    let program = program.strip_suffix(':').unwrap_or(program);
+    (!program.is_empty()).then_some(program)
+}
+
+/// Shell reserved words a simple command may follow.
+const LEADING_RESERVED_WORDS: [&str; 9] = [
+    "!", "{", "if", "then", "else", "elif", "do", "while", "until",
+];
+
+/// Wrappers that run the command after their options, with the options that take a separate
+/// value, after Claude Code's list for Deny and Ask rules.
+const COMMAND_WRAPPERS: [(&str, &[&str]); 12] = [
+    ("env", &["-u", "-C", "--unset", "--chdir"]),
+    ("command", &[]),
+    ("exec", &["-a"]),
+    ("builtin", &[]),
+    ("noglob", &[]),
+    ("time", &[]),
+    ("nohup", &[]),
+    ("nice", &["-n", "--adjustment"]),
+    ("timeout", &["-k", "-s", "--kill-after", "--signal"]),
+    (
+        "stdbuf",
+        &["-i", "-o", "-e", "--input", "--output", "--error"],
+    ),
+    (
+        "sudo",
+        &[
+            "-u",
+            "-g",
+            "-U",
+            "-C",
+            "-D",
+            "-h",
+            "-p",
+            "-r",
+            "-R",
+            "-t",
+            "-T",
+            "--user",
+            "--group",
+            "--other-user",
+            "--close-from",
+            "--chdir",
+            "--host",
+            "--prompt",
+            "--role",
+            "--type",
+            "--command-timeout",
+        ],
+    ),
+    ("xargs", &["-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a"]),
+];
+
+/// A simple command as the program it runs sees it: without leading variable assignments,
+/// reserved words and wrappers such as `env`, `command`, `nohup` or `timeout` with their options,
+/// and with the program named without quotes or its directory. `command -v` and `command -V`
+/// only look a program up and keep their wrapper.
 fn without_wrappers(command: &str) -> String {
     let is_assignment = |token: &str| {
         token.split_once('=').is_some_and(|(name, _)| {
+            let name = name.strip_suffix('+').unwrap_or(name);
             !name.is_empty()
                 && !name.starts_with(|character: char| character.is_ascii_digit())
                 && name
@@ -812,29 +985,60 @@ fn without_wrappers(command: &str) -> String {
                     .all(|character| character.is_ascii_alphanumeric() || character == '_')
         })
     };
-    let mut tokens = command.split_whitespace().peekable();
-    loop {
-        match tokens.peek().copied() {
-            Some(token) if is_assignment(token) => {}
-            Some("env" | "command") => {
-                tokens.next();
-                while tokens
-                    .peek()
-                    .is_some_and(|token| token.starts_with('-') || is_assignment(token))
-                {
-                    tokens.next();
-                }
-                continue;
-            }
-            _ => break,
+    let program_name = |token: &str| {
+        let unquoted = token.replace(['\'', '"', '\\'], "");
+        unquoted.rsplit('/').next().unwrap_or(&unquoted).to_owned()
+    };
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    while let Some(token) = tokens.get(index).copied() {
+        if is_assignment(token) || LEADING_RESERVED_WORDS.contains(&token) {
+            index += 1;
+            continue;
         }
-        tokens.next();
+        let name = program_name(token);
+        let Some((wrapper, valued_options)) = COMMAND_WRAPPERS
+            .iter()
+            .find(|(wrapper, _)| *wrapper == name)
+        else {
+            break;
+        };
+        let mut next = index + 1;
+        while let Some(option) = tokens.get(next).copied() {
+            if option == "--" {
+                next += 1;
+                break;
+            }
+            if *wrapper == "command" && option.starts_with('-') && option.contains(['v', 'V']) {
+                return command.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+            if option.starts_with('-') && option.len() > 1 {
+                next += if valued_options.contains(&option) {
+                    2
+                } else {
+                    1
+                };
+            } else if *wrapper == "env" && is_assignment(option) {
+                next += 1;
+            } else {
+                break;
+            }
+        }
+        if *wrapper == "timeout" {
+            next += 1;
+        }
+        index = next;
     }
     let mut words = Vec::new();
-    if let Some(program) = tokens.next() {
-        words.push(program.rsplit('/').next().unwrap_or(program));
+    if let Some(program) = tokens.get(index) {
+        words.push(program_name(program));
     }
-    words.extend(tokens);
+    words.extend(
+        tokens
+            .iter()
+            .skip(index + 1)
+            .map(|token| (*token).to_owned()),
+    );
     words.join(" ")
 }
 
@@ -916,10 +1120,7 @@ fn rule_applies_to_tool_and_goal(rule: &PermissionRule, name: &str, loop_id: Uui
     (rule.tool == name || rule.tool == "*") && rule.loop_id.is_none_or(|id| id == loop_id)
 }
 
-fn shell_rule_matches_any(pattern: &str, input: &Value) -> bool {
-    let Some(command) = input.get("command").and_then(Value::as_str) else {
-        return false;
-    };
+fn shell_rule_matches_any(pattern: &str, command: &str) -> bool {
     if !pattern.contains('*') && pattern == command {
         return true;
     }
@@ -1188,24 +1389,143 @@ mod restriction_tests {
         assert!(!bash_matches("git push*", "/usr/bin/git status"));
     }
 
+    fn bash_rule(decision: Decision, pattern: &str) -> PermissionRule {
+        PermissionRule {
+            decision,
+            ..deny(BASH_TOOL_NAME, Some(pattern))
+        }
+    }
+
+    fn explicit_decision(
+        rule: PermissionRule,
+        command: &str,
+    ) -> Option<ExplicitPermissionDecision> {
+        PermissionPolicy {
+            rules: vec![rule],
+            ..PermissionPolicy::default()
+        }
+        .explicit_match_with_session(
+            BASH_TOOL_NAME,
+            &json!({ "command": command }),
+            Uuid::nil(),
+            None,
+        )
+    }
+
+    const WRAPPED_PUSHES: [&str; 24] = [
+        "git push",
+        "cargo test && git push",
+        "env X=1 git push",
+        "env -i PATH=/bin git push origin",
+        "VAR=1 git push",
+        "PATH=/opt/bin git push",
+        "command git push",
+        "command -p git push",
+        "/usr/bin/git push",
+        "/usr/bin/env FOO=1 /opt/homebrew/bin/git push",
+        "'git' push",
+        r"\git push",
+        "nohup git push > push.log 2>&1 &",
+        "timeout 30 git push",
+        "sudo -u deploy git push",
+        "find . -name '*.patch' | xargs -I{} git push",
+        "if git push; then echo pushed; fi",
+        r#"echo "$(git push)""#,
+        "echo \"`git push`\"",
+        "echo $(cd repo && git push)",
+        "(cd repo && git push)",
+        "cat <(git push)",
+        "$(which git) push",
+        r#""$GIT" push origin"#,
+    ];
+
     #[test]
-    fn the_same_commands_keep_their_existing_deny_rule_matching() {
-        let rule = deny(BASH_TOOL_NAME, Some("git push*"));
-        for (command, matches) in [
-            ("git push", true),
-            ("cargo test && git push", true),
-            ("env X=1 git push", false),
-            ("/usr/bin/git push", false),
+    fn deny_and_ask_rules_see_through_wrappers_paths_and_substitutions() {
+        for (decision, explicit) in [
+            (Decision::Deny, ExplicitPermissionDecision::Deny),
+            (Decision::Ask, ExplicitPermissionDecision::Ask),
         ] {
+            for pattern in ["git push*", "git push:*"] {
+                for command in WRAPPED_PUSHES {
+                    assert_eq!(
+                        explicit_decision(bash_rule(decision, pattern), command),
+                        Some(explicit),
+                        "{decision:?} {pattern} {command}"
+                    );
+                    assert!(
+                        rule_matches_call(
+                            &bash_rule(decision, pattern),
+                            BASH_TOOL_NAME,
+                            &json!({ "command": command }),
+                            Uuid::nil()
+                        ),
+                        "{decision:?} {pattern} {command}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allow_rules_keep_their_conservative_matching() {
+        for command in WRAPPED_PUSHES
+            .into_iter()
+            .filter(|command| !matches!(*command, "git push" | "cargo test && git push"))
+        {
             assert_eq!(
-                rule_matches_call(
-                    &rule,
+                explicit_decision(bash_rule(Decision::Allow, "git push*"), command),
+                None,
+                "{command}"
+            );
+            assert!(
+                !rule_matches_call(
+                    &bash_rule(Decision::Allow, "git push*"),
                     BASH_TOOL_NAME,
                     &json!({ "command": command }),
                     Uuid::nil()
                 ),
-                matches,
                 "{command}"
+            );
+        }
+        assert_eq!(
+            explicit_decision(bash_rule(Decision::Allow, "git push*"), "git push origin"),
+            Some(ExplicitPermissionDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn unrelated_deny_and_ask_rules_leave_ordinary_commands_alone() {
+        for decision in [Decision::Deny, Decision::Ask] {
+            for pattern in ["git push*", "rm -rf*", "npm publish:*"] {
+                for command in [
+                    "echo $(date)",
+                    "ls `pwd`",
+                    "cargo build > build.log 2>&1",
+                    "env X=1 git status",
+                    "/usr/bin/git status",
+                    "command -v git",
+                    "(cd repo && make)",
+                    "git-lfs push",
+                    "echo 'unclosed",
+                    "make digits",
+                    "FOO=$(pwd) cargo test",
+                    "git status && git log | head",
+                    "$EDITOR notes.txt",
+                    "\"$HOME/.cargo/bin/cargo\" build",
+                    "git commit -m \"$(cat <<'EOF'\nPrepare the push to main\n\nPushes follow later.\nEOF\n)\"",
+                    "git log --format=%H -n1 $(git rev-parse HEAD)",
+                ] {
+                    assert_eq!(
+                        explicit_decision(bash_rule(decision, pattern), command),
+                        None,
+                        "{decision:?} {pattern} {command}"
+                    );
+                }
+            }
+            assert_eq!(
+                explicit_decision(bash_rule(decision, "git:*"), "command -v git"),
+                None,
+                "looking a program up does not run it"
             );
         }
     }

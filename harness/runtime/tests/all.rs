@@ -106,6 +106,9 @@ mod tool_list_stability;
 #[path = "all/launch_rules.rs"]
 mod launch_rules;
 
+#[path = "all/wrapped_command_rules.rs"]
+mod wrapped_command_rules;
+
 #[path = "all/environment_approval.rs"]
 mod environment_approval;
 
