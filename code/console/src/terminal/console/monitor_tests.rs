@@ -1751,6 +1751,7 @@ fn n_in_the_monitor_list_no_longer_jumps_to_an_update_and_types_into_the_input()
                 is_terminal: false,
                 min_rows: None,
                 max_rows: None,
+                joined_at_ms: None,
             });
     }
     for index in [1, 25] {
