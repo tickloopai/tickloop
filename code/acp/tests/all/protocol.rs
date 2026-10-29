@@ -643,8 +643,16 @@ async fn rich_context_is_preserved_without_path_reads_and_binary_is_rejected() {
     let (response, _) = peer.request(3, "session/prompt", json!({"sessionId":session,"prompt":[
         {"type":"text","text":"review"},
         {"type":"resource_link","uri":"file:///missing/do-not-read","name":"reference","mimeType":"text/plain"},
+        {"type":"text","text":""},
+        {"type":"text","text":" \t "},
         {"type":"resource","resource":{"uri":"client://context","mimeType":"text/plain","text":"untrusted client material"}},
-        {"type":"image","data":PNG,"mimeType":"image/png","uri":"client://pixel"}
+        {"type":"text","text":""},
+        {"type":"text","text":"between"},
+        {"type":"image","data":PNG,"mimeType":"image/png","uri":"client://pixel"},
+        {"type":"text","text":""},
+        {"type":"text","text":""},
+        {"type":"text","text":"after"},
+        {"type":"text","text":""}
     ]})).await;
     assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
     {
@@ -659,27 +667,30 @@ async fn rich_context_is_preserved_without_path_reads_and_binary_is_rejected() {
         };
         assert_eq!(text, "review");
         assert!(paths.is_empty());
-        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts.len(), 6);
         assert!(contexts.iter().all(|context| context.path().is_none()));
         let InputContext::Resource(link) = &contexts[0] else {
             panic!("resource link")
         };
         assert_eq!(link.uri, "file:///missing/do-not-read");
         assert!(link.content.is_none());
-        let InputContext::Resource(resource) = &contexts[1] else {
+        assert!(matches!(&contexts[1], InputContext::PromptText { text } if text == " \t "));
+        let InputContext::Resource(resource) = &contexts[2] else {
             panic!("embedded resource")
         };
         assert_eq!(
             resource.content.as_deref(),
             Some("untrusted client material")
         );
-        let InputContext::Image(image) = &contexts[2] else {
+        assert!(matches!(&contexts[3], InputContext::PromptText { text } if text == "between"));
+        let InputContext::Image(image) = &contexts[4] else {
             panic!("image")
         };
         assert!(
             matches!(&image.origin, ImageOrigin::Attached { id: 1, uri: Some(uri) } if uri == "client://pixel")
         );
         assert!(!image.image.data.is_empty());
+        assert!(matches!(&contexts[5], InputContext::PromptText { text } if text == "after"));
     }
     let (pure, _) = peer
         .request(

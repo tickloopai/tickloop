@@ -887,6 +887,9 @@ fn prompt_contexts(entry: &ChainEntry) -> Vec<InputContext> {
         .clone()
         .and_then(|contexts| serde_json::from_value::<Vec<InputContext>>(contexts).ok())
         .unwrap_or_default()
+        .into_iter()
+        .filter(|context| !matches!(context, InputContext::PromptText { text } if text.is_empty()))
+        .collect()
 }
 
 fn prompt_images(entry: &ChainEntry) -> Vec<ImageContext> {
@@ -1332,6 +1335,73 @@ mod tests {
         let restored: DisplayNode =
             serde_json::from_value(serde_json::to_value(&nodes[0]).unwrap()).unwrap();
         assert_eq!(restored, nodes[0]);
+    }
+
+    /// Older transcripts saved empty client text between attachments; reading skips it while
+    /// whitespace-only text and the order of everything else stay as saved.
+    #[test]
+    fn saved_empty_prompt_text_is_not_shown() {
+        let resource = InputContext::Resource(ResourceContext {
+            uri: "https://never-fetched.invalid/resource".into(),
+            mime_type: None,
+            name: None,
+            content: None,
+        });
+        let prompt_text = |text: &str| InputContext::PromptText { text: text.into() };
+        let saved = vec![
+            resource.clone(),
+            prompt_text(""),
+            prompt_text(" \t "),
+            prompt_text("after"),
+        ];
+        let mut prompt = entry(
+            tickloop_ids::generate(),
+            None,
+            Role::User,
+            vec![Content::Text {
+                text: "Analyze".into(),
+            }],
+        );
+        prompt.execution_mode = Some(serde_json::json!("default"));
+        prompt.contexts = Some(serde_json::to_value(&saved).unwrap());
+        let nodes = project(&[Line::chain(Role::User, prompt.clone())]);
+        assert!(matches!(&nodes[0].blocks[..], [
+            DisplayBlock::Text { text },
+            DisplayBlock::Resource(_),
+            DisplayBlock::Text { text: whitespace },
+            DisplayBlock::Text { text: after },
+        ] if text == "Analyze" && whitespace == " \t " && after == "after"));
+
+        let mut follow_up = prompt;
+        follow_up.uuid = tickloop_ids::generate();
+        follow_up.response_id = Some(tickloop_ids::generate());
+        let nodes = project(&[Line::chain(Role::User, follow_up)]);
+        assert!(
+            matches!(&nodes[0].blocks[..], [DisplayBlock::FollowUp { contexts, images, .. }]
+            if contexts == &[resource, prompt_text(" \t "), prompt_text("after")]
+                && images.is_empty())
+        );
+
+        let image = ImageContext {
+            origin: tickloop_harness_protocol::ImageOrigin::Attached { id: 1, uri: None },
+            image: tickloop_harness_protocol::Image {
+                media_type: tickloop_harness_protocol::ImageMediaType::Png,
+                data: "aGVsbG8=".into(),
+                width: 1,
+                height: 1,
+            },
+        };
+        let mut image_follow_up = entry(tickloop_ids::generate(), None, Role::User, Vec::new());
+        image_follow_up.execution_mode = Some(serde_json::json!("default"));
+        image_follow_up.response_id = Some(tickloop_ids::generate());
+        image_follow_up.contexts = Some(
+            serde_json::to_value([InputContext::Image(image.clone()), prompt_text("")]).unwrap(),
+        );
+        let nodes = project(&[Line::chain(Role::User, image_follow_up)]);
+        assert!(
+            matches!(&nodes[0].blocks[..], [DisplayBlock::FollowUp { contexts, images, .. }]
+            if contexts.is_empty() && images == &[image])
+        );
     }
 
     /// A compaction's copy of an answer entry only aliases it, while a fragment appended to the

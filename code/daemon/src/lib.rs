@@ -898,11 +898,13 @@ pub async fn build_runtime_with_models(
             connections,
             configuration,
         ));
-        tickloop_harness::runtime::host_tools::HostToolProvider::mcp_server_statuses(
-            provider.as_ref(),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
+        if launch.profile != tickloop_code_access::ExecutionProfile::Acp {
+            tickloop_harness::runtime::host_tools::HostToolProvider::mcp_server_statuses(
+                provider.as_ref(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        }
         sources.push(provider);
     }
     // Last, so a configured server keeps a tool name both offer.

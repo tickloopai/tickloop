@@ -1036,6 +1036,207 @@ async fn acp_empty_session_survives_eof_and_is_listed_and_loaded_without_a_model
     );
 }
 
+#[tokio::test]
+async fn acp_load_replays_no_empty_user_chunk_for_saved_empty_prompt_text() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(listener.local_addr().unwrap(), json!([]));
+    let mut first = fixture.spawn();
+    first.initialize().await;
+    let session = first.session(2, &fixture).await;
+    first
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId":session,"prompt":[
+                {"type":"text","text":"before"},
+                {"type":"resource_link","uri":"custom://material","name":"material"},
+                {"type":"text","text":"after"}
+            ]}),
+        )
+        .await;
+    let (mut socket, _) = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    read_request(&mut socket).await;
+    respond(&mut socket, &text_stream("Read it.")).await;
+    assert_eq!(first.response(3).await["result"]["stopReason"], "end_turn");
+    first.finish().await;
+
+    // Earlier versions saved an empty text block between attachments; restore that shape.
+    let saved_after = r#"{"kind":"prompt_text","text":"after"}"#;
+    let transcript = std::fs::read_dir(fixture.folder().join("config/projects"))
+        .unwrap()
+        .map(|project| project.unwrap().path().join(format!("{session}.jsonl")))
+        .find(|path| path.is_file())
+        .unwrap();
+    let saved = std::fs::read_to_string(&transcript).unwrap();
+    assert!(saved.contains(saved_after), "{saved}");
+    std::fs::write(
+        &transcript,
+        saved.replace(
+            saved_after,
+            &format!(r#"{{"kind":"prompt_text","text":""}},{saved_after}"#),
+        ),
+    )
+    .unwrap();
+
+    let mut next = fixture.spawn();
+    next.initialize().await;
+    let loaded = next.load(4, &session, &fixture.folder()).await;
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let user_chunks: Vec<&Value> = next
+        .frames
+        .iter()
+        .filter(|frame| {
+            frame["method"] == "session/update"
+                && frame["params"]["sessionId"] == session
+                && frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        })
+        .map(|frame| &frame["params"]["update"]["content"])
+        .collect();
+    let texts: Vec<&str> = user_chunks
+        .iter()
+        .filter_map(|content| content["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["before", "after"], "{user_chunks:?}");
+    assert!(
+        user_chunks
+            .iter()
+            .any(|content| content["uri"] == "custom://material"),
+        "{user_chunks:?}"
+    );
+    next.finish().await;
+    assert_no_model(&listener).await;
+}
+
+#[tokio::test]
+async fn acp_load_defers_configured_mcp_until_the_next_prompt() {
+    use tickloop_harness::test_support::mcp_service::McpService;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(
+        listener.local_addr().unwrap(),
+        json!([
+            {"id":tickloop_harness::ids::generate(),"decision":"ask","tool":"mcp__configured_local__probe"},
+            {"id":tickloop_harness::ids::generate(),"decision":"ask","tool":"mcp__configured_remote__probe"}
+        ]),
+    );
+    let mut first = fixture.spawn();
+    first.initialize().await;
+    let session = first.session(2, &fixture).await;
+    first.finish().await;
+
+    let local = McpService::start().await;
+    let remote = McpService::start().await;
+    for service in [&local, &remote] {
+        service.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
+        service.set_result(json!({"content":[{"type":"text","text":"configured MCP result"}]}));
+    }
+    let marker = fixture.folder().join("configured-mcp-started");
+    let mut args = local.stdio_args();
+    args[2] = format!(
+        "import sys\nwith open(sys.argv[2], 'w') as marker: marker.write('started')\n{}",
+        args[2]
+    );
+    args.push(marker.to_str().unwrap().to_owned());
+    let settings_path = fixture.folder().join("config/settings.json");
+    let mut settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    settings["mcpServers"] = json!({
+        "configured_local":{"exposure":"direct","command":"/usr/bin/python3","args":args},
+        "configured_remote":{"exposure":"direct","url":remote.url()}
+    });
+    std::fs::write(settings_path, settings.to_string()).unwrap();
+
+    let mut next = fixture.spawn();
+    next.initialize().await;
+    let loaded = next.load(3, &session, &fixture.folder()).await;
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    assert_no_model(&listener).await;
+    assert!(
+        !marker.exists(),
+        "loading history launched the configured stdio MCP"
+    );
+    assert!(
+        local.methods().is_empty(),
+        "loading history contacted stdio MCP"
+    );
+    assert!(
+        remote.methods().is_empty(),
+        "loading history contacted HTTP MCP"
+    );
+    assert!(
+        next.frames
+            .iter()
+            .all(|frame| frame["method"] != "session/request_permission")
+    );
+
+    next.prompt(4, &session, "Call both configured probes")
+        .await;
+    for (name, service) in [
+        ("mcp__configured_local__probe", &local),
+        ("mcp__configured_remote__probe", &remote),
+    ] {
+        let (mut socket, _) = tokio::time::timeout(TIMEOUT, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name),
+            "missing configured tool: {request}"
+        );
+        respond(&mut socket, &tool_stream(name, json!({}))).await;
+        let permission = next.permission().await;
+        assert_eq!(
+            permission["params"]["toolCall"]["title"], name,
+            "configuration must not require session-MCP startup approval: {permission}"
+        );
+        next.decide(&permission, "allow_once").await;
+        tokio::time::timeout(TIMEOUT, async {
+            while service.calls().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let (mut socket, _) = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = read_request(&mut socket).await;
+    assert!(
+        result["messages"]
+            .to_string()
+            .contains("configured MCP result")
+    );
+    respond(
+        &mut socket,
+        &text_stream("Both configured probes completed."),
+    )
+    .await;
+    assert_eq!(next.response(4).await["result"]["stopReason"], "end_turn");
+    assert!(marker.exists());
+    for service in [&local, &remote] {
+        assert!(
+            service
+                .methods()
+                .iter()
+                .any(|method| method == "initialize")
+        );
+        assert_eq!(service.calls().len(), 1);
+    }
+    next.finish().await;
+    assert_no_model(&listener).await;
+}
+
 async fn assert_no_model(listener: &TcpListener) {
     assert!(
         tokio::time::timeout(Duration::from_millis(150), listener.accept())
