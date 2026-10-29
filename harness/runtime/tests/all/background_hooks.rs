@@ -14,7 +14,7 @@ use tickloop_harness_protocol::hooks::{
     HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId,
+    AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId, TaskNotification,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
 use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
@@ -66,6 +66,7 @@ fn exits(code: i32, stdout: &str, stderr: &str, duration: Duration) -> MemoryCom
         stderr: stderr.as_bytes().to_vec(),
         exit_code: code,
         duration,
+        ..Default::default()
     }
 }
 
@@ -204,6 +205,12 @@ fn texts(request: &ModelRequest) -> Vec<String> {
         .collect()
 }
 
+/// The notifications the Chat's views were shown live so far, once those in flight arrived.
+async fn shown_live(live: &mut Receiver<TaskNotification>) -> Vec<TaskNotification> {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::iter::from_fn(|| live.try_recv().ok()).collect()
+}
+
 fn assert_prefix_kept(earlier: &ModelRequest, later: &ModelRequest) {
     assert!(
         later.messages.len() > earlier.messages.len()
@@ -240,6 +247,7 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
         exits(0, &answer.to_string(), "", SLOW_HOOK)
     });
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
     let started = Instant::now();
 
     let turn = bench.turn(&mut events, "Build it.").await;
@@ -274,6 +282,15 @@ async fn an_async_hook_never_holds_up_its_call_and_its_answer_reaches_the_next_r
     );
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     assert_eq!(history.hook_runs, [end.clone(), start.clone()]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show the hook's notification once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(
+        shown.summary,
+        "PreToolUse:Bash hook finished in the background"
+    );
 
     bench.turn(&mut events, "Anything else?").await;
     let requests = bench.requests();
@@ -315,6 +332,7 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
         .environment
         .define_command(broken, |_| exits(1, "", "crashed", Duration::ZERO));
     let mut events = bench.agent.subscribe();
+    let mut live = bench.agent.subscribe_task_notifications();
 
     let started = Instant::now();
     let first = bench
@@ -348,6 +366,12 @@ async fn an_async_rewake_exit_two_wakes_the_idle_loop_and_other_statuses_only_sh
     );
     assert!(!notification.contains("crashed"));
     assert_prefix_kept(&requests[1], &requests[2]);
+    let shown = shown_live(&mut live).await;
+    let [shown] = shown.as_slice() else {
+        panic!("the views show only the rewake, once: {shown:?}");
+    };
+    assert_eq!(shown.chat_id, bench.chat);
+    assert_eq!(shown.summary, "Security review found issues");
 
     let history = bench.agent.approval_history_view(bench.chat).await.unwrap();
     let ended = |command: &str| {
@@ -478,4 +502,173 @@ async fn the_same_command_runs_both_in_the_foreground_and_in_the_background() {
         "the foreground run is not merged into the background one"
     );
     bench.agent.shutdown().await;
+}
+
+/// The line with which Claude Code 2.1.302 lets a running hook go on in the background, as
+/// security-guidance's `SessionStart` bootstrap prints it.
+const ASYNC_FIRST_LINE: &str = "{\"async\": true, \"asyncTimeout\": 180000}\n";
+
+#[tokio::test]
+async fn a_first_line_asking_for_async_sends_a_running_hook_to_the_background() {
+    let bootstrap = "ensure_agent_sdk.sh";
+    let bench = Bench::start(
+        vec![text("hello"), text("noted")],
+        vec![background_hook(
+            HookEvent::SessionStart,
+            None,
+            bootstrap,
+            None,
+        )],
+    )
+    .await;
+    let answer = json!({
+        "metrics": {"sdk_bootstrap": 0},
+        "systemMessage": "SDK ready",
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "the commit reviewer is available",
+        },
+    });
+    bench
+        .environment
+        .define_command(bootstrap, move |_| MemoryCommandRun {
+            early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+            ..exits(0, &answer.to_string(), "", SLOW_HOOK)
+        });
+    let mut events = bench.agent.subscribe();
+    let started = Instant::now();
+
+    let turn = bench.turn(&mut events, "Hi.").await;
+
+    assert!(started.elapsed() < SLOW_HOOK, "the session did not wait");
+    let [start] = turn.hook_runs.as_slice() else {
+        panic!(
+            "only the start is recorded during the turn: {:?}",
+            turn.hook_runs
+        );
+    };
+    assert_eq!(start.event, HookEvent::SessionStart);
+    assert_eq!(start.background, Some(HookBackgroundPhase::Started));
+    assert_eq!(start.outcome, HookRunOutcome::Success);
+    assert!(
+        !texts(&bench.requests()[0])
+            .join("\n")
+            .contains("commit reviewer"),
+        "the first request did not wait for the hook's answer"
+    );
+
+    let end = hook_end(&bench, bootstrap).await;
+    assert_eq!(end.outcome, HookRunOutcome::Success);
+    assert_eq!(end.reason, None, "its output reads as its JSON answer");
+    assert_eq!(end.system_message.as_deref(), Some("SDK ready"));
+    assert!(!end.output.contains("\"async\""), "{}", end.output);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        bench.requests().len(),
+        1,
+        "an async hook never wakes the Loop"
+    );
+
+    bench.turn(&mut events, "Anything else?").await;
+    let requests = bench.requests();
+    let next = texts(&requests[1]).join("\n");
+    assert!(next.contains("the commit reviewer is available"), "{next}");
+    assert!(next.contains("SDK ready"), "{next}");
+    assert_prefix_kept(&requests[0], &requests[1]);
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hook_that_asked_for_async_decides_nothing_however_soon_it_ends() {
+    for duration in [Duration::ZERO, SLOW_HOOK] {
+        let bench = Bench::start(
+            vec![build_call(), text("done")],
+            vec![background_hook(
+                HookEvent::PreToolUse,
+                Some("Bash"),
+                AUDIT,
+                None,
+            )],
+        )
+        .await;
+        let deny = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "too late to refuse",
+            },
+        });
+        bench
+            .environment
+            .define_command(AUDIT, move |_| MemoryCommandRun {
+                early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+                ..exits(0, &deny.to_string(), "", duration)
+            });
+        let mut events = bench.agent.subscribe();
+
+        let turn = bench.turn(&mut events, "Build it.").await;
+
+        assert_eq!(turn.results, ["built"], "the deny is ignored, {duration:?}");
+        assert_eq!(
+            turn.hook_runs[0].background,
+            Some(HookBackgroundPhase::Started),
+            "{duration:?}"
+        );
+        let end = hook_end(&bench, AUDIT).await;
+        assert_eq!(end.decision, None, "{duration:?}");
+        assert!(
+            end.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ignored")),
+            "{:?}",
+            end.reason
+        );
+        bench.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn esc_leaves_a_hook_that_asked_for_async_running_and_stop_ends_it() {
+    for stops in [false, true] {
+        let bench = Bench::start(
+            vec![build_call(), text("done")],
+            vec![background_hook(
+                HookEvent::PreToolUse,
+                Some("Bash"),
+                AUDIT,
+                None,
+            )],
+        )
+        .await;
+        bench
+            .environment
+            .define_command(AUDIT, |_| MemoryCommandRun {
+                early_stdout: ASYNC_FIRST_LINE.as_bytes().to_vec(),
+                ..exits(0, "", "", SLOW_HOOK)
+            });
+        let mut events = bench.agent.subscribe();
+        let started = Instant::now();
+
+        let turn = bench.turn(&mut events, "Build it.").await;
+        assert_eq!(turn.results, ["built"]);
+        if stops {
+            bench.agent.stop(bench.chat).await.unwrap();
+        } else {
+            bench.agent.interrupt(bench.chat).await.unwrap();
+        }
+
+        let end = hook_end(&bench, AUDIT).await;
+        if stops {
+            assert_eq!(end.outcome, HookRunOutcome::Cancelled);
+            assert!(started.elapsed() < SLOW_HOOK, "/stop ends it at once");
+        } else {
+            assert_eq!(
+                end.outcome,
+                HookRunOutcome::Success,
+                "Esc leaves it running"
+            );
+            assert!(started.elapsed() >= SLOW_HOOK);
+        }
+        bench.agent.shutdown().await;
+    }
 }

@@ -483,7 +483,7 @@ async fn background_user_shell_completion_notifies_its_chat() {
         .unwrap()
         .unwrap();
     assert_eq!(notification.chat_id, chat);
-    assert_eq!(notification.task_id, receipt.command_id);
+    assert_eq!(notification.shell.unwrap().task_id, receipt.command_id);
     agent.shutdown().await;
     drop(agent);
 

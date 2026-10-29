@@ -10,7 +10,8 @@
 //! event's input on standard input and only `CLAUDE_PROJECT_DIR` and a plugin's directories
 //! added to its environment. Each run is kept in the Chat's activity history, never in what the
 //! model reads, and announced as it ends. A hook declared `async` or `asyncRewake` runs in the
-//! background instead; see [`background`].
+//! background instead, and so does the rest of a running hook whose first line of output is
+//! `{"async": true}`; see [`background`].
 
 mod background;
 mod matcher;
@@ -19,7 +20,9 @@ mod session_events;
 mod tool_events;
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +35,8 @@ use tickloop_harness_protocol::{EventKind, ExecutionMode, Receipt};
 use tokio_util::sync::CancellationToken;
 
 use crate::environment::{
-    CommandSpec, ExecutionAuthority, ExecutionIntent, ExecutionOutcome, ExecutionScope,
+    CommandOutput, CommandSpec, ExecutionAuthority, ExecutionIntent, ExecutionOutcome,
+    ExecutionScope, OutputTap,
 };
 use crate::{Agent, Chat};
 use output::{HookExit, HookResponse};
@@ -111,6 +115,96 @@ struct FinishedRun {
     output: String,
     /// What an exit status 2 tells: its standard error, else its standard output.
     blocking_output: String,
+    /// It went on in the background, which records it apart; it decides nothing for its event.
+    backgrounded: bool,
+}
+
+impl FinishedRun {
+    /// A run that ended without an exit, saying `response`.
+    fn unfinished(response: HookResponse, started: Instant) -> Self {
+        Self {
+            response,
+            duration: started.elapsed(),
+            exit_code: None,
+            output: String::new(),
+            blocking_output: String::new(),
+            backgrounded: false,
+        }
+    }
+
+    /// A run of `runnable` for `event` started at `started` that ended with `ending`.
+    fn read(
+        event: HookEvent,
+        runnable: &Runnable,
+        started: Instant,
+        ending: Result<CommandOutput, String>,
+        cancelled: bool,
+    ) -> Self {
+        let command = match ending {
+            Err(error) if cancelled => {
+                return Self::unfinished(
+                    HookResponse::failed(HookRunOutcome::Cancelled, error),
+                    started,
+                );
+            }
+            Err(error) => {
+                return Self::unfinished(
+                    HookResponse::failed(HookRunOutcome::NotRun, error),
+                    started,
+                );
+            }
+            Ok(command) => command,
+        };
+        let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
+        let stdout = output::after_background_request(&stdout).unwrap_or(&stdout);
+        let response = output::interpret(
+            event,
+            &runnable.hook.command,
+            HookExit {
+                code: command.exit.code,
+                timed_out: command.timed_out,
+                stdout,
+                stderr: &stderr,
+            },
+        );
+        let output = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|stream| !stream.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocking_output = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Self {
+            response,
+            duration: started.elapsed(),
+            exit_code: command.exit.code,
+            output,
+            blocking_output: blocking_output.to_owned(),
+            backgrounded: false,
+        }
+    }
+
+    /// What a run that went on in the background gives its event: nothing.
+    fn backgrounded() -> Self {
+        Self {
+            backgrounded: true,
+            ..Self::unfinished(HookResponse::success(), Instant::now())
+        }
+    }
+}
+
+/// A hook command's run as the execution environment reports it.
+type CommandRun = Pin<Box<dyn Future<Output = Result<CommandOutput, String>> + Send>>;
+
+/// What the records of an event's runs add after their own reasons.
+struct RecordNotes {
+    /// For the last run: the hooks together did something only one of them may do.
+    warning: Option<String>,
+    /// For the last run that blocked: why the block does not hold.
+    block_override: Option<String>,
 }
 
 /// One matched hook that may run.
@@ -138,6 +232,26 @@ fn shortened(text: &str) -> String {
     }
 }
 
+/// The one-shot command that runs `runnable` in the Chat's Folder with `stdin` as its input.
+fn command_spec(context: &HookContext, runnable: &Runnable, stdin: &[u8]) -> CommandSpec {
+    let mut env = plugin_environment(&runnable.hook);
+    env.insert(
+        "CLAUDE_PROJECT_DIR".into(),
+        context.folder.to_string_lossy().into_owned(),
+    );
+    CommandSpec {
+        command: runnable.command.clone(),
+        stdin: stdin.to_vec(),
+        env,
+        cwd: context.folder.to_string_lossy().into_owned(),
+        timeout: match runnable.hook.timeout_secs {
+            0 => DEFAULT_TIMEOUT,
+            seconds => Duration::from_secs(seconds),
+        },
+        stdout_tap: None,
+    }
+}
+
 fn plugin_environment(hook: &ConfiguredHook) -> BTreeMap<String, String> {
     let mut variables = BTreeMap::new();
     if let Some(plugin) = &hook.plugin {
@@ -159,6 +273,19 @@ impl Agent {
         receipt: &Receipt,
         call: HookCall,
         cancel: &CancellationToken,
+    ) -> HookVerdict {
+        self.run_hooks_overriding_block(receipt, call, cancel, None)
+            .await
+    }
+
+    /// Runs the hooks `call` matches as [`Self::run_hooks`] does; when they block, the record of
+    /// the last run that blocked adds `block_override`, which says why the block does not hold.
+    pub(crate) async fn run_hooks_overriding_block(
+        &self,
+        receipt: &Receipt,
+        call: HookCall,
+        cancel: &CancellationToken,
+        block_override: Option<String>,
     ) -> HookVerdict {
         let Some((context, settings)) = self.hook_context(receipt).await else {
             return HookVerdict::default();
@@ -190,7 +317,7 @@ impl Agent {
                 .await;
         }
         let runs = runnable.iter().map(|runnable| {
-            self.run_one_hook(receipt, &context, call.event, runnable, &stdin, cancel)
+            self.run_foreground_hook(receipt, &context, &call, runnable, &stdin, cancel)
         });
         let finished = futures_util::future::join_all(runs).await;
         let (verdict, warning) = HookVerdict::merge(
@@ -202,8 +329,22 @@ impl Agent {
         if let Some(warning) = &warning {
             tracing::warn!("{} hooks: {warning}", call.event.name());
         }
-        self.record_hook_runs(receipt, &call, &runnable, finished, warning)
-            .await;
+        let block_override = block_override.filter(|_| {
+            !verdict.blocking_errors.is_empty()
+                && !verdict.prevent_continuation
+                && !verdict.cancelled
+        });
+        self.record_hook_runs(
+            receipt,
+            &call,
+            &runnable,
+            finished,
+            RecordNotes {
+                warning,
+                block_override,
+            },
+        )
+        .await;
         verdict
     }
 
@@ -328,68 +469,74 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> FinishedRun {
         let started = Instant::now();
-        let mut env = plugin_environment(&runnable.hook);
-        env.insert(
-            "CLAUDE_PROJECT_DIR".into(),
-            context.folder.to_string_lossy().into_owned(),
-        );
-        let timeout = match runnable.hook.timeout_secs {
-            0 => DEFAULT_TIMEOUT,
-            seconds => Duration::from_secs(seconds),
-        };
-        let spec = CommandSpec {
-            command: runnable.command.clone(),
-            stdin: stdin.to_vec(),
-            env,
-            cwd: context.folder.to_string_lossy().into_owned(),
-            timeout,
-        };
-        let not_finished = |response| FinishedRun {
-            response,
-            duration: started.elapsed(),
-            exit_code: None,
-            output: String::new(),
-            blocking_output: String::new(),
-        };
-        match self
+        let spec = command_spec(context, runnable, stdin);
+        let ending = self
             .execute_hook_command(receipt, context, spec, cancel)
-            .await
-        {
-            Err(error) if cancel.is_cancelled() => {
-                not_finished(HookResponse::failed(HookRunOutcome::Cancelled, error))
+            .await;
+        FinishedRun::read(event, runnable, started, ending, cancel.is_cancelled())
+    }
+
+    /// Runs one hook for its event, which waits for it unless its first line of output asks to
+    /// go on in the background, as Claude Code 2.1.302 lets a running hook do. The rest of
+    /// such a run is an `async` hook's: `cancel` no longer ends it, `/stop` and shutdown do.
+    async fn run_foreground_hook(
+        &self,
+        receipt: &Receipt,
+        context: &HookContext,
+        call: &HookCall,
+        runnable: &Runnable,
+        stdin: &[u8],
+        cancel: &CancellationToken,
+    ) -> FinishedRun {
+        let started = Instant::now();
+        let (tap, stdout) = OutputTap::new();
+        let spec = CommandSpec {
+            stdout_tap: Some(tap),
+            ..command_spec(context, runnable, stdin)
+        };
+        let execution_cancel = CancellationToken::new();
+        let mut execution: CommandRun = Box::pin({
+            let (agent, receipt, context) = (self.clone(), receipt.clone(), context.clone());
+            let execution_cancel = execution_cancel.clone();
+            async move {
+                agent
+                    .execute_hook_command(&receipt, &context, spec, &execution_cancel)
+                    .await
             }
-            Err(error) => not_finished(HookResponse::failed(HookRunOutcome::NotRun, error)),
-            Ok(command) => {
-                let (stdout, stderr) = (command.stdout.text(), command.stderr.text());
-                let response = output::interpret(
-                    event,
-                    &runnable.hook.command,
-                    HookExit {
-                        code: command.exit.code,
-                        timed_out: command.timed_out,
-                        stdout: &stdout,
-                        stderr: &stderr,
-                    },
-                );
-                let output = [stdout.trim(), stderr.trim()]
-                    .into_iter()
-                    .filter(|stream| !stream.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let blocking_output = if stderr.trim().is_empty() {
-                    stdout.trim()
-                } else {
-                    stderr.trim()
-                };
-                FinishedRun {
-                    response,
-                    duration: started.elapsed(),
-                    exit_code: command.exit.code,
-                    output,
-                    blocking_output: blocking_output.to_owned(),
-                }
+        });
+        let asks_for_background = output::first_line_asks_for_background(stdout);
+        tokio::pin!(asks_for_background);
+        let ending = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                execution_cancel.cancel();
+                let ending = execution.await;
+                return FinishedRun::read(call.event, runnable, started, ending, true);
             }
+            ending = &mut execution => ending,
+            true = &mut asks_for_background => {
+                self.continue_in_background(receipt, call, runnable, started, execution, execution_cancel)
+                    .await;
+                return FinishedRun::backgrounded();
+            }
+        };
+        let asked_for_background = ending.as_ref().is_ok_and(|command| {
+            output::after_background_request(&command.stdout.text()).is_some()
+        });
+        if asked_for_background {
+            let execution: CommandRun = Box::pin(std::future::ready(ending));
+            self.continue_in_background(
+                receipt,
+                call,
+                runnable,
+                started,
+                execution,
+                execution_cancel,
+            )
+            .await;
+            return FinishedRun::backgrounded();
         }
+        FinishedRun::read(call.event, runnable, started, ending, cancel.is_cancelled())
     }
 
     async fn execute_hook_command(
@@ -440,35 +587,51 @@ impl Agent {
         call: &HookCall,
         runnable: &[Runnable],
         finished: Vec<FinishedRun>,
-        warning: Option<String>,
+        notes: RecordNotes,
     ) {
         let mut chats = self.inner.chats.lock().await;
         let Some(chat) = chats.get_mut(&receipt.chat_id) else {
             return;
         };
-        let count = finished.len();
-        for (index, (runnable, run)) in runnable.iter().zip(finished).enumerate() {
-            let mut reason = run.response.reason();
-            if index + 1 == count
-                && let Some(warning) = &warning
-            {
-                reason = Some(match reason {
-                    Some(reason) => format!("{reason}\n{warning}"),
-                    None => warning.clone(),
-                });
-            }
-            let record = run_record(
+        let ended = runnable
+            .iter()
+            .zip(finished)
+            .filter(|(_, run)| !run.backgrounded)
+            .collect::<Vec<_>>();
+        let count = ended.len();
+        let last_block = ended
+            .iter()
+            .rposition(|(_, run)| run.response.blocking_error.is_some());
+        for (index, (runnable, run)) in ended.into_iter().enumerate() {
+            let mut record = run_record(
                 receipt,
                 call.event,
                 call.tool.as_ref(),
                 &runnable.hook,
                 &run,
-                reason,
+                run.response.reason(),
             );
+            if index + 1 == count
+                && let Some(warning) = &notes.warning
+            {
+                add_to_reason(&mut record, warning);
+            }
+            if Some(index) == last_block
+                && let Some(block_override) = &notes.block_override
+            {
+                add_to_reason(&mut record, block_override);
+            }
             record_hook_run(self, chat, receipt, record);
         }
         self.save(&chat.snapshot);
     }
+}
+
+fn add_to_reason(record: &mut HookRunRecord, note: &str) {
+    record.reason = Some(match record.reason.take() {
+        Some(reason) => format!("{reason}\n{note}"),
+        None => note.to_owned(),
+    });
 }
 
 /// The record of `hook`'s `run` for `event`, giving `reason` as why it decided, blocked or

@@ -2617,17 +2617,7 @@ pub(super) fn local_message_runs(
             result,
             usage,
         } => {
-            runs.push(("\n".into(), None));
-            runs.push((
-                display.glyph(Glyph::ToolCall).into(),
-                Some(match status {
-                    Some(TaskNotificationStatus::Completed) => Role::Success,
-                    Some(TaskNotificationStatus::Failed) => Role::Error,
-                    Some(TaskNotificationStatus::Killed) => Role::Warning,
-                    None => Role::Text,
-                }),
-            ));
-            runs.push((format!(" {}\n", safe_text(summary)), None));
+            runs.extend(task_notification_runs(*status, summary, display));
             if matches!(detail, OutputDetail::Full) {
                 if let Some(result) = result {
                     push_response_block(&mut response, result, detail, display, None);
@@ -2683,6 +2673,26 @@ pub(super) fn local_message_runs(
         }
     }
     (runs, response)
+}
+
+/// Following Claude Code's task notification style: a dot coloured by how the task ended, plain
+/// for a hook that ran in the background, then its summary.
+pub(super) fn task_notification_runs(
+    status: Option<TaskNotificationStatus>,
+    summary: &str,
+    display: DisplayProfile,
+) -> Vec<(String, Option<Role>)> {
+    let role = match status {
+        Some(TaskNotificationStatus::Completed) => Role::Success,
+        Some(TaskNotificationStatus::Failed) => Role::Error,
+        Some(TaskNotificationStatus::Killed) => Role::Warning,
+        None => Role::Text,
+    };
+    vec![
+        ("\n".into(), None),
+        (display.glyph(Glyph::ToolCall).into(), Some(role)),
+        (format!(" {}\n", safe_text(summary)), None),
+    ]
 }
 
 pub(super) fn tick_delivery_runs(

@@ -1,26 +1,29 @@
 //! Hooks declared `async` or `asyncRewake`, run in the background as Claude Code 2.1.302 runs
 //! them: their event goes on at once, and nothing they print decides anything; a decision is
-//! recorded as ignored. Each run is recorded as it starts and as it ends.
+//! recorded as ignored. Each run is recorded as it starts and as it ends. A running hook whose
+//! first line of output is `{"async": true}` goes on from there as an `async` hook, still under
+//! its timeout from when it started.
 //!
 //! An `async` hook's `systemMessage` and `additionalContext` join the end of the conversation
 //! for the model's next request without starting a turn. An `asyncRewake` hook that exits 2
 //! notifies the Loop with its output the way a finished background command does: a running turn
-//! reads it after its current tool results, and an idle Loop starts a turn for it. Any other
-//! ending only shows the user. A background hook keeps its timeout; Esc leaves it running, while
-//! `/stop` and shutdown end it.
+//! reads it after its current tool results, and an idle Loop starts a turn for it. Either
+//! notification shows the Chat's views its summary line as the hook ends, as a finished
+//! background command's does. Any other ending only shows the user. A background hook keeps its
+//! timeout; Esc leaves it running, while `/stop` and shutdown end it.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::Instant;
 
 use tickloop_harness_protocol::hooks::{
     HookBackground, HookBackgroundPhase, HookDecision, HookEvent, HookRunOutcome,
 };
-use tickloop_harness_protocol::{Message, Receipt, local_messages};
+use tickloop_harness_protocol::{Message, Receipt, TaskNotification, local_messages};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ChatHookState, FinishedRun, HookCall, HookContext, HookResponse, Runnable, record_hook_run,
-    run_record,
+    ChatHookState, CommandRun, FinishedRun, HookCall, HookContext, HookResponse, Runnable,
+    record_hook_run, run_record,
 };
 use crate::Agent;
 
@@ -61,9 +64,21 @@ fn decision_name(decision: HookDecision) -> &'static str {
     }
 }
 
+/// What a background hook's end tells the model, under the summary the user sees for it.
+struct HookNotice {
+    summary: String,
+    result: String,
+}
+
+impl HookNotice {
+    fn message(&self) -> Message {
+        local_messages::background_hook_notification(&self.summary, &self.result)
+    }
+}
+
 /// What an `async` hook gives the model's next request: its `systemMessage` and
 /// `additionalContext`, as Claude Code attaches them; `None` when it gave neither.
-fn async_notification(label: &str, response: &HookResponse) -> Option<Message> {
+fn async_notification(label: &str, response: &HookResponse) -> Option<HookNotice> {
     let lines = [
         ("system message", &response.system_message),
         ("additional context", &response.additional_context),
@@ -74,33 +89,56 @@ fn async_notification(label: &str, response: &HookResponse) -> Option<Message> {
             .map(|text| format!("{label} hook {kind}: {text}"))
     })
     .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| {
-        local_messages::background_hook_notification(
-            &format!("{label} hook finished in the background"),
-            &lines.join("\n"),
-        )
+    (!lines.is_empty()).then(|| HookNotice {
+        summary: format!("{label} hook finished in the background"),
+        result: lines.join("\n"),
     })
 }
 
 /// What an `asyncRewake` hook that exited 2 tells the model: its `rewakeMessage`, or Claude
-/// Code's default, then its standard error, else its standard output.
+/// Code's default, then its standard error, else its standard output, under its `rewakeSummary`.
 fn rewake_notification(
     label: &str,
     message: Option<&str>,
     summary: Option<&str>,
     output: &str,
-) -> Message {
+) -> HookNotice {
     let lead = message.map_or_else(
         || format!("Stop hook blocking error from command \"{label}\":"),
         str::to_owned,
     );
-    local_messages::background_hook_notification(
-        summary.unwrap_or(DEFAULT_REWAKE_SUMMARY),
-        &format!("{lead} {output}"),
-    )
+    HookNotice {
+        summary: summary.unwrap_or(DEFAULT_REWAKE_SUMMARY).to_owned(),
+        result: format!("{lead} {output}"),
+    }
 }
 
 impl Agent {
+    /// Records that `runnable` goes on in the background for `call` and returns what ends it
+    /// there; `None` when the Chat is gone.
+    async fn record_background_start(
+        &self,
+        receipt: &Receipt,
+        call: &HookCall,
+        runnable: &Runnable,
+    ) -> Option<CancellationToken> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id)?;
+        let cancel = chat.hook_state.background_cancel(&self.inner.shutdown);
+        let mut record = run_record(
+            receipt,
+            call.event,
+            call.tool.as_ref(),
+            &runnable.hook,
+            &FinishedRun::unfinished(HookResponse::success(), Instant::now()),
+            None,
+        );
+        record.background = Some(HookBackgroundPhase::Started);
+        record_hook_run(self, chat, receipt, record);
+        self.save(&chat.snapshot);
+        Some(cancel)
+    }
+
     /// Starts `runnable` in the background for `call` and records its start; its event does not
     /// wait for it.
     pub(super) async fn start_background_hook(
@@ -111,31 +149,11 @@ impl Agent {
         runnable: Runnable,
         stdin: Vec<u8>,
     ) {
-        let cancel = {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&receipt.chat_id) else {
-                return;
-            };
-            let cancel = chat.hook_state.background_cancel(&self.inner.shutdown);
-            let started = FinishedRun {
-                response: HookResponse::success(),
-                duration: Duration::ZERO,
-                exit_code: None,
-                output: String::new(),
-                blocking_output: String::new(),
-            };
-            let mut record = run_record(
-                receipt,
-                call.event,
-                call.tool.as_ref(),
-                &runnable.hook,
-                &started,
-                None,
-            );
-            record.background = Some(HookBackgroundPhase::Started);
-            record_hook_run(self, chat, receipt, record);
-            self.save(&chat.snapshot);
-            cancel
+        let Some(background) = runnable.hook.background.clone() else {
+            return;
+        };
+        let Some(cancel) = self.record_background_start(receipt, call, &runnable).await else {
+            return;
         };
         let agent = self.clone();
         let receipt = receipt.clone();
@@ -147,7 +165,51 @@ impl Agent {
                 .run_one_hook(&receipt, &context, event, &runnable, &stdin, &cancel)
                 .await;
             agent
-                .finish_background_hook(&receipt, event, tool.as_ref(), &runnable, run)
+                .finish_background_hook(&receipt, event, tool.as_ref(), &runnable, &background, run)
+                .await;
+        });
+    }
+
+    /// Lets the rest of a hook run that asked for it go on in the background as an `async`
+    /// hook's run: records its start, and its end once `execution` ends; `/stop` and shutdown
+    /// end it through `execution_cancel`.
+    pub(super) async fn continue_in_background(
+        &self,
+        receipt: &Receipt,
+        call: &HookCall,
+        runnable: &Runnable,
+        started: Instant,
+        mut execution: CommandRun,
+        execution_cancel: CancellationToken,
+    ) {
+        let Some(cancel) = self.record_background_start(receipt, call, runnable).await else {
+            execution_cancel.cancel();
+            return;
+        };
+        let agent = self.clone();
+        let receipt = receipt.clone();
+        let runnable = runnable.clone();
+        let event = call.event;
+        let tool = call.tool.clone();
+        self.inner.tasks.spawn(async move {
+            let ending = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    execution_cancel.cancel();
+                    execution.await
+                }
+                ending = &mut execution => ending,
+            };
+            let run = FinishedRun::read(event, &runnable, started, ending, cancel.is_cancelled());
+            agent
+                .finish_background_hook(
+                    &receipt,
+                    event,
+                    tool.as_ref(),
+                    &runnable,
+                    &HookBackground::Async,
+                    run,
+                )
                 .await;
         });
     }
@@ -159,11 +221,9 @@ impl Agent {
         event: HookEvent,
         tool: Option<&(String, String)>,
         runnable: &Runnable,
+        background: &HookBackground,
         run: FinishedRun,
     ) {
-        let Some(background) = &runnable.hook.background else {
-            return;
-        };
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
@@ -192,7 +252,7 @@ impl Agent {
                 _ => HookRunOutcome::NonBlockingError,
             };
         }
-        let notification = match background {
+        let notice = match background {
             HookBackground::Async => async_notification(&label, response),
             HookBackground::AsyncRewake { message, summary } if rewakes => {
                 Some(rewake_notification(
@@ -211,11 +271,13 @@ impl Agent {
             };
             record_hook_run(self, chat, receipt, record);
             let mut wakes = false;
-            if let Some(notification) = notification {
+            if let Some(notice) = notice {
+                let message = notice.message();
                 if rewakes {
-                    chat.hook_state.session.note_rewake(notification.clone());
+                    chat.hook_state.session.note_rewake(message.clone());
                 }
-                match self.append_local_messages(chat, [notification]) {
+                let shown = TaskNotification::for_background_hook(receipt.chat_id, &notice.summary);
+                match self.show_task_notification(chat, shown, message) {
                     Ok(()) => {
                         wakes = rewakes && self.queue_task_continuation(chat, Some(receipt.loop_id))
                     }
@@ -235,8 +297,8 @@ impl Agent {
 mod tests {
     use super::*;
 
-    fn text(message: &Message) -> String {
-        match &message.content[0] {
+    fn text(notice: &HookNotice) -> String {
+        match &notice.message().content[0] {
             tickloop_harness_protocol::Content::Text { text } => text.clone(),
             other => panic!("{other:?}"),
         }
