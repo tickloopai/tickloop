@@ -1,6 +1,6 @@
 //! Resource bounds of the daemon's hosted Tick registry and host controller: one registry record
-//! is at most one 1 MiB shard, a host start gives up after its budget, and a running host the
-//! daemon cannot verify is never replaced.
+//! is at most one 1 MiB shard, a host start gives up after its budget, an incompatible host is
+//! never replaced, and an orphaned host no daemon can control is stopped by the next request.
 
 use crate::support;
 
@@ -422,39 +422,65 @@ async fn an_open_that_reached_the_host_is_never_sent_again() {
     assert_eq!(starts(&starts_file, 0).await, 0, "no other host is started");
 }
 
-/// A host this daemon did not start keeps running whatever the daemon's key: a wrong, unreadable
-/// or missing key never replaces or stops it, and its Tick keeps running.
+/// Only one daemon serves a config root and only it holds the controller key, so a running host
+/// that refuses this daemon's key, or runs while the key is missing, is an orphan no daemon can
+/// control. The first request that meets it stops it as `tickhost stop` does: a listing then
+/// finds no host and starts none, and an open starts a host with this daemon's key. An
+/// unreadable key may still be the running host's, so it never stops or replaces it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped() {
+async fn an_orphaned_host_is_stopped_by_the_next_listing_or_open() {
+    for replacement_key in [Some(tickhost::host::random_token()), None] {
+        for first in [FirstRequest::Listing, FirstRequest::Open] {
+            an_orphaned_host_is_stopped(replacement_key.clone(), first).await;
+        }
+    }
+}
+
+/// The first request that meets an orphaned host.
+#[derive(Clone, Copy, Debug)]
+enum FirstRequest {
+    Listing,
+    Open,
+}
+
+/// An orphan whose daemon's key file now holds `replacement_key`, or is missing.
+async fn an_orphaned_host_is_stopped(replacement_key: Option<String>, first: FirstRequest) {
     use std::os::unix::fs::PermissionsExt;
-    let directory = private_directory("hbv");
+    let directory = private_directory("hbo");
     let paths = HostPaths::of_config_root(Some(directory.path()));
+    let executable = support::hosted::executable_in(directory.path());
     let first_runtime = directory.path().join("first");
     std::fs::create_dir(&first_runtime).unwrap();
-    let _stop = StopHost {
+    let _stop_orphan = StopHost {
         runtime: paths.runtime.clone(),
         key_file: first_runtime.join("tickhost.key"),
     };
-    let first = HostController::new(
-        &first_runtime,
-        paths.clone(),
-        Uuid::new_v4(),
-        support::hosted::executable_in(directory.path()),
-        support::hosted::IDLE_TIMEOUT,
-    );
     let owner = TickOwner {
         root: "fixture-root".into(),
         chat: Uuid::new_v4(),
     };
-    let opened = first
+    let previous = HostController::new(
+        &first_runtime,
+        paths.clone(),
+        Uuid::new_v4(),
+        executable.clone(),
+        support::hosted::IDLE_TIMEOUT,
+    );
+    previous
         .open(counter_request(owner.clone(), directory.path()))
         .await
         .unwrap();
-    let inode = socket_inode(&paths);
+    // The daemon that started the host is gone; its Tick keeps running.
+    drop(previous);
+    let orphan = paths.running_host_pid().unwrap().unwrap();
 
     let second_runtime = directory.path().join("second");
     std::fs::create_dir(&second_runtime).unwrap();
-    let (executable, starts_file) = recording_executable(&second_runtime);
+    let key_file = second_runtime.join("tickhost.key");
+    let _stop_replacement = StopHost {
+        runtime: paths.runtime.clone(),
+        key_file: key_file.clone(),
+    };
     let second = HostController::new(
         &second_runtime,
         paths.clone(),
@@ -462,60 +488,63 @@ async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped()
         executable,
         support::hosted::IDLE_TIMEOUT,
     );
-    let key_file = second_runtime.join("tickhost.key");
 
-    std::fs::write(&key_file, "another-daemon-key").unwrap();
-    let wrong = second
-        .open(counter_request(owner.clone(), directory.path()))
-        .await
-        .unwrap_err();
-    assert_eq!(wrong.code, "Forbidden", "{wrong:?}");
-    assert_eq!(starts(&starts_file, 0).await, 0);
-
+    std::fs::write(&key_file, tickhost::host::random_token()).unwrap();
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let unreadable = second
-        .open(counter_request(owner.clone(), directory.path()))
-        .await
-        .unwrap_err();
-    assert_eq!(unreadable.code, "HostUnavailable", "{unreadable:?}");
-    assert_eq!(starts(&starts_file, 0).await, 0);
-
-    std::fs::remove_file(&key_file).unwrap();
-    let missing = second
-        .open(counter_request(owner.clone(), directory.path()))
-        .await
-        .unwrap_err();
-    assert_eq!(missing.code, "Forbidden", "{missing:?}");
-    assert_eq!(
-        starts(&starts_file, 1).await,
-        1,
-        "a start is tried, but the running host refuses the new key"
-    );
-
-    for refused in [&wrong, &unreadable, &missing] {
+    let unreadable = [
+        second
+            .open(counter_request(owner.clone(), directory.path()))
+            .await
+            .unwrap_err(),
+        second.list(&owner, None).await.unwrap_err(),
+    ];
+    for refused in unreadable {
+        assert_eq!(refused.code, "HostUnavailable", "{refused:?}");
         assert!(!refused.dispatched);
     }
-    assert_eq!(socket_inode(&paths), inode, "the endpoint stays the host's");
-    let listed = first.list(&owner, None).await.unwrap();
-    assert_eq!(listed["total"], 1);
-    assert_eq!(listed["items"][0]["instance"], json!(opened.instance));
-    assert_eq!(
-        json!(listed["epoch"]),
-        json!(opened.terminal.epoch),
-        "the same host still serves"
+    assert_eq!(paths.running_host_pid().unwrap(), Some(orphan));
+    std::fs::remove_file(&key_file).unwrap();
+    if let Some(key) = replacement_key {
+        std::fs::write(&key_file, key).unwrap();
+    }
+
+    if let FirstRequest::Listing = first {
+        let listed = second.list(&owner, None).await.unwrap();
+        assert_eq!(listed["total"], 0, "{listed}");
+        assert!(exits(orphan).await, "a listing stops the orphaned host");
+        assert!(!paths.host_running().unwrap(), "and starts none");
+        assert_eq!(second.host_epoch().await.unwrap(), None);
+    }
+
+    let opened = second
+        .open(counter_request(owner.clone(), directory.path()))
+        .await
+        .unwrap();
+    let replacement = paths.running_host_pid().unwrap().unwrap();
+    assert_ne!(
+        replacement, orphan,
+        "{first:?}: a new host serves the endpoint"
     );
-    first
+    assert!(
+        exits(orphan).await,
+        "{first:?}: the orphaned host was stopped"
+    );
+    let listed = second.list(&owner, None).await.unwrap();
+    assert_eq!(listed["total"], 1, "{listed}");
+    assert_eq!(listed["items"][0]["instance"], json!(opened.instance));
+    second
         .close(Uuid::new_v4(), &owner, &opened.instance)
         .await
         .unwrap();
-    for _ in 0..400 {
-        if !paths.socket().exists() {
-            break;
+}
+
+/// Whether process `pid` exits within a few seconds.
+async fn exits(pid: u32) -> bool {
+    for _ in 0..200 {
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(
-        !paths.socket().exists(),
-        "the host exits once its Tick ends"
-    );
+    false
 }
