@@ -491,6 +491,51 @@ async fn acp_real_model_multiple_turns_and_sessions_keep_context_isolated() {
     );
 }
 
+/// A second signed-in provider's models are offered beside the current provider's, grouped by
+/// provider, and choosing one switches the session to that provider.
+#[tokio::test]
+async fn acp_offers_every_signed_in_providers_models_and_switches_between_them() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(listener.local_addr().unwrap(), json!([]));
+    tickloop_harness::model::credentials::save_api_key(
+        &fixture.folder().join("config"),
+        "ZAI_API_KEY",
+        "fixture-key",
+    )
+    .unwrap();
+    let mut wire = fixture.spawn();
+    wire.initialize().await;
+    wire.request(
+        2,
+        "session/new",
+        json!({"cwd":fixture.folder(),"mcpServers":[]}),
+    )
+    .await;
+    let created = wire.response(2).await;
+    let model = &created["result"]["configOptions"][0];
+    assert_eq!(model["currentValue"], "deepseek-flash", "{created}");
+    let groups: Vec<_> = model["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(groups, ["DeepSeek API", "Z.AI Global API"], "{created}");
+    let session = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    wire.request(
+        3,
+        "session/set_config_option",
+        json!({"sessionId":session,"configId":"model","type":"select","value":"glm-5.3"}),
+    )
+    .await;
+    let switched = wire.response(3).await;
+    assert_eq!(
+        switched["result"]["configOptions"][0]["currentValue"], "glm-5.3",
+        "{switched}"
+    );
+    wire.finish().await;
+}
+
 #[tokio::test]
 async fn acp_permission_roundtrip_executes_once_and_cancel_does_not_block_on_permission() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

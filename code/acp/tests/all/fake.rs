@@ -47,10 +47,12 @@ fn configuration() -> ManagedConfiguration {
             ManagedModelInfo {
                 id: "fixture/model".into(),
                 name: "Fixture".into(),
+                provider: "Fixture provider".into(),
             },
             ManagedModelInfo {
                 id: "fixture/second".into(),
                 name: "Second".into(),
+                provider: "Fixture provider".into(),
             },
         ],
         modes: vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits],

@@ -82,21 +82,42 @@ fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
         ));
     }
     let mut seen = HashSet::new();
-    let models: Vec<Value> = config
+    let mut groups: Vec<(&str, Vec<Value>)> = Vec::new();
+    for model in config
         .models
         .iter()
         .filter(|model| !model.id.is_empty() && seen.insert(model.id.as_str()))
-        .map(|model| json!({"value": model.id, "name": model.name}))
-        .collect();
-    if !models
-        .iter()
-        .any(|model| model["value"].as_str() == Some(config.model_id.as_str()))
     {
+        let option = json!({"value": model.id, "name": model.name});
+        match groups.last_mut() {
+            Some((provider, options)) if *provider == model.provider => options.push(option),
+            _ => groups.push((&model.provider, vec![option])),
+        }
+    }
+    if !seen.contains(config.model_id.as_str()) {
         return Err(Error::new(
             -32603,
             "managed configuration does not offer its current model",
         ));
     }
+    // One provider keeps the flat list; several are grouped by provider, as the Console shows them.
+    let models = if groups.len() > 1 {
+        json!(
+            groups
+                .into_iter()
+                .map(|(provider, options)| {
+                    json!({"group": provider, "name": provider, "options": options})
+                })
+                .collect::<Vec<_>>()
+        )
+    } else {
+        json!(
+            groups
+                .into_iter()
+                .flat_map(|(_, options)| options)
+                .collect::<Vec<_>>()
+        )
+    };
     let options: Vec<Value> = modes
         .iter()
         .map(|mode| json!({"value": mode_id(*mode), "name": mode.label()}))
@@ -285,6 +306,7 @@ mod tests {
             models: vec![ManagedModelInfo {
                 id: "provider/model".into(),
                 name: "Model".into(),
+                provider: "Provider".into(),
             }],
             modes: vec![
                 ExecutionMode::Auto,
@@ -316,6 +338,32 @@ mod tests {
             }
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn models_of_several_providers_are_grouped_by_provider() {
+        let mut config = config();
+        config.models.push(ManagedModelInfo {
+            id: "other/model".into(),
+            name: "Model".into(),
+            provider: "Other provider".into(),
+        });
+        let projected = project(&config).unwrap();
+        let mut new = projected.clone();
+        new["sessionId"] = json!("session");
+        let decoded: NewSessionResponse = serde_json::from_value(new).unwrap();
+        let wire = serde_json::to_value(decoded).unwrap();
+        let groups = wire["configOptions"][0]["options"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1]["name"], "Other provider");
+        assert_eq!(groups[1]["options"][0]["value"], "other/model");
+        assert_eq!(
+            change(&config, "model", &json!("other/model"))
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("other/model")
+        );
     }
 
     #[test]

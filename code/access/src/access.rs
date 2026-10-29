@@ -353,6 +353,8 @@ pub struct ManagedSkillInfo {
 pub struct ManagedModelInfo {
     pub id: String,
     pub name: String,
+    /// The provider's display name, which a client may group models under.
+    pub provider: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

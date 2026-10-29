@@ -1030,6 +1030,69 @@ pub fn current_provider_credential_scope(config_root: Option<PathBuf>) -> Provid
     }
 }
 
+/// Whether `config`'s provider can authenticate in `scope`: a saved login, a saved or
+/// environment API key, or a connection that needs none.
+pub fn provider_signed_in(
+    config: &tickloop_harness_protocol::ModelConfig,
+    scope: &ProviderCredentialScope,
+) -> Result<bool, String> {
+    use tickloop_harness_protocol::ModelAuthSource;
+    let root = scope.config_root.as_deref();
+    if let Some(region) = minimax::MiniMaxRegion::from_auth(config.auth_source) {
+        return root.map_or(Ok(false), |root| {
+            minimax::MiniMaxAuth::new(root, region)
+                .has_saved_login()
+                .map_err(|error| error.to_string())
+        });
+    }
+    match config.auth_source {
+        ModelAuthSource::GoogleCloud => return scope.service_account_configured.clone(),
+        ModelAuthSource::GoogleOAuth => {
+            return root.map_or(Ok(false), |root| {
+                google::GoogleAuth::new(root)
+                    .has_saved_login()
+                    .map_err(|error| error.to_string())
+            });
+        }
+        _ => {}
+    }
+    if let Some(kind) = device_subscriptions::DeviceSubscription::from_auth(config.auth_source) {
+        return root.map_or(Ok(false), |root| {
+            device_subscriptions::SubscriptionAuth::new(root, kind)
+                .has_saved_login()
+                .map_err(|error| error.to_string())
+        });
+    }
+    match config.auth_source {
+        ModelAuthSource::GithubCopilot => {
+            return root.map_or(Ok(false), |root| {
+                copilot::CopilotAuth::new(root)
+                    .has_saved_login()
+                    .map_err(|error| error.to_string())
+            });
+        }
+        ModelAuthSource::CodexSubscription => {
+            return root.map_or(Ok(false), |root| {
+                CodexAuth::new(root)
+                    .has_saved_login()
+                    .map_err(|error| error.to_string())
+            });
+        }
+        _ => {}
+    }
+    if config.api_key_env.is_empty() {
+        return Ok(true);
+    }
+    if let Some(root) = root
+        && crate::credentials::load_api_key(root, &config.api_key_env)
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(scope.environment_keys.contains(&config.api_key_env))
+}
+
 #[cfg(test)]
 mod network_tests {
     use super::*;

@@ -843,11 +843,6 @@ impl EmbeddedAgentAccess {
                         ));
                     }
                     let model = if let Some(id) = change.model_id {
-                        if !config.models.iter().any(|item| item.id == id) {
-                            return Err(AccessError::invalid(
-                                "model is not in the session model directory",
-                            ));
-                        }
                         let current = self
                             .inner
                             .agent
@@ -856,9 +851,15 @@ impl EmbeddedAgentAccess {
                             .map_err(agent_access_error)?
                             .model;
                         Some(
-                            tickloop_harness::model::cards::ModelCatalog::defaults()
-                                .get(&current.provider_id, &id)
-                                .ok_or_else(|| AccessError::invalid("unknown model ID"))?,
+                            self.managed_models(&current, entry.launch.config_root.clone())
+                                .await
+                                .into_iter()
+                                .find_map(|(offered, config)| (offered == id).then_some(config))
+                                .ok_or_else(|| {
+                                    AccessError::invalid(
+                                        "model is not in the session model directory",
+                                    )
+                                })?,
                         )
                     } else {
                         None
@@ -2063,36 +2064,14 @@ impl EmbeddedAgentAccess {
             .await
             .map_err(agent_access_error)?;
         let current = &snapshot.model;
-        let cancel = CancellationToken::new();
-        let directory = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.inner.account_models.discover(
-                current,
-                entry.launch.config_root.as_deref(),
-                false,
-                &cancel,
-            ),
-        )
-        .await;
-        cancel.cancel();
-        let directory = match directory {
-            Ok(Ok(value)) => Some(value),
-            _ => None,
-        };
-        let models = tickloop_harness::model::cards::ModelCatalog::defaults()
-            .profiles()
+        let models = self
+            .managed_models(current, entry.launch.config_root.clone())
+            .await
             .into_iter()
-            .filter(|config| config.provider_id == current.provider_id)
-            .filter(|config| {
-                directory
-                    .as_ref()
-                    .map_or(config.model_id == current.model_id, |directory| {
-                        directory.availability(&config.model_id).selectable()
-                    })
-            })
-            .map(|config| ManagedModelInfo {
-                id: config.model_id,
+            .map(|(id, config)| ManagedModelInfo {
+                id,
                 name: config.name,
+                provider: config.provider_name,
             })
             .collect();
         let ceiling = if let Ok(Some(metadata)) =
@@ -2124,6 +2103,83 @@ impl EmbeddedAgentAccess {
             reasoning_effort: snapshot.reasoning_effort,
             efforts: ReasoningEffort::choices(current).to_vec(),
         })
+    }
+
+    /// Every model of each signed-in built-in provider, as the Console offers them, with the
+    /// option id a managed client selects it by: the bare model id for the provider that owns
+    /// it (the current provider first, else the first listed), `provider/model` for the others.
+    /// Built-in model ids contain no `/`, so the two forms never collide.
+    async fn managed_models(
+        &self,
+        current: &tickloop_harness::protocol::ModelConfig,
+        config_root: Option<std::path::PathBuf>,
+    ) -> Vec<(String, tickloop_harness::protocol::ModelConfig)> {
+        let scope =
+            tickloop_harness::model::auth::current_provider_credential_scope(config_root.clone());
+        let mut providers: Vec<Vec<tickloop_harness::protocol::ModelConfig>> = Vec::new();
+        for config in tickloop_harness::model::cards::ModelCatalog::defaults().profiles() {
+            match providers.last_mut() {
+                Some(provider) if provider[0].provider_id == config.provider_id => {
+                    provider.push(config)
+                }
+                _ => providers.push(vec![config]),
+            }
+        }
+        providers.retain(|provider| {
+            provider[0].provider_id == current.provider_id
+                || tickloop_harness::model::auth::provider_signed_in(&provider[0], &scope)
+                    == Ok(true)
+        });
+        let cancel = CancellationToken::new();
+        let directories = futures_util::future::join_all(providers.iter().map(|provider| {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                self.inner.account_models.discover(
+                    &provider[0],
+                    config_root.as_deref(),
+                    false,
+                    &cancel,
+                ),
+            )
+        }))
+        .await;
+        cancel.cancel();
+        // A provider whose directory cannot be read keeps its catalog models, as in the Console.
+        let listed: Vec<_> = providers
+            .into_iter()
+            .zip(directories)
+            .flat_map(|(provider, directory)| {
+                let directory = directory.ok().and_then(Result::ok);
+                provider.into_iter().filter(move |config| {
+                    (config.provider_id == current.provider_id
+                        && config.model_id == current.model_id)
+                        || directory.as_ref().is_none_or(|directory| {
+                            directory.availability(&config.model).selectable()
+                        })
+                })
+            })
+            .collect();
+        let mut owners = HashMap::new();
+        for config in listed
+            .iter()
+            .filter(|config| config.provider_id == current.provider_id)
+            .chain(&listed)
+        {
+            owners
+                .entry(config.model_id.clone())
+                .or_insert_with(|| config.provider_id.clone());
+        }
+        listed
+            .into_iter()
+            .map(|config| {
+                let id = if owners[&config.model_id] == config.provider_id {
+                    config.model_id.clone()
+                } else {
+                    format!("{}/{}", config.provider_id, config.model_id)
+                };
+                (id, config)
+            })
+            .collect()
     }
 
     fn builtin_config(

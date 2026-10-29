@@ -17,6 +17,7 @@ tickloop-harness = { path = "../../harness/sdk", features = ["artifacts", "engin
 tickloop-code-local-environment = { path = "../local-environment" }
 async-trait = "0.1"
 base64 = "0.22"
+futures-util = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,7 +41,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dev-dependencies]
 tickloop-harness = { path = "../../harness/sdk", features = ["test-support", "transcript"] }
 tickloop-code-settings = { path = "../settings", features = ["test-support"] }
-futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
 tempfile = "3"

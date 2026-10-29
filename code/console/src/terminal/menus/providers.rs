@@ -2169,76 +2169,12 @@ impl Menus {
     }
 
     pub(super) fn provider_authenticated(&self, provider: &ProviderModels) -> Result<bool, String> {
-        let config = &provider.models[0];
-        if let Some(region) =
-            tickloop_harness::model::auth::minimax::MiniMaxRegion::from_auth(config.auth_source)
-        {
-            return self
-                .provider_root()
-                .map(|root| {
-                    tickloop_harness::model::auth::minimax::MiniMaxAuth::new(root, region)
-                        .has_saved_login()
-                        .map_err(|error| error.to_string())
-                })
-                .unwrap_or(Ok(false));
-        }
-        if matches!(
-            config.auth_source,
-            ModelAuthSource::GoogleOAuth | ModelAuthSource::GoogleCloud
-        ) {
-            let Some(root) = self.provider_root() else {
-                return Ok(false);
-            };
-            let auth = tickloop_harness::model::auth::google::GoogleAuth::new(root);
-            if config.auth_source == ModelAuthSource::GoogleCloud
-                && let Some(scope) = &self.provider.provider_scope
-            {
-                return scope.service_account_configured.clone();
-            }
-            return if config.auth_source == ModelAuthSource::GoogleCloud {
-                auth.service_account_configured()
-            } else {
-                auth.has_saved_login()
-            }
-            .map_err(|error| error.to_string());
-        }
-        if let Some(kind) =
-            tickloop_harness::model::auth::device_subscriptions::DeviceSubscription::from_auth(
-                config.auth_source,
+        let scope = self.provider.provider_scope.clone().unwrap_or_else(|| {
+            tickloop_harness::model::auth::current_provider_credential_scope(
+                self.config_root.clone(),
             )
-        {
-            let Some(root) = self.provider_root() else {
-                return Ok(false);
-            };
-            return tickloop_harness::model::auth::device_subscriptions::SubscriptionAuth::new(
-                root, kind,
-            )
-            .has_saved_login()
-            .map_err(|error| error.to_string());
-        }
-        if config.auth_source == ModelAuthSource::GithubCopilot {
-            return self
-                .provider_root()
-                .map(|root| {
-                    tickloop_harness::model::auth::copilot::CopilotAuth::new(root)
-                        .has_saved_login()
-                        .map_err(|error| error.to_string())
-                })
-                .unwrap_or(Ok(false));
-        }
-        if config.auth_source == ModelAuthSource::CodexSubscription {
-            let Some(root) = self.provider_root() else {
-                return Ok(false);
-            };
-            return super::super::login::terminal_auth(root.to_path_buf())
-                .has_saved_login()
-                .map_err(|error| error.to_string());
-        }
-        if config.api_key_env.is_empty() {
-            return Ok(true);
-        }
-        self.provider_api_status(&config.api_key_env)
-            .map(|status| status != ApiKeyStatus::Missing)
+        });
+        tickloop_harness::model::auth::provider_signed_in(&provider.models[0], &scope)
     }
 
     pub(in crate::terminal) fn warm_model_directory(
