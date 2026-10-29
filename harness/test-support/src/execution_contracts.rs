@@ -903,3 +903,199 @@ pub async fn isolation_contract<F: FnOnce()>(
         ExecutionOutcome::Completed(_)
     ));
 }
+
+/// The variable the one-shot command contract hands its echo command.
+pub const COMMAND_CONTRACT_VARIABLE: &str = "CONTRACT_VALUE";
+/// Copies its input to stdout, writes the variable and its working directory to stderr and
+/// exits with 3.
+pub const ECHO_COMMAND: &str = "cat; printf '%s|%s' \"$CONTRACT_VALUE\" \"$(pwd -P)\" >&2; exit 3";
+pub const HANGING_COMMAND: &str = "sleep 30";
+pub const LARGE_OUTPUT_BYTES: usize = COMMAND_OUTPUT_BYTES + 4096;
+
+pub fn large_output_command() -> String {
+    format!("head -c {LARGE_OUTPUT_BYTES} /dev/zero | tr '\\0' x")
+}
+
+/// Scripts the contract's commands in a memory environment the way `/bin/sh` runs them.
+pub fn define_command_contract(
+    environment: &tickloop_harness_runtime::environment::memory::MemoryEnvironment,
+) {
+    use tickloop_harness_runtime::environment::memory::MemoryCommandRun;
+    environment.define_command(ECHO_COMMAND, |spec| MemoryCommandRun {
+        stdout: spec.stdin.clone(),
+        stderr: format!(
+            "{}|{}",
+            spec.env
+                .get(COMMAND_CONTRACT_VARIABLE)
+                .map_or("", String::as_str),
+            spec.cwd
+        )
+        .into_bytes(),
+        exit_code: 3,
+        ..Default::default()
+    });
+    environment.define_command(HANGING_COMMAND, |_| MemoryCommandRun {
+        duration: std::time::Duration::from_secs(30),
+        ..Default::default()
+    });
+    environment.define_command(&large_output_command(), |_| MemoryCommandRun {
+        stdout: vec![b'x'; LARGE_OUTPUT_BYTES],
+        ..Default::default()
+    });
+}
+
+/// A one-shot command gets its input, variables and directory, reports its exit and output,
+/// and ends by its timeout or a cancellation. `cwd` is a canonical directory.
+pub async fn one_shot_command_contract(
+    environment: &dyn ExecutionEnvironment,
+    scope: ExecutionScope,
+    cwd: String,
+) {
+    let authority = ExecutionAuthority::new(scope.chat);
+    let port = environment.bind(scope, authority.clone()).unwrap();
+    let command = |command: &str, timeout: std::time::Duration| CommandSpec {
+        command: command.into(),
+        stdin: Vec::new(),
+        env: Default::default(),
+        cwd: cwd.clone(),
+        timeout,
+    };
+    let long = std::time::Duration::from_secs(30);
+
+    let echo = CommandSpec {
+        stdin: b"command input".to_vec(),
+        env: [(COMMAND_CONTRACT_VARIABLE.into(), "variable value".into())].into(),
+        ..command(ECHO_COMMAND, long)
+    };
+    let prepared = port
+        .prepare(ExecutionIntent::RunCommand(echo.clone()))
+        .await
+        .unwrap();
+    assert_eq!(prepared.facts().intent, ExecutionIntent::RunCommand(echo));
+    assert_eq!(prepared.isolation(), ExecutionIsolation::default());
+    assert!(!prepared.requires_approval());
+    assert!(
+        !prepared
+            .facts()
+            .normalized_input
+            .to_string()
+            .contains("variable value"),
+        "preparation facts name variables without their values"
+    );
+    let admission = authority.admit(&prepared).unwrap();
+    let ExecutionOutcome::Completed(result) = port
+        .execute(prepared, admission, CancellationToken::new())
+        .await
+    else {
+        panic!("the command did not complete");
+    };
+    assert!(result.shell.is_none() && result.opened.is_none());
+    assert!(result.result.is_error);
+    let output = result.command.expect("command output");
+    assert_eq!(output.exit.code, Some(3));
+    assert!(!output.timed_out);
+    assert_eq!(output.stdout.data(), b"command input");
+    assert_eq!(output.stderr.text(), format!("variable value|{cwd}"));
+    assert!(!output.stdout.is_truncated());
+
+    let output = run_command(&port, &authority, command(&large_output_command(), long))
+        .await
+        .command
+        .unwrap();
+    assert_eq!(output.exit.code, Some(0));
+    assert_eq!(output.stdout.data().len(), COMMAND_OUTPUT_BYTES);
+    assert_eq!(output.stdout.total_bytes(), LARGE_OUTPUT_BYTES as u64);
+    assert!(output.stdout.is_truncated());
+    assert!(output.stdout.text().ends_with(&format!(
+        "[output truncated: kept the first {COMMAND_OUTPUT_BYTES} of {LARGE_OUTPUT_BYTES} bytes]"
+    )));
+    assert!(!output.stderr.is_truncated());
+
+    let started = std::time::Instant::now();
+    let result = run_command(
+        &port,
+        &authority,
+        command(HANGING_COMMAND, std::time::Duration::from_millis(300)),
+    )
+    .await;
+    let output = result.command.unwrap();
+    assert!(output.timed_out);
+    assert_ne!(output.exit.code, Some(0));
+    assert!(result.result.is_error);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    let prepared = port
+        .prepare(ExecutionIntent::RunCommand(command(HANGING_COMMAND, long)))
+        .await
+        .unwrap();
+    let admission = authority.admit(&prepared).unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        port.execute(prepared, admission, cancelled).await,
+        ExecutionOutcome::NotDispatched(error) if error.code == "Cancelled"
+    ));
+
+    let cancel = CancellationToken::new();
+    let outcome = interrupt_command(
+        &port,
+        &authority,
+        command(HANGING_COMMAND, long),
+        cancel.clone(),
+        || cancel.cancel(),
+    )
+    .await;
+    assert!(matches!(outcome, ExecutionOutcome::OutcomeUnknown { .. }));
+
+    let outcome = interrupt_command(
+        &port,
+        &authority,
+        command(HANGING_COMMAND, long),
+        CancellationToken::new(),
+        || authority.revoke(),
+    )
+    .await;
+    assert!(matches!(outcome, ExecutionOutcome::OutcomeUnknown { .. }));
+}
+
+async fn run_command(
+    port: &Arc<dyn ExecutionPort>,
+    authority: &ExecutionAuthority,
+    spec: CommandSpec,
+) -> ExecutionResult {
+    match execute(port, authority, ExecutionIntent::RunCommand(spec)).await {
+        ExecutionOutcome::Completed(result) => result,
+        outcome => panic!("the command did not complete: {outcome:?}"),
+    }
+}
+
+/// Starts a command, interrupts it while it runs and returns the prompt outcome.
+async fn interrupt_command(
+    port: &Arc<dyn ExecutionPort>,
+    authority: &ExecutionAuthority,
+    spec: CommandSpec,
+    cancel: CancellationToken,
+    interrupt: impl FnOnce(),
+) -> ExecutionOutcome {
+    let prepared = port
+        .prepare(ExecutionIntent::RunCommand(spec))
+        .await
+        .unwrap();
+    let operation = prepared.operation();
+    let admission = authority.admit(&prepared).unwrap();
+    let pending = tokio::spawn({
+        let port = port.clone();
+        async move { port.execute(prepared, admission, cancel).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!pending.is_finished(), "the command ended on its own");
+    interrupt();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("an interrupted command did not end")
+        .unwrap();
+    if let ExecutionOutcome::OutcomeUnknown { operation: id, .. } = &outcome {
+        assert_eq!(*id, operation);
+    }
+    outcome
+}

@@ -428,6 +428,7 @@ impl LocalShells {
                     },
                     opened: None,
                     shell: None,
+                    command: None,
                     handoff: None,
                 })
             }
@@ -604,6 +605,7 @@ impl LocalShells {
             },
             opened: None,
             shell: Some(Box::new(status)),
+            command: None,
             handoff,
         })
     }
