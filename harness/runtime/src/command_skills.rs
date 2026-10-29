@@ -51,6 +51,20 @@ impl Agent {
             {
                 return Ok(false);
             }
+            if !chat.user_skill_preparations.contains_key(&receipt.run_id)
+                && chat
+                    .snapshot
+                    .user_skill_invocations
+                    .get(&receipt.run_id)
+                    .is_some_and(|invocation| {
+                        chat.skills.is_plugin_command(&invocation.name) == Some(false)
+                            && chat.snapshot.invoked_skills.iter().any(|skill| {
+                                skill.name == invocation.name && skill.source == invocation.source
+                            })
+                    })
+            {
+                return Ok(false);
+            }
             match chat.user_skill_preparations.insert(receipt.run_id, UserSkillPreparation::Started) {
                 Some(UserSkillPreparation::Pending(expansion)) => expansion,
                 Some(UserSkillPreparation::Complete) => {

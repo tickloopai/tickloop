@@ -840,3 +840,62 @@ async fn old_checkpoint_retains_queued_guidance_without_rebuilding_an_execution_
         successor.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn plain_command_guidance_keeps_the_existing_active_turn_merge_behavior() {
+    let folder = tempfile::tempdir().unwrap();
+    let environment = MemoryEnvironment::new();
+    environment.set_shell_approval_required(true);
+    environment.define_shell("touch hold", Duration::ZERO, b"held-output".to_vec(), 0);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("hold", "Bash", json!({"command":"touch hold"})),
+        text("done"),
+    ]));
+    let agent = command_agent(
+        environment,
+        model.clone(),
+        "---\ndescription: Check\n---\nPlain command guidance",
+    );
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let active = agent.submit(chat, "Start work".into()).await.unwrap();
+    let permission = loop {
+        if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
+            break request;
+        }
+    };
+    let command = agent.invoke_skill(chat, "demo:check", "").await.unwrap();
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .invoked_skills
+            .iter()
+            .any(|skill| skill.content.contains("Plain command guidance"))
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    let mut merged = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::InputMerged { into_run_id } if event.run_id == command.run_id => {
+                assert_eq!(into_run_id, active.run_id);
+                merged = true;
+            }
+            EventKind::Completed { .. } if event.run_id == active.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(merged);
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    agent.shutdown().await;
+}

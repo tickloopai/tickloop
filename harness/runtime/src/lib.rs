@@ -698,7 +698,17 @@ fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat Pe
         {
             continue;
         }
-        if pending.is_skill_invocation {
+        if chat
+            .user_skill_preparations
+            .get(&pending.receipt.run_id)
+            .is_some_and(|preparation| match preparation {
+                command_skills::UserSkillPreparation::Pending(expansion) => {
+                    !expansion.shell_commands.is_empty()
+                }
+                command_skills::UserSkillPreparation::Started => true,
+                command_skills::UserSkillPreparation::Complete => false,
+            })
+        {
             is_behind_held_prompt = true;
         }
         if hooks::is_user_prompt(pending) {
@@ -3066,10 +3076,25 @@ impl Agent {
                     source: invoked_skill.source.clone(),
                 },
             );
-            chat.user_skill_preparations.insert(
-                run_id.into(),
-                command_skills::UserSkillPreparation::Pending(invoked_skill),
-            );
+            if invoked_skill.shell_commands.is_empty() {
+                let mut invoked = tickloop_harness_protocol::InvokedSkill::try_from(invoked_skill)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                if invoked.source == tickloop_harness_protocol::SkillSource::BuiltIn
+                    && chat.skills.is_user_only(&invoked.name)
+                {
+                    invoked.run_id = Some(run_id.into());
+                }
+                record_invoked_skill(chat, invoked);
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Complete,
+                );
+            } else {
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Pending(invoked_skill),
+                );
+            }
         } else if trigger_source.is_none() && agent_message.is_none() {
             carry_user_skills_past_sign_in(chat, loop_id, run_id.into());
         }

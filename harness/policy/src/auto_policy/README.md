@@ -243,5 +243,5 @@ calls after argument expansion, each using the existing prepare, admission and e
 The Skill call's admission and its `allowed-tools` metadata grant no permission to these calls.
 Auto uses the same frozen Bash rules, explicit Ask/Deny rules and sandbox admission as an ordinary
 Bash call; Plan and the delegation ceiling still apply. Discovery and completion execute nothing.
-User slash invocations defer preparation until their own turn; queued commands cannot execute
-inside another turn. No default rule or count changes.
+User slash invocations with Shell preparation wait for their own turn; those Shell blocks cannot
+execute inside another turn. Ordinary Skill guidance keeps its existing tool-boundary merging. No default rule or count changes.

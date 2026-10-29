@@ -268,6 +268,10 @@ impl SkillRegistry {
         self.skills.values().filter(|skill| skill.user_invocable)
     }
 
+    pub fn is_plugin_command(&self, name: &str) -> Option<bool> {
+        self.skills.get(name).map(|skill| skill.command.is_some())
+    }
+
     /// Whether the Skill named `name` disables model invocation, so only the user invokes it.
     pub fn is_user_only(&self, name: &str) -> bool {
         self.skills
