@@ -59,13 +59,13 @@ Each crate's responsibility in brief; dependencies are as declared in each `Carg
 | `code/client/` | AgentAccess client: Unix socket, reconnection, finding or starting the local daemon (one daemon per configuration root) |
 | `code/daemon/` | Daemon and worker processes: AgentAccess server, embedded agent, worker supervision and the hosted control channel |
 | `harness/sdk/` | `tickloop-harness` facade: the sole Harness dependency for hosts; stable module re-exports and capability features |
-| `harness/runtime/` | Loop, Subagents, Transcript storage/loading, generic Tick and Shell tools, subscriptions, approval, Execution Environment Port, MCP connections, Tool Exposure and Tool Search |
+| `harness/runtime/` | Loop, Subagents, Transcript storage/loading, generic Tick and Shell tools, subscriptions, approval, Execution Environment Port (including its file operations and per-Chat binding), MCP connections, Tool Exposure and Tool Search |
 | `harness/protocol/` | Shared Harness wire types (ADR 0033 narrows ADR 0022) |
 | `code/access/` | Code-only AgentAccess wire contract between Console, client and Daemon |
-| `code/local-environment/` | Execution Environment Adapter: local Tickhost, Unix sockets and FD grants, the `workspace_host` context with installed plugins, package programs and ownership handoff |
+| `code/local-environment/` | Execution Environment Adapter: local Tickhost, Unix sockets and FD grants, local file roots through the Harness file backend, the `workspace_host` context with installed plugins, package programs and ownership handoff |
 | `harness/transcript/` | Transcript record format and display projection, for users that do not need the runtime |
 | `harness/model/` | Model clients, provider catalog and login, judgment |
-| `harness/tools/` | Tools, permission rules and file-change records |
+| `harness/tools/` | Tools, permission rules and file-change records; the file Port types, the local file backend and Glob/Grep over given files |
 | `harness/policy/` | Frozen Auto policy, built-in Skills and registration, Settings Store contract, pure Loop and new-Chat rules |
 | `code/settings/` | File-backed Settings Store, settings.json, MCP server configuration and Connector credential files, Plugin User Config, disk and enabled-plugin Skill discovery |
 | `harness/cron/` | Scheduled-task timing: 5-field cron in the caller's time zone, `/loop` intervals, jitter and task ids |
@@ -98,7 +98,7 @@ Dependency boundaries:
 - `harness/protocol` depends only on `tick/protocol`, `tick/ids` and basic libraries such as serde; `harness/transcript` only on `harness/protocol`, `tick/ids` and basic libraries.
 - `tick/ids` depends only on `uuid` and `serde`; every Tickloop ID is generated through it.
 
-Integration seams: Transcript Store, Execution Environment, Model Endpoint, Credential Source and Settings Store. Harness owns generic Tick tools, approval, subscriptions, Trigger delivery and Shell tasks. Execution Environment binds authorization to a Port with inspect/prepare/execute/observe; Code's Local Environment implements it with Tickhost, and Daemon injects it. Settings Store keeps permission writes in Harness while Code persists settings.json. Filesystem tools still access the local Folder directly; sandbox file access is outside this split. The runtime registers Tick adapters only for `hosted` and `shell`; Artifacts reach the Loop through Artifact Association. Tickhost executes Shell requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. Generic TickCall reads the catalog and then calls; no model tool is generated per instance.
+Integration seams: Transcript Store, Execution Environment, Model Endpoint, Credential Source and Settings Store. Harness owns generic Tick tools, approval, subscriptions, Trigger delivery and Shell tasks. Execution Environment binds authorization to a Port with inspect/prepare/execute/observe; Code's Local Environment implements it with Tickhost, and Daemon injects it. Settings Store keeps permission writes in Harness while Code persists settings.json. File tools, file history, Rewind and `@` mentions reach the Folder and Additional Directories through the Chat's Port, which reports each directory's root name and file capability; the Harness maps paths to roots and the environment enforces them, while the Harness's own Chat directories and file-history backups stay on this machine (ADR 0042). File tools do not run in the sandbox. The runtime registers Tick adapters only for `hosted` and `shell`; Artifacts reach the Loop through Artifact Association. Tickhost executes Shell requests bound to a single-use spawn authorization. The Loop holds no Herdr layout state, and data sources stay in Tick packages. Generic TickCall reads the catalog and then calls; no model tool is generated per instance.
 
 ## Read before changing
 
@@ -108,7 +108,7 @@ Integration seams: Transcript Store, Execution Environment, Model Endpoint, Cred
 | Opening Ticks, Tick cards, subscriptions, instance lifecycle | `docs/design/tick.md`, `docs/design/native-herdr.md`; ADR 0007, 0008, 0019, 0024, 0040 |
 | Plugins, Tick packages, marketplaces, package login and credentials | `docs/design/plugins.md`; ADR 0034 |
 | MCP servers, Connectors, Tool Exposure and Tool Search | `docs/design/mcp-and-connectors.md`; ADR 0035, 0036, 0037 |
-| Module boundaries, facade features, AgentAccess, Settings Store, Execution Environment, IDs | `docs/design/architecture.md`; ADR 0033 (narrows 0022) |
+| Module boundaries, facade features, AgentAccess, Settings Store, Execution Environment, IDs | `docs/design/architecture.md`; ADR 0033 (narrows 0022), 0042 |
 | Loop, Trigger, Goal, scheduled tasks, Esc/`/stop` | `docs/design/agent.md`; ADR 0030 |
 | Subagent delegation, family messages, shared Tasks and their UI | The Subagent section of `docs/design/agent.md`; ADR 0026 |
 | Permissions, execution modes, Auto review | `harness/policy/src/auto_policy/README.md`, the permissions section of `docs/design/agent.md`; ADR 0032, 0009 |
