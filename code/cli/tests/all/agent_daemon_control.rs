@@ -769,7 +769,13 @@ async fn stopping_a_root_agent_ends_its_worker_process_and_keeps_it_listed_as_st
     let worker_socket = std::fs::read_dir(&fixture.runtime)
         .unwrap()
         .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+        .find(|entry| {
+            entry.file_name().to_string_lossy().starts_with("w-")
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
+        })
         .unwrap()
         .path();
     let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
