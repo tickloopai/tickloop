@@ -349,7 +349,7 @@ The terminal AI agent for code and office work that the `tickloop` command start
 _Avoid_: local tickloop, CLI (as a product name)
 
 **Tickloop Chat**:
-The product through which users use Chat and Work via Web/App, run by Tickloop Cloud. Always written in full: a bare "Chat" is a conversation, never the product.
+The product, run by Tickloop Cloud, that users reach via Web/App through three entry points: Chat, Work, and Design. Always written in full: a bare "Chat" is a conversation, never the product.
 _Avoid_: Chat (as a product name), cloud agent
 
 **Tickloop Cloud**:
@@ -377,15 +377,19 @@ Real-time events (streamed output, tool progress, and approval requests) the Har
 Chat content derived from the Transcript for display in the UI, rebuildable from the Transcript at any time; content meant only for the model does not enter the Display Projection.
 
 **Execution Environment**:
-Where the Agent's Bash, file tools, and Ticks actually run, connected to the Harness as tools; the tools the model sees do not change with the execution location. Locally it is the Local Environment (the local Folder and the daemon's Tickhost). A Chat without an Execution Environment has no Folder and does not touch local files or processes.
+Where the Agent's Bash, file tools, and Ticks actually run, connected to the Harness as tools. File tools are shown according to each directory's file capability (none, read, or read-write). Its types are the Local Environment (the local Folder and the daemon's Tickhost); `artifact` (the file tree of one Artifact, stored in Tickloop Artifacts); and `browser` (a local directory the user linked in the browser through the File System Access API, of which the browser keeps only a handle, so it is reachable only while the page is online). The directories of one Chat may belong to different types. A Chat without an Execution Environment has no Folder and does not touch local files or processes.
 _Avoid_: hands (colloquial only), executor
 
 **Folder**:
-The directory bound to a Chat in which the Agent reads and writes files and runs commands, located in that Chat's Execution Environment, which decides which of these it supports (a read-only connected directory supports reading files only); a local Chat uses its startup working directory as its Folder.
+The directory bound to a Chat in which the Agent reads and writes files and runs commands, located in that Chat's Execution Environment, which decides which of these it supports (a read-only connected directory supports reading files only); a local Chat uses its startup working directory as its Folder. Like an Additional Directory, it has a root name.
 _Avoid_: Workspace (that means the Herdr Workspace), Project
 
+**Additional Directory**:
+A directory attached to a Chat alongside its Folder. Each has a root name unique within that Chat (a suffix is added when names clash) and its own file capability, and can be detached on its own. Paths resolve relative to the Folder or an Additional Directory, and the Execution Environment refuses a path that leaves its root. Locally it comes from `permissions.additionalDirectories`, `--add-dir`, and `/add-dir`.
+_Avoid_: workspace directory, extra folder, mount
+
 **Work**:
-A Chat with a Folder bound; it is a state of a Chat, not a separate kind of conversation entity, and the UI shows it alongside Chat as Chat/Work. Ticks (except Artifact Ticks) are available only in Work whose Execution Environment supports them.
+A Chat with a Folder bound; it is a state of a Chat, not a separate kind of conversation entity, and the UI shows it as an entry point alongside Chat and Design. Ticks (except Artifact Ticks) are available only in Work whose Execution Environment supports them. Design is an entry point built on Work: a Work whose Folder is that Design's own file tree.
 _Avoid_: Cowork, agent mode, work mode
 
 **Tickloop Accounts**:
@@ -403,16 +407,16 @@ The standalone service and web product that stores, presents, and manages Artifa
 _Avoid_: Artifact Service, Tickloop Docs, "document" (when referring to Artifacts generally); using Artifacts for a single item
 
 **Artifact**:
-A single piece of content, owned by a user and created by a person or an Agent, that can be accessed on its own; its type is only Doc, Page, or Slides and does not change after creation. A single item and its attributes, operations, and relationships all use the singular (e.g. "open Artifact", "Artifact Comment").
+A single piece of content, owned by a user and created by a person or an Agent, that can be accessed on its own; its type is only Doc, Page, Slides, or Design and does not change after creation. A single item and its attributes, operations, and relationships all use the singular (e.g. "open Artifact", "Artifact Comment").
 _Avoid_: using Artifact for a collection; calling ordinary web pages, project docs, or build output Artifacts
 
 **Doc**:
 An Artifact (Markdown) primarily for writing, reading, and co-editing, suited to reports, proposals, specs, and notes.
-_Avoid_: adding a Chinese translation or a parenthetical explanation to the type name (likewise for Doc, Page, Slides, Slide)
+_Avoid_: adding a Chinese translation or a parenthetical explanation to the type name (likewise for Doc, Page, Slides, Slide, Design)
 
 **Page**:
 An Artifact (HTML) primarily for visual presentation and interaction, suited to dashboards, charts, explainer pages, small tools, and UI prototypes.
-_Avoid_: Design, Prototype (as Artifact type names)
+_Avoid_: Prototype (as an Artifact type name)
 
 **Slides**:
 An Artifact primarily for presenting, made of ordered Slides that can be paged through one by one, overviewed by section, and played full screen.
@@ -421,6 +425,10 @@ _Avoid_: Deck, presentation, slideshow, PPT (as Artifact type names)
 **Slide**:
 One sheet in Slides: a fixed 1920×1080 canvas with a stable ID that can carry speaker notes.
 _Avoid_: Page (when referring to a single Slide)
+
+**Design**:
+An Artifact for visual design on a canvas, whose content is a file tree (artboard HTML, an index, assets, and a design system snapshot). In Tickloop Chat a Design is also an entry point: technically it is a Work whose Folder is the Design's own file tree (the `artifact` Execution Environment).
+_Avoid_: Prototype, mockup (as Artifact type names); separate terms for the Design Artifact and the Design entry point
 
 **Artifact Image**:
 An image file uploaded to an Artifact, belonging only to it and deleted with it; currently only Slides can upload images, referenced as `asset:<id>`.
