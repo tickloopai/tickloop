@@ -1011,6 +1011,8 @@ pub(super) struct State {
     awaited_agent_cards: Vec<(tick_protocol::InstanceRef, Instant)>,
     /// The cards the last frame showed, collapsed ones left out.
     shown_cards: Vec<tick_protocol::InstanceRef>,
+    /// The open cards the last frame collapsed for lack of room.
+    collapsed_cards: Vec<tick_protocol::InstanceRef>,
     /// What showing cards asked of the Agent outside a key, such as attaching a view the
     /// Agent's use showed; the input loop sends it.
     queued_card_inputs: Vec<InputEvent>,
@@ -6446,6 +6448,7 @@ impl State {
             paired_escape_until: None,
             awaited_agent_cards: Vec::new(),
             shown_cards: Vec::new(),
+            collapsed_cards: Vec::new(),
             queued_card_inputs: Vec::new(),
             card_press: None,
             member_probes: Vec::new(),
@@ -7705,6 +7708,7 @@ impl State {
             })
             .collect();
         let mut card_sizes = Vec::new();
+        let mut collapsed_cards = Vec::new();
         let monitor_lines = self.monitor_visible().then(|| {
             let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
             let height = if self.monitor.overlay {
@@ -7747,6 +7751,7 @@ impl State {
                 &card_frames,
             );
             card_sizes = frame.card_sizes;
+            collapsed_cards = frame.collapsed_cards;
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
                 self.monitor_tick_area = Some((frame.tick_rows.clone(), columns.clone()));
@@ -7893,7 +7898,7 @@ impl State {
             })
             .chain(lines.iter().map(RoleLine::text))
             .collect();
-        self.settle_cards(card_sizes);
+        self.settle_cards(card_sizes, collapsed_cards);
         write!(output, "{}", self.card_terminal_modes())?;
         match self.card_cursor() {
             Some(Some((column, row))) => queue!(output, MoveTo(column, row), Show)?,

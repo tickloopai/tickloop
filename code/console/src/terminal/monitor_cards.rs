@@ -664,14 +664,23 @@ impl MonitorCards {
         for instance in instances.iter().rev() {
             if self.open_as(chat, instance.clone(), CardOrigin::User) {
                 opened.push(instance.clone());
-            }
-            let sequence = self.next_sequence;
-            if let Some(card) = self.card_mut(instance) {
-                card.sequence = sequence;
+            } else {
+                self.raise(instance);
             }
         }
         opened.reverse();
         opened
+    }
+
+    /// The user shows an open card again, such as one collapsed for lack of room: it becomes the
+    /// user's most recent, so it stays shown before every card but the focused one.
+    pub(super) fn raise(&mut self, instance: &InstanceRef) {
+        self.next_sequence += 1;
+        let sequence = self.next_sequence;
+        if let Some(card) = self.card_mut(instance) {
+            card.origin = CardOrigin::User;
+            card.sequence = sequence;
+        }
     }
 
     /// The user hides the card: it closes, and the Agent's use no longer shows it.

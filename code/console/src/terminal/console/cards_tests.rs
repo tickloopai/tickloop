@@ -1290,7 +1290,13 @@ fn leaving_a_card_for_the_list_and_switching_chats_tell_each_tick_its_focus() {
 /// A View of a Chat whose focused Monitor lists four hosted Ticks; returns them in the list's
 /// order, the first selected.
 fn four_hosted_fixture() -> (State, Vec<tick_protocol::InstanceRef>) {
-    let mut state = State::new(true, 140, 60);
+    hosted_fixture(60)
+}
+
+/// A View `height` rows tall of a Chat whose focused Monitor lists four hosted Ticks; returns
+/// them in the list's order, the first selected.
+fn hosted_fixture(height: u16) -> (State, Vec<tick_protocol::InstanceRef>) {
+    let mut state = State::new(true, 140, height);
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.prompt_enabled = true;
     state.monitor.replace(
@@ -1667,4 +1673,74 @@ fn cards_shift_z_showed_come_back_in_the_same_order_after_a_chat_switch() {
         std::slice::from_ref(&rows[1]),
         "and the Agent's use still shows them"
     );
+}
+
+fn collapsed(state: &State, instance: &tick_protocol::InstanceRef) -> bool {
+    state.cards.is_open(instance) && !state.shown_cards.contains(instance)
+}
+
+#[test]
+fn space_or_a_click_on_a_collapsed_cards_row_shows_it_in_one_press() {
+    let (mut state, rows) = hosted_fixture(26);
+    let chat = state.chat.unwrap();
+    let [one, two, three, four] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+    for row in [one, two, three] {
+        show_with_space(&mut state, row);
+    }
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        collapsed(&state, one) && !collapsed(&state, two) && !collapsed(&state, three),
+        "only the two most recent cards fit: {}",
+        screen(&state)
+    );
+
+    state.monitor.select(one);
+    assert!(state.monitor_list_hint().contains("space show"));
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(state.monitor.focused && !state.card_focused());
+    assert!(state.monitor_list_hint().contains("space hide"));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        !collapsed(&state, one) && collapsed(&state, two),
+        "the card shows as the user's most recent: {}",
+        screen(&state)
+    );
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert!(!state.cards.is_open(one), "a shown card hides");
+    state.draw_frame(&mut Vec::new()).unwrap();
+
+    attaches(state.key(key(KeyCode::Char(' '))), chat, one);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(collapsed(&state, two));
+    let row = target_cell(&state, &MonitorTarget::Tick(two.clone()));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        state.pointer(
+            MouseEvent {
+                kind,
+                row: row.0 as u16,
+                column: row.1 as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut Vec::new(),
+        );
+    }
+    assert!(state.pointer_input.is_none() && state.cards.is_open(two));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(
+        !collapsed(&state, two) && collapsed(&state, three),
+        "a click shows it the same way: {}",
+        screen(&state)
+    );
+
+    state.monitor.select(three);
+    attaches(state.key(key(KeyCode::Tab)), chat, four);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(collapsed(&state, four), "{}", screen(&state));
+    assert!(state.key(key(KeyCode::Char(' '))).is_none());
+    assert_eq!(origin(&state, four), Some(CardOrigin::User), "kept");
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert!(!collapsed(&state, four), "{}", screen(&state));
 }

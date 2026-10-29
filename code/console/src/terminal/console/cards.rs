@@ -82,10 +82,17 @@ impl State {
     }
 
     /// Space, or a click on the row: shows the card, or hides it, previewed or not, which
-    /// detaches its view. The focus stays on the list.
+    /// detaches its view. A card collapsed for lack of room shows as the user's most recent
+    /// instead. The focus stays on the list.
     pub(super) fn toggle_card(&mut self, instance: InstanceRef) -> Option<InputEvent> {
         self.rendered_region = None;
         if self.cards.is_open(&instance) {
+            if self.collapsed_cards.contains(&instance) {
+                self.collapsed_cards
+                    .retain(|collapsed| collapsed != &instance);
+                self.cards.raise(&instance);
+                return None;
+            }
             self.cards.hide(&instance);
             self.card_sizes.remove(&instance);
             return None;
@@ -102,6 +109,7 @@ impl State {
         }
         self.cards.close_all();
         self.card_sizes.clear();
+        self.collapsed_cards.clear();
         self.rendered_region = None;
     }
 
@@ -622,10 +630,16 @@ impl State {
 
     /// After a frame: each shown card's view takes the size the frame gave it, paced while the
     /// size keeps changing, or at once after a separator drag ends; the focus leaves a card the
-    /// frame did not show, such as when a menu covers Monitor.
-    pub(super) fn settle_cards(&mut self, sizes: Vec<(InstanceRef, CardSize)>) {
+    /// frame did not show, such as when a menu covers Monitor. The cards it `collapsed` show on
+    /// Space.
+    pub(super) fn settle_cards(
+        &mut self,
+        sizes: Vec<(InstanceRef, CardSize)>,
+        collapsed: Vec<InstanceRef>,
+    ) {
         let resizes_due = std::mem::take(&mut self.card_resizes_due);
         self.shown_cards = sizes.iter().map(|(instance, _)| instance.clone()).collect();
+        self.collapsed_cards = collapsed;
         for (instance, size) in &sizes {
             if let Some(card) = self.cards.card_mut(instance)
                 && let CardState::Attached(view) = &mut card.state
@@ -748,11 +762,15 @@ impl State {
         };
         let mut card_keys = Vec::new();
         if self.row_toggles_card(&entry.instance) {
-            card_keys.push(if self.cards.is_open(&entry.instance) {
-                "space hide"
-            } else {
-                "space show"
-            });
+            card_keys.push(
+                if self.cards.is_open(&entry.instance)
+                    && !self.collapsed_cards.contains(&entry.instance)
+                {
+                    "space hide"
+                } else {
+                    "space show"
+                },
+            );
         }
         if self
             .monitor
