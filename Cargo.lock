@@ -4518,6 +4518,7 @@ dependencies = [
  "regex",
  "serde_json",
  "sha2",
+ "tempfile",
  "tickloop-harness-artifacts",
  "tickloop-harness-base",
  "tickloop-harness-model",

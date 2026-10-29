@@ -13,8 +13,9 @@ mod observe;
 mod sandbox;
 pub(crate) use dispatch::ExecutionDispatch;
 
-/// This computer: the file tools and project Skills work on the Chat's local Folder, the daemon's
-/// Tickhost, when it granted one, runs Shells and Ticks, and one-shot commands run in this process.
+/// This computer: the Port's files are the Chat's Folder and Additional Directories on this machine
+/// ([`LocalFiles`]), the daemon's Tickhost, when it granted one, runs Shells and Ticks, and one-shot
+/// commands run in this process.
 #[derive(Clone)]
 pub struct LocalEnvironment {
     hosted_ticks: Option<Arc<HostedTickTools>>,
@@ -87,6 +88,7 @@ impl ExecutionEnvironment for LocalEnvironment {
         authority: ExecutionAuthority,
     ) -> Result<Arc<dyn ExecutionPort>, ExecutionError> {
         authority.check(scope.chat)?;
+        let files = LocalFiles::for_scope(&scope);
         Ok(Arc::new(LocalPort {
             identity: tickloop_ids::generate(),
             scope,
@@ -103,8 +105,9 @@ impl ExecutionEnvironment for LocalEnvironment {
                 ticks: self.hosted_ticks.is_some(),
                 shells: self.shells.is_some(),
                 shell_output: ShellOutputDelivery::CallerFile,
-                files: FileCapabilities::default(),
+                files: files.capabilities().clone(),
             },
+            files,
         }))
     }
 }
@@ -114,6 +117,7 @@ struct LocalPort {
     scope: ExecutionScope,
     authority: ExecutionAuthority,
     capabilities: ExecutionCapabilities,
+    files: LocalFiles,
     tools: Option<Arc<HostedTickTools>>,
     shells: Option<Arc<local_shells::LocalShells>>,
     prepared: tokio::sync::Mutex<
@@ -226,10 +230,11 @@ impl ExecutionPort for LocalPort {
                     self.authority.check(self.scope.chat)?;
                     Ok(ExecutionInspection::Description(description))
                 }
-                ExecutionQuery::File(_) => Err(ExecutionError::new(
-                    error_code::UNSUPPORTED,
-                    "this environment has no file operations",
-                )),
+                ExecutionQuery::File(query) => {
+                    let inspection = self.files.inspect(query).await?;
+                    self.authority.check(self.scope.chat)?;
+                    Ok(ExecutionInspection::File(inspection))
+                }
                 ExecutionQuery::Capabilities => {
                     Ok(ExecutionInspection::Capabilities(self.capabilities.clone()))
                 }
@@ -303,6 +308,14 @@ impl ExecutionPort for LocalPort {
     async fn prepare(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
         self.authority.check(self.scope.chat)?;
         let preparation = async {
+            if intent.file_path().is_some() {
+                let prepared = self
+                    .files
+                    .prepare(intent, self.identity, &self.authority)
+                    .await?;
+                self.authority.check(self.scope.chat)?;
+                return Ok(prepared);
+            }
             if let ExecutionIntent::RunCommand(spec) = intent {
                 if !self.runs_commands {
                     return Err(ExecutionError::new(
@@ -368,10 +381,7 @@ impl ExecutionPort for LocalPort {
                     ));
                 }
                 ExecutionIntent::WriteFile { .. } | ExecutionIntent::DeleteFile { .. } => {
-                    return Err(ExecutionError::new(
-                        error_code::UNSUPPORTED,
-                        "this environment has no file operations",
-                    ));
+                    unreachable!("file changes prepare on their own")
                 }
                 ExecutionIntent::Open(open) => {
                     let mut input =
@@ -470,6 +480,9 @@ impl ExecutionPort for LocalPort {
     ) -> ExecutionOutcome {
         if let Err(error) = prepared.validate(self.identity, &self.authority, &admission) {
             return ExecutionOutcome::NotDispatched(error);
+        }
+        if prepared.facts().intent.file_path().is_some() {
+            return self.files.execute(&prepared, cancel).await;
         }
         let operation = prepared.operation();
         if let ExecutionIntent::RunCommand(spec) = &prepared.facts().intent {
@@ -604,6 +617,7 @@ pub(crate) async fn prepare_hosted_call(
             shell_output: ShellOutputDelivery::CallerFile,
             files: FileCapabilities::default(),
         },
+        files: LocalFiles::default(),
         tools: Some(tools),
         shells: None,
         prepared: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -645,6 +659,7 @@ fn shell_port(
             shell_output: ShellOutputDelivery::CallerFile,
             files: FileCapabilities::default(),
         },
+        files: LocalFiles::default(),
         tools: None,
         shells: Some(shells),
         prepared: Default::default(),

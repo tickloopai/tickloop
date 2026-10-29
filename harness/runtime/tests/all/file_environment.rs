@@ -137,11 +137,12 @@ async fn a_cancelled_write_held_after_dispatch_is_outcome_unknown_and_took_effec
 }
 
 #[tokio::test]
-async fn a_folder_environment_offers_no_files_yet() {
+async fn a_folder_environment_without_a_folder_offers_no_files() {
+    let directory = tempfile::tempdir().unwrap();
     let scope = ExecutionScope {
         chat: tickloop_ids::generate().into(),
-        folder: Some(MemoryFileHost::FOLDER_PATH.into()),
-        additional_directories: Vec::new(),
+        folder: None,
+        additional_directories: vec![directory.path().to_string_lossy().into_owned()],
     };
     let port = FolderEnvironment::bare()
         .bind(scope.clone(), ExecutionAuthority::new(scope.chat))
@@ -159,5 +160,5 @@ async fn a_folder_environment_offers_no_files_yet() {
         )))
         .await
         .unwrap_err();
-    assert_eq!(error.code, error_code::UNSUPPORTED);
+    assert_eq!(error.code, error_code::OUTSIDE_ROOT);
 }

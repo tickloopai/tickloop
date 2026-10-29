@@ -10,6 +10,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     io,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -304,21 +305,27 @@ pub fn glob_files<'a>(
         skipped_names: GLOB_SKIPPED_NAMES,
         skipped_directories: HashMap::new(),
     };
-    let mut found = walk
+    let found = walk
         .files()
         .into_iter()
         .map(|file| FoundFile {
             path: file.path.into(),
             modified: file.modified,
         })
-        .collect::<Vec<_>>();
+        .collect();
+    Ok(oldest_first(found, query.limit))
+}
+
+/// Files found in walk order as `rg --sort=modified` lists them: oldest first, the walk order
+/// breaking ties, at most `limit` of them.
+pub(crate) fn oldest_first(mut found: Vec<FoundFile>, limit: usize) -> GlobMatches {
     found.sort_by_key(|file| file.modified);
-    let truncated = found.len() > query.limit;
-    found.truncate(query.limit);
-    Ok(GlobMatches {
+    let truncated = found.len() > limit;
+    found.truncate(limit);
+    GlobMatches {
         files: found,
         truncated,
-    })
+    }
 }
 
 /// `rg` with the query's flags on `base`, a file or directory path below the root (empty for the
@@ -328,7 +335,7 @@ pub fn grep_files<'a>(
     base: &str,
     query: &GrepQuery,
 ) -> Result<GrepMatches, FileSearchError> {
-    let matcher = query.matcher()?;
+    let mut search = GrepSearch::new(query)?;
     let overrides = override_matcher(&virtual_path(base), &query.globs)?;
     let types = query.file_type.as_deref().map(file_types).transpose()?;
     let tree = FileTree::new(files);
@@ -351,107 +358,168 @@ pub fn grep_files<'a>(
             true,
         ),
     };
-    let mut searcher = query.searcher();
-    let mut content = ContentLines {
-        lines: Vec::new(),
-        ever_written: false,
-        output_bytes: 0,
-        separates_searches: query.has_context(),
-        is_multi_line: searcher.multi_line_with_matcher(&matcher),
-    };
-    let mut counts = Vec::new();
-    let mut matched_files = Vec::new();
-    let mut count_printer = SummaryBuilder::new()
-        .kind(SummaryKind::Count)
-        .build_no_color(Vec::new());
-    let mut count_bytes = 0;
     for (file, is_explicit) in searched {
-        if file.content.len() as u64 > MAX_SEARCH_FILE_BYTES {
-            if is_explicit {
-                return Err(FileSearchError::TooLarge(file.path.into()));
-            }
-            continue;
+        let found = search.search(
+            file.path,
+            file.content,
+            file.content.len() as u64,
+            file.modified,
+            is_explicit,
+            shows_paths,
+        )?;
+        if found.is_break() {
+            break;
         }
-        searcher.set_binary_detection(binary_detection(is_explicit));
-        let (entries, output_bytes) = match query.output_mode {
+    }
+    Ok(search.finish())
+}
+
+/// One `rg` run over files given one at a time in walk order: the matcher, searcher and printers
+/// it keeps across files, and what it found so far.
+pub(crate) struct GrepSearch<'q> {
+    query: &'q GrepQuery,
+    matcher: RegexMatcher,
+    searcher: Searcher,
+    content: ContentLines,
+    counts: Vec<FileMatchCount>,
+    count_bytes: usize,
+    matched_files: Vec<FoundFile>,
+}
+
+impl<'q> GrepSearch<'q> {
+    pub(crate) fn new(query: &'q GrepQuery) -> Result<Self, FileSearchError> {
+        let matcher = query.matcher()?;
+        let searcher = query.searcher();
+        let content = ContentLines {
+            lines: Vec::new(),
+            ever_written: false,
+            output_bytes: 0,
+            separates_searches: query.has_context(),
+            is_multi_line: searcher.multi_line_with_matcher(&matcher),
+        };
+        Ok(Self {
+            query,
+            matcher,
+            searcher,
+            content,
+            counts: Vec::new(),
+            count_bytes: 0,
+            matched_files: Vec::new(),
+        })
+    }
+
+    /// Searches the file at `path` below the root, `size` bytes that `content` reads; the search
+    /// named it when `is_explicit`, and its lines show their file when `shows_paths`. Breaks once
+    /// the page is complete or the output is full.
+    pub(crate) fn search(
+        &mut self,
+        path: &str,
+        content: impl io::Read,
+        size: u64,
+        modified: Option<SystemTime>,
+        is_explicit: bool,
+        shows_paths: bool,
+    ) -> Result<ControlFlow<()>, FileSearchError> {
+        if size > MAX_SEARCH_FILE_BYTES {
+            if is_explicit {
+                return Err(FileSearchError::TooLarge(path.into()));
+            }
+            return Ok(ControlFlow::Continue(()));
+        }
+        let content = content.take(MAX_SEARCH_FILE_BYTES);
+        let matcher = &self.matcher;
+        self.searcher
+            .set_binary_detection(binary_detection(is_explicit));
+        let (entries, output_bytes) = match self.query.output_mode {
             GrepOutputMode::FilesWithMatches => {
                 let mut printer = SummaryBuilder::new()
                     .kind(SummaryKind::PathWithMatch)
                     .build_no_color(io::sink());
-                let mut sink = printer.sink_with_path(&matcher, Path::new(file.path));
-                if searcher
-                    .search_reader(&matcher, file.content, &mut sink)
+                let mut sink = printer.sink_with_path(matcher, Path::new(path));
+                if self
+                    .searcher
+                    .search_reader(matcher, content, &mut sink)
                     .is_ok()
                     && sink.has_match()
                 {
-                    matched_files.push(FoundFile {
-                        path: file.path.into(),
-                        modified: file.modified,
+                    self.matched_files.push(FoundFile {
+                        path: path.into(),
+                        modified,
                     });
                 }
-                continue;
+                return Ok(ControlFlow::Continue(()));
             }
             GrepOutputMode::Content => {
                 let sink = ContentSink {
-                    output: &mut content,
-                    path: shows_paths.then_some(file.path),
+                    output: &mut self.content,
+                    path: shows_paths.then_some(path),
                     has_written: false,
                     has_match: false,
                     binary_offset: None,
                 };
-                let _ = searcher.search_reader(&matcher, file.content, sink);
-                (content.lines.len(), content.output_bytes)
+                let _ = self.searcher.search_reader(matcher, content, sink);
+                (self.content.lines.len(), self.content.output_bytes)
             }
             GrepOutputMode::Count => {
-                let sink = count_printer.sink_with_path(&matcher, Path::new(file.path));
-                let _ = searcher.search_reader(&matcher, file.content, sink);
-                let printed = count_printer.get_mut().get_mut();
-                count_bytes += printed.len();
+                let mut printer = SummaryBuilder::new()
+                    .kind(SummaryKind::Count)
+                    .build_no_color(Vec::new());
+                let sink = printer.sink_with_path(matcher, Path::new(path));
+                let _ = self.searcher.search_reader(matcher, content, sink);
+                let printed = printer.get_mut().get_ref();
+                self.count_bytes += printed.len();
                 if let Some(count) = String::from_utf8_lossy(printed)
                     .trim_end()
                     .rsplit_once(':')
                     .and_then(|(_, count)| count.parse().ok())
                 {
-                    counts.push(FileMatchCount {
-                        path: file.path.into(),
+                    self.counts.push(FileMatchCount {
+                        path: path.into(),
                         count,
                     });
                 }
-                printed.clear();
-                (counts.len(), count_bytes)
+                (self.counts.len(), self.count_bytes)
             }
         };
-        let has_page = query
+        let has_page = self
+            .query
             .entries_needed()
             .is_some_and(|needed| entries >= needed);
-        if has_page || output_bytes > MAX_SEARCH_OUTPUT_BYTES {
-            break;
+        Ok(if has_page || output_bytes > MAX_SEARCH_OUTPUT_BYTES {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub(crate) fn finish(self) -> GrepMatches {
+        let query = self.query;
+        let (output, applied_limit) = match query.output_mode {
+            GrepOutputMode::Content => {
+                let (lines, applied_limit) = apply_head_limit(self.content.lines, query);
+                (GrepOutput::Content(lines), applied_limit)
+            }
+            GrepOutputMode::Count => {
+                let (counts, applied_limit) = apply_head_limit(self.counts, query);
+                (GrepOutput::Counts(counts), applied_limit)
+            }
+            GrepOutputMode::FilesWithMatches => {
+                let mut matched_files = self.matched_files;
+                matched_files.sort_by(|left, right| {
+                    right
+                        .modified
+                        .cmp(&left.modified)
+                        .then_with(|| walk_order(&left.path, &right.path))
+                });
+                let (files, applied_limit) = apply_head_limit(matched_files, query);
+                (GrepOutput::Files(files), applied_limit)
+            }
+        };
+        GrepMatches {
+            output,
+            truncated: applied_limit.is_some(),
         }
     }
-    let (output, applied_limit) = match query.output_mode {
-        GrepOutputMode::Content => {
-            let (lines, applied_limit) = apply_head_limit(content.lines, query);
-            (GrepOutput::Content(lines), applied_limit)
-        }
-        GrepOutputMode::Count => {
-            let (counts, applied_limit) = apply_head_limit(counts, query);
-            (GrepOutput::Counts(counts), applied_limit)
-        }
-        GrepOutputMode::FilesWithMatches => {
-            matched_files.sort_by(|left, right| {
-                right
-                    .modified
-                    .cmp(&left.modified)
-                    .then_with(|| walk_order(&left.path, &right.path))
-            });
-            let (files, applied_limit) = apply_head_limit(matched_files, query);
-            (GrepOutput::Files(files), applied_limit)
-        }
-    };
-    Ok(GrepMatches {
-        output,
-        truncated: applied_limit.is_some(),
-    })
 }
 
 /// The text the `Glob` tool returns for these matches; `display` shows a path below the root.

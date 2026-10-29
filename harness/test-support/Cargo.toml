@@ -27,6 +27,8 @@ tickloop-harness-runtime = { path = "../runtime", features = ["test-support"] }
 tickloop-harness-tools = { path = "../tools" }
 tickloop-harness-transcript = { path = "../transcript" }
 tickloop-ids = { path = "../../tick/ids" }
+# The local file contract host keeps its Folder in a temporary directory.
+tempfile = "3"
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 # ExternalIoGuard pauses and resumes the clock of the tests that use it.
 tokio = { version = "1", features = ["full", "test-util"] }

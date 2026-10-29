@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
 use super::{
-    FileOutcome, Operation, ToolDefinition, ToolError, format_file_size, io_error, open_existing,
+    FileOutcome, Operation, ToolDefinition, ToolError, format_file_size, io_error, open_for_read,
     shell::BASH_TOOL_NAME,
 };
 use tickloop_harness_base::image;
@@ -153,17 +153,7 @@ pub(super) fn execute(
     request: &ReadRequest,
     accepts_images: bool,
 ) -> Result<FileOutcome, ToolError> {
-    let mut file = open_existing(path, false)?;
-    let metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if metadata.is_dir() {
-        return Err(ToolError::Rejected(format!(
-            "EISDIR: illegal operation on a directory, read '{}'",
-            path.display()
-        )));
-    }
-    if !metadata.is_file() {
-        return Err(ToolError::UnsupportedType(path.into()));
-    }
+    let (mut file, metadata) = open_for_read(path)?;
     let mut signature = Vec::new();
     (&mut file)
         .take(IMAGE_SIGNATURE_BYTES)

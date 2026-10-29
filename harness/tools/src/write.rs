@@ -2,16 +2,7 @@
 //! `FileEditTool/utils.ts`): read-before-write validation against the Chat's read state, a file
 //! review prepared before approval, and a publication that refuses files changed after approval.
 
-use std::{
-    ffi::CString,
-    fs::{File, Metadata},
-    io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
-    path::Path,
-};
+use std::{fs::Metadata, io::Read, path::Path};
 
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
@@ -20,14 +11,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     FileReadRecordExt,
     file_change::{FileChangeReview, build_file_change_review},
+    local_files,
 };
 
 use super::{
     FileReadState, Operation, READ_TOOL_NAME, ToolDefinition, ToolError, io_error, open_existing,
     read::recorded_text,
-};
-use tickloop_harness_base::private_fs::{
-    OpenTarget, PRIVATE_FILE_MODE, open_without_following_links,
 };
 use tickloop_harness_protocol::{FileChangeAction, FileIdentity, FileReadRecord, ToolResult};
 
@@ -35,10 +24,6 @@ pub const WRITE_TOOL_NAME: &str = "Write";
 pub const EDIT_TOOL_NAME: &str = "Edit";
 
 const MAX_WRITE_BYTES: usize = 8 * 1024 * 1024;
-/// Permission bits kept when overwriting an existing file; new files get private file permissions.
-const PRESERVED_PERMISSION_BITS: u32 = 0o777;
-/// Parent directories created for a new file get the conventional mode, narrowed by the umask.
-const NEW_DIRECTORY_MODE: u32 = 0o777;
 /// Claude Code decides a file's line endings from its first 4096 characters.
 const LINE_ENDING_SAMPLE_CHARS: usize = 4096;
 
@@ -502,12 +487,9 @@ pub(super) fn take_review(operation: &mut PreparedWrite) -> Box<FileChangeReview
         .expect("bound write operation must contain a file change review")
 }
 
-/// Writes a temporary file in the target directory first, then publishes it atomically: a hard link
-/// for a new file, a rename for an existing one. File identity is checked before and after; if the
-/// file was changed externally after approval, the write fails with a conflict.
-///
-/// A new file also gets its missing parent directories. On success the written content is
-/// returned as a full read, so later changes need no new `Read`.
+/// Publishes the bound content through [`local_files::write_file`], which refuses a file changed
+/// externally after approval with a conflict and creates a new file's missing parent directories.
+/// On success the written content is returned as a full read, so later changes need no new `Read`.
 pub(super) fn execute(
     path: &Path,
     operation: PreparedWrite,
@@ -517,123 +499,24 @@ pub(super) fn execute(
     let text = operation.content.as_deref().ok_or_else(|| {
         ToolError::InvalidInput("write was not bound to its target; use Tools::prepare".into())
     })?;
-    let content = text.as_bytes();
-    let parent = path
-        .parent()
-        .ok_or_else(|| ToolError::InvalidInput("path has no parent".into()))?;
-    let directory = if operation.expected.is_none() {
-        open_without_following_links(
-            parent,
-            OpenTarget::Directory {
-                create_mode: Some(NEW_DIRECTORY_MODE),
-            },
-        )
-        .map_err(|error| io_error(parent, error))?
-    } else {
-        open_existing(parent, true)?
-    };
-    let name = CString::new(path.file_name().unwrap().as_bytes())
-        .map_err(|_| ToolError::InvalidInput("path contains NUL".into()))?;
-    let current = read_current(directory.as_raw_fd(), &name, path)?;
-    if current
-        .as_ref()
-        .map(|(_, metadata)| FileIdentity::from_metadata(metadata))
-        != operation.expected
-    {
-        return Err(ToolError::Conflict(path.into()));
-    }
-    let mode = current
-        .as_ref()
-        .map(|(_, metadata)| metadata.mode() & PRESERVED_PERMISSION_BITS)
-        .unwrap_or(PRIVATE_FILE_MODE);
-    let temporary = CString::new(format!(".tickloop-write-{operation_id}")).unwrap();
-    // SAFETY: The directory descriptor is valid and the temporary file name is NUL-terminated; with
-    // O_CREAT the mode argument is passed as required.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            temporary.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            PRIVATE_FILE_MODE as libc::c_uint,
-        )
-    };
-    if descriptor < 0 {
-        return Err(io_error(path, std::io::Error::last_os_error()));
-    }
-    // SAFETY: The descriptor returned by a successful openat is not held by anything else;
-    // ownership passes to `File`.
-    let mut file = unsafe { File::from_raw_fd(descriptor) };
-    let result = (|| {
-        file.write_all(content)
-            .map_err(|error| io_error(path, error))?;
-        // SAFETY: The descriptor is valid while `file` is alive.
-        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
-            return Err(io_error(path, std::io::Error::last_os_error()));
-        }
-        file.sync_all().map_err(|error| io_error(path, error))?;
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        let current = read_current(directory.as_raw_fd(), &name, path)?;
-        if current
-            .as_ref()
-            .map(|(_, metadata)| FileIdentity::from_metadata(metadata))
-            != operation.expected
-        {
-            return Err(ToolError::Conflict(path.into()));
-        }
-        #[cfg(test)]
-        fail_at(WriteFailurePoint::BeforePublish, path)?;
-        let published = if operation.expected.is_none() {
-            // A new target must not replace a file that appeared only after approval: the hard link
-            // fails when the target already exists.
-            // SAFETY: Both names are NUL-terminated and under the same valid directory descriptor;
-            // with flags 0 symlinks are not followed.
-            unsafe {
-                libc::linkat(
-                    directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            }
-        } else {
-            // SAFETY: Both names are NUL-terminated and under the same valid directory descriptor.
-            unsafe {
-                libc::renameat(
-                    directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                )
-            }
-        };
-        if published != 0 {
-            return Err(io_error(path, std::io::Error::last_os_error()));
-        }
-        directory
-            .sync_all()
-            .map_err(|error| io_error(parent, error))?;
-        // The staged descriptor is the published file, so its time is ours even if the name is
-        // replaced again right away.
-        let modified = file
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .map_err(|error| io_error(path, error))?;
-        Ok((
-            ToolResult {
-                content: success_message(operation.tool, path, operation.expected.is_none()),
-                is_error: false,
-                output_ref: None,
-            },
-            FileReadRecord::whole_file(text, modified),
-        ))
-    })();
-    // SAFETY: The directory descriptor is valid and the temporary file name is NUL-terminated;
-    // after a successful publish, what is removed is the leftover temporary name.
-    unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
-    result
+    let published = local_files::write_file(
+        path,
+        text.as_bytes(),
+        operation.expected.as_ref(),
+        operation_id,
+        cancel,
+    )?;
+    let modified = published
+        .modified()
+        .map_err(|error| io_error(path, error))?;
+    Ok((
+        ToolResult {
+            content: success_message(operation.tool, path, operation.expected.is_none()),
+            is_error: false,
+            output_ref: None,
+        },
+        FileReadRecord::whole_file(text, modified),
+    ))
 }
 
 /// Claude Code's success texts (`mapToolResultToToolResultBlockParam` of `FileWriteTool` and
@@ -648,29 +531,6 @@ fn success_message(tool: FileChangeTool, path: &Path, is_new_file: bool) -> Stri
         FileChangeTool::Write | FileChangeTool::Edit { replace_all: false } => {
             format!("The file {path} has been updated successfully.")
         }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq)]
-enum WriteFailurePoint {
-    BeforePublish,
-}
-
-#[cfg(test)]
-thread_local! {
-    static WRITE_FAILURE: std::cell::Cell<Option<WriteFailurePoint>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn fail_at(point: WriteFailurePoint, path: &Path) -> Result<(), ToolError> {
-    if WRITE_FAILURE.with(|failure| failure.get()) == Some(point) {
-        Err(io_error(
-            path,
-            std::io::Error::other("injected publication failure"),
-        ))
-    } else {
-        Ok(())
     }
 }
 
@@ -705,37 +565,6 @@ fn read_for_review(path: &Path) -> Result<Option<(String, Metadata)>, ToolError>
     Ok(Some((content, before_metadata)))
 }
 
-fn read_current(
-    directory: libc::c_int,
-    name: &CString,
-    path: &Path,
-) -> Result<Option<(File, Metadata)>, ToolError> {
-    // SAFETY: The caller guarantees the directory descriptor is valid and the name is
-    // NUL-terminated.
-    let descriptor = unsafe {
-        libc::openat(
-            directory,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if descriptor < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(io_error(path, error));
-    }
-    // SAFETY: The descriptor returned by a successful openat is not held by anything else;
-    // ownership passes to `File`.
-    let file = unsafe { File::from_raw_fd(descriptor) };
-    let metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if !metadata.is_file() {
-        return Err(ToolError::UnsupportedType(path.into()));
-    }
-    Ok(Some((file, metadata)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,14 +596,14 @@ mod tests {
         let target = directory.path().canonicalize().unwrap().join("target");
         fs::write(&target, "old").unwrap();
         let operation = prepared(&target, "new");
-        WRITE_FAILURE.with(|point| point.set(Some(WriteFailurePoint::BeforePublish)));
+        local_files::FAIL_BEFORE_PUBLISH.with(|failure| failure.set(true));
         let result = execute(
             &target,
             operation,
             uuid::Uuid::new_v4(),
             &CancellationToken::new(),
         );
-        WRITE_FAILURE.with(|point| point.set(None));
+        local_files::FAIL_BEFORE_PUBLISH.with(|failure| failure.set(false));
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);

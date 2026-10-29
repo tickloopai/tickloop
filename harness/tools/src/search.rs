@@ -2,15 +2,9 @@
 //! ripgrep's own libraries: `ignore` walks the tree the way `rg --files` does, and
 //! `grep-searcher` with `grep-printer` produce the lines `rg` would print.
 
-use std::{
-    ffi::OsStr,
-    io::Read,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::path::{Path, PathBuf};
 
-use grep_printer::{StandardBuilder, SummaryBuilder, SummaryKind};
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::overrides::OverrideBuilder;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -18,12 +12,11 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Operation, READ_TOOL_NAME, ToolDefinition, ToolError,
     file_search::{
-        CONTEXT_SEPARATOR, FileSearchError, GLOB_RESULT_LIMIT, GLOB_SKIPPED_NAMES,
-        GREP_SKIPPED_NAMES, GrepOutputMode, GrepQuery, MAX_COLUMNS, MAX_SEARCH_FILE_BYTES,
-        MAX_SEARCH_OUTPUT_BYTES, RIPGREP_IGNORE_FILE, apply_head_limit, binary_detection,
-        content_text, count_text, file_types, files_text, glob_listing, override_matcher,
+        FileSearchError, GLOB_RESULT_LIMIT, GlobQuery, GrepOutputMode, GrepQuery, file_types,
+        glob_text, grep_text, override_matcher,
     },
-    io_error, is_sensitive_path, open_existing,
+    io_error,
+    local_files::{self, LocalFileError},
     read::semantic_integer,
     shell::BASH_TOOL_NAME,
     write::{FILE_NOT_FOUND_CWD_NOTE, semantic_boolean},
@@ -34,6 +27,7 @@ pub const GLOB_TOOL_NAME: &str = "Glob";
 pub const GREP_TOOL_NAME: &str = "Grep";
 
 const CURRENT_DIRECTORY: &str = ".";
+const FILESYSTEM_ROOT: &str = "/";
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -400,210 +394,44 @@ fn display_path(path: &Path, workdir: &Path) -> PathBuf {
     path.strip_prefix(workdir).unwrap_or(path).to_path_buf()
 }
 
+/// Runs the search on this machine through [`local_files`], with found paths below the filesystem
+/// root, and prints them the way Claude Code does.
 pub(super) fn execute(
     root: &Path,
     request: &SearchRequest,
     cancel: &CancellationToken,
 ) -> Result<ToolResult, ToolError> {
+    let filesystem_root = Path::new(FILESYSTEM_ROOT);
+    let display = |below: &str| {
+        display_path(&filesystem_root.join(below), &request.display_base)
+            .to_string_lossy()
+            .into_owned()
+    };
     let content = match &request.kind {
-        SearchKind::Glob { pattern } => list_files(root, pattern, &request.display_base, cancel)?,
-        SearchKind::Grep(grep) => search_contents(root, grep, &request.display_base, cancel)?,
+        SearchKind::Glob { pattern } => {
+            let query = GlobQuery {
+                pattern: pattern.clone(),
+                limit: GLOB_RESULT_LIMIT,
+            };
+            let matches = local_files::glob(filesystem_root, root, &query, cancel)?;
+            glob_text(&matches, display)
+        }
+        SearchKind::Grep(query) => {
+            let matches = local_files::grep(filesystem_root, root, query, cancel).map_err(
+                |error| match error {
+                    LocalFileError::TooLarge(path) => ToolError::Rejected(format!(
+                        "{} is larger than 8 MiB, so {GREP_TOOL_NAME} does not search it. Use {READ_TOOL_NAME} with offset and limit to page through it.",
+                        path.display()
+                    )),
+                    other => other.into(),
+                },
+            )?;
+            grep_text(&matches, query, display)
+        }
     };
     Ok(ToolResult {
         content,
         is_error: false,
         output_ref: None,
     })
-}
-
-/// A walk that never follows symbolic links and prunes skipped names and sensitive paths below
-/// the root; `respect_ignore_files` chooses between `rg` and `rg --no-ignore`, both `--hidden`.
-fn walker(
-    root: &Path,
-    skipped_names: &'static [&'static str],
-    respect_ignore_files: bool,
-) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .standard_filters(respect_ignore_files)
-        .hidden(false)
-        .follow_links(false)
-        .sort_by_file_name(OsStr::cmp)
-        .filter_entry(move |entry| {
-            let name = entry.file_name();
-            !skipped_names.iter().any(|skipped| name == *skipped)
-                && !is_sensitive_path(Path::new(name))
-        });
-    if respect_ignore_files {
-        builder.add_custom_ignore_filename(RIPGREP_IGNORE_FILE);
-    }
-    builder
-}
-
-/// `rg --files --glob <pattern> --sort=modified --no-ignore --hidden`: oldest first, the first
-/// hundred.
-fn list_files(
-    root: &Path,
-    pattern: &str,
-    workdir: &Path,
-    cancel: &CancellationToken,
-) -> Result<String, ToolError> {
-    let mut walk = walker(root, GLOB_SKIPPED_NAMES, false);
-    walk.overrides(override_matcher(root, [pattern]).map_err(invalid_input)?);
-    let mut files = Vec::new();
-    for entry in walk.build() {
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        let Ok(entry) = entry else { continue };
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            let modified = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok());
-            files.push((modified, entry.into_path()));
-        }
-    }
-    files.sort_by_key(|(modified, _)| *modified);
-    let paths = files
-        .iter()
-        .take(GLOB_RESULT_LIMIT)
-        .map(|(_, path)| display_path(path, workdir).to_string_lossy().into_owned())
-        .collect();
-    Ok(glob_listing(paths, files.len() > GLOB_RESULT_LIMIT))
-}
-
-fn search_contents(
-    root: &Path,
-    request: &GrepQuery,
-    workdir: &Path,
-    cancel: &CancellationToken,
-) -> Result<String, ToolError> {
-    let matcher = request.matcher().map_err(invalid_input)?;
-    let mut searcher = request.searcher();
-    let mut walk = walker(root, GREP_SKIPPED_NAMES, true);
-    walk.overrides(override_matcher(root, &request.globs).map_err(invalid_input)?);
-    if let Some(file_type) = &request.file_type {
-        walk.types(file_types(file_type).map_err(invalid_input)?);
-    }
-    let root_is_directory = std::fs::metadata(root)
-        .map_err(|error| io_error(root, error))?
-        .is_dir();
-    let mut content_printer = StandardBuilder::new()
-        .path(root_is_directory)
-        .max_columns(Some(MAX_COLUMNS))
-        .separator_search(
-            request
-                .has_context()
-                .then(|| CONTEXT_SEPARATOR.as_bytes().to_vec()),
-        )
-        .build_no_color(Vec::new());
-    let mut count_printer = SummaryBuilder::new()
-        .kind(SummaryKind::Count)
-        .build_no_color(Vec::new());
-    let mut lines = Vec::new();
-    let mut output_bytes = 0;
-    let mut matched_files = Vec::new();
-    for entry in walk.build() {
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        let Ok(entry) = entry else { continue };
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-        let is_explicit = entry.depth() == 0;
-        let path = entry.path();
-        let Ok(file) = open_existing(path, false) else {
-            continue;
-        };
-        let Ok(metadata) = file.metadata() else {
-            continue;
-        };
-        if metadata.len() > MAX_SEARCH_FILE_BYTES {
-            if is_explicit {
-                return Err(ToolError::Rejected(format!(
-                    "{} is larger than 8 MiB, so {GREP_TOOL_NAME} does not search it. Use {READ_TOOL_NAME} with offset and limit to page through it.",
-                    path.display()
-                )));
-            }
-            continue;
-        }
-        searcher.set_binary_detection(binary_detection(is_explicit));
-        let reader = file.take(MAX_SEARCH_FILE_BYTES);
-        let shown_path = display_path(path, workdir);
-        let printed = match request.output_mode {
-            GrepOutputMode::FilesWithMatches => {
-                let mut printer = SummaryBuilder::new()
-                    .kind(SummaryKind::PathWithMatch)
-                    .build_no_color(std::io::sink());
-                let mut sink = printer.sink_with_path(&matcher, path);
-                if searcher.search_reader(&matcher, reader, &mut sink).is_ok() && sink.has_match() {
-                    matched_files.push((metadata.modified().ok(), path.to_path_buf()));
-                }
-                continue;
-            }
-            GrepOutputMode::Content => {
-                let sink = content_printer.sink_with_path(&matcher, &shown_path);
-                let _ = searcher.search_reader(&matcher, reader, sink);
-                content_printer.get_mut().get_mut()
-            }
-            GrepOutputMode::Count => {
-                let sink = count_printer.sink_with_path(&matcher, &shown_path);
-                let _ = searcher.search_reader(&matcher, reader, sink);
-                count_printer.get_mut().get_mut()
-            }
-        };
-        output_bytes += printed.len();
-        lines.extend(
-            String::from_utf8_lossy(printed)
-                .split('\n')
-                .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                .filter(|line| !line.is_empty())
-                .map(String::from),
-        );
-        printed.clear();
-        let has_page = request
-            .entries_needed()
-            .is_some_and(|needed| lines.len() >= needed);
-        if has_page || output_bytes > MAX_SEARCH_OUTPUT_BYTES {
-            break;
-        }
-    }
-    Ok(match request.output_mode {
-        GrepOutputMode::Content => {
-            let (lines, applied_limit) = apply_head_limit(lines, request);
-            content_text(lines, applied_limit, request.offset)
-        }
-        GrepOutputMode::Count => {
-            let (lines, applied_limit) = apply_head_limit(lines, request);
-            count_text(lines, applied_limit, request.offset)
-        }
-        GrepOutputMode::FilesWithMatches => files_result(matched_files, request, workdir),
-    })
-}
-
-/// Newest first like Claude Code, with the path breaking ties.
-fn files_result(
-    mut matched_files: Vec<(Option<SystemTime>, PathBuf)>,
-    request: &GrepQuery,
-    workdir: &Path,
-) -> String {
-    matched_files.sort_by(|(left_time, left_path), (right_time, right_path)| {
-        right_time
-            .cmp(left_time)
-            .then_with(|| left_path.cmp(right_path))
-    });
-    let (matched_files, applied_limit) = apply_head_limit(matched_files, request);
-    let paths = matched_files
-        .iter()
-        .map(|(_, path)| display_path(path, workdir).to_string_lossy().into_owned())
-        .collect();
-    files_text(paths, applied_limit, request.offset)
 }

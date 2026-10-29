@@ -6,12 +6,14 @@ use crate::host_tools::{HostCallResult, HostEffect, PreparedHostCall};
 use tokio_util::sync::CancellationToken;
 
 mod files;
+mod local;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 mod port;
 pub mod shell_host;
 pub mod tools;
 pub use files::*;
+pub use local::LocalFiles;
 pub use port::*;
 pub use tools::ExecutionTools;
 
@@ -85,7 +87,8 @@ impl EnvironmentPreparedCall {
     }
 }
 
-/// A Folder without Tick, Shell or file execution capabilities.
+/// A Folder and its Additional Directories on this machine, without Ticks or Shells: the Port
+/// offers only their files, through [`LocalFiles`].
 pub struct FolderEnvironment;
 impl FolderEnvironment {
     pub fn bare() -> Self {
@@ -99,56 +102,96 @@ impl ExecutionEnvironment for FolderEnvironment {
         authority: ExecutionAuthority,
     ) -> Result<Arc<dyn ExecutionPort>, ExecutionError> {
         authority.check(scope.chat)?;
-        Ok(Arc::new(FolderPort { scope, authority }))
+        Ok(Arc::new(FolderPort {
+            identity: tickloop_ids::generate(),
+            files: LocalFiles::for_scope(&scope),
+            scope,
+            authority,
+        }))
     }
 }
 struct FolderPort {
+    identity: uuid::Uuid,
     scope: ExecutionScope,
     authority: ExecutionAuthority,
+    files: LocalFiles,
 }
 #[async_trait::async_trait]
 impl ExecutionPort for FolderPort {
     async fn inspect(&self, query: ExecutionQuery) -> Result<ExecutionInspection, ExecutionError> {
         self.authority.check(self.scope.chat)?;
-        match query {
-            ExecutionQuery::Capabilities => {
-                Ok(ExecutionInspection::Capabilities(ExecutionCapabilities {
-                    ticks: false,
-                    shells: false,
-                    shell_output: ShellOutputDelivery::CallerFile,
-                    files: FileCapabilities::default(),
-                }))
+        let inspection = async {
+            match query {
+                ExecutionQuery::Capabilities => {
+                    Ok(ExecutionInspection::Capabilities(ExecutionCapabilities {
+                        ticks: false,
+                        shells: false,
+                        shell_output: ShellOutputDelivery::CallerFile,
+                        files: self.files.capabilities().clone(),
+                    }))
+                }
+                ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(Vec::new())),
+                ExecutionQuery::File(query) => {
+                    let inspection = self.files.inspect(query).await?;
+                    self.authority.check(self.scope.chat)?;
+                    Ok(ExecutionInspection::File(inspection))
+                }
+                _ => Err(ExecutionError::new(
+                    error_code::UNSUPPORTED,
+                    "this environment has no execution host",
+                )),
             }
-            ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(Vec::new())),
-            _ => Err(ExecutionError::new(
-                "Unsupported",
-                "this environment has no execution host",
-            )),
+        };
+        tokio::select! {
+            biased;
+            _ = self.authority.revoked() => Err(revoked()),
+            result = inspection => result,
         }
     }
-    async fn prepare(&self, _: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
+    async fn prepare(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
         self.authority.check(self.scope.chat)?;
-        Err(ExecutionError::new(
-            "Unsupported",
-            "this environment has no execution host",
-        ))
+        if intent.file_path().is_none() {
+            return Err(ExecutionError::new(
+                error_code::UNSUPPORTED,
+                "this environment has no execution host",
+            ));
+        }
+        let prepared = self
+            .files
+            .prepare(intent, self.identity, &self.authority)
+            .await?;
+        self.authority.check(self.scope.chat)?;
+        Ok(prepared)
     }
     async fn execute(
         &self,
-        _: PreparedExecution,
-        _: ExecutionAdmission,
-        _: CancellationToken,
+        prepared: PreparedExecution,
+        admission: ExecutionAdmission,
+        cancel: CancellationToken,
     ) -> ExecutionOutcome {
-        ExecutionOutcome::NotDispatched(ExecutionError::new(
-            "Unsupported",
-            "this environment has no execution host",
-        ))
+        if let Err(error) = prepared.validate(self.identity, &self.authority, &admission) {
+            return ExecutionOutcome::NotDispatched(error);
+        }
+        if prepared.facts().intent.file_path().is_none() {
+            return ExecutionOutcome::NotDispatched(ExecutionError::new(
+                error_code::UNSUPPORTED,
+                "this environment has no execution host",
+            ));
+        }
+        self.files.execute(&prepared, cancel).await
     }
     async fn observe(&self, _: ObserveRequest) -> Result<ExecutionObservation, ExecutionError> {
         self.authority.check(self.scope.chat)?;
         Err(ExecutionError::new(
-            "Unsupported",
+            error_code::UNSUPPORTED,
             "this environment has no execution host",
         ))
     }
+}
+
+fn revoked() -> ExecutionError {
+    ExecutionError::new(
+        error_code::AUTHORITY_REVOKED,
+        "execution authority is no longer valid",
+    )
 }

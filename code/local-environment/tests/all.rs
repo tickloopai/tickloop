@@ -1,5 +1,7 @@
 #[path = "all/execution_environment.rs"]
 mod execution_environment;
+#[path = "all/file_environment.rs"]
+mod file_environment;
 #[path = "all/one_shot_commands.rs"]
 mod one_shot_commands;
 #[path = "all/skills.rs"]

@@ -3,7 +3,12 @@
 //! with chosen modification times, lose a reply, hold a read) comes from a [`FileContractHost`].
 
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -88,6 +93,157 @@ impl FileContractHost for MemoryFileHost {
     fn hold_reads(&self, _: &str) -> Box<dyn FnOnce() + Send> {
         let release = self.memory.hold_file_reads();
         Box::new(move || release.cancel())
+    }
+}
+
+/// A fresh temporary directory on this machine as the Folder of an environment that works on local
+/// files, such as Code's Local Environment or [`FolderEnvironment`]. A lost reply and a held read
+/// come from a wrapper around that environment's Ports.
+pub struct LocalFileHost {
+    environment: FaultyEnvironment,
+    folder: tempfile::TempDir,
+    scope: ExecutionScope,
+}
+
+impl LocalFileHost {
+    pub fn new(environment: Arc<dyn ExecutionEnvironment>) -> Self {
+        let folder = tempfile::tempdir().expect("a temporary Folder");
+        let scope = ExecutionScope {
+            chat: tickloop_ids::generate().into(),
+            folder: Some(folder.path().to_string_lossy().into_owned()),
+            additional_directories: Vec::new(),
+        };
+        Self {
+            environment: FaultyEnvironment {
+                inner: environment,
+                faults: Arc::default(),
+            },
+            folder,
+            scope,
+        }
+    }
+
+    /// The Folder as the scope names it, which need not be its real path.
+    pub fn folder(&self) -> &Path {
+        self.folder.path()
+    }
+}
+
+impl FileContractHost for LocalFileHost {
+    fn environment(&self) -> &dyn ExecutionEnvironment {
+        &self.environment
+    }
+
+    fn scope(&self) -> ExecutionScope {
+        self.scope.clone()
+    }
+
+    fn put_file(&self, path: &str, content: &[u8], modified: SystemTime) {
+        let path = self.folder.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a file below the Folder"))
+            .expect("the file's directories");
+        std::fs::write(&path, content).expect("the file");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(modified))
+            .expect("the file's modification time");
+    }
+
+    fn lose_next_reply(&self) {
+        self.environment
+            .faults
+            .lose_next_reply
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn hold_reads(&self, path: &str) -> Box<dyn FnOnce() + Send> {
+        let release = CancellationToken::new();
+        self.environment
+            .faults
+            .held_reads
+            .lock()
+            .unwrap()
+            .insert(path.into(), release.clone());
+        Box::new(move || release.cancel())
+    }
+}
+
+#[derive(Default)]
+struct Faults {
+    lose_next_reply: AtomicBool,
+    held_reads: Mutex<HashMap<String, CancellationToken>>,
+}
+
+/// Binds Ports that pass everything on to the wrapped environment's, except the faults asked for.
+struct FaultyEnvironment {
+    inner: Arc<dyn ExecutionEnvironment>,
+    faults: Arc<Faults>,
+}
+
+impl ExecutionEnvironment for FaultyEnvironment {
+    fn bind(
+        &self,
+        scope: ExecutionScope,
+        authority: ExecutionAuthority,
+    ) -> Result<Arc<dyn ExecutionPort>, ExecutionError> {
+        Ok(Arc::new(FaultyPort {
+            inner: self.inner.bind(scope, authority)?,
+            faults: self.faults.clone(),
+        }))
+    }
+}
+
+struct FaultyPort {
+    inner: Arc<dyn ExecutionPort>,
+    faults: Arc<Faults>,
+}
+
+#[async_trait::async_trait]
+impl ExecutionPort for FaultyPort {
+    async fn inspect(&self, query: ExecutionQuery) -> Result<ExecutionInspection, ExecutionError> {
+        if let ExecutionQuery::File(FileQuery::Read { path, .. }) = &query {
+            let held = self
+                .faults
+                .held_reads
+                .lock()
+                .unwrap()
+                .get(path.path())
+                .cloned();
+            if let Some(release) = held {
+                release.cancelled().await;
+            }
+        }
+        self.inner.inspect(query).await
+    }
+
+    async fn prepare(&self, intent: ExecutionIntent) -> Result<PreparedExecution, ExecutionError> {
+        self.inner.prepare(intent).await
+    }
+
+    async fn execute(
+        &self,
+        prepared: PreparedExecution,
+        admission: ExecutionAdmission,
+        cancel: CancellationToken,
+    ) -> ExecutionOutcome {
+        let operation = prepared.operation();
+        let is_file_change = prepared.facts().intent.file_path().is_some();
+        let outcome = self.inner.execute(prepared, admission, cancel).await;
+        if is_file_change && self.faults.lose_next_reply.swap(false, Ordering::SeqCst) {
+            return ExecutionOutcome::OutcomeUnknown {
+                operation,
+                reason: "the reply was lost".into(),
+            };
+        }
+        outcome
+    }
+
+    async fn observe(
+        &self,
+        request: ObserveRequest,
+    ) -> Result<ExecutionObservation, ExecutionError> {
+        self.inner.observe(request).await
     }
 }
 

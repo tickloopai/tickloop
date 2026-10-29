@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
+use crate::local_files::LocalFileError;
 use tickloop_harness_base::git_worktree::sibling_linked_worktrees;
 use tickloop_harness_base::image::ImageError;
 use tickloop_harness_base::network::Reach;
@@ -22,6 +23,7 @@ use tickloop_harness_protocol::{
 
 pub mod file_change;
 pub mod file_search;
+pub mod local_files;
 pub mod permissions;
 mod persisted_output;
 pub use persisted_output::{
@@ -609,6 +611,27 @@ pub enum ToolError {
     Cancelled,
     #[error(transparent)]
     FileChange(#[from] FileChangeArtifactError),
+}
+
+impl From<LocalFileError> for ToolError {
+    fn from(error: LocalFileError) -> Self {
+        match error {
+            LocalFileError::NotFound(path) => Self::NotFound(path),
+            LocalFileError::OutsideRoot(path) => Self::PathChanged(path),
+            LocalFileError::IsDirectory(path) | LocalFileError::NotRegular(path) => {
+                Self::UnsupportedType(path)
+            }
+            LocalFileError::Conflict(path) => Self::Conflict(path),
+            LocalFileError::InvalidInput(message) => Self::InvalidInput(message),
+            LocalFileError::Cancelled => Self::Cancelled,
+            LocalFileError::Io { path, error } | LocalFileError::Unsettled { path, error } => {
+                io_error(&path, error)
+            }
+            error @ (LocalFileError::NotADirectory(_) | LocalFileError::TooLarge(_)) => {
+                Self::Rejected(error.to_string())
+            }
+        }
+    }
 }
 
 /// The local directories of one Chat with a Folder.
@@ -1446,18 +1469,19 @@ pub(crate) fn open_existing(path: &Path, directory: bool) -> Result<File, ToolEr
     open_without_following_links(path, target).map_err(|error| io_error(path, error))
 }
 
-fn read_whole_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
-    let file = open_existing(path, false)?;
-    let metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if metadata.is_dir() {
-        return Err(ToolError::Rejected(format!(
+/// Opens the regular file at `path` for `Read`, with Claude Code's answer for a directory.
+fn open_for_read(path: &Path) -> Result<(File, std::fs::Metadata), ToolError> {
+    local_files::open_file(path).map_err(|error| match error {
+        LocalFileError::IsDirectory(path) => ToolError::Rejected(format!(
             "EISDIR: illegal operation on a directory, read '{}'",
             path.display()
-        )));
-    }
-    if !metadata.is_file() {
-        return Err(ToolError::UnsupportedType(path.into()));
-    }
+        )),
+        other => other.into(),
+    })
+}
+
+fn read_whole_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
+    let (file, metadata) = open_for_read(path)?;
     let too_large = |size: usize| {
         ToolError::Rejected(format!(
             "File content ({}) exceeds maximum allowed size ({}).",
