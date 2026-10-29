@@ -158,6 +158,30 @@ Claude Code 2.1.302 has a linked-worktree Accept Edits fast path behind a flag t
 
 Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
 
+## Bash Deny and Ask rules
+
+Explicit Deny and Ask Permission Rules are decided before Auto's fast paths and the reviewer, and a
+reviewer can never clear them, so their Bash content matching fails closed
+(`harness/tools/src/permissions.rs`, the same function a hook's `if` uses). A compound command
+matches when any of its commands does, each also seen without leading variable assignments,
+reserved words such as `if` or `!`, wrappers (`env`, `command`, `exec`, `time`, `nohup`, `nice`,
+`timeout`, `stdbuf`, `sudo`, `xargs`, `builtin`, `noglob`) with their options, quotes around the
+program and the program's directory. A command whose commands cannot be told apart (a `$(…)` or
+backtick substitution, a subshell, process substitution or an unclosed quote) matches when the
+rule's command could start anywhere in it, quoted or not, or when a program named by an expansion
+or a substitution followed by the rule's arguments would match. Unlike a hook's `if`, such a command
+does not match unrelated rules, so `echo "$(date)"` or a commit message built with `$(cat <<'EOF' …)`
+still reaches the fast paths and the reviewer under `Bash(git push*)`. Claude Code 2.1.302 strips
+all leading assignments and its wrapper list for Deny and Ask and checks the commands its parser
+finds inside substitutions for Deny, but does not look past program paths, and outside its sandbox
+fast path asks about every such command; Tickloop's Deny and Ask see past paths too. Allow rules
+keep their conservative matching: every command of a compound must match as written, and a command
+whose commands cannot be told apart is allowed only by a rule naming it exactly or the whole tool. No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard
+deny, 82 total**, eight inapplicable native entries, and policy and built-in group version **10** are
+unchanged. `harness/runtime/tests/all/wrapped_command_rules.rs` covers the routing with the reference
+Execution Environment and a reviewer double, including ordinary commands that unrelated rules leave
+to the reviewer.
+
 ## Commands outside the sandbox
 
 Bash's per-call escape request uses ordinary command approval; it does not add a callback tool or grant a proxy domain.
