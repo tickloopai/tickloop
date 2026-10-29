@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use super::*;
-use tickloop_harness_protocol::{ChatStatus, chat_display_title, chat_has_work, chat_preview};
+use tickloop_harness_protocol::{
+    ChatStatus, chat_display_title, chat_has_pending_work, chat_has_work, chat_preview,
+};
 
 /// What an Agent row shows about a Chat.
 #[derive(Clone, Debug)]
@@ -13,6 +15,8 @@ pub struct ChatSummary {
     pub title: String,
     pub preview: Option<String>,
     pub has_work: bool,
+    /// Whether work is still coming while the Loop is idle; see `chat_has_pending_work`.
+    pub pending_work: bool,
     pub chat_loop: LoopSnapshot,
     pub user_shells: Vec<UserShellRecord>,
     pub waiting_permissions: usize,
@@ -43,6 +47,12 @@ impl Agent {
             title,
             has_work: chat_has_work(
                 snapshot,
+                &snapshot.user_shells,
+                snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
+            ),
+            pending_work: chat_has_pending_work(
+                snapshot,
+                &snapshot.commands,
                 &snapshot.user_shells,
                 snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
             ),

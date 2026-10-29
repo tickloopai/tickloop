@@ -280,14 +280,18 @@ async fn a_running_root_is_recorded_in_a_private_file_written_whole() {
 }
 
 #[tokio::test]
-async fn after_a_daemon_restart_the_root_is_listed_as_failed_and_nothing_runs() {
+async fn after_a_daemon_restart_a_finished_root_is_listed_as_completed_and_nothing_runs() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let folder = directory.path();
     let chat = saved_chat(&root, folder).await;
     let first = started_daemon(CountingWorkers::new(&root));
     let execution = load(&first, &root, folder, chat).await;
-    wait_for_record(&root, chat, "live").await;
+    let live = wait_for_record(&root, chat, "live").await;
+    assert_eq!(
+        live["pendingWork"], false,
+        "the Worker reports that its finished turn left nothing pending"
+    );
     drop(first);
 
     let workers = CountingWorkers::new(&root);
@@ -301,13 +305,14 @@ async fn after_a_daemon_restart_the_root_is_listed_as_failed_and_nothing_runs() 
     assert_eq!(row.record.store_root, root);
     assert_eq!(row.agent_id, execution.agent_id);
     assert_eq!(row.title, "Summarize the module");
-    assert_eq!(row.outcome, EndedOutcome::Failed);
-    assert_eq!(row.reason, EndReason::DaemonStopped);
+    // As Claude Code keeps a done job done: a turn that had finished is not a failure.
+    assert_eq!(row.outcome, EndedOutcome::Completed);
+    assert_eq!(row.reason, EndReason::Finished);
     assert!(row.resumable);
-    assert!(row.ended_at >= row.updated_at);
-    let record = wait_for_record(&root, chat, "failed").await;
-    assert!(record["endedAt"].as_u64().is_some());
-    assert_eq!(record["endReason"], "daemon_stopped");
+    assert_eq!(row.ended_at, row.updated_at);
+    let record = wait_for_record(&root, chat, "completed").await;
+    assert_eq!(record["endedAt"], record["updatedAt"]);
+    assert_eq!(record["endReason"], "finished");
     // Listing the ended Agent loads nothing and starts no Worker, so no model can run.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(workers.started.load(Ordering::SeqCst), 0);

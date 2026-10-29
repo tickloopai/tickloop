@@ -8391,7 +8391,8 @@ fn ended_agent_row(agent: &tickloop_code_access::EndedAgent) -> console::AgentRo
         EndReason::DaemonStopped => Some("ended when the daemon stopped"),
         EndReason::DaemonOff => Some("ended while the daemon was off"),
         EndReason::WorkerLost => Some("worker lost"),
-        EndReason::UserStopped => None,
+        EndReason::Finished if agent_state == AgentState::Failed => Some("run failed"),
+        EndReason::UserStopped | EndReason::Finished => None,
     };
     let status = [Some(agent_state.label()), reason]
         .into_iter()
@@ -9412,8 +9413,31 @@ mod tests {
                     14,
                     EndedOutcome::Failed,
                     EndReason::DaemonStopped,
-                    LoopState::WaitingPermission,
+                    LoopState::WaitingQuestion,
                     120,
+                ),
+                // A permission prompt is work: it ended with the daemon.
+                ended(
+                    15,
+                    EndedOutcome::Failed,
+                    EndReason::DaemonStopped,
+                    LoopState::WaitingPermission,
+                    115,
+                ),
+                // A finished turn stays finished, a failed one stays failed.
+                ended(
+                    16,
+                    EndedOutcome::Completed,
+                    EndReason::Finished,
+                    LoopState::Idle,
+                    95,
+                ),
+                ended(
+                    17,
+                    EndedOutcome::Failed,
+                    EndReason::Finished,
+                    LoopState::Failed,
+                    85,
                 ),
             ],
             waiting_permissions: 0,
@@ -9450,6 +9474,12 @@ mod tests {
                 ("live 1", NeedsInput, "Needs answer", G::NeedsInput),
                 ("live 2", Working, "Running", G::Working),
                 // Completed lists the newest end first, ended and running rows alike.
+                (
+                    "ended 15",
+                    Failed,
+                    "Failed · ended when the daemon stopped",
+                    G::Completed
+                ),
                 ("ended 13", Stopped, "Stopped", G::Completed),
                 (
                     "ended 11",
@@ -9457,6 +9487,8 @@ mod tests {
                     "Failed · ended when the daemon stopped",
                     G::Completed
                 ),
+                ("ended 16", Completed, "Completed", G::Completed),
+                ("ended 17", Failed, "Failed · run failed", G::Completed),
                 ("live 8", Idle, "Idle", G::Completed),
                 ("live 7", Idle, "Idle", G::Completed),
                 (
@@ -11207,6 +11239,7 @@ mod tests {
             title: "Lost child".into(),
             subagent: None,
             has_work: Some(true),
+            pending_work: None,
             updated_at: None,
             run_started_at: None,
             preview: None,

@@ -534,6 +534,7 @@
         "run_started_at": 1000,
         "title": "Counter check",
         "has_work": true,
+        "pending_work": false,
         "updated_at": 2000,
         "waiting_permissions": 1,
         "waiting_questions": 0,
@@ -1266,6 +1267,23 @@
         "outcome": "stopped",
         "reason": "daemon_off",
         "resumable": false
+      },
+      {
+        "record": {
+          "store_root": "/home/user/.tickloop",
+          "chat_id": "00000000-0000-0000-0000-000000000094"
+        },
+        "agent_id": "00000000-0000-0000-0000-000000000095",
+        "folder": "/work/project",
+        "title": "Greet the user",
+        "preview": "Hello",
+        "created_at": 30,
+        "updated_at": 40,
+        "ended_at": 40,
+        "last_state": "Idle",
+        "outcome": "completed",
+        "reason": "finished",
+        "resumable": true
       }
     ]
   }
