@@ -2136,6 +2136,60 @@ mod tests {
         assert_eq!(control.closes.load(Ordering::SeqCst), 1);
         agent.shutdown().await;
     }
+    /// Full Access and Allow rules answer ordinary tools without asking; a session MCP start
+    /// still waits for a person, and nothing launches or reaches the model before the answer.
+    #[tokio::test]
+    async fn full_access_and_allow_rules_still_require_human_startup_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, control) = provider(directory.path());
+        let model = Arc::new(ScriptedModel::new(vec![text("answered")]));
+        let agent = crate::Agent::new_embedded(config(), model.clone());
+        agent.install_host_tools(provider).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, tickloop_harness_protocol::ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        agent
+            .inner
+            .chats
+            .lock()
+            .await
+            .get_mut(&chat)
+            .unwrap()
+            .snapshot
+            .policy
+            .rules
+            .push(tickloop_harness_protocol::PermissionRule {
+                id: tickloop_ids::generate(),
+                decision: tickloop_harness_protocol::Decision::Allow,
+                tool: MCP_SERVER_START.into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            });
+        let receipt = agent
+            .submit(chat, "Use the MCP fixture".into())
+            .await
+            .unwrap();
+        let request = permission(&agent, chat).await;
+        assert_eq!(request.name, MCP_SERVER_START);
+        assert_eq!(
+            request.approval_source,
+            tickloop_harness_protocol::PermissionApprovalSource::ExplicitAsk
+        );
+        assert_eq!(control.starts.load(Ordering::SeqCst), 0);
+        assert!(model.requests.lock().unwrap().is_empty());
+        agent
+            .answer_permission(chat, request.id, true)
+            .await
+            .unwrap();
+        completed(&agent, &receipt).await;
+        assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+        agent.close_session_mcp(chat).await.unwrap();
+        agent.shutdown().await;
+    }
     #[tokio::test]
     async fn deny_or_policy_revision_change_never_launches_a_server() {
         for change_revision in [false, true] {
